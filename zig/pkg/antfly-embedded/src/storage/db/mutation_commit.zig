@@ -258,6 +258,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return @import("antfly_source_root").antfly_sources.storage_engine.call("batchPrepared", .{ self, req, profile, opts, generated_memo, prepared_row_allocator });
             }
             @setEvalBranchQuota(100_000);
+            var root_binding = try @import("mutation_admission.zig").bindReceiverMutationRoot(self, opts.mutation_root);
+            defer root_binding.release();
             const maintenance_contract = @import("relational_index_maintenance_contract.zig");
             var maintenance_attempted = false;
             defer if (maintenance_attempted) {
@@ -285,6 +287,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // A supplied snapshot or policy lease is retained before the
             // initial replication wait. Keep its original lifetime, with CPU
             // authority retained until capture holders adopt mandatory reentry.
+            if (opts.row_policy_retirement) |owned|
+                if (opts.row_policy_lease != owned) return error.InvalidArgument;
             const initial_controls = if (opts.snapshot_mutation != null or opts.row_policy_lease != null)
                 mutation_admission.retainedLeaseControls(opts.admission_controls)
             else
@@ -295,13 +299,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const enclosing = opts.enclosing_mutation_retirement;
                 const reacquire_enclosing = if (enclosing) |slot| slot.* != null else false;
                 if (enclosing) |slot| releaseReplicationMutationShared(slot);
-                try @import("replication_startup_admission.zig").ensureWithRoot(self, mutation_admission.retainedLeaseControls(initial_controls), opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+                if (opts.avoid_admission_capacity_cycle)
+                    try @import("replication_startup_admission.zig").ensurePreDecisionWithRoot(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self))
+                else
+                    try @import("replication_startup_admission.zig").ensureWithRoot(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
                 if (reacquire_enclosing) enclosing.?.* = try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
             }
-            var replication_mutation = if (opts.bypass_replication_write_gate) null else try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
-            defer if (replication_mutation) |*lease| lease.release();
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
-            if (!opts.bypass_replication_write_gate) try self.preflightReplicationBatchSyncCommit();
+            if (!opts.bypass_replication_write_gate) try preflightReplicationBatchSyncCommitWithAdmission(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
             const total_start_ns = monotonicTimeNs();
             var schedule_replication_recovery_on_exit = false;
             defer {
@@ -312,16 +317,37 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             try S.ownerField(self, "executor").*.checkSyncLevelHealth(req.sync_level);
+            // Admit projected LSM pressure before spending CPU, memory, or provider
+            // calls on a PreparedRow that cannot yet commit. This advisory wait
+            // precedes the primary reader so capture and maintenance can progress.
+            // Allocation/WAL admission remains the authoritative hard guard.
+            if (S.ownerField(self, "core").*.index_manager.resource_manager) |manager| {
+                var pressure_admission: mutation_admission.IntentCollection = .{};
+                const pressure_control = if (opts.avoid_admission_capacity_cycle)
+                    pressure_admission.bindPreDecisionBeforeMutation(initial_controls, S.ownerField(self, "core").*.apply_mutex.io, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self))
+                else
+                    pressure_admission.bindBeforeMutation(initial_controls, S.ownerField(self, "core").*.apply_mutex.io, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+                if (pressure_control) |control| {
+                    if (opts.avoid_admission_capacity_cycle)
+                        try manager.awaitAdmissionPreDecisionWithAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req), control)
+                    else
+                        try manager.awaitAdmissionWithAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req), control);
+                } else {
+                    try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
+                }
+            }
+            var replication_mutation = if (opts.bypass_replication_write_gate) null else if (opts.avoid_admission_capacity_cycle)
+                try mutation_admission.acquireReplicationMutationSharedPreDecisionScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self))
+            else
+                try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+            defer if (replication_mutation) |*lease| lease.release();
+            if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
+            if (!opts.bypass_replication_write_gate) try preflightReplicationBatchSyncCommitWithAdmission(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+            try S.ownerField(self, "executor").*.checkSyncLevelHealth(req.sync_level);
 
             var foreground_write = resource_manager_mod.ResourceManager.ForegroundWriteLease{};
             defer foreground_write.release();
 
-            // Admit projected LSM pressure before spending CPU, memory, or provider
-            // calls on a PreparedRow that cannot yet commit. Maintenance workers
-            // remain able to drain the pressure because no DB apply lock is held.
-            if (S.ownerField(self, "core").*.index_manager.resource_manager) |manager| {
-                try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
-            }
             const preparation_timestamp_ns = if (req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
             const preparation_alloc = prepared_row_allocator.allocator();
 
@@ -539,10 +565,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break;
                 };
                 if (eligible) {
-                    const requires_inline_generated =
-                        (req.sync_level == .full_text or req.sync_level == .enrichments or req.sync_level == .full_index) or
-                        opts.force_generated_artifact_names.len != 0 or
-                        splitShadowRequiresMaterializedDerivedBatch(self);
+                    const requires_inline_generated = (if (opts.transaction_resolution) |resolution| resolution.accepted_effects == null else true) and
+                        ((req.sync_level == .full_text or req.sync_level == .enrichments or req.sync_level == .full_index) or
+                            opts.force_generated_artifact_names.len != 0 or
+                            splitShadowRequiresMaterializedDerivedBatch(self));
                     const rows = try preparation_alloc.alloc(?mapper.PreparedRelationalWrite, effective_req.writes.len);
                     @memset(rows, null);
                     preprepared_rows = rows;
@@ -700,10 +726,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.transaction_resolution == null and
                 !(if (request_schema_view) |view| view.storageMode() == .relational else false))
             {
-                const requires_inline_generated =
-                    (effective_req.sync_level == .full_text or effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index) or
-                    opts.force_generated_artifact_names.len != 0 or
-                    splitShadowRequiresMaterializedDerivedBatch(self);
+                const requires_inline_generated = (if (opts.transaction_resolution) |resolution| resolution.accepted_effects == null else true) and
+                    ((effective_req.sync_level == .full_text or effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index) or
+                        opts.force_generated_artifact_names.len != 0 or
+                        splitShadowRequiresMaterializedDerivedBatch(self));
                 if (requires_inline_generated and effective_req.writes.len > 0) {
                     const precompute_generated_start_ns = monotonicTimeNs();
                     generated_precompute_snapshot = try self.captureGeneratedWriteReadSnapshot(preparation_alloc, effective_req.writes);
@@ -832,11 +858,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 initial_controls;
             var snapshot_mutation = if (snapshot_controls) |controls|
-                try S.ownerField(self, "core").*.snapshot_admission.acquireMutationControlledIo(
-                    S.ownerField(self, "core").*.apply_mutex.io orelse return error.MissingBackendRuntimeIo,
-                    controls,
-                    opts.snapshot_mutation,
-                )
+                if (opts.avoid_admission_capacity_cycle)
+                    try S.ownerField(self, "core").*.snapshot_admission.acquireMutationPreDecisionControlledIo(
+                        S.ownerField(self, "core").*.apply_mutex.io orelse return error.MissingBackendRuntimeIo,
+                        controls,
+                        opts.snapshot_mutation,
+                    )
+                else
+                    try S.ownerField(self, "core").*.snapshot_admission.acquireMutationControlledIo(
+                        S.ownerField(self, "core").*.apply_mutex.io orelse return error.MissingBackendRuntimeIo,
+                        controls,
+                        opts.snapshot_mutation,
+                    )
             else if (opts.snapshot_mutation) |lease| lease.retain() else S.ownerField(self, "core").*.snapshot_admission.acquireMutation();
             defer snapshot_mutation.release();
             std.debug.assert(snapshot_mutation.admission == S.ownerField(self, "core").*.snapshot_admission);
@@ -850,10 +883,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // hot-standby replay may bypass the primary-role gate, but it must never bypass
             // portable runtime activation. Rechecking under apply also closes the
             // interval between the fast preflight above and lock acquisition.
+            var publication_admission: mutation_admission.IntentCollection = .{};
+            const publication_control = publication_admission.bind(snapshot_controls, S.ownerField(self, "core").*.apply_mutex.io);
             var prepared_artifacts = try self.prepareMergeArtifactEffects(preparation_alloc, req);
             defer prepared_artifacts.deinit();
             const apply_lock_wait_start_ns = monotonicTimeNs();
-            try mutation_admission.lockApply(self, mutation_admission.retainedLeaseControls(snapshot_controls));
+            if (opts.avoid_admission_capacity_cycle)
+                try mutation_admission.lockApplyPreDecision(self, mutation_admission.retainedLeaseControls(snapshot_controls))
+            else
+                try mutation_admission.lockApply(self, mutation_admission.retainedLeaseControls(snapshot_controls));
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
             if (S.ownerField(self, "local_execution").*.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;
@@ -1063,11 +1101,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             if (opts.transaction_resolution) |resolution| {
+                if (resolution.accepted_effects) |plan| {
+                    if (!std.mem.eql(u8, &plan.decoded.plan.contract.catalog_digest, &try S.ownerField(self, "core").*.preparedEffectsCatalogDigest(publication_control))) return error.PreparedGenerationChanged;
+                }
                 const intent_snapshot = try S.ownerField(self, "core").*.validateTransactionIntentSnapshot(
                     resolution.txn_id,
                     resolution.expected_intent_revision,
                 );
-                if (!intent_snapshot.has_intents) {
+                if (!intent_snapshot.has_intents and resolution.accepted_effects == null) {
                     // Validate the requested decision while still avoiding mapper
                     // and index preparation on an idempotent resolve retry. Intent
                     // resolution does not advance the prepare revision, so another
@@ -1087,6 +1128,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .{
                             .completion_writes = completion_writes,
                             .resolved_participant = resolution.resolved_participant,
+                            .defer_retained_coordinator_acknowledgement = resolution.defer_retained_coordinator_acknowledgement,
                             .expected_intent_revision = resolution.expected_intent_revision,
                             .known_intent_keys = resolution.intent_keys,
                         },
@@ -1095,6 +1137,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const retirement: @import("mutation_admission.zig").MutationRetirement = .{
                         .current = &replication_mutation,
                         .enclosing = opts.enclosing_mutation_retirement,
+                        .snapshot = &snapshot_mutation,
+                        .row_policy = opts.row_policy_retirement,
                     };
                     if (!opts.bypass_replication_write_gate) {
                         try flushTransactionReplicationOutboxWithRetirement(self, resolution.txn_id, retirement, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
@@ -2131,7 +2175,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendGraphEndpointRetirements(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, graph_lifecycle_generation, effective_req.deletes, S.ownerField(self, "core").*.index_manager.hasGraphIndexes(), deleted_artifact_keys, &store_writes, &owned_store_keys, &owned_store_values);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
-            const use_thin_replay_fast_path =
+            const accepted_effects = if (opts.transaction_resolution) |resolution| resolution.accepted_effects else null;
+            const use_thin_replay_fast_path = accepted_effects == null and
                 effective_req.sync_level != .full_text and
                 effective_req.sync_level != .enrichments and
                 effective_req.sync_level != .full_index and
@@ -2170,7 +2215,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (!use_thin_replay_fast_path) {
                 const precompute_generated_start_ns = monotonicTimeNs();
-                if (use_preprepared_rows and preprepared_generated != null) {
+                if (accepted_effects) |plan| {
+                    precomputed_generated = try @import("prepared_transaction_effects.zig").cloneForMaterialization(preparation_alloc, plan.decoded.plan, publication_control);
+                } else if (use_preprepared_rows and preprepared_generated != null) {
                     precomputed_generated = preprepared_generated.?;
                     preprepared_generated = null;
                 } else if (use_preprepared_document_generated) {
@@ -2418,7 +2465,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             const build_derived_start_ns = monotonicTimeNs();
             const replay_payload = if (use_thin_replay_fast_path)
-                try encodeThinReplayRecordPayload(
+                try encodeThinReplayRecordPayloadWithAdmission(
                     S.ownerField(self, "alloc").*,
                     effective_req,
                     extracted[0..extracted_initialized],
@@ -2431,6 +2478,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     S.ownerField(self, "core").*.index_manager,
                     &sync_targets,
                     S.ownerField(self, "local_execution").*.row_policy_table_name,
+                    publication_control,
                 )
             else blk: {
                 materialized_derived_batch = try buildDerivedBatch(
@@ -2452,7 +2500,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 materialized_derived_batch.?.sequence = sequence;
                 var record = try prepareDirectChangeRecord(&batchContextWithMutationRoot(self, opts.mutation_root), materialized_derived_batch.?, sequence, effective_req, S.ownerField(self, "local_execution").*.row_policy_table_name);
                 defer change_journal_mod.deinitRecord(S.ownerField(self, "alloc").*, &record);
-                const payload = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, record);
+                const payload = try change_journal_mod.encodeRecordWithAdmission(S.ownerField(self, "alloc").*, record, publication_control);
                 errdefer S.ownerField(self, "alloc").*.free(payload);
                 if (write_plan_snapshot == null or write_plan_snapshot.?.plan().has_text_consumers or splitShadowRequiresMaterializedDerivedBatch(self))
                     try attachPreparedUpsertDocumentProjections(preparation_alloc, &materialized_derived_batch.?, effective_req, extracted[0..extracted_initialized]);
@@ -2881,8 +2929,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             defer authored_acceptance.deinit();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            // Known mandatory publication envelopes are funded before the
+            // local primary decision. Native allocation failure is final here;
+            // never retry the same envelope through allocating publish later.
+            var prepared_batch_publication: ?@import("replication_contract.zig").PreparedPublication = null;
+            defer if (prepared_batch_publication) |*prepared| prepared.deinit();
+            var prepared_replay_publication: ?@import("replication_contract.zig").PreparedPublication = null;
+            defer if (prepared_replay_publication) |*prepared| prepared.deinit();
+            const publication_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
+            if (transaction_replication_batch_payload orelse durable_replication_batch_payload) |payload| {
+                const mirror = publication_ctx.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
+                prepared_batch_publication = try mirror.publisher.prepare(mirror, if (scoped_replication) .restore_batch else .batch, payload, publication_ctx.identity_namespace, publication_control);
+            }
+            if (transaction_replication_replay_payload orelse durable_replication_replay_payload) |payload| {
+                const mirror = publication_ctx.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
+                prepared_replay_publication = try mirror.publisher.prepare(mirror, .replay, payload, publication_ctx.identity_namespace, publication_control);
+            }
+            // Preparation can copy/checksum an entire envelope. Preserve the
+            // original lifetime and signed policy expiry at the actual decision
+            // boundary, after all fallible precommit funding is complete.
+            if (publication_control) |control| try control.checkpoint();
+            if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
-                const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
+                const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithAcceptedEffects(
                     resolution.txn_id,
                     resolution.status,
                     resolution.commit_version,
@@ -2896,7 +2965,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .skip_all_intent_application = relationalColumns(self) != null,
                         .completion_writes = if (ordered_apply_receipt_write) |write| &.{write} else &.{},
                         .resolved_participant = resolution.resolved_participant,
+                        .defer_retained_coordinator_acknowledgement = resolution.defer_retained_coordinator_acknowledgement,
                     },
+                    resolution.accepted_effects,
+                    publication_control,
                 );
                 if (outcome.applied) {
                     if (replay_append) |entry| S.ownerField(self, "core").*.store.observeExternalReplayCommit(entry.sequence);
@@ -2917,9 +2989,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
             local_coverage_guard.release();
+            // Staged effects own their buffers; no post-commit work reads the
+            // base transaction. Retire its storage generation before waits.
+            if (index_read) |*read| read.abort();
+            index_read = null;
             if (graph_publication) |*lease| lease.release();
             if (!transaction_applied.applied) {
                 unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+                const retirement: mutation_admission.MutationRetirement = .{
+                    .current = &replication_mutation,
+                    .enclosing = opts.enclosing_mutation_retirement,
+                    .snapshot = &snapshot_mutation,
+                    .row_policy = opts.row_policy_retirement,
+                };
+                if (!opts.bypass_replication_write_gate) {
+                    try flushTransactionReplicationOutboxWithRetirement(self, opts.transaction_resolution.?.txn_id, retirement, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+                } else retirement.retire();
                 try self.waitForResolvedTransactionSync(effective_req.sync_level, transaction_applied.replay_sequence);
                 return;
             }
@@ -2934,14 +3019,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!opts.bypass_replication_write_gate) {
                 var replication_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
                 deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&replication_ctx));
-                if (transaction_replication_batch_payload) |payload| {
+                if (prepared_batch_publication) |*prepared| {
+                    const projected = replicationCommitContext(&replication_ctx);
+                    deferred_replication_gates.append(try replication_commit.appendPreparedPublicationCommitLockedContext(&projected, replication_ctx.replication_async_batch_mirror.?, prepared, scoped_replication));
+                } else if (transaction_replication_batch_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
                 } else if (durable_replication_batch_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContextStrict(&replication_ctx, payload, scoped_replication));
                 } else if (preencoded_replication_batch_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
                 } else deferred_replication_gates.append(try appendReplicationBatchMutationCommitLockedContext(&replication_ctx, effective_req));
-                if (transaction_replication_replay_payload) |payload| {
+                if (prepared_replay_publication) |*prepared| {
+                    const projected = replicationCommitContext(&replication_ctx);
+                    deferred_replication_gates.append(try replication_commit.appendPreparedPublicationCommitLockedContext(&projected, replication_ctx.replication_async_effect_mirror.?, prepared, false));
+                } else if (transaction_replication_replay_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
                 } else if (durable_replication_replay_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
@@ -2999,6 +3090,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             (@import("mutation_admission.zig").MutationRetirement{
                 .current = &replication_mutation,
                 .enclosing = opts.enclosing_mutation_retirement,
+                .snapshot = &snapshot_mutation,
+                .row_policy = opts.row_policy_retirement,
             }).retire();
             if (builtin.is_test and opts.restore_staging != null and D.test_fail_restore_projection_apply.*) {
                 D.test_fail_restore_projection_apply.* = false;
@@ -3059,11 +3152,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_pressure_ns, backlog_pressure_start_ns);
             }
+            var visibility_controls = opts.admission_controls;
+            if (visibility_controls) |*original| {
+                if (opts.committed_visibility_wait) |boundary| original.execution_wait = boundary;
+            }
+            const visibility_boundary = mutation_admission.committedVisibilityBoundary(visibility_controls, .{
+                .snapshot = opts.snapshot_mutation,
+                .row_policy = opts.row_policy_lease,
+                .root = opts.mutation_root orelse mutation_admission.receiverMutationRoot(self),
+                .capture_barrier_present = self.replicationMutationBarrier() != null,
+                .mutation_reader_active = replication_mutation != null or
+                    (if (opts.enclosing_mutation_retirement) |slot| slot.* != null else false),
+            });
             const wait_sync_start_ns = monotonicTimeNs();
             if (append_derived_replay and S.ownerField(self, "executor").*.hasWorkers()) {
                 if (opts.wait_for_sync_level) {
                     const sync_wait_start_ns = monotonicTimeNs();
-                    try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    if (comptime @hasDecl(@TypeOf(self.*), "waitForSyncLevelWithExecutionWait")) {
+                        try self.waitForSyncLevelWithExecutionWait(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed, visibility_boundary);
+                    } else {
+                        try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             } else if (append_derived_replay) {
@@ -3078,7 +3187,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (opts.wait_for_sync_level) {
                     const sync_wait_start_ns = monotonicTimeNs();
-                    try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    if (comptime @hasDecl(@TypeOf(self.*), "waitForSyncLevelWithExecutionWait")) {
+                        try self.waitForSyncLevelWithExecutionWait(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed, visibility_boundary);
+                    } else {
+                        try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             }
@@ -3100,6 +3213,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             opts: BatchExecutionOptions,
             allocator_guard: *PreparedRowAllocator,
         ) anyerror!void {
+            // One binding spans every optimistic retry and mandatory completion.
+            // Nested helpers borrow the receiver root, never a TLS reader.
+            var root_binding = try @import("mutation_admission.zig").bindReceiverMutationRoot(self, opts.mutation_root);
+            defer root_binding.release();
             try types.validateMergeArtifacts(req);
             const max_prepared_generation_retries = 2;
             var retry_count: usize = 0;
@@ -3142,14 +3259,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         fn clearDurableReplicationOutboxWithRoot(self: anytype, key: []const u8, root: ?*MutationBarrier.RootSharedLease) !void {
-            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, root);
+            return clearDurableReplicationOutboxMode(self, key, root, .wait);
+        }
+
+        fn clearDurableReplicationOutboxMode(self: anytype, key: []const u8, root: ?*MutationBarrier.RootSharedLease, comptime completion: @FieldType(replication_commit.RecoveryContext, "completion")) !void {
+            const admission = @import("mutation_admission.zig");
+            var mutation = if (completion == .poll) try admission.tryAcquireRecoveryMutationShared(self, root) else try admission.acquireReplicationMutationSharedScoped(self, null, root);
             defer releaseReplicationMutationShared(&mutation);
-            try self.lockApplyForPortableRuntime();
+            const outbox_mod = @import("durable_outbox.zig");
+            const cursor = &S.ownerField(self, "local_execution").*.replication_recovery_cursor;
+            // Declared first: the apply-unlock defer runs before this cleanup.
+            var cleared = false;
+            defer if (cleared and std.mem.startsWith(u8, key, outbox_mod.replication_outbox_v2_prefix) and key.len >= outbox_mod.replication_outbox_id_len) {
+                const identity = key[key.len - outbox_mod.replication_outbox_id_len ..][0..outbox_mod.replication_outbox_id_len].*;
+                cursor.retireIdentity(identity);
+                S.ownerField(self, "local_execution").*.replication_intent_capture.retireIdentity(identity);
+            };
+            if (completion == .poll) try admission.tryLockApplyForRecovery(self) else try self.lockApplyForPortableRuntime();
             defer S.ownerField(self, "core").*.unlockApply();
             // Recovery is repairing the pending-append flag. Check captured
             // write authority without making that flag reject its own cleanup.
             try enforceReplicationWriteGateOptional(S.ownerField(self, "local_execution").*.replication_write_gate);
             try durable_outbox_store.clearPublished(S.ownerField(self, "core").*.store, key);
+            cleared = true;
         }
 
         pub fn clearLiveDocSetCache(self: anytype) void {
@@ -3335,6 +3467,33 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try self.flushDurableReplicationOutboxesWithAdmission(null);
         }
 
+        /// Background supervision may return pending while preserving every
+        /// durable key. This does not change foreground startup/commit waits.
+        pub fn flushDurableReplicationOutboxesStep(self: anytype) !void {
+            return flushPublicationStep(self, false);
+        }
+
+        /// Reserved recovery workers may never fall through to legacy page
+        /// materialization or a publisher's blocking completion contract.
+        pub fn flushDurableReplicationOutboxesReservedStep(self: anytype) !void {
+            return flushPublicationStep(self, true);
+        }
+
+        fn flushPublicationStep(self: anytype, comptime bounded_only: bool) !void {
+            const lifetime: @import("mutation_admission.zig").BackgroundPublication = .{
+                .closing = &S.ownerField(self, "async_context").*.background_closing,
+                .stopping = &S.ownerField(self, "publication_recovery").*.stopping,
+            };
+            const controls = lifetime.controls();
+            try controls.lifetime.check();
+            if (S.ownerField(self, "async_context").*.primary_replication_outbox_pending.load(.acquire)) S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
+            if (!S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire)) return;
+            const io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
+            if (!S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.tryLock()) return error.CommitCompletionPending;
+            defer S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.unlock(io);
+            try flushDurableReplicationOutboxesMode(self, controls, @import("mutation_admission.zig").receiverMutationRoot(self), .poll, bounded_only);
+        }
+
         pub fn flushDurableReplicationOutboxesWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
             return flushDurableReplicationOutboxesWithAdmissionAndRoot(self, controls, @import("mutation_admission.zig").receiverMutationRoot(self));
         }
@@ -3346,7 +3505,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (S.ownerField(self, "async_context").*.primary_replication_outbox_pending.load(.acquire)) S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
             if (!S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire)) return;
             const io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
-            try admission.lockFlush(&S.ownerField(self, "local_execution").*.durable_replication_flush_mutex, io, retained);
+            try admission.lockFlush(&S.ownerField(self, "local_execution").*.durable_replication_flush_mutex, io, admission.entryControls(controls, root));
             defer S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.unlock(io);
             try flushDurableReplicationOutboxesLockedWithAdmissionAndRoot(self, retained, root);
         }
@@ -3360,15 +3519,169 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn flushDurableReplicationOutboxesLockedWithAdmissionAndRoot(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition, root: ?*MutationBarrier.RootSharedLease) !void {
+            return flushDurableReplicationOutboxesMode(self, controls, root, .wait, false);
+        }
+
+        /// A publication fence may hold apply while waiting for import readers.
+        /// Finish an existing immutable capture without reacquiring apply, so
+        /// its reader can retire. Fresh key/generation checks still precede all
+        /// publication. This shares the attempt's budget with post-apply work.
+        fn resumeOwnedIntentCapture(self: anytype, control: @import("../../common/read_admission.zig").Port, budget: *usize) !void {
+            try control.checkpoint();
+            const capture = &S.ownerField(self, "local_execution").*.replication_intent_capture;
+            if (!capture.mutex.tryLock()) return error.CommitCompletionPending;
+            defer capture.mutex.unlock();
+            if (!capture.hasWork()) return;
+            while (budget.* != 0) {
+                budget.* -= 1;
+                const status = capture.step(4096, control) catch |err| {
+                    capture.discard();
+                    return err;
+                };
+                if (status == .ready and !capture.hasWork()) return;
+            }
+            return error.CommitCompletionPending;
+        }
+
+        /// Poll one modern intent with a single snapshot across key discovery
+        /// and value capture. Index/snapshot metadata is still separate work;
+        /// block IO/codec, row probes, key/value copies and AHO1 are resumable.
+        fn flushOwnedDurableReplicationIntent(self: anytype, retained: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition, root: ?*MutationBarrier.RootSharedLease, control: @import("../../common/read_admission.zig").Port, apply_held: *bool, budget: *usize) !bool {
+            const admission = @import("mutation_admission.zig");
+            const core = S.ownerField(self, "core").*;
+            const local = S.ownerField(self, "local_execution");
+            const capture = &local.*.replication_intent_capture;
+            if (!capture.mutex.tryLock()) return error.CommitCompletionPending;
+            var capture_held = true;
+            var keep_pending = false;
+            defer if (capture_held) {
+                if (!keep_pending) capture.discard();
+                capture.mutex.unlock();
+            };
+            if (core.store.runtime_store.vtable.begin_owned_value_read == null) return false;
+            if (core.store.runtime_store.vtable.begin_owned_key_cursor == null) return error.ExecutionWaitUnsupported;
+            while (true) {
+                if (!capture.matches(core.store, core.identity_namespace, core.root_generation)) {
+                    capture.discard();
+                    capture.after = null;
+                }
+                if (capture.selection_result) |selected| switch (selected) {
+                    .legacy => return false,
+                    .empty => {
+                        const current = core.store.query_generation_revision.load(.acquire);
+                        if (current != capture.selection_query_revision or current == std.math.maxInt(u64)) {
+                            capture.discard();
+                        } else {
+                            capture.discard();
+                            capture.after = null;
+                            local.*.durable_replication_outbox_maybe.store(false, .release);
+                            S.ownerField(self, "async_context").*.primary_replication_outbox_pending.store(false, .release);
+                            S.ownerField(self, "async_context").*.primary_replication_append_pending.store(false, .release);
+                            core.unlockApply();
+                            apply_held.* = false;
+                            local.*.replication_recovery_cursor.reset();
+                            return true;
+                        }
+                    },
+                    .key => unreachable,
+                };
+                if (capture.value != null and capture.validation_result != null) {
+                    const validation = capture.validation_result.?;
+                    if (std.meta.activeTag(validation) == .legacy) return false;
+                    const present = switch (validation) {
+                        .key => |key| std.mem.eql(u8, &key, &capture.key.?),
+                        else => false,
+                    };
+                    if (!present) {
+                        const identity = capture.value.?.identity;
+                        capture.discard();
+                        core.unlockApply();
+                        apply_held.* = false;
+                        capture.mutex.unlock();
+                        capture_held = false;
+                        local.*.replication_recovery_cursor.retireIdentity(identity);
+                        return error.CommitCompletionPending;
+                    }
+                    const current = core.store.query_generation_revision.load(.acquire);
+                    if (capture.validation_fresh or (current == capture.validation_query_revision and current != std.math.maxInt(u64))) break;
+                    capture.validation_result = null;
+                }
+                if (!capture.hasWork()) {
+                    if (budget.* == 0) {
+                        keep_pending = true;
+                        return error.CommitCompletionPending;
+                    }
+                    budget.* -= 1;
+                    if (capture.value != null) try capture.beginValidation(control) else try capture.beginDiscovery(core.store, core.identity_namespace, core.root_generation, control);
+                }
+                core.unlockApply();
+                apply_held.* = false;
+                while (budget.* != 0 and capture.hasWork()) {
+                    budget.* -= 1;
+                    _ = try capture.step(4096, control);
+                }
+                if (capture.hasWork()) {
+                    keep_pending = true;
+                    return error.CommitCompletionPending;
+                }
+                admission.tryLockApplyForRecovery(self) catch |err| {
+                    keep_pending = err == error.CommitCompletionPending;
+                    return err;
+                };
+                apply_held.* = true;
+            }
+            // A completed presence snapshot authorizes this attempt. A later
+            // ordinary write invalidates cached presence on the next poll, but
+            // does not restart a validation already making bounded progress.
+            capture.validation_fresh = false;
+            core.unlockApply();
+            apply_held.* = false;
+            try admission.checkLifetime(retained);
+            try self.enforcePortableRuntimeGate();
+            try enforceReplicationWriteGateOptional(local.*.replication_write_gate);
+            const kind = capture.value.?.kind;
+            const mirror = switch (kind) {
+                .batch, .restore_batch => local.*.replication_async_batch_mirror,
+                .replay, .primary_effect => local.*.replication_async_effect_mirror,
+                .schema, .row_policy => local.*.replication_async_metadata_mirror,
+            } orelse return error.ReplicationPublisherUnavailable;
+            if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
+            var owned = capture.value.?.borrow();
+            owned.recovery_cursor = &local.*.replication_recovery_cursor;
+            var ctx = batchContextWithMutationRoot(self, root);
+            recoverDurableReplicationOutboxContextMode(&ctx, mirror, owned, kind, control, .poll) catch |err| {
+                keep_pending = err == error.CommitCompletionPending;
+                return err;
+            };
+            const key = capture.key.?;
+            capture.mutex.unlock();
+            capture_held = false;
+            try clearDurableReplicationOutboxMode(self, &key, root, .poll);
+            return true;
+        }
+
+        fn flushDurableReplicationOutboxesMode(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition, root: ?*MutationBarrier.RootSharedLease, comptime completion: @FieldType(replication_commit.RecoveryContext, "completion"), comptime bounded_only: bool) !void {
             const admission = @import("mutation_admission.zig");
             const retained = admission.retainedLeaseControls(controls);
             try admission.checkLifetime(retained);
             if (!S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire)) return;
-            try admission.lockApply(self, retained);
-            var apply_held = true;
-            errdefer if (apply_held) S.ownerField(self, "core").*.unlockApply();
+            if (completion == .poll) enforceReplicationWriteGateOptional(S.ownerField(self, "local_execution").*.replication_write_gate) catch |err| {
+                S.ownerField(self, "local_execution").*.replication_intent_capture.reset();
+                return err;
+            };
             var read_scope: admission.IntentCollection = .{};
             const read_control = read_scope.bind(retained, S.ownerField(self, "backend_runtime").*.io());
+            var capture_budget: usize = 16;
+            if (completion == .poll) if (read_control) |control| {
+                try resumeOwnedIntentCapture(self, control, &capture_budget);
+            };
+            if (completion == .poll) try admission.tryLockApplyForRecovery(self) else try admission.lockApply(self, retained);
+            var apply_held = true;
+            errdefer if (apply_held) S.ownerField(self, "core").*.unlockApply();
+            if (completion == .poll) if (read_control) |control| {
+                if (try flushOwnedDurableReplicationIntent(self, retained, root, control, &apply_held, &capture_budget)) return;
+            };
+            if (bounded_only) return error.PublicationRecoveryNeedsMaintenance;
             var page = if (read_control) |control|
                 try durable_outbox_store.readPendingWithAdmission(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, control)
             else
@@ -3386,7 +3699,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             S.ownerField(self, "core").*.unlockApply();
             apply_held = false;
-            if (!any_pending) return;
+            if (!any_pending) {
+                S.ownerField(self, "local_execution").*.replication_intent_capture.reset();
+                S.ownerField(self, "local_execution").*.replication_recovery_cursor.reset();
+                return;
+            }
 
             const batch_outbox = if (batch_raw) |raw| try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(raw, read_control) else null;
             const replay_outbox = if (replay_raw) |raw| try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(raw, read_control) else null;
@@ -3411,26 +3728,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (batch_outbox) |outbox| {
                 try admission.checkLifetime(retained);
                 var ctx = batchContextWithMutationRoot(self, root);
-                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, S.ownerField(self, "local_execution").*.replication_async_batch_mirror.?, outbox, .batch, read_control);
-                try clearDurableReplicationOutboxWithRoot(self, replication_batch_outbox_key, root);
+                try recoverDurableReplicationOutboxContextMode(&ctx, S.ownerField(self, "local_execution").*.replication_async_batch_mirror.?, outbox, .batch, read_control, completion);
+                try clearDurableReplicationOutboxMode(self, replication_batch_outbox_key, root, completion);
             }
             if (replay_outbox) |outbox| {
                 try admission.checkLifetime(retained);
                 var ctx = batchContextWithMutationRoot(self, root);
-                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, S.ownerField(self, "local_execution").*.replication_async_effect_mirror.?, outbox, .replay, read_control);
-                try clearDurableReplicationOutboxWithRoot(self, replication_replay_outbox_key, root);
+                try recoverDurableReplicationOutboxContextMode(&ctx, S.ownerField(self, "local_execution").*.replication_async_effect_mirror.?, outbox, .replay, read_control, completion);
+                try clearDurableReplicationOutboxMode(self, replication_replay_outbox_key, root, completion);
             }
             if (schema_outbox) |outbox| {
                 try admission.checkLifetime(retained);
                 var ctx = batchContextWithMutationRoot(self, root);
-                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, S.ownerField(self, "local_execution").*.replication_async_metadata_mirror.?, outbox, .schema, read_control);
-                try clearDurableReplicationOutboxWithRoot(self, replication_schema_outbox_key, root);
+                try recoverDurableReplicationOutboxContextMode(&ctx, S.ownerField(self, "local_execution").*.replication_async_metadata_mirror.?, outbox, .schema, read_control, completion);
+                try clearDurableReplicationOutboxMode(self, replication_schema_outbox_key, root, completion);
             }
 
             for (pending) |entry| {
                 try admission.checkLifetime(retained);
                 const kind = try durableReplicationOutboxKindFromKey(entry.key);
-                const outbox = try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(entry.value, read_control);
+                var outbox = try (try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(entry.value, read_control)).withRecoveryKey(entry.key);
+                outbox.recovery_cursor = &S.ownerField(self, "local_execution").*.replication_recovery_cursor;
                 const mirror = switch (kind) {
                     .batch, .restore_batch => S.ownerField(self, "local_execution").*.replication_async_batch_mirror,
                     .replay, .primary_effect => S.ownerField(self, "local_execution").*.replication_async_effect_mirror,
@@ -3438,10 +3756,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 } orelse return error.ReplicationPublisherUnavailable;
                 if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
                 var ctx = batchContextWithMutationRoot(self, root);
-                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, mirror, outbox, kind, read_control);
+                try recoverDurableReplicationOutboxContextMode(&ctx, mirror, outbox, kind, read_control, completion);
                 // The key names this exact mutation, so concurrent publishers cannot
                 // replace the record which this recovery pass is about to remove.
-                try clearDurableReplicationOutboxWithRoot(self, entry.key, root);
+                try clearDurableReplicationOutboxMode(self, entry.key, root, completion);
             }
         }
 
@@ -3678,6 +3996,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_effect_mirror);
         }
 
+        pub fn preflightReplicationBatchSyncCommitWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition, root: ?*MutationBarrier.RootSharedLease) !void {
+            var admission: @import("mutation_admission.zig").IntentCollection = .{};
+            const original = admission.bindBeforeMutation(controls, S.ownerField(self, "core").*.apply_mutex.io, root);
+            const ctx = self.batchContext();
+            try replication_commit.preflightWithAdmission(ctx.replication_async_batch_mirror, ctx.log_mutex, original);
+            try replication_commit.preflightWithAdmission(ctx.replication_async_effect_mirror, ctx.log_mutex, original);
+        }
+
         pub fn rememberBulkIngestAllNewIdentityUpserts(self: anytype, doc_ids: []const []const u8) !bool {
             return S.ownerField(self, "bulk_identity").*.remember(S.ownerField(self, "alloc").*, doc_ids);
         }
@@ -3727,10 +4053,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             resolved_participant: ?[]const u8,
             controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
         ) !void {
+            return self.resolveTransactionIntentsInternalWithAcknowledgementPolicy(txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, controls, false);
+        }
+
+        pub fn resolveTransactionIntentsInternalWithAcknowledgementPolicy(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+            defer_retained_coordinator_acknowledgement: bool,
+        ) !void {
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
             defer preparation.deinit();
-            self.resolveTransactionIntentsPreparedWithControls(
+            self.resolveTransactionIntentsPreparedWithAcknowledgementPolicy(
                 txn_id,
                 status,
                 commit_version,
@@ -3740,6 +4081,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 resolved_participant,
                 &preparation.guard,
                 controls,
+                defer_retained_coordinator_acknowledgement,
             ) catch |err| return preparation.mapError(err);
         }
 
@@ -3768,6 +4110,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             resolved_participant: ?[]const u8,
             preparation: *PreparedRowAllocator,
             controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+        ) !void {
+            return self.resolveTransactionIntentsPreparedWithAcknowledgementPolicy(txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, preparation, controls, false);
+        }
+
+        pub fn resolveTransactionIntentsPreparedWithAcknowledgementPolicy(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            preparation: *PreparedRowAllocator,
+            controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+            defer_retained_coordinator_acknowledgement: bool,
         ) !void {
             const admission = @import("mutation_admission.zig");
             try admission.checkLifetime(controls);
@@ -3798,6 +4156,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
                     .completion_writes = marker_writes,
                     .resolved_participant = resolved_participant,
+                    .defer_retained_coordinator_acknowledgement = defer_retained_coordinator_acknowledgement,
                 }) catch |err| switch (err) {
                     // An abort decision for a participant that was declared but
                     // never enlisted is already satisfied. Treat it as an
@@ -3815,6 +4174,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             while (attempts < 8) : (attempts += 1) {
                 try admission.checkLifetime(retained);
                 const schema_namespace = S.ownerField(self, "core").*.schemaNamespaceGeneration();
+                var accepted: ?transactions_mod.PreparedEffects = blk: {
+                    try admission.lockApply(self, retained);
+                    defer S.ownerField(self, "core").*.unlockApply();
+                    var manager = try S.ownerField(self, "core").*.initTxnManager();
+                    defer manager.deinit();
+                    // Preserve authoritative terminal conflict priority.
+                    if (try manager.getTransactionStatusWithAdmission(txn_id, collection_control) == .aborted) return transactions_mod.TxnError.DecisionConflict;
+                    const result = try manager.loadPreparedEffects(alloc, txn_id, collection_control);
+                    if (result == null and (try manager.loadPreparationRequirement(txn_id, collection_control)) != null) return error.PreparedEffectsRequired;
+                    break :blk result;
+                };
+                defer if (accepted) |*plan| plan.deinit();
                 var intents = try S.ownerField(self, "core").*.collectTransactionIntentBatchWithAdmission(alloc, txn_id, collection_control);
                 defer intents.deinit(alloc);
                 try admission.checkLifetime(retained);
@@ -3828,7 +4199,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (i % 64 == 0) try admission.checkLifetime(retained);
                     intent_keys[intents.writes.len + i] = key;
                 }
-                if (intents.writes.len == 0 and intents.deletes.len == 0) {
+                if (accepted == null and intents.writes.len == 0 and intents.deletes.len == 0) {
                     try admission.lockApply(self, retained);
                     if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) {
                         S.ownerField(self, "core").*.unlockApply();
@@ -3852,6 +4223,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .{
                             .completion_writes = marker_writes,
                             .resolved_participant = resolved_participant,
+                            .defer_retained_coordinator_acknowledgement = defer_retained_coordinator_acknowledgement,
                             .expected_intent_revision = intents.revision,
                             .known_intent_keys = intent_keys,
                         },
@@ -3893,12 +4265,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .ordered_apply_receipt = ordered_receipt,
                     .durable_rows = &durable_rows,
                     .transaction_resolution = .{
+                        .accepted_effects = if (accepted) |*plan| plan else null,
                         .txn_id = txn_id,
                         .status = status,
                         .commit_version = commit_version,
                         .expected_intent_revision = intents.revision,
                         .intent_keys = intent_keys,
                         .resolved_participant = resolved_participant,
+                        .defer_retained_coordinator_acknowledgement = defer_retained_coordinator_acknowledgement,
                         .schema_binding = intents.schema_binding,
                         .schema_namespace_generation = schema_namespace,
                     },
@@ -4457,6 +4831,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             sync_targets_out: ?*ManagedSyncTargets,
             owning_table: ?[]const u8,
         ) ![]u8 {
+            return encodeThinReplayRecordPayloadWithAdmission(alloc, req, extracted, deleted_artifact_keys, changed_artifact_keys, overwritten_flags, derived_changed_flags, sequence, include_generated_enrichment_hint, index_manager, sync_targets_out, owning_table, null);
+        }
+
+        fn encodeThinReplayRecordPayloadWithAdmission(
+            alloc: Allocator,
+            req: types.BatchRequest,
+            extracted: []const mapper.ExtractedWrite,
+            deleted_artifact_keys: []const []u8,
+            changed_artifact_keys: []const []u8,
+            overwritten_flags: []const bool,
+            derived_changed_flags: []const bool,
+            sequence: u64,
+            include_generated_enrichment_hint: bool,
+            index_manager: ?*index_manager_mod.IndexManager,
+            sync_targets_out: ?*ManagedSyncTargets,
+            owning_table: ?[]const u8,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) ![]u8 {
             if ((index_manager == null) != (sync_targets_out == null)) return error.InvalidArgument;
             if (derived_changed_flags.len != req.writes.len) return error.InvalidArgument;
             var changed_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -4647,7 +5039,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             record.target_hints = try target_hints.toOwnedSlice(alloc);
             if (sync_targets_out) |out|
                 out.* = try collectManagedSyncTargetsForRecord(alloc, index_manager.?, record);
-            return try change_journal_mod.encodeRecord(alloc, record);
+            return try change_journal_mod.encodeRecordWithAdmission(alloc, record, control);
         }
 
         pub fn enforcePortableRuntimeGateOptional(pending: ?*const std.atomic.Value(bool)) !void {
@@ -4902,6 +5294,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             kind: DurableReplicationOutboxKind,
             control: ?@import("../../common/read_admission.zig").Port,
         ) !void {
+            return recoverDurableReplicationOutboxContextMode(ctx, mirror, outbox, kind, control, .wait);
+        }
+
+        fn recoverDurableReplicationOutboxContextMode(ctx: *const BatchExecutionContext, mirror: ReplicationAsyncEffectMirror, outbox: DurableReplicationOutbox, kind: DurableReplicationOutboxKind, control: ?@import("../../common/read_admission.zig").Port, comptime completion: @FieldType(replication_commit.RecoveryContext, "completion")) !void {
             var mutation_barrier: ?*MutationBarrier = null;
             inline for (.{ ctx.replication_async_batch_mirror, ctx.replication_async_effect_mirror, ctx.replication_async_metadata_mirror }) |configured| {
                 if (configured) |binding| {
@@ -4912,6 +5308,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             try replication_commit.recoverDurableOutbox(.{
+                .completion = completion,
                 .mutation_barrier = mutation_barrier,
                 .io = ctx.io,
                 .admission = control,
@@ -5126,4 +5523,150 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
     };
+}
+
+test "mutation batch root production retry wrapper preserves receiver identity memo and accepted completion" {
+    const admission = @import("mutation_admission.zig");
+    const Barrier = execution_resources.MutationBarrier;
+    const Pipeline = ImplementationFor(struct {}, struct {});
+    const Mode = enum { retry_success, preparation_failure, retry_exhaustion, completion_failure, inherited_success, conflict };
+    const Receiver = struct {
+        mutation_root: ?*Barrier.RootSharedLease = null,
+        expected_root: *Barrier.RootSharedLease,
+        barrier: *Barrier,
+        core: struct { apply_mutex: *@import("apply_rw_lock.zig").ApplyRwLock },
+        mode: Mode,
+        attempts: usize = 0,
+        accepted: usize = 0,
+        completions: usize = 0,
+        memo: ?*execution_resources.GeneratedEmbeddingMemo = null,
+        vector: ?[*]f32 = null,
+        pub fn deinitScratch(_: *@This()) void {}
+        pub fn replicationMutationBarrier(self: *@This()) ?*Barrier {
+            return self.barrier;
+        }
+        pub fn batchInternalPrepared(self: *@This(), _: types.BatchRequest, _: ?*execution_resources.BatchProfile, options: execution_resources.BatchExecutionOptions, memo: *execution_resources.GeneratedEmbeddingMemo, _: *execution_resources.PreparedRowAllocator) !void {
+            self.attempts += 1;
+            try std.testing.expect(self.mutation_root == self.expected_root and (options.mutation_root == null or options.mutation_root == self.expected_root));
+            // This lookup follows the same receiver-only nested helper path as
+            // production. A queued capture must not force a new reader wait.
+            var borrow = (try admission.acquireReplicationMutationShared(self, null)).?;
+            defer borrow.release();
+            try std.testing.expect(borrow.root == self.expected_root and !borrow.phase_owner);
+            const key: execution_resources.GeneratedEmbeddingMemo.Key = @splat(1);
+            if (self.memo) |previous| {
+                try std.testing.expect(previous == memo);
+                try std.testing.expectEqual(self.vector.?, memo.dense.get(key).?.ptr);
+            } else {
+                self.memo = memo;
+                const vector = try memo.alloc.alloc(f32, 3);
+                errdefer memo.alloc.free(vector);
+                @memset(vector, 1);
+                try memo.dense.put(memo.alloc, key, vector);
+                self.vector = vector.ptr;
+            }
+            try std.testing.expect(!memo.reuse_stored_artifacts);
+            switch (self.mode) {
+                .retry_success => {
+                    if (self.attempts == 1) return error.PreparedGenerationChanged;
+                    if (self.attempts == 2) return error.PreparedReadSetChanged;
+                },
+                .preparation_failure => return error.Canceled,
+                .retry_exhaustion => return error.PreparedGenerationChanged,
+                .completion_failure, .inherited_success, .conflict => {},
+            }
+            self.accepted += 1;
+        }
+        pub fn finishBatchGraphEndpointCleanup(self: *@This(), _: types.BatchRequest, _: execution_resources.BatchExecutionOptions) !void {
+            self.completions += 1;
+            try std.testing.expect(self.mutation_root == self.expected_root);
+            try std.testing.expectEqual(@as(usize, 0), self.expected_root.borrowers.load(.acquire));
+            // This error belongs to the retry set, but follows primary acceptance.
+            // The production wrapper must propagate it without replaying prepare.
+            if (self.mode == .completion_failure) return error.PreparedGenerationChanged;
+        }
+    };
+    const Check = struct {
+        pub fn checkpoint(_: *@This()) !void {}
+        pub fn executionBoundary(_: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+            return null;
+        }
+    };
+    for ([_]Mode{ .retry_success, .preparation_failure, .retry_exhaustion, .completion_failure, .inherited_success, .conflict }) |mode| {
+        var barrier: Barrier = .{};
+        var check: Check = .{};
+        var root = try barrier.acquireSharedRootControlled(std.testing.io, &check);
+        defer root.release();
+        var conflicting_root = Barrier.RootSharedLease.initRetired(&barrier);
+        defer conflicting_root.release();
+        var mutex: @import("apply_rw_lock.zig").ApplyRwLock = .{ .io = std.testing.io };
+        var receiver: Receiver = .{ .expected_root = &root, .barrier = &barrier, .core = .{ .apply_mutex = &mutex }, .mode = mode };
+        receiver.mutation_root = switch (mode) {
+            .inherited_success => &root,
+            .conflict => &conflicting_root,
+            else => null,
+        };
+        const previous = receiver.mutation_root;
+        var guard: execution_resources.PreparedRowAllocator = .{ .child = std.testing.allocator, .io = std.testing.io };
+        try std.testing.expect(barrier.reader_gate.tryLock());
+        defer barrier.reader_gate.unlock();
+        const result = Pipeline.batchInternalWithPreparationAllocator(&receiver, .{ .sync_level = .propose }, null, .{ .mutation_root = if (mode == .inherited_success) null else &root }, &guard);
+        switch (mode) {
+            .inherited_success => {
+                try result;
+                try std.testing.expectEqual(@as(usize, 1), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 1), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 1), receiver.completions);
+            },
+            .conflict => {
+                try std.testing.expectError(error.InvalidArgument, result);
+                try std.testing.expectEqual(@as(usize, 0), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 0), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 0), receiver.completions);
+                try std.testing.expect(receiver.memo == null);
+            },
+            .retry_success => {
+                try result;
+                try std.testing.expectEqual(@as(usize, 3), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 1), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 1), receiver.completions);
+            },
+            .preparation_failure => {
+                try std.testing.expectError(error.Canceled, result);
+                try std.testing.expectEqual(@as(usize, 1), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 0), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 0), receiver.completions);
+            },
+            .retry_exhaustion => {
+                try std.testing.expectError(error.PreparedGenerationChanged, result);
+                try std.testing.expectEqual(@as(usize, 3), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 0), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 0), receiver.completions);
+            },
+            .completion_failure => {
+                try std.testing.expectError(error.PreparedGenerationChanged, result);
+                try std.testing.expectEqual(@as(usize, 1), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 1), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 1), receiver.completions);
+            },
+        }
+        try std.testing.expect(receiver.mutation_root == previous);
+        try std.testing.expect(root.held and root.borrowers.load(.acquire) == 0);
+    }
+    const AllocationFixture = struct {
+        fn run(allocator: execution_resources.Allocator) !void {
+            var barrier: Barrier = .{};
+            var check: Check = .{};
+            var root = try barrier.acquireSharedRootControlled(std.testing.io, &check);
+            defer root.release();
+            var mutex: @import("apply_rw_lock.zig").ApplyRwLock = .{ .io = std.testing.io };
+            var receiver: Receiver = .{ .expected_root = &root, .barrier = &barrier, .core = .{ .apply_mutex = &mutex }, .mode = .retry_success };
+            var guard: execution_resources.PreparedRowAllocator = .{ .child = allocator, .io = std.testing.io };
+            defer std.debug.assert(receiver.mutation_root == null and root.borrowers.load(.acquire) == 0);
+            try Pipeline.batchInternalWithPreparationAllocator(&receiver, .{ .sync_level = .propose }, null, .{ .mutation_root = &root }, &guard);
+            try std.testing.expectEqual(@as(usize, 1), receiver.accepted);
+            try std.testing.expectEqual(@as(usize, 1), receiver.completions);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationFixture.run, .{});
 }

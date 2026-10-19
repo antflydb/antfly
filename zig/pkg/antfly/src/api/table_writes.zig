@@ -5132,6 +5132,21 @@ const TestEmbeddingRequest = struct {
     input: std.json.Value,
 };
 
+/// Invoke only after the caller's catalog/table admission has validated and
+/// retained this route. Both adapters keep the same request lifetime capability.
+fn dispatchRangeTrackingBatch(alloc: std.mem.Allocator, batcher: ?RaftBatcher, local: ?TableWriteSource, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").api_operation.RequestContext) !void {
+    try request.ensureExecutionActive();
+    const context: distributed_txn.PreDecisionContext = .{
+        .deadline_ns = request.deadline_ns,
+        .deadline_io = request.deadline_io,
+        .cancellation = request.cancellation,
+        .execution_runnable = if (request.execution_team) |team| team.borrow else null,
+    };
+    if (batcher) |owner| return owner.batchGroupRoutedWithPreDecisionContext(alloc, fence, table, .{ .activate_range_tracking = true }, request.cancellation, context);
+    const source = local orelse return error.SqlRangeTrackingRequired;
+    _ = (try source.batchGroupLocalWithPreDecisionContext(alloc, fence.route.group_id, table, .{ .activate_range_tracking = true }, context)) orelse return error.StorageKernelOwnerUnavailable;
+}
+
 pub const TableWriteSource = @import("antfly_local_sources").api_local_table_writes.TableWriteSource;
 
 pub const DropCleanupContract = metadata_topology_protocol.DropCleanupContract;
@@ -6122,8 +6137,10 @@ pub const RaftBatcher = struct {
         req: db_mod.types.BatchRequest,
         context: distributed_txn.PreDecisionContext,
     ) !void {
-        const fn_ptr = self.vtable.batch_group_local_with_pre_decision_context orelse
+        const fn_ptr = self.vtable.batch_group_local_with_pre_decision_context orelse {
+            if (context.requiresAwareCallback()) return error.UnsupportedOperation;
             return try self.batchGroupLocalWithCancellation(alloc, group_id, table_name, req, context.cancellation);
+        };
         return BoundaryAbi.call("batch_group_local_with_pre_decision_context", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req, context });
     }
 
@@ -6175,6 +6192,11 @@ pub const RaftBatcher = struct {
         return BoundaryAbi.call("txn_status_group_local_until", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id, deadline_ns });
     }
 };
+
+test "controlled group batch context hosted route rejects before resource access" {
+    var source: HostedProvisionedTableWriteSource = undefined;
+    try std.testing.expectError(error.PreDecisionDeadlineExceeded, HostedProvisionedTableWriteSource.batchGroupLocalFencedWithPreDecisionContext(&source, std.testing.allocator, 1, "rows", .{}, 0, .{ .deadline_ns = 0 }));
+}
 
 const ensurePreDecisionContextActive = @import("antfly_local_sources").api_local_table_writes.ensurePreDecisionContextActive;
 
@@ -15671,32 +15693,49 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     pub fn acquireHotStandbySeedCaptureActivityLease(self: *ProvisionedTableWriteSource) !HotStandbySeedCaptureActivityLease {
+        return self.acquireHotStandbySeedCaptureActivityLeaseWithLifetime(null);
+    }
+
+    /// Global mutation/state fences already belong to this capture. Keep CPU
+    /// while acquiring dependent holders; only the original lifetime may reject.
+    pub fn acquireHotStandbySeedCaptureActivityLeaseWithLifetime(self: *ProvisionedTableWriteSource, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !HotStandbySeedCaptureActivityLease {
+        const original = @import("antfly_local_sources").common_seed_snapshot_lifetime;
         const io = self.tableActivityIo();
-        self.table_activity_mutex.lockUncancelable(io);
+        if (lifetime) |control| try original.lockIo(io, &self.table_activity_mutex, control) else self.table_activity_mutex.lockUncancelable(io);
         errdefer self.table_activity_mutex.unlock(io);
 
         for (self.active_table_activities.items) |activity| {
+            try original.checkpoint(lifetime);
             if (activity.table_request_active > 0 or activity.operation_active or activity.structural_active)
                 return error.HASeedSnapshotRuntimeBusy;
         }
+        try original.checkpoint(lifetime);
         if (self.startup_catch_up_active.load(.acquire)) return error.HASeedSnapshotRuntimeBusy;
 
-        lockAtomic(&self.local_db_mutex);
+        if (lifetime) |control| try self.local_db_mutex.lockWithLifetime(io, control) else lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
-        if (writerCacheHasHotStandbySeedBlockingActivity(self.write_cache) or
-            writerCacheHasHotStandbySeedBlockingActivity(self.startup_write_cache))
+        if (try writerCacheHasHotStandbySeedBlockingActivityWithLifetime(self.write_cache, lifetime) or
+            try writerCacheHasHotStandbySeedBlockingActivityWithLifetime(self.startup_write_cache, lifetime))
             return error.HASeedSnapshotRuntimeBusy;
-
+        try original.checkpoint(lifetime);
         return .{ .source = self };
     }
 
     fn writerCacheHasHotStandbySeedBlockingActivity(cache: ?*ProvisionedTableWriteCache) bool {
+        return writerCacheHasHotStandbySeedBlockingActivityWithLifetime(cache, null) catch unreachable;
+    }
+
+    fn writerCacheHasHotStandbySeedBlockingActivityWithLifetime(cache: ?*ProvisionedTableWriteCache, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        const original = @import("antfly_local_sources").common_seed_snapshot_lifetime;
+        try original.checkpoint(lifetime);
         const value = cache orelse return false;
         if (value.active_bulk_ingest_sessions.items.len > 0) return true;
         for (value.entries.items) |entry| {
+            try original.checkpoint(lifetime);
             if (entry.bulk_ingest_session_open or entry.auto_bulk_ingest_session_open or
                 entry.auto_bulk_ingest_finish_requested) return true;
         }
+        try original.checkpoint(lifetime);
         return false;
     }
 
@@ -16844,7 +16883,11 @@ pub const ProvisionedTableWriteSource = struct {
                 _ = (try owner_source.txnResolveGroupLocalWithExecution(alloc, group_id, table_name, resolve.txn_id, resolve.status, resolve.commit_version, 0, req.sync_level, context)) orelse return error.StorageKernelOwnerUnavailable;
                 return;
             };
-            _ = (try owner_source.batchGroupLocal(alloc, group_id, table_name, req)) orelse return error.StorageKernelOwnerUnavailable;
+            const applied = if (req.transaction == null)
+                try owner_source.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req, context)
+            else
+                try owner_source.batchGroupLocal(alloc, group_id, table_name, req);
+            _ = applied orelse return error.StorageKernelOwnerUnavailable;
             return;
         }
         var lease = (try self.residentDbSource().leaseGroup(alloc, table_name, group_id, self.visibleRootGeneration(group_id), .{})) orelse return error.UnknownGroup;
@@ -20267,7 +20310,7 @@ pub const ProvisionedTableWriteSource = struct {
         return .{
             .ptr = self,
             .supports_sql_range_guards = if (self.raft_batcher) |batcher|
-                batcher.vtable.batch_group_routed_with_cancellation != null
+                (batcher.vtable.batch_group_routed_with_cancellation != null or batcher.vtable.batch_group_routed_with_pre_decision_context != null)
             else
                 self.standalone_sql_range_guards and (self.groupLocalWriteSource() != null or self.write_cache != null),
             .vtable = &.{
@@ -21614,13 +21657,13 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            if ((try local_source.batchGroupLocal(alloc, group.group_id, table_name, req)) == null) {
+            if ((try local_source.batchGroupLocalWithPreDecisionContext(alloc, group.group_id, table_name, req, .{ .cancellation = cancellation })) == null) {
                 return error.TableNotFound;
             }
             return;
         }
         if (self.local_write_source) |source_override| {
-            if ((try source_override.batchGroupLocal(alloc, group.group_id, table_name, req)) == null) {
+            if ((try source_override.batchGroupLocalWithPreDecisionContext(alloc, group.group_id, table_name, req, .{ .cancellation = cancellation })) == null) {
                 return error.TableNotFound;
             }
             return;
@@ -21673,24 +21716,24 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn activateRangeTracking(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        try context.ensureActive();
+        try context.ensureExecutionActive();
         const batcher = self.raft_batcher;
         if (batcher) |owner| {
-            if (owner.vtable.batch_group_routed_with_cancellation == null) return error.SqlRangeTrackingRequired;
+            if (owner.vtable.batch_group_routed_with_cancellation == null and owner.vtable.batch_group_routed_with_pre_decision_context == null) return error.SqlRangeTrackingRequired;
         } else if (!self.standalone_sql_range_guards or (self.groupLocalWriteSource() == null and self.write_cache == null)) return error.SqlRangeTrackingRequired;
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
         var routing = (try table_catalog.tableRoutingSnapshotForWrite(alloc, self.catalog, table, self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }))) orelse return error.TableNotFound;
         defer routing.deinit(alloc);
         if (!routing.coversKeyspace() or routing.ranges.len > 256) return error.CatalogGenerationChanged;
         for (routing.ranges) |range| {
-            try context.ensureActive();
+            try context.ensureExecutionActive();
             const route = routing.resolveRouteForKey(range.start_key) orelse return error.CatalogGenerationChanged;
             var fence = routing.fenceForRoute(route);
             fence.admission_deadline_ns = context.deadline_ns;
             fence.admission_deadline_io = context.deadline_io;
             fence.admission_cancellation = context.cancellation;
             if (batcher) |owner| {
-                try owner.batchGroupRoutedWithCancellation(alloc, fence, table, .{ .activate_range_tracking = true }, context.cancellation);
+                try dispatchRangeTrackingBatch(alloc, owner, null, fence, table, context);
             } else {
                 // Standalone owns every local range directly. Hold the same
                 // table admission used by restore and split while validating
@@ -21704,7 +21747,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .execution_runnable = if (context.execution_team) |team| team.borrow else null,
                 });
                 defer admission.deinit();
-                _ = (try self.source().batchGroupLocal(alloc, route.group_id, table, .{ .activate_range_tracking = true })) orelse return error.StorageKernelOwnerUnavailable;
+                try dispatchRangeTrackingBatch(alloc, null, self.source(), fence, table, context);
             }
         }
     }
@@ -27065,7 +27108,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            return try local_source.batchGroupLocal(alloc, group_id, table_name, req);
+            return try local_source.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req, context);
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -36642,6 +36685,91 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 4), fixture.calls);
         }
 
+        test "controlled HA capture activity preserves retained holders and unwinds every original rejection" {
+            const runtime = @import("antfly_runtime_abi");
+            const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+            const Catalog = struct {
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.Unused;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-capture-activity", .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = Catalog.snapshot, .free_admin_snapshot = Catalog.free } });
+            defer source.deinit();
+            const io = source.tableActivityIo();
+            source.table_activity_mutex.lockUncancelable(io);
+            for (0..131) |i| _ = source.activityEntryLocked("docs", @intCast(i));
+            source.table_activity_mutex.unlock(io);
+            var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+            defer scheduler.close();
+            var execution: native.Execution = .{};
+            defer execution.finish();
+            try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .background);
+            var barrier: runtime.mutation_barrier.MutationBarrier = .{};
+            var capture = barrier.acquireExclusive();
+            defer capture.release();
+            const Check = struct {
+                execution: *native.Execution,
+                scheduler: *native.Scheduler,
+                calls: usize = 0,
+                fail_at: usize = std.math.maxInt(usize),
+                cause: anyerror = error.Canceled,
+                fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    std.debug.assert(self.scheduler.stats().runnable_slots == 1);
+                    std.debug.assert(self.scheduler.stats().operations == 1);
+                    std.debug.assert(self.scheduler.stats().retained_bytes == 23);
+                    self.execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+                    self.calls += 1;
+                    if (self.calls == self.fail_at) return runtime.error_abi.statusFromError(self.cause);
+                    return .ok;
+                }
+            };
+            var check: Check = .{ .execution = &execution, .scheduler = &scheduler };
+            const original: runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
+            var lease = try source.acquireHotStandbySeedCaptureActivityLeaseWithLifetime(&original);
+            const checks = check.calls;
+            try std.testing.expect(checks > 131);
+            try std.testing.expect(!source.table_activity_mutex.tryLock());
+            lease.release();
+            for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+                for (1..checks + 1) |fail_at| {
+                    check = .{ .execution = &execution, .scheduler = &scheduler, .fail_at = fail_at, .cause = cause };
+                    try std.testing.expectError(cause, source.acquireHotStandbySeedCaptureActivityLeaseWithLifetime(&original));
+                    try std.testing.expect(source.table_activity_mutex.tryLock());
+                    source.table_activity_mutex.unlock(io);
+                    try std.testing.expect(source.local_db_mutex.tryLock());
+                    source.local_db_mutex.unlock();
+                    try std.testing.expect(barrier.tryAcquireShared() == null);
+                }
+                // Reject behind an independently held activity or source lock.
+                source.table_activity_mutex.lockUncancelable(io);
+                check = .{ .execution = &execution, .scheduler = &scheduler, .fail_at = 3, .cause = cause };
+                try std.testing.expectError(cause, source.acquireHotStandbySeedCaptureActivityLeaseWithLifetime(&original));
+                try std.testing.expect(!source.table_activity_mutex.tryLock());
+                source.table_activity_mutex.unlock(io);
+                try std.testing.expect(source.local_db_mutex.tryLock());
+                check = .{ .execution = &execution, .scheduler = &scheduler, .fail_at = 136, .cause = cause };
+                try std.testing.expectError(cause, source.acquireHotStandbySeedCaptureActivityLeaseWithLifetime(&original));
+                try std.testing.expect(!source.local_db_mutex.tryLock());
+                source.local_db_mutex.unlock();
+                try std.testing.expect(source.table_activity_mutex.tryLock());
+                source.table_activity_mutex.unlock(io);
+            }
+            check = .{ .execution = &execution, .scheduler = &scheduler };
+            source.active_table_activities.items[130].structural_active = true;
+            try std.testing.expectError(error.HASeedSnapshotRuntimeBusy, source.acquireHotStandbySeedCaptureActivityLeaseWithLifetime(&original));
+            source.active_table_activities.items[130].structural_active = false;
+            source.startup_catch_up_active.store(true, .release);
+            try std.testing.expectError(error.HASeedSnapshotRuntimeBusy, source.acquireHotStandbySeedCaptureActivityLeaseWithLifetime(&original));
+            source.startup_catch_up_active.store(false, .release);
+            var legacy = try source.acquireHotStandbySeedCaptureActivityLease();
+            legacy.release();
+            var health: native.Execution = .{};
+            try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+        }
+
         test "HA seed maintenance lifetime locks the actual owned or shared source state" {
             const runtime = @import("antfly_runtime_abi");
             const Check = struct {
@@ -41426,6 +41554,22 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        /// Healthy admission may race unrelated maintenance. Poll only after
+        /// each invocation retires its own fences, preserving original lifetime
+        /// authority and one fixed test ceiling; persistent contention fails.
+        fn retryHealthyAdmission(comptime operation: anytype, args: anytype, io: std.Io, controls: @import("antfly_local_sources").storage_db_apply_rw_lock.ApplyRwLock.Acquisition) anyerror!@typeInfo(@typeInfo(@TypeOf(operation)).@"fn".return_type.?).error_union.payload {
+            const until = std.Io.Clock.now(.awake, io).nanoseconds + 5 * std.time.ns_per_s;
+            while (true) {
+                return @call(.auto, operation, args) catch |err| {
+                    if (err != error.Backpressured) return err;
+                    try controls.lifetime.check();
+                    if (std.Io.Clock.now(.awake, io).nanoseconds >= until) return error.TestAdmissionRetryTimeout;
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                };
+            }
+        }
+
         test "writer cache distinguishes borrowed publisher callbacks and synchronization" {
             const contract = @import("antfly_local_sources").storage_db_replication_contract;
             const outbox = @import("antfly_local_sources").storage_db_durable_outbox;
@@ -44725,17 +44869,13 @@ fn implementationTests() type {
                 fn lifetime(raw: *anyopaque) callconv(.c) runtime_error_abi.Status {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.lifetimes += 1;
-                    // The policy lease is retained while snapshot admission
-                    // waits. Progress/rejection uses the original lifetime,
-                    // without a CPU handoff to an unadmitted capture holder.
+                    // Foreground admission cannot park while retaining policy
+                    // ownership. Preserve scoped failures before the busy
+                    // snapshot gate; never release someone else's capture.
                     if (!self.released_capture and self.db.local_execution.row_policy_gate.readers.load(.acquire) != 0) {
                         self.retained_checks += 1;
-                        if (self.retained_checks >= 32) {
-                            self.capture.release();
-                            self.released_capture = true;
-                            if (self.scenario == 1) return runtime_error_abi.statusFromError(error.SchedulerClosed);
-                            if (self.scenario == 2) self.canceled.store(true, .release);
-                        }
+                        if (self.scenario == 1) return runtime_error_abi.statusFromError(error.SchedulerClosed);
+                        if (self.scenario == 2) self.canceled.store(true, .release);
                     }
                     return .ok;
                 }
@@ -44778,16 +44918,42 @@ fn implementationTests() type {
                 };
                 const control: distributed_txn.CommitControl = .{ .team = &team, .pre_decision = .{ .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) } };
                 if (scenario == 0) {
-                    const outcome = (try source.source().commitBatchWithControl(alloc, &tables, .write, .none, control)).?;
+                    try std.testing.expectError(error.Backpressured, source.source().commitBatchWithControl(alloc, &tables, .write, .none, control));
+                    try std.testing.expect(team.state == .joined);
+                    try std.testing.expect(capture.active);
+                    capture.release();
+                    state.released_capture = true;
+                    try std.testing.expect(try db.lookup(alloc, "doc:admission", .{}) == null);
+                    // A new invocation borrows the same original owner and
+                    // cancellation state after the conflicting capture retires.
+                    team = .{ .borrow = team.borrow, .maximum_slots = 1, .allocator = alloc };
+                    const retry_io = db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+                    const until = std.Io.Clock.now(.awake, retry_io).nanoseconds + 5 * std.time.ns_per_s;
+                    const outcome = retry: while (true) {
+                        const result = source.source().commitBatchWithControl(alloc, &tables, .write, .none, control) catch |err| {
+                            if (err != error.Backpressured) return err;
+                            try std.testing.expect(team.state == .joined);
+                            try team.borrow.checkLifetime();
+                            if (canceled.load(.acquire)) return error.Canceled;
+                            if (std.Io.Clock.now(.awake, retry_io).nanoseconds >= until) return error.TestAdmissionRetryTimeout;
+                            team = .{ .borrow = team.borrow, .maximum_slots = 1, .allocator = alloc };
+                            try retry_io.sleep(.fromMilliseconds(1), .awake);
+                            continue;
+                        };
+                        break :retry result.?;
+                    };
                     try std.testing.expect(outcome == .committed);
                     var row = (try db.lookup(alloc, "doc:admission", .{})).?;
                     defer row.deinit(alloc);
                 } else {
                     try std.testing.expectError(if (scenario == 1) error.SchedulerClosed else error.Canceled, source.source().commitBatchWithControl(alloc, &tables, .write, .none, control));
+                    try std.testing.expect(capture.active);
+                    capture.release();
+                    state.released_capture = true;
                     try std.testing.expect(try db.lookup(alloc, "doc:admission", .{}) == null);
                 }
                 try std.testing.expect(state.released_capture);
-                try std.testing.expectEqual(@as(usize, 32), state.retained_checks);
+                try std.testing.expect(state.retained_checks > 0);
                 try std.testing.expectEqual(@as(usize, 0), state.parks);
                 try std.testing.expectEqual(state.parks, state.resumes);
                 try std.testing.expect(state.lifetimes > 1);
@@ -44804,58 +44970,316 @@ fn implementationTests() type {
             const alloc = std.testing.allocator;
             const State = struct {
                 checks: usize = 0,
-                reject: ?anyerror,
-                transitions: usize = 0,
+                reject: ?anyerror = null,
                 fn lifetime(raw: *const anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
                     self.checks += 1;
-                    if (self.checks >= 8) if (self.reject) |err| return err;
+                    if (self.reject) |err| return err;
+                    if (self.checks > 4096) return error.TestUnexpectedCoarseWait;
+                }
+                fn controls(self: *@This()) @import("antfly_local_sources").storage_db_apply_rw_lock.ApplyRwLock.Acquisition {
+                    return .{ .lifetime = .{ .context = self, .check_fn = lifetime } };
+                }
+            };
+            for (0..2) |fence| {
+                var tmp = try TestDirectory.init("antfly-bound-startup-predecision");
+                defer tmp.cleanup();
+                var db = try db_mod.DB.open(alloc, tmp.path(), .{});
+                defer db.close();
+                const io = db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+                if (fence == 0) db.local_execution.durable_replication_flush_mutex.lockUncancelable(io) else db.core.lockApply();
+                var held = true;
+                defer if (held) {
+                    if (fence == 0) db.local_execution.durable_replication_flush_mutex.unlock(io) else db.core.unlockApply();
+                };
+                var state: State = .{};
+                const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc:startup", .value = "{}" }} };
+                try std.testing.expectError(error.Backpressured, db.batchWithAdmissionControls(request, state.controls(), .none));
+                for ([_]anyerror{ error.DeadlineExceeded, error.Canceled, error.SchedulerClosed }) |cause| {
+                    var rejected: State = .{ .reject = cause };
+                    try std.testing.expectError(cause, db.batchWithAdmissionControls(request, rejected.controls(), .none));
+                }
+                try std.testing.expectEqual(@as(usize, 0), db.local_execution.row_policy_gate.readers.load(.acquire));
+                try std.testing.expect(db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
+                if (fence == 0) db.local_execution.durable_replication_flush_mutex.unlock(io) else db.core.unlockApply();
+                held = false;
+                try std.testing.expect(try db.lookup(alloc, "doc:startup", .{}) == null);
+                try retryHealthyAdmission(db_mod.DB.batchWithAdmissionControls, .{ &db, request, state.controls(), @as(db_mod.types.CancellationToken, .none) }, db.backend_runtime.io().?, state.controls());
+                try std.testing.expect(!db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
+                var row = (try db.lookup(alloc, "doc:startup", .{})) orelse return error.MissingHealthyRetry;
+                row.deinit(alloc);
+                try std.testing.expect(db.local_execution.durable_replication_flush_mutex.tryLock());
+                db.local_execution.durable_replication_flush_mutex.unlock(io);
+                try std.testing.expect(db.core.tryLockApplyExclusive());
+                db.core.unlockApply();
+            }
+        }
+
+        test "bound batch startup lends original CPU before acquiring policy ownership" {
+            const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+            const alloc = std.testing.allocator;
+            var tmp = try TestDirectory.init("antfly-bound-startup-lend");
+            defer tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, tmp.path(), .{});
+            defer db.close();
+            const io = db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+            var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+            var producer: native.Execution = .{};
+            try producer.start(&scheduler, .{ .io = io, .allow_wait = false, .retained_bytes = 17 }, .background);
+            defer producer.finish();
+            db.local_execution.durable_replication_flush_mutex.lockUncancelable(io);
+            var held = true;
+            defer if (held) db.local_execution.durable_replication_flush_mutex.unlock(io);
+            try producer.park(.resource_blocked);
+            var writer: native.Execution = .{};
+            try writer.start(&scheduler, .{ .io = io, .allow_wait = false, .retained_bytes = 23 }, .write);
+            defer writer.finish();
+            const State = struct {
+                db: *db_mod.DB,
+                scheduler: *native.Scheduler,
+                producer: *native.Execution,
+                writer: *native.Execution,
+                held: *bool,
+                waits: usize = 0,
+                fn lifetime(raw: *const anyopaque) !void {
+                    const self: *const @This() = @ptrCast(@alignCast(raw));
+                    try self.writer.checkLifetime();
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.waits += 1;
+                    try std.testing.expectEqual(@as(usize, 0), self.db.local_execution.row_policy_gate.readers.load(.acquire));
+                    try self.writer.park(.resource_blocked);
+                    try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+                    try std.testing.expectEqual(@as(usize, 2), self.scheduler.stats().operations);
+                    try std.testing.expectEqual(@as(u64, 40), self.scheduler.stats().retained_bytes);
+                    const owner_io = self.db.backend_runtime.io().?;
+                    var health: native.Execution = .{};
+                    try health.start(self.scheduler, .{ .io = owner_io, .allow_wait = false }, .control);
+                    health.finish();
+                    try self.producer.enter(.background);
+                    self.db.local_execution.durable_replication_flush_mutex.unlock(owner_io);
+                    self.held.* = false;
+                    try self.producer.park(.resource_blocked);
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.writer.enter(.write);
+                }
+            };
+            var state: State = .{ .db = &db, .scheduler = &scheduler, .producer = &producer, .writer = &writer, .held = &held };
+            const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc:startup-lend", .value = "{}" }} };
+            const controls: @import("antfly_local_sources").storage_db_apply_rw_lock.ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &state, .check_fn = State.lifetime }, .execution_wait = .{ .ptr = &state, .begin = State.begin, .end = State.end } };
+            try retryHealthyAdmission(db_mod.DB.batchWithAdmissionControls, .{ &db, request, controls, @as(db_mod.types.CancellationToken, .none) }, io, controls);
+            try std.testing.expectEqual(@as(usize, 1), state.waits);
+            try std.testing.expect(!db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
+            var row = (try db.lookup(alloc, "doc:startup-lend", .{})) orelse return error.MissingHealthyWrite;
+            row.deinit(alloc);
+            writer.finish();
+            producer.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
+
+        test "bound batch startup pending records survive retryable rejection and reopen" {
+            const alloc = std.testing.allocator;
+            const outbox = @import("antfly_local_sources").storage_db_durable_outbox;
+            const State = struct {
+                checks: usize = 0,
+                fn lifetime(raw: *const anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                    self.checks += 1;
+                    if (self.checks > 4096) return error.TestUnexpectedCoarseWait;
+                }
+            };
+            for ([_]bool{ false, true }) |mutation| {
+                var tmp = try TestDirectory.init("antfly-bound-startup-pending");
+                defer tmp.cleanup();
+                const generated = try outbox.durableReplicationOutboxKeyAlloc(alloc, .batch, 1, 1, "pending");
+                defer alloc.free(generated);
+                const key = if (mutation) generated else outbox.replication_batch_outbox_key;
+                var db = try db_mod.DB.open(alloc, tmp.path(), .{});
+                var live = true;
+                defer if (live) db.close();
+                try db.core.store.put(key, "pending");
+                var state: State = .{};
+                const controls: @import("antfly_local_sources").storage_db_apply_rw_lock.ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &state, .check_fn = State.lifetime } };
+                const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc:must-not-commit", .value = "{}" }} };
+                try std.testing.expectError(error.Backpressured, db.batchWithAdmissionControls(request, controls, .none));
+                try std.testing.expect(db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
+                try std.testing.expect(db.local_execution.durable_replication_outbox_maybe.load(.acquire));
+                try std.testing.expect(try db.lookup(alloc, "doc:must-not-commit", .{}) == null);
+                db.close();
+                live = false;
+                {
+                    var read_only = try db_mod.DB.open(alloc, tmp.path(), .{ .open_mode = .query_readonly });
+                    defer read_only.close();
+                    // Optimistic pending hints must not turn a read-only write
+                    // rejection into recovery or retryable foreground admission.
+                    read_only.local_execution.durable_replication_startup_barrier_pending.store(true, .release);
+                    read_only.local_execution.durable_replication_outbox_maybe.store(true, .release);
+                    try std.testing.expectError(error.ReadOnly, read_only.batchWithAdmissionControls(request, controls, .none));
+                    try std.testing.expect(read_only.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
+                    const unchanged = try read_only.core.store.get(alloc, key);
+                    defer alloc.free(unchanged);
+                    try std.testing.expectEqualStrings("pending", unchanged);
+                }
+                var reopened = try db_mod.DB.open(alloc, tmp.path(), .{});
+                defer reopened.close();
+                const value = try reopened.core.store.get(alloc, key);
+                defer alloc.free(value);
+                try std.testing.expectEqualStrings("pending", value);
+                try std.testing.expectError(error.Backpressured, reopened.batchWithAdmissionControls(request, controls, .none));
+                try std.testing.expect(try reopened.lookup(alloc, "doc:must-not-commit", .{}) == null);
+            }
+        }
+
+        test "bound batch controls reject non-lending replication capture contention and retry the same root" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-bound-batch-global-capture");
+            defer path_tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{});
+            defer db.close();
+            try db.ensureDurableReplicationStartupBarrier();
+            const contract = @import("antfly_local_sources").storage_db_replication_contract;
+            const outbox = @import("antfly_local_sources").storage_db_durable_outbox;
+            const Namespace = @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace;
+            const Stub = struct {
+                fn next(_: *anyopaque) u64 {
+                    return 0;
+                }
+                fn identity(_: *anyopaque) contract.Publisher.Identity {
+                    return .{ .table_id = 0, .shard_id = 0, .timeline_id = 0, .epoch = 0 };
+                }
+                fn publish(_: contract.AsyncEffectMirror, _: outbox.Kind, _: []const u8, _: Namespace) !u64 {
+                    return error.UnexpectedMetadataPublication;
+                }
+                fn recover(_: contract.AsyncEffectMirror, _: outbox.Kind, _: outbox.DurableReplicationOutbox, _: Namespace) !u64 {
+                    return error.UnexpectedMetadataRecovery;
+                }
+                fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {
+                    return error.UnexpectedMetadataAdmission;
+                }
+                fn complete(_: contract.AsyncEffectMirror, _: u64) !void {
+                    return error.UnexpectedMetadataCompletion;
+                }
+                const vtable: contract.Publisher.VTable = .{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete };
+            };
+            var context: u8 = 0;
+            var barrier: replication_mutation_barrier_mod.MutationBarrier = .{};
+            // Metadata and row mutation share capture admission, while this
+            // ordinary row write must not invoke metadata publication callbacks.
+            db.local_execution.replication_async_metadata_mirror = .{ .publisher = .{ .ptr = &context, .vtable = &Stub.vtable }, .mutation_barrier = &barrier };
+            defer db.local_execution.replication_async_metadata_mirror = null;
+            var root = replication_mutation_barrier_mod.MutationBarrier.RootSharedLease.initRetired(&barrier);
+            defer root.release();
+            const State = struct {
+                reject: bool = false,
+                transitions: usize = 0,
+                fn lifetime(raw: *const anyopaque) !void {
+                    const self: *const @This() = @ptrCast(@alignCast(raw));
+                    if (self.reject) return error.DeadlineExceeded;
                 }
                 fn transition(raw: *anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.transitions += 1;
                     return error.InvalidRunnableTransition;
                 }
-            };
-            for ([_]anyerror{ error.DeadlineExceeded, error.Canceled, error.SchedulerClosed }) |rejection| {
-                for (0..2) |fence| {
-                    var tmp = try TestDirectory.init("antfly-bound-startup-lifetime");
-                    defer tmp.cleanup();
-                    var db = try db_mod.DB.open(alloc, tmp.path(), .{});
-                    defer db.close();
-                    const io = db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
-                    try std.testing.expect(db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
-                    if (fence == 0) db.local_execution.durable_replication_flush_mutex.lockUncancelable(io) else db.core.lockApply();
-                    var held = true;
-                    defer if (held) {
-                        if (fence == 0) db.local_execution.durable_replication_flush_mutex.unlock(io) else db.core.unlockApply();
-                    };
-                    var state: State = .{ .reject = rejection };
-                    const original: @typeInfo(@TypeOf(db_mod.DB.batchWithAdmissionControls)).@"fn".param_types[2].? = .{
-                        .lifetime = .{ .context = &state, .check_fn = State.lifetime },
-                        .execution_wait = .{ .ptr = &state, .begin = State.transition, .end = State.transition },
-                    };
-                    const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc:startup", .value = "{}" }} };
-                    try std.testing.expectError(rejection, db.batchWithAdmissionControls(request, original, .none));
-                    try std.testing.expectEqual(@as(usize, 8), state.checks);
-                    try std.testing.expectEqual(@as(usize, 0), state.transitions);
-                    try std.testing.expect(db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
-                    if (fence == 0) db.local_execution.durable_replication_flush_mutex.unlock(io) else db.core.unlockApply();
-                    held = false;
-                    try std.testing.expect(try db.lookup(alloc, "doc:startup", .{}) == null);
-                    state.reject = null;
-                    try db.batchWithAdmissionControls(request, original, .none);
-                    try std.testing.expect(!db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
-                    var row = (try db.lookup(alloc, "doc:startup", .{})) orelse return error.MissingHealthyRetry;
-                    defer row.deinit(alloc);
-                    try std.testing.expectEqualStrings("{}", row.json);
-                    try std.testing.expectEqual(@as(usize, 0), state.transitions);
-                    try std.testing.expect(db.local_execution.durable_replication_flush_mutex.tryLock());
-                    db.local_execution.durable_replication_flush_mutex.unlock(io);
-                    try std.testing.expect(db.core.tryLockApplyExclusive());
-                    db.core.unlockApply();
+                fn controls(self: *@This()) @import("antfly_local_sources").storage_db_apply_rw_lock.ApplyRwLock.Acquisition {
+                    return .{ .lifetime = .{ .context = self, .check_fn = lifetime }, .execution_wait = .{ .ptr = self, .begin = transition, .end = transition } };
                 }
-            }
+            };
+            var state: State = .{};
+            var capture = barrier.acquireExclusive();
+            var held = true;
+            defer if (held) capture.release();
+            const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc:global-capture", .value = "{}" }} };
+            try std.testing.expectError(error.Backpressured, db.batchWithAdmissionControlsAndMutationRoot(request, state.controls(), .none, &root, null, null));
+            var expired: State = .{ .reject = true };
+            try std.testing.expectError(error.DeadlineExceeded, db.batchWithAdmissionControlsAndMutationRoot(request, expired.controls(), .none, &root, null, null));
+            try std.testing.expect(!root.held);
+            try std.testing.expectEqual(@as(usize, 0), root.borrowers.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), state.transitions + expired.transitions);
+            try std.testing.expectEqual(@as(usize, 0), db.local_execution.row_policy_gate.readers.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
+            try std.testing.expect(barrier.tryAcquireExclusive() == null);
+            var local_capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedSnapshotMutation;
+            local_capture.release();
+            capture.release();
+            held = false;
+            try std.testing.expect(try db.lookup(alloc, "doc:global-capture", .{}) == null);
+            try retryHealthyAdmission(db_mod.DB.batchWithAdmissionControlsAndMutationRoot, .{ &db, request, state.controls(), @as(db_mod.types.CancellationToken, .none), &root, null, null }, db.backend_runtime.io().?, state.controls());
+            var row = (try db.lookup(alloc, "doc:global-capture", .{})) orelse return error.MissingRetriedWrite;
+            row.deinit(alloc);
+            try std.testing.expect(!root.held);
+            try std.testing.expectEqual(@as(usize, 0), root.borrowers.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), state.transitions);
+            var next = barrier.tryAcquireExclusive() orelse return error.LeakedReplicationMutation;
+            next.release();
+        }
+
+        test "bound batch predecision pressure rejects blocked producers and preserves soft admission" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-bound-batch-predecision-pressure");
+            defer path_tmp.cleanup();
+            var budgets = resource_manager_mod.Options.defaultBudgets();
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{ .soft_limit_bytes = 8 * 1024 * 1024, .hard_limit_bytes = 16 * 1024 * 1024 };
+            var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .identity_allocator = alloc });
+            defer manager.deinit(alloc);
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{ .resource_manager = &manager, .start_index_workers = false, .start_optional_runtime_workers = false, .ttl_cleanup = .{ .enabled = false } });
+            defer db.close();
+            try db.ensureDurableReplicationStartupBarrier();
+            const State = struct {
+                reject: bool = false,
+                checks: usize = 0,
+                transitions: usize = 0,
+                fn lifetime(raw: *const anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                    self.checks += 1;
+                    if (self.reject) return error.DeadlineExceeded;
+                    if (self.checks > 4096) return error.TestUnexpectedCoarseWait;
+                }
+                fn transition(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.transitions += 1;
+                    return error.InvalidRunnableTransition;
+                }
+                fn controls(self: *@This()) @import("antfly_local_sources").storage_db_apply_rw_lock.ApplyRwLock.Acquisition {
+                    return .{ .lifetime = .{ .context = self, .check_fn = lifetime }, .execution_wait = .{ .ptr = self, .begin = transition, .end = transition } };
+                }
+            };
+            var state: State = .{};
+            var charged: u64 = 0;
+            defer manager.observeUsage(.lsm_in_memory_state, &charged, 0);
+            // Model another producer's accounted resident state. Admission does
+            // not own these bytes and must never release them on rejection.
+            manager.observeUsage(.lsm_in_memory_state, &charged, 16 * 1024 * 1024);
+            const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc:pressure-retry", .value = "{}" }} };
+            try std.testing.expectError(error.Backpressured, db.batchWithAdmissionControls(request, state.controls(), .none));
+            var expired: State = .{ .reject = true };
+            try std.testing.expectError(error.DeadlineExceeded, db.batchWithAdmissionControls(request, expired.controls(), .none));
+            try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), charged);
+            try std.testing.expectEqual(@as(usize, 0), state.transitions + expired.transitions);
+            try std.testing.expectEqual(@as(usize, 0), db.local_execution.row_policy_gate.readers.load(.acquire));
+            var capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedSnapshotMutation;
+            capture.release();
+            try std.testing.expect(try db.lookup(alloc, "doc:pressure-retry", .{}) == null);
+            // Soft pressure is advisory pacing; the non-lending foreground
+            // write may reach its allocation/WAL hard guard without a CPU-held
+            // sleep. The existing producer's charge remains independently owned.
+            manager.observeUsage(.lsm_in_memory_state, &charged, 8 * 1024 * 1024);
+            const soft_request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc:soft-pressure", .value = "{}" }} };
+            try retryHealthyAdmission(db_mod.DB.batchWithAdmissionControls, .{ &db, soft_request, state.controls(), @as(db_mod.types.CancellationToken, .none) }, db.backend_runtime.io().?, state.controls());
+            var soft_row = (try db.lookup(alloc, "doc:soft-pressure", .{})) orelse return error.MissingSoftPressureWrite;
+            soft_row.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), charged);
+            manager.observeUsage(.lsm_in_memory_state, &charged, 0);
+            try retryHealthyAdmission(db_mod.DB.batchWithAdmissionControls, .{ &db, request, state.controls(), @as(db_mod.types.CancellationToken, .none) }, db.backend_runtime.io().?, state.controls());
+            var row = (try db.lookup(alloc, "doc:pressure-retry", .{})) orelse return error.MissingRetriedWrite;
+            row.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 0), state.transitions);
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApply();
         }
 
         test "bound batch controls retain CPU through snapshot-owned apply rejection" {
@@ -44864,18 +45288,17 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             var db = try db_mod.DB.open(alloc, path_tmp.path(), .{});
             defer db.close();
-            // This fixture targets the later snapshot-owned apply fence.
-            // Complete startup recovery before deliberately holding apply.
             try db.ensureDurableReplicationStartupBarrier();
             const State = struct {
                 db: *db_mod.DB,
+                reject: bool = false,
                 retained_checks: usize = 0,
                 transitions: usize = 0,
                 fn lifetime(raw: *const anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
                     if (self.db.core.snapshot_admission.lock.state.load(.acquire) != 0) {
                         self.retained_checks += 1;
-                        if (self.retained_checks >= 8) return error.DeadlineExceeded;
+                        if (self.reject) return error.DeadlineExceeded;
                     }
                 }
                 fn transition(raw: *anyopaque) !void {
@@ -44883,22 +45306,33 @@ fn implementationTests() type {
                     self.transitions += 1;
                     return error.InvalidRunnableTransition;
                 }
+                fn controls(self: *@This()) @import("antfly_local_sources").storage_db_apply_rw_lock.ApplyRwLock.Acquisition {
+                    return .{ .lifetime = .{ .context = self, .check_fn = lifetime }, .execution_wait = .{ .ptr = self, .begin = transition, .end = transition } };
+                }
             };
             var state: State = .{ .db = &db };
             db.core.lockApply();
             var held = true;
             defer if (held) db.core.unlockApply();
-            try std.testing.expectError(error.DeadlineExceeded, db.batchWithAdmissionControls(.{ .writes = &.{.{ .key = "doc:retained-cpu", .value = "{}" }} }, .{
-                .lifetime = .{ .context = &state, .check_fn = State.lifetime },
-                .execution_wait = .{ .ptr = &state, .begin = State.transition, .end = State.transition },
-            }, .none));
-            try std.testing.expectEqual(@as(usize, 8), state.retained_checks);
+            const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc:retained-cpu", .value = "{}" }} };
+            try std.testing.expectError(error.Backpressured, db.batchWithAdmissionControls(request, state.controls(), .none));
+            try std.testing.expect(state.retained_checks > 0);
             try std.testing.expectEqual(@as(usize, 0), state.transitions);
+            // A different rejected invocation keeps its own scoped cause.
+            var expired: State = .{ .db = &db, .reject = true };
+            try std.testing.expectError(error.DeadlineExceeded, db.batchWithAdmissionControls(request, expired.controls(), .none));
+            try std.testing.expectEqual(@as(usize, 0), expired.transitions);
+            try std.testing.expect(!db.core.tryLockApplyExclusive());
+            try std.testing.expectEqual(@as(usize, 0), db.local_execution.row_policy_gate.readers.load(.acquire));
+            var next_capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedMutationAdmission;
+            next_capture.release();
             db.core.unlockApply();
             held = false;
             try std.testing.expect(try db.lookup(alloc, "doc:retained-cpu", .{}) == null);
-            var next_capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedMutationAdmission;
-            next_capture.release();
+            _ = try retryHealthyAdmission(db_mod.DB.batchWithAdmissionControls, .{ &db, request, state.controls(), @as(db_mod.types.CancellationToken, .none) }, db.backend_runtime.io().?, state.controls());
+            var row = (try db.lookup(alloc, "doc:retained-cpu", .{})) orelse return error.MissingRetriedWrite;
+            row.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 0), state.transitions);
             try std.testing.expect(db.core.tryLockApplyExclusive());
             db.core.unlockApply();
         }
@@ -44911,19 +45345,23 @@ fn implementationTests() type {
             defer db.close();
             const State = struct {
                 db: *db_mod.DB,
+                reject: bool = false,
                 retained_checks: usize = 0,
                 transitions: usize = 0,
                 fn lifetime(raw: *const anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
                     if (self.db.local_execution.row_policy_gate.readers.load(.acquire) != 0) {
                         self.retained_checks += 1;
-                        if (self.retained_checks >= 32) return error.DeadlineExceeded;
+                        if (self.reject) return error.DeadlineExceeded;
                     }
                 }
                 fn transition(raw: *anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.transitions += 1;
                     return error.InvalidRunnableTransition;
+                }
+                fn controls(self: *@This()) @import("antfly_local_sources").storage_db_apply_rw_lock.ApplyRwLock.Acquisition {
+                    return .{ .lifetime = .{ .context = self, .check_fn = lifetime }, .execution_wait = .{ .ptr = self, .begin = transition, .end = transition } };
                 }
             };
             for ([_]bool{ false, true }) |prepare| {
@@ -44933,29 +45371,46 @@ fn implementationTests() type {
                 db.core.lockApply();
                 var held = true;
                 defer if (held) db.core.unlockApply();
-                if (prepare) {
-                    try std.testing.expectError(error.DeadlineExceeded, db.writeTransactionWithAdmissionControls(id, .{ .writes = &.{.{ .key = "doc:retained-prepare", .value = "{}" }} }, .{
-                        .lifetime = .{ .context = &state, .check_fn = State.lifetime },
-                        .execution_wait = .{ .ptr = &state, .begin = State.transition, .end = State.transition },
-                    }));
-                } else {
-                    try std.testing.expectError(error.DeadlineExceeded, db.beginTransactionWithAdmissionControls(id, 1, 1, &.{}, true, true, .{
-                        .lifetime = .{ .context = &state, .check_fn = State.lifetime },
-                        .execution_wait = .{ .ptr = &state, .begin = State.transition, .end = State.transition },
-                    }));
+                const request: db_mod.types.TransactionIntentRequest = .{ .writes = &.{.{ .key = "doc:retained-prepare", .value = "{}" }} };
+                for ([_]bool{ false, true }) |reject| {
+                    // Each invocation owns independent lifetime authority.
+                    var scoped: State = .{ .db = &db, .reject = reject };
+                    if (prepare) {
+                        try std.testing.expectError(if (reject) error.DeadlineExceeded else error.Backpressured, db.writeTransactionWithAdmissionControls(id, request, scoped.controls()));
+                    } else {
+                        try std.testing.expectError(if (reject) error.DeadlineExceeded else error.Backpressured, db.beginTransactionWithAdmissionControls(id, 1, 1, &.{}, true, true, scoped.controls()));
+                    }
+                    try std.testing.expect(scoped.retained_checks > 0);
+                    try std.testing.expectEqual(@as(usize, 0), scoped.transitions);
+                    try std.testing.expectEqual(@as(usize, 0), db.local_execution.row_policy_gate.readers.load(.acquire));
+                    try std.testing.expect(!db.core.tryLockApplyExclusive());
                 }
-                try std.testing.expectEqual(@as(usize, 32), state.retained_checks);
-                try std.testing.expectEqual(@as(usize, 0), state.transitions);
-                try std.testing.expectEqual(@as(usize, 0), db.local_execution.row_policy_gate.readers.load(.acquire));
                 db.core.unlockApply();
                 held = false;
+                if (!prepare) {
+                    // A real inner capture dependency must reject through both
+                    // BEGIN adapters, preserving policy/apply retirement.
+                    try std.testing.expect(db.core.store.payload_policy_mutex.tryLock());
+                    var policy_held = true;
+                    defer if (policy_held) db.core.store.payload_policy_mutex.unlock(db.backend_runtime.io().?);
+                    try std.testing.expectError(error.Backpressured, db.beginTransactionWithAdmissionControls(id, 1, 1, &.{}, true, true, state.controls()));
+                    try std.testing.expectEqual(@as(usize, 0), state.transitions);
+                    try std.testing.expectEqual(@as(usize, 0), db.local_execution.row_policy_gate.readers.load(.acquire));
+                    try std.testing.expect(db.core.tryLockApplyExclusive());
+                    db.core.unlockApply();
+                    db.core.store.payload_policy_mutex.unlock(db.backend_runtime.io().?);
+                    policy_held = false;
+                }
                 if (prepare) {
                     try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try db.getTransactionStatus(id));
-                    try db.resolveTransactionIntents(id, .aborted, 2);
-                    try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try db.getTransactionStatus(id));
+                    _ = try retryHealthyAdmission(db_mod.DB.writeTransactionWithAdmissionControls, .{ &db, id, request, state.controls() }, db.backend_runtime.io().?, state.controls());
                 } else {
                     try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(id));
+                    _ = try retryHealthyAdmission(db_mod.DB.beginTransactionWithAdmissionControls, .{ &db, id, @as(u64, 1), @as(u64, 1), @as([]const []const u8, &.{}), true, true, state.controls() }, db.backend_runtime.io().?, state.controls());
                 }
+                try std.testing.expectEqual(@as(usize, 0), state.transitions);
+                try db.resolveTransactionIntents(id, .aborted, 2);
+                try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try db.getTransactionStatus(id));
                 try std.testing.expect(try db.lookup(alloc, "doc:retained-prepare", .{}) == null);
                 try std.testing.expect(db.core.tryLockApplyExclusive());
                 db.core.unlockApply();
@@ -64543,3 +64998,78 @@ pub const executeBackupPinControl = @import("antfly_local_sources").storage_db_b
 pub const RestoreTerminalAdmission = local_write_contract.RestoreTerminalAdmission;
 
 pub const exportPortableBackupShardWithSeal = @import("antfly_local_sources").api_local_table_writes.exportPortableBackupShardWithSeal;
+
+test "controlled range tracking context preserves routed and local original authority" {
+    const runtime = @import("antfly_runtime_abi");
+    const Capture = struct {
+        expected: distributed_txn.PreDecisionContext = .{},
+        calls: usize = 0,
+        legacy_calls: usize = 0,
+        lifetime_checks: usize = 0,
+        failure: ?anyerror = null,
+        fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.lifetime_checks += 1;
+            return if (self.failure) |cause| runtime.error_abi.statusFromError(cause) else .ok;
+        }
+        fn checkpoint(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.TestUnexpectedResult);
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.TestUnexpectedResult);
+        }
+        fn unexpected(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn observe(self: *@This(), group: u64, table: []const u8, req: db_mod.types.BatchRequest, context: distributed_txn.PreDecisionContext) !void {
+            try std.testing.expectEqual(@as(u64, 7001), group);
+            try std.testing.expectEqualStrings("docs", table);
+            try std.testing.expect(req.activate_range_tracking);
+            try std.testing.expectEqualDeep(self.expected, context);
+            self.calls += 1;
+        }
+        fn routed(raw: *anyopaque, _: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, table: []const u8, req: db_mod.types.BatchRequest, cancellation: db_mod.types.CancellationToken, context: distributed_txn.PreDecisionContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualDeep(self.expected.cancellation, cancellation);
+            try self.observe(fence.route.group_id, table, req, context);
+        }
+        fn local(raw: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, req: db_mod.types.BatchRequest, context: distributed_txn.PreDecisionContext) !?void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.observe(group, table, req, context);
+            return {};
+        }
+        fn legacy(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return {};
+        }
+    };
+    var capture: Capture = .{};
+    var signal = std.atomic.Value(bool).init(false);
+    var io = std.testing.io;
+    var team: runtime.runnable_abi.Team = .{ .borrow = .{ .context = &capture, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .checkpoint = Capture.checkpoint, .park = Capture.phase, .enter = Capture.phase, .check_lifetime = Capture.lifetime }, .maximum_slots = 1, .allocator = std.testing.allocator };
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .execution_team = &team, .deadline_ns = std.math.maxInt(u64), .deadline_io = runtime.io_abi.Borrow.init(&io), .cancellation = .fromAtomic(&signal) };
+    capture.expected = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation, .execution_runnable = team.borrow };
+    const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 5, .topology_epoch = 1, .route = .{ .group_id = 7001, .range_id = 7001, .identity_namespace = .{ .table_id = 5, .shard_id = 7001, .range_id = 7001 } } };
+    const batcher: RaftBatcher = .{ .ptr = &capture, .vtable = &.{ .batch_group = Capture.unexpected, .batch_group_local = Capture.unexpected, .batch_group_routed_with_pre_decision_context = Capture.routed } };
+    const local: TableWriteSource = .{ .ptr = &capture, .vtable = &.{ .batch = undefined, .batch_group_local_with_pre_decision_context = Capture.local } };
+    try dispatchRangeTrackingBatch(std.testing.allocator, batcher, null, fence, "docs", context);
+    try dispatchRangeTrackingBatch(std.testing.allocator, null, local, fence, "docs", context);
+    try std.testing.expectEqual(@as(usize, 2), capture.calls);
+    const legacy: TableWriteSource = .{ .ptr = &capture, .vtable = &.{ .batch = undefined, .batch_group_local = Capture.legacy } };
+    try std.testing.expectError(error.UnsupportedOperation, dispatchRangeTrackingBatch(std.testing.allocator, null, legacy, fence, "docs", context));
+    try std.testing.expectEqual(@as(usize, 0), capture.legacy_calls);
+    try dispatchRangeTrackingBatch(std.testing.allocator, null, legacy, fence, "docs", .{});
+    try std.testing.expectEqual(@as(usize, 1), capture.legacy_calls);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        capture.failure = cause;
+        try std.testing.expectError(cause, dispatchRangeTrackingBatch(std.testing.allocator, batcher, null, fence, "docs", context));
+        try std.testing.expectError(cause, dispatchRangeTrackingBatch(std.testing.allocator, null, local, fence, "docs", context));
+    }
+    try std.testing.expectEqual(@as(usize, 2), capture.calls);
+}
+
+test "controlled range tracking lifetime rejects before catalog and source access" {
+    var source: ProvisionedTableWriteSource = undefined;
+    try std.testing.expectError(error.DeadlineExceeded, ProvisionedTableWriteSource.activateRangeTracking(&source, std.testing.allocator, "docs", .{ .deadline_ns = 0 }));
+}

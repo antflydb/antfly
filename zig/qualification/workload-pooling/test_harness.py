@@ -434,6 +434,159 @@ class RunnableQualificationTests(unittest.TestCase):
             delta = runnable_diagnostics({"runnable": stats}, {"runnable": after})
             self.assertEqual([1, 1, 0, 0, 0], delta["grants"])
             self.assertEqual(1, delta["yields"])
+            self.assertEqual({"available": False}, delta["service"])
+            stats["service"] = self.service_stats()
+            after["service"] = self.service_stats()
+            after["service"]["observed_slot_ns"][4] += 12
+            delta = runnable_diagnostics({"runnable": stats}, {"runnable": after})
+            self.assertEqual(
+                [0, 0, 0, 0, 12, 0], delta["service"]["counters"]["observed_slot_ns"]
+            )
+
+    @staticmethod
+    def service_stats():
+        from load_clients import SERVICE_COUNTERS
+
+        return dict(
+            version=1,
+            struct_size=408,
+            measurement_model=1,
+            available=True,
+            quantum_ns=1_000_000,
+            **{field: [100] * 6 for field in SERVICE_COUNTERS},
+            debt_slot_ns=[0] * 6,
+            rebate_slot_ns=[0] * 6,
+        )
+
+    def test_service_deltas_preserve_classes_and_allow_correction_gauges_to_fall(self):
+        from load_clients import SERVICE_CLASSES, SERVICE_COUNTERS, service_diagnostics
+
+        before = self.service_stats()
+        before["debt_slot_ns"][0] = 2_000_000
+        after = self.service_stats()
+        for field in SERVICE_COUNTERS:
+            after[field] = [101 + index for index in range(6)]
+        after["rebate_slot_ns"][0] = 500_000
+        delta = service_diagnostics({"service": before}, {"service": after})
+        self.assertEqual(list(SERVICE_CLASSES), delta["classes"])
+        for field in SERVICE_COUNTERS:
+            self.assertEqual([1, 2, 3, 4, 5, 6], delta["counters"][field])
+        self.assertEqual(0, delta["debt_slot_ns"][0])
+        self.assertEqual(500_000, delta["rebate_slot_ns"][0])
+
+    def test_service_deltas_reject_resets_malformed_contracts_and_policy_changes(self):
+        from load_clients import SERVICE_COUNTERS, service_diagnostics
+
+        mutations = [
+            ("version", 2),
+            ("struct_size", 400),
+            ("measurement_model", 2),
+            ("available", False),
+            ("available", 1),
+            ("quantum_ns", 2_000_000),
+            ("quantum_ns", 0),
+            ("quantum_ns", 100_000_001),
+            ("debt_slot_ns", [64_000_001] + [0] * 5),
+            ("rebate_slot_ns", [True] + [0] * 5),
+        ]
+        for field in SERVICE_COUNTERS:
+            mutations.extend(
+                (
+                    (field, [99] + [100] * 5),
+                    (field, [100] * 5),
+                    (field, [-1] * 6),
+                    (field, [2**64] * 6),
+                )
+            )
+        for field, value in mutations:
+            with self.subTest(field=field, value=value):
+                before = self.service_stats()
+                after = dict(before, **{field: value})
+                with self.assertRaises(RuntimeError):
+                    service_diagnostics({"service": before}, {"service": after})
+        after = self.service_stats()
+        after["debt_slot_ns"][0] = after["rebate_slot_ns"][0] = 1
+        with self.assertRaises(RuntimeError):
+            service_diagnostics({"service": self.service_stats()}, {"service": after})
+        with self.assertRaises(RuntimeError):
+            service_diagnostics({"service": self.service_stats()}, {})
+
+    def test_absent_service_is_explicit_and_ignores_unavailable_payload(self):
+        from load_clients import service_diagnostics
+
+        self.assertEqual({"available": False}, service_diagnostics({}, {}))
+        unavailable = dict(self.service_stats(), available=False, observed_slot_ns=None)
+        self.assertEqual(
+            {"available": False},
+            service_diagnostics({"service": unavailable}, {"service": unavailable}),
+        )
+
+    def test_service_gate_requires_observation_not_grants_or_estimates(self):
+        from load_clients import runnable_evidence_failures, service_diagnostics
+
+        measured = self.measured()
+        policy = self.manifest()["runnable_policy"]
+        self.assertIn(
+            "runnable service observations were not measured",
+            runnable_evidence_failures(measured, policy, 1, 10),
+        )
+        before, after = self.service_stats(), self.service_stats()
+        after["estimated_slot_ns"][0] += 1000
+        delta = service_diagnostics({"service": before}, {"service": after})
+        measured["runnable_diagnostics"]["service"] = delta
+        self.assertIn(
+            "runnable observed service was below the declared minimum",
+            runnable_evidence_failures(measured, policy, 1, 10),
+        )
+        after["observed_slot_ns"][0] += 10
+        measured["runnable_diagnostics"]["service"] = service_diagnostics(
+            {"service": before},
+            {"service": after},
+        )
+        self.assertEqual([], runnable_evidence_failures(measured, policy, 1, 10))
+
+    def test_comparison_recomputes_declared_service_gate_from_snapshots(self):
+        from load_clients import service_diagnostics
+
+        baseline = QualificationTests().receipt()
+        baseline["binary_sha256"] = "baseline"
+        candidate = copy.deepcopy(baseline)
+        candidate.update(binary_sha256="candidate", policy="runnable")
+        for phase in candidate["manifest"]["phases"]:
+            phase["thresholds"] = {"runnable_observed_slot_ns_min": 1}
+        baseline["manifest"] = copy.deepcopy(candidate["manifest"])
+        for phase in candidate["phases"]:
+            before, after = self.service_stats(), self.service_stats()
+            after["observed_slot_ns"][0] += 1
+            phase["workload_before"] = {"runnable": {"service": before}}
+            phase["workload_after"] = {"runnable": {"service": after}}
+            phase["runnable_diagnostics"] = {
+                "service": service_diagnostics(
+                    phase["workload_before"]["runnable"],
+                    phase["workload_after"]["runnable"],
+                )
+            }
+        self.assertTrue(compare(baseline, candidate)["passed"])
+        for change in ("missing", "unavailable", "reset", "zero", "forged"):
+            changed = copy.deepcopy(candidate)
+            phase = changed["phases"][0]
+            if change == "missing":
+                phase.pop("workload_before")
+            elif change == "unavailable":
+                phase["workload_before"]["runnable"]["service"]["available"] = False
+                phase["workload_after"]["runnable"]["service"]["available"] = False
+            elif change == "reset":
+                phase["workload_after"]["runnable"]["service"]["observed_slot_ns"][
+                    0
+                ] = 99
+            elif change == "zero":
+                phase["workload_after"] = copy.deepcopy(phase["workload_before"])
+            else:
+                phase["runnable_diagnostics"]["service"]["counters"][
+                    "observed_slot_ns"
+                ][0] = 999
+            with self.subTest(change=change):
+                self.assertFalse(compare(baseline, changed)["passed"])
 
     def test_runnable_snapshot_rejects_disabled_and_missing_scheduler(self):
         with patch.dict("os.environ", ANTFLY_QUALIFICATION_POLICY="runnable"):
@@ -481,14 +634,19 @@ class RunnableQualificationTests(unittest.TestCase):
     def test_failfast_runnable_comparison_verifies_both_complete_policies(self):
         from run_local import configuration_for_policy
 
-        baseline, candidate = QualificationTests().receipt(), QualificationTests().receipt()
+        baseline, candidate = (
+            QualificationTests().receipt(),
+            QualificationTests().receipt(),
+        )
         manifest = dict(candidate["manifest"], **self.manifest())
         for receipt, policy in ((baseline, "failfast"), (candidate, "runnable")):
             receipt["policy"] = policy
             receipt["manifest"] = manifest
             receipt["configuration"] = configuration_for_policy(manifest, policy)
             receipt["configuration"]["pgwire"] = {
-                "enabled": True, "bind_port": 5432, "max_connections": 32,
+                "enabled": True,
+                "bind_port": 5432,
+                "max_connections": 32,
             }
         self.assertTrue(compare(baseline, candidate)["passed"])
         for index, original in enumerate((baseline, candidate)):

@@ -25,6 +25,7 @@ pub const RoutingBudget = struct {
     deadline_ns: ?u64 = null,
     io: ?runtime_io_abi.Borrow = null,
     cancellation: @import("antfly_cancellation").CancellationToken = .none,
+    admission: ?@import("../common/read_admission.zig").Port = null,
 
     const checkpoint_stride: usize = 64;
 
@@ -68,6 +69,7 @@ pub const RoutingBudget = struct {
     }
 
     pub fn checkpoint(self: RoutingBudget) !void {
+        if (self.admission) |port| try port.checkpoint();
         try self.cancellation.check();
         if (self.deadline_ns) |deadline| {
             if (self.nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;

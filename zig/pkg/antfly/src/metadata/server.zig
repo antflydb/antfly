@@ -54,6 +54,8 @@ pub const MetadataServerConfig = struct {
     online_merge_enabled: bool = true,
     http: raft_managed_host.ManagedHttpHostConfig,
     service: service.MetadataServiceConfig = .{},
+    /// Optional borrowed process context, alive through MetadataServer.deinit.
+    storage_context: ?*anyopaque = null,
     admin_listener: ?raft_transport.StdHttpListenerConfig = null,
     api_server_cfg: public_api_http_server.ApiHttpServerConfig = .{},
     reconciler_config: metadata_mod.Reconciler.Config = .{},
@@ -288,9 +290,14 @@ pub const MetadataServer = struct {
                     catalog,
                     raft.read_gate.alreadyReadSafeBarrier(),
                 );
+                _ = owner_source.withBackendRuntime(backend_runtime, .{});
+                _ = owner_source.withSecretStore(cfg.api_server_cfg.secret_store);
                 owner_source.row_policy_authority_secret = cfg.api_server_cfg.trusted_principal_secret;
                 owner_source.row_policy_authority_issuer = cfg.api_server_cfg.trusted_principal_issuer;
                 _ = owner_source.withRemoteContent(cfg.api_server_cfg.remote_content);
+                // Borrowed contexts are already configured. Attach last so the
+                // local setters above cannot request a second configuration.
+                if (cfg.storage_context) |context| _ = owner_source.withStorageContextHandle(context);
                 owned_kernel_owner_source = owner_source;
                 _ = public_read_source.withLocalReadSource(owner_source.readSource());
                 _ = public_write_source.withLocalWriteSource(owner_source.writeSource());

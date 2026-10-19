@@ -593,6 +593,8 @@ const TestReadGroupPreparationHook = struct {
 
 var test_read_group_preparation_hook: ?TestReadGroupPreparationHook = null;
 var test_read_group_retirement_hook: ?TestReadGroupPreparationHook = null;
+var test_before_read_view_pin_hook: ?TestReadGroupPreparationHook = null;
+var test_after_read_view_pin_hook: ?TestReadGroupPreparationHook = null;
 var test_authority_sync_index_visits: std.atomic.Value(usize) = .init(0);
 
 fn runTestAfterStructuralPublishPreparationHook() void {
@@ -756,21 +758,22 @@ pub const TableRuntimeSnapshotCache = struct {
         }
     };
 
-    /// Immutable topology whose group payloads are independent ref-counted COW
-    /// snapshots. Ordinary group publication swaps one slot; only a genuine
-    /// topology change constructs and publishes a replacement view.
+    /// Immutable slot topology with independent ref-counted COW payloads.
+    /// Publication swaps one slot; retirement clears it under read_view_mutex.
+    /// Positions and allocation size stay immutable for retained view readers.
+    /// Adding a new ID still constructs a replacement topology.
     const ReadView = struct {
         ref_count: std.atomic.Value(usize) = .init(1),
-        groups: []*ReadGroupSnapshot,
+        groups: []?*ReadGroupSnapshot,
         group_by_id: std.AutoHashMapUnmanaged(u64, usize) = .empty,
 
         fn init(alloc: std.mem.Allocator, statuses: LocalTableRuntimeStatuses) !*@This() {
             const view = try alloc.create(@This());
             errdefer alloc.destroy(view);
-            const groups = try alloc.alloc(*ReadGroupSnapshot, statuses.items.len);
+            const groups = try alloc.alloc(?*ReadGroupSnapshot, statuses.items.len);
             var initialized: usize = 0;
             errdefer {
-                for (groups[0..initialized]) |group| group.release(alloc);
+                for (groups[0..initialized]) |group| if (group) |value| value.release(alloc);
                 alloc.free(groups);
             }
             var group_by_id = std.AutoHashMapUnmanaged(u64, usize).empty;
@@ -794,7 +797,7 @@ pub const TableRuntimeSnapshotCache = struct {
 
         fn release(self: *@This(), alloc: std.mem.Allocator) void {
             if (self.ref_count.fetchSub(1, .acq_rel) != 1) return;
-            for (self.groups) |group| group.release(alloc);
+            for (self.groups) |group| if (group) |value| value.release(alloc);
             alloc.free(self.groups);
             self.group_by_id.deinit(alloc);
             alloc.destroy(self);
@@ -862,6 +865,7 @@ pub const TableRuntimeSnapshotCache = struct {
     pub const CatalogToken = struct {
         alloc: std.mem.Allocator,
         topology_revision: u64,
+        cache_invalidation_epoch: u64 = 0,
         complete_catalog: bool,
         observation_generation: u64,
         target_observation_revision: u64,
@@ -905,6 +909,7 @@ pub const TableRuntimeSnapshotCache = struct {
             observed_source_target_sequence: u64 = 0,
         };
 
+        minimum_group_observation_generation: u64 = 0,
         ref_count: std.atomic.Value(usize) = .init(1),
         mutation_mutex: std.Io.Mutex = .init,
         epoch: TableEpoch,
@@ -1667,6 +1672,7 @@ pub const TableRuntimeSnapshotCache = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         token.topology_revision = self.topology_revision;
+        token.cache_invalidation_epoch = self.next_invalidation_epoch;
         token.observation_generation = self.takeObservationGenerationLocked();
         token.target_observation_revision = self.target_observation_revision;
         // A complete refresh is also authoritative for tables absent from the
@@ -1688,6 +1694,41 @@ pub const TableRuntimeSnapshotCache = struct {
             const owned_name = try alloc.dupe(u8, table_name);
             token.table_epochs.putAssumeCapacityNoClobber(owned_name, state.epoch);
         }
+        return token;
+    }
+
+    /// A page inherits its observation/target fences from BEFORE the catalog
+    /// read. Existing tables retain their captured epoch even if DDL replaced
+    /// it. A cold table can be initialized only if no intervening publisher or
+    /// cache invalidation established a competing lifecycle.
+    pub fn captureObservedTableToken(self: *@This(), alloc: std.mem.Allocator, observation: *const CatalogToken, table_name: []const u8) !?CatalogToken {
+        if (!observation.complete_catalog) return error.InvalidArgument;
+        var token: CatalogToken = .{
+            .alloc = alloc,
+            .topology_revision = observation.topology_revision,
+            .cache_invalidation_epoch = observation.cache_invalidation_epoch,
+            .complete_catalog = false,
+            .observation_generation = observation.observation_generation,
+            .target_observation_revision = observation.target_observation_revision,
+        };
+        errdefer token.deinit();
+        try token.table_epochs.ensureTotalCapacity(alloc, 1);
+        const owned_name = try alloc.dupe(u8, table_name);
+        var name_owned = true;
+        defer if (name_owned) alloc.free(owned_name);
+        self.mutation_barrier.lockSharedUncancelable(std.Options.debug_io);
+        defer self.mutation_barrier.unlockShared(std.Options.debug_io);
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const epoch = observation.table_epochs.get(table_name) orelse blk: {
+            if (self.tables.contains(table_name) or self.next_invalidation_epoch != observation.cache_invalidation_epoch) {
+                token.deinit();
+                return null;
+            }
+            break :blk (try self.ensureTableLocked(table_name)).epoch;
+        };
+        token.table_epochs.putAssumeCapacityNoClobber(owned_name, epoch);
+        name_owned = false;
         return token;
     }
 
@@ -1718,6 +1759,10 @@ pub const TableRuntimeSnapshotCache = struct {
             self.mutex.unlock();
             return .stale_table;
         };
+        if (token.observation_generation < initial_state.minimum_group_observation_generation) {
+            self.mutex.unlock();
+            return .stale_observation;
+        }
         if (!std.meta.eql(initial_state.epoch, token.table_epoch)) {
             self.mutex.unlock();
             return .stale_table;
@@ -1993,6 +2038,7 @@ pub const TableRuntimeSnapshotCache = struct {
                 token.observation_generation = self.takeObservationGenerationLocked();
             }
             if (!std.meta.eql(state.epoch, token.table_epoch)) return .stale_table;
+            if (token.observation_generation < state.minimum_group_observation_generation) return .stale_observation;
             var missing_group_count: usize = 0;
             for (statuses) |status| {
                 if (!state.groups.contains(status.group_id)) missing_group_count += 1;
@@ -2303,7 +2349,8 @@ pub const TableRuntimeSnapshotCache = struct {
         self.clearIndexAuthoritiesLocked(state);
 
         if (prepared_read_view) |view| {
-            for (view.groups) |group| {
+            for (view.groups) |slot| {
+                const group = slot orelse continue;
                 const current = state.groups.get(group.status.group_id).?;
                 group.status.cache_observation_generation = current.cache_observation_generation;
                 group.status.cache_publication_epoch = current.cache_publication_epoch;
@@ -2357,12 +2404,6 @@ pub const TableRuntimeSnapshotCache = struct {
             seen_tables.deinit(self.alloc);
         }
         try seen_tables.ensureTotalCapacity(self.alloc, @intCast(snapshots.len));
-        const retired_read_views = try self.alloc.alloc(RetiredReadView, catalog_token.table_epochs.count());
-        var retired_read_view_count: usize = 0;
-        defer {
-            for (retired_read_views[0..retired_read_view_count]) |retired| retired.deinit(self.read_view_alloc);
-            if (retired_read_views.len > 0) self.alloc.free(retired_read_views);
-        }
         for (snapshots) |snapshot_entry| {
             if (seen_tables.contains(snapshot_entry.table_name)) return error.DuplicateRuntimeStatusTable;
             const owned_name = try self.alloc.dupe(u8, snapshot_entry.table_name);
@@ -2373,7 +2414,9 @@ pub const TableRuntimeSnapshotCache = struct {
         for (snapshots) |*snapshot_entry| {
             const expected_epoch = catalog_token.table_epochs.get(snapshot_entry.table_name);
             const state = self.lockExistingTableMutation(snapshot_entry.table_name);
-            if (expected_epoch == null or state == null or !std.meta.eql(expected_epoch.?, state.?.epoch)) {
+            if (expected_epoch == null or state == null or !std.meta.eql(expected_epoch.?, state.?.epoch) or
+                catalog_token.observation_generation < state.?.minimum_group_observation_generation)
+            {
                 if (state) |value| self.unlockTableMutation(value);
                 const rejected_name = try self.alloc.dupe(u8, snapshot_entry.table_name);
                 errdefer self.alloc.free(rejected_name);
@@ -2402,7 +2445,107 @@ pub const TableRuntimeSnapshotCache = struct {
             result.published_tables += 1;
         }
 
-        if (!catalog_token.complete_catalog) return result;
+        if (catalog_token.complete_catalog) {
+            var pruning = try self.pruneAbsentTablesLockedToken(catalog_token, &seen_tables);
+            defer pruning.deinit();
+            result.removed_tables = pruning.removed_tables;
+            result.removals_deferred = pruning.removals_deferred;
+        }
+        return result;
+    }
+
+    /// Partial observations preserve unsampled groups and inherit authority
+    /// captured before the metadata read. Payloads remain caller-owned.
+    pub fn publishObservedGroups(self: *@This(), token: *const CatalogToken, table_name: []const u8, statuses: []const LocalTableRuntimeStatus) !PublishResult {
+        const epoch = token.table_epochs.get(table_name) orelse return .stale_table;
+        return self.publishGroups(.{
+            .table_epoch = epoch,
+            .observation_generation = token.observation_generation,
+            .target_observation_revision = token.target_observation_revision,
+        }, table_name, statuses);
+    }
+
+    pub const GroupPruneResult = struct { removed: usize = 0, deferred: bool = false };
+
+    /// Presence is authoritative for this table; observation fragments are not.
+    /// Retire at most eight payloads outside cache locks. Read payloads are
+    /// detached individually without rebuilding the table view. Candidate scans
+    /// and authority reductions still require further staging.
+    pub fn pruneAbsentGroups(self: *@This(), token: *const CatalogToken, table_name: []const u8, present: *const std.AutoHashMapUnmanaged(u64, void)) GroupPruneResult {
+        const epoch = token.table_epochs.get(table_name) orelse return .{ .deferred = true };
+        const state = self.lockExistingTableMutation(table_name) orelse return .{ .deferred = true };
+        defer self.unlockTableMutation(state);
+        var retired: [8]LocalTableRuntimeStatus = undefined;
+        var count: usize = 0;
+        defer for (retired[0..count]) |*status| status.deinit(self.alloc);
+        var retired_read: [8]*ReadGroupSnapshot = undefined;
+        var read_count: usize = 0;
+        defer for (retired_read[0..read_count]) |group| group.release(self.read_view_alloc);
+        lockAtomic(&self.mutex);
+        if (!std.meta.eql(state.epoch, epoch) or self.topology_revision != token.topology_revision) {
+            self.mutex.unlock();
+            return .{ .deferred = true };
+        }
+        var result: GroupPruneResult = .{};
+        var it = state.groups.iterator();
+        while (it.next()) |entry| {
+            if (present.contains(entry.key_ptr.*)) continue;
+            // A post-observation publisher owns a newer fact. Leave it for a
+            // subsequent authoritative catalog read rather than deleting it.
+            if (entry.value_ptr.cache_observation_generation > token.observation_generation or count == retired.len) {
+                result.deferred = true;
+                continue;
+            }
+            const id = entry.key_ptr.*;
+            retired[count] = entry.value_ptr.*;
+            count += 1;
+            state.groups.removeByPtr(entry.key_ptr);
+            lockAtomic(&self.read_view_mutex);
+            if (self.read_views.get(table_name)) |view| {
+                if (view.groupPosition(id)) |position| {
+                    if (view.groups[position]) |group| {
+                        retired_read[read_count] = group;
+                        read_count += 1;
+                        view.groups[position] = null;
+                    }
+                }
+            }
+            self.read_view_mutex.unlock();
+            _ = state.required_target_observation_revisions.remove(id);
+            var authorities = state.index_authorities.valueIterator();
+            while (authorities.next()) |authority| {
+                if (!authority.handoff_topology_bound) _ = authority.handoff_groups.remove(id);
+            }
+        }
+        result.removed = count;
+        if (count != 0) state.minimum_group_observation_generation = @max(state.minimum_group_observation_generation, token.observation_generation);
+        const handed_off = self.advanceTargetedIndexAuthorityLocked(state);
+        if (handed_off) self.syncReadViewAuthorityLocked(table_name, state);
+        self.settleReleasedIndexAuthoritiesLocked(state);
+        self.mutex.unlock();
+        return result;
+    }
+
+    /// Prune only authoritative catalog absence. Unsampled present tables keep
+    /// their observations. Capture the complete token BEFORE reading metadata;
+    /// its epochs/topology fence deletion across concurrent publishers/DDL.
+    pub fn pruneAbsentTables(self: *@This(), token: *const CatalogToken, present_names: []const []const u8) !RefreshResult {
+        if (!token.complete_catalog) return error.InvalidArgument;
+        var present = std.StringHashMapUnmanaged(void).empty;
+        defer present.deinit(self.alloc);
+        try present.ensureTotalCapacity(self.alloc, @intCast(present_names.len));
+        for (present_names) |name| present.putAssumeCapacity(name, {});
+        return self.pruneAbsentTablesLockedToken(token, &present);
+    }
+
+    fn pruneAbsentTablesLockedToken(self: *@This(), catalog_token: *const CatalogToken, seen_tables: *const std.StringHashMapUnmanaged(void)) !RefreshResult {
+        var result: RefreshResult = .{ .alloc = self.alloc };
+        const retired_read_views = try self.alloc.alloc(RetiredReadView, catalog_token.table_epochs.count());
+        var retired_read_view_count: usize = 0;
+        defer {
+            for (retired_read_views[0..retired_read_view_count]) |retired| retired.deinit(self.read_view_alloc);
+            if (retired_read_views.len > 0) self.alloc.free(retired_read_views);
+        }
         const RetiredTableState = struct {
             name: []const u8,
             state: *TableState,
@@ -2433,9 +2576,15 @@ pub const TableRuntimeSnapshotCache = struct {
         var it = self.tables.iterator();
         while (it.next()) |entry| {
             if (seen_tables.contains(entry.key_ptr.*)) continue;
-            const expected_epoch = catalog_token.table_epochs.get(entry.key_ptr.*) orelse continue;
+            const expected_epoch = catalog_token.table_epochs.get(entry.key_ptr.*) orelse {
+                result.removals_deferred = true;
+                continue;
+            };
             const retired_state = entry.value_ptr.*;
-            if (!std.meta.eql(expected_epoch, retired_state.epoch)) continue;
+            if (!std.meta.eql(expected_epoch, retired_state.epoch)) {
+                result.removals_deferred = true;
+                continue;
+            }
             if (!advanced_invalidation_epoch) {
                 self.advanceInvalidationEpochLocked();
                 advanced_invalidation_epoch = true;
@@ -2556,7 +2705,8 @@ pub const TableRuntimeSnapshotCache = struct {
             self.mutex.unlock();
             return;
         }
-        for (prepared.groups) |group| {
+        for (prepared.groups) |slot| {
+            const group = slot orelse unreachable;
             const current = state.groups.get(group.status.group_id) orelse {
                 self.mutex.unlock();
                 return;
@@ -2642,7 +2792,7 @@ pub const TableRuntimeSnapshotCache = struct {
         if (self.read_views.get(table_name)) |view| {
             if (view.groupPosition(group_id)) |position| {
                 const current = view.groups[position];
-                if (current.status.cache_observation_generation <= expected_generation) {
+                if (current == null or current.?.status.cache_observation_generation <= expected_generation) {
                     view.groups[position] = prepared;
                     prepared_owned = false;
                     retired = current;
@@ -2672,7 +2822,7 @@ pub const TableRuntimeSnapshotCache = struct {
         lockAtomic(&self.read_view_mutex);
         defer self.read_view_mutex.unlock();
         const view = self.read_views.get(table_name) orelse return;
-        for (view.groups) |group| syncReadGroupAuthorityFromStateLocked(state, group);
+        for (view.groups) |slot| if (slot) |group| syncReadGroupAuthorityFromStateLocked(state, group);
     }
 
     fn syncReadGroupAuthorityLocked(
@@ -2685,7 +2835,7 @@ pub const TableRuntimeSnapshotCache = struct {
         defer self.read_view_mutex.unlock();
         const view = self.read_views.get(table_name) orelse return;
         const position = view.groupPosition(group_id) orelse return;
-        syncReadGroupAuthorityFromStateLocked(state, view.groups[position]);
+        syncReadGroupAuthorityFromStateLocked(state, view.groups[position] orelse return);
     }
 
     fn syncReadGroupAuthorityFromStateLocked(
@@ -2727,7 +2877,8 @@ pub const TableRuntimeSnapshotCache = struct {
         defer self.read_view_mutex.unlock();
         const view = self.read_views.get(table_name) orelse return;
         const group_index = view.groupPosition(group_id) orelse return;
-        view.groups[group_index].authority.target_observation_complete.store(false, .release);
+        const group = view.groups[group_index] orelse return;
+        group.authority.target_observation_complete.store(false, .release);
     }
 
     fn markReadViewIndexTargetsPendingLocked(
@@ -2741,7 +2892,7 @@ pub const TableRuntimeSnapshotCache = struct {
         defer self.read_view_mutex.unlock();
         const view = self.read_views.get(table_name) orelse return;
         const group_index = view.groupPosition(group_id) orelse return;
-        const group = view.groups[group_index];
+        const group = view.groups[group_index] orelse return;
         for (identities, applied_positions) |identity, applied_position| {
             if (applied_position == null) continue;
             const index = group.authority.index_by_name.get(identity.index_name) orelse continue;
@@ -2753,23 +2904,33 @@ pub const TableRuntimeSnapshotCache = struct {
     pub fn snapshot(self: *@This(), alloc: std.mem.Allocator, table_name: []const u8) !?LocalTableRuntimeStatuses {
         if (self.retainReadView(table_name)) |view| {
             defer view.release(self.read_view_alloc);
+            if (comptime builtin.is_test) {
+                if (test_before_read_view_pin_hook) |hook| hook.run(hook.ptr);
+            }
             const retained = try alloc.alloc(*ReadGroupSnapshot, view.groups.len);
             defer alloc.free(retained);
+            var retained_count: usize = 0;
             lockAtomic(&self.read_view_mutex);
-            for (view.groups, 0..) |group, index| {
+            for (view.groups) |slot| {
+                const group = slot orelse continue;
                 group.retain();
-                retained[index] = group;
+                retained[retained_count] = group;
+                retained_count += 1;
             }
             self.read_view_mutex.unlock();
-            defer for (retained) |group| group.release(self.read_view_alloc);
+            defer for (retained[0..retained_count]) |group| group.release(self.read_view_alloc);
+            if (comptime builtin.is_test) {
+                if (test_after_read_view_pin_hook) |hook| hook.run(hook.ptr);
+            }
+            if (retained_count == 0) return null;
 
-            const items = try alloc.alloc(LocalTableRuntimeStatus, retained.len);
+            const items = try alloc.alloc(LocalTableRuntimeStatus, retained_count);
             var initialized: usize = 0;
             errdefer {
                 for (items[0..initialized]) |*status| status.deinit(alloc);
                 alloc.free(items);
             }
-            for (retained, 0..) |group, index| {
+            for (retained[0..retained_count], 0..) |group, index| {
                 items[index] = try group.status.clone(alloc);
                 errdefer items[index].deinit(alloc);
                 try group.applyAuthority(alloc, &items[index]);
@@ -3135,7 +3296,10 @@ pub const TableRuntimeSnapshotCache = struct {
             defer view.release(self.read_view_alloc);
             const group_index = view.groupPosition(group_id) orelse return null;
             lockAtomic(&self.read_view_mutex);
-            const group = view.groups[group_index];
+            const group = view.groups[group_index] orelse {
+                self.read_view_mutex.unlock();
+                return null;
+            };
             group.retain();
             self.read_view_mutex.unlock();
             defer group.release(self.read_view_alloc);
@@ -6060,6 +6224,301 @@ fn consumerTests() type {
             var logs = (try cache.snapshot(alloc, "logs")).?;
             defer logs.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 9), logs.items[0].stats.doc_count);
+        }
+
+        test "runtime status paged catalog readers pin payloads safely across retirement" {
+            const alloc = std.testing.allocator;
+            for ([_]bool{ false, true }) |pin_first| {
+                var cache = TableRuntimeSnapshotCache.init(alloc);
+                defer cache.deinit();
+                const initial = try cache.capturePublicationToken("docs");
+                _ = try cache.publishGroup(initial, "docs", .{ .group_id = 7, .stats = .{ .doc_count = 42 } });
+                var catalog = try cache.captureCatalogToken(alloc, &.{}, true);
+                defer catalog.deinit();
+                const view = cache.read_views.get("docs").?;
+                const Block = struct {
+                    entered: std.atomic.Value(bool) = .init(false),
+                    release: std.atomic.Value(bool) = .init(false),
+                    fn run(raw: *anyopaque) void {
+                        const self: *@This() = @ptrCast(@alignCast(raw));
+                        self.entered.store(true, .release);
+                        while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                    }
+                };
+                const Reader = struct {
+                    cache: *TableRuntimeSnapshotCache,
+                    result: ?LocalTableRuntimeStatuses = null,
+                    failed: bool = false,
+                    fn run(self: *@This()) void {
+                        self.result = self.cache.snapshot(std.testing.allocator, "docs") catch {
+                            self.failed = true;
+                            return;
+                        };
+                    }
+                };
+                var block: Block = .{};
+                const hook = TestReadGroupPreparationHook{ .ptr = &block, .run = Block.run };
+                if (pin_first) test_after_read_view_pin_hook = hook else test_before_read_view_pin_hook = hook;
+                defer {
+                    test_before_read_view_pin_hook = null;
+                    test_after_read_view_pin_hook = null;
+                }
+                var reader = Reader{ .cache = &cache };
+                defer if (reader.result) |*result| result.deinit(alloc);
+                var task = try std.testing.io.concurrent(Reader.run, .{&reader});
+                defer {
+                    block.release.store(true, .release);
+                    task.await(std.testing.io);
+                }
+                while (!block.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                const present = std.AutoHashMapUnmanaged(u64, void).empty;
+                try std.testing.expectEqual(@as(usize, 1), cache.pruneAbsentGroups(&catalog, "docs", &present).removed);
+                block.release.store(true, .release);
+                task.await(std.testing.io);
+                try std.testing.expect(!reader.failed);
+                if (pin_first) {
+                    try std.testing.expectEqual(@as(usize, 1), reader.result.?.items.len);
+                    try std.testing.expectEqual(@as(u64, 42), reader.result.?.items[0].stats.doc_count);
+                } else try std.testing.expect(reader.result == null);
+                try std.testing.expect((try cache.snapshotGroupStatus(alloc, "docs", 7)) == null);
+                var fresh = try cache.captureCatalogToken(alloc, &.{}, true);
+                defer fresh.deinit();
+                _ = try cache.publishObservedGroups(&fresh, "docs", &.{.{ .group_id = 7, .stats = .{ .doc_count = 77 } }});
+                try std.testing.expect(cache.read_views.get("docs").? == view);
+                var restored = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+                defer restored.deinit(alloc);
+                try std.testing.expectEqual(@as(u64, 77), restored.stats.doc_count);
+            }
+        }
+
+        test "runtime status paged catalog retirement detaches read slots without allocation or sibling cloning" {
+            const alloc = std.testing.allocator;
+            var failing = std.testing.FailingAllocator.init(alloc, .{});
+            var cache = TableRuntimeSnapshotCache.init(failing.allocator());
+            defer cache.deinit();
+            var statuses: [16]LocalTableRuntimeStatus = undefined;
+            for (&statuses, 0..) |*status, id| status.* = .{ .group_id = id, .stats = .{ .doc_count = 42 } };
+            const initial = try cache.capturePublicationToken("docs");
+            _ = try cache.publishLifecycleTransition(initial, "docs", &statuses);
+            var catalog = try cache.captureCatalogToken(alloc, &.{}, true);
+            defer catalog.deinit();
+            var present = std.AutoHashMapUnmanaged(u64, void).empty;
+            defer present.deinit(alloc);
+            for (0..16) |id| if (id != 7) try present.put(alloc, id, {});
+            const view = cache.read_views.get("docs").?;
+            const sibling = view.groups[view.groupPosition(8).?].?;
+            const held = view.groups[view.groupPosition(7).?].?;
+            held.retain();
+            var held_owned = true;
+            defer if (held_owned) held.release(cache.read_view_alloc);
+            const Probe = struct {
+                cache: *TableRuntimeSnapshotCache,
+                prepared: usize = 0,
+                retired: usize = 0,
+                locks_available: bool = true,
+                fn prepare(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.prepared += 1;
+                }
+                fn retire(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.retired += 1;
+                    if (self.cache.mutex.tryLock()) self.cache.mutex.unlock() else self.locks_available = false;
+                    if (self.cache.read_view_mutex.tryLock()) self.cache.read_view_mutex.unlock() else self.locks_available = false;
+                }
+            };
+            var probe = Probe{ .cache = &cache };
+            test_read_group_preparation_hook = .{ .ptr = &probe, .run = Probe.prepare };
+            defer test_read_group_preparation_hook = null;
+            test_read_group_retirement_hook = .{ .ptr = &probe, .run = Probe.retire };
+            defer test_read_group_retirement_hook = null;
+            const allocation_count = failing.alloc_index;
+            failing.fail_index = allocation_count;
+            const result = cache.pruneAbsentGroups(&catalog, "docs", &present);
+            try std.testing.expectEqual(@as(usize, 1), result.removed);
+            try std.testing.expect(!result.deferred);
+            try std.testing.expectEqual(allocation_count, failing.alloc_index);
+            try std.testing.expect(!failing.has_induced_failure);
+            try std.testing.expectEqual(@as(usize, 0), probe.prepared);
+            try std.testing.expectEqual(@as(usize, 0), probe.retired);
+            try std.testing.expect(cache.read_views.get("docs").? == view);
+            try std.testing.expect(view.groups[view.groupPosition(8).?].? == sibling);
+            try std.testing.expect((try cache.snapshotGroupStatus(alloc, "docs", 7)) == null);
+            try std.testing.expectEqual(@as(u64, 42), held.status.stats.doc_count);
+            held_owned = false;
+            held.release(cache.read_view_alloc);
+            try std.testing.expectEqual(@as(usize, 1), probe.retired);
+            try std.testing.expect(probe.locks_available);
+            failing.fail_index = std.math.maxInt(usize);
+            var snapshot = (try cache.snapshot(alloc, "docs")).?;
+            defer snapshot.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 15), snapshot.items.len);
+            for (snapshot.items) |status| try std.testing.expect(status.group_id != 7);
+            const fresh = try cache.capturePublicationToken("docs");
+            _ = try cache.publishGroup(fresh, "docs", .{ .group_id = 7, .stats = .{ .doc_count = 99 } });
+            try std.testing.expectEqual(@as(usize, 1), probe.prepared);
+            try std.testing.expect(cache.read_views.get("docs").? == view);
+            var restored = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+            defer restored.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 99), restored.stats.doc_count);
+        }
+
+        test "runtime status paged catalog group fragments preserve unsampled facts and retire bounded absence" {
+            const alloc = std.testing.allocator;
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            const old = try cache.capturePublicationToken("docs");
+            for (0..12) |id| _ = try cache.publishGroup(old, "docs", .{ .group_id = id, .stats = .{ .doc_count = 42 } });
+            var catalog = try cache.captureCatalogToken(alloc, &.{}, true);
+            defer catalog.deinit();
+            try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishObservedGroups(&catalog, "docs", &.{.{ .group_id = 0, .stats = .{ .doc_count = 99 } }}));
+            var unsampled = (try cache.snapshotGroupStatus(alloc, "docs", 11)).?;
+            defer unsampled.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 42), unsampled.stats.doc_count);
+            var present = std.AutoHashMapUnmanaged(u64, void).empty;
+            defer present.deinit(alloc);
+            try present.put(alloc, 0, {});
+            const first = cache.pruneAbsentGroups(&catalog, "docs", &present);
+            try std.testing.expectEqual(@as(usize, 8), first.removed);
+            try std.testing.expect(first.deferred);
+            const second = cache.pruneAbsentGroups(&catalog, "docs", &present);
+            try std.testing.expectEqual(@as(usize, 3), second.removed);
+            try std.testing.expect(!second.deferred);
+            try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.stale_observation, try cache.publishGroup(old, "docs", .{ .group_id = 11, .stats = .{} }));
+            try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.stale_observation, try cache.publishGroups(old, "docs", &.{.{ .group_id = 11, .stats = .{} }}));
+            var snapshot = (try cache.snapshot(alloc, "docs")).?;
+            defer snapshot.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.items.len);
+            try std.testing.expectEqual(@as(u64, 99), snapshot.items[0].stats.doc_count);
+            present.clearRetainingCapacity();
+            try std.testing.expectEqual(@as(usize, 1), cache.pruneAbsentGroups(&catalog, "docs", &present).removed);
+            try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
+        }
+
+        test "runtime status paged catalog group pruning preserves newer publications and rejects lifecycle changes" {
+            const alloc = std.testing.allocator;
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            _ = try cache.capturePublicationToken("docs");
+            var catalog = try cache.captureCatalogToken(alloc, &.{}, true);
+            defer catalog.deinit();
+            const newer = try cache.capturePublicationToken("docs");
+            _ = try cache.publishGroup(newer, "docs", .{ .group_id = 7, .stats = .{ .doc_count = 42 } });
+            const present = std.AutoHashMapUnmanaged(u64, void).empty;
+            const result = cache.pruneAbsentGroups(&catalog, "docs", &present);
+            try std.testing.expect(result.deferred and result.removed == 0);
+            cache.invalidateTable("unrelated");
+            try std.testing.expect(cache.pruneAbsentGroups(&catalog, "docs", &present).deferred);
+            var snapshot = (try cache.snapshot(alloc, "docs")).?;
+            defer snapshot.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 42), snapshot.items[0].stats.doc_count);
+        }
+
+        test "runtime status paged catalog table tokens retain premetadata lifecycle fences" {
+            const alloc = std.testing.allocator;
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            _ = try cache.capturePublicationToken("docs");
+            var catalog = try cache.captureCatalogToken(alloc, &.{}, true);
+            defer catalog.deinit();
+            const old_epoch = catalog.table_epochs.get("docs").?;
+            cache.invalidateTable("docs");
+            var page = (try cache.captureObservedTableToken(alloc, &catalog, "docs")).?;
+            defer page.deinit();
+            try std.testing.expectEqual(old_epoch, page.table_epochs.get("docs").?);
+            try std.testing.expectEqual(catalog.observation_generation, page.observation_generation);
+            try std.testing.expectEqual(catalog.target_observation_revision, page.target_observation_revision);
+            var entries = [_]TableRuntimeSnapshot{.{
+                .table_name = try alloc.dupe(u8, "docs"),
+                .statuses = .{ .items = try alloc.alloc(LocalTableRuntimeStatus, 1) },
+            }};
+            entries[0].statuses.items[0] = .{ .group_id = 1, .stats = .{} };
+            var result = try cache.publishRefresh(&page, &entries);
+            defer result.deinit();
+            try std.testing.expect(result.hasRejectedTables());
+            try std.testing.expectEqual(@as(usize, 0), result.published_tables);
+        }
+
+        test "runtime status paged catalog cold tokens reject intervening lifecycles" {
+            const alloc = std.testing.allocator;
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            var catalog = try cache.captureCatalogToken(alloc, &.{}, true);
+            defer catalog.deinit();
+            var cold = (try cache.captureObservedTableToken(alloc, &catalog, "cold")).?;
+            defer cold.deinit();
+            _ = try cache.capturePublicationToken("concurrent");
+            try std.testing.expect((try cache.captureObservedTableToken(alloc, &catalog, "concurrent")) == null);
+            cache.clear();
+            try std.testing.expect((try cache.captureObservedTableToken(alloc, &catalog, "missing")) == null);
+            var partial = try cache.captureCatalogToken(alloc, &.{}, false);
+            defer partial.deinit();
+            try std.testing.expectError(error.InvalidArgument, cache.captureObservedTableToken(alloc, &partial, "missing"));
+        }
+
+        test "runtime status paged catalog pruning retains unsampled present tables and retires absence" {
+            const alloc = std.testing.allocator;
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            const gone = try cache.capturePublicationToken("gone");
+            const kept = try cache.capturePublicationToken("unsampled");
+            _ = try cache.publishGroup(gone, "gone", .{ .group_id = 1, .stats = .{} });
+            _ = try cache.publishGroup(kept, "unsampled", .{ .group_id = 2, .stats = .{ .doc_count = 42 } });
+            var catalog = try cache.captureCatalogToken(alloc, &.{}, true);
+            defer catalog.deinit();
+            var pruning = try cache.pruneAbsentTables(&catalog, &.{"unsampled"});
+            defer pruning.deinit();
+            try std.testing.expectEqual(@as(usize, 1), pruning.removed_tables);
+            var snapshot = (try cache.snapshot(alloc, "unsampled")).?;
+            defer snapshot.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 42), snapshot.items[0].stats.doc_count);
+            try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.stale_table, try cache.publishGroup(gone, "gone", .{ .group_id = 1, .stats = .{} }));
+        }
+
+        test "runtime status paged catalog pruning rejects partial tokens and concurrent topology changes" {
+            const alloc = std.testing.allocator;
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            const token = try cache.capturePublicationToken("docs");
+            _ = try cache.publishGroup(token, "docs", .{ .group_id = 1, .stats = .{} });
+            var partial = try cache.captureCatalogToken(alloc, &.{"docs"}, false);
+            defer partial.deinit();
+            try std.testing.expectError(error.InvalidArgument, cache.pruneAbsentTables(&partial, &.{}));
+            var catalog = try cache.captureCatalogToken(alloc, &.{}, true);
+            defer catalog.deinit();
+            const fresh = try cache.capturePublicationToken("new");
+            _ = try cache.publishGroup(fresh, "new", .{ .group_id = 2, .stats = .{} });
+            // Ordinary publication intentionally does not advance topology.
+            // The uncaptured new table must nevertheless survive pruning.
+            var uncaptured = try cache.pruneAbsentTables(&catalog, &.{"docs"});
+            defer uncaptured.deinit();
+            try std.testing.expect(uncaptured.removals_deferred);
+            var new_snapshot = (try cache.snapshot(alloc, "new")).?;
+            defer new_snapshot.deinit(alloc);
+            var updated_catalog = try cache.captureCatalogToken(alloc, &.{}, true);
+            defer updated_catalog.deinit();
+            cache.invalidateTable("changed");
+            var pruning = try cache.pruneAbsentTables(&updated_catalog, &.{});
+            defer pruning.deinit();
+            try std.testing.expect(pruning.removals_deferred);
+            var snapshot = (try cache.snapshot(alloc, "docs")).?;
+            defer snapshot.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.items.len);
+        }
+
+        test "runtime status paged catalog pruning preserves a replaced epoch and retains retry debt" {
+            const alloc = std.testing.allocator;
+            var cache = TableRuntimeSnapshotCache.init(alloc);
+            defer cache.deinit();
+            _ = try cache.capturePublicationToken("docs");
+            var catalog = try cache.captureCatalogToken(alloc, &.{}, true);
+            defer catalog.deinit();
+            cache.invalidateTable("docs");
+            const fresh = try cache.capturePublicationToken("docs");
+            var pruning = try cache.pruneAbsentTables(&catalog, &.{});
+            defer pruning.deinit();
+            try std.testing.expect(pruning.removals_deferred);
+            try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try cache.publishGroup(fresh, "docs", .{ .group_id = 1, .stats = .{} }));
         }
 
         test "runtime status cache stable absence removal retires the old table epoch" {

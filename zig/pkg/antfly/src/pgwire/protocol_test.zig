@@ -53,6 +53,10 @@ const Mock = struct {
     saw_statement_unchanged: bool = false,
     entered: ?*std.Io.Event = null,
     blocked: bool = false,
+    consumer_active: bool = false,
+    consumer_deliveries: usize = 0,
+    consumer_polls: usize = 0,
+    consumer_cancel_at: usize = std.math.maxInt(usize),
     stream_rows: usize = 0,
     retain_stream_allocator: bool = false,
     retained_stream_allocator: ?std.mem.Allocator = null,
@@ -206,7 +210,7 @@ const Mock = struct {
     }
     fn releaseStreamPage(raw: *anyopaque) void {
         const self: *Mock = @ptrCast(@alignCast(raw));
-        std.debug.assert(self.stream_live_pages > 0);
+        std.debug.assert(self.stream_live_pages > 0 and !self.consumer_active);
         self.stream_live_pages -= 1;
     }
     fn streamCell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) !backend.Cell {
@@ -2661,5 +2665,53 @@ test "pgwire typed cells match column-aware materialized text and binary frames"
         defer a.free(failures);
         try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, failures, "D"));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, failures, "E"));
+    }
+}
+
+test "pgwire consumer held cursor materialization retires before page release and commit" {
+    const Delivery = struct {
+        fn checkpoint(raw: ?*anyopaque) !void {
+            const mock: *Mock = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(mock.consumer_active and mock.stream_live_pages == 1);
+            mock.consumer_polls += 1;
+            if (mock.consumer_polls == mock.consumer_cancel_at) return error.Cancelled;
+        }
+        fn run(raw: *anyopaque, _: backend.Identity, request: backend.Request, work: backend.DeliveryWork) !void {
+            const mock: *Mock = @ptrCast(@alignCast(raw));
+            try std.testing.expect(request.completion_drain);
+            try std.testing.expectEqualStrings("SELECT n FROM t", request.statement);
+            mock.consumer_deliveries += 1;
+            mock.consumer_active = true;
+            defer mock.consumer_active = false;
+            try work.run(work.context, .{ .ptr = mock, .checkpoint = checkpoint });
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{ "BEGIN\x00", "DECLARE rows SCROLL CURSOR WITH HOLD FOR SELECT n FROM t\x00", "COMMIT\x00" }) |statement| try frame(&input.writer, 'Q', statement);
+    try frame(&input.writer, 'X', "");
+    for ([_]bool{ false, true }) |cancel| {
+        var mock: Mock = .{ .stream_rows = 2, .stream_cells = true, .consumer_cancel_at = if (cancel) 12 else std.math.maxInt(usize) };
+        var source = mock.source();
+        var vtable = source.vtable.*;
+        vtable.deliver_row = Delivery.run;
+        source.vtable = &vtable;
+        var reader = std.Io.Reader.fixed(input.written());
+        var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer output.deinit();
+        {
+            var session: protocol.Session = .{ .alloc = std.testing.allocator, .io = std.testing.io, .source = source, .reader = &reader, .writer = &output.writer };
+            defer session.deinit();
+            try session.run();
+        }
+        try std.testing.expectEqual(@as(usize, 1), mock.consumer_deliveries);
+        try std.testing.expect(!mock.consumer_active);
+        try std.testing.expectEqual(@as(usize, 0), mock.stream_live_pages);
+        try std.testing.expectEqual(@as(usize, 1), mock.stream_closes);
+        try std.testing.expectEqual(@as(usize, if (cancel) 1 else 2), mock.executions);
+        const messages = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(messages);
+        try std.testing.expectEqual(@as(usize, @intFromBool(cancel)), std.mem.count(u8, messages, "E"));
     }
 }

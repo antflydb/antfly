@@ -1022,6 +1022,10 @@ fn installPublishedChildSchema(self: *DB, alloc: std.mem.Allocator, schema_json:
     return .{ .value = self.installPublishedChildSchema(alloc, schema_json, publication) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn enablePreparedTransactionProtocol(self: *DB) engine.Outcome(void) {
+    return .{ .value = self.enablePreparedTransactionProtocol() catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn beginTransactionWithIdAndParticipantsCreatedAtAndRole(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool) engine.Outcome(@import("transactions.zig").TxnId) {
     return .{ .value = self.beginTransactionWithIdAndParticipantsCreatedAtAndRole(txn_id, timestamp_ns, created_at_ns, participants, coordinator) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -2084,4 +2088,48 @@ comptime {
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
     @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v24", .visibility = .hidden });
+}
+
+// Admission-aware operations execute in the archive that owns the physical
+// reader and translate compilation-local errors before returning to callers.
+fn openDocumentReadSessionWithAdmission(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, control: ?@import("../common/read_admission.zig").Port) engine.Outcome(*DB.DocumentReadSession) {
+    return .{ .value = self.openDocumentReadSessionWithAdmission(alloc, from_key, to_key, opts, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn openRelationalReadSessionAtSnapshotWithAdmission(self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot, control: ?@import("../common/read_admission.zig").Port) engine.Outcome(*DB.RelationalReadSession) {
+    return .{ .value = self.openRelationalReadSessionAtSnapshotWithAdmission(alloc, from_key, to_key, opts, statement, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn tryStatementReadFenceWithAdmission(self: *DB, control: ?@import("../common/read_admission.zig").Port) engine.Outcome(?DB.StatementReadFence) {
+    return .{ .value = self.tryStatementReadFenceWithAdmission(control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn captureRelationalStatementSnapshotWithAdmission(self: *DB, original: ?@import("../common/read_admission.zig").Port) engine.Outcome(DB.RelationalStatementSnapshot) {
+    return .{ .value = self.captureRelationalStatementSnapshotWithAdmission(original) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn documentSessionNextWithAdmission(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, limit: u32, control: @import("../common/read_admission.zig").Port) engine.Outcome(@import("relational_read_view.zig").View.Page) {
+    return .{ .value = self.nextWithAdmission(alloc, limit, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn documentSessionRangeProofsWithAdmission(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, control: @import("../common/read_admission.zig").Port) engine.Outcome([]@import("range_protection.zig").Proof) {
+    return .{ .value = self.rangeProofsWithAdmission(alloc, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn documentSessionNormalizeRowsWithAdmission(self: *@import("db/document_rows.zig").Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite, control: @import("../common/read_admission.zig").Port) engine.Outcome([]types.BatchWrite) {
+    return .{ .value = self.normalizeRowsWithAdmission(alloc, writes, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn relationalSessionNextTypedPageWithAdmission(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget, control: @import("../common/read_admission.zig").Port) engine.Outcome(@import("db/relational_rows.zig").Page) {
+    var receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (io) |borrow| borrow.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
+    const received_io: ?std.Io = if (receiver) |*value| value.io() else null;
+    return .{ .value = session.nextTypedPageWithAdmission(alloc, received_io, budget, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn relationalSessionRangeProofsWithAdmission(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, control: @import("../common/read_admission.zig").Port) engine.Outcome([]@import("range_protection.zig").Proof) {
+    return .{ .value = session.rangeProofsWithAdmission(alloc, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn relationalSessionNormalizeRowsWithAdmission(session: *@import("db/relational_read_session.zig").Session, alloc: Allocator, writes: []const types.BatchWrite, control: @import("../common/read_admission.zig").Port) engine.Outcome([]types.BatchWrite) {
+    return .{ .value = session.normalizeRowsWithAdmission(alloc, writes, control) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

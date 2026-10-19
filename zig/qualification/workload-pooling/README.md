@@ -224,6 +224,25 @@ limits still apply. Same-binary comparisons reject any undeclared admission or
 memory change. The server build and compiler qualification stay outside the
 measurement container.
 
+Phase receipts also include `runnable_diagnostics.service`: versioned active
+execution-lease wall slot-time deltas for query general, write, inference,
+background, query bounded and query analytical. Estimates, observations,
+unobserved estimates, refunds, debt payments and clipped corrections are separate
+counter arrays; debt and rebate are end-of-phase gauges. The probe rejects
+counter resets, malformed classes, unsupported contracts, changing availability
+or quantum, and corrections outside the scheduler's 64-quantum bound. Older
+snapshots without service telemetry report `available: false`, without fabricated
+zero observations. A phase may declare `runnable_observed_slot_ns_min` before a
+run to require measured service; estimates and grants cannot satisfy that gate.
+`linux-runnable-pressure.json` now requires at least one observed slot-nanosecond
+in every runnable phase. The comparison also reconstructs service deltas from
+both workload snapshots and rejects missing, invalid or inconsistent diagnostics,
+even if the receipt's outer `passed` flag is true. This gate is declared before
+new measurements; historical receipts without observations cannot satisfy it.
+These observations do not establish thread CPU utilization, complete operator
+coverage, or fair service shares. Existing latency, throughput and resource
+thresholds remain unchanged.
+
 This profile has not yet passed a current-source runtime matrix. It does not
 complete the concurrency sweep, inference/background fairness, distributed
 progress, durability, or automatic sizing gates. Runtime receipts are required

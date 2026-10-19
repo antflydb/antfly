@@ -30,6 +30,34 @@ pub const Context = struct {
     authority: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
     execution: ?*@import("../../common/runnable_scheduler.zig").Execution = null,
     wait: ?@import("../../sql/execution_wait.zig").Boundary = null,
+    /// A synchronous physical object-provider operation. Encoding, decoding and
+    /// authority validation stay outside this borrow. Failed CPU return discards
+    /// owned provider output without reacquiring another execution grant.
+    pub fn objectCall(self: Context, comptime operation: anytype, args: anytype, alloc: Allocator) anyerror!@typeInfo(@typeInfo(@TypeOf(operation)).@"fn".return_type.?).error_union.payload {
+        try self.ensureActive();
+        if (self.wait) |wait| try wait.begin(wait.ptr);
+        const result = @call(.auto, operation, args);
+        if (self.wait) |wait| wait.end(wait.ptr) catch |err| {
+            if (result) |value| discardObjectResult(value, alloc) else |_| {}
+            try self.checkLifetime();
+            return err;
+        };
+        const value = result catch |err| {
+            // Even absence/error results require current CPU and authority.
+            // A missing WAL/pin object cannot bypass a resumed policy fence.
+            try self.ensureActive();
+            return err;
+        };
+        errdefer discardObjectResult(value, alloc);
+        try self.ensureActive();
+        return value;
+    }
+    fn discardObjectResult(value: anytype, alloc: Allocator) void {
+        if (@TypeOf(value) != void) {
+            var owned = value;
+            owned.deinit(alloc);
+        }
+    }
     pub fn withExecution(self: Context, execution: *@import("../../common/runnable_scheduler.zig").Execution) Context {
         var child = self;
         child.execution = execution;

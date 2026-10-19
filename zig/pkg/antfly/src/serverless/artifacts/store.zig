@@ -41,7 +41,7 @@ pub fn chargeReadBudget(remaining: *u64, amount: u64) !void {
 }
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const ReadContext = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
+pub const ReadContext = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 const execution_wait = @import("antfly_local_sources").sql_execution_wait;
 
 pub const sha256_checksum_len: usize = std.crypto.hash.sha2.Sha256.digest_length * 2;
@@ -403,7 +403,7 @@ pub const ArtifactStore = struct {
 
         if (self.vtable.get_bounded_alloc_with_cancellation != null) {
             const payload = execution_wait.runOwned(context.wait, ArtifactStore.getBoundedAlloc, .{ self, result_alloc, artifact_id, expected_len, token }, discardPayload, .{result_alloc}) catch |err| {
-                try context.ensureActive();
+                try context.checkLifetime();
                 return err;
             };
             errdefer result_alloc.free(payload);
@@ -415,7 +415,7 @@ pub const ArtifactStore = struct {
 
         {
             var metadata = execution_wait.runOwned(context.wait, ArtifactStore.statWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, token }, discardMetadata, .{result_alloc}) catch |err| {
-                try context.ensureActive();
+                try context.checkLifetime();
                 return err;
             };
             defer metadata.deinit(result_alloc);
@@ -437,7 +437,7 @@ pub const ArtifactStore = struct {
         }
 
         const payload = execution_wait.runOwned(context.wait, ArtifactStore.getRangeAllocWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, @as(u64, 0), expected_len, token }, discardPayload, .{result_alloc}) catch |err| {
-            try context.ensureActive();
+            try context.checkLifetime();
             return err;
         };
         errdefer result_alloc.free(payload);
@@ -480,7 +480,7 @@ pub const ArtifactStore = struct {
         try cancellation.check();
         const lifetime: ReadCancellation = .{ .context = context, .parent = cancellation };
         const payload = execution_wait.runOwned(context.wait, ArtifactStore.getRangeAllocWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, offset, len, lifetime.token() }, discardPayload, .{result_alloc}) catch |err| {
-            try context.ensureActive();
+            try context.checkLifetime();
             try cancellation.check();
             return err;
         };
@@ -729,7 +729,7 @@ pub fn validatePayloadSha256WithCancellation(
     return validatePayloadSha256For(payload, expected_checksum, cancellation, .{});
 }
 
-fn validatePayloadSha256For(payload: []const u8, expected_checksum: []const u8, cancellation: CancellationToken, context: ReadContext) !void {
+pub fn validatePayloadSha256For(payload: []const u8, expected_checksum: []const u8, cancellation: CancellationToken, context: ReadContext) !void {
     try context.ensureActive();
     validateSha256Checksum(expected_checksum) catch return error.ArtifactIntegrityMismatch;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});

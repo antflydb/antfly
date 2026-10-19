@@ -286,7 +286,12 @@ fn publicQuerySuccessResponse(
     alloc: std.mem.Allocator,
     query_response: query_api.QueryResponse,
 ) !contextual_operations.OwnedResponse {
-    var response = contextual_operations.json(query_response.json, false);
+    var owned = query_response;
+    defer if (owned.retirement != null) owned.deinit(alloc);
+    // This older public response contract carries bytes only. Its caller owns
+    // alloc independently of the source snapshot/response owner being retired.
+    const body = if (owned.retirement != null) try alloc.dupe(u8, owned.json) else owned.json;
+    var response = contextual_operations.json(body, false);
     errdefer response.deinit(alloc);
     if (query_response.graph_dialect == .legacy) {
         try markLegacyGraphSearchResponse(alloc, &response);
@@ -1634,6 +1639,12 @@ pub const WorkloadPolicyRequest = struct {
     suspended: ?bool = null,
 };
 
+pub const RemoteAttemptControl = struct {
+    registry: *@import("../common/remote_worker.zig").Registry,
+    signer: *const @import("../common/remote_attempt_reply.zig").Signer,
+    maximum_duration_ns: u64 = 5 * std.time.ns_per_s,
+};
+
 pub const ApiHttpServerConfig = struct {
     /// Node-local personal connection owner; never populated by distributed configuration.
     chatgpt: ?*@import("antfly_local_sources").chatgpt_manager.Manager = null,
@@ -1698,6 +1709,12 @@ pub const ApiHttpServerConfig = struct {
     /// both values before opening a listener; they must never share the public
     /// trusted-principal signing domain.
     internal_service_secret: ?[]const u8 = null,
+    /// Borrowed stable owners. The node must establish durable root identity,
+    /// pinned key enrollment and external recovery before publishing this service;
+    /// then join all requests before destroying these owners.
+    remote_attempt_control: ?RemoteAttemptControl = null,
+    /// Trusted runtime rollout policy, never public request metadata.
+    remote_read_capabilities: @import("../common/remote_read_capabilities.zig").Families = .{},
     /// Optional overlap key used only while rotating the node-to-node signing
     /// credential. Outbound requests are always signed by
     /// internal_service_secret; inbound requests accept either key.
@@ -2209,7 +2226,11 @@ pub const StatusSource = struct {
 
     pub fn getBackupCohort(self: StatusSource, alloc: std.mem.Allocator, job_id: u64, request: api_operation.RequestContext) !?[]u8 {
         const callback = self.vtable.get_backup_cohort orelse return error.UnsupportedOperation;
-        return BoundaryAbi.call("get_backup_cohort", self.boundary_dispatch, callback, .{ self.ptr, alloc, job_id, request });
+        try request.ensureExecutionActive();
+        const result = try BoundaryAbi.call("get_backup_cohort", self.boundary_dispatch, callback, .{ self.ptr, alloc, job_id, request });
+        errdefer if (result) |bytes| alloc.free(bytes);
+        try request.ensureExecutionActive();
+        return result;
     }
 
     pub fn listBackupCohorts(self: StatusSource, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: api_operation.RequestContext) ![]@import("antfly_local_sources").storage_docstore.OwnedKVPair {
@@ -2224,24 +2245,39 @@ pub const StatusSource = struct {
 
     pub fn getRestoreStaging(self: StatusSource, alloc: std.mem.Allocator, id: [16]u8, request: api_operation.RequestContext) !?[]u8 {
         const callback = self.vtable.get_restore_staging orelse return error.UnsupportedOperation;
-        return BoundaryAbi.call("get_restore_staging", self.boundary_dispatch, callback, .{ self.ptr, alloc, id, request });
+        try request.ensureExecutionActive();
+        const result = try BoundaryAbi.call("get_restore_staging", self.boundary_dispatch, callback, .{ self.ptr, alloc, id, request });
+        errdefer if (result) |bytes| alloc.free(bytes);
+        try request.ensureExecutionActive();
+        return result;
     }
 
     /// One leader read-index capture binds the immutable plan and its current
     /// activation revision. Separate job/progress calls are not an authority.
     pub fn getRestoreStagingAuthority(self: StatusSource, alloc: std.mem.Allocator, input: @import("../metadata/restore_staging.zig").AuthorityRequest, request: api_operation.RequestContext) !@import("../metadata/restore_staging.zig").AuthorityResponse {
         const callback = self.vtable.get_restore_staging_authority orelse return error.UnsupportedOperation;
-        return BoundaryAbi.call("get_restore_staging_authority", self.boundary_dispatch, callback, .{ self.ptr, alloc, input, request });
+        try request.ensureExecutionActive();
+        var result = try BoundaryAbi.call("get_restore_staging_authority", self.boundary_dispatch, callback, .{ self.ptr, alloc, input, request });
+        errdefer result.deinit(alloc);
+        try request.ensureExecutionActive();
+        return result;
     }
 
     pub fn getRestoreStagingProgress(self: StatusSource, alloc: std.mem.Allocator, id: [16]u8, request: api_operation.RequestContext) !?@import("../metadata/restore_staging.zig").Progress {
         const callback = self.vtable.get_restore_staging_progress orelse return error.UnsupportedOperation;
-        return BoundaryAbi.call("get_restore_staging_progress", self.boundary_dispatch, callback, .{ self.ptr, alloc, id, request });
+        try request.ensureExecutionActive();
+        const result = try BoundaryAbi.call("get_restore_staging_progress", self.boundary_dispatch, callback, .{ self.ptr, alloc, id, request });
+        try request.ensureExecutionActive();
+        return result;
     }
 
     pub fn getRestoreStagingReceipt(self: StatusSource, alloc: std.mem.Allocator, id: [16]u8, state: @import("../metadata/restore_staging.zig").State, owner_group: u64, request: api_operation.RequestContext) !?[]u8 {
         const callback = self.vtable.get_restore_staging_receipt orelse return error.UnsupportedOperation;
-        return BoundaryAbi.call("get_restore_staging_receipt", self.boundary_dispatch, callback, .{ self.ptr, alloc, id, state, owner_group, request });
+        try request.ensureExecutionActive();
+        const result = try BoundaryAbi.call("get_restore_staging_receipt", self.boundary_dispatch, callback, .{ self.ptr, alloc, id, state, owner_group, request });
+        errdefer if (result) |bytes| alloc.free(bytes);
+        try request.ensureExecutionActive();
+        return result;
     }
 
     /// Returns the authoritative resulting job; callers must verify their
@@ -3570,6 +3606,12 @@ pub const ApiHttpServer = struct {
         return if (self.request_memory) |memory| memory.allocator(true) else self.alloc;
     }
 
+    /// Only stable node cleanup/recovery consumers receive this view. Request
+    /// controls and their per-operation remote bindings cannot spend its floor.
+    fn cleanupAllocator(self: *ApiHttpServer) std.mem.Allocator {
+        return if (self.request_memory) |memory| memory.cleanupAllocator() else self.alloc;
+    }
+
     /// Lazily started only at the stable server address. HTTP ingress must be
     /// drained before server destruction, as for the other request owners.
     pub fn retainedReadRuntime(self: *ApiHttpServer) !*@import("retained_read_owner.zig").Runtime {
@@ -3580,7 +3622,7 @@ pub const ApiHttpServer = struct {
         var nonce: [16]u8 = undefined;
         try io.randomSecure(&nonce);
         const incarnation = std.mem.readInt(u128, &nonce, .little);
-        const runtime = try @import("retained_read_owner.zig").Runtime.create(self.alloc, io, if (incarnation == 0) 1 else incarnation, 1024, 256, 30 * std.time.ns_per_s);
+        const runtime = try @import("retained_read_owner.zig").Runtime.create(self.state_alloc, io, if (incarnation == 0) 1 else incarnation, 1024, 256, 30 * std.time.ns_per_s);
         self.retained_read_runtime = runtime;
         return runtime;
     }
@@ -3934,6 +3976,7 @@ pub const ApiHttpServer = struct {
     state_alloc: std.mem.Allocator,
     state_memory: ?*@import("../common/allocation_budget.zig").Shared = null,
     request_memory: ?*RequestMemory = null,
+    read_memory: ?*@import("../common/read_memory.zig").Pool = null,
     control_memory_reserved: usize = 0,
     transport_memory: ?*@import("../common/allocation_budget.zig").Shared = null,
     parser_memory: ?*@import("../common/allocation_budget.zig").Shared = null,
@@ -3945,13 +3988,25 @@ pub const ApiHttpServer = struct {
     sql_preparation_admission: RequestAdmission,
     sql_control_preparation: RequestAdmission = RequestAdmission.init(4),
     sql_control_admission: RequestAdmission = RequestAdmission.init(4),
+    // One observer may occupy protected admission; retirement keeps its floor.
+    remote_capability_admission: RequestAdmission = RequestAdmission.init(1),
     sql_control_workers: ?@import("sql_worker_lease.zig").Lease = null,
+    sql_bounded_read_workers: ?@import("sql_worker_lease.zig").Lease = null,
     sql_cleanup_workers: ?@import("sql_worker_lease.zig").Lease = null,
     sql_cleanup_reaper_workers: ?@import("sql_worker_lease.zig").Lease = null,
     sql_cleanup_runtime: ?*@import("runnable_cleanup_owner.zig").Runtime = null,
     sql_cleanup_closing: bool = false,
     resource_cleanup_runtime: ?*@import("resource_manager_cleanup.zig").Runtime = null,
     resource_cleanup_workers: ?@import("sql_worker_lease.zig").Lease = null,
+    remote_reconciliation: ?*@import("remote_reconciliation.zig").Runtime = null,
+    remote_reconciliation_workers: ?@import("sql_worker_lease.zig").Lease = null,
+    remote_reconciliation_node: ?*RunnableScheduler.NodeOwner = null,
+    read_retirement_runtime: ?*@import("retained_read_retirement.zig").Runtime = null,
+    read_retirement_workers: ?@import("sql_worker_lease.zig").Lease = null,
+    read_retirement_node: ?*RunnableScheduler.NodeOwner = null,
+    read_retirement_closing: bool = false,
+
+    owned_remote_attempts: std.atomic.Value(?*@import("remote_attempt_owner.zig").State) = .init(null),
     sql_workers_mutex: std.atomic.Mutex = .unlocked,
     sql_workers: ?@import("sql_worker_lease.zig").Lease = null,
     sql_workers_closing: bool = false,
@@ -4441,9 +4496,25 @@ pub const ApiHttpServer = struct {
         transport_reserved_bytes: usize,
         foreground: ?@import("../common/allocation_budget.zig").Shared.Stats,
         control: ?@import("../common/allocation_budget.zig").Shared.Stats,
+        cleanup: ?@import("../common/allocation_budget.zig").Shared.Stats,
         retained: ?@import("../common/allocation_budget.zig").Shared.Stats,
         transport: ?@import("../common/allocation_budget.zig").Shared.Stats,
         parser: ?@import("../common/allocation_budget.zig").Shared.Stats,
+        read_reserved_bytes: usize = 0,
+        read: ?@import("../common/read_memory.zig").Pool.Stats = null,
+
+        /// The existing three-part kernel ABI reports all prepaid control
+        /// storage together. Peak is a conservative sum of partition peaks.
+        pub fn controlWithCleanup(self: @This()) ?@import("../common/allocation_budget.zig").Shared.Stats {
+            var combined = self.control orelse return self.cleanup;
+            if (self.cleanup) |cleanup| {
+                combined.limit_bytes += cleanup.limit_bytes;
+                combined.used_bytes += cleanup.used_bytes;
+                combined.peak_bytes += cleanup.peak_bytes;
+                combined.rejected_total +|= cleanup.rejected_total;
+            }
+            return combined;
+        }
     };
 
     pub fn workloadMemoryStats(self: *const ApiHttpServer) WorkloadMemoryStats {
@@ -4453,10 +4524,33 @@ pub const ApiHttpServer = struct {
             .transport_reserved_bytes = self.transport_memory_reserved,
             .foreground = if (self.request_memory) |m| m.foreground.stats() else null,
             .control = if (self.request_memory) |m| m.control.stats() else null,
+            .cleanup = if (self.request_memory) |m| if (m.cleanup) |*cleanup| cleanup.stats() else null else null,
             .retained = if (self.state_memory) |m| m.stats() else null,
             .transport = if (self.transport_memory) |m| m.stats() else null,
             .parser = if (self.parser_memory) |m| m.stats() else null,
+            .read_reserved_bytes = if (self.read_memory) |m| m.pinned else 0,
+            .read = if (self.read_memory) |m| m.stats() else null,
         };
+    }
+
+    pub fn readMemoryStats(self: *const ApiHttpServer) @import("antfly_runtime_abi").ReadMemoryStats {
+        const pool = self.read_memory orelse return .{};
+        const observed = pool.stats();
+        return .{
+            .enabled = true,
+            .reserved_bytes = pool.pinned,
+            .capacity_bytes = pool.limits.bytes,
+            .group_capacity = pool.limits.groups,
+            .used_bytes = observed.used,
+            .groups = observed.groups,
+            .transition_reserved_bytes = observed.transition_reserved_bytes,
+            .transition_reserved_groups = observed.transition_reserved_groups,
+            .rejected = observed.rejected,
+        };
+    }
+
+    pub fn readMemoryPool(self: *ApiHttpServer) ?*@import("../common/read_memory.zig").Pool {
+        return self.read_memory;
     }
 
     pub fn queryAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
@@ -4486,6 +4580,19 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    /// Preparation and execution share one retained runnable request. Coarse
+    /// admission waits hold no CPU; failure to resume retires an acquired lease.
+    pub fn acquireSqlExecutionUnderRunnable(self: *ApiHttpServer, execution: *RunnableScheduler.Execution, write: bool, protected: bool, options: @import("antfly_local_sources").common_bounded_admission.Options) !RequestAdmission.Lease {
+        const Acquire = struct {
+            fn run(server: *ApiHttpServer, is_write: bool, is_protected: bool, original: @import("antfly_local_sources").common_bounded_admission.Options) !RequestAdmission.Lease {
+                try original.check();
+                return if (is_protected) server.acquireSqlControl() else server.acquireSqlExecutionWithOptions(is_write, original);
+            }
+        };
+        try options.check();
+        return execution.acquirePhaseLease(if (protected) .control else if (write) .write else .query, Acquire.run, .{ self, write, protected, options });
+    }
+
     pub fn acquireSqlControl(self: *ApiHttpServer) !RequestAdmission.Lease {
         return self.sql_control_admission.tryAcquireLease() orelse error.SqlWriteCapacityUnavailable;
     }
@@ -4509,11 +4616,297 @@ pub const ApiHttpServer = struct {
         defer self.sql_workers_mutex.unlock();
         if (self.sql_workers_closing or self.sql_cleanup_closing) return error.ManagerCleanupCapacityUnavailable;
         if (self.resource_cleanup_runtime != null) return;
-        var workers = try self.acquireSqlWorkers(1);
+        var workers = try self.acquireCleanupWorkers();
         errdefer workers.release();
-        const worker = try @import("resource_manager_cleanup.zig").Runtime.create(self.state_alloc, workers.io(), manager, scheduler);
+        const worker = try @import("resource_manager_cleanup.zig").Runtime.create(self.cleanupAllocator(), workers.io(), manager, scheduler);
         self.resource_cleanup_workers = workers;
         self.resource_cleanup_runtime = worker;
+    }
+
+    /// Serialized node bootstrap. Atomic publication also permits installation
+    /// after authoritative enrollment while control listeners are up. The descriptor
+    /// is copied; only this kernel constructs and owns protocol state. Reads
+    /// and external recovery remain closed until their physical owners exist.
+    pub fn bootstrapRemoteAttempts(self: *ApiHttpServer, config: @import("remote_attempt_owner.zig").Bootstrap) !void {
+        const owner_mod = @import("remote_attempt_owner.zig");
+        const reply_mod = @import("../common/remote_attempt_reply.zig");
+        try config.validate();
+        if (self.owned_remote_attempts.load(.acquire) != null or self.cfg.remote_attempt_control != null or self.remote_reconciliation != null or self.read_retirement_runtime != null or self.read_retirement_closing) return error.InvalidArgument;
+        const retirement = @import("retained_read_retirement.zig");
+        const sender_policy: retirement.Policy = .{};
+        const scheduler = self.runnableScheduler() orelse return error.CleanupCapacityUnavailable;
+        const publication = @import("remote_capability_publication.zig").Cache;
+        try retirement.validateNodeCapacity(scheduler.policyAndStats().config, sender_policy, try std.math.add(u64, try owner_mod.State.reservationBytes(config), try std.math.add(u64, try publication.reservationBytes(config.targets.len), try std.math.add(u64, try @import("remote_endpoint_view.zig").View.reservationBytes(config.targets), try @import("remote_endpoint_source.zig").Source.reservationBytes(config.targets.len)))));
+        try internal_service_auth.validateRuntimeConfig(self.cfg.internal_service_secret, self.cfg.internal_service_verification_secret, self.cfg.internal_service_issuer);
+        const io = configuredDurableIo(self.cfg) orelse return error.Unavailable;
+        const allocator = self.controlAllocator();
+        const request: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| (5 * std.time.ns_per_s) };
+        if (self.source.vtable.free_admin_snapshot == null) return error.RemoteMembershipUnavailable;
+        var snapshot = (try self.source.linearizableSnapshot(request)) orelse return error.RemoteMembershipUnavailable;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        try request.ensureActive();
+        const authority = try reply_mod.Authority.fromSnapshot(snapshot, config.local);
+        const authorities = try allocator.alloc(reply_mod.Authority, config.targets.len);
+        defer allocator.free(authorities);
+        for (authorities, config.targets) |*resolved, target| resolved.* = try reply_mod.Authority.fromSnapshot(snapshot, target.local);
+        const signing = try @import("antfly_local_sources").storage_db_root_signing_identity.load(allocator, io, config.root_path);
+        try request.ensureActive();
+        const initialization_mod = @import("remote_initialization.zig");
+        const Catalog = struct {
+            fn invoke(raw: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../metadata/remote_attempt_initialization.zig").Request) ![]u8 {
+                const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
+                return server.source.systemCatalog(alloc, context, .{ .remote_attempt_initialization = input });
+            }
+        };
+        var candidate: [32]u8 = undefined;
+        while (true) {
+            try io.randomSecure(&candidate);
+            if (!std.mem.allEqual(u8, &candidate, 0)) break;
+        }
+        var initialization: initialization_mod.Driver = .{
+            .allocator = allocator,
+            .context = self,
+            .call = Catalog.invoke,
+            .request = request,
+            .identity = .{ .metadata_incarnation = config.local.metadata_incarnation, .node_id = config.local.node_id, .store_id = config.local.store_id, .root_incarnation = config.local.root_incarnation, .public_key = signing.public_key },
+            .reporter = config.local.reporter_incarnation,
+            .seed = signing.seed,
+            .candidate = candidate,
+        };
+        const state = try owner_mod.State.create(allocator, self.alloc, io, config, signing, authority, authorities, .{ .authority = initialization.authority(), .activate = initialization_mod.Driver.activate, .scheduler = scheduler });
+        errdefer state.destroy();
+        state.capabilities = try publication.create(allocator, scheduler, authorities, platform_time.monotonicNs);
+        state.endpoint_view.capabilities = state.capabilities;
+        state.endpoint_source = try @import("remote_endpoint_source.zig").Source.create(allocator, scheduler, state.endpoint_view);
+        state.capabilities.?.shared_activation = &state.endpoint_source.?.enabled;
+        // A restart must not reopen legacy dispatch while discovery is empty
+        // if this exact journal has ever published an owned obligation.
+        try state.capabilities.?.restorePublishedHistory(try state.store.initializationState());
+        try self.startRemoteReconciliation(state.client(self.alloc, .{ .secret = self.cfg.internal_service_secret.?, .issuer = self.cfg.internal_service_issuer.? }), config.reconciliation);
+        errdefer self.stopRemoteReconciliation();
+        // No request can borrow this sender before the final state publication.
+        // Failure rolls back reconciliation before destroying its borrowed state.
+        try self.startReadRetirementWithControlAdmission(sender_policy.capacity, sender_policy.bytes, sender_policy.item_bytes, state.control_admission);
+        self.owned_remote_attempts.store(state, .release);
+    }
+    /// Refresh only endpoint/process profiles for durably enrolled destinations.
+    /// Stable root indices and unresolved physical obligations never change here.
+    pub fn refreshRemoteAttemptPeers(self: *ApiHttpServer) !void {
+        const scheduler = self.runnableScheduler() orelse return error.Unavailable;
+        const io = try self.sqlControlIo();
+        const deadline = platform_time.monotonicNs() +| (250 * std.time.ns_per_ms);
+        var execution: RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        try execution.startCleanupRoot(scheduler, .{ .io = io, .native_now_ns = platform_time.monotonicNs, .deadline_ns = deadline, .retained_bytes = 64 * 1024, .allow_wait = false });
+        var adapter: @import("runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = self.controlAllocator() };
+        var team = try adapter.team();
+        const request: api_operation.RequestContext = .{ .deadline_ns = deadline, .execution_team = &team };
+        return @call(.never_inline, refreshRemoteAttemptPeersUnder, .{ self, request });
+    }
+    fn refreshRemoteAttemptPeersUnder(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
+        const state = self.owned_remote_attempts.load(.acquire) orelse return error.Unavailable;
+        const source = state.endpoint_source orelse return error.Unavailable;
+        var current = try source.current();
+        defer current.release();
+        const old_view = current.view();
+        // A failed authority refresh cannot reopen legacy dispatch or retain a
+        // stale positive capability for admission of new remote work.
+        errdefer if (old_view.capabilities) |cache| {
+            for (old_view.targets, 0..) |target, index| cache.invalidate(index, target.authority) catch {};
+        };
+        try request.ensureExecutionActive();
+        if (self.source.vtable.free_admin_snapshot == null) return error.RemoteMembershipUnavailable;
+        var snapshot = (try self.source.linearizableSnapshot(request)) orelse return error.RemoteMembershipUnavailable;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        try request.ensureActive();
+        if (snapshot.peer_view or snapshot.planning_view) return error.RemoteMembershipUnavailable;
+        const realm = snapshot.status.metadata_incarnation orelse return error.RemoteMembershipUnavailable;
+        if (!std.mem.eql(u8, &realm, &state.registry.local.metadata_incarnation)) return error.RemoteMembershipChanged;
+        const owner_mod = @import("remote_attempt_owner.zig");
+        const reply_mod = @import("../common/remote_attempt_reply.zig");
+        var descriptors: [256]owner_mod.Target = undefined;
+        var authorities: [256]reply_mod.Authority = undefined;
+        var observed: [256]bool = @splat(false);
+        var changed = false;
+        for (old_view.targets, 0..) |old, index| {
+            try request.ensureExecutionActive();
+            var descriptor: owner_mod.Target = .{ .local = old.authority.local, .base_uri = old.base_uri, .available = false, .max_attempts = state.destinations[index].max_attempts, .max_bytes = state.destinations[index].max_bytes };
+            var authority = old.authority;
+            var seen = false;
+            for (snapshot.stores) |store| {
+                if (store.store_id != old.authority.local.store_id) continue;
+                if (seen) return error.InvalidRemoteMembership;
+                seen = true;
+                if (store.node_id != old.authority.local.node_id or store.replica_root_incarnation != old.authority.local.root_incarnation or store.reporter_incarnation == 0 or store.api_url.len == 0) continue;
+                descriptor.local.reporter_incarnation = store.reporter_incarnation;
+                descriptor.base_uri = store.api_url;
+                authority = try reply_mod.Authority.fromSnapshot(snapshot, descriptor.local);
+                if (!std.mem.eql(u8, &authority.public_key, &old.authority.public_key)) return error.InvalidRemoteMembership;
+                observed[index] = true;
+                var active_node = false;
+                for (snapshot.nodes) |node| if (node.node_id == descriptor.local.node_id) {
+                    active_node = std.mem.eql(u8, node.lifecycle, "active");
+                };
+                descriptor.available = store.live and !store.drain_requested and active_node;
+            }
+            descriptors[index] = descriptor;
+            authorities[index] = authority;
+            changed = changed or !std.mem.eql(u8, old.base_uri, descriptor.base_uri) or !std.meta.eql(old.authority, authority) or old.available != descriptor.available;
+        }
+        // Reuse bootstrap's complete endpoint validation without reopening any
+        // journal. Missing known roots remain unavailable; new roots require a
+        // separate durable append and cannot be silently assigned old indices.
+        const config: owner_mod.Bootstrap = .{ .root_path = "/", .local = state.registry.local, .targets = descriptors[0..old_view.targets.len], .max_outbound_attempts = state.slots.len, .max_outbound_bytes = state.ledger.max_bytes };
+        try config.validate();
+        try request.ensureActive();
+        const revision = try source.acceptSnapshot(current.revision, config.targets, authorities[0..config.targets.len], observed[0..config.targets.len]);
+        if (!changed) return;
+        const view = try @import("remote_endpoint_view.zig").View.create(state.allocator, source.scheduler, config.targets, authorities[0..config.targets.len]);
+        defer view.release();
+        view.capabilities = try @import("remote_capability_publication.zig").Cache.create(state.allocator, source.scheduler, authorities[0..config.targets.len], platform_time.monotonicNs);
+        view.capabilities.?.shared_activation = &source.enabled;
+        try request.ensureActive();
+        try source.publish(revision, view);
+    }
+
+    pub fn remoteQueryClient(self: *ApiHttpServer, allocator: std.mem.Allocator) ?@import("remote_attempt_client.zig").Client {
+        const state = self.owned_remote_attempts.load(.acquire) orelse return null;
+        var activated = self.cfg.remote_read_capabilities.group_query;
+        for (state.targets) |target| activated = activated or target.owned_reads_v1;
+        if (state.capabilities) |cache| activated = activated or cache.everEnabled(false);
+        if (!activated) return null;
+        return state.client(allocator, .{ .secret = self.cfg.internal_service_secret orelse return null, .issuer = self.cfg.internal_service_issuer orelse return null });
+    }
+    /// Stable node allocation and transports; never copy a query arena into
+    /// a descriptor that can outlive the foreground statement.
+    pub fn remoteRetainedReadClient(self: *ApiHttpServer) ?@import("remote_attempt_client.zig").Client {
+        const state = self.owned_remote_attempts.load(.acquire) orelse return null;
+        var activated = self.cfg.remote_read_capabilities.retained_read;
+        for (state.targets) |target| activated = activated or target.owned_retained_reads_v1;
+        if (state.capabilities) |cache| activated = activated or cache.everEnabled(true);
+        if (!activated) return null;
+        return state.client(self.alloc, .{ .secret = self.cfg.internal_service_secret orelse return null, .issuer = self.cfg.internal_service_issuer orelse return null });
+    }
+    pub fn remoteAttemptControl(self: *ApiHttpServer) ?RemoteAttemptControl {
+        if (self.owned_remote_attempts.load(.acquire)) |state| return .{ .registry = &state.registry, .signer = &state.signer };
+        return self.cfg.remote_attempt_control;
+    }
+    pub fn remoteAttemptOwnerStats(self: *ApiHttpServer) !@import("remote_attempt_owner.zig").Stats {
+        return if (self.owned_remote_attempts.load(.acquire)) |state| state.stats() else .{};
+    }
+
+    /// Trusted API-kernel bootstrap only, before request publication. All
+    /// client borrows must outlive this API; deinit joins before releasing its
+    /// accounted control allocator and independently reserved physical worker.
+    pub fn startRemoteReconciliation(self: *ApiHttpServer, client: @import("remote_attempt_client.zig").Client, policy: @import("remote_reconciliation.zig").Policy) !void {
+        const scheduler = self.runnableScheduler() orelse return error.InvalidArgument;
+        try policy.validate();
+        // Establish ordinary protected control capacity before this independent
+        // consumer reserves a worker; reconciliation must not consume its lane.
+        _ = try self.sqlControlIo();
+        platform_sync.lockYielding(&self.sql_workers_mutex);
+        defer self.sql_workers_mutex.unlock();
+        if (self.sql_workers_closing or self.remote_reconciliation != null) return error.InvalidRunnableTransition;
+        if (self.read_retirement_runtime != null and @min(@as(usize, 4), scheduler.config.max_operations / 2) < 3) return error.InvalidArgument;
+        var workers = try self.acquireCleanupWorkers();
+        errdefer workers.release();
+        const node = self.runnable_owner;
+        if (node) |owner| try owner.retain();
+        errdefer if (node) |owner| owner.release();
+        var scoped = client;
+        scoped.control_allocator = self.cleanupAllocator();
+        const runtime = try @import("remote_reconciliation.zig").Runtime.create(self.cleanupAllocator(), workers.io(), scheduler, scoped, policy);
+        self.remote_reconciliation_workers = workers;
+        self.remote_reconciliation_node = node;
+        self.remote_reconciliation = runtime;
+    }
+    /// Trusted node bootstrap, at the stable API address. Bounds are fixed
+    /// before publication; the physical worker is exclusive of foreground SQL
+    /// and the ordinary control lane. Failure exposes no runtime or binding.
+    pub fn startReadRetirement(self: *ApiHttpServer, capacity: usize, bytes: usize, item_bytes: usize) !void {
+        return self.startReadRetirementWithControlAdmission(capacity, bytes, item_bytes, null);
+    }
+    fn startReadRetirementWithControlAdmission(self: *ApiHttpServer, capacity: usize, bytes: usize, item_bytes: usize, gate: ?*@import("remote_control_admission.zig").Gate) !void {
+        const scheduler = self.runnableScheduler() orelse return error.InvalidArgument;
+        _ = try self.sqlControlIo();
+        platform_sync.lockYielding(&self.sql_workers_mutex);
+        defer self.sql_workers_mutex.unlock();
+        if (self.sql_workers_closing or self.read_retirement_closing or self.read_retirement_runtime != null) return error.InvalidRunnableTransition;
+        if (self.remote_reconciliation != null and @min(@as(usize, 4), scheduler.config.max_operations / 2) < 3) return error.InvalidArgument;
+        var workers = try self.acquireCleanupWorkers();
+        errdefer workers.release();
+        const node = self.runnable_owner;
+        if (node) |owner| try owner.retain();
+        errdefer if (node) |owner| owner.release();
+        const runtime = try @import("retained_read_retirement.zig").Runtime.createWithControlAdmission(self.cleanupAllocator(), workers.io(), scheduler, capacity, bytes, item_bytes, gate);
+        self.read_retirement_workers = workers;
+        self.read_retirement_node = node;
+        self.read_retirement_runtime = runtime;
+    }
+
+    /// The caller already owns the complete request/allocator/node parent.
+    /// All such borrowers must be physically joined before final runtime join.
+    pub fn readRetirementBinding(self: *ApiHttpServer, parent: @import("retained_read_retirement.zig").Parent) !@import("retained_read_retirement.zig").Binding {
+        platform_sync.lockYielding(&self.sql_workers_mutex);
+        defer self.sql_workers_mutex.unlock();
+        if (self.sql_workers_closing or self.read_retirement_closing) return error.CleanupCapacityUnavailable;
+        const runtime = self.read_retirement_runtime orelse return error.CleanupCapacityUnavailable;
+        return runtime.binding(parent);
+    }
+
+    pub fn closeReadRetirementAdmission(self: *ApiHttpServer) void {
+        platform_sync.lockYielding(&self.sql_workers_mutex);
+        self.read_retirement_closing = true;
+        const runtime = self.read_retirement_runtime;
+        self.sql_workers_mutex.unlock();
+        if (runtime) |active| active.closeAdmission();
+    }
+    pub fn waitReadRetirementUntil(self: *ApiHttpServer, io: std.Io, deadline: std.Io.Clock.Timestamp) !void {
+        self.closeReadRetirementAdmission();
+        if (self.read_retirement_runtime) |runtime| {
+            try runtime.waitDrainedUntil(io, deadline);
+            // A busy response can retire its ticket while its outbox alone
+            // still owns Client metadata and the complete original parent.
+            while (self.readRetirementParentsPending()) {
+                try io.checkCancel();
+                if (deadline.raw.nanoseconds <= deadline.clock.now(io).nanoseconds) return error.CleanupPending;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try io.checkCancel();
+        }
+    }
+    fn readRetirementParentsPending(self: *ApiHttpServer) bool {
+        const state = self.owned_remote_attempts.load(.acquire) orelse return false;
+        return state.ledger.hasRetainedParents();
+    }
+    /// Node supervisor only, after fencing and joining all Binding borrowers.
+    /// Pending retirement leaves the consumer, byte reservation, executor lease
+    /// and node pin alive. No publisher mutex spans a physical join.
+    pub fn joinReadRetirement(self: *ApiHttpServer) !void {
+        self.closeReadRetirementAdmission();
+        const runtime = self.read_retirement_runtime orelse return;
+        if (self.readRetirementParentsPending()) return error.CleanupPending;
+        try runtime.join();
+        try runtime.destroyJoined();
+        self.read_retirement_runtime = null;
+        var workers = self.read_retirement_workers;
+        self.read_retirement_workers = null;
+        const node = self.read_retirement_node;
+        self.read_retirement_node = null;
+        if (workers) |*lease| lease.release();
+        if (node) |owner| owner.release();
+    }
+
+    pub fn stopRemoteReconciliation(self: *ApiHttpServer) void {
+        // The node supervisor serializes startup/shutdown with request joins.
+        // Never hold the publisher mutex across a physical executor join.
+        if (self.remote_reconciliation) |runtime| runtime.deinit();
+        self.remote_reconciliation = null;
+        if (self.remote_reconciliation_workers) |*workers| workers.release();
+        self.remote_reconciliation_workers = null;
+        const node = self.remote_reconciliation_node;
+        self.remote_reconciliation_node = null;
+        if (node) |owner| owner.release();
     }
 
     fn stopResourceCleanup(self: *ApiHttpServer) void {
@@ -4530,17 +4923,17 @@ pub const ApiHttpServer = struct {
         return @import("antfly_local_sources").common_request_admission.runnable_metrics.snapshot(mutable.runnableScheduler());
     }
 
-    fn acquireSqlWorkers(self: *ApiHttpServer, capacity: usize) !@import("sql_worker_lease.zig").Lease {
+    fn acquireCleanupWorkers(self: *ApiHttpServer) !@import("sql_worker_lease.zig").Lease {
         if (self.cfg.imported_runtime_io) |views| {
-            const producer = views.sql_workers orelse return error.SqlWriteCapacityUnavailable;
-            return @import("sql_worker_lease.zig").Lease.acquireImported(self.alloc, producer, capacity);
+            return @import("sql_worker_lease.zig").Lease.acquireImported(self.cleanupAllocator(), views.sql_workers orelse return error.SqlWriteCapacityUnavailable, 1);
         }
-        return @import("sql_worker_lease.zig").Lease.acquireNative(self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable, capacity);
+        return @import("sql_worker_lease.zig").Lease.acquireNativeFunded(self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable, self.cleanupAllocator(), 1);
     }
+
     fn acquireSharedSqlWorkers(self: *ApiHttpServer, role: @import("kernel_abi.zig").SqlWorkerRole, capacity: usize) !@import("sql_worker_lease.zig").Lease {
         if (self.cfg.imported_runtime_io) |views| {
             const producer = views.sql_workers orelse return error.SqlWriteCapacityUnavailable;
-            return @import("sql_worker_lease.zig").Lease.acquireImportedShared(self.alloc, producer, role, capacity);
+            return @import("sql_worker_lease.zig").Lease.acquireImportedShared(if (role == .control or role == .cleanup) self.cleanupAllocator() else self.alloc, producer, role, capacity);
         }
         return @import("sql_worker_lease.zig").Lease.acquireNativeShared(self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable, role, capacity);
     }
@@ -4550,7 +4943,7 @@ pub const ApiHttpServer = struct {
             if (views.sql_workers == null) return views.sql_control orelse error.SqlWriteCapacityUnavailable;
         } else {
             const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-            if (runtime.borrowed_io != null or runtime.lane_limits.worker_capacity < 10)
+            if (runtime.borrowed_io != null or runtime.lane_limits.sql_worker_capacity < 10)
                 return runtime.controlIo() orelse error.SqlWriteCapacityUnavailable;
         }
         platform_sync.lockYielding(&self.sql_workers_mutex);
@@ -4568,6 +4961,27 @@ pub const ApiHttpServer = struct {
         return self.sql_control_workers.?.io();
     }
 
+    /// Private physical worker for a verified bounded stage. This never aliases
+    /// general, control or cleanup IO. Its caller must qualify CPU/heap/work
+    /// ownership before publication; requesting this IO is not eligibility.
+    pub fn sqlBoundedReadIo(self: *ApiHttpServer) !std.Io {
+        const scheduler = self.runnableScheduler() orelse return error.UnsupportedOperation;
+        if (!scheduler.config.readIsolation()) return error.UnsupportedOperation;
+        if (self.cfg.imported_runtime_io) |views| {
+            if (views.sql_workers == null) return error.SqlWriteCapacityUnavailable;
+        } else {
+            const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
+            if (runtime.borrowed_io != null or runtime.lane_limits.sql_worker_capacity < 10) return error.SqlWriteCapacityUnavailable;
+        }
+        _ = try self.sqlControlIo();
+        platform_sync.lockYielding(&self.sql_workers_mutex);
+        defer self.sql_workers_mutex.unlock();
+        if (self.sql_workers_closing or self.sql_control_workers == null) return error.SqlWriteCapacityUnavailable;
+        if (self.sql_bounded_read_workers == null)
+            self.sql_bounded_read_workers = self.acquireSharedSqlWorkers(.bounded_read, 1) catch return error.SqlWriteCapacityUnavailable;
+        return self.sql_bounded_read_workers.?.io();
+    }
+
     /// Own a bounded foreground SQL executor independent of durable/general
     /// completion and control lanes. Reserve it before publishing SQL work.
     pub fn sqlExecutionIo(self: *ApiHttpServer) !std.Io {
@@ -4579,13 +4993,16 @@ pub const ApiHttpServer = struct {
             self.cfg.query_max_concurrent_requests == 0 or self.cfg.write_max_concurrent_requests == 0;
         const worker_capacity: u64 = if (imported) |views| blk: {
             if (legacy or views.sql_workers == null) return views.sql_execution orelse error.SqlWriteCapacityUnavailable;
-            break :blk views.sql_workers.?.capacity;
+            break :blk views.sql_workers.?.shared_capacity;
         } else blk: {
             const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
             if (legacy or runtime.borrowed_io != null) return runtime.io() orelse error.SqlWriteCapacityUnavailable;
-            break :blk runtime.lane_limits.worker_capacity;
+            break :blk runtime.lane_limits.sql_worker_capacity;
         };
         _ = try self.sqlControlIo();
+        if (self.runnableScheduler()) |scheduler| {
+            if (scheduler.config.readIsolation()) _ = try self.sqlBoundedReadIo();
+        }
         platform_sync.lockYielding(&self.sql_workers_mutex);
         defer self.sql_workers_mutex.unlock();
         if (self.sql_workers_closing) return error.SqlWriteCapacityUnavailable;
@@ -4593,11 +5010,11 @@ pub const ApiHttpServer = struct {
             const required = @as(u64, self.cfg.query_max_concurrent_requests) +
                 self.cfg.query_waiting.max_queued_requests + self.cfg.write_max_concurrent_requests +
                 @max(1, self.cfg.sql_max_concurrent_preparations) + 4;
-            const capacity = @min(required, (worker_capacity / 2) -| 5);
-            if (capacity < @as(u64, self.cfg.query_waiting.max_queued_requests) + 4) {
-                if (imported) |views| return views.sql_execution orelse error.SqlWriteCapacityUnavailable;
-                return self.cfg.backend_runtime.?.io() orelse error.SqlWriteCapacityUnavailable;
-            }
+            const capacity = @min(required, (worker_capacity / 2) -| 4);
+            // A configured bounded queue cannot silently turn into general IO
+            // when its node envelope is too small. Refuse before publication.
+            if (capacity < @as(u64, self.cfg.query_waiting.max_queued_requests) + 4)
+                return error.SqlWriteCapacityUnavailable;
             self.sql_workers = self.acquireSharedSqlWorkers(.execution, std.math.cast(usize, capacity) orelse return error.SqlWriteCapacityUnavailable) catch
                 return error.SqlWriteCapacityUnavailable;
         }
@@ -4609,12 +5026,12 @@ pub const ApiHttpServer = struct {
     /// they must never consume foreground or protected control concurrency.
     pub fn sqlCleanupIo(self: *ApiHttpServer) !std.Io {
         const worker_capacity: usize = if (self.cfg.imported_runtime_io) |views|
-            (views.sql_workers orelse return error.SqlWriteCapacityUnavailable).capacity
+            (views.sql_workers orelse return error.SqlWriteCapacityUnavailable).shared_capacity
         else blk: {
             const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-            if (runtime.borrowed_io != null or runtime.lane_limits.worker_capacity < 10)
+            if (runtime.borrowed_io != null or runtime.lane_limits.sql_worker_capacity < 10)
                 return error.SqlWriteCapacityUnavailable;
-            break :blk runtime.lane_limits.worker_capacity;
+            break :blk runtime.lane_limits.sql_worker_capacity;
         };
         _ = try self.sqlControlIo();
         platform_sync.lockYielding(&self.sql_workers_mutex);
@@ -4644,9 +5061,13 @@ pub const ApiHttpServer = struct {
         if (self.sql_workers_closing or self.sql_cleanup_closing) return error.SqlWriteCapacityUnavailable;
         if (self.sql_cleanup_runtime) |active| return active;
         if (self.sql_cleanup_reaper_workers == null) {
-            self.sql_cleanup_reaper_workers = self.acquireSqlWorkers(1) catch return error.SqlWriteCapacityUnavailable;
+            self.sql_cleanup_reaper_workers = self.acquireCleanupWorkers() catch return error.SqlWriteCapacityUnavailable;
         }
-        const active = @import("runnable_cleanup_owner.zig").Runtime.create(self.alloc, self.sql_cleanup_reaper_workers.?.io(), self.sql_cleanup_workers.?.capacity) catch {
+        // Runtime, registry slots, gated tasks and the independent reaper all
+        // use the prepaid cleanup floor. Foreground pressure must not prevent
+        // ownership admission; reserve still fails before resource publication
+        // when this bounded floor or actual worker capacity is exhausted.
+        const active = @import("runnable_cleanup_owner.zig").Runtime.create(self.cleanupAllocator(), self.sql_cleanup_reaper_workers.?.io(), self.sql_cleanup_workers.?.capacity) catch {
             // Runtime.create physically retires its partial state before
             // returning. No owner was published, so return this worker lease
             // now rather than retaining capacity through a failed startup.
@@ -4693,7 +5114,24 @@ pub const ApiHttpServer = struct {
         result.request_body_allocator = if (self.transport_memory) |memory| memory.allocator() else null;
         result.protected_request_body_allocator = result.transport_allocator;
         result.protected_application_allocator = @constCast(self).controlAllocator();
-        return result;
+        if (@constCast(self).runnableScheduler()) |scheduler| {
+            // Advertise an input that fits an idle retained root, leaving
+            // room for decoded state and request metadata. Clamp before
+            // normalization so aggregate quotas cannot grow past their owner.
+            const input_bytes = scheduler.config.generalMetadataBytes();
+            result.max_body_size = @min(result.max_body_size, std.math.cast(usize, input_bytes / 2) orelse std.math.maxInt(usize));
+            if (self.transport_memory) |memory| {
+                result.max_body_size = @min(result.max_body_size, memory.limit / 2);
+                result.request_body_buffer_budget_bytes = @min(result.request_body_buffer_budget_bytes, memory.limit);
+            }
+        }
+        // This applies to direct API users too, even without runnable policy.
+        // HTTP request admission cannot advertise the node cleanup reserve.
+        if (self.request_memory) |memory| {
+            result.application_memory_budget_bytes = @min(result.application_memory_budget_bytes, memory.foreground.limit + memory.control.limit);
+            result.protected_application_memory_bytes = @min(result.protected_application_memory_bytes, memory.control.limit);
+        }
+        return result.normalized();
     }
 
     pub fn releaseQuery(self: *ApiHttpServer) void {
@@ -4904,9 +5342,13 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) !ApiHttpServer {
+        if (cfg.remote_attempt_control) |control| {
+            if (control.maximum_duration_ns == 0 or !std.meta.eql(control.registry.local, control.signer.local)) return error.InvalidApiServerConfig;
+        }
         var effective_cfg = cfg;
         if (cfg.runnable_owner_handle != null and cfg.runnable_policy != null) return error.InvalidApiServerConfig;
-        if (cfg.runnable_policy) |policy| try policy.validate();
+        if (cfg.runnable_policy) |policy| effective_cfg.runnable_policy = try policy.resolveForStartup(0);
+        const read_policy: ?RunnableScheduler.Config = if (effective_cfg.runnable_policy) |policy| policy else if (cfg.runnable_owner_handle) |handle| @as(*RunnableScheduler.NodeOwner, @ptrCast(@alignCast(handle))).scheduler.policyAndStats().config else null;
         if (cfg.request_memory_bytes < 1 << 20 or cfg.retained_memory_bytes < 1 << 20) return error.InvalidApiServerConfig;
         const backing = if (builtin.is_test)
             alloc
@@ -4916,6 +5358,9 @@ pub const ApiHttpServer = struct {
         var memory_transferred = false;
         errdefer if (!memory_transferred) alloc.destroy(memory);
         const control_bytes = @min(16 << 20, cfg.request_memory_bytes / 8);
+        // Keep the original total pin. Ordinary transaction/health traffic
+        // cannot consume the half owned by independent cleanup consumers.
+        const cleanup_bytes = control_bytes / 2;
         const transport_bytes = @min(64 << 20, cfg.request_memory_bytes);
         const parser_bytes = @min(8 << 20, transport_bytes / 8);
         const transport_memory = try alloc.create(@import("../common/allocation_budget.zig").Shared);
@@ -4934,7 +5379,23 @@ pub const ApiHttpServer = struct {
 
         memory.* = .{
             .foreground = .{ .child = backing, .limit = cfg.request_memory_bytes - control_bytes, .accounting = cfg.memory_accounting },
-            .control = .{ .child = backing, .limit = control_bytes },
+            .control = .{ .child = backing, .limit = control_bytes - cleanup_bytes },
+            .cleanup = .{ .child = backing, .limit = cleanup_bytes },
+        };
+        var read_memory: ?*@import("../common/read_memory.zig").Pool = null;
+        var read_memory_transferred = false;
+        errdefer if (!read_memory_transferred) if (read_memory) |pool| {
+            pool.deinit();
+            alloc.destroy(pool);
+        };
+        if (read_policy) |policy| if (policy.readIsolation()) {
+            const read = @import("../common/read_memory.zig");
+            const limits = try read.startupLimits(memory.foreground.limit, policy.max_operations);
+            const pool = try alloc.create(read.Pool);
+            errdefer alloc.destroy(pool);
+            pool.* = try read.Pool.init(backing, cfg.memory_accounting, limits);
+            read_memory = pool;
+            memory.foreground.limit -= pool.pinned;
         };
         const state_memory = try alloc.create(@import("../common/allocation_budget.zig").Shared);
         var state_transferred = false;
@@ -4964,6 +5425,8 @@ pub const ApiHttpServer = struct {
         );
         owner_ids_transferred = true;
         server.request_memory = memory;
+        server.read_memory = read_memory;
+        read_memory_transferred = true;
         server.control_memory_reserved = if (cfg.memory_accounting != null) control_bytes else 0;
         server.transport_memory = transport_memory;
         server.parser_memory = parser_memory;
@@ -5088,6 +5551,11 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        self.closeReadRetirementAdmission();
+        if (self.owned_remote_attempts.load(.acquire)) |state| {
+            state.registry.closeAdmission();
+            if (state.endpoint_source) |source| source.close();
+        }
         const runnable_owner = self.runnable_owner;
         defer if (runnable_owner) |owner| owner.release();
         if (self.runnable_scheduler) |*scheduler| scheduler.close();
@@ -5117,14 +5585,19 @@ pub const ApiHttpServer = struct {
             active.destroyJoined();
             self.sql_workers_mutex.unlock();
         }
+        self.joinReadRetirement() catch @panic("read retirement still pending: fence and drain request bindings before API destruction");
+        self.stopRemoteReconciliation();
         self.stopResourceCleanup();
         self.object_tables.deinit(self.owner_alloc);
         platform_sync.lockYielding(&self.sql_workers_mutex);
         self.sql_workers_closing = true;
+        self.remote_capability_admission.close();
         self.sql_control_admission.close();
         self.sql_control_preparation.close();
         var control_workers = self.sql_control_workers;
         self.sql_control_workers = null;
+        var bounded_read_workers = self.sql_bounded_read_workers;
+        self.sql_bounded_read_workers = null;
         var sql_workers = self.sql_workers;
         self.sql_workers = null;
         var cleanup_workers = self.sql_cleanup_workers;
@@ -5133,6 +5606,7 @@ pub const ApiHttpServer = struct {
         self.sql_cleanup_reaper_workers = null;
         self.sql_workers_mutex.unlock();
         if (sql_workers) |*workers| workers.release();
+        if (bounded_read_workers) |*workers| workers.release();
         if (cleanup_workers) |*workers| workers.release();
         if (reaper_workers) |*workers| workers.release();
         if (control_workers) |*workers| workers.release();
@@ -5202,9 +5676,15 @@ pub const ApiHttpServer = struct {
             std.debug.assert(memory.used.load(.acquire) == 0);
             self.owner_alloc.destroy(memory);
         }
+        if (self.read_memory) |pool| {
+            pool.deinit();
+            self.owner_alloc.destroy(pool);
+        }
+        if (self.owned_remote_attempts.swap(null, .acq_rel)) |state| state.destroy();
         if (self.request_memory) |memory| {
             std.debug.assert(memory.foreground.used.load(.acquire) == 0);
             std.debug.assert(memory.control.used.load(.acquire) == 0);
+            if (memory.cleanup) |*cleanup| std.debug.assert(cleanup.used.load(.acquire) == 0);
             self.owner_alloc.destroy(memory);
         }
         if (self.cfg.memory_accounting) |owner| owner.release(self.control_memory_reserved);
@@ -8467,23 +8947,171 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn authenticateInternalServiceRequest(self: *ApiHttpServer, token: []const u8) !AuthenticatedIdentity {
+        return self.authenticateInternalServiceRequestWithAllocator(self.alloc, token);
+    }
+
+    pub fn authenticateInternalServiceRequestWithAllocator(self: *ApiHttpServer, alloc: std.mem.Allocator, token: []const u8) !AuthenticatedIdentity {
         const secret = self.cfg.internal_service_secret orelse return error.Unauthorized;
         if (self.cfg.trusted_principal_secret) |trusted_secret| {
             if (std.mem.eql(u8, secret, trusted_secret)) return error.Unauthorized;
         }
-        return self.authenticateTrustedPrincipalWithIssuer(
+        return self.authenticateTrustedPrincipalWithIssuerAndAllocator(
+            alloc,
             token,
             secret,
             self.cfg.internal_service_issuer,
         ) catch |primary_err| {
             if (primary_err != error.Unauthorized) return primary_err;
             const verification_secret = self.cfg.internal_service_verification_secret orelse return primary_err;
-            return try self.authenticateTrustedPrincipalWithIssuer(
+            return try self.authenticateTrustedPrincipalWithIssuerAndAllocator(
+                alloc,
                 token,
                 verification_secret,
                 self.cfg.internal_service_issuer,
             );
         };
+    }
+
+    /// This verifies signed service metadata; the caller must additionally
+    /// authorize membership and enter the persisted destination generation gate.
+    /// Capture platform monotonic receipt time before authentication; callers
+    /// cannot supply a different clock domain or refresh this budget later.
+    pub fn authenticateRemoteAttempt(self: *ApiHttpServer, token: []const u8, worker_incarnation: u128, kind: @import("../common/remote_attempt_wire.zig").Kind, method: []const u8, target: []const u8, body: []const u8, maximum_duration_ns: u64) !@import("../common/remote_attempt_wire.zig").Verified {
+        const received_at_ns = platform_time.monotonicNs();
+        const allocator = if (kind == .read) self.alloc else self.controlAllocator();
+        var identity = try self.authenticateInternalServiceRequestWithAllocator(allocator, token);
+        defer identity.deinit(allocator);
+        const verified = try @import("../common/remote_attempt_wire.zig").authorize(allocator, identity, worker_incarnation, kind, method, target, body, received_at_ns, maximum_duration_ns);
+        if (platform_time.monotonicNs() >= verified.local_deadline_ns) return error.DeadlineExceeded;
+        return verified;
+    }
+
+    /// Use the exact snapshot covered by the metadata authority barrier. No
+    /// cached/admin fallback may authorize a distributed attempt or fence.
+    pub fn authorizeRemoteAttemptMembership(self: *ApiHttpServer, verified: @import("../common/remote_attempt_wire.zig").Verified, request: api_operation.RequestContext, local: @import("../common/remote_membership.zig").Local) !@import("../common/remote_membership.zig").Binding {
+        return self.authorizeRemoteMembershipCut(verified, request, local, null);
+    }
+    fn authorizeRemoteMembershipCut(self: *ApiHttpServer, verified: @import("../common/remote_attempt_wire.zig").Verified, request: api_operation.RequestContext, local: @import("../common/remote_membership.zig").Local, expected_key: ?[32]u8) !@import("../common/remote_membership.zig").Binding {
+        var scoped = try request.platformDeadline();
+        scoped.deadline_ns = if (scoped.deadline_ns) |deadline| @min(deadline, verified.local_deadline_ns) else verified.local_deadline_ns;
+        try scoped.ensureActive();
+        try verified.context.validate();
+        if (self.source.vtable.free_admin_snapshot == null) return error.RemoteMembershipUnavailable;
+        var snapshot = (try self.source.linearizableSnapshot(scoped)) orelse return error.RemoteMembershipUnavailable;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        try scoped.ensureActive();
+        const binding = try @import("../common/remote_membership.zig").authorize(snapshot, verified, local);
+        if (expected_key) |key| {
+            const current_key = try @import("../common/remote_membership.zig").replyPublicKey(snapshot, local);
+            if (!std.mem.eql(u8, &key, &current_key)) return error.RemoteMembershipChanged;
+        }
+        return binding;
+    }
+
+    pub fn resolveRemoteReplyAuthority(self: *ApiHttpServer, expected: @import("../common/remote_membership.zig").Local, request: api_operation.RequestContext) !@import("../common/remote_attempt_reply.zig").Authority {
+        const scoped = try request.platformDeadline();
+        try scoped.ensureActive();
+        if (self.source.vtable.free_admin_snapshot == null) return error.RemoteMembershipUnavailable;
+        var snapshot = (try self.source.linearizableSnapshot(scoped)) orelse return error.RemoteMembershipUnavailable;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        try scoped.ensureActive();
+        return @import("../common/remote_attempt_reply.zig").Authority.fromSnapshot(snapshot, expected);
+    }
+
+    pub const RemoteAttemptCall = struct {
+        token: []const u8,
+        method: []const u8,
+        target: []const u8,
+        body: []const u8,
+        request: api_operation.RequestContext = .{},
+        maximum_duration_ns: u64,
+    };
+    const RemoteAuthorization = struct {
+        verified: @import("../common/remote_attempt_wire.zig").Verified,
+        binding: @import("../common/remote_membership.zig").Binding,
+    };
+    fn authorizeRemoteWorkerCall(self: *ApiHttpServer, registry: *@import("../common/remote_worker.zig").Registry, kind: @import("../common/remote_attempt_wire.zig").Kind, call: RemoteAttemptCall) !RemoteAuthorization {
+        const original = try call.request.platformDeadline();
+        if (kind == .read) try internal_api_routes.validateOwnedReadScope(call.target, registry.local.root_incarnation, registry.local.reporter_incarnation);
+        var verified = try self.authenticateRemoteAttempt(call.token, registry.local.root_incarnation, kind, call.method, call.target, call.body, call.maximum_duration_ns);
+        if (original.deadline_ns) |deadline| verified.local_deadline_ns = @min(deadline, verified.local_deadline_ns);
+        const binding = try self.authorizeRemoteAttemptMembership(verified, original, registry.local);
+        return .{ .verified = verified, .binding = binding };
+    }
+    pub fn beginRemoteRead(self: *ApiHttpServer, registry: *@import("../common/remote_worker.zig").Registry, call: RemoteAttemptCall) !@import("../common/remote_worker.zig").Begin {
+        return self.beginRemoteReadWithWait(registry, call, null);
+    }
+    /// Authenticate and resolve membership at receipt, before a query owner can
+    /// wait for CPU. Carry this same verified deadline into worker admission.
+    pub fn verifyRemoteReadForAdmission(self: *ApiHttpServer, registry: *@import("../common/remote_worker.zig").Registry, call: RemoteAttemptCall) !RemoteAuthorization {
+        return self.authorizeRemoteWorkerCall(registry, .read, call);
+    }
+    pub fn remoteQueryMembershipAuthority(self: *ApiHttpServer) @import("internal_query_owner.zig").MembershipAuthority {
+        return .{ .context = self, .refresh = struct {
+            fn refresh(raw: *anyopaque, verified: @import("../common/remote_attempt_wire.zig").Verified, request: api_operation.RequestContext, local: @import("../common/remote_membership.zig").Local) !@import("../common/remote_membership.zig").Binding {
+                const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
+                const control = server.remoteAttemptControl() orelse return error.RemoteMembershipUnavailable;
+                if (!std.meta.eql(control.registry.local, local) or !std.meta.eql(control.signer.local, local)) return error.RemoteWorkerIdentityChanged;
+                return server.authorizeRemoteMembershipCut(verified, request, local, control.signer.pair.public_key.toBytes());
+            }
+        }.refresh };
+    }
+    pub fn beginRemoteReadWithWait(self: *ApiHttpServer, registry: *@import("../common/remote_worker.zig").Registry, call: RemoteAttemptCall, wait: ?@import("../common/remote_fence_store.zig").Wait) !@import("../common/remote_worker.zig").Begin {
+        const authorized = try self.verifyRemoteReadForAdmission(registry, call);
+        return registry.beginWithWait(authorized.verified, authorized.binding, wait);
+    }
+    pub fn fenceRemoteReads(self: *ApiHttpServer, registry: *@import("../common/remote_worker.zig").Registry, call: RemoteAttemptCall) !@import("../common/remote_attempts.zig").FenceAck {
+        const authorized = try self.authorizeRemoteWorkerCall(registry, .fence, call);
+        return registry.fence(authorized.verified, authorized.binding);
+    }
+    pub fn remoteReadStatus(self: *ApiHttpServer, registry: *@import("../common/remote_worker.zig").Registry, call: RemoteAttemptCall) !@import("../common/remote_attempts.zig").WorkerGate.Status {
+        const authorized = try self.authorizeRemoteWorkerCall(registry, .status, call);
+        return registry.status(authorized.verified, authorized.binding);
+    }
+
+    pub fn signRemoteCapabilities(self: *ApiHttpServer, registry: *@import("../common/remote_worker.zig").Registry, signer: *const @import("../common/remote_attempt_reply.zig").Signer, verified: @import("../common/remote_attempt_wire.zig").Verified, request: api_operation.RequestContext) !@import("../common/remote_read_capabilities.zig").Reply {
+        if (verified.context.kind != .capabilities or !std.meta.eql(registry.local, signer.local)) return error.InvalidRemoteAttempt;
+        var scoped = try request.platformDeadline();
+        scoped.deadline_ns = if (scoped.deadline_ns) |deadline| @min(deadline, verified.local_deadline_ns) else verified.local_deadline_ns;
+        _ = try self.authorizeRemoteMembershipCut(verified, scoped, registry.local, signer.pair.public_key.toBytes());
+        try scoped.ensureActive();
+        const families: @import("../common/remote_read_capabilities.zig").Families = ready: {
+            platform_sync.lockYielding(&self.sql_workers_mutex);
+            defer self.sql_workers_mutex.unlock();
+            const state = self.owned_remote_attempts.load(.acquire) orelse break :ready .{};
+            const retirement = self.read_retirement_runtime orelse break :ready .{};
+            const reconciliation = self.remote_reconciliation orelse break :ready .{};
+            if (registry != &state.registry or !registry.recoveryComplete() or self.runnableScheduler() == null or self.read_retirement_closing or self.sql_workers_closing or retirement.registry.snapshot().closed or retirement.stopping.load(.acquire) or reconciliation.stopping.load(.acquire)) break :ready .{};
+            break :ready self.cfg.remote_read_capabilities;
+        };
+        return @import("../common/remote_read_capabilities.zig").Reply.sign(signer, verified.context, families);
+    }
+
+    /// Trusted middleware has already verified this fixed control context.
+    /// Preserve that receipt deadline through membership I/O and signing.
+    pub fn signVerifiedRemoteControl(self: *ApiHttpServer, registry: *@import("../common/remote_worker.zig").Registry, signer: *const @import("../common/remote_attempt_reply.zig").Signer, verified: @import("../common/remote_attempt_wire.zig").Verified, request: api_operation.RequestContext) !@import("../common/remote_attempt_reply.zig").Reply {
+        return self.signVerifiedRemoteControlWithWait(registry, signer, verified, request, null);
+    }
+    pub fn signVerifiedRemoteControlWithWait(self: *ApiHttpServer, registry: *@import("../common/remote_worker.zig").Registry, signer: *const @import("../common/remote_attempt_reply.zig").Signer, verified: @import("../common/remote_attempt_wire.zig").Verified, request: api_operation.RequestContext, wait: ?@import("../common/remote_fence_store.zig").Wait) !@import("../common/remote_attempt_reply.zig").Reply {
+        const original = try request.platformDeadline();
+        var scoped = verified;
+        if (original.deadline_ns) |deadline| scoped.local_deadline_ns = @min(deadline, scoped.local_deadline_ns);
+        const binding = try self.authorizeRemoteAttemptMembership(scoped, original, registry.local);
+        return switch (scoped.context.kind) {
+            .status => signer.statusWithWait(registry, scoped, binding, wait),
+            .fence => signer.fenceWithWait(registry, scoped, binding, wait),
+            .cancel => signer.cancelWithWait(registry, scoped, binding, wait),
+            .read, .capabilities => error.InvalidRemoteAttempt,
+        };
+    }
+
+    pub fn signedRemoteReadStatus(self: *ApiHttpServer, registry: *@import("../common/remote_worker.zig").Registry, signer: *const @import("../common/remote_attempt_reply.zig").Signer, call: RemoteAttemptCall) !@import("../common/remote_attempt_reply.zig").Reply {
+        const authorized = try self.authorizeRemoteWorkerCall(registry, .status, call);
+        return signer.status(registry, authorized.verified, authorized.binding);
+    }
+    pub fn signedFenceRemoteReads(self: *ApiHttpServer, registry: *@import("../common/remote_worker.zig").Registry, signer: *const @import("../common/remote_attempt_reply.zig").Signer, call: RemoteAttemptCall) !@import("../common/remote_attempt_reply.zig").Reply {
+        const authorized = try self.authorizeRemoteWorkerCall(registry, .fence, call);
+        return signer.fence(registry, authorized.verified, authorized.binding);
     }
 
     fn internalAuthRealtimeNs(self: *ApiHttpServer) i128 {
@@ -8582,13 +9210,14 @@ pub const ApiHttpServer = struct {
         else
             try alloc.dupe(u8, "{}");
 
+        errdefer alloc.free(metadata_json);
+        const username = try alloc.dupe(u8, subject);
+        errdefer alloc.free(username);
+        const credential_principal = try std.fmt.allocPrint(alloc, "trusted:{s}:{s}", .{ jsonStringField(payload.get("iss")) orelse "", subject });
+        errdefer alloc.free(credential_principal);
         return .{
-            .username = try alloc.dupe(u8, subject),
-            .credential_principal = try std.fmt.allocPrint(
-                alloc,
-                "trusted:{s}:{s}",
-                .{ jsonStringField(payload.get("iss")) orelse "", subject },
-            ),
+            .username = username,
+            .credential_principal = credential_principal,
             .is_internal_service = is_internal_service,
             .permissions = permissions,
             .row_filter = row_filters,
@@ -9259,6 +9888,7 @@ pub const ApiHttpServer = struct {
             .query_router = .{
                 .ptr = self,
                 .route_query_to_read_schema = routeInternalGroupQueryToReadSchema,
+                .route_with_context = routeInternalGroupQueryWithContext,
             },
             .query_planning = self.internalQueryPlanningContext(),
             .graph_execution_limits = self.cfg.graph_execution_limits,
@@ -9637,9 +10267,10 @@ pub const ApiHttpServer = struct {
         query_req.req.execution_deadline_ns = context.deadline_ns;
         query_req.req.cancellation = context.cancellation;
         query_req.req.execution_runnable = if (context.execution_team) |team| team.borrow else null;
+        query_req.req.execution_remote_query = context.execution_remote_query;
         var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer catalog_arena.deinit();
-        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_team = context.execution_team };
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_team = context.execution_team, .execution_remote_query = context.execution_remote_query };
         self.routeQueryToReadSchemaWithResolver(table_name, &query_req.req, &resolver) catch |err| switch (err) {
             error.TableNotFound => return err,
             error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
@@ -9676,6 +10307,7 @@ pub const ApiHttpServer = struct {
             cancellation: CancellationToken,
             source: table_reads.TableReadSource,
             execution_team: ?*@import("antfly_runtime_abi").runnable_abi.Team,
+            execution_remote_query: ?http_common.RequestExecutor,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
@@ -9720,7 +10352,7 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                return runner.server.executeInternalRetrievalQuery(alloc, runner.source, .{ .deadline_ns = runner.deadline_ns, .cancellation = runner.cancellation, .execution_team = runner.execution_team }, table_name, query_json);
+                return runner.server.executeInternalRetrievalQuery(alloc, runner.source, .{ .deadline_ns = runner.deadline_ns, .cancellation = runner.cancellation, .execution_team = runner.execution_team, .execution_remote_query = runner.execution_remote_query }, table_name, query_json);
             }
 
             fn scanKeyPage(
@@ -9742,7 +10374,7 @@ pub const ApiHttpServer = struct {
                     filter_query_json,
                     exclusion_query_json,
                     null,
-                    .{ .deadline_ns = runner.deadline_ns, .cancellation = runner.cancellation, .execution_team = runner.execution_team },
+                    .{ .deadline_ns = runner.deadline_ns, .cancellation = runner.cancellation, .execution_team = runner.execution_team, .execution_remote_query = runner.execution_remote_query },
                 );
             }
 
@@ -9760,7 +10392,7 @@ pub const ApiHttpServer = struct {
                     table_name,
                     index_name,
                     keys,
-                    .{ .deadline_ns = runner.deadline_ns, .cancellation = runner.cancellation, .execution_team = runner.execution_team },
+                    .{ .deadline_ns = runner.deadline_ns, .cancellation = runner.cancellation, .execution_team = runner.execution_team, .execution_remote_query = runner.execution_remote_query },
                 );
             }
         };
@@ -9807,6 +10439,7 @@ pub const ApiHttpServer = struct {
             .cancellation = context.cancellation,
             .source = source,
             .execution_team = context.execution_team,
+            .execution_remote_query = context.execution_remote_query,
         };
         return retrieval_agent.execute(self.alloc, query_runner.iface(), generation_runner.iface(), body);
     }
@@ -9829,6 +10462,10 @@ pub const ApiHttpServer = struct {
     fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         return try self.maybeRouteQueryToReadSchema(table_name, req);
+    }
+    fn routeInternalGroupQueryWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: api_operation.RequestContext, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        return self.routeQueryToReadSchemaOwned(alloc, request, table_name, req, null);
     }
 
     fn queryTableDefinition(self: *ApiHttpServer, alloc: std.mem.Allocator, resolver: ?*CatalogQueryResolver, table_name: []const u8, context: api_operation.RequestContext) !?metadata_table_manager.TableRecord {
@@ -9861,16 +10498,24 @@ pub const ApiHttpServer = struct {
     }
 
     fn routeQueryToReadSchemaWithResolver(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest, resolver: ?*CatalogQueryResolver) !void {
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        return self.routeQueryToReadSchemaOwned(self.alloc, .{}, table_name, query_req, resolver);
+    }
+    fn routeQueryToReadSchemaOwned(self: *ApiHttpServer, request_allocator: std.mem.Allocator, original: api_operation.RequestContext, table_name: []const u8, query_req: *db_mod.types.SearchRequest, resolver: ?*CatalogQueryResolver) !void {
+        var arena = std.heap.ArenaAllocator.init(request_allocator);
         defer arena.deinit();
         const alloc = if (resolver) |cache| cache.arena else arena.allocator();
-        const table = (try self.queryTableDefinition(alloc, resolver, table_name, .{ .deadline_ns = query_req.execution_deadline_ns, .cancellation = query_req.cancellation orelse .none, .execution_team = if (resolver) |cache| cache.execution_team else null })) orelse return;
+        var context = original;
+        context.deadline_ns = query_req.execution_deadline_ns;
+        context.cancellation = query_req.cancellation orelse original.cancellation;
+        context.execution_team = if (resolver) |cache| cache.execution_team else original.execution_team;
+        context.execution_remote_query = if (resolver) |cache| cache.execution_remote_query orelse original.execution_remote_query else original.execution_remote_query;
+        const table = (try self.queryTableDefinition(alloc, resolver, table_name, context)) orelse return;
         if (query_req.lake_read != null) {
-            var binding = (try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json)) orelse return error.UnsupportedQueryRequest;
-            defer binding.deinit(self.alloc);
+            var binding = (try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(request_allocator, table.schema_json)) orelse return error.UnsupportedQueryRequest;
+            defer binding.deinit(request_allocator);
             if (binding.binding.write_policy != .iceberg_writer) return error.UnsupportedQueryRequest;
         }
-        try tables_api.routeQueryRequestToActiveReadIndex(self.alloc, &table, query_req);
+        try tables_api.routeQueryRequestToActiveReadIndex(request_allocator, &table, query_req);
         query_req.prepared_read_table_id = table.table_id;
         // Internal owners already select the retained DB before schema routing.
         // Only a request-scoped resolver owns capability descriptor memory.
@@ -14678,7 +15323,8 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
         try ensureTableOperationActive(request);
-        const response = self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation, null, null, null) catch |err| switch (err) {
+        var response = self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation, null, null, null) catch |err| switch (err) {
+            error.RemoteOutcomeUncertain, error.RemoteAttemptCapacity => return error.DistributedQueryUnavailable,
             error.RowPolicyAuthenticationRequired, error.RowPolicyDenied => return error.RowPolicyAuthenticationRequired,
             error.RowPolicyCatalogChanged, error.RowPolicyReadersActive => return error.RowPolicyCatalogChanged,
             error.RowPolicyUnsupported, error.RowPolicyMutationUnsupported, error.RowPolicyTopologyUnsupported => return error.RowPolicyUnsupported,
@@ -14757,6 +15403,10 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
+        if (response.retirement != null) {
+            defer response.deinit(alloc);
+            return alloc.dupe(u8, response.json) catch return error.InternalFailure;
+        }
         return response.json;
     }
 
@@ -14915,29 +15565,67 @@ pub const ApiHttpServer = struct {
         else
             retry_deadline_ns;
         const Cancellation = struct {
-            request: CancellationToken,
+            request: api_operation.RequestContext,
             options: ?CancellationToken,
+            // Watchdogs may check cancellation concurrently with a provider.
+            // Error IDs stay private to this synchronous compiled owner.
+            failure_code: std.atomic.Value(u16) = .init(0),
+            fn failure(self_: *const @This()) ?anyerror {
+                const code = self_.failure_code.load(.acquire);
+                return if (code == 0) null else @errorFromInt(code);
+            }
+            fn reject(self_: *@This(), cause: anyerror) anyerror {
+                const code = self_.failure_code.cmpxchgStrong(0, @intFromError(cause), .acq_rel, .acquire) orelse @intFromError(cause);
+                return @errorFromInt(code);
+            }
             fn check(ptr: *const anyopaque) bool {
                 const self_: *const @This() = @ptrCast(@alignCast(ptr));
-                return self_.request.isCancelled() or if (self_.options) |token| token.isCancelled() else false;
+                return self_.request.cancellation.isCancelled() or if (self_.options) |token| token.isCancelled() else false;
+            }
+            fn scopedCheck(ptr: *const anyopaque) !void {
+                const self_: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+                if (self_.failure()) |cause| return cause;
+                self_.request.ensureExecutionActive() catch |cause| return self_.reject(cause);
+                if (self_.options) |token| token.check() catch |cause| return self_.reject(cause);
             }
         };
-        var cancellation = Cancellation{ .request = request.cancellation, .options = opts.cancellation };
+        var cancellation = Cancellation{ .request = request, .options = opts.cancellation };
         var scoped = opts;
         // The first ordinary read keeps its caller budget. The readiness
         // ceiling applies only after a transient readiness failure, never to
         // a successful long-running read admitted with a larger deadline.
         scoped.execution_deadline_ns = retry_deadline_ns;
         scoped.execution_io = clock.io;
-        scoped.cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = Cancellation.check };
+        scoped.cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = Cancellation.check, .check_fn = if (request.execution_team != null) Cancellation.scopedCheck else null };
         var retrying = false;
         var last_readiness_error: anyerror = error.StorageReadTemporarilyUnavailable;
         while (true) {
-            try ensureTableOperationActive(request);
-            try ensureRequestActive(scoped.cancellation);
+            if (request.execution_team != null) {
+                try request.ensureExecutionActive();
+                try scoped.cancellation.?.check();
+            } else {
+                try ensureTableOperationActive(request);
+                try ensureRequestActive(scoped.cancellation);
+            }
             if (retryDeadlineExpired(retry_deadline_ns, clock.nowNs())) return error.DeadlineExceeded;
             if (retrying and retryDeadlineExpired(attempt_deadline_ns, clock.nowNs())) return last_readiness_error;
-            return source.lookup(alloc, table_name, key, scoped, consistency) catch |err| switch (err) {
+            const result = source.lookup(alloc, table_name, key, scoped, consistency);
+            if (request.execution_team != null) {
+                scoped.cancellation.?.check() catch {};
+                if (cancellation.failure()) |cause| {
+                    // A legacy callback may have converted scoped NotFound
+                    // into absence, or returned owned data after rejection.
+                    // Never publish either; retire any newly returned buffer.
+                    if (result) |maybe| {
+                        if (maybe) |value| {
+                            var discarded = value;
+                            discarded.deinit(alloc);
+                        }
+                    } else |_| {}
+                    return cause;
+                }
+            }
+            return result catch |err| switch (err) {
                 error.StorageReadTemporarilyUnavailable,
                 error.StorageKernelOwnerStaleDescriptor,
                 error.CatalogRoutingUnavailable,
@@ -14963,7 +15651,15 @@ pub const ApiHttpServer = struct {
                     retrying = true;
                     last_readiness_error = terminal_error;
                     scoped.execution_deadline_ns = attempt_deadline_ns;
-                    try sleepNsCancellable(retry_io, sleep_ns, scoped.cancellation);
+                    if (request.execution_team != null) {
+                        var waiting = request;
+                        // Readiness expiry ends retries; it does not replace
+                        // the caller's scope while returning its CPU grant.
+                        waiting.deadline_ns = retry_deadline_ns;
+                        waiting.deadline_io = clock.io;
+                        waiting.cancellation = scoped.cancellation.?;
+                        try @import("request_dependency_wait.zig").run(waiting, sleepNsScoped, .{ retry_io, sleep_ns, waiting, clock, attempt_deadline_ns });
+                    } else try sleepNsCancellable(retry_io, sleep_ns, scoped.cancellation);
                     continue;
                 },
                 error.Timeout, error.DeadlineExceeded => {
@@ -15066,7 +15762,7 @@ pub const ApiHttpServer = struct {
         defer if (identity) |*owned| owned.deinit(self.alloc);
         var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer catalog_arena.deinit();
-        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_team = normalized.execution_team };
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_team = normalized.execution_team, .execution_remote_query = normalized.execution_remote_query };
         var binding = try self.bindCatalogQuery(alloc, normalized, logical_name, body, &identity, &resolver);
         defer binding.deinit();
         // Retrieval must use the same bound engine and publication as HTTP
@@ -15877,6 +16573,7 @@ pub const ApiHttpServer = struct {
         };
         defer query_req.deinit(alloc);
         query_req.req.execution_runnable = if (execution_team) |team| team.borrow else null;
+        query_req.req.execution_remote_query = resolver.execution_remote_query;
         if (request_deadline_ns) |deadline| {
             query_req.req.execution_deadline_ns = deadline;
             try ensureRequestDeadline(deadline);
@@ -21564,6 +22261,7 @@ pub const ApiHttpServer = struct {
         arena: std.mem.Allocator,
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery = null,
         execution_team: ?*@import("antfly_runtime_abi").runnable_abi.Team = null,
+        execution_remote_query: ?http_common.RequestExecutor = null,
         revision: ?u64 = null,
         tables: std.StringHashMapUnmanaged(?system_catalog.ResolvedTable) = .empty,
         definitions: std.StringHashMapUnmanaged(system_catalog.QueryDefinition) = .empty,
@@ -22427,7 +23125,7 @@ pub const ApiHttpServer = struct {
                     return @as(*const http_common.RequestCancellation, @ptrCast(@alignCast(raw))).isCancelled();
                 }
             }.requested } else null,
-            .retained_bytes = @as(u64, body.len) +| table_name.len +| 1024,
+            .retained_bytes = @as(u64, body.len) +| table_name.len +| @max(@as(usize, 1024), @sizeOf(@import("runnable_http_response.zig").Owner)),
         }, .query);
     }
 
@@ -22472,7 +23170,21 @@ pub const ApiHttpServer = struct {
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
         execution: *RunnableScheduler.Execution,
     ) !contextual_operations.OwnedResponse {
-        if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithRunnable(table_name, body, borrowed_identity, cancellation, null, null, execution);
+        return self.handleAdmittedPublicTableQueryWithRemoteAuthority(table_name, body, content_type, borrowed_identity, cancellation, delivery, execution, null);
+    }
+
+    pub fn handleAdmittedPublicTableQueryWithRemoteAuthority(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        content_type: ?[]const u8,
+        borrowed_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+        execution: *RunnableScheduler.Execution,
+        remote_query: ?http_common.RequestExecutor,
+    ) !contextual_operations.OwnedResponse {
+        if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithRemoteAuthority(table_name, body, borrowed_identity, cancellation, null, null, execution, remote_query);
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*owned| owned.deinit(self.alloc);
         const body_deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
@@ -22509,7 +23221,7 @@ pub const ApiHttpServer = struct {
             }
         };
         var bridge: ?Bridge = if (delivery) |target| .{ .server = self, .table_name = table_name, .target = target, .execution = execution } else null;
-        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_team = if (team) |*value| value else null, .delivery = if (bridge) |*value| .{ .ptr = value, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = true } else null };
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_remote_query = remote_query, .execution_team = if (team) |*value| value else null, .delivery = if (bridge) |*value| .{ .ptr = value, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = true } else null };
         var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none, .execution_team = resolver.execution_team }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer binding.deinit();
         if (bridge) |*value| value.table_name = binding.physical;
@@ -22699,11 +23411,35 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
+        return self.handleAdmittedPublicGlobalMultiQueryWithAuthority(body, authenticated_identity, cancellation, null, null);
+    }
+
+    fn handleAdmittedPublicGlobalMultiQueryWithAuthority(
+        self: *ApiHttpServer,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+        provided_execution: ?*RunnableScheduler.Execution,
+        remote_query: ?http_common.RequestExecutor,
+    ) !contextual_operations.OwnedResponse {
         const composed = @import("composed_query.zig");
         if (composed.hasSource(self.alloc, body) catch false) {
             const composed_started = @import("antfly_platform").time.monotonicNs();
             var composed_profile: @import("lake_query_metrics.zig").ComposedProfile = .{};
             defer composed_profile.finish(&self.lake_query_metrics, composed_started);
+            var local_execution: RunnableScheduler.Execution = .{};
+            defer if (provided_execution == null) local_execution.finish();
+            const execution = provided_execution orelse &local_execution;
+            if (provided_execution == null) {
+                if (try self.admitPublicQueryRunnable(execution, "", body, cancellation)) |response| return response;
+            }
+            const original_deadline = if (execution.entry) |*entry| entry.options.deadline_ns else originalQueryDeadline(null, cancellation);
+            const body_deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
+            const deadline = if (original_deadline) |original| @min(original, body_deadline orelse original) else body_deadline;
+            var read: @import("runnable_local_read.zig").Read = .{ .execution = execution, .allocator = self.alloc };
+            var team: ?@import("antfly_runtime_abi").runnable_abi.Team = if (execution.entry != null) try read.team() else null;
+            const root_context: api_operation.RequestContext = .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none, .execution_team = if (team) |*value| value else null, .execution_remote_query = remote_query };
+            root_context.ensureActive() catch |err| return self.publicQueryOperationErrorResponse("", body, err);
             var source_root = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{ .allocate = .alloc_always });
             defer source_root.deinit();
             var composed_body = body;
@@ -22715,8 +23451,7 @@ pub const ApiHttpServer = struct {
                 defer composed_profile.record(&self.lake_query_metrics, .composed_definition, definition_started);
                 if (source_value.object.count() != 1 or saved != .string) return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
                 if (!admittedTablePermissionAllowed(authenticated_identity, saved.string, .read)) return contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
-                const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .cancellation = if (cancellation) |cancel| cancel.token() else .none };
-                const bytes = try self.source.systemCatalog(self.alloc, context, .{ .read = .{ .kind = .query_source, .name = saved.string } });
+                const bytes = try self.source.systemCatalog(self.alloc, root_context, .{ .read = .{ .kind = .query_source, .name = saved.string } });
                 defer self.alloc.free(bytes);
                 var state = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_domain.State, self.alloc, bytes, .{});
                 defer state.deinit();
@@ -22730,7 +23465,6 @@ pub const ApiHttpServer = struct {
                 composed_body = expanded_body.?;
             };
             const overlay = source_value == .object and source_value.object.contains("overlay");
-            const deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
             const Runner = struct {
                 server: *ApiHttpServer,
                 profile: *@import("lake_query_metrics.zig").ComposedProfile,
@@ -22738,10 +23472,11 @@ pub const ApiHttpServer = struct {
                 deadline: ?u64,
                 identity: ?AuthenticatedIdentity,
                 cancellation: ?*const http_common.RequestCancellation,
+                context: api_operation.RequestContext,
                 fn checkpoint(raw: *anyopaque) !void {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
-                    if (runner.cancellation) |cancel| if (cancel.isCancelled()) return error.Cancelled;
-                    try ensureRequestDeadline(runner.deadline);
+                    try runner.context.ensureActive();
+                    if (runner.context.execution_team) |original| try queryRunnableStatus(original.borrow.checkpoint(original.borrow.context));
                 }
                 fn execute(raw: *anyopaque, a: std.mem.Allocator, name: []const u8, query: []const u8) !contextual_operations.OwnedResponse {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
@@ -22760,8 +23495,8 @@ pub const ApiHttpServer = struct {
                     } else query;
                     var identity = try cloneCatalogIdentity(a, runner.identity);
                     defer if (identity) |*owned| owned.deinit(a);
-                    var resolver = CatalogQueryResolver{ .arena = scratch };
-                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = runner.deadline, .cancellation = if (runner.cancellation) |cancel| cancel.token() else .none };
+                    const context = runner.context;
+                    var resolver = CatalogQueryResolver{ .arena = scratch, .execution_team = context.execution_team, .execution_remote_query = context.execution_remote_query };
                     var binding = runner.server.bindCatalogQuery(a, context, name, leaf_query, &identity, &resolver) catch |err| return runner.server.publicQueryOperationErrorResponse(name, leaf_query, err);
                     defer binding.deinit();
                     var before = (try runner.server.source.linearizableSnapshot(context)) orelse return error.UnsupportedQueryRequest;
@@ -22775,7 +23510,8 @@ pub const ApiHttpServer = struct {
                     if (bound.storage.engine != .object and external == null) {
                         var request = try std.json.parseFromSliceLeaky(std.json.Value, scratch, leaf_query, .{});
                         if (!request.object.contains("remote_snapshot")) {
-                            var store = try @import("lake_index_store.zig").Store.openNative(scratch, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
+                            var wait: @import("runnable_fanout_owner.zig").RemoteWait = .{ .borrow = if (runner.context.execution_team) |original| original.borrow else null };
+                            var store = try @import("lake_index_store.zig").Store.openNativeFor(scratch, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir, artifactContext(runner, &wait));
                             defer store.deinit();
                             const cover = try @import("native_retained_cut.zig").captureCover(scratch, before, binding.physical, bound.table_id);
                             const token = try @import("native_query_repository.zig").saveWithCover(scratch, &store, runner.server.embedding_provider_runtime.io, bound.*, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(runner.server.cfg.node_config), cover, context.cancellation);
@@ -22809,42 +23545,64 @@ pub const ApiHttpServer = struct {
                     response.body = encoded;
                     return response;
                 }
-                fn cursorCancelled(raw: *const anyopaque) bool {
-                    const cancel: *const http_common.RequestCancellation = @ptrCast(@alignCast(raw));
-                    return cancel.isCancelled();
-                }
                 fn saveCursor(raw: *anyopaque, a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
                     const started = @import("antfly_platform").time.monotonicNs();
                     defer runner.profile.record(&runner.server.lake_query_metrics, .composed_cursor, started);
                     try checkpoint(raw);
-                    var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
+                    var wait: @import("runnable_fanout_owner.zig").RemoteWait = .{ .borrow = if (runner.context.execution_team) |original| original.borrow else null };
+                    var store = try @import("lake_index_store.zig").Store.openNativeFor(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir, artifactContext(runner, &wait));
                     defer store.deinit();
                     var artifacts = store.artifactStore();
-                    return @import("lake_retained_cut.zig").saveCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), runner.server.embedding_provider_runtime.io, bytes, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
+                    const result = try @import("lake_retained_cut.zig").saveCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), runner.server.embedding_provider_runtime.io, bytes, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, runner.context.cancellation);
+                    errdefer a.free(result);
+                    try checkpoint(raw);
+                    return result;
                 }
                 fn loadCursor(raw: *anyopaque, a: std.mem.Allocator, token: []const u8) ![]const u8 {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
                     const started = @import("antfly_platform").time.monotonicNs();
                     defer runner.profile.record(&runner.server.lake_query_metrics, .composed_cursor, started);
                     try checkpoint(raw);
-                    var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, true, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
+                    var wait: @import("runnable_fanout_owner.zig").RemoteWait = .{ .borrow = if (runner.context.execution_team) |original| original.borrow else null };
+                    var store = try @import("lake_index_store.zig").Store.openNativeFor(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, true, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir, artifactContext(runner, &wait));
                     defer store.deinit();
                     var artifacts = store.artifactStore();
-                    return @import("lake_retained_cut.zig").loadCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
+                    const result = try @import("lake_retained_cut.zig").loadCursorFor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, runner.context.cancellation, artifactContext(runner, &wait));
+                    errdefer a.free(result);
+                    try checkpoint(raw);
+                    return result;
+                }
+                fn artifactContext(runner: *@This(), wait: *@import("runnable_fanout_owner.zig").RemoteWait) @import("antfly_local_sources").serverless_query_lake_read_context.Context {
+                    const boundary = wait.boundary();
+                    return .{
+                        .deadline_ns = runner.context.deadline_ns,
+                        .checkpoint = .{ .ptr = runner, .check = checkpoint },
+                        .authority = .{ .ptr = runner, .check = cursorLifetime },
+                        .wait = if (boundary) |value| .{ .ptr = value.ptr, .begin = value.begin, .end = value.end } else null,
+                    };
+                }
+                fn cursorLifetime(raw: *anyopaque) !void {
+                    const runner: *@This() = @ptrCast(@alignCast(raw));
+                    try runner.context.ensureActive();
+                    if (runner.context.execution_team) |original| try original.borrow.checkLifetime();
                 }
                 fn localDigest(bytes: []const u8) [64]u8 {
                     return @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(bytes);
                 }
             };
-            var runner: Runner = .{ .server = self, .profile = &composed_profile, .identity = authenticated_identity, .cancellation = cancellation, .overlay = overlay, .deadline = deadline };
+            var runner: Runner = .{ .server = self, .profile = &composed_profile, .identity = authenticated_identity, .cancellation = cancellation, .overlay = overlay, .deadline = deadline, .context = root_context };
             return composed.execute(self.alloc, composed_body, .{ .ptr = &runner, .execute = Runner.execute, .checkpoint = Runner.checkpoint, .save_cursor = Runner.saveCursor, .load_cursor = Runner.loadCursor }) catch |err| return self.publicQueryOperationErrorResponse("", body, err);
         }
-        return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation, null, null);
+        return self.handlePublicTableMultiQueryWithRemoteAuthority(null, body, authenticated_identity, cancellation, null, null, provided_execution, remote_query);
+    }
+
+    pub fn handleAdmittedPublicGlobalMultiQueryWithRemoteAuthority(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity, cancellation: ?*const http_common.RequestCancellation, execution: *RunnableScheduler.Execution, remote_query: ?http_common.RequestExecutor) !contextual_operations.OwnedResponse {
+        return self.handleAdmittedPublicGlobalMultiQueryWithAuthority(body, authenticated_identity, cancellation, execution, remote_query);
     }
 
     pub fn handleAdmittedPublicGlobalMultiQueryWithRunnable(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity, cancellation: ?*const http_common.RequestCancellation, execution: *RunnableScheduler.Execution) !contextual_operations.OwnedResponse {
-        return self.handlePublicTableMultiQueryWithRunnable(null, body, authenticated_identity, cancellation, null, null, execution);
+        return self.handleAdmittedPublicGlobalMultiQueryWithAuthority(body, authenticated_identity, cancellation, execution, null);
     }
 
     fn publicQueryOperationErrorResponse(
@@ -22854,7 +23612,8 @@ pub const ApiHttpServer = struct {
         err: anyerror,
     ) !contextual_operations.OwnedResponse {
         return switch (err) {
-            error.SchedulerFull, error.SchedulerClosed, error.RunnableWaitTimeout => try self.queryOverloadedResponse(),
+            error.SchedulerFull, error.SchedulerClosed, error.RunnableWaitTimeout, error.RemoteAttemptCapacity => try self.queryOverloadedResponse(),
+            error.RemoteOutcomeUncertain => try contextualRetryableTextResponse(self.alloc, 503, "remote query unavailable"),
             error.ObjectTableJoinUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported"),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
             error.CatalogGenerationChanged, error.TableGenerationChanged => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
@@ -23075,6 +23834,20 @@ pub const ApiHttpServer = struct {
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
         provided_execution: ?*RunnableScheduler.Execution,
     ) !contextual_operations.OwnedResponse {
+        return self.handlePublicTableMultiQueryWithRemoteAuthority(route_table_name, body, authenticated_identity, cancellation, response_label, bound_join, provided_execution, null);
+    }
+
+    fn handlePublicTableMultiQueryWithRemoteAuthority(
+        self: *ApiHttpServer,
+        route_table_name: ?[]const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+        response_label: ?[]const u8,
+        bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
+        provided_execution: ?*RunnableScheduler.Execution,
+        remote_query: ?http_common.RequestExecutor,
+    ) !contextual_operations.OwnedResponse {
         // One ingress capsule retains the complete input and original request
         // authority across every sequential line and its physical child joins.
         var local_execution: RunnableScheduler.Execution = .{};
@@ -23094,7 +23867,7 @@ pub const ApiHttpServer = struct {
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
-        var catalog_resolver = CatalogQueryResolver{ .arena = arena, .execution_team = if (team) |*value| value else null };
+        var catalog_resolver = CatalogQueryResolver{ .arena = arena, .execution_remote_query = remote_query, .execution_team = if (team) |*value| value else null };
 
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
@@ -26464,6 +27237,23 @@ fn sleepNsCancellable(io: ?std.Io, duration_ns: u64, cancellation: ?Cancellation
     try ensureRequestActive(cancellation);
 }
 
+/// The execution is parked while this physical retry sleep runs. Check the
+/// retained fallible scope directly; a boolean cancellation adapter would lose
+/// one-shot authority/provider rejection before mandatory CPU return.
+fn sleepNsScoped(io: ?std.Io, duration_ns: u64, request: api_operation.RequestContext, clock: table_catalog.RoutingBudget, local_deadline_ns: ?u64) !void {
+    var remaining = duration_ns;
+    while (remaining > 0) {
+        try request.ensureExecutionActive();
+        const now = clock.nowNs();
+        if (retryDeadlineExpired(local_deadline_ns, now)) return;
+        const available = if (local_deadline_ns) |deadline| deadline - now else remaining;
+        const slice = @min(@min(remaining, available), 5 * std.time.ns_per_ms);
+        if (io) |borrowed| try borrowed.sleep(.fromNanoseconds(slice), .awake) else sleepNs(slice);
+        remaining -= slice;
+    }
+    try request.ensureExecutionActive();
+}
+
 fn boundedRetrySleepNs(
     deadline_ns: ?u64,
     now_ns: u64,
@@ -29554,7 +30344,8 @@ fn trustedPrincipalPermissionsFromPayload(alloc: std.mem.Allocator, payload: std
     }
 
     if (jsonBoolField(payload.get("admin"))) {
-        try out.append(alloc, try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin));
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin));
         return try out.toOwnedSlice(alloc);
     }
 
@@ -29585,15 +30376,21 @@ fn appendTrustedPrincipalPermissionsForTable(
     for (operation_values) |operation_value| {
         const operation = jsonStringValue(operation_value) orelse continue;
         if (std.mem.eql(u8, operation, "read")) {
-            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .read));
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try usermgr.Permission.initOwned(alloc, .table, table, .read));
         } else if (std.mem.eql(u8, operation, "write")) {
-            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .write));
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try usermgr.Permission.initOwned(alloc, .table, table, .write));
         } else if (std.mem.eql(u8, operation, "admin")) {
-            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .admin));
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try usermgr.Permission.initOwned(alloc, .table, table, .admin));
         } else if (std.mem.eql(u8, operation, "*")) {
-            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .read));
-            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .write));
-            try out.append(alloc, try usermgr.Permission.initOwned(alloc, .table, table, .admin));
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try usermgr.Permission.initOwned(alloc, .table, table, .read));
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try usermgr.Permission.initOwned(alloc, .table, table, .write));
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try usermgr.Permission.initOwned(alloc, .table, table, .admin));
         }
     }
 }
@@ -29610,7 +30407,8 @@ fn trustedPrincipalRowFiltersFromPayload(alloc: std.mem.Allocator, payload: std.
     while (it.next()) |entry| {
         const filter_json = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{});
         defer alloc.free(filter_json);
-        try out.append(alloc, try usermgr.RowFilterEntry.initOwned(alloc, entry.key_ptr.*, filter_json));
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(try usermgr.RowFilterEntry.initOwned(alloc, entry.key_ptr.*, filter_json));
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -29664,6 +30462,8 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
 
 pub fn normalizeQueryOperationalError(err: anyerror) ?anyerror {
     if (err == error.MetricNotReady or err == error.MetricStale or err == error.DecisionLimitExceeded) return err;
+    if (err == error.RemoteOutcomeUncertain or err == error.RemoteAttemptCapacity) return error.DistributedQueryUnavailable;
+    if (err == error.MetricNotReady or err == error.MetricStale) return err;
     if (normalizeQueryEmbeddingOperationalError(err)) |normalized| return normalized;
     return switch (reranking_runtime.normalizeOperationalError(err)) {
         error.RerankRateLimited,
@@ -58990,6 +59790,11 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
 /// Connection, upload and aggregate body ceilings remain authoritative.
 pub fn configurePublicHttpTransportForConfig(cfg: ApiHttpServerConfig, config: httpx.ServerConfig) httpx.ServerConfig {
     var result = config.normalized();
+    const configured_duration = if (cfg.node_config) |node| node.admission.max_request_duration_ms else 300_000;
+    // Parsed configuration rejects this range; defensive clamping also keeps
+    // programmatically constructed configurations from disabling the ceiling.
+    const duration = std.math.clamp(configured_duration, 1, 86_400_000);
+    result.request_timeout_ms = if (config.request_timeout_ms == 0) duration else @min(config.request_timeout_ms, duration);
     if (cfg.query_waiting.max_wait_ms != 0) {
         result.max_request_tasks = @min(result.max_connections, result.max_request_tasks +| cfg.query_waiting.max_queued_requests +| 4);
         // Reapply the user's stream ceiling after expanding task capacity.
@@ -58997,9 +59802,155 @@ pub fn configurePublicHttpTransportForConfig(cfg: ApiHttpServerConfig, config: h
     }
     result.protected_request_tasks = 4;
     result.is_protected_request = protectedHttpRequest;
-    result.is_protected_body_candidate = protectedSqlBodyCandidate;
-    result.is_protected_body_request = protectedSqlBodyRequest;
+    result.is_protected_body_candidate = protectedBodyCandidate;
+    result.is_protected_body_request = protectedBodyRequest;
+    // The first normalization has no control routes and clears this reserve.
+    // Resolve it again from the operator's value once those routes exist.
+    result.protected_application_memory_bytes = config.protected_application_memory_bytes;
     return result.normalized();
+}
+
+test "workload read pools startup preserves total envelope and protects control progress" {
+    const Node = struct {
+        limit: usize = 64 << 20,
+        used: usize = 0,
+        failed_bytes: usize = 0,
+        fn reserve(raw: *anyopaque, bytes: usize) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (bytes > self.limit - self.used) {
+                self.failed_bytes = bytes;
+                return false;
+            }
+            self.used += bytes;
+            return true;
+        }
+        fn release(raw: *anyopaque, bytes: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.used -= bytes;
+        }
+        fn accounting(self: *@This()) @import("../common/allocation_budget.zig").Accounting {
+            return .{ .ptr = self, .reserve_fn = reserve, .release_fn = release };
+        }
+    };
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var source: Source = .{};
+    for ([_]bool{ false, true }) |isolated| {
+        var node: Node = .{};
+        {
+            var api = try ApiHttpServer.initWithConfig(std.testing.allocator, .{
+                .request_memory_bytes = 8 << 20,
+                .retained_memory_bytes = 8 << 20,
+                .memory_accounting = node.accounting(),
+                .runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .read_isolation = isolated },
+            }, .{ .ptr = &source, .vtable = &.{ .status = Source.status } }, null, null);
+            defer api.deinit();
+            const observed = api.workloadMemoryStats();
+            try std.testing.expectEqual(@as(usize, 8 << 20), observed.foreground.?.limit_bytes + observed.control.?.limit_bytes + observed.cleanup.?.limit_bytes + observed.read_reserved_bytes);
+            if (!isolated) {
+                try std.testing.expect(api.readMemoryPool() == null);
+                try std.testing.expect(!api.readMemoryStats().enabled);
+                try std.testing.expectEqual(@as(usize, 0), observed.read_reserved_bytes);
+                continue;
+            }
+            const pool = api.readMemoryPool().?;
+            try std.testing.expectEqual(@as(usize, (7 << 20) / 4), pool.pinned);
+            var read = try @import("runnable_read_resources.zig").Owner.init(pool, 64 << 10);
+            defer read.deinit();
+            try read.start(&api.runnable_scheduler.?, .{ .io = std.testing.io, .retained_bytes = 1024 }, .{ .max_retained_bytes = 1024, .max_wait_ms = 100, .estimated_work_ns = std.time.ns_per_ms }, .{ .io = std.testing.io }, std.time.ns_per_s);
+            const free_foreground = api.request_memory.?.foreground.limit - api.request_memory.?.foreground.stats().used_bytes;
+            const held = try api.alloc.alloc(u8, free_foreground - ApiHttpServer.RequestMemory.overhead(.of(u8)));
+            defer api.alloc.free(held);
+            try std.testing.expectError(error.OutOfMemory, api.alloc.alloc(u8, 1));
+            const charged = node.used;
+            const before_read = api.readMemoryStats();
+            try std.testing.expect(before_read.enabled);
+            try std.testing.expectEqual(@as(u64, pool.pinned), before_read.reserved_bytes);
+            try std.testing.expectEqual(@as(u64, 64 << 10), before_read.transition_reserved_bytes);
+            const bytes = try read.allocator().dupe(u8, "read progresses with ordinary heap full");
+            defer read.allocator().free(bytes);
+            const control = try api.controlAllocator().alloc(u8, 32);
+            defer api.controlAllocator().free(control);
+            try std.testing.expectEqual(charged, node.used);
+            const bounded_stats = api.readMemoryStats();
+            try std.testing.expect(bounded_stats.used_bytes[1] >= bytes.len);
+            try read.execution.demoteRead(.general);
+            const general_stats = api.readMemoryStats();
+            try std.testing.expectEqual(bounded_stats.used_bytes[1], general_stats.used_bytes[0]);
+            try std.testing.expectEqual(@as(u64, 0), general_stats.used_bytes[1]);
+            try std.testing.expectEqual(@as(u64, 0), general_stats.transition_reserved_bytes);
+            try std.testing.expectEqual(charged, node.used);
+            try std.testing.expectEqualStrings("read progresses with ordinary heap full", bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 0), node.used);
+    }
+    var refusing: Node = .{ .limit = 9 << 20 };
+    try std.testing.expectError(error.OutOfMemory, ApiHttpServer.initWithConfig(std.testing.allocator, .{
+        .request_memory_bytes = 8 << 20,
+        .retained_memory_bytes = 8 << 20,
+        .memory_accounting = refusing.accounting(),
+        .runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .read_isolation = true },
+    }, .{ .ptr = &source, .vtable = &.{ .status = Source.status } }, null, null));
+    try std.testing.expectEqual(@as(usize, (7 << 20) / 4), refusing.failed_bytes);
+    try std.testing.expectEqual(@as(usize, 0), refusing.used);
+}
+
+test "workload read pools startup uses the borrowed node policy without another probe" {
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var source: Source = .{};
+    var node = try RunnableScheduler.NodeOwner.init(.{ .slots = 4, .cleanup_slots = 1, .read_isolation = true });
+    defer node.deinit();
+    {
+        var api = try ApiHttpServer.initWithConfig(std.testing.allocator, .{ .request_memory_bytes = 8 << 20, .retained_memory_bytes = 8 << 20, .runnable_owner_handle = &node }, .{ .ptr = &source, .vtable = &.{ .status = Source.status } }, null, null);
+        defer api.deinit();
+        try std.testing.expect(api.readMemoryPool() != null);
+        try std.testing.expect(api.runnable_owner.? == &node);
+        try std.testing.expect(api.runnable_scheduler == null);
+        try std.testing.expectEqual(@as(usize, 1), node.borrowers);
+        try std.testing.expectEqual(@as(usize, 8 << 20), api.request_memory.?.foreground.limit + api.request_memory.?.control.limit + api.request_memory.?.cleanup.?.limit + api.readMemoryPool().?.pinned);
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.borrowers);
+}
+
+test "workload public transport envelope fits retained roots and honors smaller operator limits" {
+    const a = std.testing.allocator;
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    for ([_]bool{ false, true }) |isolated| {
+        var source: Source = .{};
+        var api = try ApiHttpServer.initWithConfig(a, .{
+            .request_memory_bytes = 8 << 20,
+            .retained_memory_bytes = 8 << 20,
+            .runnable_policy = .{ .slots = if (isolated) 4 else 3, .cleanup_slots = 1, .read_isolation = isolated, .max_bytes = 2 << 20 },
+        }, .{ .ptr = &source, .vtable = &.{ .status = Source.status } }, null, null);
+        defer api.deinit();
+        const transport = api.configurePublicHttpTransport(.{});
+        try std.testing.expect(transport.max_body_size <= api.runnable_scheduler.?.config.generalMetadataBytes() / 2);
+        try std.testing.expect(transport.request_body_buffer_budget_bytes <= api.transport_memory.?.limit);
+        try std.testing.expect(transport.max_body_size * 2 <= transport.request_body_buffer_budget_bytes);
+        try std.testing.expect(transport.application_memory_budget_bytes <= 8 << 20);
+        try std.testing.expect(transport.protected_application_memory_bytes > 0);
+        try std.testing.expect(transport.protected_application_memory_bytes <= api.request_memory.?.control.limit);
+        var execution: RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        try api.startSqlRunnable(&execution, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = transport.max_body_size + 1024 }, .query);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), api.runnable_scheduler.?.stats().operations);
+        const smaller = api.configurePublicHttpTransport(.{ .max_body_size = 4096, .request_body_buffer_budget_bytes = 8192, .application_memory_budget_bytes = 65536, .protected_application_memory_bytes = 8192 });
+        try std.testing.expectEqual(@as(usize, 4096), smaller.max_body_size);
+        try std.testing.expectEqual(@as(usize, 8192), smaller.request_body_buffer_budget_bytes);
+        try std.testing.expectEqual(@as(usize, 65536), smaller.application_memory_budget_bytes);
+    }
 }
 
 test "workload envelope fail-fast transport reserves controls within its task ceiling" {
@@ -59018,13 +59969,14 @@ test "workload envelope fail-fast transport reserves controls within its task ce
 
 pub fn isProtectedHttpControl(method: httpx.Method, target: []const u8, body: []const u8) bool {
     return protectedHttpRequest(method, target) or
-        (protectedSqlBodyCandidate(method, target) and protectedSqlBodyRequest(method, target, body));
+        (protectedBodyCandidate(method, target) and protectedBodyRequest(method, target, body));
 }
 
 fn protectedHttpRequest(method: httpx.Method, target: []const u8) bool {
     // Fixed routes only. Query text, headers, role hints and arbitrary
     // administrative endpoints cannot claim the reserve.
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+    if (method == .POST and internal_api_routes.isRemoteAttemptControl(path)) return true;
     if (method == .POST and std.mem.startsWith(u8, path, "/db/v1/transactions/")) {
         const rest = path["/db/v1/transactions/".len..];
         if (rest.len > 32 and rest[32] == '/') {
@@ -59051,13 +60003,15 @@ fn protectedHttpRequest(method: httpx.Method, target: []const u8) bool {
     return std.mem.eql(u8, path, "/db/v1/status") or std.mem.eql(u8, path, "/healthz") or std.mem.eql(u8, path, "/readyz");
 }
 
-fn protectedSqlBodyCandidate(method: httpx.Method, target: []const u8) bool {
+fn protectedBodyCandidate(method: httpx.Method, target: []const u8) bool {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
-    return (method == .POST and std.mem.eql(u8, path, "/db/v1/sql")) or
+    return (method == .POST and internal_api_routes.isRetainedRead(path)) or
+        (method == .POST and std.mem.eql(u8, path, "/db/v1/sql")) or
         (method == .PUT and std.mem.eql(u8, path, "/admin/v1/workload/query"));
 }
-fn protectedSqlBodyRequest(method: httpx.Method, target: []const u8, body: []const u8) bool {
+fn protectedBodyRequest(method: httpx.Method, target: []const u8, body: []const u8) bool {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+    if (method == .POST and internal_api_routes.isRetainedRead(path)) return @import("retained_read_rpc.zig").isControlBody(body) or @import("owned_retained_read.zig").isControlBody(body);
     if (method == .PUT and std.mem.eql(u8, path, "/admin/v1/workload/query")) {
         if (body.len > 1024) return false;
         var buffer: [8192]u8 = undefined;
@@ -59076,7 +60030,7 @@ test "workload envelope preserves control allocation under aggregate foreground 
     const occupied = try server.alloc.alloc(u8, memory.foreground.limit - ApiHttpServer.RequestMemory.overhead(.of(u8)));
     defer server.alloc.free(occupied);
     try std.testing.expectError(error.OutOfMemory, server.alloc.alloc(u8, 1));
-    try std.testing.expectEqual(@as(usize, 1 << 20), memory.foreground.limit + memory.control.limit);
+    try std.testing.expectEqual(@as(usize, 1 << 20), memory.foreground.limit + memory.control.limit + memory.cleanup.?.limit);
     var diagnostic: @import("antfly_local_sources").sql_compiler.Diagnostic = .{};
     var plan = try @import("sql_control.zig").Plan.acquire(server.controlAllocator(), &server.sql_plan_cache, std.testing.io, .{ .statement = "ROLLBACK", .principal = "reader", .database = "default", .namespace = "public" }, &diagnostic, true);
     defer plan.release(std.testing.io);
@@ -59086,6 +60040,208 @@ test "workload envelope preserves control allocation under aggregate foreground 
     try std.testing.expect(memory.control.used.load(.acquire) > 0);
     try std.testing.expectError(error.DeadlineExceeded, server.executeMcpApplicationOperationWithContext(.{ .query = .{ .table_name = "docs", .body = "{}" } }, null, .{ .deadline_ns = 0 }));
     try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+}
+
+test "workload envelope cleanup memory statistics retain combined kernel accounting" {
+    const alloc = std.testing.allocator;
+    var api = try ApiHttpServer.initWithConfig(alloc, .{ .request_memory_bytes = 1 << 20 }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer api.deinit();
+    const ordinary = try api.controlAllocator().alloc(u8, 24);
+    defer api.cleanupAllocator().free(ordinary);
+    const cleanup = try api.cleanupAllocator().alloc(u8, 48);
+    defer api.alloc.free(cleanup);
+    const memory = api.workloadMemoryStats();
+    const combined = memory.controlWithCleanup().?;
+    try std.testing.expectEqual(@as(usize, (1 << 20) / 8), combined.limit_bytes);
+    try std.testing.expectEqual(memory.control.?.used_bytes + memory.cleanup.?.used_bytes, combined.used_bytes);
+    try std.testing.expectEqual(memory.control.?.peak_bytes + memory.cleanup.?.peak_bytes, combined.peak_bytes);
+    try std.testing.expectEqual(@as(usize, 24 + 48 + 2 * ApiHttpServer.RequestMemory.overhead(.of(u8))), combined.used_bytes);
+    // Transport advertises only memory available to actual request handlers.
+    // Cleanup capacity stays private even though the legacy ABI includes it.
+    const transport = api.configurePublicHttpTransport(.{});
+    try std.testing.expect(transport.protected_application_memory_bytes <= memory.control.?.limit_bytes);
+    try std.testing.expect(transport.application_memory_budget_bytes <= memory.foreground.?.limit_bytes + memory.control.?.limit_bytes);
+}
+
+test "workload envelope cleanup consumers start through ordinary control and node exhaustion" {
+    const alloc = std.testing.allocator;
+    const Manager = @import("antfly_local_sources").storage_resource_manager.ResourceManager;
+    const Callbacks = struct {
+        fn reserve(ptr: *anyopaque, bytes: usize) callconv(.c) bool {
+            return @as(*Manager, @ptrCast(@alignCast(ptr))).reserveExternal(bytes);
+        }
+        fn release(ptr: *anyopaque, bytes: usize) callconv(.c) void {
+            @as(*Manager, @ptrCast(@alignCast(ptr))).releaseExternal(bytes);
+        }
+    };
+    for ([_]bool{ false, true }) |imported| {
+        var manager = Manager.init(.{ .memory_budget = .{ .hard_limit_bytes = 32 << 20 }, .identity_allocator = alloc });
+        defer manager.deinit(alloc);
+        var backend = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 16, .sql_worker_capacity = 16 } });
+        defer backend.deinit();
+        var node = try RunnableScheduler.NodeOwner.init(.{ .slots = 4, .cleanup_slots = 1, .max_operations = 8, .max_bytes = 4 << 20, .control_bytes = 1 << 20, .read_isolation = false });
+        defer node.deinit();
+        var api = try ApiHttpServer.initWithConfig(alloc, .{
+            .backend_runtime = backend.ptr(),
+            .imported_runtime_io = if (imported) .{ .api = backend.ptr().apiIo(), .sql_workers = @import("sql_worker_lease.zig").factory(backend.ptr()).? } else null,
+            .resource_manager = &manager,
+            .runnable_owner_handle = &node,
+            .request_memory_bytes = 8 << 20,
+            .retained_memory_bytes = 8 << 20,
+            .memory_accounting = .{ .ptr = &manager, .reserve_fn = Callbacks.reserve, .release_fn = Callbacks.release },
+        }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+        defer api.deinit();
+        _ = try api.sqlControlIo();
+        // Adopt legacy registry allocations during bootstrap, before workloads
+        // can consume the node budget. Restarting its consumer must not need
+        // ordinary request/state memory after that ownership is established.
+        try api.startResourceCleanup();
+        api.stopResourceCleanup();
+        const memory = api.request_memory.?;
+        const prefix = ApiHttpServer.RequestMemory.overhead(.of(u8));
+        const foreground = try api.alloc.alloc(u8, memory.foreground.limit - memory.foreground.stats().used_bytes - prefix);
+        defer api.alloc.free(foreground);
+        const control = try api.controlAllocator().alloc(u8, memory.control.limit - memory.control.stats().used_bytes - prefix);
+        defer api.controlAllocator().free(control);
+        const retained = try api.state_alloc.alloc(u8, api.state_memory.?.limit - api.state_memory.?.stats().used_bytes);
+        defer api.state_alloc.free(retained);
+        const pressure = (32 << 20) - manager.snapshot().memory.used_bytes;
+        try std.testing.expect(manager.reserveExternal(pressure));
+        defer manager.releaseExternal(pressure);
+        try std.testing.expectError(error.OutOfMemory, api.alloc.alloc(u8, 1));
+        try std.testing.expectError(error.OutOfMemory, api.controlAllocator().alloc(u8, 1));
+        try std.testing.expectError(error.OutOfMemory, api.state_alloc.alloc(u8, 1));
+        // These are real consumers with independently joined native/imported
+        // worker leases, not allocations through a test-only reserve.
+        try api.startResourceCleanup();
+        try api.startReadRetirement(2, 4096, 2048);
+        try std.testing.expect(api.resource_cleanup_runtime != null);
+        try std.testing.expect(api.read_retirement_runtime != null);
+        try std.testing.expectEqual(@as(u64, 32 << 20), manager.snapshot().memory.used_bytes);
+        try api.joinReadRetirement();
+        api.stopResourceCleanup();
+        try std.testing.expectEqual(@as(u64, 32 << 20), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), node.borrowers);
+    }
+}
+
+test "workload envelope cleanup SQL completion survives exhausted ordinary budgets and publication needs no allocation" {
+    const alloc = std.testing.allocator;
+    const runtime = @import("antfly_runtime_abi");
+    const Manager = @import("antfly_local_sources").storage_resource_manager.ResourceManager;
+    const Fixture = struct {
+        refs: std.atomic.Value(usize) = .init(1),
+        cleaned: std.atomic.Value(bool) = .init(false),
+        retired: std.atomic.Value(bool) = .init(false),
+        go: std.Io.Event = .unset,
+        fn now() u64 {
+            return 0;
+        }
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn retain(raw: *anyopaque) anyerror!void {
+            _ = from(raw).refs.fetchAdd(1, .acq_rel);
+        }
+        fn release(raw: *anyopaque) void {
+            _ = from(raw).refs.fetchSub(1, .acq_rel);
+        }
+        fn cleanup(raw: *anyopaque, _: runtime.runnable_abi.Borrowed, io: std.Io) anyerror!void {
+            try from(raw).go.wait(io);
+            from(raw).cleaned.store(true, .release);
+        }
+        fn retire(raw: *anyopaque) anyerror!void {
+            from(raw).retired.store(true, .release);
+        }
+        fn reserve(raw: *anyopaque, bytes: usize) callconv(.c) bool {
+            return @as(*Manager, @ptrCast(@alignCast(raw))).reserveExternal(bytes);
+        }
+        fn releaseMemory(raw: *anyopaque, bytes: usize) callconv(.c) void {
+            @as(*Manager, @ptrCast(@alignCast(raw))).releaseExternal(bytes);
+        }
+    };
+    for ([_]bool{ false, true }) |imported| {
+        var manager = Manager.init(.{ .memory_budget = .{ .hard_limit_bytes = 32 << 20 }, .identity_allocator = alloc });
+        defer manager.deinit(alloc);
+        var backend = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+        defer backend.deinit();
+        var owner: @import("runnable_owner_execution.zig").State = .{
+            .owner_alloc = alloc,
+            .owner = try RunnableScheduler.NodeOwner.init(.{ .slots = 4, .cleanup_slots = 1, .max_operations = 8, .max_bytes = 4 << 20, .control_bytes = 1 << 20, .read_isolation = false }),
+            .native_now_ns = Fixture.now,
+        };
+        defer owner.owner.deinit();
+        var api = try ApiHttpServer.initWithConfig(alloc, .{
+            .backend_runtime = backend.ptr(),
+            .imported_runtime_io = if (imported) .{ .api = backend.ptr().apiIo(), .sql_workers = @import("sql_worker_lease.zig").factory(backend.ptr()).? } else null,
+            .resource_manager = &manager,
+            .runnable_owner_handle = &owner.owner,
+            .request_memory_bytes = 8 << 20,
+            .retained_memory_bytes = 8 << 20,
+            .memory_accounting = .{ .ptr = &manager, .reserve_fn = Fixture.reserve, .release_fn = Fixture.releaseMemory },
+        }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+        defer api.deinit();
+        // Shared executors still belong to the node; this test isolates the
+        // API-owned completion runtime, reaper, registry and task metadata.
+        const io = try api.sqlCleanupIo();
+        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+        const port = owner.port();
+        var handle: ?*anyopaque = null;
+        try std.testing.expect(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(runtime.runnable_abi.Class.query), .out_handle = &handle }).isOk());
+        defer port.finish(handle.?);
+        const borrow = try runtime.runnable_abi.Borrowed.fromOwner(port, handle.?, 1, .query);
+        const memory = api.request_memory.?;
+        const prefix = ApiHttpServer.RequestMemory.overhead(.of(u8));
+        const foreground = try api.alloc.alloc(u8, memory.foreground.limit - memory.foreground.stats().used_bytes - prefix);
+        defer api.alloc.free(foreground);
+        const control = try api.controlAllocator().alloc(u8, memory.control.limit - memory.control.stats().used_bytes - prefix);
+        defer api.controlAllocator().free(control);
+        const retained = try api.state_alloc.alloc(u8, api.state_memory.?.limit - api.state_memory.?.stats().used_bytes);
+        defer api.state_alloc.free(retained);
+        const pressure = (32 << 20) - manager.snapshot().memory.used_bytes;
+        try std.testing.expect(manager.reserveExternal(pressure));
+        defer manager.releaseExternal(pressure);
+        try std.testing.expectError(error.OutOfMemory, api.alloc.alloc(u8, 1));
+        try std.testing.expectError(error.OutOfMemory, api.controlAllocator().alloc(u8, 1));
+        try std.testing.expectError(error.OutOfMemory, api.state_alloc.alloc(u8, 1));
+        const active = try api.sqlCleanupOwner();
+        var fixture: Fixture = .{};
+        defer fixture.go.set(io);
+        var reservation = try active.registry.reserve(io, borrow, &.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 100 }, &fixture, .{
+            .retain = Fixture.retain,
+            .release = Fixture.release,
+            .cleanup = Fixture.cleanup,
+            .retire = Fixture.retire,
+        });
+        var published = false;
+        var started = false;
+        defer if (reservation.slot != null) {
+            if (!published) reservation.abort() catch unreachable else {
+                if (!started) reservation.start() catch unreachable;
+                reservation.transfer() catch unreachable;
+            }
+        };
+        try std.testing.expectEqual(@as(usize, 2), fixture.refs.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), active.registry.snapshot().foreground);
+        const cleanup = try api.cleanupAllocator().alloc(u8, memory.cleanup.?.limit - memory.cleanup.?.stats().used_bytes - prefix);
+        defer api.cleanupAllocator().free(cleanup);
+        try std.testing.expectError(error.OutOfMemory, api.cleanupAllocator().alloc(u8, 1));
+        try reservation.publish();
+        published = true;
+        try reservation.start();
+        started = true;
+        try reservation.transfer();
+        try std.testing.expect(!fixture.cleaned.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), active.registry.snapshot().retained);
+        fixture.go.set(io);
+        const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+        while (fixture.refs.load(.acquire) != 1 or active.registry.snapshot().retained != 0) {
+            if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.Timeout;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(fixture.cleaned.load(.acquire) and fixture.retired.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 32 << 20), manager.snapshot().memory.used_bytes);
+    }
 }
 
 test "workload envelope pins HTTP transport and control through node memory exhaustion" {
@@ -59328,7 +60484,7 @@ test "runnable execution legacy API constructors retain bounded request owners" 
     }
 }
 
-test "retrieval catalog read owns or borrows one original query execution" {
+test "internal query owner retrieval catalog read owns or borrows one original query execution" {
     const a = std.testing.allocator;
     const Fake = struct {
         server: ?*ApiHttpServer = null,
@@ -59355,11 +60511,15 @@ test "retrieval catalog read owns or borrows one original query execution" {
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
             return null;
         }
+        fn unused(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedTestCall;
+        }
         fn query(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
             try std.testing.expectEqualStrings("table:docs", table);
             try std.testing.expect(req.execution_deadline_ns != null);
+            try std.testing.expectEqual(@as(*anyopaque, self), req.execution_remote_query.?.ptr);
             const stats = self.server.?.runnable_scheduler.?.stats();
             try std.testing.expectEqual(@as(usize, 1), stats.operations);
             try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots);
@@ -59372,10 +60532,11 @@ test "retrieval catalog read owns or borrows one original query execution" {
     var server = ApiHttpServer.init(a, .{ .runnable_policy = .{ .slots = 2 } }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog, .supports_query_definitions = true } }, reads, null);
     defer server.deinit();
     fake.server = &server;
+    const authority: http_common.RequestExecutor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.unused } };
     const deadline = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
     const body = "{\"full_text_search\":{\"match_all\":{}}}";
     const before = server.runnable_scheduler.?.stats().grants[0];
-    var response = try server.executeCatalogRetrievalQuery(a, .{ .deadline_ns = deadline }, "docs", body, null);
+    var response = try server.executeCatalogRetrievalQuery(a, .{ .deadline_ns = deadline, .execution_remote_query = authority }, "docs", body, null);
     defer response.deinit(a);
     try std.testing.expectEqual(before + 1, server.runnable_scheduler.?.stats().grants[0]);
     try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
@@ -59385,17 +60546,17 @@ test "retrieval catalog read owns or borrows one original query execution" {
     var read: @import("runnable_local_read.zig").Read = .{ .execution = &parent, .allocator = a };
     var team = try read.team();
     const borrowed_grants = server.runnable_scheduler.?.stats().grants;
-    var borrowed = try server.executeCatalogRetrievalQuery(a, .{ .deadline_ns = deadline, .execution_team = &team }, "docs", body, null);
+    var borrowed = try server.executeCatalogRetrievalQuery(a, .{ .deadline_ns = deadline, .execution_team = &team, .execution_remote_query = authority }, "docs", body, null);
     defer borrowed.deinit(a);
     try std.testing.expectEqual(borrowed_grants, server.runnable_scheduler.?.stats().grants);
     try parent.checkLifetime();
     try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().operations);
-    var internal_borrowed = try server.executeInternalRetrievalQuery(a, reads, .{ .deadline_ns = deadline, .execution_team = &team }, "table:docs", body);
+    var internal_borrowed = try server.executeInternalRetrievalQuery(a, reads, .{ .deadline_ns = deadline, .execution_team = &team, .execution_remote_query = authority }, "table:docs", body);
     defer internal_borrowed.deinit(a);
     try parent.checkLifetime();
     try std.testing.expectEqual(borrowed_grants, server.runnable_scheduler.?.stats().grants);
     parent.finish();
-    var internal_owned = try server.executeInternalRetrievalQuery(a, reads, .{ .deadline_ns = deadline }, "table:docs", body);
+    var internal_owned = try server.executeInternalRetrievalQuery(a, reads, .{ .deadline_ns = deadline, .execution_remote_query = authority }, "table:docs", body);
     defer internal_owned.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
@@ -59661,4 +60822,2589 @@ test "api http server serves status using control metadata without diagnostic tr
     defer denied.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 3), fake.control_reads);
     try std.testing.expectEqual(@as(usize, 0), fake.diagnostic_reads);
+}
+
+test "request execution lifetime ingress rejects retrieval and extension batch before server access" {
+    const runtime = @import("antfly_runtime_abi");
+    const Scope = struct {
+        cause: anyerror,
+        checks: usize = 0,
+        fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            return runtime.error_abi.statusFromError(self.cause);
+        }
+        fn checkpoint(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.TestUnexpectedResult);
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.TestUnexpectedResult);
+        }
+    };
+    var server: ApiHttpServer = undefined;
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        var scope: Scope = .{ .cause = cause };
+        var team: runtime.runnable_abi.Team = .{ .borrow = .{ .context = &scope, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.query), .checkpoint = Scope.checkpoint, .park = Scope.phase, .enter = Scope.phase, .check_lifetime = Scope.lifetime }, .maximum_slots = 1, .allocator = std.testing.allocator };
+        const context: api_operation.RequestContext = .{ .execution_team = &team };
+        try std.testing.expectError(cause, server.executeCatalogRetrievalQuery(std.testing.allocator, context, "docs", "{}", null));
+        try std.testing.expectError(cause, server.executeExtensionHostBatchWithContext(std.testing.allocator, "docs", "{}", null, null, context));
+        try std.testing.expectEqual(@as(usize, 2), scope.checks);
+    }
+}
+
+test "request metadata read lifetime rejects before callbacks and retires post-read owned results" {
+    const runtime = @import("antfly_runtime_abi");
+    const staging = @import("../metadata/restore_staging.zig");
+    const Capture = struct {
+        calls: usize = 0,
+        returned: bool = false,
+        reject_before: bool = false,
+        reject_after: bool = false,
+        missing: bool = false,
+        cause: anyerror = error.Canceled,
+        fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.reject_before or (self.reject_after and self.returned)) runtime.error_abi.statusFromError(self.cause) else .ok;
+        }
+        fn checkpoint(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.TestUnexpectedResult);
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.TestUnexpectedResult);
+        }
+        fn bytes(raw: *anyopaque, allocator: std.mem.Allocator, request: api_operation.RequestContext) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("reader", request.request_id);
+            self.calls += 1;
+            const result = if (self.missing) null else try allocator.dupe(u8, "owned");
+            self.returned = true;
+            return result;
+        }
+        fn backup(raw: *anyopaque, allocator: std.mem.Allocator, _: u64, request: api_operation.RequestContext) !?[]u8 {
+            return bytes(raw, allocator, request);
+        }
+        fn job(raw: *anyopaque, allocator: std.mem.Allocator, _: [16]u8, request: api_operation.RequestContext) !?[]u8 {
+            return bytes(raw, allocator, request);
+        }
+        fn receipt(raw: *anyopaque, allocator: std.mem.Allocator, _: [16]u8, _: staging.State, _: u64, request: api_operation.RequestContext) !?[]u8 {
+            return bytes(raw, allocator, request);
+        }
+        fn progress(raw: *anyopaque, _: std.mem.Allocator, _: [16]u8, request: api_operation.RequestContext) !?staging.Progress {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("reader", request.request_id);
+            self.calls += 1;
+            self.returned = true;
+            return if (self.missing) null else .{ .revision = 7 };
+        }
+        fn authority(raw: *anyopaque, allocator: std.mem.Allocator, input: staging.AuthorityRequest, request: api_operation.RequestContext) !staging.AuthorityResponse {
+            const json = try bytes(raw, allocator, request);
+            return .{ .node_id = input.node_id, .plan_id = input.plan_id, .metadata_group_id = 1, .metadata_incarnation = @splat(1), .metadata_epoch = 1, .progress = .{ .revision = 7 }, .job_json = json };
+        }
+    };
+    const Fixture = struct {
+        fn run(allocator: std.mem.Allocator, mode: u8, reject_after: bool, missing: bool, cause: anyerror, reject_before: bool) !void {
+            var capture: Capture = .{ .reject_after = reject_after, .missing = missing, .cause = cause, .reject_before = reject_before };
+            var team: runtime.runnable_abi.Team = .{ .borrow = .{ .context = &capture, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.query), .checkpoint = Capture.checkpoint, .park = Capture.phase, .enter = Capture.phase, .check_lifetime = Capture.lifetime }, .maximum_slots = 1, .allocator = allocator };
+            const request: api_operation.RequestContext = .{ .execution_team = &team, .request_id = "reader" };
+            const source: StatusSource = .{ .ptr = &capture, .vtable = &.{ .status = undefined, .get_backup_cohort = Capture.backup, .get_restore_staging = Capture.job, .get_restore_staging_receipt = Capture.receipt, .get_restore_staging_progress = Capture.progress, .get_restore_staging_authority = Capture.authority } };
+            const Call = struct {
+                fn invoke(a: std.mem.Allocator, kind: u8, status: StatusSource, context: api_operation.RequestContext, absent: bool) !void {
+                    if (kind == 4) {
+                        var result = try status.getRestoreStagingAuthority(a, .{ .node_id = 1, .plan_id = @splat(1), .include_plan = true }, context);
+                        defer result.deinit(a);
+                        try std.testing.expectEqual(absent, result.job_json == null);
+                        return;
+                    }
+                    if (kind == 3) {
+                        const result = try status.getRestoreStagingProgress(a, @splat(1), context);
+                        try std.testing.expectEqual(absent, result == null);
+                        if (result) |value| try std.testing.expectEqual(@as(u64, 7), value.revision);
+                        return;
+                    }
+                    const result = switch (kind) {
+                        0 => try status.getBackupCohort(a, 1, context),
+                        1 => try status.getRestoreStaging(a, @splat(1), context),
+                        2 => try status.getRestoreStagingReceipt(a, @splat(1), .importing, 7001, context),
+                        else => unreachable,
+                    };
+                    defer if (result) |value| a.free(value);
+                    try std.testing.expectEqual(absent, result == null);
+                    if (result) |value| try std.testing.expectEqualStrings("owned", value);
+                }
+            };
+            if (reject_after or reject_before) {
+                try std.testing.expectError(cause, Call.invoke(allocator, mode, source, request, missing));
+            } else try Call.invoke(allocator, mode, source, request, missing);
+            try std.testing.expectEqual(@as(usize, if (reject_before) 0 else 1), capture.calls);
+        }
+    };
+    for (0..5) |index| {
+        const mode: u8 = @intCast(index);
+        for ([_]bool{ false, true }) |missing| {
+            try Fixture.run(std.testing.allocator, mode, false, missing, error.Canceled, false);
+            for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+                try Fixture.run(std.testing.allocator, mode, true, missing, cause, false);
+                try Fixture.run(std.testing.allocator, mode, false, missing, cause, true);
+            }
+        }
+        if (mode != 3) try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ mode, false, false, error.Canceled, false });
+    }
+}
+
+test "workload read pools startup allocation failure releases node reservations" {
+    const Fixture = struct {
+        const Node = struct {
+            used: usize = 0,
+            fn reserve(raw: *anyopaque, bytes: usize) callconv(.c) bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.used += bytes;
+                return true;
+            }
+            fn release(raw: *anyopaque, bytes: usize) callconv(.c) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.used -= bytes;
+            }
+        };
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn run(a: std.mem.Allocator) !void {
+            var node: Node = .{};
+            defer std.debug.assert(node.used == 0);
+            var source: u8 = 0;
+            var api = try ApiHttpServer.initWithConfig(a, .{
+                .request_memory_bytes = 8 << 20,
+                .retained_memory_bytes = 8 << 20,
+                .memory_accounting = .{ .ptr = &node, .reserve_fn = Node.reserve, .release_fn = Node.release },
+                .runnable_policy = .{ .slots = 4, .cleanup_slots = 1, .read_isolation = true },
+            }, .{ .ptr = &source, .vtable = &.{ .status = status } }, null, null);
+            defer api.deinit();
+            try std.testing.expect(api.readMemoryPool() != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "remote attempt service credential verifies signed context before worker admission" {
+    const wire = @import("../common/remote_attempt_wire.zig");
+    const service = @import("internal_service_auth.zig");
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var source: Source = .{};
+    const secret = "remote-attempt-test-secret-at-least-32-bytes";
+    var server = try ApiHttpServer.initWithConfig(std.testing.allocator, .{
+        .internal_service_secret = secret,
+        .internal_service_issuer = "cluster",
+    }, .{ .ptr = &source, .vtable = &.{ .status = Source.status } }, null, null);
+    defer server.deinit();
+    const context = wire.Context{
+        .kind = .read,
+        .id = .{ .coordinator = 7, .generation = 9, .operation = 71, .sequence = 4 },
+        .worker_incarnation = 11,
+        .remaining_ns = 10 * std.time.ns_per_s,
+        .charged_bytes = 4096,
+        .request_digest = wire.requestDigest("POST", "/internal/v1/read", "{}"),
+    };
+    const subject = context.subject();
+    const now: i64 = @intCast(@divFloor(server.internalAuthRealtimeNs(), std.time.ns_per_s));
+    const token = try service.tokenAlloc(std.testing.allocator, .{ .secret = secret, .issuer = "cluster", .subject = &subject, .remote_attempt = context }, now);
+    defer std.testing.allocator.free(token);
+    const received_before = platform_time.monotonicNs();
+    const verified = try server.authenticateRemoteAttempt(token, 11, .read, "POST", "/internal/v1/read", "{}", 7 * std.time.ns_per_s);
+    try std.testing.expect(verified.local_deadline_ns >= received_before + 7 * std.time.ns_per_s);
+    try std.testing.expect(verified.local_deadline_ns <= platform_time.monotonicNs() + 7 * std.time.ns_per_s);
+    try std.testing.expectEqualDeep(context.id, verified.context.id);
+    try std.testing.expectError(error.InvalidRemoteAttempt, server.authenticateRemoteAttempt(token, 11, .read, "POST", "/internal/v1/write", "{}", 7 * std.time.ns_per_s));
+    try std.testing.expectError(error.Unauthorized, server.authenticateRemoteAttempt(token, 22, .read, "POST", "/internal/v1/read", "{}", 7 * std.time.ns_per_s));
+    const AllocationFailures = struct {
+        fn run(allocator: std.mem.Allocator, api: *ApiHttpServer, signed_token: []const u8) !void {
+            const previous = api.alloc;
+            api.alloc = allocator;
+            defer api.alloc = previous;
+            const before = platform_time.monotonicNs();
+            const result = try api.authenticateRemoteAttempt(signed_token, 11, .read, "POST", "/internal/v1/read", "{}", 7 * std.time.ns_per_s);
+            try std.testing.expect(result.local_deadline_ns >= before + 7 * std.time.ns_per_s);
+            try std.testing.expect(result.local_deadline_ns <= platform_time.monotonicNs() + 7 * std.time.ns_per_s);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationFailures.run, .{ &server, token });
+    const encoded_context = try context.encode();
+    const user_payload = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+        .iss = "cluster",
+        .sub = "user:alice",
+        .tables = [_][]const u8{ "docs", "peers" },
+        .operations = [_][]const u8{"*"},
+        .row_filter = .{ .docs = .{ .term = .{ .tenant_id = "t1" } }, .peers = .{ .term = .{ .tenant_id = "t2" } } },
+        .metadata = .{ .remote_attempt = @as([]const u8, &encoded_context) },
+        .iat = now,
+        .exp = now + 60,
+    }, .{});
+    defer std.testing.allocator.free(user_payload);
+    const user_token = try encodeTrustedPrincipalToken(std.testing.allocator, secret, user_payload);
+    defer std.testing.allocator.free(user_token);
+    try std.testing.expectError(error.Unauthorized, server.authenticateRemoteAttempt(user_token, 11, .read, "POST", "/internal/v1/read", "{}", 7 * std.time.ns_per_s));
+    const UserAllocationFailures = struct {
+        fn run(allocator: std.mem.Allocator, api: *ApiHttpServer, signed_token: []const u8, signing_secret: []const u8) !void {
+            var identity = try api.authenticateTrustedPrincipalWithIssuerAndAllocator(allocator, signed_token, signing_secret, "cluster");
+            defer identity.deinit(allocator);
+            try std.testing.expect(!identity.is_internal_service);
+            try std.testing.expectEqualStrings("user:alice", identity.username);
+            try std.testing.expectEqual(@as(usize, 6), identity.permissions.len);
+            try std.testing.expectEqual(@as(usize, 2), identity.row_filter.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, UserAllocationFailures.run, .{ &server, user_token, secret });
+    const signature_start = std.mem.lastIndexOfScalar(u8, token, '.').? + 1;
+    const original = token[signature_start];
+    token[signature_start] = if (original == 'A') 'B' else 'A';
+    try std.testing.expectError(error.Unauthorized, server.authenticateRemoteAttempt(token, 11, .read, "POST", "/internal/v1/read", "{}", 7 * std.time.ns_per_s));
+    token[signature_start] = original;
+    const legacy = try service.tokenAlloc(std.testing.allocator, .{ .secret = secret, .issuer = "cluster" }, now);
+    defer std.testing.allocator.free(legacy);
+    try std.testing.expectError(error.InvalidRemoteAttempt, server.authenticateRemoteAttempt(legacy, 11, .read, "POST", "/internal/v1/read", "{}", 7 * std.time.ns_per_s));
+    try std.testing.expectError(error.InvalidRemoteAttemptPrincipal, service.tokenAlloc(std.testing.allocator, .{ .secret = secret, .issuer = "cluster", .remote_attempt = context }, now));
+}
+
+test "remote attempt membership uses linearizable owner and original cancellation deadline" {
+    const membership = @import("../common/remote_membership.zig");
+    const wire = @import("../common/remote_attempt_wire.zig");
+    const realm = "0123456789abcdef0123456789abcdef".*;
+    const Source = struct {
+        nodes: [2]metadata_mod.NodeRecord = .{ .{ .node_id = 7 }, .{ .node_id = 9 } },
+        stores: [1]metadata_mod.StoreRecord = .{.{ .store_id = 13, .node_id = 9, .replica_root_incarnation = 11, .reporter_incarnation = 17 }},
+        calls: usize = 0,
+        frees: usize = 0,
+        cached_calls: usize = 0,
+        observed_deadline: ?u64 = null,
+        cancel: std.atomic.Value(bool) = .init(false),
+        cancel_during_snapshot: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metadata_incarnation = realm, .metrics = .{} };
+        }
+        fn linearizable(raw: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.observed_deadline = request.deadline_ns;
+            if (self.cancel_during_snapshot) self.cancel.store(true, .release);
+            return .{ .status = try status(raw), .nodes = &self.nodes, .stores = &self.stores, .tables = &.{}, .ranges = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn cached(raw: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cached_calls += 1;
+            return error.UnexpectedCachedMembershipRead;
+        }
+        fn cachedOptional(raw: *anyopaque) !?metadata_api.AdminSnapshot {
+            return try cached(raw);
+        }
+        fn free(raw: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.frees += 1;
+        }
+    };
+    var source: Source = .{};
+    const secret = "remote-worker-control-test-secret-over-32-bytes";
+    var server = try ApiHttpServer.initWithConfig(std.testing.allocator, .{
+        .request_memory_bytes = 8 << 20,
+        .retained_memory_bytes = 8 << 20,
+        .internal_service_secret = secret,
+        .internal_service_issuer = "cluster",
+    }, .{
+        .ptr = &source,
+        .vtable = &.{ .status = Source.status, .admin_snapshot = Source.cached, .cached_admin_snapshot = Source.cachedOptional, .linearizable_snapshot = Source.linearizable, .free_admin_snapshot = Source.free },
+    }, null, null);
+    defer server.deinit();
+    try std.testing.expect(isProtectedHttpControl(.POST, internal_api_routes.remote_attempt_status, "{}"));
+    try std.testing.expect(isProtectedHttpControl(.POST, internal_api_routes.remote_attempt_fence, "{}"));
+    try std.testing.expect(isProtectedHttpControl(.POST, internal_api_routes.remote_attempt_cancel, "{}"));
+    try std.testing.expect(!isProtectedHttpControl(.GET, internal_api_routes.remote_attempt_status, "{}"));
+    try std.testing.expect(!isProtectedHttpControl(.POST, "/internal/v1/attempt/read", "{}"));
+    const verified = wire.Verified{
+        .context = .{
+            .kind = .read,
+            .id = .{ .coordinator = try membership.coordinatorIdentity(realm, 7), .generation = 1, .operation = 71, .sequence = 1 },
+            .worker_incarnation = 11,
+            .remaining_ns = 10 * std.time.ns_per_s,
+            .charged_bytes = 4096,
+            .request_digest = @splat(0),
+        },
+        .local_deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s,
+    };
+    const local: membership.Local = .{ .metadata_incarnation = realm, .node_id = 9, .store_id = 13, .root_incarnation = 11, .reporter_incarnation = 17 };
+    const request: api_operation.RequestContext = .{ .cancellation = .fromAtomic(&source.cancel), .deadline_ns = verified.local_deadline_ns + std.time.ns_per_s };
+    const binding = try server.authorizeRemoteAttemptMembership(verified, request, local);
+    try std.testing.expectEqual(@as(u64, 7), binding.coordinator_node_id);
+    try std.testing.expectEqual(@as(?u64, verified.local_deadline_ns), source.observed_deadline);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqual(@as(usize, 1), source.frees);
+    var earlier = request;
+    earlier.deadline_ns = verified.local_deadline_ns - std.time.ns_per_s;
+    _ = try server.authorizeRemoteAttemptMembership(verified, earlier, local);
+    try std.testing.expectEqual(earlier.deadline_ns, source.observed_deadline);
+    source.cancel_during_snapshot = true;
+    try std.testing.expectError(error.Canceled, server.authorizeRemoteAttemptMembership(verified, request, local));
+    try std.testing.expectEqual(@as(usize, 3), source.calls);
+    try std.testing.expectEqual(@as(usize, 3), source.frees);
+    source.cancel.store(false, .release);
+    const original_vtable = server.source.vtable;
+    defer server.source.vtable = original_vtable;
+    var unsupported = original_vtable.*;
+    unsupported.linearizable_snapshot = null;
+    server.source.vtable = &unsupported;
+    try std.testing.expectError(error.RemoteMembershipUnavailable, server.authorizeRemoteAttemptMembership(verified, request, local));
+    unsupported.linearizable_snapshot = Source.linearizable;
+    unsupported.free_admin_snapshot = null;
+    try std.testing.expectError(error.RemoteMembershipUnavailable, server.authorizeRemoteAttemptMembership(verified, request, local));
+    try std.testing.expectEqual(@as(usize, 3), source.calls);
+    try std.testing.expectEqual(@as(usize, 0), source.cached_calls);
+    server.source.vtable = original_vtable;
+    source.cancel_during_snapshot = false;
+    const worker = @import("../common/remote_worker.zig");
+    const durable = @import("../common/remote_fence_store.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try durable.Store.create(std.testing.allocator, std.testing.io, tmp.dir, 11, 2);
+    defer store.deinit();
+    var registry = try worker.Registry.init(std.testing.allocator, &store, local, .{
+        .coordinators = 2,
+        .attempts = 2,
+        .per_coordinator_attempts = 2,
+        .duplicate_window = 8,
+        .bytes = 16 << 10,
+        .per_coordinator_bytes = 16 << 10,
+        .resource_references = 4,
+    }, platform_time.monotonicNs);
+    defer registry.deinit() catch unreachable;
+    const Recovery = struct {
+        fn ready(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    try registry.completeRecovery(.{ .context = &source, .quiescent = Recovery.ready });
+    const Sign = struct {
+        fn token(context: wire.Context, signing_secret: []const u8, now: i64) ![]u8 {
+            const subject = context.subject();
+            return @import("internal_service_auth.zig").tokenAlloc(std.testing.allocator, .{ .secret = signing_secret, .issuer = "cluster", .subject = &subject, .remote_attempt = context }, now);
+        }
+    };
+    const replies = @import("../common/remote_attempt_reply.zig");
+    const reply_seed: [32]u8 = @splat(7);
+    const reply_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(reply_seed);
+    source.stores[0].replica_root_public_key = reply_pair.public_key.toBytes();
+    const reply_authority = try server.resolveRemoteReplyAuthority(local, request);
+    const reply_signer = try replies.Signer.initEnrolled(reply_authority, .{ .root_incarnation = local.root_incarnation, .public_key = reply_pair.public_key.toBytes(), .seed = reply_seed });
+    {
+        const Clock = struct {
+            fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+                return .{ .nanoseconds = 100 };
+            }
+        };
+        var clock_vtable = std.testing.io.vtable.*;
+        clock_vtable.now = Clock.now;
+        var foreign_clock = std.testing.io;
+        foreign_clock.vtable = &clock_vtable;
+        var capability = verified;
+        capability.context.kind = .capabilities;
+        capability.context.id.operation = 0;
+        capability.context.id.sequence = 0;
+        capability.context.charged_bytes = 0;
+        capability.context.request_digest = wire.requestDigest("POST", internal_api_routes.remote_attempt_capabilities, &@as([32]u8, @splat(1)));
+        capability.local_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        const before = platform_time.monotonicNs();
+        const observation = try server.signRemoteCapabilities(&registry, &reply_signer, capability, .{ .deadline_io = .init(&foreign_clock), .deadline_ns = 100 + 2 * std.time.ns_per_s });
+        try observation.verify(reply_authority, capability.context);
+        try std.testing.expect(source.observed_deadline.? > before + std.time.ns_per_s);
+        try std.testing.expect(source.observed_deadline.? < before + 3 * std.time.ns_per_s);
+    }
+
+    const now: i64 = @intCast(@divFloor(server.internalAuthRealtimeNs(), std.time.ns_per_s));
+    var fence_context = verified.context;
+    fence_context.kind = .fence;
+    fence_context.id.operation = 0;
+    fence_context.id.sequence = 0;
+    fence_context.charged_bytes = 0;
+    fence_context.request_digest = wire.requestDigest("POST", "/internal/v1/attempt/fence", "{}");
+    const fence_token = try Sign.token(fence_context, secret, now);
+    defer std.testing.allocator.free(fence_token);
+    var fence_call: ApiHttpServer.RemoteAttemptCall = .{ .token = fence_token, .method = "POST", .target = "/internal/v1/attempt/fence", .body = "{}", .maximum_duration_ns = 7 * std.time.ns_per_s };
+    _ = try server.fenceRemoteReads(&registry, fence_call);
+    var read_context = verified.context;
+    read_context.request_digest = wire.requestDigest("POST", "/internal/v1/groups/7/tables/docs/owned-query/11/17", "{}");
+    const read_token = try Sign.token(read_context, secret, now);
+    defer std.testing.allocator.free(read_token);
+    const original_read_deadline = platform_time.monotonicNs() + 4 * std.time.ns_per_s;
+    const read_call: ApiHttpServer.RemoteAttemptCall = .{ .token = read_token, .method = "POST", .target = "/internal/v1/groups/7/tables/docs/owned-query/11/17", .body = "{}", .request = .{ .deadline_ns = original_read_deadline }, .maximum_duration_ns = 7 * std.time.ns_per_s };
+    var stale_context = read_context;
+    const stale_path = "/internal/v1/groups/7/tables/docs/owned-query/11/18";
+    stale_context.request_digest = wire.requestDigest("POST", stale_path, "{}");
+    const stale_token = try Sign.token(stale_context, secret, now);
+    defer std.testing.allocator.free(stale_token);
+    var stale_call = read_call;
+    stale_call.target = stale_path;
+    stale_call.token = stale_token;
+    const before_stale = source.calls;
+    try std.testing.expectError(error.RemoteWorkerIdentityChanged, server.beginRemoteRead(&registry, stale_call));
+    try std.testing.expectEqual(before_stale, source.calls);
+    try std.testing.expectEqual(@as(usize, 0), registry.snapshot().attempts);
+    var lease = (try server.beginRemoteRead(&registry, read_call)).started;
+    defer lease.close();
+    try std.testing.expectEqual(original_read_deadline, try lease.deadlineNs());
+    var held = try lease.retainResource();
+    defer held.release();
+    const bytes = try std.testing.allocator.dupe(u8, "output retained through signed status and fence");
+    var bytes_live = true;
+    defer if (bytes_live) std.testing.allocator.free(bytes);
+    lease.close();
+    var status_context = verified.context;
+    status_context.kind = .status;
+    status_context.charged_bytes = 0;
+    status_context.request_digest = wire.requestDigest("POST", "/internal/v1/attempt/status", "{}");
+    const status_token = try Sign.token(status_context, secret, now);
+    defer std.testing.allocator.free(status_token);
+    const status_call: ApiHttpServer.RemoteAttemptCall = .{ .token = status_token, .method = "POST", .target = "/internal/v1/attempt/status", .body = "{}", .maximum_duration_ns = 7 * std.time.ns_per_s };
+    fence_context.id.generation = 2;
+    const next_fence_token = try Sign.token(fence_context, secret, now);
+    defer std.testing.allocator.free(next_fence_token);
+    fence_call.token = next_fence_token;
+    server.cfg.remote_attempt_control = .{ .registry = &registry, .signer = &reply_signer, .maximum_duration_ns = 7 * std.time.ns_per_s };
+    defer server.cfg.remote_attempt_control = null;
+    const Route = struct {
+        fn run(api: *ApiHttpServer, path: []const u8, token: ?[]const u8, body: []const u8) !http_common.HttpResponse {
+            const headers = [_]http_common.RequestHeader{.{ .name = @import("internal_service_auth.zig").header_name, .value = token orelse "" }};
+            return test_runtime_support.executeRemoteAttemptControlOnce(std.testing.allocator, api, .{ .method = .POST, .uri = path, .headers = if (token != null) &headers else &.{}, .content_type = "application/json", .body = body });
+        }
+        fn signed(api: *ApiHttpServer, path: []const u8, token: []const u8, authority: replies.Authority, context: wire.Context, outcome: replies.Outcome) !void {
+            var response = try run(api, path, token, "{}");
+            defer response.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            const decoded = try replies.Reply.decode(response.body);
+            try decoded.verify(authority, context);
+            try std.testing.expectEqual(outcome, decoded.outcome);
+        }
+    };
+    const legacy_token = try @import("internal_service_auth.zig").tokenAlloc(std.testing.allocator, .{ .secret = secret, .issuer = "cluster" }, now);
+    defer std.testing.allocator.free(legacy_token);
+    const attempt_headers = [_]http_common.RequestHeader{.{ .name = @import("internal_service_auth.zig").header_name, .value = read_token }};
+    var unsupported_http = try test_runtime_support.executeRemoteAttemptControlOnce(std.testing.allocator, &server, .{ .method = .GET, .uri = "/internal/v1/capabilities", .headers = &attempt_headers });
+    defer unsupported_http.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), unsupported_http.status);
+    const legacy_headers = [_]http_common.RequestHeader{.{ .name = @import("internal_service_auth.zig").header_name, .value = legacy_token }};
+    var legacy_http = try test_runtime_support.executeRemoteAttemptControlOnce(std.testing.allocator, &server, .{ .method = .GET, .uri = "/internal/v1/capabilities", .headers = &legacy_headers });
+    defer legacy_http.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), legacy_http.status);
+    const memory = server.request_memory.?;
+    const available = memory.foreground.limit - memory.foreground.stats().used_bytes;
+    const ordinary = try server.alloc.alloc(u8, available - ApiHttpServer.RequestMemory.overhead(.of(u8)));
+    defer server.alloc.free(ordinary);
+    try std.testing.expectError(error.OutOfMemory, server.alloc.alloc(u8, 1));
+    try std.testing.expectEqual(@import("../common/remote_attempts.zig").WorkerGate.Status.active, try server.remoteReadStatus(&registry, status_call));
+    const active_reply = try server.signedRemoteReadStatus(&registry, &reply_signer, status_call);
+    try active_reply.verify(reply_authority, status_context);
+    try std.testing.expectEqual(replies.Outcome.active, active_reply.outcome);
+    try std.testing.expectError(error.RemoteFencePending, server.signedFenceRemoteReads(&registry, &reply_signer, fence_call));
+    try Route.signed(&server, internal_api_routes.remote_attempt_status, status_token, reply_authority, status_context, .active);
+    var pending_http = try Route.run(&server, internal_api_routes.remote_attempt_fence, next_fence_token, "{}");
+    defer pending_http.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), pending_http.status);
+    try std.testing.expectError(error.InvalidRemoteReply, replies.Reply.decode(pending_http.body));
+    // Migration permits old peers elsewhere; control evidence never bypasses it.
+    server.cfg.internal_service_accept_legacy_unauthenticated = true;
+    var unsigned_http = try Route.run(&server, internal_api_routes.remote_attempt_status, null, "{}");
+    defer unsigned_http.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), unsigned_http.status);
+    var missing_context_http = try Route.run(&server, internal_api_routes.remote_attempt_status, legacy_token, "{}");
+    defer missing_context_http.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), missing_context_http.status);
+    var changed_body_http = try Route.run(&server, internal_api_routes.remote_attempt_status, status_token, "{ }");
+    defer changed_body_http.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 413), changed_body_http.status);
+    try std.testing.expectEqualStrings("output retained through signed status and fence", bytes);
+    try std.testing.expectEqual(@as(usize, 4096), registry.snapshot().bytes);
+    std.testing.allocator.free(bytes);
+    bytes_live = false;
+    held.release();
+    const fence_reply = try server.signedFenceRemoteReads(&registry, &reply_signer, fence_call);
+    try fence_reply.verify(reply_authority, fence_context);
+    try std.testing.expectEqual(replies.Outcome.fence_ack, fence_reply.outcome);
+    const fenced_reply = try server.signedRemoteReadStatus(&registry, &reply_signer, status_call);
+    try fenced_reply.verify(reply_authority, status_context);
+    try std.testing.expectEqual(replies.Outcome.fenced, fenced_reply.outcome);
+    try Route.signed(&server, internal_api_routes.remote_attempt_fence, next_fence_token, reply_authority, fence_context, .fence_ack);
+    try Route.signed(&server, internal_api_routes.remote_attempt_status, status_token, reply_authority, status_context, .fenced);
+    try std.testing.expectEqual(@as(usize, 0), registry.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 0), source.cached_calls);
+}
+
+test "remote attempt client retains published uncertainty through TCP status and fence reconciliation" {
+    const alloc = std.testing.allocator;
+    const client_mod = @import("remote_attempt_client.zig");
+    const worker = @import("../common/remote_worker.zig");
+    const durable = @import("../common/remote_fence_store.zig");
+    const attempts = @import("../common/remote_attempts.zig");
+    const replies = @import("../common/remote_attempt_reply.zig");
+    const wire = @import("../common/remote_attempt_wire.zig");
+    const membership = @import("../common/remote_membership.zig");
+    const service = @import("internal_service_auth.zig");
+    const Executor = @import("../raft/transport/std_http_executor.zig").StdHttpExecutor;
+    const realm = "0123456789abcdef0123456789abcdef".*;
+    const secret = "0123456789abcdef0123456789abcdef";
+    const seed: [32]u8 = @splat(7);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const Source = struct {
+        nodes: [2]metadata_mod.NodeRecord = .{ .{ .node_id = 7 }, .{ .node_id = 9 } },
+        stores: [1]metadata_mod.StoreRecord,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metadata_incarnation = realm, .metrics = .{} };
+        }
+        fn snapshot(raw: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .status = try status(raw), .nodes = &self.nodes, .stores = &self.stores, .tables = &.{}, .ranges = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var source = Source{ .stores = .{.{ .store_id = 13, .node_id = 9, .replica_root_incarnation = 11, .reporter_incarnation = 17, .replica_root_public_key = pair.public_key.toBytes() }} };
+    var api = try ApiHttpServer.initWithConfig(alloc, .{ .request_memory_bytes = 8 << 20, .retained_memory_bytes = 8 << 20, .internal_service_secret = secret, .internal_service_issuer = "cluster", .runnable_policy = .{ .slots = 2, .read_isolation = false } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .linearizable_snapshot = Source.snapshot, .free_admin_snapshot = Source.free } }, null, null);
+    defer api.deinit();
+    const local: membership.Local = .{ .metadata_incarnation = realm, .node_id = 9, .store_id = 13, .root_incarnation = 11, .reporter_incarnation = 17 };
+    const authority = try api.resolveRemoteReplyAuthority(local, .{});
+    const signer = try replies.Signer.initEnrolled(authority, .{ .root_incarnation = local.root_incarnation, .public_key = pair.public_key.toBytes(), .seed = seed });
+    var worker_tmp = std.testing.tmpDir(.{});
+    defer worker_tmp.cleanup();
+    var worker_store = try durable.Store.create(alloc, std.testing.io, worker_tmp.dir, 11, 2);
+    defer worker_store.deinit();
+    var registry = try worker.Registry.init(alloc, &worker_store, local, .{ .coordinators = 2, .attempts = 2, .per_coordinator_attempts = 2, .duplicate_window = 8, .bytes = 16 << 10, .per_coordinator_bytes = 16 << 10, .resource_references = 4 }, platform_time.monotonicNs);
+    defer registry.deinit() catch unreachable;
+    const ReceiverProbe = struct {
+        var server: *ApiHttpServer = undefined;
+        var original: *const fn (?*anyopaque, std.Io.File) std.Io.File.SyncError!void = undefined;
+        var checking: bool = true;
+        var checks: usize = 0;
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            if (checking) {
+                const stats = server.runnableScheduler().?.stats();
+                std.debug.assert(stats.resource_blocked >= 1 and stats.operations >= 1 and stats.retained_bytes > 0);
+                checks += 1;
+            }
+            return original(userdata, file);
+        }
+    };
+    ReceiverProbe.server = &api;
+    ReceiverProbe.original = std.testing.io.vtable.fileSync;
+    ReceiverProbe.checking = true;
+    ReceiverProbe.checks = 0;
+    var receiver_vtable = std.testing.io.vtable.*;
+    receiver_vtable.fileSync = ReceiverProbe.sync;
+    worker_store.io = .{ .userdata = std.testing.io.userdata, .vtable = &receiver_vtable };
+    defer worker_store.io = std.testing.io;
+    const Recovery = struct {
+        fn fresh(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    try registry.completeRecovery(.{ .context = &source, .quiescent = Recovery.fresh });
+    api.cfg.remote_attempt_control = .{ .registry = &registry, .signer = &signer };
+    defer api.cfg.remote_attempt_control = null;
+    var listener = try test_runtime_support.Runtime.startRemoteAttemptControlOwned(alloc, &api);
+    defer listener.deinit();
+    const base_uri = try listener.baseUri(alloc);
+    defer alloc.free(base_uri);
+    var control_executor = Executor.init(alloc, .{});
+    defer control_executor.deinit();
+    const ReadTransport = struct {
+        api: *ApiHttpServer,
+        registry: *worker.Registry,
+        held: ?worker.Resource = null,
+        buffer: ?[]u8 = null,
+        buffer_allocator: std.mem.Allocator = alloc,
+        retain_output: bool = true,
+        drop_before_admission: bool = false,
+        calls: usize = 0,
+        cleanup_calls: usize = 0,
+        sender_store: ?*durable.Store = null,
+        maximum_remaining_ns: ?u64 = null,
+        managed_mode: bool = false,
+        managed_loss: bool = false,
+        managed_capacity_loss: bool = false,
+        managed_busy: bool = false,
+        managed_cancel_reply: ?*bool = null,
+        expected_route: ?[]const u8 = "{\"catalog_revision\":4}",
+        managed_resources: [4]?worker.Resource = @splat(null),
+        managed_buffers: [4]?[]u8 = @splat(null),
+        managed_tokens: [4]?@import("../storage/retained_read_registry.zig").Token = @splat(null),
+        managed_connections: [4]u128 = @splat(0),
+        const Admission = struct {
+            execution: RunnableScheduler.Execution = .{},
+            request: http_common.HttpRequest,
+            deadline_ns: u64,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.request.cancellation) |token| if (token.isCancelled()) return error.Canceled;
+                if (platform_time.monotonicNs() >= self.deadline_ns) return error.DeadlineExceeded;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try check(raw);
+                try self.execution.park(.resource_blocked);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try check(raw);
+                try self.execution.enterWithCheck(.query, .{ .context = self, .check = check });
+            }
+        };
+        fn closeManaged(self: *@This(), index: usize) void {
+            if (self.managed_buffers[index]) |bytes| {
+                alloc.free(bytes);
+                self.managed_buffers[index] = null;
+            }
+            self.managed_tokens[index] = null;
+            if (self.managed_resources[index]) |*value| {
+                value.release();
+                self.managed_resources[index] = null;
+            }
+        }
+
+        fn execute(raw: *anyopaque, output_alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(request.cancellation != null);
+            try std.testing.expect(request.max_response_bytes != null);
+            var headers: usize = 0;
+            for (request.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, service.header_name)) {
+                headers += 1;
+            };
+            try std.testing.expectEqual(@as(usize, 1), headers);
+            const token = request.header(service.header_name) orelse return error.TestMissingServiceContext;
+            const parsed = try std.Uri.parse(request.uri);
+            var path_buffer: [128]u8 = undefined;
+            const path = try parsed.path.toRaw(&path_buffer);
+            if (self.maximum_remaining_ns) |maximum| {
+                const verified = try self.api.authenticateRemoteAttempt(token, self.registry.local.root_incarnation, .read, @tagName(request.method), path, request.body, 5 * std.time.ns_per_s);
+                try std.testing.expect(verified.context.remaining_ns <= maximum);
+                try std.testing.expect(request.timeout_ms.? <= maximum / std.time.ns_per_ms);
+            }
+            if (@import("../internal/routes.zig").isRetainedRead(path)) {
+                try std.testing.expect(request.header(metadata_api.catalog_route_fence_header) == null);
+                var envelope = try @import("owned_retained_read.zig").decode(output_alloc, request.body);
+                defer envelope.deinit();
+                if (self.expected_route) |expected| try std.testing.expectEqualStrings(expected, envelope.value.route_fence);
+                var input = try std.json.parseFromSlice(@import("retained_read_rpc.zig").Request, output_alloc, envelope.value.request, .{});
+                defer input.deinit();
+                if (input.value.operation == .close or input.value.operation == .cancel) {
+                    const verified = try self.api.authenticateRemoteAttempt(token, self.registry.local.root_incarnation, .read, "POST", path, request.body, 5 * std.time.ns_per_s);
+                    _ = try self.api.authorizeRemoteAttemptMembership(verified, .{ .deadline_ns = verified.local_deadline_ns }, self.registry.local);
+                    if (self.managed_mode) {
+                        for (self.managed_tokens, 0..) |issued, slot| if (issued) |issued_token| {
+                            if ((input.value.operation == .close and std.meta.eql(input.value.token.?, issued_token)) or (input.value.operation == .cancel and input.value.connection == self.managed_connections[slot])) self.closeManaged(slot);
+                        };
+                    } else {
+                        try std.testing.expectEqual(@as(u128, 11), input.value.token.?.incarnation);
+                        self.releaseOutput();
+                    }
+                    self.cleanup_calls += 1;
+                    // The receiver physically closed, but the caller lost ACK.
+                    return error.ConnectionResetByPeer;
+                }
+                if (!self.managed_mode) try std.testing.expectEqual(.capture, input.value.operation);
+                const sender_store = self.sender_store orelse return error.TestMissingDurablePublication;
+                var history: [2]u128 = undefined;
+                try std.testing.expectEqual(@as(usize, 1), try sender_store.destinationHistory(&history));
+                try std.testing.expectEqual(@as(u128, 11), history[0]);
+                try std.testing.expect((try sender_store.initializationState()).publication_started);
+            }
+            if (self.drop_before_admission) return error.ConnectionResetByPeer;
+            var admission: Admission = .{ .request = request, .deadline_ns = platform_time.monotonicNs() +| @as(u64, request.timeout_ms.?) * std.time.ns_per_ms };
+            defer admission.execution.finish();
+            try self.api.startSqlRunnable(&admission.execution, .{ .io = std.testing.io, .native_now_ns = platform_time.monotonicNs, .deadline_ns = admission.deadline_ns, .retained_bytes = 512 }, .query);
+            const started = try self.api.beginRemoteReadWithWait(self.registry, .{ .token = token, .method = @tagName(request.method), .target = path, .body = request.body, .request = .{ .deadline_ns = admission.deadline_ns }, .maximum_duration_ns = 5 * std.time.ns_per_s }, .{ .ptr = &admission, .begin = Admission.begin, .end = Admission.end });
+            var lease = switch (started) {
+                .started => |value| value,
+                else => return error.TestUnexpectedDuplicate,
+            };
+            defer lease.close();
+            if (self.managed_mode) {
+                var envelope = try @import("owned_retained_read.zig").decode(output_alloc, request.body);
+                defer envelope.deinit();
+                var input = try std.json.parseFromSlice(@import("retained_read_rpc.zig").Request, output_alloc, envelope.value.request, .{});
+                defer input.deinit();
+                if (input.value.operation == .admit) {
+                    return @import("http_route_helpers.zig").textResponseWithHeaders(output_alloc, 200, "{}", &.{.{ .name = metadata_api.catalog_route_fence_ack_header, .value = metadata_api.catalog_route_fence_ack_value }});
+                }
+                if (self.managed_busy) {
+                    const body = try std.json.Stringify.valueAlloc(output_alloc, @import("retained_read_rpc.zig").Response{ .busy = true }, .{});
+                    defer output_alloc.free(body);
+                    return @import("http_route_helpers.zig").textResponseWithHeaders(output_alloc, 200, body, &.{.{ .name = metadata_api.catalog_route_fence_ack_header, .value = metadata_api.catalog_route_fence_ack_value }});
+                }
+                const slot = for (self.managed_resources, 0..) |value, index| {
+                    if (value == null) break index;
+                } else return error.TestResourceCapacity;
+                const bytes = try alloc.dupe(u8, "server-owned retained resource");
+                self.managed_resources[slot] = lease.retainResource() catch |err| {
+                    alloc.free(bytes);
+                    return err;
+                };
+                self.managed_buffers[slot] = bytes;
+                self.managed_connections[slot] = input.value.connection;
+                const token_value: @import("../storage/retained_read_registry.zig").Token = .{ .incarnation = 11, .slot = @intCast(slot), .sequence = lease.id.sequence };
+                self.managed_tokens[slot] = token_value;
+                if (self.managed_loss) return if (self.managed_capacity_loss) error.RemoteAttemptCapacity else error.ConnectionResetByPeer;
+                const body = try std.json.Stringify.valueAlloc(output_alloc, @import("retained_read_rpc.zig").Response{ .token = token_value }, .{});
+                defer output_alloc.free(body);
+                const response = try @import("http_route_helpers.zig").textResponseWithHeaders(output_alloc, 200, body, &.{.{ .name = metadata_api.catalog_route_fence_ack_header, .value = metadata_api.catalog_route_fence_ack_value }});
+                if (self.managed_cancel_reply) |flag| {
+                    flag.* = true;
+                    self.managed_cancel_reply = null;
+                }
+                return response;
+            }
+            if (self.retain_output) {
+                const output = try output_alloc.dupe(u8, "physical remote output");
+                self.held = lease.retainResource() catch |err| {
+                    output_alloc.free(output);
+                    return err;
+                };
+                self.buffer = output;
+                self.buffer_allocator = output_alloc;
+                return error.ConnectionResetByPeer;
+            }
+            return .{ .status = 503, .body = try output_alloc.dupe(u8, "backend unavailable") };
+        }
+        fn releaseOutput(self: *@This()) void {
+            for (0..self.managed_resources.len) |index| self.closeManaged(index);
+            if (self.buffer) |output| {
+                self.buffer_allocator.free(output);
+                self.buffer = null;
+            }
+            if (self.held) |*held| {
+                held.release();
+                self.held = null;
+            }
+        }
+    };
+    var read_transport = ReadTransport{ .api = &api, .registry = &registry };
+    defer read_transport.releaseOutput();
+    var coordinator_tmp = std.testing.tmpDir(.{});
+    defer coordinator_tmp.cleanup();
+    var coordinator_store = try durable.Store.create(alloc, std.testing.io, coordinator_tmp.dir, 77, 2);
+    defer coordinator_store.deinit();
+    var slots: [2]?attempts.Attempt = undefined;
+    var destinations = [_]attempts.Destination{.{ .worker_incarnation = 11, .max_attempts = 2, .max_bytes = 8192 }};
+    var ledger = try coordinator_store.startCoordinator(try membership.coordinatorIdentity(realm, 7), 0, &slots, &destinations, 8192);
+    var targets = [_]client_mod.Target{.{ .base_uri = base_uri, .authority = authority }};
+    var client: client_mod.Client = .{ .ledger = &ledger, .store = &coordinator_store, .targets = &targets, .signing = .{ .secret = secret, .issuer = "cluster" }, .read_allocator = alloc, .control_allocator = api.controlAllocator(), .read_executor = .{ .ptr = &read_transport, .vtable = &.{ .execute = ReadTransport.execute } }, .control_executor = control_executor.executor() };
+    const request: http_common.HttpRequest = .{ .method = .POST, .uri = "/internal/v1/groups/7/tables/docs/query", .body = "{}", .content_type = "application/json", .headers = &.{.{ .name = service.header_name, .value = "caller-supplied" }} };
+    const deadline = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
+    try std.testing.expectError(error.UnsupportedRemoteAttemptProtocol, client.dispatchRead(0, 71, 4096, deadline, request));
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().bytes);
+    try std.testing.expectEqual(replies.Reconciled.fenced, try client.fence(0, deadline));
+    api.cfg.remote_read_capabilities = .{ .group_query = true, .retained_read = true };
+    const before_capabilities = ledger.generationState();
+    const capabilities = try client.probeCapabilities(0, deadline, null);
+    const supported = try capabilities.forAuthority(authority, platform_time.monotonicNs());
+    try std.testing.expect(!supported.group_query and !supported.retained_read);
+    try std.testing.expect(!targets[0].owned_reads_v1 and !targets[0].owned_retained_reads_v1);
+    try std.testing.expectEqualDeep(before_capabilities, ledger.generationState());
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().attempts);
+    var canceled_probe: http_common.RequestCancellation = .{};
+    canceled_probe.cancel();
+    try std.testing.expectError(error.Canceled, client.probeCapabilities(0, deadline, &canceled_probe));
+    try std.testing.expectError(error.DeadlineExceeded, client.probeCapabilities(0, platform_time.monotonicNs(), null));
+    var probe_empty_bytes: [0]u8 = .{};
+    var probe_empty = std.heap.FixedBufferAllocator.init(&probe_empty_bytes);
+    var probe_oom = client;
+    probe_oom.control_allocator = probe_empty.allocator();
+    try std.testing.expectError(error.OutOfMemory, probe_oom.probeCapabilities(0, deadline, null));
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().attempts);
+    {
+        const Observed = struct {
+            base: http_common.RequestExecutor,
+            canceled: ?*http_common.RequestCancellation = null,
+            expire: bool = false,
+            replay: bool = false,
+            saved: ?[]u8 = null,
+            var tick: u64 = 0;
+            var expiry: u64 = 0;
+            fn now() u64 {
+                return tick;
+            }
+            fn execute(raw: *anyopaque, output: std.mem.Allocator, input: http_common.HttpRequest) !http_common.HttpResponse {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                var response = try self.base.execute(output, input);
+                errdefer response.deinit(output);
+                if (self.canceled) |signal| signal.cancel();
+                if (self.expire) tick = expiry;
+                if (self.replay) {
+                    if (self.saved) |old| {
+                        const body = try output.dupe(u8, old);
+                        response.deinit(output);
+                        return .{ .status = 200, .body = body };
+                    }
+                    self.saved = try alloc.dupe(u8, response.body);
+                }
+                return response;
+            }
+            fn executor(self: *@This()) http_common.RequestExecutor {
+                return .{ .ptr = self, .clock_io = self.base.clock_io, .vtable = &.{ .execute = execute } };
+            }
+        };
+        var late_cancel: http_common.RequestCancellation = .{};
+        var observed: Observed = .{ .base = client.control_executor, .canceled = &late_cancel };
+        var observed_client = client;
+        observed_client.control_executor = observed.executor();
+        try std.testing.expectError(error.Canceled, observed_client.probeCapabilities(0, deadline, &late_cancel));
+        observed.canceled = null;
+        observed.expire = true;
+        Observed.tick = platform_time.monotonicNs();
+        Observed.expiry = Observed.tick + std.time.ns_per_s;
+        observed_client.now_ns = Observed.now;
+        try std.testing.expectError(error.DeadlineExceeded, observed_client.probeCapabilities(0, Observed.expiry, null));
+        observed.expire = false;
+        observed.replay = true;
+        observed_client.now_ns = client.now_ns;
+        defer if (observed.saved) |body| alloc.free(body);
+        _ = try observed_client.probeCapabilities(0, deadline, null);
+        // The same valid root signature cannot answer the next fresh nonce.
+        try std.testing.expectError(error.InvalidRemoteReply, observed_client.probeCapabilities(0, deadline, null));
+        try std.testing.expectEqualDeep(before_capabilities, ledger.generationState());
+        try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().attempts);
+    }
+    api.cfg.remote_read_capabilities = .{};
+    targets[0].owned_reads_v1 = true; // Explicit fixture capability, not health inference.
+    var canceled: http_common.RequestCancellation = .{};
+    canceled.cancel();
+    var canceled_request = request;
+    canceled_request.cancellation = &canceled;
+    try std.testing.expectError(error.Canceled, client.dispatchRead(0, 70, 512, deadline, canceled_request));
+    var invalid_request = request;
+    invalid_request.uri = "https://unrelated.invalid/read";
+    try std.testing.expectError(error.InvalidRemoteAttemptTarget, client.dispatchRead(0, 70, 512, deadline, invalid_request));
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 0), read_transport.calls);
+    // Advance only the sender's injected monotonic clock during a real durable
+    // file sync. The authenticated wire grant must lose those two seconds.
+    const PublicationClock = struct {
+        var offset: u64 = 0;
+        var fired: bool = false;
+        var original: *const fn (?*anyopaque, std.Io.File) std.Io.File.SyncError!void = undefined;
+        fn now() u64 {
+            return platform_time.monotonicNs() + offset;
+        }
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            try original(userdata, file);
+            if (!fired) {
+                fired = true;
+                offset = 2 * std.time.ns_per_s;
+            }
+        }
+    };
+    {
+        PublicationClock.offset = 0;
+        PublicationClock.fired = false;
+        const original_io = coordinator_store.io;
+        defer coordinator_store.io = original_io;
+        var sender_vtable = original_io.vtable.*;
+        PublicationClock.original = sender_vtable.fileSync;
+        sender_vtable.fileSync = PublicationClock.sync;
+        coordinator_store.io.vtable = &sender_vtable;
+        var timed = client;
+        timed.now_ns = PublicationClock.now;
+        read_transport.maximum_remaining_ns = 2 * std.time.ns_per_s;
+        defer read_transport.maximum_remaining_ns = null;
+        defer PublicationClock.offset = 0;
+        const timed_delivery = (try timed.dispatchRead(0, 69, 512, PublicationClock.now() + 4 * std.time.ns_per_s, request)).uncertain;
+        try std.testing.expect(PublicationClock.fired);
+        try std.testing.expectEqual(error.ConnectionResetByPeer, timed_delivery.cause);
+        try std.testing.expectEqual(@as(usize, 512), ledger.snapshot().bytes);
+        read_transport.releaseOutput();
+        try std.testing.expectEqual(replies.Reconciled.retired, try client.status(0, timed_delivery.id, deadline));
+        try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().bytes);
+    }
+
+    const calls_before_failures = read_transport.calls;
+    const AllocationFailures = struct {
+        const Parent = struct {
+            ledger: *attempts.Coordinator,
+            releases: usize = 0,
+            fn release(raw: *anyopaque, _: usize, _: attempts.Id) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                std.debug.assert(self.ledger.snapshot().bytes == 512);
+                self.releases += 1;
+                std.debug.assert(self.releases == 1);
+            }
+        };
+        fn run(failing: std.mem.Allocator, original: *const client_mod.Client, transport: *ReadTransport, input: http_common.HttpRequest, until: u64) !void {
+            var experimental = original.*;
+            experimental.read_allocator = failing;
+            const calls = transport.calls;
+            defer transport.releaseOutput();
+            var physical_parent = Parent{ .ledger = original.ledger };
+            var retained: ?attempts.Retention = .{ .context = &physical_parent, .index = 0, .id = .{ .coordinator = 1, .generation = 1, .operation = 1, .sequence = 1 }, .release_fn = Parent.release };
+            const sent = experimental.dispatchReadRetained(0, 70, 512, until, input, &retained) catch |err| {
+                try std.testing.expectEqual(calls, transport.calls);
+                try std.testing.expectEqual(@as(usize, 0), original.ledger.snapshot().bytes);
+                try std.testing.expect(retained == null);
+                try std.testing.expectEqual(@as(usize, 1), physical_parent.releases);
+                return err;
+            };
+            try std.testing.expect(retained == null);
+            try std.testing.expectEqual(@as(usize, 0), physical_parent.releases);
+            const pending = switch (sent) {
+                .uncertain => |value| value,
+                .response => |value| {
+                    var response = value.value;
+                    response.deinit(failing);
+                    return error.TestUnexpectedResponse;
+                },
+            };
+            transport.releaseOutput();
+            const outcome = try original.status(0, pending.id, until);
+            if (outcome == .retained) {
+                // Re-signing can fail after durable publication but before any
+                // executor call. An unknown worker status is not quiescence.
+                try std.testing.expectEqual(calls, transport.calls);
+                try std.testing.expectEqual(@as(usize, 512), original.ledger.snapshot().bytes);
+                try std.testing.expectEqual(@as(usize, 0), physical_parent.releases);
+                try std.testing.expect(try original.abandon(pending.id));
+                var cursor: client_mod.ReconcileCursor = .{};
+                const report = try original.reconcilePass(&cursor, .{ .max_rpc_calls = 3, .max_scanned = 4, .rpc_timeout_ns = std.time.ns_per_s, .deadline_ns = until });
+                try std.testing.expectEqual(@as(usize, 1), report.terminal);
+            } else try std.testing.expectEqual(replies.Reconciled.retired, outcome);
+            try std.testing.expectEqual(@as(usize, 1), physical_parent.releases);
+            try std.testing.expectEqual(@as(usize, 0), original.ledger.snapshot().bytes);
+            if (pending.cause == error.OutOfMemory) return error.OutOfMemory;
+            try std.testing.expectEqual(error.ConnectionResetByPeer, pending.cause);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationFailures.run, .{ &client, &read_transport, request, deadline });
+    try std.testing.expect(read_transport.calls > calls_before_failures);
+    const calls_before_dispatch = read_transport.calls;
+    const delivery = try client.dispatchRead(0, 71, 4096, deadline, request);
+    const id = switch (delivery) {
+        .uncertain => |pending| pending: {
+            try std.testing.expectEqual(error.ConnectionResetByPeer, pending.cause);
+            break :pending pending.id;
+        },
+        .response => |value| {
+            var response = value.value;
+            response.deinit(alloc);
+            return error.TestUnexpectedResponse;
+        },
+    };
+    try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 4096), registry.snapshot().bytes);
+    const generation_before_probe = ledger.generationState();
+    {
+        var discovery = api.remote_capability_admission.tryAcquireLease() orelse return error.TestUnexpectedResult;
+        defer discovery.release();
+        try std.testing.expectError(error.UnsupportedRemoteAttemptProtocol, client.probeCapabilities(0, deadline, null));
+        // Exact signed status remains available while discovery is occupied.
+        try std.testing.expectEqual(replies.Reconciled.retained, try client.status(0, id, deadline));
+        try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+        try std.testing.expectEqual(@as(usize, 4096), registry.snapshot().bytes);
+    }
+    _ = try client.probeCapabilities(0, deadline, null);
+    // The peer may receive bytes before the server retires its physical context.
+    const context_retired_by = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (api.remote_capability_admission.stats().in_flight != 0) {
+        if (platform_time.monotonicNs() >= context_retired_by) return error.TestDiscoveryContextRetirementTimeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqualDeep(generation_before_probe, ledger.generationState());
+    try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 4096), registry.snapshot().bytes);
+    const memory = api.request_memory.?;
+    const occupied = try api.alloc.alloc(u8, memory.foreground.limit - memory.foreground.stats().used_bytes - ApiHttpServer.RequestMemory.overhead(.of(u8)));
+    var occupied_live = true;
+    defer if (occupied_live) api.alloc.free(occupied);
+    try std.testing.expectError(error.OutOfMemory, api.alloc.alloc(u8, 1));
+    var reconcile_cursor: client_mod.ReconcileCursor = .{};
+    const pass_budget: client_mod.ReconcileBudget = .{ .max_rpc_calls = 1, .max_scanned = 4, .rpc_timeout_ns = std.time.ns_per_s, .deadline_ns = deadline };
+    var canceled_budget = pass_budget;
+    canceled_budget.cancellation = &canceled;
+    const canceled_pass = try client.reconcilePass(&reconcile_cursor, canceled_budget);
+    try std.testing.expect(canceled_pass.canceled);
+    try std.testing.expectEqual(@as(usize, 0), canceled_pass.rpc_calls);
+    try std.testing.expectEqual(@as(usize, 0), reconcile_cursor.next);
+    var expired_budget = pass_budget;
+    expired_budget.deadline_ns = platform_time.monotonicNs();
+    try std.testing.expect((try client.reconcilePass(&reconcile_cursor, expired_budget)).deadline_exhausted);
+    const active_pass = try client.reconcilePass(&reconcile_cursor, pass_budget);
+    try std.testing.expectEqual(@as(usize, 1), active_pass.rpc_calls);
+    try std.testing.expectEqual(@as(usize, 1), active_pass.retained);
+    var wrong_targets = targets;
+    wrong_targets[0].authority.public_key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(8))).public_key.toBytes();
+    var wrong_client = client;
+    wrong_client.targets = &wrong_targets;
+    try std.testing.expectError(error.InvalidRemoteReplySignature, wrong_client.status(0, id, deadline));
+    try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+    try std.testing.expect(try client.abandon(id));
+    const cancel_pass = try client.reconcilePass(&reconcile_cursor, pass_budget);
+    try std.testing.expectEqual(@as(usize, 1), cancel_pass.retained);
+    try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 4096), registry.snapshot().bytes);
+    try client.advanceGeneration();
+    try std.testing.expectEqual(@as(u64, 2), ledger.generationState().generation);
+    const pending_pass = try client.reconcilePass(&reconcile_cursor, pass_budget);
+    try std.testing.expectEqual(@as(usize, 1), pending_pass.rpc_calls);
+    try std.testing.expectEqual(@as(usize, 1), pending_pass.pending);
+    try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+    try std.testing.expectEqualStrings("physical remote output", read_transport.buffer.?);
+    read_transport.releaseOutput();
+    try std.testing.expectEqual(replies.Reconciled.fenced, try client.fence(0, deadline));
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 0), registry.snapshot().bytes);
+    api.alloc.free(occupied);
+    occupied_live = false;
+    read_transport.retain_output = false;
+    var received = (try client.dispatchRead(0, 72, 1024, deadline, request)).response;
+    try std.testing.expectEqual(@as(u16, 503), received.value.status);
+    received.value.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1024), ledger.snapshot().bytes);
+    const terminal_pass = try client.reconcilePass(&reconcile_cursor, pass_budget);
+    try std.testing.expectEqual(@as(usize, 1), terminal_pass.rpc_calls);
+    try std.testing.expectEqual(@as(usize, 1), terminal_pass.terminal);
+    try std.testing.expectEqual(replies.Reconciled.duplicate, try client.status(0, received.id, deadline));
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().bytes);
+    try std.testing.expectEqual(calls_before_dispatch + 2, read_transport.calls);
+
+    // Lost before worker admission: ordinary status is not terminal proof.
+    // Explicit owner abandonment schedules cancellation in the same fair ring.
+    read_transport.drop_before_admission = true;
+    const delayed = (try client.dispatchRead(0, 74, 512, deadline, request)).uncertain;
+    try std.testing.expectEqual(error.ConnectionResetByPeer, delayed.cause);
+    try std.testing.expectEqual(replies.Reconciled.retained, try client.status(0, delayed.id, deadline));
+    try std.testing.expectEqual(@as(usize, 512), ledger.snapshot().bytes);
+    const LostCancelReply = struct {
+        executor: http_common.RequestExecutor,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, a: std.mem.Allocator, input: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            var response = try self.executor.execute(a, input);
+            // Worker cancellation is real; only its signed response is lost.
+            response.deinit(a);
+            return error.ConnectionResetByPeer;
+        }
+    };
+    try std.testing.expectError(error.InvalidRemoteAttempt, client.retireAttempt(1, delayed.id, deadline, null));
+    try std.testing.expect(ledger.reconciliationAction(2).?.kind == .status);
+    var lost_cancel: LostCancelReply = .{ .executor = client.control_executor };
+    var detached = client;
+    detached.control_executor = .{ .ptr = &lost_cancel, .vtable = &.{ .execute = LostCancelReply.execute } };
+    try std.testing.expectError(error.ConnectionResetByPeer, detached.retireAttempt(0, delayed.id, deadline, null));
+    try std.testing.expectEqual(@as(usize, 1), lost_cancel.calls);
+    try std.testing.expectEqual(@as(usize, 512), ledger.snapshot().bytes);
+    try std.testing.expectEqual(replies.Reconciled.retired, try client.retireAttempt(0, delayed.id, deadline, null));
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().bytes);
+    try std.testing.expectEqual(replies.Reconciled.duplicate, try client.retireAttempt(0, delayed.id, deadline, null));
+    const delayed_read: wire.Verified = .{ .context = .{ .kind = .read, .id = delayed.id, .worker_incarnation = 11, .remaining_ns = std.time.ns_per_s, .charged_bytes = 512, .request_digest = wire.requestDigest("POST", request.uri, request.body) }, .local_deadline_ns = deadline };
+    try std.testing.expect((try registry.begin(delayed_read, .{ .coordinator_node_id = 7, .worker_node_id = 9, .store_id = 13, .root_incarnation = 11, .reporter_incarnation = 17 })) == .terminal);
+    try std.testing.expectEqual(@as(usize, 0), registry.snapshot().attempts);
+    read_transport.drop_before_admission = false;
+
+    // Retained RPCs use their own explicitly activated signed family. The
+    // ordinary read capability cannot activate this path implicitly.
+    const Parent = struct {
+        ledger: *attempts.Coordinator,
+        expected_bytes: usize = 0,
+        releases: usize = 0,
+        fn release(raw: *anyopaque, _: usize, _: attempts.Id) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.ledger.snapshot().bytes == self.expected_bytes);
+            self.releases += 1;
+        }
+    };
+    var physical_parent: Parent = .{ .ledger = &ledger };
+    var retained_parent: ?attempts.Retention = .{ .context = &physical_parent, .index = 0, .id = delayed.id, .release_fn = Parent.release };
+    defer if (retained_parent) |parent| parent.release();
+    const retained_request: http_common.HttpRequest = .{ .method = .POST, .uri = "/internal/v1/groups/7/tables/docs/retained-read", .body = "{\"operation\":\"capture\",\"schema_version\":5}", .headers = &.{.{ .name = metadata_api.catalog_route_fence_header, .value = "unsigned override" }} };
+    try std.testing.expectError(error.UnsupportedRemoteAttemptProtocol, client.dispatchRetainedRead(0, 75, 4096, deadline, retained_request, "{\"catalog_revision\":4}", &retained_parent));
+    try std.testing.expect(retained_parent != null);
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().attempts);
+    {
+        const Publication = @import("remote_capability_publication.zig").Cache;
+        const caps = @import("../common/remote_read_capabilities.zig");
+        var metadata = try RunnableScheduler.Scheduler.init(.{ .slots = 2, .read_isolation = false, .control_bytes = 1 << 20 });
+        defer metadata.close();
+        const cache = try Publication.create(alloc, &metadata, &.{authority}, platform_time.monotonicNs);
+        var cache_live = true;
+        defer if (cache_live) {
+            cache.close();
+            cache.deinit() catch unreachable;
+        };
+        const generation = ledger.generationState();
+        const capability_context: wire.Context = .{ .kind = .capabilities, .id = .{ .coordinator = generation.coordinator, .generation = generation.generation, .operation = 0, .sequence = 0 }, .worker_incarnation = authority.local.root_incarnation, .remaining_ns = std.time.ns_per_s, .charged_bytes = 0, .request_digest = wire.requestDigest("POST", internal_api_routes.remote_attempt_capabilities, &@as([32]u8, @splat(9))) };
+        // Explicit trusted fixture support, now carried by signed evidence and
+        // publication rather than mutating the enrolled target descriptor.
+        const advertised = try caps.Reply.sign(&signer, capability_context, .{ .retained_read = true });
+        try advertised.verify(authority, capability_context);
+        var probe = try cache.begin(0, authority);
+        try probe.publish(.{ .authority = authority, .families = advertised.families, .deadline_ns = deadline });
+        var current = client;
+        current.capabilities = cache;
+        try std.testing.expect(try current.supportsRead(0, true));
+        const pinned = try current.pinCapabilities(0);
+        try std.testing.expect(pinned.capabilities == null);
+        current.reads_ready = false;
+        try std.testing.expect(!try current.supportsRead(0, true));
+        try std.testing.expect(!try current.supportsRead(0, false));
+        try std.testing.expect(try pinned.supportsRead(0, true));
+        current.reads_ready = true;
+        try cache.invalidate(0, authority);
+        try std.testing.expect(!try current.supportsRead(0, true));
+        try std.testing.expect(try pinned.supportsRead(0, true));
+        try std.testing.expect(cache.everEnabled(true));
+        var changed_targets = targets;
+        changed_targets[0].authority.local.reporter_incarnation += 1;
+        var wrong_process = pinned;
+        wrong_process.targets = &changed_targets;
+        try std.testing.expectError(error.InvalidRemoteReply, wrong_process.supportsRead(0, true));
+        cache.close();
+        try cache.deinit();
+        cache_live = false;
+        try std.testing.expectEqual(@as(u64, 0), metadata.stats().retained_bytes);
+        client = pinned;
+        try std.testing.expect(!targets[0].owned_retained_reads_v1);
+    }
+    const prior_calls = read_transport.calls;
+    var empty_storage: [0]u8 = .{};
+    var empty = std.heap.FixedBufferAllocator.init(&empty_storage);
+    var no_memory = client;
+    no_memory.read_allocator = empty.allocator();
+    try std.testing.expectError(error.OutOfMemory, no_memory.dispatchRetainedRead(0, 75, 4096, deadline, retained_request, "{\"catalog_revision\":4}", &retained_parent));
+    try std.testing.expect(retained_parent != null);
+    try std.testing.expectEqual(@as(usize, 0), physical_parent.releases);
+    try std.testing.expectEqual(prior_calls, read_transport.calls);
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().attempts);
+    var malformed = retained_request;
+    malformed.uri = "/internal/v1/groups/7/tables/docs/retained-read?override=1";
+    try std.testing.expectError(error.UnsupportedRemoteAttemptProtocol, client.dispatchRetainedRead(0, 75, 4096, deadline, malformed, "{}", &retained_parent));
+    try std.testing.expectEqual(prior_calls, read_transport.calls);
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().attempts);
+    read_transport.retain_output = true;
+    read_transport.sender_store = &coordinator_store;
+    physical_parent.expected_bytes = 4096;
+    const lost_creation = (try client.dispatchRetainedRead(0, 75, 4096, deadline, retained_request, "{\"catalog_revision\":4}", &retained_parent)).uncertain;
+    try std.testing.expect(retained_parent == null);
+    try std.testing.expectEqual(error.ConnectionResetByPeer, lost_creation.cause);
+    try std.testing.expectEqual(replies.Reconciled.retained, try client.status(0, lost_creation.id, deadline));
+    try std.testing.expectEqual(@as(usize, 0), physical_parent.releases);
+    try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 4096), registry.snapshot().bytes);
+    var cleanup_client = client;
+    cleanup_client.control_executor = client.read_executor;
+    const close_request: http_common.HttpRequest = .{ .method = .POST, .uri = retained_request.uri, .body = "{\"operation\":\"close\",\"schema_version\":5,\"token\":{\"incarnation\":11,\"slot\":0,\"sequence\":99}}" };
+    // Data dispatch must never turn idempotent cleanup into another owned read.
+    var absent_parent: ?attempts.Retention = null;
+    try std.testing.expectError(error.UnsupportedRemoteAttemptProtocol, client.dispatchRetainedRead(0, 75, 4096, deadline, close_request, "{}", &absent_parent));
+    try std.testing.expectError(error.UnsupportedRemoteAttemptProtocol, cleanup_client.cleanupRetainedRead(0, lost_creation.id, deadline, retained_request, "{}"));
+    const old_generation = ledger.generationState().generation;
+    try client.advanceGeneration();
+    try std.testing.expectEqual(old_generation + 1, ledger.generationState().generation);
+    try std.testing.expectError(error.RemoteFencePending, client.fence(0, deadline));
+    registry.closeAdmission();
+    try std.testing.expectError(error.ConnectionResetByPeer, cleanup_client.cleanupRetainedRead(0, lost_creation.id, deadline, close_request, "{\"catalog_revision\":4}"));
+    try std.testing.expectEqual(@as(usize, 1), read_transport.cleanup_calls);
+    try std.testing.expectEqual(@as(usize, 0), registry.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+    try std.testing.expectEqual(@as(usize, 0), physical_parent.releases);
+    try std.testing.expectEqual(replies.Reconciled.retired, try client.status(0, lost_creation.id, deadline));
+    try std.testing.expectEqual(@as(usize, 1), physical_parent.releases);
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().bytes);
+    try std.testing.expectEqual(replies.Reconciled.fenced, try client.fence(0, deadline));
+    // The following cold-process case reconstructs the registry. It also proves
+    // restart handling after this cleanup; no read admission is reopened here.
+    read_transport.retain_output = false;
+    read_transport.sender_store = null;
+
+    // Cold registry, same durable worker floor: status must forbid the equal
+    // epoch without claiming the lost attempt is physically terminal.
+    registry.deinit() catch unreachable;
+    registry = try worker.Registry.init(alloc, &worker_store, local, .{ .coordinators = 2, .attempts = 2, .per_coordinator_attempts = 2, .duplicate_window = 8, .bytes = 16 << 10, .per_coordinator_bytes = 16 << 10, .resource_references = 4 }, platform_time.monotonicNs);
+    const cold = (try client.dispatchRead(0, 73, 1024, deadline, request)).uncertain;
+    try std.testing.expectEqual(error.RemoteWorkerRecoveryPending, cold.cause);
+    const closed = try client.reconcilePass(&reconcile_cursor, pass_budget);
+    try std.testing.expect(closed.needs_generation_advance);
+    try std.testing.expectEqual(@as(usize, 1), closed.retained);
+    try std.testing.expectEqual(@as(usize, 1024), ledger.snapshot().bytes);
+    try std.testing.expectEqual(@as(u64, 3), ledger.generationState().generation);
+    try registry.completeRecovery(.{ .context = &source, .quiescent = Recovery.fresh });
+    try client.advanceGeneration();
+    try std.testing.expectEqual(@as(u64, 4), ledger.generationState().generation);
+    const reopened = try client.reconcilePass(&reconcile_cursor, pass_budget);
+    try std.testing.expectEqual(@as(usize, 1), reopened.fenced);
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().bytes);
+
+    // A restarted coordinator has one unavailable destination and one whose
+    // worker already has a higher durable floor. Neither failure may monopolize
+    // the cursor or admit a mixed-generation startup barrier.
+    var fair_slots: [2]?attempts.Attempt = undefined;
+    var fair_destinations = [_]attempts.Destination{
+        .{ .worker_incarnation = 22, .max_attempts = 2, .max_bytes = 8192 },
+        .{ .worker_incarnation = 11, .max_attempts = 2, .max_bytes = 8192 },
+    };
+    var fair_ledger = try coordinator_store.startCoordinator(ledger.generationState().coordinator, 0, &fair_slots, &fair_destinations, 8192);
+    const higher_floor = fair_ledger.generationState().generation + 1;
+    const floor_context: wire.Context = .{ .kind = .fence, .id = .{ .coordinator = fair_ledger.generationState().coordinator, .generation = higher_floor, .operation = 0, .sequence = 0 }, .worker_incarnation = 11, .remaining_ns = 5 * std.time.ns_per_s, .charged_bytes = 0, .request_digest = wire.requestDigest("POST", internal_api_routes.remote_attempt_fence, "{}") };
+    const floor_subject = floor_context.subject();
+    const floor_token = try service.tokenAlloc(alloc, .{ .secret = secret, .issuer = "cluster", .subject = &floor_subject, .remote_attempt = floor_context }, @intCast(@divFloor(api.internalAuthRealtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(floor_token);
+    ReceiverProbe.checking = false; // Setup uses a direct helper outside ingress.
+    _ = try api.fenceRemoteReads(&registry, .{ .token = floor_token, .method = "POST", .target = internal_api_routes.remote_attempt_fence, .body = "{}", .maximum_duration_ns = 5 * std.time.ns_per_s });
+    ReceiverProbe.checking = true;
+    var unavailable_authority = authority;
+    unavailable_authority.local.root_incarnation = 22;
+    unavailable_authority.local.store_id = 23;
+    unavailable_authority.local.node_id = 10;
+    const fair_targets = [_]client_mod.Target{
+        .{ .base_uri = "http://unreachable.invalid", .authority = unavailable_authority },
+        .{ .base_uri = base_uri, .authority = authority },
+    };
+    const Routing = struct {
+        executor: http_common.RequestExecutor,
+        unavailable_calls: usize = 0,
+        forwarded_calls: usize = 0,
+        fn execute(raw: *anyopaque, output_alloc: std.mem.Allocator, input: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(input.timeout_ms.? <= 1000);
+            if (std.mem.startsWith(u8, input.uri, "http://unreachable.invalid/")) {
+                self.unavailable_calls += 1;
+                return error.ConnectionRefused;
+            }
+            self.forwarded_calls += 1;
+            return self.executor.execute(output_alloc, input);
+        }
+    };
+    var routing = Routing{ .executor = control_executor.executor() };
+    var fair_client = client;
+    fair_client.ledger = &fair_ledger;
+    fair_client.targets = &fair_targets;
+    fair_client.control_executor = .{ .ptr = &routing, .vtable = &.{ .execute = Routing.execute } };
+    var fair_cursor: client_mod.ReconcileCursor = .{};
+    const fair_budget: client_mod.ReconcileBudget = .{ .max_rpc_calls = 1, .max_scanned = 6, .rpc_timeout_ns = std.time.ns_per_s, .deadline_ns = deadline };
+    for (0..3) |_| {
+        const pass = try fair_client.reconcilePass(&fair_cursor, fair_budget);
+        try std.testing.expectEqual(@as(usize, 1), pass.rpc_calls);
+        try std.testing.expectEqual(@as(usize, 1), pass.failed);
+    }
+    const observed = try fair_client.reconcilePass(&fair_cursor, fair_budget);
+    try std.testing.expectEqual(@as(usize, 1), observed.rpc_calls);
+    try std.testing.expect(observed.needs_generation_advance);
+    try std.testing.expectEqual(higher_floor, (try coordinator_store.coordinatorEpoch()).generation);
+    try std.testing.expectEqual(@as(usize, 2), fair_ledger.snapshot().startup_fences_remaining);
+    const before_advance = try fair_client.reconcilePass(&fair_cursor, fair_budget);
+    try std.testing.expectEqual(@as(usize, 0), before_advance.rpc_calls);
+    try fair_client.advanceGeneration();
+    try std.testing.expectEqual(higher_floor + 1, fair_ledger.generationState().generation);
+    const unavailable = try fair_client.reconcilePass(&fair_cursor, fair_budget);
+    try std.testing.expectEqual(@as(usize, 1), unavailable.failed);
+    const healthy = try fair_client.reconcilePass(&fair_cursor, fair_budget);
+    try std.testing.expectEqual(@as(usize, 1), healthy.rpc_calls);
+    try std.testing.expectEqual(@as(usize, 1), healthy.fenced);
+    try std.testing.expectEqual(@as(usize, 1), fair_ledger.snapshot().startup_fences_remaining);
+    try std.testing.expectError(error.RemoteGenerationNotReady, fair_ledger.reserve(1, 99, 1));
+    try std.testing.expectEqual(@as(usize, 3), routing.unavailable_calls);
+    try std.testing.expectEqual(@as(usize, 3), routing.forwarded_calls);
+    try std.testing.expect(ReceiverProbe.checks >= 6);
+
+    // Bring the original node-owned descriptor to the latest observed floor;
+    // its old table had no unavailable destination with published reads.
+    try client.advanceGeneration();
+    _ = try client.fence(0, deadline);
+    const Managed = @import("retained_read_client.zig");
+    const Retirement = @import("retained_read_retirement.zig");
+    const ManagedParent = struct {
+        execution: *RunnableScheduler.Execution,
+        pins: usize = 0,
+        charged: usize = 0,
+        detached: bool = false,
+        fn retain(raw: *anyopaque, bytes: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.detached) return error.Canceled;
+            try self.execution.retainReadBytes(bytes);
+            self.pins += 1;
+            self.charged += bytes;
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.pins != 0);
+            self.pins -= 1;
+            if (self.pins == 0 and self.detached) self.execution.finish();
+        }
+    };
+    const ControlMux = struct {
+        data: http_common.RequestExecutor,
+        control: http_common.RequestExecutor,
+        cancel_after_terminal: ?*bool = null,
+        fn execute(raw: *anyopaque, a: std.mem.Allocator, input: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const parsed = try std.Uri.parse(input.uri);
+            var path_buffer: [256]u8 = undefined;
+            const is_cleanup = @import("../internal/routes.zig").isRetainedRead(try parsed.path.toRaw(&path_buffer));
+            const response = try (if (is_cleanup) self.data else self.control).execute(a, input);
+            if (!is_cleanup and self.cancel_after_terminal != null and response.status == 200) {
+                const proof = try replies.Reply.decode(response.body);
+                if (proof.outcome == .terminal) {
+                    self.cancel_after_terminal.?.* = true;
+                    self.cancel_after_terminal = null;
+                }
+            }
+            return response;
+        }
+    };
+    var mux: ControlMux = .{ .data = client.read_executor, .control = client.control_executor };
+    const ManagedCase = enum { success, busy, late_cancel, lost, published_capacity };
+    for (std.enums.values(ManagedCase)) |managed_case| {
+        const managed_creation_loss = managed_case == .lost or managed_case == .published_capacity;
+        var caller = try RunnableScheduler.Scheduler.init(.{ .slots = 2, .read_isolation = false });
+        defer caller.close();
+        var execution: RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        try execution.start(&caller, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+        var parent: ManagedParent = .{ .execution = &execution };
+        var node_alloc: @import("../common/allocation_budget.zig").Shared = .{ .child = alloc, .limit = 128 * 1024 };
+        var cleanup = try Retirement.Registry.init(node_alloc.allocator(), 4, 64 * 1024, 16 * 1024);
+        const node_baseline = node_alloc.stats().used_bytes;
+        var cleanup_live = true;
+        defer if (cleanup_live) {
+            read_transport.releaseOutput();
+            parent.detached = true;
+            for (0..12) |_| {
+                if (cleanup.snapshot().retained == 0) break;
+                _ = cleanup.pollOne(.{ .allocator = alloc });
+            }
+            cleanup.close();
+            cleanup.deinit() catch unreachable;
+        };
+        var foreground = std.heap.ArenaAllocator.init(alloc);
+        var foreground_live = true;
+        defer if (foreground_live) foreground.deinit();
+        read_transport.managed_mode = true;
+        read_transport.managed_loss = managed_creation_loss;
+        read_transport.managed_capacity_loss = managed_case == .published_capacity;
+        read_transport.managed_busy = managed_case == .busy;
+        read_transport.expected_route = null;
+        read_transport.sender_store = &coordinator_store;
+        var protocol = client;
+        protocol.read_executor.clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io);
+        protocol.control_executor = .{ .ptr = &mux, .vtable = &.{ .execute = ControlMux.execute } };
+        const route: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 4, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 2, .shard_id = 7, .range_id = 7 } } };
+        const binding: Retirement.Binding = .{ .registry = &cleanup, .parent = .{ .ptr = &parent, .retain = ManagedParent.retain, .release = ManagedParent.release } };
+        const ForegroundScope = struct {
+            canceled: bool = false,
+            poisoned: bool = false,
+            deadline: u64,
+            remote: http_common.RequestExecutor,
+            binding: ?Retirement.Binding,
+            pub fn remoteExecutor(self: *@This()) !?http_common.RequestExecutor {
+                try self.checkLifetime();
+                return self.remote;
+            }
+            pub fn retirementBinding(self: *@This()) !?Retirement.Binding {
+                try self.checkLifetime();
+                return self.binding;
+            }
+            pub fn checkpoint(self: *@This()) !void {
+                try self.checkLifetime();
+            }
+            pub fn checkLifetime(self: *@This()) !void {
+                if (self.poisoned) return error.TestForegroundBorrowEscaped;
+                if (self.canceled) return error.Canceled;
+            }
+            pub fn deadlineNs(self: *@This()) !?u64 {
+                try self.checkLifetime();
+                return self.deadline;
+            }
+            pub fn waitForProgress(self: *@This()) !void {
+                try self.checkLifetime();
+                return error.Backpressured;
+            }
+        };
+        const QueryDispatch = @import("retained_query_dispatch.zig").Dispatcher;
+        const DispatchScope = struct {
+            deadline: u64,
+            fn current(raw: *anyopaque) !?u64 {
+                return @as(*@This(), @ptrCast(@alignCast(raw))).deadline;
+            }
+            fn release(raw: *anyopaque, bytes: usize, _: @import("../common/remote_attempts.zig").Id) void {
+                // This test's node parent remains alive through every outbox.
+                ManagedParent.release(raw, bytes);
+            }
+        };
+        var dispatch_scope: DispatchScope = .{ .deadline = deadline };
+        const query_dispatch = try foreground.allocator().create(QueryDispatch);
+        var detach_signal: std.atomic.Value(bool) = .init(false);
+        query_dispatch.* = try QueryDispatch.initRetained(protocol, &dispatch_scope, DispatchScope.current, .{ .parent = binding.parent, .context = &parent, .release = DispatchScope.release, .cancellation = &detach_signal });
+        const other_operation = try QueryDispatch.initRetained(protocol, &dispatch_scope, DispatchScope.current, .{ .parent = binding.parent, .context = &parent, .release = DispatchScope.release, .cancellation = &detach_signal });
+        try std.testing.expect(other_operation.operation != query_dispatch.operation);
+        var foreground_scope: ForegroundScope = .{ .deadline = deadline, .remote = query_dispatch.executor(), .binding = binding };
+        var foreground_adapter: @import("antfly_local_sources").common_read_admission.Adapter(*ForegroundScope) = .{ .budget = &foreground_scope };
+        const foreground_payload = foreground_adapter.payload();
+        // Explicit capability errors cannot silently select legacy transport.
+        foreground_scope.binding = null;
+        try std.testing.expectError(error.CleanupCapacityUnavailable, Managed.Client.captureWithAdmission(foreground.allocator(), protocol.read_executor, base_uri, "docs", route, 5, deadline, .init(&foreground_payload)));
+        foreground_scope.binding = binding;
+        foreground_scope.remote = protocol.read_executor;
+        try std.testing.expectError(error.UnsupportedRemoteAttemptProtocol, Managed.Client.captureWithAdmission(foreground.allocator(), protocol.read_executor, base_uri, "docs", route, 5, deadline, .init(&foreground_payload)));
+        foreground_scope.remote = query_dispatch.executor();
+        foreground_scope.canceled = true;
+        try std.testing.expectError(error.Canceled, Managed.Client.captureWithAdmission(foreground.allocator(), protocol.read_executor, base_uri, "docs", route, 5, deadline, .init(&foreground_payload)));
+        foreground_scope.canceled = false;
+        try std.testing.expectEqual(@as(usize, 0), cleanup.snapshot().retained);
+        try std.testing.expectEqual(@as(usize, 0), parent.pins);
+        read_transport.managed_cancel_reply = if (managed_case == .late_cancel) &foreground_scope.canceled else null;
+        // Resolve both capabilities through the same restriction/trace wrappers
+        // used around provider calls. Neither wrapper nor dispatcher may escape.
+        var restricted: @import("antfly_local_sources").common_read_admission.RetainedDependency = .{};
+        var trace: @import("antfly_local_sources").common_read_admission.RejectionTrace = .{};
+        const scoped_control = trace.bind(restricted.bind(.init(&foreground_payload)));
+        if (managed_case == .success) {
+            try Managed.Client.admitWithAdmission(foreground.allocator(), protocol.read_executor, base_uri, "docs", route, 5, deadline, scoped_control);
+            try std.testing.expectEqual(@as(usize, 1), parent.pins);
+            try std.testing.expectEqual(@as(usize, 4096), parent.charged);
+            try std.testing.expectEqual(@as(u64, 17 + 4096), caller.stats().retained_bytes);
+            try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+            try std.testing.expectEqual(@as(usize, 0), cleanup.snapshot().retained);
+            var admission_cursor: client_mod.ReconcileCursor = .{};
+            const reconciled = try protocol.reconcilePass(&admission_cursor, .{ .max_rpc_calls = 4, .max_scanned = ledger.reconciliationWidth(), .rpc_timeout_ns = std.time.ns_per_s, .deadline_ns = deadline });
+            try std.testing.expectEqual(@as(usize, 1), reconciled.terminal);
+            try std.testing.expectEqual(@as(usize, 0), parent.pins);
+            try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().bytes);
+        }
+        const calls_before_capture = read_transport.calls;
+        const result = Managed.Client.captureWithAdmission(foreground.allocator(), protocol.read_executor, base_uri, "docs", route, 5, deadline, scoped_control);
+        if (managed_case == .busy) {
+            try std.testing.expect((try result) == null);
+            try std.testing.expectEqual(@as(usize, 0), cleanup.snapshot().retained);
+            try std.testing.expectEqual(@as(usize, 1), parent.pins);
+            try std.testing.expect(node_alloc.stats().used_bytes > node_baseline);
+        } else if (managed_case == .late_cancel) {
+            try std.testing.expectError(error.Canceled, result);
+            try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+        } else if (managed_creation_loss) {
+            // An executor-entry failure is uncertain even when its error name
+            // collides with prepublication credit exhaustion. Never recapture.
+            try std.testing.expectError(if (managed_case == .published_capacity) error.RemoteAttemptCapacity else error.ConnectionResetByPeer, result);
+            try std.testing.expectEqual(calls_before_capture + 1, read_transport.calls);
+            try std.testing.expectEqual(@as(usize, 1), cleanup.snapshot().retained);
+            try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+            // This receiver is shared across cases. Close only for the final
+            // case so both uncertain creations reach executor publication;
+            // its cleanup still proves control progress after admission closes.
+            if (managed_case == .published_capacity) registry.closeAdmission();
+        } else {
+            const capture = (try result).?;
+            var capture_live = true;
+            defer if (capture_live) capture.deinit();
+            const capture_client: *Managed.Client = @ptrCast(@alignCast(capture.ptr));
+            try std.testing.expectEqual(query_dispatch.operation, capture_client.signed.?.operation);
+            try std.testing.expectEqual(protocol.read_executor.ptr, capture_client.executor.ptr);
+            const capture_id = capture_client.creation_id.?;
+            const snapshot = try capture.captureSnapshot(foreground.allocator());
+            var snapshot_live = true;
+            defer if (snapshot_live) snapshot.deinit();
+            const snapshot_client: *Managed.Client = @ptrCast(@alignCast(snapshot.ptr));
+            const snapshot_id = snapshot_client.creation_id.?;
+            try std.testing.expect(!capture_id.eql(snapshot_id));
+            capture.deinit();
+            capture_live = false;
+            // Capacity remains charged until physical close, then signed proof.
+            _ = cleanup.pollOne(.{ .allocator = alloc });
+            try std.testing.expectEqual(@as(usize, 8192), ledger.snapshot().bytes);
+            _ = cleanup.pollOne(.{ .allocator = alloc });
+            try std.testing.expectEqual(@as(usize, 4096), ledger.snapshot().bytes);
+            const cursor = try snapshot.open(foreground.allocator(), "", "", .{ .relational_query = .{ .fields = &.{} } });
+            var cursor_live = true;
+            defer if (cursor_live) cursor.deinit();
+            const cursor_client: *Managed.Client = @ptrCast(@alignCast(cursor.ptr));
+            try std.testing.expect(!snapshot_id.eql(cursor_client.creation_id.?));
+            snapshot.deinit();
+            snapshot_live = false;
+            cursor.deinit();
+            cursor_live = false;
+        }
+        if (managed_case != .busy) try std.testing.expect(parent.pins >= 2);
+        parent.detached = true;
+        execution.park(.output_blocked) catch unreachable;
+        foreground_scope.poisoned = true;
+        foreground.deinit();
+        foreground_live = false;
+        try std.testing.expectEqual(@as(usize, 0), caller.stats().runnable_slots);
+        try std.testing.expect(caller.stats().retained_bytes >= 17 + parent.charged);
+        var health: RunnableScheduler.Execution = .{};
+        try health.start(&caller, .{ .io = std.testing.io, .allow_wait = false }, .control);
+        health.finish();
+        const PollScope = struct {
+            canceled: bool = false,
+            deadline: u64,
+            pub fn checkpoint(self: *@This()) !void {
+                try self.checkLifetime();
+            }
+            pub fn checkLifetime(self: *@This()) !void {
+                if (self.canceled) return error.Canceled;
+            }
+            pub fn deadlineNs(self: *@This()) !?u64 {
+                try self.checkLifetime();
+                return self.deadline;
+            }
+            pub fn waitForProgress(self: *@This()) !void {
+                try self.checkLifetime();
+                return error.Backpressured;
+            }
+        };
+        var observer: PollScope = .{ .deadline = platform_time.monotonicNs() + std.time.ns_per_s };
+        defer mux.cancel_after_terminal = null;
+        for (0..12) |_| {
+            if (cleanup.snapshot().retained == 0) break;
+            observer.canceled = false;
+            observer.deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+            if (managed_creation_loss) mux.cancel_after_terminal = &observer.canceled;
+            var adapter: @import("antfly_local_sources").common_read_admission.Adapter(*PollScope) = .{ .budget = &observer };
+            const payload = adapter.payload();
+            var scratch: [64 * 1024]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+            _ = cleanup.pollOne(.{ .allocator = fixed.allocator(), .control = .init(&payload) });
+        }
+        if (managed_case == .busy) {
+            // The ticket is already gone; only the outbox reference owns Client
+            // metadata now. The node's existing reconciler retires that parent.
+            var node_cursor: client_mod.ReconcileCursor = .{};
+            const pass = try client.reconcilePass(&node_cursor, .{ .max_rpc_calls = 4, .max_scanned = ledger.reconciliationWidth(), .rpc_timeout_ns = std.time.ns_per_s, .deadline_ns = deadline });
+            try std.testing.expectEqual(@as(usize, 1), pass.terminal);
+        }
+        if (managed_creation_loss) try std.testing.expect(observer.canceled);
+        try std.testing.expectEqual(@as(usize, 0), cleanup.snapshot().retained);
+        try std.testing.expectEqual(@as(usize, 0), parent.pins);
+        try std.testing.expectEqual(@as(usize, 0), caller.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().bytes);
+        try std.testing.expectEqual(@as(usize, 0), registry.snapshot().bytes);
+        // Registry baseline remains until its joined node owner is destroyed.
+        try std.testing.expectEqual(node_baseline, node_alloc.stats().used_bytes);
+        cleanup.close();
+        try cleanup.deinit();
+        cleanup_live = false;
+        try std.testing.expectEqual(@as(usize, 0), node_alloc.stats().used_bytes);
+    }
+}
+
+test "remote attempt client durable I/O releases control CPU while retaining its original root" {
+    const durable = @import("../common/remote_fence_store.zig");
+    const attempts = @import("../common/remote_attempts.zig");
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    const Probe = struct {
+        var current: *@This() = undefined;
+        server: *ApiHttpServer,
+        execution: *RunnableScheduler.Execution,
+        original_sync: *const fn (?*anyopaque, std.Io.File) std.Io.File.SyncError!void,
+        deny_after_rename: bool,
+        ends: usize = 0,
+        health_runs: usize = 0,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            if (self.deny_after_rename and self.ends == 3) return error.Forbidden;
+            try self.execution.enter(.control);
+        }
+        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            const self = current;
+            const scheduler = self.server.runnableScheduler().?;
+            const retained = scheduler.stats();
+            std.debug.assert(retained.runnable_slots == 0 and retained.operations == 1 and retained.retained_bytes == 23);
+            var health: RunnableScheduler.Execution = .{};
+            health.start(scheduler, .{ .io = std.testing.io, .native_now_ns = platform_time.monotonicNs, .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s, .retained_bytes = 5 }, .control) catch @panic("health control CPU unavailable during fsync");
+            std.debug.assert(scheduler.stats().runnable_slots == 1);
+            health.finish();
+            std.debug.assert(scheduler.stats().operations == 1 and scheduler.stats().retained_bytes == 23);
+            self.health_runs += 1;
+            return self.original_sync(userdata, file);
+        }
+    };
+    for ([_]bool{ false, true }) |deny| {
+        var api = try ApiHttpServer.initWithConfig(alloc, .{ .runnable_policy = .{ .slots = 2, .control_slots = 1, .read_isolation = false, .max_operations = 8, .max_bytes = 4096, .control_bytes = 1024 } }, .{ .ptr = undefined, .vtable = &.{ .status = Source.status } }, null, null);
+        defer api.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var store = try durable.Store.create(alloc, io, tmp.dir, 11, 2);
+        defer store.deinit();
+        var records: [2]?attempts.WorkerRecord = undefined;
+        var gate = try store.restoreGate(1, &records);
+        _ = try store.fence(&gate, 1);
+        var execution: RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        try api.startSqlRunnable(&execution, .{ .io = io, .native_now_ns = platform_time.monotonicNs, .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s, .retained_bytes = 23 }, .control);
+        var probe: Probe = .{ .server = &api, .execution = &execution, .original_sync = io.vtable.fileSync, .deny_after_rename = deny };
+        Probe.current = &probe;
+        var vtable = io.vtable.*;
+        vtable.fileSync = Probe.sync;
+        store.io = .{ .userdata = io.userdata, .vtable = &vtable };
+        const result = store.withWait(.{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end }).fence(&gate, 2);
+        if (deny) {
+            try std.testing.expectError(error.Forbidden, result);
+            try std.testing.expect(!gate.accepting);
+            try std.testing.expectEqual(@as(usize, 0), api.runnableScheduler().?.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), probe.health_runs);
+            try std.testing.expectError(error.RemoteFenceStoreUncertain, store.floor(1));
+        } else {
+            try std.testing.expectEqual(@as(u64, 2), (try result).generation);
+            try std.testing.expectEqual(@as(usize, 1), api.runnableScheduler().?.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 2), probe.health_runs);
+        }
+        try std.testing.expectEqual(@as(usize, 1), api.runnableScheduler().?.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), api.runnableScheduler().?.stats().retained_bytes);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), api.runnableScheduler().?.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), api.runnableScheduler().?.stats().retained_bytes);
+        store.io = io;
+    }
+}
+
+test "remote attempt client periodic owner keeps control progress and joins before releasing uncertainty" {
+    const alloc = std.testing.allocator;
+    const client_mod = @import("remote_attempt_client.zig");
+    const loop_mod = @import("remote_reconciliation.zig");
+    const attempts = @import("../common/remote_attempts.zig");
+    const durable = @import("../common/remote_fence_store.zig");
+    const worker = @import("../common/remote_worker.zig");
+    const replies = @import("../common/remote_attempt_reply.zig");
+    const membership = @import("../common/remote_membership.zig");
+    const wire = @import("../common/remote_attempt_wire.zig");
+    const service = @import("internal_service_auth.zig");
+    const backend_mod = @import("antfly_local_sources").storage_background_runtime;
+    const realm = "0123456789abcdef0123456789abcdef".*;
+    const secret = "0123456789abcdef0123456789abcdef";
+    const seed: [32]u8 = @splat(7);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const local: membership.Local = .{ .metadata_incarnation = realm, .node_id = 9, .store_id = 13, .root_incarnation = 11, .reporter_incarnation = 17 };
+    const Source = struct {
+        nodes: [2]metadata_mod.NodeRecord = .{ .{ .node_id = 7 }, .{ .node_id = 9 } },
+        stores: [1]metadata_mod.StoreRecord,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metadata_incarnation = realm, .metrics = .{} };
+        }
+        fn snapshot(raw: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            try request.ensureActive();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .status = try status(raw), .nodes = &self.nodes, .stores = &self.stores, .tables = &.{}, .ranges = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    for ([_]bool{ false, true }) |imported| {
+        var backend = try backend_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 16, .sql_worker_capacity = 16 } });
+        defer backend.deinit();
+        var node = try RunnableScheduler.NodeOwner.init(.{ .slots = 2, .control_bytes = 1 << 20, .read_isolation = false });
+        defer node.deinit();
+        var source = Source{ .stores = .{.{ .store_id = 13, .node_id = 9, .replica_root_incarnation = 11, .reporter_incarnation = 17, .replica_root_public_key = pair.public_key.toBytes() }} };
+        var api = try ApiHttpServer.initWithConfig(alloc, .{ .request_memory_bytes = 8 << 20, .retained_memory_bytes = 8 << 20, .backend_runtime = backend.ptr(), .imported_runtime_io = if (imported) .{ .api = backend.ptr().apiIo(), .sql_workers = @import("sql_worker_lease.zig").factory(backend.ptr()).? } else null, .internal_service_secret = secret, .internal_service_issuer = "cluster", .runnable_owner_handle = &node }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .linearizable_snapshot = Source.snapshot, .free_admin_snapshot = Source.free } }, null, null);
+        var api_live = true;
+        defer if (api_live) api.deinit();
+        var worker_tmp = std.testing.tmpDir(.{});
+        defer worker_tmp.cleanup();
+        var worker_store = try durable.Store.create(alloc, std.testing.io, worker_tmp.dir, 11, 2);
+        defer worker_store.deinit();
+        var registry = try worker.Registry.init(alloc, &worker_store, local, .{ .coordinators = 2, .attempts = 2, .per_coordinator_attempts = 2, .duplicate_window = 8, .bytes = 8192, .per_coordinator_bytes = 8192, .resource_references = 2 }, platform_time.monotonicNs);
+        defer registry.deinit() catch unreachable;
+        const Recovery = struct {
+            fn fresh(_: *const anyopaque) bool {
+                return true;
+            }
+        };
+        try registry.completeRecovery(.{ .context = &source, .quiescent = Recovery.fresh });
+        const authority = try api.resolveRemoteReplyAuthority(local, .{});
+        const signer = try replies.Signer.initEnrolled(authority, .{ .root_incarnation = local.root_incarnation, .public_key = pair.public_key.toBytes(), .seed = seed });
+        var coordinator_tmp = std.testing.tmpDir(.{});
+        defer coordinator_tmp.cleanup();
+        var store = try durable.Store.create(alloc, std.testing.io, coordinator_tmp.dir, 77, 2);
+        defer store.deinit();
+        var slots: [2]?attempts.Attempt = undefined;
+        var destinations = [_]attempts.Destination{.{ .worker_incarnation = 11, .max_attempts = 2, .max_bytes = 8192 }};
+        var ledger = try store.startCoordinator(try membership.coordinatorIdentity(realm, 7), 0, &slots, &destinations, 8192);
+        const Transport = struct {
+            api: *ApiHttpServer,
+            registry: *worker.Registry,
+            signer: *const replies.Signer,
+            blocked: std.atomic.Value(bool) = .init(false),
+            block_capabilities: std.atomic.Value(bool) = .init(false),
+            fail_capabilities: std.atomic.Value(bool) = .init(false),
+            capability_calls: std.atomic.Value(u64) = .init(0),
+            entered: std.atomic.Value(bool) = .init(false),
+            physically_joined: std.atomic.Value(bool) = .init(false),
+            cancellation_observed: std.atomic.Value(bool) = .init(false),
+            ownership_observed: std.atomic.Value(bool) = .init(false),
+            fn canceled(raw: *const anyopaque) bool {
+                return @as(*const http_common.RequestCancellation, @ptrCast(@alignCast(raw))).isCancelled();
+            }
+            fn execute(raw: *anyopaque, output_alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const path = if (std.mem.endsWith(u8, request.uri, "/capabilities")) internal_api_routes.remote_attempt_capabilities else if (std.mem.endsWith(u8, request.uri, "/fence")) internal_api_routes.remote_attempt_fence else if (std.mem.endsWith(u8, request.uri, "/cancel")) internal_api_routes.remote_attempt_cancel else internal_api_routes.remote_attempt_status;
+                const kind: wire.Kind = if (std.mem.endsWith(u8, path, "/capabilities")) .capabilities else if (std.mem.endsWith(u8, path, "/fence")) .fence else if (std.mem.endsWith(u8, path, "/cancel")) .cancel else .status;
+                const token = request.header(service.header_name) orelse return error.Unauthorized;
+                const verified = try self.api.authenticateRemoteAttempt(token, 11, kind, "POST", path, request.body, std.time.ns_per_s);
+                const wait = request.execution_wait orelse return error.InvalidArgument;
+                if (self.blocked.load(.acquire) and (if (self.block_capabilities.load(.acquire)) kind == .capabilities else kind == .cancel)) {
+                    try wait.beginWait();
+                    defer wait.endWait() catch {};
+                    defer {
+                        self.cancellation_observed.store(request.cancellation.?.isCancelled(), .release);
+                        self.ownership_observed.store(self.api.remote_reconciliation != null and self.api.remote_reconciliation_workers != null and self.api.remote_reconciliation_node != null and self.api.runnableScheduler().?.stats().control_retained_bytes >= loop_mod.Runtime.reservationBytes(), .release);
+                        self.physically_joined.store(true, .release);
+                    }
+                    self.entered.store(true, .release);
+                    while (true) {
+                        if (request.cancellation.?.isCancelled()) return error.Canceled;
+                        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    }
+                }
+                if (kind == .capabilities) {
+                    _ = self.capability_calls.fetchAdd(1, .monotonic);
+                    if (self.fail_capabilities.load(.acquire)) return error.ConnectionResetByPeer;
+                    // Trusted fixture support, not production readiness inferred
+                    // from a healthy control route. The consumer still verifies
+                    // the actual root signature and original nonce-bound scope.
+                    const reply = try @import("../common/remote_read_capabilities.zig").Reply.sign(self.signer, verified.context, .{ .retained_read = true });
+                    return .{ .status = 200, .body = try output_alloc.dupe(u8, &reply.encode()) };
+                }
+                const reply = try self.api.signVerifiedRemoteControlWithWait(self.registry, self.signer, verified, .{ .deadline_ns = request.cancellation.?.execution_deadline_ns, .cancellation = .{ .ptr = request.cancellation.?, .is_cancelled_fn = canceled } }, wait);
+                return .{ .status = 200, .body = try output_alloc.dupe(u8, &reply.encode()) };
+            }
+        };
+        var transport = Transport{ .api = &api, .registry = &registry, .signer = &signer };
+        const targets = [_]client_mod.Target{.{ .base_uri = "http://worker", .authority = authority }};
+        var client: client_mod.Client = .{ .ledger = &ledger, .store = &store, .targets = &targets, .signing = .{ .secret = secret, .issuer = "cluster" }, .read_allocator = alloc, .control_allocator = api.controlAllocator(), .read_executor = undefined, .control_executor = .{ .ptr = &transport, .clock_io = .init(&std.testing.io), .vtable = &.{ .execute = Transport.execute } } };
+        // This defer precedes every borrowed store/registry teardown, including on
+        // assertion failure. API deinit independently owns the same shutdown hook.
+        defer if (api_live) api.stopRemoteReconciliation();
+        const policy: loop_mod.Policy = .{ .interval_ms = 5, .pass_duration_ns = 500 * std.time.ns_per_ms, .rpc_timeout_ns = 250 * std.time.ns_per_ms, .max_rpc_calls = 1, .max_scanned = 4 };
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, loop_mod.Runtime.create(failing.allocator(), std.testing.io, api.runnableScheduler().?, client, policy));
+        try std.testing.expect(!ledger.reconciler_bound);
+        try std.testing.expectEqual(@as(u64, 0), node.scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 1), node.borrowers);
+        // A control partition too small for bounded scratch rejects installation;
+        // it must not bind the ledger or leave even an idle byte reservation.
+        var small = try RunnableScheduler.Scheduler.init(.{ .slots = 2, .control_bytes = 64 << 10, .read_isolation = false });
+        defer small.close();
+        try std.testing.expectError(error.CleanupCapacityUnavailable, loop_mod.Runtime.create(alloc, std.testing.io, &small, client, policy));
+        try std.testing.expect(!ledger.reconciler_bound);
+        try std.testing.expectEqual(@as(u64, 0), small.stats().retained_bytes);
+        // An actual executor refusal rolls back binding and the persistent charge.
+        const Block = struct {
+            entered: std.Io.Event = .unset,
+            release: std.Io.Event = .unset,
+            fn run(self: *@This(), io: std.Io) void {
+                self.entered.set(io);
+                self.release.wait(io) catch {};
+            }
+        };
+        {
+            var workers = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(1) });
+            defer workers.deinit();
+            var block: Block = .{};
+            var future = try workers.io().concurrent(Block.run, .{ &block, workers.io() });
+            defer {
+                block.release.set(workers.io());
+                future.await(workers.io());
+            }
+            try block.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            try std.testing.expectError(error.ConcurrencyUnavailable, loop_mod.Runtime.create(alloc, workers.io(), &node.scheduler, client, policy));
+            try std.testing.expect(!ledger.reconciler_bound);
+            try std.testing.expectEqual(@as(u64, 0), node.scheduler.stats().retained_bytes);
+        }
+        const Publication = @import("remote_capability_publication.zig").Cache;
+        const publication = try Publication.create(alloc, &node.scheduler, &.{authority}, platform_time.monotonicNs);
+        var publication_live = true;
+        defer if (publication_live) {
+            api.stopRemoteReconciliation();
+            publication.close();
+            publication.deinit() catch unreachable;
+        };
+        const publication_bytes = publication.reservedBytes();
+        client.capabilities = publication;
+        try api.startRemoteReconciliation(client, policy);
+        const reconcile_bytes = api.remote_reconciliation.?.reservedBytes();
+        try std.testing.expectEqual(loop_mod.Runtime.reservationBytes(), reconcile_bytes);
+        try api.startReadRetirement(2, 4096, 2048);
+        const retirement_bytes = api.read_retirement_runtime.?.reservedBytes();
+        const baseline = reconcile_bytes + retirement_bytes + publication_bytes;
+        try std.testing.expectEqual(@as(usize, 3), node.borrowers);
+        try std.testing.expectEqual(baseline, node.scheduler.stats().control_retained_bytes);
+        try api.read_retirement_runtime.?.join();
+        try std.testing.expectEqual(@as(usize, 3), node.borrowers);
+        const Await = struct {
+            fn ready(ledger_: *attempts.Coordinator) !void {
+                const until = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+                while (ledger_.snapshot().startup_fences_remaining != 0) {
+                    if (platform_time.monotonicNs() >= until) return error.TestReconciliationTimeout;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
+            }
+        };
+        try Await.ready(&ledger);
+        const discover_by = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (!try client.supportsRead(0, true)) {
+            if (platform_time.monotonicNs() >= discover_by) return error.TestDiscoveryTimeout;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        const pinned = try client.pinCapabilities(0);
+        try std.testing.expect(pinned.capabilities == null);
+        try std.testing.expect(api.remote_reconciliation.?.snapshot().discovery_passes > 0);
+        try std.testing.expect(!targets[0].owned_retained_reads_v1);
+        try std.testing.expectError(error.InvalidRunnableTransition, api.startRemoteReconciliation(client, policy));
+        try std.testing.expectError(error.InvalidRunnableTransition, loop_mod.Runtime.create(alloc, std.testing.io, api.runnableScheduler().?, client, policy));
+        try std.testing.expectEqual(baseline, node.scheduler.stats().control_retained_bytes);
+        var ordinary: RunnableScheduler.Execution = .{};
+        defer ordinary.finish();
+        try api.startSqlRunnable(&ordinary, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+        const memory = api.request_memory.?;
+        const occupied = try api.alloc.alloc(u8, memory.foreground.limit - memory.foreground.stats().used_bytes - ApiHttpServer.RequestMemory.overhead(.of(u8)));
+        var occupied_live = true;
+        defer if (occupied_live) api.alloc.free(occupied);
+        try std.testing.expectError(error.OutOfMemory, api.alloc.alloc(u8, 1));
+        const id = try ledger.reserve(0, 71, 512);
+        try store.prepareDispatch(&ledger, id);
+        ledger.transportLost(id);
+        transport.fail_capabilities.store(true, .release);
+        const failed_by = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (try client.supportsRead(0, true) or api.remote_reconciliation.?.snapshot().discovery_failures == 0) {
+            if (platform_time.monotonicNs() >= failed_by) return error.TestDiscoveryTimeout;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(publication.everEnabled(true));
+        try std.testing.expect(try pinned.supportsRead(0, true));
+        try std.testing.expectEqual(@as(usize, 512), ledger.snapshot().bytes);
+        transport.blocked.store(true, .release);
+        try std.testing.expect(try client.abandon(id));
+        const until = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (!transport.entered.load(.acquire)) {
+            if (platform_time.monotonicNs() >= until) return error.TestReconciliationTimeout;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 1), api.runnableScheduler().?.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), api.runnableScheduler().?.stats().resource_blocked);
+        var health: RunnableScheduler.Execution = .{};
+        defer health.finish();
+        try api.startSqlRunnable(&health, .{ .io = std.testing.io, .retained_bytes = 11 }, .control);
+        health.finish();
+        api.remote_reconciliation.?.join();
+        try std.testing.expectEqual(@as(usize, 3), node.borrowers);
+        try std.testing.expectEqual(baseline, node.scheduler.stats().control_retained_bytes);
+        try std.testing.expectEqual(baseline + 23, node.scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 1), node.scheduler.stats().operations);
+        try std.testing.expect(transport.ownership_observed.load(.acquire));
+        api.stopRemoteReconciliation();
+        try std.testing.expectEqual(@as(usize, 2), node.borrowers);
+        try std.testing.expectEqual(retirement_bytes + publication_bytes + 23, node.scheduler.stats().retained_bytes);
+        try std.testing.expect(api.remote_reconciliation_node == null);
+        try std.testing.expect(transport.physically_joined.load(.acquire));
+        try std.testing.expect(transport.cancellation_observed.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 512), ledger.snapshot().bytes);
+        try std.testing.expect(!ledger.reconciler_bound);
+        try std.testing.expectEqual(@as(usize, 1), api.runnableScheduler().?.stats().operations);
+        // The worker moves to a higher quiescent epoch while the consumer is
+        // stopped. A subsequent signed reply must drive ONE durable advance and
+        // a later automatic fence, preserving ownership until those proofs arrive.
+        const higher: wire.Verified = .{ .context = .{ .kind = .fence, .id = .{ .coordinator = ledger.generationState().coordinator, .generation = 3, .operation = 0, .sequence = 0 }, .worker_incarnation = 11, .remaining_ns = std.time.ns_per_s, .charged_bytes = 0, .request_digest = wire.requestDigest("POST", internal_api_routes.remote_attempt_fence, "{}") }, .local_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s };
+        _ = try signer.fence(&registry, higher, .{ .coordinator_node_id = 7, .worker_node_id = 9, .store_id = 13, .root_incarnation = 11, .reporter_incarnation = 17 });
+        transport.blocked.store(false, .release);
+        try api.startRemoteReconciliation(client, policy);
+        node.close();
+        try std.testing.expectError(error.InvalidRunnableTransition, node.tryDeinit());
+        const drained_by = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (ledger.snapshot().bytes != 0 or ledger.generationState().generation != 4 or ledger.reconciliationAction(0) != null) {
+            if (platform_time.monotonicNs() >= drained_by) return error.TestReconciliationTimeout;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(api.remote_reconciliation.?.snapshot().passes > 0);
+        try std.testing.expectEqual(@as(u64, 1), api.remote_reconciliation.?.snapshot().generation_advances);
+        // A pending discovery physically owns its table ticket through cancel
+        // and join, exactly as a blocked reconciliation owns its retained parent.
+        // Keep the installed consumer: ordinary node close forbids installation
+        // of new baseline owners, while this existing cleanup owner can finish.
+        transport.entered.store(false, .release);
+        transport.physically_joined.store(false, .release);
+        transport.block_capabilities.store(true, .release);
+        transport.blocked.store(true, .release);
+        const probe_by = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (!transport.entered.load(.acquire)) {
+            if (platform_time.monotonicNs() >= probe_by) return error.TestDiscoveryTimeout;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        publication.close();
+        try std.testing.expectError(error.CleanupPending, publication.deinit());
+        try std.testing.expectEqual(baseline + 23, node.scheduler.stats().retained_bytes);
+        api.stopRemoteReconciliation();
+        try std.testing.expect(transport.physically_joined.load(.acquire));
+        try std.testing.expect(transport.cancellation_observed.load(.acquire));
+        try publication.deinit();
+        publication_live = false;
+        api.alloc.free(occupied);
+        occupied_live = false;
+        ordinary.finish();
+        api.deinit();
+        api_live = false;
+        try std.testing.expect(!ledger.reconciler_bound);
+        try std.testing.expectEqual(@as(usize, 0), node.borrowers);
+        try std.testing.expectEqual(@as(u64, 0), node.scheduler.stats().retained_bytes);
+    }
+}
+
+test "internal query owner API resume authority uses one linearizable cut and rejects key replacement" {
+    const alloc = std.testing.allocator;
+    const owner_mod = @import("internal_query_owner.zig");
+    const member = @import("../common/remote_membership.zig");
+    const wire = @import("../common/remote_attempt_wire.zig");
+    const replies = @import("../common/remote_attempt_reply.zig");
+    const worker = @import("../common/remote_worker.zig");
+    const local: member.Local = .{ .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .node_id = 9, .store_id = 13, .root_incarnation = 11, .reporter_incarnation = 17 };
+    const key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
+    const Source = struct {
+        api: *ApiHttpServer = undefined,
+        nodes: [2]metadata_mod.NodeRecord = .{ .{ .node_id = 7 }, .{ .node_id = 9 } },
+        stores: [1]metadata_mod.StoreRecord,
+        captures: usize = 0,
+        frees: usize = 0,
+        cached: usize = 0,
+        deadline: u64,
+        fn checked(value: @import("antfly_runtime_abi").error_abi.Status) !void {
+            if (!value.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(value);
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metadata_incarnation = local.metadata_incarnation, .metrics = .{} };
+        }
+        fn observed(raw: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cached += 1;
+            return error.TestObservationalFallback;
+        }
+        fn linear(raw: *anyopaque, request: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try request.ensureActive();
+            try std.testing.expect(request.deadline_ns.? <= self.deadline);
+            const team = request.execution_team orelse return error.TestMissingRunnable;
+            try checked(team.borrow.park(team.borrow.context, @backingInt(@import("antfly_runtime_abi").runnable_abi.Wait.resource)));
+            try std.testing.expectEqual(@as(u64, 0), self.api.runnableSchedulingStats().runnable_slots);
+            try checked(team.borrow.enter(team.borrow.context, @backingInt(@import("antfly_runtime_abi").runnable_abi.Class.query)));
+            self.captures += 1;
+            return .{ .status = try status(raw), .nodes = &self.nodes, .stores = &self.stores, .tables = &.{}, .ranges = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(raw: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.frees += 1;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try @import("../common/remote_fence_store.zig").Store.create(alloc, std.testing.io, tmp.dir, 11, 2);
+    defer store.deinit();
+    var registry = try worker.Registry.init(alloc, &store, local, .{ .coordinators = 2, .attempts = 2, .per_coordinator_attempts = 2, .duplicate_window = 8, .bytes = 65536, .per_coordinator_bytes = 65536, .resource_references = 4 }, platform_time.monotonicNs);
+    defer registry.deinit() catch unreachable;
+    const Fresh = struct {
+        fn ready(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    try registry.completeRecovery(.{ .context = &tmp, .quiescent = Fresh.ready });
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    var receipt: wire.Verified = .{ .context = .{ .kind = .fence, .id = .{ .coordinator = try member.coordinatorIdentity(local.metadata_incarnation, 7), .generation = 1, .operation = 0, .sequence = 0 }, .worker_incarnation = 11, .remaining_ns = 5 * std.time.ns_per_s, .charged_bytes = 0, .request_digest = @splat(7) }, .local_deadline_ns = deadline };
+    const binding: member.Binding = .{ .coordinator_node_id = 7, .worker_node_id = 9, .store_id = 13, .root_incarnation = 11, .reporter_incarnation = 17 };
+    _ = try registry.fence(receipt, binding);
+    receipt.context.kind = .read;
+    receipt.context.id.operation = 71;
+    receipt.context.id.sequence = 1;
+    receipt.context.charged_bytes = 32768;
+    var source = Source{ .deadline = deadline, .stores = .{.{ .store_id = 13, .node_id = 9, .reporter_incarnation = 17, .replica_root_incarnation = 11, .replica_root_public_key = key.public_key.toBytes() }} };
+    var api = try ApiHttpServer.initWithConfig(alloc, .{ .request_memory_bytes = 8 << 20, .runnable_policy = .{ .slots = 2, .read_isolation = false } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .admin_snapshot = Source.observed, .linearizable_snapshot = Source.linear, .free_admin_snapshot = Source.free } }, null, null);
+    defer api.deinit();
+    source.api = &api;
+    const signer = try replies.Signer.init(local, key.public_key.toBytes(), @splat(7));
+    api.cfg.remote_attempt_control = .{ .registry = &registry, .signer = &signer };
+    defer api.cfg.remote_attempt_control = null;
+    const owner = try owner_mod.Owner.create(api.alloc, api.runnable_owner, api.readMemoryPool(), .{ .deadline_ns = deadline });
+    defer owner.release();
+    try owner.start(&api, std.testing.io, 23);
+    _ = try owner.admitRemote(&registry, receipt, binding, api.remoteQueryMembershipAuthority());
+    try std.testing.expectEqual(@as(usize, 1), source.captures);
+    source.stores[0].replica_root_public_key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(8))).public_key.toBytes();
+    const borrow = owner.team.?.borrow;
+    try Source.checked(borrow.park(borrow.context, @backingInt(@import("antfly_runtime_abi").runnable_abi.Wait.resource)));
+    try std.testing.expectError(error.RemoteMembershipChanged, Source.checked(borrow.enter(borrow.context, @backingInt(@import("antfly_runtime_abi").runnable_abi.Class.query))));
+    try std.testing.expectEqual(@as(usize, 2), source.captures);
+    try std.testing.expectEqual(source.captures, source.frees);
+    try std.testing.expectEqual(@as(usize, 0), source.cached);
+    try std.testing.expectEqual(@as(u64, 0), api.runnableSchedulingStats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 32768), registry.snapshot().bytes);
+}
+
+test "internal query owner public single and NDJSON plans preserve retained dispatch authority" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        queries: usize = 0,
+        uncertain: bool = false,
+        retires: usize = 0,
+        fn retire(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retires += 1;
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(_: *anyopaque, alloc: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            if (input == .policy_publication_status) return alloc.dupe(u8, "null");
+            if (input != .resolve_many) return error.UnexpectedTestCall;
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "table:docs", .query_definition = .{ .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}" } }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 3, .tables = &tables }, .{});
+        }
+        fn query(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.queries += 1;
+            try std.testing.expectEqual(@as(*anyopaque, self), req.execution_remote_query.?.ptr);
+            if (self.uncertain) return error.RemoteOutcomeUncertain;
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"hits\":[]}}]}"), .retirement = .{ .ptr = self, .release = retire } };
+        }
+        fn unused(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+    var fake: Fake = .{};
+    var server = ApiHttpServer.init(a, .{ .runnable_policy = .{ .slots = 2 } }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog, .supports_query_definitions = true } }, .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = Fake.query } }, null);
+    defer server.deinit();
+    const authority: http_common.RequestExecutor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.unused } };
+    for ([_]bool{ false, true }) |multi| {
+        for ([_]bool{ false, true }) |uncertain| {
+            fake.uncertain = uncertain;
+            const before = fake.queries;
+            const retired_before = fake.retires;
+            var execution: RunnableScheduler.Execution = .{};
+            defer execution.finish();
+            const body = if (multi) "{\"table\":\"docs\",\"query\":{\"match_all\":{}},\"timeout_ms\":1000}\n" else "{\"query\":{\"match_all\":{}},\"timeout_ms\":1000}";
+            const rejection = if (multi) try server.admitPublicMultiQueryRunnable(&execution, "", body, null) else try server.admitPublicQueryRunnable(&execution, "docs", body, null);
+            try std.testing.expect(rejection == null);
+            var response = if (multi) try server.handleAdmittedPublicGlobalMultiQueryWithRemoteAuthority(body, null, null, &execution, authority) else try server.handleAdmittedPublicTableQueryWithRemoteAuthority("docs", body, null, null, null, null, &execution, authority);
+            var response_live = true;
+            defer if (response_live) response.deinit(server.alloc);
+            try std.testing.expectEqual(@as(u16, if (uncertain) 503 else 200), response.status);
+            try std.testing.expectEqual(before + 1, fake.queries);
+            response.deinit(server.alloc);
+            response_live = false;
+            try std.testing.expectEqual(retired_before + @intFromBool(!uncertain), fake.retires);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), fake.queries);
+}
+
+test "internal query owner composed ingress preserves original execution and retained authority" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        server: *ApiHttpServer = undefined,
+        deadline: u64 = 0,
+        snapshots: usize = 0,
+        bindings: usize = 0,
+        saved_reads: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn check(self: *@This(), context: api_operation.RequestContext) !void {
+            try context.ensureActive();
+            try std.testing.expect(context.deadline_ns != null and context.deadline_ns.? <= self.deadline);
+            try std.testing.expectEqual(@as(*anyopaque, self), context.execution_remote_query.?.ptr);
+            const team = context.execution_team orelse return error.TestMissingReadCapability;
+            try team.borrow.checkLifetime();
+            try std.testing.expectEqual(@as(usize, 1), self.server.runnableSchedulingStats().operations);
+        }
+        fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (input == .policy_publication_status) return alloc.dupe(u8, "null");
+            try self.check(context);
+            if (input == .read) {
+                self.saved_reads += 1;
+                const resources = [_]system_catalog.Resource{.{ .kind = .query_source, .id = 7, .name = "saved", .source_json = "{\"union\":[{\"table\":\"docs\"},{\"table\":\"other\"}]}" }};
+                return std.json.Stringify.valueAlloc(alloc, system_catalog.State{ .revision = 1, .resources = &resources }, .{});
+            }
+            if (input != .resolve_many) return error.UnexpectedTestCall;
+            self.bindings += 1;
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "table:docs", .query_definition = .{ .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}" } }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 3, .tables = &tables }, .{});
+        }
+        fn snapshot(raw: *anyopaque, context: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.check(context);
+            self.snapshots += 1;
+            return error.RemoteOutcomeUncertain;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn unused(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+    var fake: Fake = .{};
+    var server = ApiHttpServer.init(a, .{ .runnable_policy = .{ .slots = 2, .checkpoint_budget = 1 } }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog, .supports_query_definitions = true, .linearizable_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free } }, null, null);
+    defer server.deinit();
+    fake.server = &server;
+    for ([_]bool{ false, true }) |saved| {
+        fake.bindings = 0;
+        fake.snapshots = 0;
+        fake.saved_reads = 0;
+        const body = if (saved) "{\"source\":{\"saved\":\"saved\"},\"source_ranking\":\"rrf\",\"limit\":1,\"timeout_ms\":1000}" else "{\"source\":{\"union\":[{\"table\":\"docs\"},{\"table\":\"other\"}]},\"source_ranking\":\"rrf\",\"limit\":1,\"timeout_ms\":1000}";
+        var execution: RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        fake.deadline = platform_time.monotonicNs() + 500 * std.time.ns_per_ms;
+        const cancellation: http_common.RequestCancellation = .{ .execution_deadline_ns = fake.deadline };
+        try std.testing.expect((try server.admitPublicMultiQueryRunnable(&execution, "", body, &cancellation)) == null);
+        const authority: http_common.RequestExecutor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.unused } };
+        var response = try server.handleAdmittedPublicGlobalMultiQueryWithRemoteAuthority(body, null, &cancellation, &execution, authority);
+        defer response.deinit(server.alloc);
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+        try std.testing.expectEqual(@as(usize, 1), fake.bindings);
+        try std.testing.expectEqual(@as(usize, 1), fake.snapshots);
+        try std.testing.expectEqual(@as(usize, @intFromBool(saved)), fake.saved_reads);
+        try std.testing.expectEqual(@as(usize, 1), server.runnableSchedulingStats().operations);
+        try std.testing.expect(server.runnableSchedulingStats().yields > 0);
+    }
+}
+
+test "retained read owner charges persistent snapshots to retained memory through exhaustion and physical cleanup" {
+    const a = std.testing.allocator;
+    const ReadOwner = @import("retained_read_owner.zig").Owner;
+    const Fixture = struct {
+        calls: usize = 0,
+        closed: usize = 0,
+        const Backend = @This();
+        const Physical = struct {
+            alloc: std.mem.Allocator,
+            fixture: *Backend,
+            bytes: []u8,
+            cancellation: CancellationToken,
+            fn validate(raw: *anyopaque) !void {
+                try @as(*@This(), @ptrCast(@alignCast(raw))).cancellation.check();
+            }
+            fn clone(self: *@This(), alloc: std.mem.Allocator, cancellation: CancellationToken) !*@This() {
+                const result = try alloc.create(@This());
+                errdefer alloc.destroy(result);
+                result.* = .{ .alloc = alloc, .fixture = self.fixture, .bytes = try alloc.dupe(u8, self.bytes), .cancellation = cancellation };
+                return result;
+            }
+            fn snapshot(raw: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.cancellation.check();
+                return .{ .ptr = try self.clone(alloc, .none), .vtable = &.{ .open = open, .release = close } };
+            }
+            fn open(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8, opts: db_mod.types.ScanOptions) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.cancellation.check();
+                return .{ .ptr = try self.clone(alloc, opts.cancellation.?), .vtable = &.{ .next = next, .close = close } };
+            }
+            fn next(raw: *anyopaque, alloc: std.mem.Allocator, _: u32) !@import("antfly_local_sources").api_table_read_source.RelationalReadView.Page {
+                try validate(raw);
+                return .{ .arena = .init(alloc), .rows = &.{}, .after = null };
+            }
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.fixture.closed += 1;
+                const alloc = self.alloc;
+                alloc.free(self.bytes);
+                alloc.destroy(self);
+            }
+        };
+        fn capture(raw: *anyopaque, alloc: std.mem.Allocator, _: metadata_api.CatalogRouteFence, _: u64, _: []const u8, opts: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.StatementReadFence {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const physical = try alloc.create(Physical);
+            errdefer alloc.destroy(physical);
+            physical.* = .{ .alloc = alloc, .fixture = self, .bytes = try alloc.alloc(u8, 8192), .cancellation = opts.cancellation.? };
+            @memset(physical.bytes, 42);
+            return .{ .ptr = physical, .vtable = &.{ .validate = Physical.validate, .open = Physical.open, .capture_snapshot = Physical.snapshot, .release = Physical.close } };
+        }
+    };
+    var server = try ApiHttpServer.initWithConfig(a, .{ .request_memory_bytes = 1 << 20, .retained_memory_bytes = 1 << 20, .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    const requests = server.request_memory.?;
+    const retained = server.state_memory.?;
+    const initial_requests = requests.foreground.stats().used_bytes;
+    const initial_retained = retained.stats().used_bytes;
+    const available = requests.foreground.limit - initial_requests;
+    const pressure = try server.alloc.alloc(u8, available - ApiHttpServer.RequestMemory.overhead(.of(u8)));
+    defer server.alloc.free(pressure);
+    try std.testing.expectEqual(requests.foreground.limit, requests.foreground.stats().used_bytes);
+    // Persistent owner creation cannot consume any of the saturated request heap.
+    const runtime = try server.retainedReadRuntime();
+    const idle_retained = retained.stats().used_bytes;
+    try std.testing.expect(idle_retained > initial_retained);
+    try std.testing.expectEqual(requests.foreground.limit, requests.foreground.stats().used_bytes);
+    var fixture: Fixture = .{};
+    const owner: ReadOwner = .{ .registry = &runtime.registry, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .try_statement_read_fence_group_local_routed = Fixture.capture } } };
+    const scope = @import("../storage/retained_read_registry.zig").Scope{ .principal = @splat(1), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+    const route: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } };
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    const token = (try owner.capture(scope, 1, route, "rows", deadline)).?;
+    try owner.validateCapture(scope, token);
+    const snapshot = try owner.captureSnapshot(scope, token, 1, deadline);
+    const cursor = try owner.openSnapshot(scope, snapshot, 1, "", "", .{ .relational_query = .{ .fields = &.{} } }, deadline);
+    try runtime.registry.close(token, scope);
+    try runtime.registry.close(snapshot, scope);
+    try std.testing.expectEqual(@as(usize, 2), fixture.closed);
+    var first_page = try owner.next(a, scope, cursor, 0, 10);
+    first_page.deinit();
+    const held = retained.stats().used_bytes;
+    try std.testing.expect(held >= idle_retained + 8192);
+    const retained_pressure = try server.state_alloc.alloc(u8, retained.limit - held);
+    var retained_pressure_live = true;
+    defer if (retained_pressure_live) server.state_alloc.free(retained_pressure);
+    try std.testing.expectError(error.OutOfMemory, owner.capture(scope, 1, route, "rows", deadline));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    var delayed_page = try owner.next(a, scope, cursor, 1, 10);
+    delayed_page.deinit();
+    // Verified control has its own reserved allocation capacity under both pressures.
+    const control = try server.controlAllocator().alloc(u8, 64);
+    server.controlAllocator().free(control);
+    try runtime.registry.close(cursor, scope);
+    try std.testing.expectEqual(@as(usize, 3), fixture.closed);
+    try std.testing.expect(retained.stats().used_bytes < retained.limit);
+    server.state_alloc.free(retained_pressure);
+    retained_pressure_live = false;
+    try std.testing.expectEqual(idle_retained, retained.stats().used_bytes);
+    const recovered = (try owner.capture(scope, 1, route, "rows", deadline)).?;
+    try runtime.registry.close(recovered, scope);
+    try std.testing.expectEqual(@as(usize, 4), fixture.closed);
+    try std.testing.expectEqual(idle_retained, retained.stats().used_bytes);
+    runtime.deinit();
+    server.retained_read_runtime = null;
+    try std.testing.expectEqual(initial_retained, retained.stats().used_bytes);
+    try std.testing.expectEqual(requests.foreground.limit, requests.foreground.stats().used_bytes);
+}
+
+test "retained read RPC protected transport accepts bounded cleanup only" {
+    const rpc = @import("retained_read_rpc.zig");
+    const a = std.testing.allocator;
+    const path = "/internal/v1/groups/3/tables/rows/retained-read";
+    const control = try std.json.Stringify.valueAlloc(a, rpc.Request{ .operation = .close, .schema_version = 5, .token = .{ .incarnation = 1, .sequence = 2, .slot = 0 } }, .{});
+    defer a.free(control);
+    const config = configurePublicHttpTransportForConfig(.{}, .{});
+    try std.testing.expect(config.is_protected_body_candidate.?(.POST, path));
+    try std.testing.expect(config.is_protected_body_request.?(.POST, path, control));
+    try std.testing.expect(isProtectedHttpControl(.POST, path, control));
+    try std.testing.expect(isProtectedHttpControl(.POST, path, "{\"operation\":\"cancel\",\"schema_version\":5,\"connection\":7}"));
+    for ([_][]const u8{
+        "{\"operation\":\"next\",\"schema_version\":5}",
+        "{\"operation\":\"capture\",\"schema_version\":5}",
+        "{\"operation\":\"cancel\",\"schema_version\":5}",
+        "{\"operation\":\"close\",\"schema_version\":5}",
+        "{\"operation\":\"close\",\"schema_version\":5,\"token\":{\"incarnation\":1,\"sequence\":2,\"slot\":0},\"writes\":[{\"key\":\"x\"}]}",
+        "{\"operation\":\"cancel\",\"schema_version\":5,\"connection\":7,\"query\":{}}",
+        "{\"operation\":\"cancel\",\"operation\":\"next\",\"schema_version\":5,\"connection\":7}",
+    }) |body| try std.testing.expect(!isProtectedHttpControl(.POST, path, body));
+    for ([_][]const u8{ "/internal/v1/groups/0/tables/rows/retained-read", "/internal/v1/groups/3/tables//retained-read", "/internal/v1/groups/3/tables/rows/retained-read/next", "/internal/v1/groups/3/tables/rows/query", "/db/v1/query" }) |other| try std.testing.expect(!isProtectedHttpControl(.POST, other, control));
+    const signed = try @import("owned_retained_read.zig").encode(a, control, "{}");
+    defer a.free(signed);
+    try std.testing.expect(isProtectedHttpControl(.POST, path, signed));
+    const signed_read = try @import("owned_retained_read.zig").encode(a, "{\"operation\":\"capture\",\"schema_version\":5}", "{}");
+    defer a.free(signed_read);
+    try std.testing.expect(!isProtectedHttpControl(.POST, path, signed_read));
+    const oversized: [4097]u8 = @splat(' ');
+    try std.testing.expect(!isProtectedHttpControl(.POST, path, &oversized));
+    try std.testing.expect(!isProtectedHttpControl(.GET, path, control));
+    try std.testing.expect(@import("../internal/routes.zig").isOwnedGroupQuery("/internal/v1/groups/3/tables/rows/query"));
+    try std.testing.expect(!@import("../internal/routes.zig").isOwnedGroupQuery(path));
+}
+
+test "runnable point lookup readiness retries return original CPU and never restart rejected scopes" {
+    const runtime = @import("antfly_runtime_abi");
+    const Read = @import("runnable_local_read.zig").Read;
+    const Disposition = enum { after_wait, legacy_error, absent, value, unchecked_value };
+    const Fixture = struct {
+        server: *ApiHttpServer,
+        calls: usize = 0,
+        parks: usize = 0,
+        enters: usize = 0,
+        cause: ?anyerror,
+        deadline: u64,
+        disposition: Disposition,
+        source_scope_failed: bool = false,
+        source_scope_checks: usize = 0,
+        original: runtime.runnable_abi.Borrowed = undefined,
+        fn get(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn lookup(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8, opts: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            const self = get(raw);
+            self.calls += 1;
+            if (self.calls == 1) try std.testing.expectEqual(@as(?u64, self.deadline), opts.execution_deadline_ns) else try std.testing.expect(opts.execution_deadline_ns.? <= self.deadline);
+            try std.testing.expectEqual(@as(u64, 1), self.server.runnableSchedulingStats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 1), self.server.runnableSchedulingStats().operations);
+            try opts.cancellation.?.check();
+            if (self.calls == 1) {
+                if (self.disposition == .after_wait) return error.StorageReadTemporarilyUnavailable;
+                self.source_scope_failed = true;
+                if (self.disposition != .unchecked_value) try std.testing.expect(opts.cancellation.?.isCancelled());
+                return switch (self.disposition) {
+                    .legacy_error => error.Cancelled,
+                    .absent => null,
+                    .value, .unchecked_value => .{ .json = try alloc.dupe(u8, "{}"), .version = 7 },
+                    .after_wait => unreachable,
+                };
+            }
+            return .{ .json = try alloc.dupe(u8, "{}"), .version = 7 };
+        }
+        fn scope(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (!self.source_scope_failed) return;
+            self.source_scope_checks += 1;
+            if (self.source_scope_checks == 1) return self.cause.?;
+        }
+        fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self = get(raw);
+            return self.original.checkpoint(self.original.context);
+        }
+        fn life(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self = get(raw);
+            if (self.parks != 0) if (self.cause) |cause| return runtime.error_abi.statusFromError(cause);
+            return self.original.check_lifetime.?(self.original.context);
+        }
+        fn current(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+            const self = get(raw);
+            return self.original.current_class.?(self.original.context, out);
+        }
+        fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+            const self = get(raw);
+            const status = self.original.park(self.original.context, reason);
+            if (!status.isOk()) return status;
+            self.parks += 1;
+            self.producers() catch |cause| return runtime.error_abi.statusFromError(cause);
+            return .ok;
+        }
+        fn producers(self: *@This()) !void {
+            try std.testing.expectEqual(@as(usize, 1), self.calls);
+            try std.testing.expectEqual(@as(u64, 1), self.server.runnableSchedulingStats().resource_blocked);
+            try std.testing.expectEqual(@as(u64, 23), self.server.runnableSchedulingStats().retained_bytes);
+            var producer: RunnableScheduler.Execution = .{};
+            defer producer.finish();
+            try self.server.startSqlRunnable(&producer, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .write);
+            var health: RunnableScheduler.Execution = .{};
+            defer health.finish();
+            try self.server.startSqlRunnable(&health, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            try std.testing.expectEqual(@as(u64, 40), self.server.runnableSchedulingStats().retained_bytes);
+        }
+        fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
+            const self = get(raw);
+            return self.original.enter(self.original.context, class);
+        }
+        fn enterChecked(raw: *anyopaque, class: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+            const self = get(raw);
+            self.enters += 1;
+            return self.original.enter_checked.?(self.original.context, class, restriction);
+        }
+    };
+    for ([_]?anyerror{ null, error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged, error.NotFound, error.UnknownGroup, error.ReadIndexTimeout }) |cause| {
+        for (std.enums.values(Disposition)) |disposition| {
+            if (cause == null and disposition != .after_wait) continue;
+            var server = ApiHttpServer.init(std.testing.allocator, .{ .runnable_policy = .{ .slots = 2 } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, .{ .ptr = undefined, .vtable = &.{ .batch = undefined } });
+            defer server.deinit();
+            const deadline = platform_time.monotonicNs() + 60 * std.time.ns_per_s;
+            var execution: RunnableScheduler.Execution = .{};
+            defer execution.finish();
+            try server.startSqlRunnable(&execution, .{ .io = std.testing.io, .native_now_ns = platform_time.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23 }, .query);
+            var read: Read = .{ .execution = &execution, .allocator = std.testing.allocator };
+            var team = try read.team();
+            var fixture: Fixture = .{ .server = &server, .deadline = deadline, .cause = cause, .original = team.borrow, .disposition = disposition };
+            team.borrow = .{ .context = &fixture, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.query), .checkpoint = Fixture.check, .check_lifetime = Fixture.life, .current_class = Fixture.current, .park = Fixture.park, .enter = Fixture.enter, .enter_checked = Fixture.enterChecked };
+            const result = server.lookupWithReadinessRetry(std.testing.allocator, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, "docs", "key", .{}, .read_index, .{ .deadline_ns = deadline, .execution_team = &team, .cancellation = .{ .ptr = &fixture, .check_fn = Fixture.scope } });
+            if (cause) |failure| {
+                try std.testing.expectError(failure, result);
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            } else {
+                var response = (try result).?;
+                response.deinit(std.testing.allocator);
+                try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+            }
+            const waited: usize = @intFromBool(disposition == .after_wait);
+            try std.testing.expectEqual(waited, fixture.parks);
+            try std.testing.expectEqual(waited, fixture.enters);
+            try std.testing.expectEqual(@as(usize, if (disposition == .after_wait) 0 else 1), fixture.source_scope_checks);
+            try std.testing.expectEqual(@as(u64, 1), server.runnableSchedulingStats().operations);
+            try std.testing.expectEqual(@as(u64, 23), server.runnableSchedulingStats().retained_bytes);
+            try std.testing.expectEqual(@as(?u64, deadline), execution.entry.?.options.deadline_ns);
+            execution.finish();
+            try std.testing.expectEqual(@as(u64, 0), server.runnableSchedulingStats().operations);
+            try std.testing.expectEqual(@as(u64, 0), server.runnableSchedulingStats().retained_bytes);
+        }
+    }
+}
+
+test "runnable point lookup retry ceiling remains local to physical waiting" {
+    const native = RunnableScheduler;
+    const Read = @import("runnable_local_read.zig").Read;
+    var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+    defer scheduler.close();
+    var execution: native.Execution = .{};
+    defer execution.finish();
+    const deadline = platform_time.monotonicNs() + 60 * std.time.ns_per_s;
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = platform_time.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23 }, .query);
+    var read: Read = .{ .execution = &execution, .allocator = std.testing.allocator };
+    var team = try read.team();
+    const request: api_operation.RequestContext = .{ .deadline_ns = deadline, .execution_team = &team };
+    // An expired local readiness ceiling performs no more physical sleeping.
+    // It must still rejoin the live original scope so the caller can return
+    // its availability result, rather than inventing a caller timeout.
+    try @import("request_dependency_wait.zig").run(request, sleepNsScoped, .{ @as(?std.Io, null), @as(u64, 5 * std.time.ns_per_s), request, table_catalog.RoutingBudget.init(null), @as(?u64, 0) });
+    try std.testing.expectEqual(@as(?u64, deadline), execution.entry.?.options.deadline_ns);
+    try std.testing.expectEqual(native.State.running, execution.entry.?.state);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "remote attempt client API sender owns idle baseline and independent native or imported worker through pending joins" {
+    const alloc = std.testing.allocator;
+    const retirement = @import("retained_read_retirement.zig");
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    const Resource = struct {
+        api: *ApiHttpServer,
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        unblock: std.Io.Event = .unset,
+        allow: std.atomic.Value(bool) = .init(false),
+        pins: usize = 0,
+        released: usize = 0,
+        destroyed: usize = 0,
+        fn retain(raw: *anyopaque, _: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pins += 1;
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pins -= 1;
+            self.released += 1;
+        }
+        fn poll(raw: *anyopaque, context: retirement.Poll) !retirement.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.allow.load(.acquire)) {
+                const wait = (try context.control.?.executionWait()).?;
+                try wait.beginWait();
+                self.entered.set(std.testing.io);
+                self.unblock.waitUncancelable(self.io);
+                try wait.endWait();
+            }
+            return if (self.allow.load(.acquire)) .retired else .pending;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.pins != 0);
+            std.debug.assert(self.api.read_retirement_workers != null);
+            std.debug.assert(self.api.read_retirement_runtime != null);
+            self.destroyed += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |imported| {
+        var backend = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 16, .sql_worker_capacity = 16 } });
+        defer backend.deinit();
+        var node = try RunnableScheduler.NodeOwner.init(.{ .slots = 2, .max_operations = 4, .max_bytes = 4 << 20, .control_bytes = 1 << 20, .read_isolation = false });
+        defer node.deinit();
+        var api = try ApiHttpServer.initWithConfig(alloc, .{ .backend_runtime = backend.ptr(), .imported_runtime_io = if (imported) .{ .api = backend.ptr().apiIo(), .sql_workers = @import("sql_worker_lease.zig").factory(backend.ptr()).? } else null, .runnable_owner_handle = &node, .request_memory_bytes = 8 << 20, .retained_memory_bytes = 8 << 20 }, .{ .ptr = undefined, .vtable = &.{ .status = Source.status } }, null, null);
+        defer api.deinit();
+        _ = try api.sqlControlIo();
+        try std.testing.expectEqual(@as(usize, 1), node.borrowers);
+        // A failed start rolls back the independently acquired worker, node pin
+        // and scheduler byte reservation, even under actual allocator pressure.
+        const memory = api.request_memory.?;
+        const ordinary_pressure = try api.controlAllocator().alloc(u8, memory.control.limit - memory.control.stats().used_bytes - ApiHttpServer.RequestMemory.overhead(.of(u8)));
+        defer api.controlAllocator().free(ordinary_pressure);
+        const cleanup = &memory.cleanup.?;
+        const pressure = try api.cleanupAllocator().alloc(u8, cleanup.limit - cleanup.stats().used_bytes - ApiHttpServer.RequestMemory.overhead(.of(u8)));
+        try std.testing.expectError(error.OutOfMemory, api.startReadRetirement(2, 4096, 2048));
+        try std.testing.expectEqual(@as(usize, 1), node.borrowers);
+        try std.testing.expectEqual(@as(u64, 0), node.scheduler.stats().retained_bytes);
+        try std.testing.expect(api.read_retirement_runtime == null and api.read_retirement_workers == null);
+        api.cleanupAllocator().free(pressure);
+        try api.startReadRetirement(2, 4096, 2048);
+        try std.testing.expectEqual(@as(usize, 2), node.borrowers);
+        const runtime = api.read_retirement_runtime.?;
+        const baseline = runtime.reservedBytes();
+        try std.testing.expectEqual(baseline, node.scheduler.stats().control_retained_bytes);
+        try std.testing.expectError(error.InvalidRunnableTransition, api.startReadRetirement(2, 4096, 2048));
+        var resource: Resource = .{ .api = &api, .io = api.read_retirement_workers.?.io() };
+        var finished = false;
+        defer if (!finished) {
+            resource.allow.store(true, .release);
+            resource.unblock.set(resource.io);
+            const until = std.Io.Clock.Timestamp.now(std.testing.io, .awake).addDuration(.{ .raw = .fromSeconds(5), .clock = .awake });
+            api.waitReadRetirementUntil(std.testing.io, until) catch {};
+            api.joinReadRetirement() catch unreachable;
+        };
+        const binding = try api.readRetirementBinding(.{ .ptr = &resource, .retain = Resource.retain, .release = Resource.release });
+        const ticket = try binding.registry.reserve(binding.parent, 64);
+        try ticket.bind(.{ .ptr = &resource, .poll = Resource.poll, .destroy = Resource.destroy });
+        // Model the same independent parent reference used by a signed outbox
+        // after its busy response has already retired the registry ticket.
+        var independent_parent = binding.parent;
+        try independent_parent.acquire(32);
+        var independent_live = true;
+        defer if (independent_live) independent_parent.retire(32);
+        try ticket.publish();
+        try ticket.transfer();
+        try resource.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        try std.testing.expectError(error.CleanupPending, api.joinReadRetirement());
+        try std.testing.expect(!runtime.stopping.load(.acquire) and !runtime.joined);
+        try std.testing.expectEqual(@as(usize, 2), node.borrowers);
+        try std.testing.expectEqual(baseline, node.scheduler.stats().retained_bytes);
+        try std.testing.expectError(error.CleanupCapacityUnavailable, api.readRetirementBinding(binding.parent));
+        const expired: std.Io.Clock.Timestamp = .{ .raw = .{ .nanoseconds = 0 }, .clock = .awake };
+        try std.testing.expectError(error.CleanupPending, api.waitReadRetirementUntil(std.testing.io, expired));
+        var health: RunnableScheduler.Execution = .{};
+        try api.startSqlRunnable(&health, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 7 }, .control);
+        health.finish();
+        node.close();
+        try std.testing.expectError(error.InvalidRunnableTransition, node.tryDeinit());
+        resource.allow.store(true, .release);
+        resource.unblock.set(resource.io);
+        const until = std.Io.Clock.Timestamp.now(std.testing.io, .awake).addDuration(.{ .raw = .fromSeconds(5), .clock = .awake });
+        while (runtime.registry.snapshot().retained != 0) {
+            if (until.raw.nanoseconds <= until.clock.now(std.testing.io).nanoseconds) return error.TestCleanupTimeout;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectError(error.CleanupPending, api.joinReadRetirement());
+        try std.testing.expectError(error.CleanupPending, api.waitReadRetirementUntil(std.testing.io, expired));
+        try std.testing.expect(!runtime.stopping.load(.acquire) and !runtime.joined);
+        try std.testing.expectEqual(@as(usize, 2), node.borrowers);
+        try std.testing.expectEqual(baseline, node.scheduler.stats().retained_bytes);
+        independent_parent.retire(32);
+        independent_live = false;
+        try api.waitReadRetirementUntil(std.testing.io, until);
+        try api.joinReadRetirement();
+        finished = true;
+        try std.testing.expectEqual(@as(usize, 1), resource.destroyed);
+        try std.testing.expectEqual(@as(usize, 2), resource.released);
+        try std.testing.expectEqual(@as(usize, 0), resource.pins);
+        try std.testing.expectEqual(@as(usize, 1), node.borrowers);
+        try std.testing.expectEqual(@as(u64, 0), node.scheduler.stats().retained_bytes);
+        try std.testing.expect(api.read_retirement_runtime == null and api.read_retirement_workers == null and api.read_retirement_node == null);
+    }
+}
+
+test "HTTP request lifetime canonical transport preserves tighter caller ceilings" {
+    try std.testing.expectEqual(@as(u64, 300_000), configurePublicHttpTransportForConfig(.{}, .{}).request_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 25), configurePublicHttpTransportForConfig(.{}, .{ .request_timeout_ms = 25 }).request_timeout_ms);
+    var node = try common_config.Config.parseFromSlice(std.testing.allocator, "{\"admission\":{\"max_request_duration_ms\":700}}");
+    defer node.deinit();
+    try std.testing.expectEqual(@as(u64, 700), configurePublicHttpTransportForConfig(.{ .node_config = &node }, .{}).request_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 700), configurePublicHttpTransportForConfig(.{ .node_config = &node }, .{ .request_timeout_ms = 5000 }).request_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 10), configurePublicHttpTransportForConfig(.{ .node_config = &node }, .{ .request_timeout_ms = 10 }).request_timeout_ms);
+    node.admission.max_request_duration_ms = 0;
+    try std.testing.expectEqual(@as(u64, 1), configurePublicHttpTransportForConfig(.{ .node_config = &node }, .{}).request_timeout_ms);
 }

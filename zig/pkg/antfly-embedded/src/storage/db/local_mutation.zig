@@ -253,6 +253,8 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const failIfIdentityOrdinalExhaustedForNewUpserts = commit.failIfIdentityOrdinalExhaustedForNewUpserts;
         pub const finalizePendingRowPolicyReceiptLocked = commit.finalizePendingRowPolicyReceiptLocked;
         pub const flushDurableReplicationOutboxes = commit.flushDurableReplicationOutboxes;
+        pub const flushDurableReplicationOutboxesStep = commit.flushDurableReplicationOutboxesStep;
+        pub const flushDurableReplicationOutboxesReservedStep = commit.flushDurableReplicationOutboxesReservedStep;
         pub const flushDurableReplicationOutboxesWithAdmission = commit.flushDurableReplicationOutboxesWithAdmission;
         pub const flushDurableReplicationOutboxesWithAdmissionAndRoot = commit.flushDurableReplicationOutboxesWithAdmissionAndRoot;
         pub const flushDurableReplicationOutboxesLocked = commit.flushDurableReplicationOutboxesLocked;
@@ -289,8 +291,10 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const resetCoalescedEntryToDelete = preparation.resetCoalescedEntryToDelete;
         pub const resolveTransactionIntentsInternal = commit.resolveTransactionIntentsInternal;
         pub const resolveTransactionIntentsInternalWithControls = commit.resolveTransactionIntentsInternalWithControls;
+        pub const resolveTransactionIntentsInternalWithAcknowledgementPolicy = commit.resolveTransactionIntentsInternalWithAcknowledgementPolicy;
         pub const resolveTransactionIntentsPrepared = commit.resolveTransactionIntentsPrepared;
         pub const resolveTransactionIntentsPreparedWithControls = commit.resolveTransactionIntentsPreparedWithControls;
+        pub const resolveTransactionIntentsPreparedWithAcknowledgementPolicy = commit.resolveTransactionIntentsPreparedWithAcknowledgementPolicy;
         pub const restoreStagingStatus = commit.restoreStagingStatus;
         pub const setCoalescedEntryToBorrowedWrite = preparation.setCoalescedEntryToBorrowedWrite;
         pub const setCoalescedEntryToOwnedWrite = preparation.setCoalescedEntryToOwnedWrite;
@@ -768,11 +772,12 @@ pub fn ImplementationFor(comptime D: type) type {
             const NativeBoundary = @import("../named_callback.zig").Boundary(struct { get_fn: @FieldType(PreparedBatchOwner, "get_fn"), wait_fn: @FieldType(PreparedBatchOwner, "wait_fn"), resolved_wait_fn: @FieldType(PreparedBatchOwner, "resolved_wait_fn") });
             callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
             recovery: bool,
+            mutation_root: ?*execution_resources.MutationBarrier.RootSharedLease = null,
             context: *anyopaque,
             get_fn: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!?[]u8,
             bulk_fn: *const fn (*anyopaque) bool,
             schedule_fn: *const fn (*anyopaque) void,
-            wait_fn: *const fn (*anyopaque, types.SyncLevel, u64, ManagedSyncTargets, types.CancellationToken, bool) anyerror!void,
+            wait_fn: *const fn (*anyopaque, types.SyncLevel, u64, ManagedSyncTargets, types.CancellationToken, bool, ?@import("../../common/execution_wait.zig").Boundary) anyerror!void,
             resolved_wait_fn: *const fn (*anyopaque, types.SyncLevel, u64, types.CancellationToken) anyerror!void,
             local_execution: *@FieldType(Execution, "local_execution"),
             rewrite_program_cache: *@FieldType(Execution, "rewrite_program_cache"),
@@ -808,6 +813,7 @@ pub fn ImplementationFor(comptime D: type) type {
             embedding_activity: *@FieldType(Execution, "embedding_activity"),
             active_index_repairs: *@FieldType(Execution, "active_index_repairs"),
             graph_restore_parse_cache: *@FieldType(Execution, "graph_restore_parse_cache"),
+            pub const admissionOwnerField = Implementation.ownerField;
             pub const derivedCoverageAppliesToIndex = Implementation.derivedCoverageAppliesToIndex;
             pub const acquireReplicationMutationShared = Implementation.acquireReplicationMutationShared;
             pub const acquireTransactionSchemaView = Implementation.acquireTransactionSchemaView;
@@ -835,6 +841,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const failIfIdentityOrdinalExhaustedForNewUpserts = Implementation.failIfIdentityOrdinalExhaustedForNewUpserts;
             pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
             pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
+            pub const flushDurableReplicationOutboxesStep = Implementation.flushDurableReplicationOutboxesStep;
             pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
             pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;
             pub const hasConfiguredResolvers = Implementation.hasConfiguredResolvers;
@@ -863,6 +870,16 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const validateRestoreStagingReplicationEffects = Implementation.validateRestoreStagingReplicationEffects;
             pub const validateTransformReadSnapshot = Implementation.validateTransformReadSnapshot;
             pub const waitForResolvedTransactionSync = Implementation.waitForResolvedTransactionSync;
+            pub const drainDocumentArtifactChildRangeOutboxWithRoot = Implementation.drainDocumentArtifactChildRangeOutboxWithRoot;
+            pub const ensureDurableReplicationStartupBarrierWithAdmission = Implementation.ensureDurableReplicationStartupBarrierWithAdmission;
+            pub const flushDurableReplicationOutboxesLockedWithAdmission = Implementation.flushDurableReplicationOutboxesLockedWithAdmission;
+            pub const flushDurableReplicationOutboxesWithAdmission = Implementation.flushDurableReplicationOutboxesWithAdmission;
+            pub const flushDurableReplicationOutboxesWithAdmissionAndRoot = Implementation.flushDurableReplicationOutboxesWithAdmissionAndRoot;
+            pub const flushDurableReplicationOutboxesLockedWithAdmissionAndRoot = Implementation.flushDurableReplicationOutboxesLockedWithAdmissionAndRoot;
+            pub const resolveTransactionIntentsInternalWithAcknowledgementPolicy = Implementation.resolveTransactionIntentsInternalWithAcknowledgementPolicy;
+            pub const resolveTransactionIntentsInternalWithControls = Implementation.resolveTransactionIntentsInternalWithControls;
+            pub const resolveTransactionIntentsPreparedWithAcknowledgementPolicy = Implementation.resolveTransactionIntentsPreparedWithAcknowledgementPolicy;
+            pub const resolveTransactionIntentsPreparedWithControls = Implementation.resolveTransactionIntentsPreparedWithControls;
             pub fn from(receiver: anytype) PreparedBatchOwner {
                 const Receiver = @TypeOf(receiver);
                 const Callbacks = struct {
@@ -879,8 +896,9 @@ pub fn ImplementationFor(comptime D: type) type {
                         const original: Receiver = @ptrCast(@alignCast(ptr));
                         original.scheduleDurableReplicationOutboxRecovery();
                     }
-                    fn wait(ptr: *anyopaque, level: types.SyncLevel, version: u64, targets: ManagedSyncTargets, cancellation: types.CancellationToken, explicit: bool) anyerror!void {
+                    fn wait(ptr: *anyopaque, level: types.SyncLevel, version: u64, targets: ManagedSyncTargets, cancellation: types.CancellationToken, explicit: bool, boundary: ?@import("../../common/execution_wait.zig").Boundary) anyerror!void {
                         const original: Receiver = @ptrCast(@alignCast(ptr));
+                        if (comptime @hasDecl(@TypeOf(original.*), "waitForSyncLevelWithExecutionWait")) return original.waitForSyncLevelWithExecutionWait(level, version, targets, cancellation, explicit, boundary);
                         return original.waitForSyncLevelWithCancellation(level, version, targets, cancellation, explicit);
                     }
                     fn resolvedWait(ptr: *anyopaque, level: types.SyncLevel, version: u64, cancellation: types.CancellationToken) anyerror!void {
@@ -889,7 +907,10 @@ pub fn ImplementationFor(comptime D: type) type {
                     }
                 };
                 var view: PreparedBatchOwner = undefined;
-                inline for (@typeInfo(Execution).@"struct".field_names) |field| @field(view, field) = &@field(receiver, field);
+                inline for (@typeInfo(Execution).@"struct".field_names) |field| {
+                    if (comptime !std.mem.eql(u8, field, "mutation_root")) @field(view, field) = &@field(receiver, field);
+                }
+                view.mutation_root = @import("mutation_admission.zig").receiverMutationRoot(receiver);
                 view.callback_dispatch = NativeBoundary.local_dispatch;
                 view.recovery = Receiver == *Execution;
                 view.context = @ptrCast(receiver);
@@ -911,7 +932,10 @@ pub fn ImplementationFor(comptime D: type) type {
                 self.schedule_fn(self.context);
             }
             pub fn waitForSyncLevelWithCancellation(self: *PreparedBatchOwner, level: types.SyncLevel, version: u64, targets: ManagedSyncTargets, cancellation: types.CancellationToken, explicit: bool) anyerror!void {
-                return NativeBoundary.call("wait_fn", self.callback_dispatch, self.wait_fn, .{ self.context, level, version, targets, cancellation, explicit });
+                return self.waitForSyncLevelWithExecutionWait(level, version, targets, cancellation, explicit, null);
+            }
+            pub fn waitForSyncLevelWithExecutionWait(self: *PreparedBatchOwner, level: types.SyncLevel, version: u64, targets: ManagedSyncTargets, cancellation: types.CancellationToken, explicit: bool, boundary: ?@import("../../common/execution_wait.zig").Boundary) anyerror!void {
+                return NativeBoundary.call("wait_fn", self.callback_dispatch, self.wait_fn, .{ self.context, level, version, targets, cancellation, explicit, boundary });
             }
             pub fn waitForResolvedTransactionSyncWithCancellation(self: *PreparedBatchOwner, level: types.SyncLevel, version: u64, cancellation: types.CancellationToken) anyerror!void {
                 return NativeBoundary.call("resolved_wait_fn", self.callback_dispatch, self.resolved_wait_fn, .{ self.context, level, version, cancellation });
@@ -996,6 +1020,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const failIfIdentityOrdinalExhaustedForNewUpserts = Implementation.failIfIdentityOrdinalExhaustedForNewUpserts;
             pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
             pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
+            pub const flushDurableReplicationOutboxesStep = Implementation.flushDurableReplicationOutboxesStep;
             pub const flushDurableReplicationOutboxesWithAdmission = Implementation.flushDurableReplicationOutboxesWithAdmission;
             pub const flushDurableReplicationOutboxesWithAdmissionAndRoot = Implementation.flushDurableReplicationOutboxesWithAdmissionAndRoot;
             pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
@@ -1019,8 +1044,10 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const replicationMutationBarrier = Implementation.replicationMutationBarrier;
             pub const resolveTransactionIntentsInternal = Implementation.resolveTransactionIntentsInternal;
             pub const resolveTransactionIntentsInternalWithControls = Implementation.resolveTransactionIntentsInternalWithControls;
+            pub const resolveTransactionIntentsInternalWithAcknowledgementPolicy = Implementation.resolveTransactionIntentsInternalWithAcknowledgementPolicy;
             pub const resolveTransactionIntentsPrepared = Implementation.resolveTransactionIntentsPrepared;
             pub const resolveTransactionIntentsPreparedWithControls = Implementation.resolveTransactionIntentsPreparedWithControls;
+            pub const resolveTransactionIntentsPreparedWithAcknowledgementPolicy = Implementation.resolveTransactionIntentsPreparedWithAcknowledgementPolicy;
             pub const restoreStagingStatus = Implementation.restoreStagingStatus;
             pub const shouldApplySplitReplicationLocked = Implementation.shouldApplySplitReplicationLocked;
             pub const unchangedDerivedReplayTargetsServiceable = Implementation.unchangedDerivedReplayTargetsServiceable;

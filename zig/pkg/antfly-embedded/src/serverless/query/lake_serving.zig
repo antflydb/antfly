@@ -508,11 +508,20 @@ pub const ServingSource = struct {
     /// Capture uses this call's execution only until all provider requests and
     /// owned metadata have completed. The pinned source may outlive that call.
     pub fn openCachedFor(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) !ServingSource {
+        return openScoped(alloc, schema, options, context, cache, false, null, execution);
+    }
+    pub fn openLazyCachedFor(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) !ServingSource {
+        return openScoped(alloc, schema, options, context, cache, true, null, execution);
+    }
+    pub fn openLazyNavigatedFor(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: *@import("lake_serving_cache.zig").Cache, navigation: SnapshotNavigation, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) !ServingSource {
+        return openScoped(alloc, schema, options, context, cache, true, navigation, execution);
+    }
+    fn openScoped(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache, lazy: bool, navigation: ?SnapshotNavigation, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) !ServingSource {
         const active = if (execution) |owner| context.withExecution(owner) else context;
-        var source = try openCached(alloc, schema, options, active, cache);
+        var source = try openCachedMode(alloc, schema, options, active, cache, lazy, navigation);
         errdefer source.deinit();
-        // No provider task escapes openCached. Removing the temporary grant
-        // preserves the original clock/token without retaining a call receiver.
+        // Provider requests have joined. The pinned source retains lifetime
+        // authority while later pulls attach their own call execution.
         source.context_store.?.context = context;
         if (execution) |owner| try owner.checkpoint();
         try context.ensureActive();
@@ -1362,7 +1371,7 @@ test "lake SQL statement capture suspends metadata IO and detaches pinned source
         }
     };
     const a = std.testing.allocator;
-    for (std.enums.values(Case)) |case| {
+    for ([_]bool{ false, true }) |lazy| for (std.enums.values(Case)) |case| {
         var memory = storage.MemoryObjectStorage.init(a);
         defer memory.deinit();
         var base = memory.client();
@@ -1387,7 +1396,7 @@ test "lake SQL statement capture suspends metadata IO and detaches pinned source
         } };
         const original: Context.Context = .{ .io = std.testing.io, .cancellation = storage.CancellationToken.fromAtomic(&signal), .deadline_ns = if (case == .original_deadline) 0 else null };
         if (case == .original_cancel) signal.store(true, .release);
-        const result = ServingSource.openCachedFor(a, schema, .{ .resolver = .{ .ptr = &fixture, .open_fn = Fixture.open } }, original, null, if (case == .unscheduled) null else &execution);
+        const result = if (lazy) ServingSource.openLazyCachedFor(a, schema, .{ .resolver = .{ .ptr = &fixture, .open_fn = Fixture.open } }, original, null, if (case == .unscheduled) null else &execution) else ServingSource.openCachedFor(a, schema, .{ .resolver = .{ .ptr = &fixture, .open_fn = Fixture.open } }, original, null, if (case == .unscheduled) null else &execution);
         if (case == .success or case == .unscheduled) {
             var source = try result;
             defer source.deinit();
@@ -1420,7 +1429,7 @@ test "lake SQL statement capture suspends metadata IO and detaches pinned source
         }
         if (execution.entry) |entry| try std.testing.expectEqual(@as(usize, 0), entry.children);
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
-    }
+    };
 }
 
 test "external lake metadata navigation coalesces cold immutable snapshot discovery" {
@@ -1571,7 +1580,7 @@ test "external lake metadata navigation full scans share frozen plans and empty 
     try std.testing.expectEqual(first.plan_lease.?.item, second.plan_lease.?.item);
     try std.testing.expect(first.canonicalOrder().?.ptr == second.canonicalOrder().?.ptr);
     try std.testing.expect(!first.hasLazyInventory());
-    try std.testing.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &cache, metadata });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &cache, metadata });
     var constrained = @import("lake_serving_cache.zig").Cache.init(a);
     defer constrained.deinit();
     constrained.decoded.max_loading_bytes = 32 * 1024 * 1024;
@@ -1581,5 +1590,5 @@ test "external lake metadata navigation full scans share frozen plans and empty 
     try std.testing.expect(private.private_snapshot != null);
     try private.ensureInventory(.{});
     try private.ownInventory();
-    try std.testing.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &constrained, metadata });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &constrained, metadata });
 }

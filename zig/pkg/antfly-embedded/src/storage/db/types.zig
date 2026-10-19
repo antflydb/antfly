@@ -101,6 +101,19 @@ pub const BatchWrite = struct {
     json_null_fields: []const []const u8 = &.{},
 };
 
+/// Only for normalization results whose keys, values and null names were
+/// independently allocated by the supplied allocator.
+pub fn freeNormalizedWrite(alloc: std.mem.Allocator, write: BatchWrite) void {
+    alloc.free(write.key);
+    alloc.free(write.value);
+    for (write.json_null_fields) |name| alloc.free(name);
+    if (write.json_null_fields.len != 0) alloc.free(write.json_null_fields);
+}
+pub fn freeNormalizedWrites(alloc: std.mem.Allocator, writes: []const BatchWrite) void {
+    for (writes) |write| freeNormalizedWrite(alloc, write);
+    alloc.free(writes);
+}
+
 pub fn cloneJsonNullFields(alloc: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
     if (fields.len == 0) return &.{};
     const copy = try alloc.alloc([]const u8, fields.len);
@@ -1883,6 +1896,7 @@ pub const SearchRequest = struct {
     /// Trusted local coordinator authority. Never serialized or reconstructed
     /// from public JSON. Independent graph fanout tasks reserve owned children.
     execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+    execution_remote_query: ?@import("../../common/http/http_common.zig").RequestExecutor = null,
 
     /// Trusted request-local preparation, never decoded from public input.
     native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
@@ -2104,6 +2118,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "identity_read_generation",
     "execution_deadline_ns",
     "execution_runnable",
+    "execution_remote_query",
     "cancellation",
     "graph_execution_limits",
     "graph_physical_scan_observation",

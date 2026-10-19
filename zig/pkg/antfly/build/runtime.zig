@@ -113,7 +113,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     };
     const antfly_main_mod = b.createModule(main_module_options);
     addSharedSignalStackOwner(b, antfly_main_mod, target, link_libc);
-    addSharedSignalStackOwner(b, libantfly_link_mod, target, link_libc);
+    addSharedSignalStackOwner(b, capi_mod, target, link_libc);
     // Tests share imports, not the product's final-link inputs and archives.
     const antfly_main_tests = b.addTest(.{
         .root_module = b.createModule(main_module_options),

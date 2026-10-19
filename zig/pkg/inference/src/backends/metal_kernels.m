@@ -18,6 +18,7 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <objc/runtime.h>
+#import "metal_device_credit.h"
 #import <dispatch/dispatch.h>
 // Use libdispatch's exported implementation: the SDK inline fast path's
 // completion-state assumption trips Zig 0.17's C sanitizer on macOS.
@@ -983,6 +984,8 @@ typedef struct termite_metal_planned_encoder_range {
 #include "metal_mtp_head.h"
 
 typedef struct termite_metal_decode_runtime {
+    termite_metal_device_budget kv_device_budget;
+    atomic_uint kv_device_budget_state; // 0 empty, 1 installing, 2 published, 3 legacy allocating, 4 legacy used
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
     id<MTLDevice> device;
     // Opt-in dense embedding workspace guard. Counts fresh allocations until
@@ -3299,8 +3302,28 @@ static uint64_t termite_metal_clock_monotonic_nanos(void) {
     return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
 }
 
-static id<MTLBuffer> termite_metal_workspace_buffer(
-    termite_metal_decode_runtime *runtime, size_t bytes, MTLResourceOptions options
+static id<MTLBuffer> termite_metal_kv_buffer(
+    termite_metal_decode_runtime *runtime, size_t bytes, MTLResourceOptions options)
+{
+    unsigned state = atomic_load_explicit(&runtime->kv_device_budget_state, memory_order_acquire);
+    if (state == 0) {
+        unsigned expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&runtime->kv_device_budget_state, &expected, 3,
+                                                    memory_order_acq_rel, memory_order_acquire)) {
+            id<MTLBuffer> buffer = antfly_observe_metal_buffer(termite_metal_device_budget_new_buffer(runtime->device, bytes, options, NULL), ANTFLY_BUFFER_OWNED);
+            atomic_store_explicit(&runtime->kv_device_budget_state, buffer == nil ? 0 : 4, memory_order_release);
+            return buffer;
+        }
+        state = expected;
+    }
+    if (state == 1 || state == 3) return nil;
+    return antfly_observe_metal_buffer(termite_metal_device_budget_new_buffer(runtime->device, bytes, options,
+        state == 2 ? &runtime->kv_device_budget : NULL), ANTFLY_BUFFER_OWNED);
+}
+
+static id<MTLBuffer> termite_metal_workspace_buffer_owned(
+    termite_metal_decode_runtime *runtime, size_t bytes, MTLResourceOptions options,
+    bool kv_owned
 ) {
     if (runtime->embedding_workspace_bounded) {
         // Metal may round allocations. Charge a page-rounded upper bound.
@@ -3318,7 +3341,14 @@ static id<MTLBuffer> termite_metal_workspace_buffer(
         }
         runtime->embedding_workspace_remaining -= charge;
     }
-    return antfly_observe_metal_buffer([runtime->device newBufferWithLength:bytes options:options], ANTFLY_BUFFER_OWNED);
+    return kv_owned ? termite_metal_kv_buffer(runtime, bytes, options)
+                    : antfly_observe_metal_buffer(termite_metal_device_budget_new_buffer(runtime->device, bytes, options, NULL), ANTFLY_BUFFER_OWNED);
+}
+
+static id<MTLBuffer> termite_metal_workspace_buffer(
+    termite_metal_decode_runtime *runtime, size_t bytes, MTLResourceOptions options
+) {
+    return termite_metal_workspace_buffer_owned(runtime, bytes, options, false);
 }
 
 int termite_metal_decode_runtime_begin_embedding_workspace(termite_metal_decode_runtime *runtime, size_t bytes) {
@@ -28216,6 +28246,45 @@ static void termite_metal_paged_kv_slot_leases_init(
     }
 }
 
+// Acquire publication before reading the immutable owner identity. Callers hold
+// the provider lease, including when deciding whether configuration can allocate.
+void *termite_metal_decode_runtime_kv_device_budget_identity(termite_metal_decode_runtime *runtime) {
+    if (runtime == NULL || atomic_load_explicit(&runtime->kv_device_budget_state, memory_order_acquire) != 2) return NULL;
+    return runtime->kv_device_budget.identity;
+}
+
+// Installation requires an idle, empty KV runtime: already allocated bytes
+// cannot be presented as preallocation admission. The owning provider lane
+// serializes this with graph/slot mutation. Repeated same-domain hooks share it.
+int termite_metal_decode_runtime_install_kv_device_budget(
+    termite_metal_decode_runtime *runtime, const termite_metal_device_budget *budget)
+{
+    if (runtime == NULL || budget == NULL || budget->context == NULL || budget->identity == NULL ||
+        budget->retain_context == NULL || budget->release_context == NULL ||
+        budget->reserve == NULL || budget->release_credit == NULL) return -1;
+    unsigned state = atomic_load_explicit(&runtime->kv_device_budget_state, memory_order_acquire);
+    if (state == 2) return runtime->kv_device_budget.identity == budget->identity ? 0 : -2;
+    unsigned expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(&runtime->kv_device_budget_state, &expected, 1,
+                                                 memory_order_acq_rel, memory_order_acquire)) return expected == 4 ? -4 : -3;
+    int failure = 0;
+    if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) failure = -3;
+    for (size_t slot = 0; slot < TERMITE_METAL_ATTENTION_SPAN_SLOT_CAPACITY; ++slot) {
+        if (runtime->attention_span_encoded_key_buffers[slot] != nil || runtime->attention_span_v_buffers[slot] != nil)
+            failure = -4;
+    }
+    if (runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_ATTENTION_SPAN_KEY_SLOT] != nil ||
+        runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_ATTENTION_SPAN_VALUE_SLOT] != nil) failure = -4;
+    if (failure == 0 && !budget->retain_context(budget->context)) failure = -5;
+    if (failure != 0) {
+        atomic_store_explicit(&runtime->kv_device_budget_state, 0, memory_order_release);
+        return failure;
+    }
+    runtime->kv_device_budget = *budget;
+    atomic_store_explicit(&runtime->kv_device_budget_state, 2, memory_order_release);
+    return 0;
+}
+
 termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
     @autoreleasepool {
         id<MTLDevice> device = termite_metal_shared_device();
@@ -28239,6 +28308,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
 
         termite_metal_decode_runtime *runtime = calloc(1, sizeof(termite_metal_decode_runtime));
         if (runtime == NULL) return NULL;
+        atomic_init(&runtime->kv_device_budget_state, 0);
         termite_metal_jit_exact_dispatch_stats_init(runtime);
         termite_metal_paged_kv_slot_leases_init(runtime);
         runtime->buffer_reuse_enabled = -1;
@@ -29411,13 +29481,15 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     if (runtime == NULL) return;
     @autoreleasepool {
     if (runtime->submitted_frame_cb != nil) {
-        (void)termite_metal_decode_runtime_wait_frame(runtime);
+        if (termite_metal_decode_runtime_wait_frame(runtime) != 0 && runtime->kv_device_budget.context != NULL) return;
     }
     if (runtime->active_frame_cb != nil) {
         if (termite_metal_decode_runtime_active_frame_empty(runtime)) {
-            (void)termite_metal_decode_runtime_cancel_frame(runtime);
+            if (termite_metal_decode_runtime_cancel_frame(runtime) != 0 && runtime->kv_device_budget.context != NULL) return;
         } else if (termite_metal_decode_runtime_submit_frame(runtime) == 0) {
-            (void)termite_metal_decode_runtime_wait_frame(runtime);
+            if (termite_metal_decode_runtime_wait_frame(runtime) != 0 && runtime->kv_device_budget.context != NULL) return;
+        } else if (runtime->kv_device_budget.context != NULL) {
+            return;
         }
     }
     if (@available(macOS 15.0, *)) {
@@ -30263,8 +30335,42 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->attention_span_v_row_stride = 0;
     runtime->attention_span_position_offset = 0;
     runtime->mtp_head_workspace = nil;
+    const termite_metal_device_budget budget = runtime->kv_device_budget;
     free(runtime);
+    if (budget.context != NULL) budget.release_context(budget.context);
     }
+}
+
+// CPU-only fixture: no Metal device, queue, pipeline or buffer is created.
+termite_metal_decode_runtime *termite_metal_device_budget_fixture_runtime(void) {
+    termite_metal_decode_runtime *runtime = calloc(1, sizeof(*runtime));
+    if (runtime != NULL) atomic_init(&runtime->kv_device_budget_state, 0);
+    return runtime;
+}
+
+int termite_metal_device_budget_qualify_install(const termite_metal_device_budget *budget) {
+    termite_metal_decode_runtime *runtime = calloc(1, sizeof(*runtime));
+    if (runtime == NULL) return -1;
+    atomic_init(&runtime->kv_device_budget_state, 0);
+    if (termite_metal_decode_runtime_install_kv_device_budget(runtime, budget) != 0) { free(runtime); return -2; }
+    int result = 0;
+    if (termite_metal_decode_runtime_kv_device_budget_identity(runtime) != budget->identity) result = -10;
+    if (termite_metal_decode_runtime_install_kv_device_budget(runtime, budget) != 0) result = -3;
+    termite_metal_device_budget other = *budget;
+    other.identity = &other;
+    if (termite_metal_decode_runtime_install_kv_device_budget(runtime, &other) != -2) result = -4;
+    termite_metal_decode_runtime_destroy(runtime);
+    runtime = calloc(1, sizeof(*runtime));
+    if (runtime == NULL) return -5;
+    atomic_init(&runtime->kv_device_budget_state, 1);
+    if (termite_metal_decode_runtime_install_kv_device_budget(runtime, budget) != -3) result = -6;
+    atomic_store_explicit(&runtime->kv_device_budget_state, 3, memory_order_release);
+    if (termite_metal_decode_runtime_install_kv_device_budget(runtime, budget) != -3) result = -7;
+    atomic_store_explicit(&runtime->kv_device_budget_state, 4, memory_order_release);
+    if (termite_metal_decode_runtime_install_kv_device_budget(runtime, budget) != -4) result = -8;
+    if (atomic_load_explicit(&runtime->kv_device_budget_state, memory_order_acquire) != 4) result = -9;
+    termite_metal_decode_runtime_destroy(runtime);
+    return result;
 }
 
 int termite_metal_decode_runtime_prepare_absolute_embeddings(
@@ -30424,7 +30530,10 @@ int termite_metal_decode_runtime_commit_graph_plan(termite_metal_decode_runtime 
             }
             const size_t allocation_bytes = runtime->embedding_workspace_bounded ? bytes :
                 termite_metal_decode_runtime_graph_plan_allocation_bytes(runtime->graph_plan_capacities[slot], bytes);
-            id<MTLBuffer> buffer = termite_metal_workspace_buffer(runtime, allocation_bytes, MTLResourceStorageModePrivate);
+            id<MTLBuffer> buffer = (slot == TERMITE_METAL_GRAPH_PLAN_ATTENTION_SPAN_KEY_SLOT ||
+                                    slot == TERMITE_METAL_GRAPH_PLAN_ATTENTION_SPAN_VALUE_SLOT)
+                ? termite_metal_workspace_buffer_owned(runtime, allocation_bytes, MTLResourceStorageModePrivate, true)
+                : termite_metal_workspace_buffer(runtime, allocation_bytes, MTLResourceStorageModePrivate);
             if (buffer == nil) return -2;
             runtime->graph_plan_buffers[slot] = buffer;
             runtime->graph_plan_capacities[slot] = allocation_bytes;
@@ -35092,7 +35201,8 @@ static int termite_metal_decode_runtime_copy_grown_buffer(
         }
         // The runtime's reference to old_buffer is replaced by the caller; the
         // frame must keep it alive until the copy executes at frame drain.
-        if (termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffer) != 0) return failure_code;
+        if (termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffer) != 0 ||
+            termite_metal_decode_runtime_retain_frame_resource(runtime, new_buffer) != 0) return failure_code;
         id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
         const uint32_t count = (uint32_t)old_capacity;
         [encoder setComputePipelineState:runtime->copy_bytes_pipeline];
@@ -35106,7 +35216,8 @@ static int termite_metal_decode_runtime_copy_grown_buffer(
     bool frame_owned = false;
     id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
     if (command_buffer == nil) return failure_code;
-    if (!frame_owned && termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffer) != 0) return failure_code;
+    if (!frame_owned && (termite_metal_decode_runtime_retain_frame_resource(runtime, old_buffer) != 0 ||
+                         termite_metal_decode_runtime_retain_frame_resource(runtime, new_buffer) != 0)) return failure_code;
     id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
     if (blit == nil) return failure_code;
     [blit copyFromBuffer:old_buffer sourceOffset:0 toBuffer:new_buffer destinationOffset:0 size:old_capacity];
@@ -35129,7 +35240,7 @@ static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
         {
             id<MTLBuffer> old_buffer = runtime->attention_span_encoded_key_buffers[slot];
             const size_t old_capacity = runtime->attention_span_encoded_key_capacities[slot];
-            id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:encoded_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+            id<MTLBuffer> buffer = termite_metal_kv_buffer(runtime, encoded_bytes, MTLResourceStorageModePrivate);
             if (buffer == nil) return -5;
             if (old_buffer != nil && old_capacity > 0) {
                 if (termite_metal_decode_runtime_copy_grown_buffer(runtime, old_buffer, buffer, old_capacity, -10) != 0) return -10;
@@ -35142,7 +35253,7 @@ static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
         {
             id<MTLBuffer> old_buffer = runtime->attention_span_v_buffers[slot];
             const size_t old_capacity = runtime->attention_span_v_capacities[slot];
-            id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:v_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+            id<MTLBuffer> buffer = termite_metal_kv_buffer(runtime, v_bytes, MTLResourceStorageModePrivate);
             if (buffer == nil) return -6;
             if (old_buffer != nil && old_capacity > 0) {
                 if (termite_metal_decode_runtime_copy_grown_buffer(runtime, old_buffer, buffer, old_capacity, -14) != 0) return -14;

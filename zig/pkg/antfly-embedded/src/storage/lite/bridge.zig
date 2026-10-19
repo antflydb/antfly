@@ -25,7 +25,8 @@ const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const byte_copy = @import("../../common/byte_copy.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
+const OwnedIo = @import("../owned_io.zig").Owner;
+const resource_manager = @import("../resource_manager.zig");
 const platform_sync = @import("antfly_platform").sync;
 const storage_io = @import("../lsm_backend/storage_io.zig");
 
@@ -49,6 +50,7 @@ const RecordKind = enum(u8) {
 pub const ContainerStorage = struct {
     pub const Options = struct {
         read_only: bool = false,
+        resource_manager: ?*resource_manager.ResourceManager = null,
     };
 
     pub const CheckReport = struct {
@@ -73,7 +75,8 @@ pub const ContainerStorage = struct {
     };
 
     allocator: Allocator,
-    io_impl: if (builtin.os.tag == .freestanding) void else std.Io.Threaded,
+    io_impl: if (builtin.os.tag == .freestanding) void else *std.Io.Threaded,
+    io_owner: if (builtin.os.tag == .freestanding) void else *OwnedIo,
     path: []u8,
     lock_file: ?std.Io.File = null,
     read_only: bool = false,
@@ -108,24 +111,27 @@ pub const ContainerStorage = struct {
     }
 
     pub fn openWithOptions(allocator: Allocator, path: []const u8, options: Options) !ContainerStorage {
-        var io_impl = threaded_io_limits.initService(allocator);
-        errdefer io_impl.deinit();
+        const owner = try OwnedIo.create(allocator, options.resource_manager);
+        var owner_transferred = false;
+        errdefer if (!owner_transferred) owner.destroy();
 
         const owned_path = try allocator.dupe(u8, path);
         var owned_path_transferred = false;
         errdefer if (!owned_path_transferred) allocator.free(owned_path);
 
         if (!options.read_only) {
-            try ensureParentDir(io_impl.io(), owned_path);
+            try ensureParentDir(owner.io(), owned_path);
         }
 
         var self = ContainerStorage{
             .allocator = allocator,
-            .io_impl = io_impl,
+            .io_impl = &owner.threaded,
+            .io_owner = owner,
             .path = owned_path,
             .read_only = options.read_only,
         };
         owned_path_transferred = true;
+        owner_transferred = true;
         errdefer self.deinit();
 
         self.lock_file = try openLockFile(self.io_impl.io(), self.path, options.read_only);
@@ -134,6 +140,8 @@ pub const ContainerStorage = struct {
     }
 
     pub fn deinit(self: *ContainerStorage) void {
+        self.io_owner.join();
+        const close_io = std.Io.Threaded.global_single_threaded.io();
         var it = self.files.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -141,11 +149,11 @@ pub const ContainerStorage = struct {
         }
         self.files.deinit(self.allocator);
         if (self.lock_file) |file| {
-            file.unlock(self.io_impl.io());
-            file.close(self.io_impl.io());
+            file.unlock(close_io);
+            file.close(close_io);
         }
         self.allocator.free(self.path);
-        self.io_impl.deinit();
+        self.io_owner.destroy();
         self.* = undefined;
     }
 
@@ -157,9 +165,9 @@ pub const ContainerStorage = struct {
     }
 
     pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
+        const owner = try OwnedIo.create(allocator, null);
+        defer owner.destroy();
+        const io = owner.io();
 
         var lock_file = try openLockFile(io, path, true);
         defer {
@@ -1103,4 +1111,35 @@ test "aflite container vacuum compacts overwritten records" {
         try std.testing.expectEqualStrings("new value", got);
         try std.testing.expectError(error.FileNotFound, reopened.storage().readFileAlloc(alloc, "/deleted", 64));
     }
+}
+
+test "aflite container stable executor retains the managed budget after a value move" {
+    const a = std.testing.allocator;
+    const manager = try resource_manager.SharedResourceManager.create(a, .{ .memory_budget = .{ .hard_limit_bytes = 128 << 20 } });
+    var held = true;
+    defer if (held) manager.releaseOwned(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "stable-bridge.aflite");
+    defer a.free(path);
+    var first = try ContainerStorage.openWithOptions(a, path, .{ .resource_manager = manager });
+    const io = first.io_impl.io();
+    const Work = struct {
+        fn run() u32 {
+            return 42;
+        }
+    };
+    var task = try io.concurrent(Work.run, .{});
+    var moved = first;
+    first = undefined;
+    defer moved.deinit();
+    manager.releaseOwned(a);
+    held = false;
+    try std.testing.expectEqual(io.userdata, moved.io_impl.io().userdata);
+    try std.testing.expectEqual(@as(u32, 42), task.await(io));
+    try std.testing.expect(moved.io_owner.memory.?.stackStats().used > 0);
+    try moved.storage().writeFileAbsolute("/proof", "stable");
+    const bytes = try moved.storage().readFileAlloc(a, "/proof", 64);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("stable", bytes);
 }

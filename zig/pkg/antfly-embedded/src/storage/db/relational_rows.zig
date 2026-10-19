@@ -34,6 +34,7 @@ const ttl = @import("../ttl.zig");
 const predicates = @import("relational_predicate.zig");
 const row_cursor_codec = @import("relational_row_cursor.zig");
 const Allocator = std.mem.Allocator;
+const admission = @import("../../common/read_admission.zig");
 
 pub const Value = tuples.Value;
 pub const Condition = predicates.Condition;
@@ -127,6 +128,7 @@ pub const Page = struct {
 };
 
 pub const Reader = struct {
+    page_admission: admission.Scope = .{},
     row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
     alloc: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -201,8 +203,16 @@ pub const Reader = struct {
     /// and this transaction must have been captured under one publication
     /// fence; predicate compilation and bounded planning need no apply lock.
     pub fn openSnapshot(alloc: Allocator, snapshot: docstore.DocStore.Txn, authenticated: bool, active_view: registry.SchemaView, indexes: ?catalog.WriteSnapshot, request: Request, now_ns: u64) !Reader {
+        return openSnapshotWithAdmission(alloc, snapshot, authenticated, active_view, indexes, request, now_ns, null);
+    }
+
+    /// Consumes the snapshot, never retaining the creation call's admission.
+    pub fn openSnapshotWithAdmission(alloc: Allocator, snapshot: docstore.DocStore.Txn, authenticated: bool, active_view: registry.SchemaView, indexes: ?catalog.WriteSnapshot, request: Request, now_ns: u64, control: ?admission.Port) !Reader {
         var read = snapshot;
         errdefer read.abort();
+        try checkpointCreation(control);
+        var metadata = admission.MetadataRead(*docstore.DocStore.Txn).init(alloc, &read, control);
+        defer metadata.deinit();
         if (active_view.storageMode() != .relational) return error.RelationalTableRequired;
         if (request.expected_schema_version) |version| if (version != active_view.version()) return error.PreparedGenerationChanged;
         if (request.fields.len > 256 or request.conditions.len > 256 or (request.index == null and (request.lower != null or request.upper != null)))
@@ -214,12 +224,13 @@ pub const Reader = struct {
         const owned = arena.allocator();
         const fields = try owned.alloc([]const u8, request.fields.len);
         for (request.fields, fields, 0..) |field, *copy, i| {
+            try checkpointCreation(control);
             if (active_view.physicalLayout().ordinalForName(active_view.tableSchema().relational_columns, field) == null)
                 return error.RelationalIndexColumnNotFound;
             for (fields[0..i]) |prior| if (std.mem.eql(u8, field, prior)) return error.InvalidRelationalRowsRequest;
             copy.* = try owned.dupe(u8, field);
         }
-        const range_raw = read.get(range_state.range_key) catch |err| switch (err) {
+        const range_raw = metadata.get(range_state.range_key) catch |err| switch (err) {
             error.NotFound => &(@as([8]u8, @splat(0))),
             else => return err,
         };
@@ -243,12 +254,12 @@ pub const Reader = struct {
         if (request.index) |name| {
             const pinned = indexes orelse return error.IndexNotFound;
             if (pinned.plan.schemaView().epoch != active_view.epoch) return error.PreparedGenerationChanged;
-            const raw_head = try read.get(catalog.head_key);
+            const raw_head = try metadata.get(catalog.head_key);
             if (!(try catalog.Head.decode(raw_head)).eql(pinned.head)) return error.PreparedGenerationChanged;
             selected_index = for (pinned.plan.boundIndexes()) |index| {
                 if (std.mem.eql(u8, index.name, name)) break index;
             } else return error.IndexNotFound;
-            if ((try jobs.status(&read, selected_index.?)).state != .ready) return error.RelationalIndexNotReady;
+            if ((try jobs.status(&metadata, selected_index.?)).state != .ready) return error.RelationalIndexNotReady;
             if (request.include_cursor or request.after != null) cursor_identity = row_cursor_codec.identity(active_view.version(), selected_index.?.name, selected_index.?.tuple.fingerprint);
             const prefix = try records.forwardPrefix(selected_index.?.id());
             lower = try owned.dupe(u8, &prefix);
@@ -272,6 +283,7 @@ pub const Reader = struct {
             alloc.free(conditions);
         }
         for (conditions, request.conditions) |*plan, condition| {
+            try checkpointCreation(control);
             plan.* = try predicates.Plan.init(alloc, active_view.tableSchema().*, active_view.physicalLayout(), condition);
             initialized += 1;
         }
@@ -286,7 +298,7 @@ pub const Reader = struct {
         if (selected_index == null and request.auto_index and request.primary_lower == null and request.primary_upper == null) {
             if (indexes) |pinned| {
                 if (pinned.plan.schemaView().epoch != active_view.epoch) return error.PreparedGenerationChanged;
-                const raw_head = try read.get(catalog.head_key);
+                const raw_head = try metadata.get(catalog.head_key);
                 if (!(try catalog.Head.decode(raw_head)).eql(pinned.head)) return error.PreparedGenerationChanged;
                 var candidates: [16]Candidate = undefined;
                 var candidate_count: usize = 0;
@@ -309,6 +321,7 @@ pub const Reader = struct {
                     }
                 }
                 for (pinned.plan.boundIndexes()) |candidate| {
+                    try checkpointCreation(control);
                     if (candidate.tuple.keys.len == 0) continue;
                     var equality_count: usize = 0;
                     var candidate_values: [32]Value = @splat(.null);
@@ -354,13 +367,14 @@ pub const Reader = struct {
                     candidate_count = @min(candidate_count + 1, candidates.len);
                 }
                 if (candidate_count != 0) {
-                    const owner = try jobs.ownership(&read);
+                    const owner = try jobs.ownership(&metadata);
                     var best_cost: usize = std.math.maxInt(usize);
                     var best_complete = false;
                     var best_candidate: ?*Candidate = null;
                     for (candidates[0..candidate_count]) |*candidate| {
+                        try checkpointCreation(control);
                         planner_candidates += 1;
-                        if ((try jobs.statusWithOwnership(&read, candidate.index, owner)).state != .ready) continue;
+                        if ((try jobs.statusWithOwnership(&metadata, candidate.index, owner)).state != .ready) continue;
                         var scratch = std.heap.ArenaAllocator.init(alloc);
                         defer scratch.deinit();
                         // An oversized search value is legal SQL data, even
@@ -378,14 +392,15 @@ pub const Reader = struct {
                         var count: usize = 0;
                         var complete = std.mem.order(u8, bounds.lower, bounds.upper) != .lt;
                         if (std.mem.order(u8, bounds.lower, bounds.upper) == .lt) {
-                            var cursor = try read.openCursor();
+                            var cursor = if (control) |port| try read.openCursorWithAdmission(port) else try read.openCursor();
                             defer cursor.close();
                             cursor.setUpperBound(bounds.upper);
-                            var entry = try cursor.seekAtOrAfter(bounds.lower);
+                            var entry = if (control) |port| try cursor.seekAtOrAfterWithAdmission(bounds.lower, port) else try cursor.seekAtOrAfter(bounds.lower);
                             while (entry != null) {
+                                try checkpointCreation(control);
                                 count += 1;
                                 if (count == 8) break;
-                                entry = try cursor.next();
+                                entry = if (control) |port| try cursor.nextWithAdmission(port) else try cursor.next();
                             }
                             complete = entry == null;
                             planner_records += count;
@@ -422,6 +437,7 @@ pub const Reader = struct {
                 };
             } else index_only = false;
         }
+        try checkpointCreation(control);
         return .{
             .alloc = alloc,
             .arena = arena,
@@ -578,7 +594,7 @@ pub const Reader = struct {
             // the live registry: a whole-store restore may reuse version IDs.
             const source = if (version == self.active.version()) self.active.clone() else blk: {
                 const key = try schema.schemaVersionKeyAlloc(alloc, version);
-                const encoded = self.read.get(key) catch |err| switch (err) {
+                const encoded = self.get(key) catch |err| switch (err) {
                     error.NotFound => return error.UnknownSchemaVersion,
                     else => return err,
                 };
@@ -786,7 +802,7 @@ pub const Reader = struct {
         const temporary = scratch.allocator();
         const key = try internal.relationalRowKeyAlloc(temporary, document);
         if (std.mem.order(u8, key, self.lower) == .lt or std.mem.order(u8, key, self.upper) != .lt) return null;
-        const raw = self.read.get(key) catch |err| switch (err) {
+        const raw = self.get(key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
@@ -829,6 +845,35 @@ pub const Reader = struct {
         };
     }
 
+    /// Physical reads borrow this page's admission only until the call joins.
+    pub fn nextTypedPageWithAdmission(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, control: admission.Port) !Page {
+        const guard = try self.page_admission.enter(control);
+        defer guard.deinit();
+        var page = try self.nextTypedPage(alloc, io, budget);
+        errdefer page.deinit();
+        try control.checkpoint();
+        return page;
+    }
+    fn get(self: *Reader, key: []const u8) ![]const u8 {
+        const control = self.page_admission.control orelse return self.read.get(key);
+        return getWithAdmission(&self.read, key, control);
+    }
+    fn checkpointCreation(control: ?admission.Port) !void {
+        if (control) |port| try port.checkpoint();
+    }
+    fn getWithAdmission(read: *docstore.DocStore.Txn, key: []const u8, control: ?admission.Port) ![]const u8 {
+        const port = control orelse return read.get(key);
+        var values: [1]?[]const u8 = .{null};
+        try read.getManySortedWithAdmission(&.{key}, &values, port);
+        return values[0] orelse error.NotFound;
+    }
+    fn cursorNext(self: *Reader, cursor: *docstore.DocStore.Txn.CursorAdapter) !?@import("../backend_erased.zig").Entry {
+        return if (self.page_admission.control) |control| cursor.nextWithAdmission(control) else cursor.next();
+    }
+    fn cursorSeek(self: *Reader, cursor: *docstore.DocStore.Txn.CursorAdapter, key: []const u8) !?@import("../backend_erased.zig").Entry {
+        return if (self.page_admission.control) |control| cursor.seekAtOrAfterWithAdmission(key, control) else cursor.seekAtOrAfter(key);
+    }
+
     pub fn nextTypedPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderNextTypedPage", .{ self, alloc, io, budget });
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
@@ -839,6 +884,7 @@ pub const Reader = struct {
     }
 
     fn nextPageFormat(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, typed_output: bool) !Page {
+        try self.page_admission.checkpoint();
         try budget.validate();
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
@@ -857,14 +903,15 @@ pub const Reader = struct {
         try continuation.appendSlice(alloc, self.after.items);
         var successor = std.ArrayList(u8).empty;
         defer successor.deinit(alloc);
-        var cursor = try self.read.openCursor();
+        var cursor = if (self.page_admission.control) |control| try self.read.openCursorWithAdmission(control) else try self.read.openCursor();
         defer cursor.close();
         cursor.setUpperBound(self.upper);
         const start = if (self.after.items.len == 0) self.lower else if (self.index != null) self.after.items else try internal.documentPrefixSuccessor(alloc, &successor, self.after.items);
-        var entry = try cursor.seekAtOrAfter(start);
+        var entry = try self.cursorSeek(&cursor, start);
         var exhausted = true;
         const started = time.monotonicNs();
-        while (entry) |kv| : (entry = if (self.index != null) try cursor.next() else try cursor.seekAtOrAfter(try internal.documentPrefixSuccessor(alloc, &successor, continuation.items))) {
+        while (entry) |kv| : (entry = if (self.index != null) try self.cursorNext(&cursor) else try self.cursorSeek(&cursor, try internal.documentPrefixSuccessor(alloc, &successor, continuation.items))) {
+            try self.page_admission.checkpoint();
             if (io) |runtime_io| try runtime_io.checkCancel();
             if (self.after.items.len != 0 and std.mem.order(u8, kv.key, self.after.items) != .gt) continue;
             if (std.mem.order(u8, kv.key, self.upper) != .lt) break;
@@ -900,14 +947,14 @@ pub const Reader = struct {
                     // One adjacent step handles the ordinary timestamp/row
                     // pair; seek only when another companion intervenes. This
                     // keeps artifact-heavy and orphan families bounded too.
-                    var candidate = try cursor.next();
+                    var candidate = try self.cursorNext(&cursor);
                     if (candidate) |item| if (std.mem.order(u8, item.key, key) == .lt) {
-                        candidate = try cursor.seekAtOrAfter(key);
+                        candidate = try self.cursorSeek(&cursor, key);
                     };
                     break :locate if (candidate) |item| if (std.mem.eql(u8, item.key, key)) item.value else null else null;
                 } else lookup: {
                     result.primary_lookups += 1;
-                    break :lookup self.read.get(key) catch |err| switch (err) {
+                    break :lookup self.get(key) catch |err| switch (err) {
                         error.NotFound => return error.InvalidRelationalIndexForwardKey,
                         else => return err,
                     };
@@ -933,6 +980,7 @@ pub const Reader = struct {
                 const matches = check: {
                     if (expired) break :check false;
                     for (if (self.index_only) self.covering_conditions else self.source_conditions) |condition| {
+                        try self.page_admission.checkpoint();
                         if (io) |runtime_io| try runtime_io.checkCancel();
                         if (!(try condition.evaluate(alloc, &predicate_scratch, row)).matches()) break :check false;
                     }
@@ -1003,6 +1051,7 @@ pub const Reader = struct {
                 break;
             }
         }
+        try self.page_admission.checkpoint();
         try self.after.ensureTotalCapacity(self.alloc, continuation.items.len);
         @memcpy(self.after.items.ptr[0..continuation.items.len], continuation.items);
         self.after.items.len = continuation.items.len;

@@ -1641,6 +1641,7 @@ pub fn applySchemaMutationRecord(
 }
 
 pub const parseValidatedTableSchema = @import("antfly_local_sources").api_local_tables.parseValidatedTableSchema;
+pub const parseValidatedTableSchemaWithAdmission = @import("antfly_local_sources").api_local_tables.parseValidatedTableSchemaWithAdmission;
 
 pub fn validateBatchWritesAgainstTableSchema(
     alloc: std.mem.Allocator,

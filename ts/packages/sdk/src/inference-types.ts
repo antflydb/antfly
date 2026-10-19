@@ -4,6 +4,7 @@
  */
 
 import type { components, operations } from "./public-api.js";
+import type { RequestAdmission, RequestAdmissionOptions } from "./request-admission.js";
 
 // Request/Response types
 export type EmbedRequest = components["schemas"]["InferenceEmbedRequest"];
@@ -100,6 +101,8 @@ export type ResponseData<T extends keyof operations> = operations[T]["responses"
 
 // Client configuration
 export interface InferenceConfig {
+  /** Bounded local admission; pass an owner to share capacity across clients. */
+  requestAdmission?: RequestAdmission | RequestAdmissionOptions;
   /** Base URL of the Inference API server (e.g., "http://localhost:8080/api") */
   baseUrl: string;
   /** Additional headers to include in requests */

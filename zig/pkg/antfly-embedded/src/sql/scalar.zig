@@ -155,12 +155,20 @@ test "SQL NUMERIC ingress constructors retain shared cancellation quotas and lim
 
 pub const NumericJsonText = struct {
     value: *const @import("numeric_value.zig").Value,
+    /// Optional output authority; local numeric work accounting remains the
+    /// same as the legacy formatter and is not charged to the parent twice.
+    checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
+    ptr: ?*anyopaque = null,
+    failure: ?*?anyerror = null,
     pub fn jsonStringify(self: @This(), writer: anytype) std.Io.Writer.Error!void {
         var none = std.heap.FixedBufferAllocator.init(&.{});
-        var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+        var ctx: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .checkpoint = self.checkpoint, .ptr = self.ptr };
         try writer.beginWriteRaw();
         try writer.writer.writeByte('"');
-        @import("numeric_value.zig").write(&ctx, self.value.*, writer.writer) catch return error.WriteFailed;
+        @import("numeric_value.zig").write(&ctx, self.value.*, writer.writer) catch |err| {
+            if (self.failure) |failure| failure.* = err;
+            return error.WriteFailed;
+        };
         try writer.writer.writeByte('"');
         writer.endWriteRaw();
     }
@@ -3667,7 +3675,7 @@ const Evaluator = struct {
         if (!result.sql_null and result.value == .integer) if (instruction.type.element_type) |kind| if (builtin_cast.integral(kind)) {
             _ = try builtin_cast.checkedInteger(result.value.integer, kind);
         };
-        if (!result.sql_null and result.value == .float and instruction.type.element_type == .float32) result.value = .{ .float = try builtin_cast.floatValue(f32, result.value) };
+        if (!result.sql_null and result.value == .float and instruction.type.element_type == .float32) result.value = .{ .float = try builtin_cast.floatValueControlled(f32, result.value, self.workOwner()) };
         return result;
     }
 
@@ -3735,18 +3743,21 @@ const Evaluator = struct {
         };
     }
 
+    fn jsonOutputCheck(raw: *anyopaque) !void {
+        const self: *Evaluator = @ptrCast(@alignCast(raw));
+        try self.workOwner().checkpointNow();
+    }
+
     fn jsonText(self: *Evaluator, value: Json) ![]const u8 {
         _ = try self.validateJson(value, 0);
-        var writer: std.Io.Writer.Allocating = .init(self.alloc);
-        errdefer writer.deinit();
-        // The execution allocator also carries the statement-wide hard cap.
-        // Count before producing output so a large JSON subtree cannot evade
-        // this scalar's independent output bound.
-        var counter: std.Io.Writer.Discarding = .init(&.{});
-        try std.json.Stringify.value(value, .{}, &counter.writer);
-        try self.charge(std.math.cast(usize, counter.count) orelse return error.SqlProgramLimitExceeded);
-        std.json.Stringify.value(value, .{}, &writer.writer) catch return error.OutOfMemory;
-        return writer.toOwnedSlice();
+        var encoder: @import("cooperative_json_output.zig").Encoder = undefined;
+        encoder.init(self.alloc, .{ .ptr = self, .check = jsonOutputCheck }, .{});
+        defer encoder.deinit();
+        // Preflight retains no payload and uses the same controlled traversal
+        // as emission. Existing scalar admission still precedes output writes.
+        try self.charge(try encoder.countValue(value));
+        encoder.write(value) catch |err| return encoder.original(err);
+        return encoder.toOwnedSlice();
     }
 
     fn validateJson(self: *Evaluator, value: Json, depth: usize) anyerror!usize {
@@ -3755,7 +3766,7 @@ const Evaluator = struct {
         var size: usize = 8;
         switch (value) {
             .string => |string| {
-                if (!std.unicode.utf8ValidateSlice(string)) return error.SqlTypeMismatch;
+                try @import("scalar_input.zig").validateUtf8(string, self.workOwner());
                 size = string.len;
             },
             .number_string => |string| {
@@ -3784,14 +3795,14 @@ const Evaluator = struct {
                     if (!std.math.isFinite(rounded) or rounded < -9223372036854775808.0 or rounded >= 9223372036854775808.0) return error.SqlNumericOutOfRange;
                     break :blk .{ .integer = @intFromFloat(rounded) };
                 },
-                .string, .number_string => |v| .{ .integer = std.fmt.parseInt(i64, v, 10) catch return error.SqlTypeMismatch },
+                .string, .number_string => |v| .{ .integer = try @import("scalar_input.zig").integer(v, self.workOwner()) },
                 .bool => |v| .{ .integer = @intFromBool(v) },
                 else => error.SqlTypeMismatch,
             },
             .number => switch (value) {
                 .integer => |v| finite(@floatFromInt(v)),
                 .float => |v| finite(v),
-                .string, .number_string => |v| finite(std.fmt.parseFloat(f64, v) catch return error.SqlTypeMismatch),
+                .string, .number_string => |v| finite(@import("controlled_float.zig").parseFloatControlled(f64, v, self.workOwner()) catch |err| return if (err == error.InvalidCharacter) error.SqlTypeMismatch else err),
                 else => error.SqlTypeMismatch,
             },
             .boolean => switch (value) {
@@ -4087,7 +4098,7 @@ const Evaluator = struct {
                 return Datum.json(.{ .string = text });
             }
             defer self.alloc.free(text);
-            return Datum.json(.{ .float = if (target == .float32) try builtin_cast.floatValue(f32, .{ .string = text }) else try builtin_cast.floatValue(f64, .{ .string = text }) });
+            return Datum.json(.{ .float = if (target == .float32) try builtin_cast.floatValueControlled(f32, .{ .string = text }, self.workOwner()) else try builtin_cast.floatValueControlled(f64, .{ .string = text }, self.workOwner()) });
         }
         return Datum.json(try self.castBuiltin(datum.value, source, target));
     }
@@ -4124,16 +4135,16 @@ const Evaluator = struct {
                     const result = try json_order.roundedInteger(text, &work);
                     break :blk result;
                 },
-                .string => |text| try builtin_cast.integerText(text, target),
+                .string => |text| try builtin_cast.integerTextWithContext(text, target, self.workOwner()),
                 .bool => |boolean| @intFromBool(boolean),
                 else => return error.SqlTypeMismatch,
             }, target) },
-            .float32 => .{ .float = try builtin_cast.floatValue(f32, value) },
-            .float64 => .{ .float = try builtin_cast.floatValue(f64, value) },
+            .float32 => .{ .float = try builtin_cast.floatValueControlled(f32, value, self.workOwner()) },
+            .float64 => .{ .float = try builtin_cast.floatValueControlled(f64, value, self.workOwner()) },
             .boolean => .{ .bool = switch (value) {
                 .bool => |boolean| boolean,
                 .integer => |integer| integer != 0,
-                .string => |text| try builtin_cast.booleanText(text),
+                .string => |text| try builtin_cast.booleanTextControlled(text, self.workOwner()),
                 else => return error.SqlTypeMismatch,
             } },
             .text => blk: {
@@ -4867,6 +4878,45 @@ pub fn semanticHashDatum(value: Datum) anyerror!u64 {
     }
     return semanticHash(value.value);
 }
+/// Operator-owned hashing preserves the legacy per-value limits. The shared
+/// parent only supplies the original checkpoint; it adds no query-wide work cap.
+pub fn semanticHashDatumControlled(value: Datum, control: ?@import("operator_work.zig").Control) anyerror!u64 {
+    const owner = control orelse return semanticHashDatum(value);
+    try @import("operator_work.zig").poll(control);
+    const result = blk: {
+        if (value.sql_null) break :blk @as(u64, 0);
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        if (value.numeric) |number| {
+            // Keep NUMERIC's original independent eight-MiB work allowance.
+            var context: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .checkpoint = owner.checkpoint, .ptr = owner.ptr };
+            var hash = std.hash.Wyhash.init(0);
+            try @import("numeric_value.zig").hash(&context, number.*, &hash);
+            break :blk hash.final();
+        }
+        var parent: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = std.math.maxInt(u64), .checkpoint = owner.checkpoint, .ptr = owner.ptr };
+        var work: json_order.Budget = .{ .shared = &parent };
+        if (value.array) |array| break :blk try array.semanticHash(&work);
+        if (value.value == .float and !std.math.isFinite(value.value.float)) {
+            const bits: u64 = if (std.math.isNan(value.value.float)) 0x7ff8000000000000 else @bitCast(value.value.float);
+            break :blk std.hash.Wyhash.hash(0, std.mem.asBytes(&bits));
+        }
+        break :blk try json_order.hash(value.value, &work, 0);
+    };
+    try @import("operator_work.zig").poll(control);
+    return result;
+}
+
+pub fn compareDatumsControlled(left: Datum, right: Datum, control: ?@import("operator_work.zig").Control) anyerror!std.math.Order {
+    const owner = control orelse return compareDatums(left, right);
+    try @import("operator_work.zig").poll(control);
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var parent: @import("numeric_value.zig").Context = .{ .alloc = none.allocator(), .remaining = std.math.maxInt(u64), .checkpoint = owner.checkpoint, .ptr = owner.ptr };
+    var work: json_order.Budget = .{ .shared = &parent };
+    const result = try compareDatumsWithBudget(left, right, &work);
+    try @import("operator_work.zig").poll(control);
+    return result;
+}
+
 /// Borrow a UTF-8 character interval; callers account for its linear work.
 fn textSlice(text: []const u8, begin: usize, end: usize) ![]const u8 {
     var iterator = (std.unicode.Utf8View.init(text) catch return error.SqlTypeMismatch).iterator();
@@ -5649,6 +5699,248 @@ test "SQL strpos rejects invalid UTF8 and bounds adversarial substring work" {
     try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = &invalid }, .{ .string = "x" } }, .{}));
     try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = "x" }, .{ .string = &invalid } }, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(alloc, &.{}, &.{ .{ .string = "aaaaaaaaaaaaab" }, .{ .string = "aaaaab" } }, .{ .pattern_steps = 24 }));
+}
+
+test "SQL scalar input large string validation and integer conversion retain work and cancellation" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 3) return error.QueryCanceled;
+        }
+    };
+    const text = try a.alloc(u8, 16384);
+    defer a.free(text);
+    @memset(text, '0');
+    text[text.len - 1] = '7';
+    for ([_]bool{ false, true }) |integer_mode| {
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        var healthy: Evaluator = .{ .program = undefined, .alloc = none.allocator(), .cells = &.{}, .parameters = &.{}, .limits = .{} };
+        if (integer_mode) {
+            try std.testing.expectEqual(@as(i64, 7), (try healthy.convert(.{ .number_string = text }, .integer)).integer);
+            try std.testing.expectEqual(@as(usize, 0), healthy.usedSteps());
+        } else {
+            try std.testing.expectEqual(text.len, try healthy.validateJson(.{ .string = text }, 0));
+            try std.testing.expectEqual(@as(usize, 1), healthy.usedSteps());
+        }
+        var probe: Probe = .{};
+        var canceled: Evaluator = .{ .program = undefined, .alloc = none.allocator(), .cells = &.{}, .parameters = &.{}, .limits = .{ .checkpoint = Probe.check, .checkpoint_context = &probe } };
+        if (integer_mode) {
+            try std.testing.expectError(error.QueryCanceled, canceled.convert(.{ .number_string = text }, .integer));
+        } else try std.testing.expectError(error.QueryCanceled, canceled.validateJson(.{ .string = text }, 0));
+        try std.testing.expectEqual(@as(usize, 3), probe.calls);
+        try std.testing.expectError(error.QueryCanceled, canceled.workOwner().charge(0));
+    }
+}
+
+test "SQL scalar JSON output preserves bytes work and quota before emission" {
+    const a = std.testing.allocator;
+    var value = try std.json.parseFromSlice(Json, a, "{\"key\\u03bb\":[null,true,9007199254740993,1.25,\"\\u0000\",{\"nested\":[]} ]}", .{ .parse_numbers = false });
+    defer value.deinit();
+    const expected = try std.json.Stringify.valueAlloc(a, value.value, .{});
+    defer a.free(expected);
+    var vm: Evaluator = .{ .program = undefined, .alloc = a, .cells = &.{}, .parameters = &.{}, .limits = .{} };
+    _ = try vm.validateJson(value.value, 0);
+    const validation_work = vm.usedSteps();
+    vm.work_owner = null;
+    const actual = try vm.jsonText(value.value);
+    defer a.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expectEqual(validation_work, vm.usedSteps());
+    try std.testing.expectEqual(expected.len, vm.bytes);
+    // Escaping expands beyond the raw validation size. Refuse that output
+    // before retaining even one payload byte, with an allocator that cannot
+    // produce a destination buffer.
+    const controls: [128]u8 = @splat(0);
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var limited: Evaluator = .{ .program = undefined, .alloc = none.allocator(), .cells = &.{}, .parameters = &.{}, .limits = .{ .output_bytes = controls.len } };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, limited.jsonText(.{ .string = &controls }));
+    try std.testing.expectEqual(@as(usize, 0), limited.bytes);
+    try std.testing.expectEqual(@as(usize, 0), none.end_index);
+}
+
+test "SQL scalar JSON output cancellation at every validation count emission and compaction checkpoint retires storage" {
+    const Probe = struct {
+        calls: usize = 0,
+        refuse: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == self.refuse) return error.QueryCanceled;
+        }
+    };
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, 32768);
+    defer a.free(text);
+    @memset(text, 'x');
+    const value: Json = .{ .string = text };
+    var baseline: Probe = .{};
+    var vm: Evaluator = .{ .program = undefined, .alloc = a, .cells = &.{}, .parameters = &.{}, .limits = .{ .checkpoint = Probe.check, .checkpoint_context = &baseline } };
+    const output = try vm.jsonText(value);
+    defer a.free(output);
+    try std.testing.expect(baseline.calls > 30);
+    for (1..baseline.calls + 1) |failure| {
+        var interrupted: Probe = .{ .refuse = failure };
+        var canceled: Evaluator = .{ .program = undefined, .alloc = a, .cells = &.{}, .parameters = &.{}, .limits = .{ .checkpoint = Probe.check, .checkpoint_context = &interrupted } };
+        try std.testing.expectError(error.QueryCanceled, canceled.jsonText(value));
+        try std.testing.expectError(error.QueryCanceled, canceled.workOwner().checkpointNow());
+        try std.testing.expectEqual(failure, interrupted.calls);
+        try std.testing.expectEqual(@as(usize, 1), canceled.usedSteps());
+    }
+}
+
+test "SQL scalar JSON output allocation failures retire traversal frames and buffers" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            const text: [16384]u8 = @splat('x');
+            var cells = [_]Json{.{ .string = &text }};
+            const value: Json = .{ .array = .fromOwnedSlice(a, &cells) };
+            var vm: Evaluator = .{ .program = undefined, .alloc = a, .cells = &.{}, .parameters = &.{}, .limits = .{} };
+            const output = try vm.jsonText(value);
+            defer a.free(output);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL scalar input floating conversion retains finite diagnostics and original cancellation" {
+    const a = std.testing.allocator;
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var vm: Evaluator = .{ .program = undefined, .alloc = none.allocator(), .cells = &.{}, .parameters = &.{}, .limits = .{} };
+    for ([_][]const u8{ "-0", "0x1.fp2", "1_2.3_4", "5e-324", "1.00000000000000011102230246251565404236316680908203125" }) |text| {
+        const actual = (try vm.convert(.{ .number_string = text }, .number)).float;
+        try std.testing.expectEqual(@as(u64, @bitCast(try std.fmt.parseFloat(f64, text))), @as(u64, @bitCast(actual)));
+    }
+    try std.testing.expectError(error.SqlTypeMismatch, vm.convert(.{ .string = "1__2" }, .number));
+    try std.testing.expectError(error.SqlNumericOutOfRange, vm.convert(.{ .string = "Infinity" }, .number));
+    try std.testing.expectError(error.SqlNumericOutOfRange, vm.convert(.{ .string = "NaN" }, .number));
+    try std.testing.expectEqual(@as(usize, 0), vm.usedSteps());
+    const Probe = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 3) return error.QueryCanceled;
+        }
+    };
+    const text = try a.alloc(u8, 16384);
+    defer a.free(text);
+    @memset(text, '0');
+    var probe: Probe = .{};
+    var canceled: Evaluator = .{ .program = undefined, .alloc = none.allocator(), .cells = &.{}, .parameters = &.{}, .limits = .{ .checkpoint = Probe.check, .checkpoint_context = &probe } };
+    try std.testing.expectError(error.QueryCanceled, canceled.convert(.{ .number_string = text }, .number));
+    try std.testing.expectError(error.QueryCanceled, canceled.workOwner().charge(0));
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), canceled.usedSteps());
+}
+
+test "SQL scalar input floating arrays retain original context work and cancellation across text and wire decoders" {
+    const Context = @import("numeric_value.zig").Context;
+    const Probe = struct {
+        calls: usize = 0,
+        refuse: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == self.refuse) return error.QueryCanceled;
+        }
+    };
+    const Fixture = struct {
+        fn run(a: Allocator, text_mode: bool, input: []const u8, context: ?*Context) !struct { number: f64, work: usize } {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            if (text_mode) {
+                const decoded = try @import("array_text.zig").decodeLeaky(arena.allocator(), .float64, input, .{ .context = context });
+                return .{ .number = decoded.value.elements[0].value.float, .work = decoded.work };
+            }
+            const parsed = try std.json.parseFromSliceLeaky(Json, arena.allocator(), input, .{ .parse_numbers = false });
+            const decoded = try @import("array_wire.zig").decodeLeakyMeasured(arena.allocator(), .float64, parsed, .{ .context = context });
+            return .{ .number = decoded.value.elements[0].value.float, .work = decoded.work };
+        }
+    };
+    const a = std.testing.allocator;
+    const zeros = try a.alloc(u8, 4096);
+    defer a.free(zeros);
+    @memset(zeros, '0');
+    for ([_]bool{ false, true }) |text_mode| {
+        const input = try std.mem.concat(a, u8, if (text_mode) &.{ "{", zeros, "1.5}" } else &.{ "{\"dimensions\":[{\"lower_bound\":1,\"length\":1}],\"values\":[1.5", zeros, "],\"sql_nulls\":[false]}" });
+        defer a.free(input);
+        const legacy = try Fixture.run(a, text_mode, input, null);
+        var baseline: Probe = .{};
+        var parent: Context = .{ .alloc = a, .checkpoint = Probe.check, .ptr = &baseline };
+        const initial = parent.remaining;
+        const controlled = try Fixture.run(a, text_mode, input, &parent);
+        try std.testing.expectEqual(@as(f64, 1.5), controlled.number);
+        try std.testing.expectEqual(legacy.work, controlled.work);
+        try std.testing.expectEqual(controlled.work, initial - parent.remaining);
+        try std.testing.expect(baseline.calls > 8);
+        for (1..baseline.calls + 1) |failure| {
+            var interrupted: Probe = .{ .refuse = failure };
+            var retained: Context = .{ .alloc = a, .checkpoint = Probe.check, .ptr = &interrupted };
+            try std.testing.expectError(error.QueryCanceled, Fixture.run(a, text_mode, input, &retained));
+            try std.testing.expectError(error.QueryCanceled, retained.charge(0));
+            try std.testing.expectEqual(failure, interrupted.calls);
+        }
+    }
+}
+
+test "SQL scalar input text domain validation and array payload copy preserve work and retire on every interruption" {
+    const Context = @import("numeric_value.zig").Context;
+    const Probe = struct {
+        calls: usize = 0,
+        refuse: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == self.refuse) return error.QueryCanceled;
+        }
+    };
+    const Fixture = struct {
+        fn run(a: Allocator, text: []const u8, context: ?*Context) !usize {
+            var work: arrays.Budget = .{ .remaining = 1 << 20, .shared = context };
+            const initial = work.remaining;
+            const decoded = try @import("array_text.zig").decodeElementLeaky(a, .text, text, &work);
+            defer a.free(decoded.value.string);
+            try std.testing.expectEqualStrings(text, decoded.value.string);
+            try std.testing.expect(decoded.value.string.ptr != text.ptr);
+            return initial - work.remaining;
+        }
+    };
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, 16384);
+    defer a.free(text);
+    @memset(text, 'x');
+    var baseline: Probe = .{};
+    var parent: Context = .{ .alloc = a, .checkpoint = Probe.check, .ptr = &baseline };
+    const initial = parent.remaining;
+    const actual_work = try Fixture.run(a, text, &parent);
+    try std.testing.expectEqual(try Fixture.run(a, text, null), actual_work);
+    try std.testing.expectEqual(text.len, actual_work);
+    try std.testing.expectEqual(actual_work, initial - parent.remaining);
+    try std.testing.expect(baseline.calls > 10);
+    for (1..baseline.calls + 1) |failure| {
+        var interrupted: Probe = .{ .refuse = failure };
+        var retained: Context = .{ .alloc = a, .checkpoint = Probe.check, .ptr = &interrupted };
+        try std.testing.expectError(error.QueryCanceled, Fixture.run(a, text, &retained));
+        try std.testing.expectError(error.QueryCanceled, retained.charge(0));
+        try std.testing.expectEqual(failure, interrupted.calls);
+    }
+    for ([_][]const u8{ "\x00", "\xed\xa0\x80", "\xe2\x82" }) |invalid| {
+        var work: Context = .{ .alloc = a };
+        const expected = if (invalid[0] == 0) error.SqlUntranslatableCharacter else error.SqlInvalidTextEncoding;
+        try std.testing.expectError(expected, Fixture.run(a, invalid, &work));
+        try std.testing.expectError(expected, Fixture.run(a, invalid, null));
+    }
+    const AllocationFixture = struct {
+        fn run(allocator: Allocator) !void {
+            var context: Context = .{ .alloc = allocator };
+            const input: [16384]u8 = @splat('x');
+            _ = try Fixture.run(allocator, &input, &context);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, AllocationFixture.run, .{});
 }
 
 test "SQL computed array scalar producers retain compact results under tight output budgets" {

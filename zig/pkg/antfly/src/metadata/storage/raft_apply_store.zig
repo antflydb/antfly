@@ -63,6 +63,7 @@ const fk_initial_retirement_ack = @import("../fk_initial_retirement_ack.zig");
 const fk_initial_retirement_auth = @import("../fk_initial_retirement_auth.zig");
 const fk_initial_retirement_contract = @import("../fk_initial_retirement_contract.zig");
 const fk_initial_retirement_wire = @import("../fk_initial_retirement_wire.zig");
+const remote_initialization = @import("../remote_attempt_initialization.zig");
 const store_root_enrollment = @import("../store_root_enrollment.zig");
 
 pub const AppliedMetadataCheckpoint = apply_contract.AppliedMetadataCheckpoint;
@@ -5906,6 +5907,7 @@ pub const TransitionCommand = union(enum) {
     apply_sql_policy_publication: []const u8,
     apply_fk_generation_publication: []const u8,
     apply_fk_initial_create: []const u8,
+    apply_remote_attempt_initialization: []const u8,
     apply_store_root_enrollment: []const u8,
     ack_initial_fk_retirement: []const u8,
     publish_secret_collection: []const u8,
@@ -6062,7 +6064,7 @@ pub const TransitionCommand = union(enum) {
         switch (self.*) {
             .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_remote_attempt_initialization, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -6190,7 +6192,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         .apply_restore_staging => |bytes| if (bytes.len == 0 or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging,
         .apply_fk_generation_publication => |bytes| if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication,
         .apply_fk_initial_create => |bytes| if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication,
-        .apply_store_root_enrollment, .ack_initial_fk_retirement => |bytes| if (bytes.len == 0 or bytes.len > 8192) return error.InvalidStoreRootEnrollment,
+        .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_remote_attempt_initialization => |bytes| if (bytes.len == 0 or bytes.len > 8192) return error.InvalidStoreRootEnrollment,
         .upsert_store, .upsert_store_heartbeat, .register_store => |record| {
             if (!metadata_table_manager.reporterFenceValid(
                 record.reporter_incarnation,
@@ -13118,6 +13120,15 @@ pub const RaftApplyStore = struct {
         // Write preflights use an aborting transaction so the proposer and the
         // apply path execute the same authority comparisons.
         switch (control) {
+            .remote_initialization_preflight, .remote_initialization_status => |request| {
+                var txn = try self.store.beginReadTxn();
+                defer txn.abort();
+                const prior = try self.remoteAttemptInitializationTxn(&txn, group_id, request);
+                if (control == .remote_initialization_preflight) return std.json.Stringify.valueAlloc(alloc, try remote_initialization.transition(prior, request), .{});
+                const entry = prior orelse return error.CatalogNotFound;
+                if (request.action == .activate and (entry.phase != .active or !std.mem.eql(u8, &entry.initialization_id, &request.initialization_id))) return error.MetadataMutationOutcomeUnknown;
+                return std.json.Stringify.valueAlloc(alloc, entry, .{});
+            },
             .preflight_enrollment => |request| {
                 const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
                 defer alloc.free(bytes);
@@ -13153,6 +13164,34 @@ pub const RaftApplyStore = struct {
                 return self.fkInitialRetirementTicketPageTxn(alloc, &txn, group_id, request.page);
             },
         }
+    }
+
+    fn remoteAttemptInitializationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: remote_initialization.Request) !?remote_initialization.Entry {
+        try request.validate();
+        var key_buf: [256]u8 = undefined;
+        const raw = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&key_buf, group))) orelse return error.StoreRootEnrollmentChanged;
+        if (!std.mem.eql(u8, &(try decodeMetadataIncarnationRecord(raw)).incarnation, &request.identity.metadata_incarnation)) return error.StoreRootEnrollmentChanged;
+        const current = (try self.loadStoreHeaderTxn(txn, group, request.identity.store_id)) orelse return error.UnknownStore;
+        defer metadata_table_manager.freeStore(self.alloc, current);
+        if (current.node_id != request.identity.node_id or current.replica_root_incarnation != request.identity.root_incarnation or
+            current.reporter_incarnation != request.reporter_incarnation or !std.mem.eql(u8, &current.replica_root_public_key, &request.identity.public_key)) return error.StoreRootEnrollmentChanged;
+        const stored = (try stagingGet(txn, try remote_initialization.key(&key_buf, group, request.identity.store_id, request.identity.root_incarnation))) orelse return null;
+        var parsed = try std.json.parseFromSlice(remote_initialization.Entry, self.alloc, stored, .{});
+        defer parsed.deinit();
+        try parsed.value.validate();
+        if (!std.meta.eql(parsed.value.identity, request.identity) or parsed.value.profile != request.profile) return error.StoreRootEnrollmentChanged;
+        return parsed.value;
+    }
+    fn applyRemoteAttemptInitializationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, bytes: []const u8) !void {
+        var parsed = std.json.parseFromSlice(remote_initialization.Request, self.alloc, bytes, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidStoreRootEnrollment;
+        defer parsed.deinit();
+        if (parsed.value.action == .status) return error.InvalidStoreRootEnrollment;
+        const before = try self.remoteAttemptInitializationTxn(txn, group, parsed.value);
+        const after = try remote_initialization.transition(before, parsed.value);
+        const encoded = try std.json.Stringify.valueAlloc(self.alloc, after, .{});
+        defer self.alloc.free(encoded);
+        var key_buf: [256]u8 = undefined;
+        try txn.put(try remote_initialization.key(&key_buf, group, after.identity.store_id, after.identity.root_incarnation), encoded);
     }
 
     fn requireStoreRootEnrollmentTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, identity: store_root_enrollment.Identity) !void {
@@ -17702,6 +17741,7 @@ pub const RaftApplyStore = struct {
         fk_initial_retire,
         fk_initial_replica_count,
         store_root_enrollment,
+        remote_attempt_initialization,
         range,
         reconcile_lease,
         reallocation_request,
@@ -17768,6 +17808,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .fk_initial_retire, .key = .{ .prefix = fk_initial_retirement.allStoresPrefix } },
         .{ .projection = .fk_initial_replica_count, .key = .{ .prefix = fk_initial_retirement.allCountsPrefix } },
         .{ .projection = .store_root_enrollment, .key = .{ .prefix = store_root_enrollment.prefix } },
+        .{ .projection = .remote_attempt_initialization, .key = .{ .prefix = remote_initialization.prefix } },
         .{ .projection = .range, .key = .{ .prefix = rangePrefixForGroup } },
         .{ .projection = .reconcile_lease, .key = .{ .point = reconcileLeaseKeyForGroup } },
         .{ .projection = .reallocation_request, .key = .{ .point = reallocationRequestKeyForGroup } },
@@ -17793,6 +17834,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
             .publish_secret_collection => metadataSnapshotProjectionBit(.secret_collection),
             .apply_store_root_enrollment => metadataSnapshotProjectionBit(.store_root_enrollment),
+            .apply_remote_attempt_initialization => metadataSnapshotProjectionBit(.remote_attempt_initialization),
             .ack_initial_fk_retirement => metadataSnapshotProjectionBit(.fk_initial_replica) | metadataSnapshotProjectionBit(.fk_initial_retire),
             .activate_topology_protocol => metadataSnapshotProjectionBit(.topology_activation),
             .apply_store_report_baseline => metadataSnapshotProjectionBit(.store) | metadataSnapshotProjectionBit(.store_report_cursor) | metadataSnapshotProjectionBit(.store_report_baseline) | metadataSnapshotProjectionBit(.store_report_generation),
@@ -20168,6 +20210,10 @@ pub const RaftApplyStore = struct {
             .apply_sql_policy_publication => |bytes| try self.applySqlPolicyPublicationTxn(txn, group_id, bytes),
             .apply_fk_generation_publication => |bytes| try self.applyFkGenerationPublicationTxn(txn, group_id, bytes),
             .apply_fk_initial_create => |bytes| try self.applyCommittedFkInitialCreateTxn(txn, group_id, bytes),
+            .apply_remote_attempt_initialization => |bytes| self.applyRemoteAttemptInitializationTxn(txn, group_id, bytes) catch |err| switch (err) {
+                error.InvalidStoreRootEnrollment, error.StoreRootEnrollmentChanged, error.UnknownStore, error.CatalogNotFound => {},
+                else => return err,
+            },
             .apply_store_root_enrollment => |bytes| self.applyStoreRootEnrollmentTxn(txn, group_id, bytes) catch |err| switch (err) {
                 error.InvalidStoreRootEnrollment, error.StoreRootEnrollmentChanged, error.UnknownStore => {},
                 else => return err,
@@ -24929,6 +24975,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    apply_remote_attempt_initialization = 78,
     apply_relation_reconciliation = 76,
     mutate_lake_index_lifecycle = 75,
     publish_secret_collection = 60,
@@ -25100,6 +25147,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .apply_fk_initial_create => |bytes| {
             if (bytes.len > fk_generation_publication.max_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @backingInt(TransitionTag.apply_fk_initial_create));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_remote_attempt_initialization => |bytes| {
+            if (bytes.len == 0 or bytes.len > 8192) return error.CatalogCommandTooLarge;
+            try out.append(alloc, @backingInt(TransitionTag.apply_remote_attempt_initialization));
             try appendRequiredString(alloc, &out, bytes);
         },
         .apply_store_root_enrollment, .ack_initial_fk_retirement => |bytes| {
@@ -25526,6 +25578,10 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .apply_fk_initial_create => blk: {
             if (encoded.len > fk_generation_publication.max_bytes + 16) return error.CatalogCommandTooLarge;
             break :blk .{ .apply_fk_initial_create = try readRequiredString(alloc, encoded, &pos) };
+        },
+        .apply_remote_attempt_initialization => blk: {
+            if (encoded.len > 8208) return error.CatalogCommandTooLarge;
+            break :blk .{ .apply_remote_attempt_initialization = try readRequiredString(alloc, encoded, &pos) };
         },
         .apply_store_root_enrollment => blk: {
             if (encoded.len > 8208) return error.CatalogCommandTooLarge;
@@ -38656,4 +38712,100 @@ test "metadata.lake index object table engine framing preserves empty topology a
     invalid = table;
     invalid.indexes_json = "{\"new\":{\"type\":\"full_text\"}}";
     try std.testing.expectError(error.ObjectTableDefinitionConflict, metadata_table_manager.validateObjectTableMutation(a, table, invalid));
+}
+
+test "remote initialization persists immutable grants through restart snapshots and reporter replacement" {
+    const alloc = std.testing.allocator;
+    const group = group_ids.main_metadata_group_id;
+    const realm = "11111111111111111111111111111111".*;
+    const seed: [32]u8 = @splat(7);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const identity: remote_initialization.Identity = .{ .metadata_incarnation = realm, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/remote-init", .{tmp.sub_path});
+    defer alloc.free(path);
+    const restored_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/remote-init-restored", .{tmp.sub_path});
+    defer alloc.free(restored_path);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = realm });
+    var registered = metadata.StoreRecord{ .store_id = 3, .node_id = 2, .reporter_incarnation = 4, .replica_root_incarnation = 7, .replica_root_public_key = identity.public_key };
+    try store.applyStandaloneCommand(group, .{ .register_store = registered });
+    const T = struct {
+        fn entry(store_: *RaftApplyStore, request: remote_initialization.Request) !remote_initialization.Entry {
+            const bytes = try store_.storeRootControlJson(std.testing.allocator, group, .{ .remote_initialization_status = request });
+            defer std.testing.allocator.free(bytes);
+            var parsed = try std.json.parseFromSlice(remote_initialization.Entry, std.testing.allocator, bytes, .{});
+            defer parsed.deinit();
+            return parsed.value;
+        }
+        fn apply(store_: *RaftApplyStore, request: remote_initialization.Request) !void {
+            const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, request, .{});
+            defer std.testing.allocator.free(bytes);
+            const encoded = try encodeTransitionCommand(std.testing.allocator, .{ .apply_remote_attempt_initialization = bytes });
+            defer std.testing.allocator.free(encoded);
+            var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)).?;
+            defer decoded.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings(bytes, decoded.apply_remote_attempt_initialization);
+            try store_.applyStandaloneCommand(group, decoded);
+        }
+        fn preflight(store_: *RaftApplyStore, request: remote_initialization.Request) !void {
+            const checked = try store_.storeRootControlJson(std.testing.allocator, group, .{ .remote_initialization_preflight = request });
+            std.testing.allocator.free(checked);
+        }
+    };
+    const prepare = try remote_initialization.Request.sign(identity, 4, .prepare, @splat(1), seed);
+    const status = try remote_initialization.Request.sign(identity, 4, .status, @splat(0), seed);
+    try std.testing.expectError(error.CatalogNotFound, T.entry(&store, status));
+    try T.preflight(&store, prepare);
+    // Preflight must not grant creation or install a durable marker.
+    try std.testing.expectError(error.CatalogNotFound, T.entry(&store, status));
+    try T.apply(&store, prepare);
+    const prepared = try T.entry(&store, status);
+    try std.testing.expectEqual(remote_initialization.Phase.prepared, prepared.phase);
+    const prepare_again = try remote_initialization.Request.sign(identity, 4, .prepare, @splat(2), seed);
+    try T.apply(&store, prepare_again);
+    try std.testing.expectEqualDeep(prepared, try T.entry(&store, status));
+    const pending_snapshot = try store.snapshotBuilder().buildSnapshot(alloc, group);
+    defer alloc.free(pending_snapshot);
+    var restored = try RaftApplyStore.init(alloc, .{ .root_dir = restored_path });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(alloc, group, 5, pending_snapshot));
+    try std.testing.expectEqualDeep(prepared, try T.entry(&restored, status));
+    const activate = try remote_initialization.Request.sign(identity, 4, .activate, prepared.initialization_id, seed);
+    try T.preflight(&store, activate);
+    try T.apply(&store, activate);
+    try T.apply(&store, prepare_again);
+    const active = try T.entry(&store, status);
+    try std.testing.expectEqual(remote_initialization.Phase.active, active.phase);
+    try std.testing.expectEqualDeep(prepared.initialization_id, active.initialization_id);
+    const wrong = try remote_initialization.Request.sign(identity, 4, .activate, @splat(2), seed);
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, T.preflight(&store, wrong));
+    try T.apply(&store, wrong); // A raced/stale committed command cannot mutate authority.
+    try std.testing.expectEqualDeep(active, try T.entry(&store, status));
+    try store.applyStandaloneCommand(group, .{ .remove_store = .{ .store_id = registered.store_id } });
+    registered.reporter_incarnation = 5;
+    try store.applyStandaloneCommand(group, .{ .register_store = registered });
+    const current_status = try remote_initialization.Request.sign(identity, 5, .status, @splat(0), seed);
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, T.entry(&store, status));
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, T.preflight(&store, prepare));
+    try T.apply(&store, prepare);
+    try std.testing.expectEqualDeep(active, try T.entry(&store, current_status));
+    store.deinit();
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+    try std.testing.expectEqualDeep(active, try T.entry(&store, current_status));
+    const active_snapshot = try store.snapshotBuilder().buildSnapshot(alloc, group);
+    defer alloc.free(active_snapshot);
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(alloc, group, 6, active_snapshot));
+    try std.testing.expectEqualDeep(active, try T.entry(&restored, current_status));
+    // A valid signature for a different realm or verifier is not this root's
+    // authority; neither can replace the permanent initialization identifier.
+    var foreign = identity;
+    foreign.metadata_incarnation = @splat('2');
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, T.preflight(&store, try remote_initialization.Request.sign(foreign, 5, .prepare, @splat(3), seed)));
+    const other_seed: [32]u8 = @splat(8);
+    foreign = identity;
+    foreign.public_key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(other_seed)).public_key.toBytes();
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, T.preflight(&store, try remote_initialization.Request.sign(foreign, 5, .prepare, @splat(3), other_seed)));
 }

@@ -36,7 +36,37 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const target = options.target;
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
+    const status_paging_tests = b.addTest(.{
+        .name = "data-status-refresh-paging-tests",
+        .root_module = data_runtime_test_mod,
+        .filters = &.{
+            "data runtime status paging",
+            "runtime status refresh cursor",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 7 * 1024 * 1024 * 1024,
+    });
+    const status_paging_run = b.addRunArtifact(status_paging_tests);
+    status_paging_run.has_side_effects = true;
+    status_paging_run.addArg("--require-no-skips");
+    b.step("antfly-data-status-refresh-paging-test", "Verify resumable table refreshes, catalog absence fences and partial ownership cleanup")
+        .dependOn(&status_paging_run.step);
+    const status_admission_tests = b.addTest(.{
+        .name = "data-status-refresh-admission-tests",
+        .root_module = data_runtime_test_mod,
+        .filters = &.{"data runtime status admission"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 7 * 1024 * 1024 * 1024,
+    });
+    const status_admission_run = b.addRunArtifact(status_admission_tests);
+    status_admission_run.has_side_effects = true;
+    status_admission_run.addArg("--require-no-skips");
+    b.step("antfly-data-status-refresh-admission-test", "Verify original queued refresh authority, activity polling and publication fences")
+        .dependOn(&status_admission_run.step);
     const lib_data_runtime_default_filters = [_][]const u8{
+        "data runtime status paging",
+        "runtime status refresh cursor",
+        "data runtime status admission",
         "data runtime ordered artifact upload handoff",
         "data runtime hosted FK retirement",
         "pure topology control bypasses only ordinary dense repair writer preflight",

@@ -15,6 +15,7 @@
 
 //! PostgreSQL builtin coercion primitives; no allocation or mutable global state.
 const std = @import("std");
+pub const WorkControl = @import("sql_parser").lexer.WorkControl;
 const Kind = @import("../common/sql_builtin_type.zig").Type;
 pub const whitespace = " \t\n\r\x0b\x0c";
 pub fn integral(kind: Kind) bool {
@@ -52,8 +53,78 @@ pub fn checkedInteger(value: i64, target: Kind) !i64 {
     return value;
 }
 
+const IntegerWork = struct {
+    control: ?WorkControl,
+    remaining: usize = 1024,
+    fn check(self: *IntegerWork) error{SqlPreparationInterrupted}!void {
+        if (self.control) |value| try value.checkpoint(value.ptr);
+    }
+    fn poll(self: *IntegerWork) error{SqlPreparationInterrupted}!void {
+        if (self.control == null) return;
+        self.remaining -= 1;
+        if (self.remaining == 0) {
+            self.remaining = 1024;
+            try self.check();
+        }
+    }
+};
+
+pub fn unsignedTextControlled(input: []const u8, base: u8, control: ?WorkControl) !u64 {
+    if (control == null) return std.fmt.parseInt(u64, input, base);
+    var work: IntegerWork = .{ .control = control };
+    try work.check();
+    if (input.len == 0) return error.InvalidCharacter;
+    const negative = input[0] == '-';
+    var text = if (negative or input[0] == '+') input[1..] else input;
+    if (text.len == 0) return error.InvalidCharacter;
+    var radix: u8 = if (base == 0) 10 else base;
+    if (base == 0 and text.len > 2 and text[0] == '0') switch (std.ascii.toLower(text[1])) {
+        'b' => {
+            radix = 2;
+            text = text[2..];
+        },
+        'o' => {
+            radix = 8;
+            text = text[2..];
+        },
+        'x' => {
+            radix = 16;
+            text = text[2..];
+        },
+        else => {},
+    };
+    if (text[0] == '_' or text[text.len - 1] == '_') return error.InvalidCharacter;
+    var magnitude: u64 = 0;
+    for (text) |byte| {
+        try work.poll();
+        if (byte == '_') continue;
+        const digit = try std.fmt.charToDigit(byte, radix);
+        if (negative and digit != 0) return error.Overflow;
+        magnitude = try std.math.mul(u64, magnitude, radix);
+        magnitude = try std.math.add(u64, magnitude, digit);
+    }
+    try work.check();
+    return magnitude;
+}
+
 pub fn integerText(input: []const u8, target: Kind) !i64 {
-    const text = std.mem.trim(u8, input, whitespace);
+    return integerTextControlled(input, target, null);
+}
+
+pub fn integerTextControlled(input: []const u8, target: Kind, control: ?WorkControl) !i64 {
+    var work: IntegerWork = .{ .control = control };
+    try work.check();
+    var start: usize = 0;
+    var end = input.len;
+    while (start < end and std.mem.indexOfScalar(u8, whitespace, input[start]) != null) {
+        try work.poll();
+        start += 1;
+    }
+    while (end > start and std.mem.indexOfScalar(u8, whitespace, input[end - 1]) != null) {
+        try work.poll();
+        end -= 1;
+    }
+    const text = input[start..end];
     var at: usize = 0;
     if (text.len != 0 and (text[0] == '+' or text[0] == '-')) at = 1;
     var base: u8 = 10;
@@ -77,6 +148,7 @@ pub fn integerText(input: []const u8, target: Kind) !i64 {
     if (base != 10 and at < text.len and text[at] == '_') at += 1;
     const first = at;
     for (text[at..]) |byte| {
+        try work.poll();
         if (byte == '_') {
             if (!digit) return error.SqlInvalidTextRepresentation;
             digit = false;
@@ -89,13 +161,30 @@ pub fn integerText(input: []const u8, target: Kind) !i64 {
     // std's parser rejects an underscore directly following the prefix; the
     // normalized magnitude below handles that one PostgreSQL extension.
     const negative = text.len != 0 and text[0] == '-';
-    const magnitude = std.fmt.parseInt(u64, text[first..], base) catch |err| return switch (err) {
+    const magnitude = unsignedTextControlled(text[first..], base, control) catch |err| return switch (err) {
+        error.SqlPreparationInterrupted => error.SqlPreparationInterrupted,
         error.Overflow => error.SqlNumericOutOfRange,
         else => error.SqlInvalidTextRepresentation,
     };
     if (magnitude > @as(u64, std.math.maxInt(i64)) + @intFromBool(negative)) return error.SqlNumericOutOfRange;
     const result: i64 = if (negative and magnitude == @as(u64, 1) << 63) std.math.minInt(i64) else if (negative) -@as(i64, @intCast(magnitude)) else @intCast(magnitude);
     return checkedInteger(result, target);
+}
+
+/// Bridge the preparation parser's narrow interruption error to an existing
+/// execution context; original cancellation/deadline failures escape intact.
+pub fn integerTextWithContext(input: []const u8, target: Kind, context: ?*@import("numeric_value.zig").Context) !i64 {
+    const owner = context orelse return integerText(input, target);
+    try owner.checkpointNow();
+    const Bridge = struct {
+        fn check(raw: *anyopaque) error{SqlPreparationInterrupted}!void {
+            const value: *@import("numeric_value.zig").Context = @ptrCast(@alignCast(raw));
+            value.checkpointNow() catch return error.SqlPreparationInterrupted;
+        }
+    };
+    const result = integerTextControlled(input, target, .{ .ptr = owner, .checkpoint = Bridge.check }) catch |err| return owner.failure orelse err;
+    try owner.checkpointNow();
+    return result;
 }
 
 pub fn floatingInteger(value: f64, target: Kind) !i64 {
@@ -110,7 +199,12 @@ pub fn floatingInteger(value: f64, target: Kind) !i64 {
 }
 
 pub fn booleanText(input: []const u8) !bool {
-    const text = std.mem.trim(u8, input, whitespace);
+    return booleanTextControlled(input, null);
+}
+pub fn booleanTextControlled(input: []const u8, context: ?*@import("numeric_value.zig").Context) !bool {
+    if (context) |owner| try owner.checkpointNow();
+    const text = try trimTextControlled(input, context);
+    if (context) |owner| try owner.checkpointNow();
     if (std.mem.eql(u8, text, "1")) return true;
     if (std.mem.eql(u8, text, "0")) return false;
     if (text.len == 0) return error.SqlInvalidTextRepresentation;
@@ -121,6 +215,20 @@ pub fn booleanText(input: []const u8) !bool {
 }
 
 pub fn floatValue(comptime T: type, value: std.json.Value) !f64 {
+    return floatValueControlled(T, value, null);
+}
+fn floatPoll(context: ?*@import("numeric_value.zig").Context, index: usize) !void {
+    if (index % 1024 == 0) if (context) |work| try work.checkpointNow();
+}
+fn trimTextControlled(input: []const u8, context: ?*@import("numeric_value.zig").Context) ![]const u8 {
+    var first: usize = 0;
+    var last = input.len;
+    while (first < last and std.mem.indexOfScalar(u8, whitespace, input[first]) != null) : (first += 1) try floatPoll(context, first);
+    while (last > first and std.mem.indexOfScalar(u8, whitespace, input[last - 1]) != null) : (last -= 1) try floatPoll(context, input.len - last);
+    return input[first..last];
+}
+pub fn floatValueControlled(comptime T: type, value: std.json.Value, context: ?*@import("numeric_value.zig").Context) !f64 {
+    if (context) |work| try work.checkpointNow();
     var nonzero = false;
     var special = false;
     const result: T = switch (value) {
@@ -130,10 +238,13 @@ pub fn floatValue(comptime T: type, value: std.json.Value) !f64 {
         },
         .float => |number| return @import("../common/float_domain.zig").normalize(number, if (T == f32) .float32 else .float64),
         .string, .number_string => |input| blk: {
-            const text = std.mem.trim(u8, input, whitespace);
+            const text = try trimTextControlled(input, context);
             const positive = if (text.len != 0 and (text[0] == '+' or text[0] == '-')) text[1..] else text;
             const nan_payload = positive.len >= 5 and std.ascii.eqlIgnoreCase(positive[0..4], "nan(") and positive[positive.len - 1] == ')' and payload: {
-                for (positive[4 .. positive.len - 1]) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') break :payload false;
+                for (positive[4 .. positive.len - 1], 0..) |byte, index| {
+                    try floatPoll(context, index);
+                    if (!std.ascii.isAlphanumeric(byte) and byte != '_') break :payload false;
+                }
                 break :payload true;
             };
             if (std.ascii.eqlIgnoreCase(positive, "nan") or nan_payload) {
@@ -146,17 +257,25 @@ pub fn floatValue(comptime T: type, value: std.json.Value) !f64 {
             }
             // Zig accepts underscores in numbers; PostgreSQL float input does
             // not. Hex mantissas may contain e/E, unlike decimal exponents.
-            if (std.mem.indexOfScalar(u8, text, '_') != null) return error.SqlInvalidTextRepresentation;
+            for (text, 0..) |byte, index| {
+                try floatPoll(context, index);
+                if (byte == '_') return error.SqlInvalidTextRepresentation;
+            }
             const hex = positive.len >= 2 and std.ascii.eqlIgnoreCase(positive[0..2], "0x");
             const mantissa = if (hex) positive[2..] else positive;
-            for (mantissa) |byte| {
+            for (mantissa, 0..) |byte, index| {
+                try floatPoll(context, index);
                 if ((hex and (byte == 'p' or byte == 'P')) or (!hex and (byte == 'e' or byte == 'E'))) break;
                 nonzero = nonzero or (byte >= '1' and byte <= '9') or (hex and std.ascii.toLower(byte) >= 'a' and std.ascii.toLower(byte) <= 'f');
             }
-            break :blk std.fmt.parseFloat(T, text) catch return error.SqlInvalidTextRepresentation;
+            break :blk if (context) |work|
+                @import("controlled_float.zig").parseFloatControlled(T, text, work) catch |err| return if (err == error.InvalidCharacter) error.SqlInvalidTextRepresentation else err
+            else
+                std.fmt.parseFloat(T, text) catch return error.SqlInvalidTextRepresentation;
         },
         else => return error.SqlTypeMismatch,
     };
+    if (context) |work| try work.checkpointNow();
     if (!special and (!std.math.isFinite(result) or (result == 0 and nonzero))) return error.SqlNumericOutOfRange;
     return result;
 }
@@ -190,4 +309,142 @@ test "SQL builtin casts preserve integer boundaries and PostgreSQL float input s
     try std.testing.expectEqual(@as(f64, 1), try floatValue(f64, .{ .string = "0x1p0" }));
     try std.testing.expect(std.math.isNan(try floatValue(f64, .{ .string = "nan(1)" })));
     for ([_]f64{ 2.5, 3.5, -2.5, -3.5 }, [_]i64{ 2, 4, -2, -4 }) |input, expected| try std.testing.expectEqual(expected, try floatingInteger(input, .int32));
+}
+
+test "controlled integer preparation preserves signs prefixes separators and range errors" {
+    const Probe = struct {
+        fn checkpoint(_: *anyopaque) error{SqlPreparationInterrupted}!void {}
+    };
+    var marker: u8 = 0;
+    const control: WorkControl = .{ .ptr = &marker, .checkpoint = Probe.checkpoint };
+    for ([_][]const u8{ "0", "00000001", "+42", "-0", "0b111", "0Xff", "0o77", "1_2_3", "1__2", "18446744073709551615" }) |text| {
+        try std.testing.expectEqual(try std.fmt.parseInt(u64, text, 0), try unsignedTextControlled(text, 0, control));
+    }
+    for ([_][]const u8{ "18446744073709551616", "-1" }) |text|
+        try std.testing.expectError(error.Overflow, unsignedTextControlled(text, 0, control));
+    for ([_][]const u8{ "", "+", "_1", "1_", "0x_1", "0x1_", "1x" }) |text|
+        try std.testing.expectError(error.InvalidCharacter, unsignedTextControlled(text, 0, control));
+    try std.testing.expectEqual(std.math.minInt(i64), try integerTextControlled("-0x_8000000000000000", .int64, control));
+    try std.testing.expectEqual(@as(i64, 32767), try integerTextControlled(" +32_767 ", .int16, control));
+    try std.testing.expectError(error.SqlNumericOutOfRange, integerTextControlled("32768", .int16, control));
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, integerTextControlled("18446744073709551616x", .int64, control));
+}
+
+test "controlled integer preparation interrupts long zero and whitespace scans" {
+    const Probe = struct {
+        checks: usize = 0,
+        fn checkpoint(raw: *anyopaque) error{SqlPreparationInterrupted}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == 3) return error.SqlPreparationInterrupted;
+        }
+    };
+    const zeros: [8192]u8 = @splat('0');
+    const spaces: [8192]u8 = @splat(' ');
+    for ([_][]const u8{ &zeros, spaces ++ "1", "1" ++ spaces }) |text| {
+        var probe: Probe = .{};
+        try std.testing.expectError(error.SqlPreparationInterrupted, integerTextControlled(text, .int32, .{ .ptr = &probe, .checkpoint = Probe.checkpoint }));
+        try std.testing.expectEqual(@as(usize, 3), probe.checks);
+    }
+}
+
+test "controlled floating input preserves PostgreSQL grammar diagnostics and polling without work charges" {
+    const Context = @import("numeric_value.zig").Context;
+    const Probe = struct {
+        calls: usize = 0,
+        refuse: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == self.refuse) return error.QueryCanceled;
+        }
+    };
+    const a = std.testing.allocator;
+    const zeros = try a.alloc(u8, 16384);
+    defer a.free(zeros);
+    @memset(zeros, '0');
+    for ([_]struct { prefix: []const u8, fill: u8, suffix: []const u8 }{
+        .{ .prefix = "", .fill = ' ', .suffix = "-1.5 " },
+        .{ .prefix = "nan(", .fill = 'x', .suffix = ")" },
+        .{ .prefix = "0x", .fill = '0', .suffix = "1.fp2" },
+        .{ .prefix = "1e", .fill = '0', .suffix = "1" },
+    }) |case| {
+        @memset(zeros, case.fill);
+        const text = try std.mem.concat(a, u8, &.{ case.prefix, zeros, case.suffix });
+        defer a.free(text);
+        inline for (.{ f32, f64 }) |T| {
+            var probe: Probe = .{};
+            var context: Context = .{ .alloc = a, .remaining = 7, .checkpoint = Probe.check, .ptr = &probe };
+            const actual = try floatValueControlled(T, .{ .string = text }, &context);
+            const expected = try floatValue(T, .{ .string = text });
+            if (std.math.isNan(expected)) {
+                try std.testing.expect(std.math.isNan(actual));
+            } else try std.testing.expectEqual(@as(u64, @bitCast(expected)), @as(u64, @bitCast(actual)));
+            try std.testing.expect(probe.calls > 16);
+            for (1..probe.calls + 1) |failure| {
+                var interrupted: Probe = .{ .refuse = failure };
+                var work: Context = .{ .alloc = a, .remaining = 7, .checkpoint = Probe.check, .ptr = &interrupted };
+                try std.testing.expectError(error.QueryCanceled, floatValueControlled(T, .{ .string = text }, &work));
+                try std.testing.expectError(error.QueryCanceled, work.charge(0));
+                try std.testing.expectEqual(failure, interrupted.calls);
+                try std.testing.expectEqual(@as(u64, 7), work.remaining);
+            }
+            try std.testing.expectEqual(@as(u64, 7), context.remaining);
+        }
+    }
+    var context: Context = .{ .alloc = a };
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, floatValueControlled(f64, .{ .string = "1_2" }, &context));
+    try std.testing.expectError(error.SqlNumericOutOfRange, floatValueControlled(f32, .{ .string = "1e-100" }, &context));
+    try std.testing.expectEqual(-std.math.inf(f64), try floatValueControlled(f64, .{ .string = "-Infinity" }, &context));
+}
+
+test "controlled cast input integer and boolean preserve grammar diagnostics work and original failures" {
+    const Context = @import("numeric_value.zig").Context;
+    const Probe = struct {
+        calls: usize = 0,
+        refuse: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == self.refuse) return error.QueryCanceled;
+        }
+    };
+    const a = std.testing.allocator;
+    var healthy: Context = .{ .alloc = a, .remaining = 31 };
+    for ([_][]const u8{ "", "+", "0x_ff", "-9223372036854775808", "9223372036854775808", "1__2", "  0b101  ", "1_2", "123x" }) |text| {
+        if (integerText(text, .int64)) |expected| {
+            try std.testing.expectEqual(expected, try integerTextWithContext(text, .int64, &healthy));
+        } else |err| try std.testing.expectError(err, integerTextWithContext(text, .int64, &healthy));
+    }
+    for ([_][]const u8{ "", "true", "T", "yes", "off", "o", "fa", "  1 \t", "not", "0" }) |text| {
+        if (booleanText(text)) |expected| {
+            try std.testing.expectEqual(expected, try booleanTextControlled(text, &healthy));
+        } else |err| try std.testing.expectError(err, booleanTextControlled(text, &healthy));
+    }
+    const padding = try a.alloc(u8, 16384);
+    defer a.free(padding);
+    for ([_]bool{ false, true }) |integer_mode| {
+        @memset(padding, if (integer_mode) '0' else ' ');
+        const text = try std.mem.concat(a, u8, &.{ padding, if (integer_mode) "7" else "true" });
+        defer a.free(text);
+        var probe: Probe = .{};
+        var parent: Context = .{ .alloc = a, .remaining = 31, .checkpoint = Probe.check, .ptr = &probe };
+        if (integer_mode) {
+            try std.testing.expectEqual(@as(i64, 7), try integerTextWithContext(text, .int64, &parent));
+        } else try std.testing.expect(try booleanTextControlled(text, &parent));
+        try std.testing.expect(probe.calls >= 16);
+        for (1..probe.calls + 1) |failure| {
+            var interrupted: Probe = .{ .refuse = failure };
+            var retained: Context = .{ .alloc = a, .remaining = 31, .checkpoint = Probe.check, .ptr = &interrupted };
+            var child: Context = .{ .alloc = a, .remaining = 23, .parent = &retained };
+            if (integer_mode) {
+                try std.testing.expectError(error.QueryCanceled, integerTextWithContext(text, .int64, &child));
+            } else try std.testing.expectError(error.QueryCanceled, booleanTextControlled(text, &child));
+            try std.testing.expectError(error.QueryCanceled, retained.charge(0));
+            try std.testing.expectEqual(@as(u64, 31), retained.remaining);
+            try std.testing.expectEqual(@as(u64, 23), child.remaining);
+            try std.testing.expectEqual(failure, interrupted.calls);
+        }
+        try std.testing.expectEqual(@as(u64, 31), parent.remaining);
+    }
 }

@@ -30,6 +30,11 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .corrupt_input, .err = error.CorruptInput },
+    .{ .status = .invalid_table_file, .err = error.InvalidTableFile },
+    .{ .status = .table_block_checksum_mismatch, .err = error.TableBlockChecksumMismatch },
+    .{ .status = .backpressured, .err = error.Backpressured },
+    .{ .status = .transaction_closed, .err = error.TransactionClosed },
     .{ .status = .scheduler_closed, .err = error.SchedulerClosed },
     .{ .status = .scheduler_full, .err = error.SchedulerFull },
     .{ .status = .runnable_wait_timeout, .err = error.RunnableWaitTimeout },

@@ -3316,6 +3316,7 @@ pub const NativeGenerationPipeline = struct {
     gpt_config: gpt_mod.Config,
     kv_dtype: ?runtime.kv.pool.KvDType = null,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
+    device_memory_budget: ?runtime.kv.device_memory.Budget = null,
     tokenizer: tokenizer_mod.Tokenizer,
     add_bos_token: bool = false,
     bos_token: []const u8 = "",

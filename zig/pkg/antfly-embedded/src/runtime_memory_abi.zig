@@ -19,5 +19,5 @@ pub const Bytes = shared.Bytes;
 pub const OwnedBytes = shared.OwnedBytes;
 pub const OptionalOwnedBytes = shared.OptionalOwnedBytes;
 pub const Allocator = shared.Allocator;
-pub const Parent = @import("storage/memory_parent.zig").Port;
-pub const ParentSnapshot = @import("storage/memory_parent.zig").Snapshot;
+pub const Parent = shared.Parent;
+pub const ParentSnapshot = shared.ParentSnapshot;

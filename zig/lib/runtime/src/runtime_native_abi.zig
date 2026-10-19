@@ -24,7 +24,48 @@ const builtin = @import("builtin");
 
 // Routed writers and Raft batchers now carry their owning error-domain
 // dispatcher. Reject older native handles before reading the added field.
-pub const abi_version: u32 = 8;
+// Execution leases and recurring handles carry a shared-services capability.
+// Reject older native layouts before interpreting those added fields.
+// Publisher bindings now carry an optional completion-poll capability.
+// Reject the previous binding layout before any native payload is decoded.
+// Publisher recovery vtables include a controlled WAL matching callback.
+// Reject old vtables before dereferencing their changed callback layout.
+// Namespace store/read vtables include original-control snapshot and lookup callbacks.
+// Reject older layouts before interpreting these added capabilities.
+// Durable outbox callback values carry a copied immutable recovery identity.
+// Reject older native callbacks before passing the larger argument layout.
+// Namespace stores now expose owned stepped lookups and detached values.
+// Reject older namespace vtables before reading the added callback.
+// DB recovery cursors now own a funded provider continuation and destructor.
+// Reject the prior scalar-only layout before interpreting callback payloads.
+// Single-namespace stores now expose caller-owned stepped point reads.
+// Reject prior store vtables before interpreting the added callback.
+// DB local execution now owns a separate intent capture continuation.
+// Reject prior DB layouts before accessing its reader and value owners.
+// Store vtables and DB state now include an owned snapshot key cursor.
+// Reject prior layouts before interpreting the cursor and its ownership.
+// Version 19 adds retained cold-index continuations to owned namespace reads.
+// Metadata arrays and retained cursor layout must agree across native modules.
+// Version 20 adds progress-aware recovery ports and capture generations.
+// Reject earlier native retry/capture layouts before reading those fields.
+// Provider recovery progress and retry probes now carry independent tokens.
+// Reject previous cursor and progress-return layouts before interpreting them.
+// Publication owners now carry a distinct finite-step recovery callback.
+// Reject earlier owner/port layouts before interpreting the reserved path.
+// DocStore transactions now retain precommit durable publication accounting.
+// Reject earlier transaction layouts before crossing the native boundary.
+// Publisher ports now return provider-owned, precommit envelope funding.
+// Reject older callback and prepared-publication layouts.
+// Metadata and physical-maintenance completion retain prepared publication.
+// Reject previous retained-owner and publication method contracts.
+// Canonical generated-effect type identities no longer depend on physical DB owners.
+// Reject earlier native type contracts before interpreting prepared payloads.
+// Required preparation now gates transaction commit. Reject native owners
+// that do not enforce the durable requirement before resolving intents.
+// Transaction resolution carries its accepted decoded-effect owner.
+// Sealed frames retain their catalog definitions through resolution.
+// Reject older native owners that publish through that durable lease.
+pub const abi_version: u32 = 33;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

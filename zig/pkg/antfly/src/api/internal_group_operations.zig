@@ -322,6 +322,7 @@ pub const Operations = struct {
             error.ReadIndexTimeout => error.ReadIndexTimeout,
             error.CatalogRoutingUnavailable,
             error.CatalogProjectionRefreshRequired,
+            error.OutOfMemory,
             => error.Unavailable,
             else => null,
         };

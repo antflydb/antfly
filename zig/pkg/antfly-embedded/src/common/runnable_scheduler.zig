@@ -30,13 +30,91 @@ pub const AdmissionCheck = struct {
 };
 
 pub const Class = enum(u3) { query, write, inference, background, control };
+/// Trusted execution policy, independent of public operation admission classes.
+/// Bounded eligibility requires a verified non-growing, non-fanout operator.
+pub const ReadLane = enum { general, bounded, analytical };
+const ordinary_queues = [_]usize{ 0, 1, 2, 3, 6, 7 };
+/// Trusted accounting participants only. Callbacks run under the scheduler
+/// mutex and may perform bounded, allocation-free accounting with scheduler ->
+/// resource lock order. They must never perform IO or reenter the scheduler.
+/// C booleans keep compilation-local error identities out of this boundary.
+pub const ReadResourceTransfer = struct {
+    context: *anyopaque,
+    begin: *const fn (*anyopaque) callconv(.c) bool,
+    try_general: *const fn (*anyopaque) callconv(.c) bool,
+};
+/// Trusted resource owners only. Both callbacks run under the scheduler lock,
+/// use bounded try-lock accounting, and never allocate, wait, perform IO, call
+/// reclaimers, or reenter this scheduler. Probe holds no capacity. Unknown
+/// means acquisition may succeed but must not establish a CPU drain barrier.
+/// Acquisition commits the complete incremental non-CPU bundle or nothing.
+/// The caller retains acquired physical resources through their actual joins;
+/// CPU park/finish does not release them. Metadata is prepared before submit.
+pub const GrantResources = struct {
+    pub const Probe = enum(c_int) { ready, wait, unknown, too_large, unsupported, mismatch };
+    pub const Acquire = enum(c_int) { acquired, wait, too_large, unsupported, mismatch };
+    context: *anyopaque,
+    probe: *const fn (*anyopaque) callconv(.c) c_int,
+    acquire: *const fn (*anyopaque) callconv(.c) c_int,
+};
+pub const ReadTransitionBudget = struct {
+    /// Verified retained continuation plus its minimum cleanup metadata.
+    max_retained_bytes: u64,
+    max_wait_ms: u32,
+    estimated_work_ns: u64,
+};
+/// Trusted prepared operator stage: one worker, fixed resources, no blocking,
+/// fanout or mutation, with a verified bound between safe checkpoints.
+/// CPU loans lend no heap, registry, cleanup or durable authority.
+pub const CpuBorrowBudget = struct { max_non_yield_ns: u64 };
+/// Hard dispatch scan bound, independent of queue length and bypass policy.
+/// Each class has independent fresh-start and continuation windows, each
+/// including its head plus at most this many younger entries.
+pub const max_backfill_lookahead = 8;
+const BackfillCandidates = struct {
+    current: ?*Entry,
+    remaining: usize = max_backfill_lookahead + 1,
+    fn peek(self: *const @This()) ?*Entry {
+        return if (self.remaining == 0) null else self.current;
+    }
+    fn take(self: *@This()) ?*Entry {
+        const entry = self.peek() orelse return null;
+        self.current = entry.next;
+        self.remaining -= 1;
+        return entry;
+    }
+};
+/// Merge independently bounded windows in enqueue order. Fresh starts cannot
+/// consume the continuation scan budget; both still share class service credit.
+const ClassCandidates = struct {
+    fresh: BackfillCandidates,
+    resumed: BackfillCandidates,
+
+    fn take(self: *@This()) ?*Entry {
+        const fresh = self.fresh.peek() orelse return self.resumed.take();
+        const resumed = self.resumed.peek() orelse return self.fresh.take();
+        return if (fresh.sequence <= resumed.sequence) self.fresh.take() else self.resumed.take();
+    }
+};
 pub const State = enum { fresh, queued, running, resource_blocked, output_blocked, stopped, finished };
+/// Named because Config crosses separately compiled native ABI boundaries.
+/// Anonymous enum type names include compilation-local declaration numbers.
+pub const CapacityMode = enum(u8) { fixed, automatic };
 pub const Config = struct {
+    /// Automatic mode treats slots, max_bytes and control_bytes as ceilings.
+    /// Fixed policies preserve their exact declared control reservation.
+    capacity_mode: CapacityMode = .fixed,
     slots: usize = 8,
     control_slots: usize = 1,
     /// Dedicated cleanup CPU drawn from slots, separate from health controls.
     /// Zero retains the legacy shared-control policy until callers opt in.
     cleanup_slots: usize = 0,
+    /// Reserve bounded_read_slots ordinary CPUs and one quarter of ordinary
+    /// registry count/bytes for verified bounded reads.
+    read_isolation: ?bool = null,
+    /// Total bounded CPU reserve inside slots. One slot is a nonborrowable
+    /// floor; only excess capacity may lend one CPU to a verified stage.
+    bounded_read_slots: usize = 1,
     weights: [4]u16 = .{ 4, 2, 1, 1 },
     max_operations: usize = 128,
     max_bytes: u64 = 8 << 20,
@@ -46,21 +124,104 @@ pub const Config = struct {
     quantum_ms: u32 = 2,
     checkpoint_budget: u32 = 64,
 
+    /// Resolve once before publication. Protected lanes remain inside the
+    /// declared slot ceiling, with a minimum ordinary lane even below that CPU
+    /// count. Slots bound runnable ownership, not guaranteed dedicated cores.
+    /// Metadata receives at most 1/32 of the visible memory envelope, subject to
+    /// the configured ceiling. This is not a cap on storage/model/process heap.
+    pub fn resolveCapacity(self: Config, cpu: @import("antfly_platform").process_memory.CpuCapacity, memory: @import("antfly_platform").process_memory.Envelope) !Config {
+        try self.validate();
+        if (self.capacity_mode == .fixed) return self;
+        var resolved = self;
+        resolved.capacity_mode = .fixed;
+        resolved.cleanup_slots = 1;
+        const minimum = self.control_slots + 2;
+        if (minimum > self.slots) return error.InvalidRunnablePolicy;
+        resolved.slots = @max(minimum, @min(self.slots, cpu.parallelism()));
+        resolved.read_isolation = self.read_isolation orelse (resolved.ordinarySlots() > self.bounded_read_slots and self.max_operations >= 8);
+        if (memory.limit_bytes != 0) resolved.max_bytes = @min(self.max_bytes, memory.limit_bytes / 32);
+        // Large nodes can hold the complete protocol baseline without taking
+        // foreground headroom. Smaller envelopes retain half for ordinary work;
+        // never shrink below the generic protected-control minimum (or a
+        // stricter caller-selected smaller ceiling).
+        resolved.control_bytes = @min(self.control_bytes, resolved.max_bytes / 2);
+        if (resolved.control_bytes < @min(self.control_bytes, @as(u64, 64 << 10))) return error.InvalidRunnablePolicy;
+        try resolved.validateManagedCleanupCapacity();
+        return resolved;
+    }
+
+    /// Honor a stricter configured process budget before publishing one
+    /// effective policy to API/storage consumers. A fixed policy never probes.
+    pub fn resolveForStartup(self: Config, process_limit_bytes: u64) !Config {
+        if (self.capacity_mode == .fixed) {
+            try self.validate();
+            return self;
+        }
+        return self.resolveCapacity(@import("antfly_platform").process_memory.cpuCapacity(), startupMemoryEnvelope(process_limit_bytes));
+    }
+
+    pub fn startupMemoryEnvelope(process_limit_bytes: u64) @import("antfly_platform").process_memory.Envelope {
+        var memory = @import("antfly_platform").process_memory.systemEnvelope();
+        if (process_limit_bytes != 0) memory.limit_bytes = if (memory.limit_bytes == 0)
+            process_limit_bytes
+        else
+            @min(memory.limit_bytes, process_limit_bytes);
+        return memory;
+    }
+
     pub fn ordinarySlots(self: Config) usize {
         return self.slots - self.control_slots - self.cleanup_slots;
+    }
+
+    pub fn readIsolation(self: Config) bool {
+        return self.read_isolation orelse false;
+    }
+
+    pub fn generalSlots(self: Config) usize {
+        return self.ordinarySlots() - self.boundedReadSlots();
+    }
+
+    pub fn boundedReadSlots(self: Config) usize {
+        return if (self.readIsolation()) self.bounded_read_slots else 0;
+    }
+
+    pub fn boundedReadFloorSlots(self: Config) usize {
+        return @intFromBool(self.readIsolation());
+    }
+
+    pub fn cpuBorrowSlots(self: Config) usize {
+        // Keep at most one borrower until broader lending is qualified.
+        return @min(@as(usize, 1), self.boundedReadSlots() - self.boundedReadFloorSlots());
+    }
+
+    pub fn boundedReadMetadataBytes(self: Config) u64 {
+        return if (self.readIsolation()) (self.max_bytes - self.control_bytes) / 4 else 0;
+    }
+
+    pub fn generalMetadataBytes(self: Config) u64 {
+        return self.max_bytes - self.control_bytes - self.boundedReadMetadataBytes();
     }
 
     /// Managed startup needs independent ordinary, health and cleanup capacity.
     /// Keep generic scheduler validation separate for standalone consumers.
     pub noinline fn validateManagedCleanupCapacity(self: Config) !void {
         try self.validate();
-        if (self.max_operations < 4 or (self.cleanup_slots == 0 and self.ordinarySlots() < 2))
+        if (self.max_operations < 4 or (self.cleanup_slots == 0 and self.ordinarySlots() < (if (self.readIsolation()) self.bounded_read_slots + 2 else 2)))
             return error.ManagerCleanupCapacityUnavailable;
+    }
+
+    /// Protect sparse arrivals as well as a rapid bypass stream. Derive an
+    /// internal bound from the existing wait policy, without another clock or
+    /// admission deadline: at most 25 ms and at most one quarter of queue wait.
+    pub fn backfillAgeNs(self: Config) u64 {
+        return @min(25 * std.time.ns_per_ms, @as(u64, self.max_wait_ms) * std.time.ns_per_ms / 4);
     }
 
     pub fn validate(self: Config) !void {
         if (self.slots < 2 or self.slots > 65535 or self.control_slots == 0 or self.control_slots >= self.slots or
             self.cleanup_slots > 1 or self.cleanup_slots >= self.slots - self.control_slots or
+            self.bounded_read_slots == 0 or self.bounded_read_slots > 65533 or
+            (self.readIsolation() and (self.ordinarySlots() <= self.bounded_read_slots or self.max_operations < 8 or self.max_bytes -| self.control_bytes < 4)) or
             self.max_operations < 2 or self.max_bytes == 0 or self.control_bytes == 0 or self.control_bytes >= self.max_bytes or self.max_wait_ms == 0 or self.max_wait_ms > 60000 or
             self.quantum_ms == 0 or self.quantum_ms > 100 or self.checkpoint_budget == 0 or self.checkpoint_budget > 1048576)
             return error.InvalidRunnablePolicy;
@@ -75,7 +236,24 @@ pub const Entry = struct {
     parent: ?*Entry = null,
     children: usize = 0,
     class: Class,
+    read_lane: ReadLane = .general,
+    read_transition_budget: ?ReadTransitionBudget = null,
+    read_resource_transfer: ?ReadResourceTransfer = null,
+    read_transition_active: bool = false,
+    read_transition_target: ReadLane = .general,
+    read_transition_started_ns: u64 = 0,
+    measured_read_work_ns: u64 = 0,
+    service_debt: usize = 0,
+    bounded_service_paid: u64 = 0,
+    /// One acknowledged CPU lease, sampled only by its stable owning caller.
+    service_started_ns: ?u64 = null,
+    service_observed_ns: u64 = 0,
+    service_estimate_ns: u64 = 0,
+    service_class: ?usize = null,
+    service_clock_valid: bool = true,
     slots: usize = 1,
+    cpu_borrow_budget: ?CpuBorrowBudget = null,
+    borrowed_read_cpu: bool = false,
     bytes: u64 = 0,
     state: State = .fresh,
     ready: std.Io.Event = .unset,
@@ -86,7 +264,14 @@ pub const Entry = struct {
     all_next: ?*Entry = null,
     all_previous: ?*Entry = null,
     sequence: u64 = 0,
+    /// Running, parked, and cleanup owners use continuation queues on reentry.
+    continuation: bool = false,
+    pending_resources: ?GrantResources = null,
+    resource_probe_epoch: u64 = 0,
+    resource_probe: GrantResources.Probe = .unknown,
+
     bypasses: u16 = 0,
+    age_protected: bool = false,
     queued_since_ns: u64 = 0,
     waited: bool = false,
     reserved_control: bool = false,
@@ -111,17 +296,130 @@ const Queue = struct { head: ?*Entry = null, tail: ?*Entry = null };
 pub const Scheduler = struct {
     config: Config,
     mutex: std.atomic.Mutex = .unlocked,
-    queues: [6]Queue = @splat(.{}),
+    queues: [8]Queue = @splat(.{}),
+    continuation_queues: [8]Queue = @splat(.{}),
     entries: ?*Entry = null,
-    used: [6]usize = @splat(0),
-    credits: [4]usize = @splat(0),
+    used: [8]usize = @splat(0),
+    credits: [6]usize = @splat(0),
     cursor: usize = 0,
     round_open: bool = false,
+    progress_cursor: usize = 0,
+    progress_round_open: bool = false,
+    /// Signed slot-time correction retained across roots, parks and class
+    /// changes. Positive remainder is rebate; negative remainder is owed work.
+    work_adjustment_ns: [6]i128 = @splat(0),
+    work_service: ServiceStats = .{},
     sequence: u64 = 0,
     closed: bool = false,
+    dispatch_epoch: u64 = 0,
+    resource_barrier: ?*Entry = null,
+
     metrics: Stats = .{},
+    control_baseline_bytes: u64 = 0,
+    cpu_borrower: ?*Entry = null,
+    cpu_borrow_grants: u64 = 0,
+    cpu_borrow_returns: u64 = 0,
+
+    pub const ServiceStats = struct {
+        estimated_slot_ns: [6]u64 = @splat(0),
+        observed_slot_ns: [6]u64 = @splat(0),
+        unobserved_estimate_ns: [6]u64 = @splat(0),
+        refunded_slot_ns: [6]u64 = @splat(0),
+        debt_paid_slot_ns: [6]u64 = @splat(0),
+        clipped_adjustments: [6]u64 = @splat(0),
+        adjustment_slot_ns: [6]i128 = @splat(0),
+    };
+    pub fn serviceStats(self: *Scheduler) ServiceStats {
+        self.lock();
+        defer self.mutex.unlock();
+        var result = self.work_service;
+        result.adjustment_slot_ns = self.work_adjustment_ns;
+        return result;
+    }
+    fn serviceQuantumNs(self: *const Scheduler) u64 {
+        return @as(u64, self.config.quantum_ms) * std.time.ns_per_ms;
+    }
+    /// A successfully returned wait acknowledges real execution. Queue time,
+    /// wake latency and blocked time have no active sample. Host clocks stay
+    /// outside accounting locks; a zero/backwards observation uses the estimate.
+    pub fn beginService(self: *Scheduler, e: *Entry) !void {
+        const now = e.options.now();
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.state != .running) return e.failure orelse error.InvalidRunnableTransition;
+        if (e.service_class != null and e.service_started_ns == null) e.service_started_ns = now;
+    }
+    fn sampleServiceLocked(self: *Scheduler, e: *Entry, now: u64) void {
+        _ = self;
+        const start = e.service_started_ns orelse return;
+        if (now < start) e.service_clock_valid = false;
+        e.service_observed_ns +|= (now -| start) *| @as(u64, @intCast(e.slots));
+        e.service_started_ns = now;
+    }
+    fn settleServiceLocked(self: *Scheduler, e: *Entry, now: u64) void {
+        const c = e.service_class orelse return;
+        self.sampleServiceLocked(e, now);
+        const estimate = e.service_estimate_ns;
+        const observed = e.service_observed_ns;
+        if (e.service_started_ns == null or !e.service_clock_valid or observed == 0) {
+            self.work_service.unobserved_estimate_ns[c] +|= estimate;
+        } else {
+            self.work_service.observed_slot_ns[c] +|= observed;
+            const correction = @as(i128, estimate) - @as(i128, observed);
+            const limit = @as(i128, 64) * self.serviceQuantumNs();
+            const next = self.work_adjustment_ns[c] + correction;
+            self.work_adjustment_ns[c] = std.math.clamp(next, -limit, limit);
+            if (next != self.work_adjustment_ns[c]) self.work_service.clipped_adjustments[c] +|= 1;
+            // Return unused estimated work in this same open deficit round.
+            // Fractional slot-time remains exact across many short requests.
+            if (self.work_adjustment_ns[c] >= self.serviceQuantumNs()) {
+                const units: usize = @intCast(@divTrunc(self.work_adjustment_ns[c], self.serviceQuantumNs()));
+                const room = self.config.slots + self.weight(c) -| self.credits[c];
+                const refund = @min(units, room);
+                self.credits[c] += refund;
+                self.work_service.refunded_slot_ns[c] +|= @as(u64, @intCast(refund)) * self.serviceQuantumNs();
+                self.work_adjustment_ns[c] -= @as(i128, @intCast(units)) * self.serviceQuantumNs();
+                if (refund != units) self.work_service.clipped_adjustments[c] +|= 1;
+            }
+        }
+        e.service_started_ns = null;
+        e.service_class = null;
+        e.service_estimate_ns = 0;
+        e.service_observed_ns = 0;
+    }
+    /// Completion/cleanup already owns mandatory progress. Preserve its prior
+    /// scheduling behavior while any such receiver is in this bounded window.
+    fn classHasRetainedProgress(self: *Scheduler, c: usize) bool {
+        var candidates = self.classCandidates(ordinary_queues[c]);
+        while (candidates.take()) |e| if (e.retainedPhase()) return true;
+        return false;
+    }
+    fn payWorkDebt(self: *Scheduler, c: usize, floor: usize) void {
+        if (self.work_adjustment_ns[c] >= 0 or self.classHasRetainedProgress(c)) return;
+        const quantum = self.serviceQuantumNs();
+        const owed: u64 = @intCast(-self.work_adjustment_ns[c]);
+        const units = owed / quantum + @intFromBool(owed % quantum != 0);
+        const paid = @min(units, self.credits[c] -| floor);
+        self.credits[c] -= @intCast(paid);
+        self.work_adjustment_ns[c] += @as(i128, paid) * quantum;
+        self.work_service.debt_paid_slot_ns[c] +|= @min(owed, paid * quantum);
+    }
 
     pub const Stats = struct {
+        cpu_borrowed_slots: usize = 0,
+        cpu_borrow_grants: u64 = 0,
+        cpu_borrow_returns: u64 = 0,
+        read_transition_reserved_operations: usize = 0,
+        read_transition_reserved_bytes: u64 = 0,
+        read_transition_operations: usize = 0,
+        read_transition_bytes: u64 = 0,
+        read_demotions: u64 = 0,
+        read_transition_expired: u64 = 0,
+        read_service_debt_paid: u64 = 0,
+        bounded_read_operations: usize = 0,
+        bounded_read_bytes: u64 = 0,
+        bounded_read_slots: usize = 0,
+        read_lane_grants: [3]u64 = @splat(0),
         operations: usize = 0,
         child_operations: usize = 0,
         retained_bytes: u64 = 0,
@@ -144,7 +442,44 @@ pub const Scheduler = struct {
 
     pub fn init(config: Config) !Scheduler {
         try config.validate();
-        return .{ .config = config };
+        const resolved = if (config.capacity_mode == .automatic)
+            try config.resolveForStartup(0)
+        else
+            config;
+        return .{ .config = resolved };
+    }
+
+    /// Move-only persistent node metadata reservation. It owns bytes through
+    /// physical destruction, including idle periods, but no operation or CPU.
+    pub const ControlBaseline = struct {
+        scheduler: ?*Scheduler,
+        bytes: u64,
+        pub fn release(self: *ControlBaseline) void {
+            const scheduler = self.scheduler orelse return;
+            self.scheduler = null;
+            scheduler.lock();
+            defer scheduler.mutex.unlock();
+            std.debug.assert(scheduler.control_baseline_bytes >= self.bytes);
+            scheduler.control_baseline_bytes -= self.bytes;
+            scheduler.metrics.control_retained_bytes -= self.bytes;
+            scheduler.metrics.retained_bytes -= self.bytes;
+            scheduler.dispatch();
+        }
+    };
+    pub fn reserveControlBaseline(self: *Scheduler, bytes: u64) !ControlBaseline {
+        if (bytes == 0) return error.InvalidArgument;
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return error.SchedulerClosed;
+        // Fixed node consumers collectively use at most one quarter. Existing
+        // protected cleanup may use half, leaving a quarter for health/control.
+        // Include each consumer's maximum scratch in its persistent reservation.
+        if (bytes > self.config.control_bytes / 4 -| self.control_baseline_bytes or
+            bytes > self.config.control_bytes -| self.metrics.control_retained_bytes) return error.SchedulerFull;
+        self.control_baseline_bytes += bytes;
+        self.metrics.control_retained_bytes += bytes;
+        self.metrics.retained_bytes += bytes;
+        return .{ .scheduler = self, .bytes = bytes };
     }
 
     /// Establish the managed server's dedicated cleanup reserve before any
@@ -163,18 +498,147 @@ pub const Scheduler = struct {
     fn lock(self: *Scheduler) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
+    fn boundedRead(self: *const Scheduler, e: *const Entry) bool {
+        return self.config.readIsolation() and e.class == .query and e.read_lane == .bounded and !e.read_transition_active;
+    }
     fn cpuIndex(self: *const Scheduler, e: *const Entry) usize {
-        return if ((e.protected_cleanup_root or e.cleanup_active) and self.config.cleanup_slots != 0) 5 else @backingInt(e.class);
+        if ((e.protected_cleanup_root or e.cleanup_active) and self.config.cleanup_slots != 0) return 5;
+        if (self.config.readIsolation() and e.class == .query) return switch (e.read_lane) {
+            .general => 0,
+            .bounded => 6,
+            .analytical => 7,
+        };
+        return @backingInt(e.class);
     }
     fn capacityFor(self: *const Scheduler, e: *const Entry, class: Class) usize {
         if ((e.protected_cleanup_root or e.cleanup_active) and self.config.cleanup_slots != 0) return self.config.cleanup_slots;
-        return if (class == .control) self.config.control_slots else self.config.ordinarySlots();
+        if (class == .control) return self.config.control_slots;
+        if (!self.config.readIsolation()) return self.config.ordinarySlots();
+        return if (class == .query and e.read_lane == .bounded) self.config.boundedReadSlots() else self.config.generalSlots();
+    }
+    fn generalUsed(self: *const Scheduler) usize {
+        return self.ordinaryUsed() - self.used[6] - @intFromBool(self.cpu_borrower != null);
+    }
+    fn canBorrowCpu(self: *const Scheduler, e: *const Entry) bool {
+        return self.config.cpuBorrowSlots() != 0 and e.cpu_borrow_budget != null and
+            !self.boundedRead(e) and e.class != .control and !e.retainedPhase() and
+            e.slots == 1 and e.children == 0 and e.parent == null and
+            self.cpu_borrower == null and self.used[6] < self.config.boundedReadSlots() and self.queueHead(6) == null;
+    }
+    fn fitsCpu(self: *const Scheduler, e: *const Entry, free: usize) bool {
+        if (e.slots > free) return false;
+        if (!self.config.readIsolation()) return true;
+        const lane_used = if (self.boundedRead(e)) self.used[6] else self.generalUsed();
+        return e.slots <= self.capacityFor(e, e.class) -| lane_used or self.canBorrowCpu(e);
+    }
+    fn validateCpuBorrow(self: *const Scheduler, e: *const Entry, budget: CpuBorrowBudget) !void {
+        if (budget.max_non_yield_ns == 0 or budget.max_non_yield_ns > @as(u64, self.config.quantum_ms) * std.time.ns_per_ms or
+            e.slots != 1 or e.parent != null or e.children != 0 or e.class == .control or
+            e.read_lane == .bounded or e.read_transition_active or e.retainedPhase() or e.completion_options != null)
+            return error.InvalidRunnableTransition;
+    }
+    pub fn enableCpuBorrow(self: *Scheduler, e: *Entry, budget: CpuBorrowBudget) !void {
+        try self.checkAuthority(e);
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.state != .running) return error.InvalidRunnableTransition;
+        try self.validateCpuBorrow(e, budget);
+        e.cpu_borrow_budget = budget;
+        // A validated stage already owns this live grant. Move it onto elastic
+        // capacity before waking queued ordinary work, without a suspend/resume
+        // or an authority/quantum refresh. Never lend the bounded hard floor.
+        if (self.canBorrowCpu(e) and self.generalUsed() == self.config.generalSlots()) {
+            const waiting = for (ordinary_queues) |index| {
+                if (index != 6 and self.queueHead(index) != null) break true;
+            } else false;
+            if (waiting) {
+                self.startCpuLoan(e);
+                self.dispatchWithLoan(true);
+            }
+        }
+    }
+    /// Disable before an unqualified phase; waitRetained must precede new work.
+    pub fn disableCpuBorrow(self: *Scheduler, e: *Entry) !void {
+        const now = e.options.now();
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.state != .running) return error.InvalidRunnableTransition;
+        e.cpu_borrow_budget = null;
+        if (!e.borrowed_read_cpu) return;
+        self.releaseCpu(e, now);
+        e.bypasses = 0;
+        self.sequence +|= 1;
+        e.sequence = self.sequence;
+        self.enqueue(e, now);
+        self.dispatch();
+        e.waited = e.state == .queued;
+    }
+    pub const CpuBorrowStats = struct { active: usize, grants: u64, returns: u64 };
+    pub fn cpuBorrowStats(self: *Scheduler) CpuBorrowStats {
+        self.lock();
+        defer self.mutex.unlock();
+        return .{ .active = @intFromBool(self.cpu_borrower != null), .grants = self.cpu_borrow_grants, .returns = self.cpu_borrow_returns };
+    }
+    fn borrowingCpu(self: *Scheduler, e: *const Entry) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return e.scheduler == self and e.borrowed_read_cpu;
+    }
+    fn returnBorrowRequested(self: *Scheduler, e: *const Entry) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        return e.scheduler == self and e.borrowed_read_cpu and self.queueHead(6) != null;
+    }
+    fn returnCpuLoan(self: *Scheduler, e: *Entry) void {
+        if (!e.borrowed_read_cpu) return;
+        std.debug.assert(self.cpu_borrower == e);
+        self.cpu_borrower = null;
+        e.borrowed_read_cpu = false;
+        self.cpu_borrow_returns +|= 1;
+    }
+    fn releaseCpu(self: *Scheduler, e: *Entry, now: u64) void {
+        self.settleServiceLocked(e, now);
+        self.used[self.cpuIndex(e)] -= e.slots;
+        self.returnCpuLoan(e);
+    }
+    fn weight(self: *const Scheduler, index: usize) usize {
+        const q = ordinary_queues[index];
+        if (!self.config.readIsolation()) return self.config.weights[@min(q, 3)];
+        const query_shares: usize = @intFromBool(self.queueHead(0) != null) +
+            @as(usize, 2) * @intFromBool(self.queueHead(6) != null) +
+            @intFromBool(self.queueHead(7) != null);
+        // Scale every ordinary class by the same denominator, preserving the
+        // configured query share when one or more read lanes are idle.
+        if (q >= 1 and q <= 3) return @as(usize, self.config.weights[q]) * @max(@as(usize, 1), query_shares);
+        return @as(usize, self.config.weights[0]) * (if (q == 6) @as(usize, 2) else 1);
+    }
+    fn boundedCountLimit(self: *const Scheduler) usize {
+        return (self.config.max_operations - @min(@as(usize, 4), self.config.max_operations / 2)) / 4;
+    }
+    fn boundedByteLimit(self: *const Scheduler) u64 {
+        return self.config.boundedReadMetadataBytes();
     }
 
+    fn queueFor(self: *Scheduler, e: *const Entry) *Queue {
+        const index = self.cpuIndex(e);
+        return if (e.continuation) &self.continuation_queues[index] else &self.queues[index];
+    }
+    fn queueHead(self: *const Scheduler, index: usize) ?*Entry {
+        const fresh = self.queues[index].head orelse return self.continuation_queues[index].head;
+        const resumed = self.continuation_queues[index].head orelse return fresh;
+        return if (fresh.sequence <= resumed.sequence) fresh else resumed;
+    }
+    fn classCandidates(self: *const Scheduler, index: usize) ClassCandidates {
+        return .{
+            .fresh = .{ .current = self.queues[index].head },
+            .resumed = .{ .current = self.continuation_queues[index].head },
+        };
+    }
     fn enqueue(self: *Scheduler, e: *Entry, now: u64) void {
         e.queued_since_ns = now;
+        e.age_protected = false;
         e.waited = false;
-        const q = &self.queues[self.cpuIndex(e)];
+        const q = self.queueFor(e);
         e.previous = q.tail;
         e.next = null;
         if (q.tail) |tail| tail.next = e else q.head = e;
@@ -184,7 +648,8 @@ pub const Scheduler = struct {
         self.metrics.queued += 1;
     }
     fn unlink(self: *Scheduler, e: *Entry) void {
-        const q = &self.queues[self.cpuIndex(e)];
+        if (self.resource_barrier == e) self.resource_barrier = null;
+        const q = self.queueFor(e);
         if (e.previous) |p| p.next = e.next else q.head = e.next;
         if (e.next) |n| n.previous = e.previous else q.tail = e.previous;
         e.next = null;
@@ -192,68 +657,340 @@ pub const Scheduler = struct {
         self.metrics.queued -= 1;
     }
     fn ordinaryUsed(self: *const Scheduler) usize {
-        return self.used[0] + self.used[1] + self.used[2] + self.used[3];
+        return self.used[0] + self.used[1] + self.used[2] + self.used[3] + self.used[6] + self.used[7];
+    }
+    fn startCpuLoan(self: *Scheduler, e: *Entry) void {
+        std.debug.assert(self.canBorrowCpu(e));
+        self.cpu_borrower = e;
+        e.borrowed_read_cpu = true;
+        self.cpu_borrow_grants +|= 1;
+    }
+    fn convertCpuLoanToGeneral(self: *Scheduler) void {
+        if (self.cpu_borrower) |e| {
+            if (self.ordinaryUsed() - self.used[6] <= self.config.generalSlots()) self.returnCpuLoan(e);
+        }
     }
     fn grant(self: *Scheduler, e: *Entry) void {
+        std.debug.assert(e.pending_resources == null);
         self.unlink(e);
+        e.continuation = true;
         e.state = .running;
         const c = @backingInt(e.class);
+        if (self.config.readIsolation() and !self.boundedRead(e) and e.class != .control and !e.retainedPhase() and
+            e.slots > self.config.generalSlots() -| self.generalUsed())
+        {
+            self.startCpuLoan(e);
+        }
         self.used[self.cpuIndex(e)] += e.slots;
         self.metrics.grants[c] +|= 1;
+        e.service_started_ns = null;
+        e.service_observed_ns = 0;
+        e.service_clock_valid = true;
+        e.service_class = if (e.retainedPhase() or (self.boundedRead(e) and e.read_transition_budget != null)) null else self.barrierClass(e);
+        e.service_estimate_ns = @as(u64, @intCast(e.slots)) * self.serviceQuantumNs();
+        if (e.service_class) |index| self.work_service.estimated_slot_ns[index] +|= e.service_estimate_ns;
+        if (self.boundedRead(e)) e.bounded_service_paid +|= e.slots;
+        if (e.class == .query) self.metrics.read_lane_grants[@backingInt(e.read_lane)] +|= 1;
         e.ready.set(e.options.io);
     }
 
+    /// A paid general team keeps its deficit round open while its peers drain.
+    /// The isolated one-slot bounded partition can still make independent
+    /// progress; charge its ordinary deficit without moving that open cursor.
+    fn stopResourceGrant(self: *Scheduler, e: *Entry, cause: anyerror) void {
+        self.unlink(e);
+        e.state = .stopped;
+        e.failure = cause;
+        self.metrics.rejected +|= 1;
+        e.ready.set(e.options.io);
+    }
+    fn resourceProbe(self: *Scheduler, e: *Entry) GrantResources.Probe {
+        const resources = e.pending_resources orelse return .ready;
+        if (e.resource_probe_epoch != self.dispatch_epoch) {
+            e.resource_probe_epoch = self.dispatch_epoch;
+            e.resource_probe = std.enums.fromInt(GrantResources.Probe, resources.probe(resources.context)) orelse .mismatch;
+            switch (e.resource_probe) {
+                .too_large => self.stopResourceGrant(e, error.ResourceRequestTooLarge),
+                .unsupported => self.stopResourceGrant(e, error.ExecutionWaitUnsupported),
+                .mismatch => self.stopResourceGrant(e, error.ResourceAccountingMismatch),
+                else => {},
+            }
+        }
+        return e.resource_probe;
+    }
+    fn acquireGrantResources(self: *Scheduler, e: *Entry) bool {
+        const resources = e.pending_resources orelse return true;
+        const probe = self.resourceProbe(e);
+        if (probe != .ready and probe != .unknown) return false;
+        switch (std.enums.fromInt(GrantResources.Acquire, resources.acquire(resources.context)) orelse .mismatch) {
+            .acquired => {
+                e.pending_resources = null;
+                return true;
+            },
+            .wait => e.resource_probe = .wait,
+            .too_large => self.stopResourceGrant(e, error.ResourceRequestTooLarge),
+            .unsupported => self.stopResourceGrant(e, error.ExecutionWaitUnsupported),
+            .mismatch => self.stopResourceGrant(e, error.ResourceAccountingMismatch),
+        }
+        return false;
+    }
+    fn barrierClass(self: *const Scheduler, e: *const Entry) ?usize {
+        for (ordinary_queues, 0..) |index, c| if (self.cpuIndex(e) == index) return c;
+        return null;
+    }
+    fn rememberResourceBarrier(self: *Scheduler, e: *Entry) void {
+        if (e.state != .queued) return;
+        if (self.resource_barrier == null or e.sequence < self.resource_barrier.?.sequence)
+            self.resource_barrier = e;
+    }
+    fn earliestBarrier(self: *const Scheduler, prior: ?*Entry) ?*Entry {
+        const older = if (prior) |e| (if (e.state == .queued) e else null) else null;
+        const resource = self.resource_barrier orelse return older;
+        if (older == null or resource.sequence < older.?.sequence) return resource;
+        return older;
+    }
+    fn barrierAllows(self: *Scheduler, barrier: ?*Entry, e: *Entry) bool {
+        const older = barrier orelse return true;
+        if (older == e or (self.config.readIsolation() and self.boundedRead(older) != self.boundedRead(e))) return true;
+        // Already admitted owners retain progress while new starts drain.
+        // This also applies to a CPU-only barrier: a parked owner may hold
+        // resources needed by work occupying the remaining CPUs.
+        return e.continuation;
+    }
+    /// Attach only an incremental bundle prepared while this owner is parked.
+    /// Original operation, deadline, cancellation and metadata remain retained.
+    pub fn requestResources(self: *Scheduler, e: *Entry, resources: GrantResources) !void {
+        try self.checkAuthority(e);
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.class == .control or e.retainedPhase() or e.pending_resources != null or
+            (e.state != .resource_blocked and e.state != .output_blocked)) return error.InvalidRunnableTransition;
+        e.pending_resources = resources;
+        e.resource_probe_epoch = 0;
+    }
+    /// Only the synchronous waiter may detach its own participant after enter
+    /// has returned. A refused retained root can outlive the temporary stage.
+    fn detachResources(self: *Scheduler, e: *Entry, resources: GrantResources) void {
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(e.state != .queued);
+        if (e.pending_resources) |pending| {
+            std.debug.assert(pending.context == resources.context and pending.probe == resources.probe and pending.acquire == resources.acquire);
+            e.pending_resources = null;
+            e.resource_probe_epoch = 0;
+        }
+    }
+
+    /// The stable owning waiter observes its original clock outside the
+    /// scheduler lock. Host clock/cancellation callbacks may use other owners.
+    /// Dispatch consumes only this cached age flag; enqueue resets it once.
+    pub fn pollWait(self: *Scheduler, e: *Entry) !void {
+        self.checkAuthority(e) catch |err| {
+            self.failWait(e, err, true);
+            return err;
+        };
+        const now = e.options.now();
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.state != .queued) return;
+        e.age_protected = e.age_protected or now -| e.queued_since_ns >= self.config.backfillAgeNs();
+        self.dispatch();
+    }
+
+    /// Notify after physical resource retirement and after releasing every
+    /// resource-owner lock. Waiters also retry on their original bounded clock.
+    pub fn notifyResourceProgress(self: *Scheduler) void {
+        self.lock();
+        defer self.mutex.unlock();
+        self.dispatch();
+    }
+
+    fn drainCandidate(self: *Scheduler, free: usize, barrier: *Entry, head: ?*Entry, e: *Entry) bool {
+        if (e == barrier or !self.fitsCpu(e, free)) return false;
+        if (!e.continuation and (!self.config.readIsolation() or self.boundedRead(e) == self.boundedRead(barrier) or e != head)) return false;
+        const probe = self.resourceProbe(e);
+        return e.state == .queued and (probe == .ready or probe == .unknown);
+    }
+    fn hasDrainCandidate(self: *Scheduler, free: usize, barrier: *Entry) bool {
+        for (ordinary_queues) |index| {
+            const head = self.queueHead(index);
+            var candidates = self.classCandidates(index);
+            while (candidates.take()) |e| if (self.drainCandidate(free, barrier, head, e)) return true;
+        }
+        return false;
+    }
+
+    /// Preserve the paid team's DRR cursor while existing owners retire. This
+    /// pass shares the same bounded credit/debt ledger, never admits new work
+    /// into the draining partition, and never spends the team's reserved credit.
+    fn chooseDrainProgress(self: *Scheduler, free: usize, barrier: *Entry) ?*Entry {
+        const reserved_class = self.barrierClass(barrier);
+        const rounds = (self.config.slots + 65) * ordinary_queues.len;
+        for (0..rounds) |round| {
+            // Stop promptly when no retained owner can progress. Probe results
+            // are cached in this dispatch, including a failed acquire attempt.
+            if (round % ordinary_queues.len == 0 and !self.hasDrainCandidate(free, barrier)) return null;
+            const c = self.progress_cursor;
+            const head = self.queueHead(ordinary_queues[c]);
+            const floor: usize = if (reserved_class == c) barrier.slots else 0;
+            var candidates = self.classCandidates(ordinary_queues[c]);
+            while (candidates.take()) |e| {
+                if (!self.drainCandidate(free, barrier, head, e)) continue;
+                if (!self.progress_round_open) {
+                    self.credits[c] = @min(self.config.slots + self.weight(c), self.credits[c] +| self.weight(c));
+                    self.progress_round_open = true;
+                }
+                self.payWorkDebt(c, floor);
+                const available = self.credits[c] -| floor;
+                const paid = @min(e.service_debt, available);
+                e.service_debt -= paid;
+                self.credits[c] -= paid;
+                self.metrics.read_service_debt_paid +|= paid;
+                if (e.service_debt == 0 and e.slots <= self.credits[c] -| floor) {
+                    if (!self.acquireGrantResources(e)) break;
+                    self.credits[c] -= e.slots;
+                    return e;
+                }
+                break;
+            }
+            self.progress_cursor = (c + 1) % ordinary_queues.len;
+            self.progress_round_open = false;
+        }
+        return null;
+    }
+
     fn choose(self: *Scheduler, free: usize) ?*Entry {
-        // Once an older large head has been bypassed enough, let current work
-        // drain. New small arrivals cannot repeatedly steal its required slots.
+        // Count and original-clock age independently protect a blocked head.
+        // Only blocked heads age into a barrier; fitting work still follows DRR.
+        // Enqueue sequence orders competing barriers without comparing clocks.
         var barrier: ?*Entry = null;
-        for (self.queues[0..4]) |q| if (q.head) |head| {
-            if (head.bypasses >= self.config.max_backfills and
+        for (ordinary_queues) |index| if (self.queueHead(index)) |head| {
+            const age_blocked = head.age_protected and (!self.fitsCpu(head, free) or self.resourceProbe(head) == .wait);
+            if (head.state == .queued and (head.bypasses >= self.config.max_backfills or age_blocked) and
                 (barrier == null or head.sequence < barrier.?.sequence)) barrier = head;
         };
-        if (barrier) |e| return if (e.slots <= free) e else null;
-        const eligible = outer: for (self.queues[0..4]) |q| {
-            var next = q.head;
-            while (next) |e| : (next = e.next) {
-                if (e.slots <= free) break :outer true;
+        if (self.resource_barrier) |resource| {
+            if (barrier == null or resource.sequence < barrier.?.sequence) barrier = resource;
+        }
+        if (barrier) |e| {
+            _ = self.resourceProbe(e);
+            if (e.state != .queued) {
+                barrier = null;
+            } else {
+                const resource_class = self.barrierClass(e);
+                if (self.fitsCpu(e, free)) if (resource_class) |c| self.payWorkDebt(c, 0);
+                const can_pay = if (resource_class) |c| e.slots <= self.credits[c] else true;
+                if (can_pay and self.fitsCpu(e, free) and e.service_debt == 0 and self.acquireGrantResources(e)) {
+                    if (resource_class) |c| self.credits[c] -= e.slots;
+                    return e;
+                }
+                if (e.state != .queued) barrier = null else if (self.resourceProbe(e) == .ready and can_pay and !self.fitsCpu(e, free)) {
+                    return self.chooseDrainProgress(free, e);
+                } else self.rememberResourceBarrier(e);
+            }
+        }
+        const eligible = outer: for (ordinary_queues) |index| {
+            var candidates = self.classCandidates(index);
+            while (candidates.take()) |e| {
+                if (self.barrierAllows(barrier, e) and self.fitsCpu(e, free)) {
+                    const probe = self.resourceProbe(e);
+                    if (e.state == .queued and (probe == .ready or probe == .unknown)) break :outer true;
+                }
             }
         } else false;
         if (!eligible) return null;
         // Deficit round robin charges slot demand, rather than grant count.
         // Idle classes accumulate no credit. Bound rounds even for large jobs.
-        const rounds = self.config.slots * 4 + 4;
+        const rounds = (self.config.slots + 64) * ordinary_queues.len + ordinary_queues.len;
         for (0..rounds) |_| {
             const c = self.cursor;
-            const q = &self.queues[c];
+            const head = self.queueHead(ordinary_queues[c]);
             if (!self.round_open) {
-                self.credits[c] = @min(self.config.slots + @as(usize, self.config.weights[c]), self.credits[c] +| self.config.weights[c]);
+                self.credits[c] = @min(self.config.slots + self.weight(c), self.credits[c] +| self.weight(c));
                 self.round_open = true;
             }
-            var candidate = q.head;
-            while (candidate) |e| {
-                if (e.slots <= free) {
-                    if (e.slots <= self.credits[c]) {
+            var candidates = self.classCandidates(ordinary_queues[c]);
+            var fitting_candidate = false;
+            while (candidates.take()) |e| {
+                if (!self.barrierAllows(barrier, e)) continue;
+                if (self.fitsCpu(e, free)) {
+                    fitting_candidate = true;
+                    const probe = self.resourceProbe(e);
+                    if (e.state != .queued) continue;
+                    if (probe != .ready and probe != .unknown) {
+                        if (head == e and e.slots <= self.credits[c]) {
+                            self.rememberResourceBarrier(e);
+                            barrier = self.earliestBarrier(barrier);
+                        }
+                        continue;
+                    }
+                    self.payWorkDebt(c, 0);
+                    const paid = @min(e.service_debt, self.credits[c]);
+                    e.service_debt -= paid;
+                    self.credits[c] -= paid;
+                    self.metrics.read_service_debt_paid +|= paid;
+                    if (e.service_debt == 0 and e.slots <= self.credits[c]) {
+                        if (!self.acquireGrantResources(e)) {
+                            if (head == e) {
+                                self.rememberResourceBarrier(e);
+                                barrier = self.earliestBarrier(barrier);
+                            }
+                            continue;
+                        }
                         self.credits[c] -= e.slots;
                         return e;
                     }
                     break;
                 }
-                candidate = e.next;
             }
-            if (q.head == null) self.credits[c] = 0;
-            self.cursor = (c + 1) % 4;
+            // A backlogged class which has paid for its head must be able to
+            // assemble that team's CPU slots. Otherwise a stream of smaller
+            // jobs in other classes steals every fragmented free slot until
+            // the starvation backstop overrides weighted sharing. Retain a
+            // paid admission barrier across dispatches while existing work
+            // drains; retained continuations keep their own class credit.
+            if (!fitting_candidate) if (head) |team| {
+                if (team.state == .queued and team.slots <= self.credits[c]) {
+                    if (self.resourceProbe(team) != .ready) {
+                        self.rememberResourceBarrier(team);
+                        barrier = self.earliestBarrier(barrier);
+                    } else {
+                        // Preserve this earned round until the team fits. A
+                        // full one-slot isolated lane needs no assembly and
+                        // cannot stop borrowing from the other lane's excess.
+                        if (!self.config.readIsolation() or
+                            (!self.boundedRead(team) and team.slots > 1 and team.slots <= self.capacityFor(team, team.class)))
+                            return self.chooseDrainProgress(free, team);
+                    }
+                }
+            };
+            if (head == null) self.credits[c] = 0;
+            self.cursor = (c + 1) % ordinary_queues.len;
             self.round_open = false;
         }
         return null;
     }
     fn dispatch(self: *Scheduler) void {
+        self.dispatchWithLoan(false);
+    }
+    fn dispatchWithLoan(self: *Scheduler, transferring_live_grant: bool) void {
+        self.dispatch_epoch +%= 1;
+        if (self.dispatch_epoch == 0) {
+            // Wrap is practically unreachable, but cannot revive a stale probe.
+            var entry = self.entries;
+            while (entry) |e| : (entry = e.all_next) e.resource_probe_epoch = 0;
+            self.dispatch_epoch = 1;
+        }
+        // A just-transferred live loan first offers its former general capacity
+        // to queued work. Other dispatches may immediately convert a loan back.
+        if (!transferring_live_grant) self.convertCpuLoanToGeneral();
         // Close removes ordinary queued entries, but preauthorized active
         // completion/cleanup retains the same bounded queues and capacity partition.
-        while (self.queues[4].head) |e| {
+        while (self.queueHead(4)) |e| {
             if (e.slots > self.config.control_slots - self.used[4]) break;
             self.grant(e);
         }
-        while (self.queues[5].head) |e| {
+        while (self.queueHead(5)) |e| {
             if (e.slots > self.config.cleanup_slots - self.used[5]) break;
             self.grant(e);
         }
@@ -261,14 +998,18 @@ pub const Scheduler = struct {
         while (self.ordinaryUsed() < capacity) {
             const free = capacity - self.ordinaryUsed();
             const e = self.choose(free) orelse break;
-            for (self.queues[0..4]) |q| if (q.head) |head| {
-                if (head != e and head.slots > free) {
+            for (ordinary_queues) |index| if (self.queueHead(index)) |head| {
+                const probe = self.resourceProbe(head);
+                if (head.state == .queued and head != e and (head.slots > free or probe == .wait)) {
                     head.bypasses +|= 1;
                     self.metrics.backfills +|= 1;
                 }
             };
             self.grant(e);
         }
+        // A team barrier or current deficit may prevent the released general
+        // capacity being used. Keep no loan when ordinary capacity still fits.
+        if (transferring_live_grant) self.convertCpuLoanToGeneral();
     }
 
     pub fn submit(self: *Scheduler, e: *Entry) !void {
@@ -299,7 +1040,7 @@ pub const Scheduler = struct {
         const now = parent.options.now();
         self.lock();
         defer self.mutex.unlock();
-        if (parent == child or parent.scheduler != self or parent.state != .running or parent.cleanup_active or parent.protected_cleanup_root or
+        if (parent == child or parent.scheduler != self or parent.state != .running or parent.cleanup_active or parent.protected_cleanup_root or parent.cpu_borrow_budget != null or child.cpu_borrow_budget != null or
             child.state != .fresh or child.scheduler != null or child.parent != null or child.children != 0 or parent.slots != 1) return error.InvalidRunnableTransition;
         try self.checkAncestorsLocked(parent);
         if (child.bytes < @sizeOf(Entry)) return error.InvalidRunnableDemand;
@@ -309,7 +1050,9 @@ pub const Scheduler = struct {
         child.options.clock_io = parent.options.clock_io orelse parent.options.io;
         child.options.io = io;
         child.options.retained_bytes = child.bytes;
+        if (self.boundedRead(parent)) return error.InvalidRunnableTransition;
         child.class = parent.class;
+        child.read_lane = parent.read_lane;
         child.slots = 1;
         // Accepted completion is inherited, never reserved or extended by the
         // child. The parent and its original clock live through every join.
@@ -322,18 +1065,32 @@ pub const Scheduler = struct {
     }
 
     fn submitLocked(self: *Scheduler, e: *Entry, now: u64, completion_child: bool, initially_blocked: bool) !void {
-        if (e.state != .fresh or e.scheduler != null) return error.InvalidRunnableTransition;
+        if (e.state != .fresh or e.scheduler != null or e.continuation) return error.InvalidRunnableTransition;
+        if (e.class == .control and e.pending_resources != null) return error.InvalidRunnableTransition;
         const capacity = self.capacityFor(e, e.class);
-        // Only the validated child factory can extend an already accepted
-        // completion family after close. New roots remain fenced out.
-        if (self.closed and !completion_child) return error.SchedulerClosed;
+        if (e.cpu_borrow_budget) |budget| try self.validateCpuBorrow(e, budget);
+        if (e.borrowed_read_cpu) return error.InvalidRunnableTransition;
+        // Retained consumers may admit finite trusted cleanup after ordinary
+        // closure. Its independent reserve cannot become new request authority.
+        if (e.protected_cleanup_root and (e.class != .control or e.slots != 1 or e.options.allow_wait or
+            e.options.deadline_ns == null or e.options.deadline_ns.? > now +| (250 * std.time.ns_per_ms)))
+            return error.InvalidArgument;
+        if (self.closed and !completion_child and !e.protected_cleanup_root) return error.SchedulerClosed;
         if (e.slots == 0 or e.slots > capacity) return error.InvalidRunnableDemand;
         const control = e.class == .control;
         const control_count = @min(@as(usize, 4), self.config.max_operations / 2);
-        const count_limit = if (control) control_count else self.config.max_operations - control_count;
-        const count_used = if (control) self.metrics.control_operations else self.metrics.operations - self.metrics.control_operations;
-        const byte_limit = if (control) self.config.control_bytes else self.config.max_bytes - self.config.control_bytes;
-        const byte_used = if (control) self.metrics.control_retained_bytes else self.metrics.retained_bytes - self.metrics.control_retained_bytes;
+        const bounded = self.boundedRead(e);
+        const bounded_count = if (self.config.readIsolation()) self.boundedCountLimit() else 0;
+        const bounded_bytes = if (self.config.readIsolation()) self.boundedByteLimit() else 0;
+        const count_limit = if (control) control_count else if (bounded) bounded_count else self.config.max_operations - control_count - bounded_count;
+        const count_used = if (control) self.metrics.control_operations else if (bounded) self.metrics.bounded_read_operations else self.metrics.operations - self.metrics.control_operations - self.metrics.bounded_read_operations - self.metrics.read_transition_operations;
+        const byte_limit = if (control) self.config.control_bytes else if (bounded) bounded_bytes else self.config.max_bytes - self.config.control_bytes - bounded_bytes;
+        const byte_used = if (control) self.metrics.control_retained_bytes else if (bounded) self.metrics.bounded_read_bytes else self.metrics.retained_bytes - self.metrics.control_retained_bytes - self.metrics.bounded_read_bytes - self.metrics.read_transition_bytes;
+        if (e.read_transition_budget) |budget| {
+            if (!bounded or e.slots != 1 or budget.max_retained_bytes < e.bytes or
+                budget.max_wait_ms == 0 or budget.max_wait_ms > self.config.max_wait_ms or budget.estimated_work_ns == 0)
+                return error.InvalidRunnableDemand;
+        }
         if (e.protected_cleanup_root) {
             // Cleanup roots share the control partition, but cannot consume
             // its last operation or more than half its retained byte reserve.
@@ -345,9 +1102,22 @@ pub const Scheduler = struct {
                 return error.ResourceTemporarilyUnavailable;
             }
         }
-        if (count_used >= count_limit or e.bytes > byte_limit - byte_used) {
+        const transition_count: usize = if (e.read_transition_budget != null) 1 else 0;
+        const transition_bytes: u64 = if (e.read_transition_budget) |budget| budget.max_retained_bytes else 0;
+        const reserved_count = if (bounded) self.metrics.read_transition_reserved_operations else 0;
+        const reserved_bytes = if (bounded) self.metrics.read_transition_reserved_bytes else 0;
+        if (count_used + reserved_count + transition_count + 1 > count_limit or
+            e.bytes > byte_limit -| byte_used -| reserved_bytes or
+            transition_bytes > byte_limit -| byte_used -| reserved_bytes -| e.bytes)
+        {
             self.metrics.rejected +|= 1;
             return error.SchedulerFull;
+        }
+        self.metrics.read_transition_reserved_operations += transition_count;
+        self.metrics.read_transition_reserved_bytes += transition_bytes;
+        if (bounded) {
+            self.metrics.bounded_read_operations += 1;
+            self.metrics.bounded_read_bytes += e.bytes;
         }
         e.reserved_control = control;
         if (control) {
@@ -431,15 +1201,16 @@ pub const Scheduler = struct {
     }
     fn failWait(self: *Scheduler, e: *Entry, err: anyerror, comptime retain: bool) void {
         if (!retain) return self.finish(e);
+        const now = e.options.now();
         self.lock();
         defer self.mutex.unlock();
         if (e.scheduler != self) return;
         switch (e.state) {
             .queued => self.unlink(e),
-            .running => self.used[self.cpuIndex(e)] -= e.slots,
+            .running => self.releaseCpu(e, now),
             .resource_blocked => self.metrics.resource_blocked -= 1,
             .output_blocked => self.metrics.output_blocked -= 1,
-            .stopped => {},
+            .stopped => return,
             .fresh, .finished => unreachable,
         }
         e.state = .stopped;
@@ -450,8 +1221,15 @@ pub const Scheduler = struct {
     fn waitImpl(self: *Scheduler, e: *Entry, comptime retain: bool, restriction: ?AdmissionCheck) !void {
         self.lock();
         const owned = e.scheduler == self;
+        const terminal: ?anyerror = if (owned and e.state == .stopped) e.failure orelse error.InvalidRunnableTransition else null;
         self.mutex.unlock();
         if (!owned) return error.InvalidRunnableTransition;
+        // A retained refusal already fenced execution. Later clocks or caller
+        // restrictions cannot replace its cause or retire its owning resources.
+        if (terminal) |cause| {
+            if (!retain) self.finish(e);
+            return cause;
+        }
         const options = e.options;
         // Fail-fast initial consumers may run under a transport lock. Never
         // suspend that caller for CPU; unpublished rejection releases its
@@ -473,8 +1251,8 @@ pub const Scheduler = struct {
                 self.failWait(e, err, retain);
                 return err;
             };
-            self.checkAuthority(e) catch |err| {
-                self.failWait(e, err, retain);
+            self.pollWait(e) catch |err| {
+                if (!retain) self.finish(e);
                 return err;
             };
             self.lock();
@@ -499,6 +1277,7 @@ pub const Scheduler = struct {
                     self.failWait(e, err, retain);
                     return err;
                 };
+                try self.beginService(e);
                 return;
             }
             if (closed and !completing) {
@@ -531,7 +1310,7 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (e.scheduler != self or e.state != .running) return error.InvalidRunnableTransition;
-        self.used[self.cpuIndex(e)] -= e.slots;
+        self.releaseCpu(e, now);
         self.metrics.yields +|= 1;
         e.bypasses = 0;
         self.sequence +|= 1;
@@ -556,10 +1335,12 @@ pub const Scheduler = struct {
         if (e.scheduler != self or e.state != .running or e.children != 0) return error.InvalidRunnableTransition;
         const capacity = self.capacityFor(e, e.class);
         if (slots == 0 or slots > capacity) return error.InvalidRunnableDemand;
+        if (e.cpu_borrow_budget != null and slots != 1) return error.InvalidRunnableTransition;
         // Only a separately reserved/activated retained phase may resize
         // after close. Other live work keeps its existing grant until finish.
         if (self.closed and !e.retainedPhase()) return error.SchedulerClosed;
         if (slots <= e.slots) {
+            self.sampleServiceLocked(e, now);
             self.used[self.cpuIndex(e)] -= e.slots - slots;
             e.slots = slots;
             // Shrinking retains the current grant; no old queue deadline
@@ -568,7 +1349,7 @@ pub const Scheduler = struct {
             self.dispatch();
             return;
         }
-        self.used[self.cpuIndex(e)] -= e.slots;
+        self.releaseCpu(e, now);
         e.slots = slots;
         e.bypasses = 0;
         self.sequence +|= 1;
@@ -578,11 +1359,13 @@ pub const Scheduler = struct {
         e.waited = e.state == .queued;
     }
     pub fn block(self: *Scheduler, e: *Entry, reason: State) !void {
+        const now = e.options.now();
         self.lock();
         defer self.mutex.unlock();
         if (e.scheduler != self or e.state != .running or
             (reason != .resource_blocked and reason != .output_blocked)) return error.InvalidRunnableTransition;
-        self.used[self.cpuIndex(e)] -= e.slots;
+        self.releaseCpu(e, now);
+        e.cpu_borrow_budget = null;
         if (self.closed and !e.retainedPhase()) {
             e.state = .stopped;
             e.failure = error.SchedulerClosed;
@@ -608,7 +1391,11 @@ pub const Scheduler = struct {
         if (e.scheduler != self) return error.InvalidRunnableTransition;
         if (self.closed and !e.retainedPhase()) return error.SchedulerClosed;
         if (e.state != .resource_blocked and e.state != .output_blocked) return error.InvalidRunnableTransition;
+        if (e.read_transition_active and !e.cleanup_active) return error.InvalidRunnableTransition;
         if (e.state == .resource_blocked) self.metrics.resource_blocked -= 1 else self.metrics.output_blocked -= 1;
+        // Reserved children can already own external resources before their
+        // first CPU grant. Reentry is a continuation even without prior CPU.
+        e.continuation = true;
         e.bypasses = 0;
         self.sequence +|= 1;
         e.sequence = self.sequence;
@@ -624,12 +1411,197 @@ pub const Scheduler = struct {
         if (e.scheduler != self) return error.InvalidRunnableTransition;
         if (self.closed and !e.retainedPhase()) return error.SchedulerClosed;
         if (e.state != .resource_blocked and e.state != .output_blocked) return error.InvalidRunnableTransition;
+        if (e.read_transition_active and !e.cleanup_active) return error.InvalidRunnableTransition;
         if ((e.children != 0 or e.parent != null) and class != e.class) return error.InvalidRunnableTransition;
         // Retained completion/cleanup cannot promote its capacity partition.
         if (e.retainedPhase() and class != e.class) return error.InvalidRunnableTransition;
         const capacity = self.capacityFor(e, class);
         if (e.slots > capacity) return error.InvalidRunnableDemand;
+        if (self.boundedRead(e) and class != .query) return error.InvalidRunnableTransition;
         e.class = class;
+    }
+
+    /// General/analytical classification changes only at a parked boundary.
+    /// Bounded promotion/demotion needs its own verified transition owner.
+    pub fn reclassifyReadBlocked(self: *Scheduler, e: *Entry, lane: ReadLane) !void {
+        try self.checkAuthority(e);
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return error.SchedulerClosed;
+        if (e.scheduler != self or e.class != .query or e.parent != null or e.children != 0 or
+            e.retainedPhase() or lane == .bounded or e.read_lane == .bounded or
+            (e.state != .resource_blocked and e.state != .output_blocked)) return error.InvalidRunnableTransition;
+        e.read_lane = lane;
+    }
+
+    fn releaseReadTransitionCredit(self: *Scheduler, e: *Entry) void {
+        if (e.read_transition_budget) |budget| {
+            self.metrics.read_transition_reserved_operations -= 1;
+            self.metrics.read_transition_reserved_bytes -= budget.max_retained_bytes;
+            e.read_transition_budget = null;
+        }
+    }
+
+    pub fn attachReadResources(self: *Scheduler, e: *Entry, transfer: ReadResourceTransfer) !void {
+        try self.checkAuthority(e);
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.state != .running or !self.boundedRead(e) or e.read_transition_budget == null or
+            e.read_resource_transfer != null or e.children != 0 or e.parent != null or e.retainedPhase()) return error.InvalidRunnableTransition;
+        e.read_resource_transfer = transfer;
+    }
+
+    /// Trusted caller has reached a verified yield point and joined helpers.
+    /// Actual ownership moves once; reserved capacity is not another live copy.
+    pub fn beginReadDemotion(self: *Scheduler, e: *Entry, target: ReadLane) !void {
+        try self.checkAuthority(e);
+        const now = e.options.now();
+        self.lock();
+        defer self.mutex.unlock();
+        const budget = e.read_transition_budget orelse return error.InvalidRunnableTransition;
+        if (e.scheduler != self or e.state != .running or !self.boundedRead(e) or target == .bounded or
+            e.children != 0 or e.parent != null or e.retainedPhase() or e.cleanup_options == null or e.slots != 1)
+            return error.InvalidRunnableTransition;
+        if (e.read_resource_transfer) |transfer| if (!transfer.begin(transfer.context)) return error.ResourceTemporarilyUnavailable;
+        self.settleServiceLocked(e, now);
+        self.used[self.cpuIndex(e)] -= 1;
+        self.metrics.bounded_read_operations -= 1;
+        self.metrics.bounded_read_bytes -= e.bytes;
+        self.metrics.read_transition_operations += 1;
+        self.metrics.read_transition_bytes += e.bytes;
+        self.metrics.resource_blocked += 1;
+        self.metrics.read_demotions +|= 1;
+        e.read_transition_active = true;
+        e.read_transition_target = target;
+        e.read_transition_started_ns = now;
+        _ = budget;
+        const quantum = @as(u64, self.config.quantum_ms) * std.time.ns_per_ms;
+        const measured_service = e.measured_read_work_ns / quantum + @intFromBool(e.measured_read_work_ns % quantum != 0);
+        e.service_debt = @intCast(@min(@as(u64, 64), measured_service -| e.bounded_service_paid));
+        e.state = .resource_blocked;
+        self.sequence +|= 1;
+        e.sequence = self.sequence;
+        self.dispatch();
+    }
+
+    /// No runnable authority is granted here. The caller must reenter through
+    /// the original checked CPU queue after this atomic ownership transfer.
+    pub fn tryCompleteReadDemotion(self: *Scheduler, e: *Entry) !bool {
+        self.lock();
+        const terminal = if (e.scheduler == self and e.state == .stopped) e.failure else null;
+        self.mutex.unlock();
+        if (terminal) |cause| return cause;
+        self.checkAuthority(e) catch |err| {
+            self.failWait(e, err, true);
+            return err;
+        };
+        const now = e.options.now();
+        self.lock();
+        if (e.scheduler != self or !e.read_transition_active or e.state != .resource_blocked or e.retainedPhase()) {
+            self.mutex.unlock();
+            return error.InvalidRunnableTransition;
+        }
+        const budget = e.read_transition_budget.?;
+        if (now -| e.read_transition_started_ns >= @as(u64, budget.max_wait_ms) * std.time.ns_per_ms) {
+            self.metrics.read_transition_expired +|= 1;
+            self.mutex.unlock();
+            self.failWait(e, error.RunnableWaitTimeout, true);
+            return error.RunnableWaitTimeout;
+        }
+        var other = self.entries;
+        while (other) |older| : (other = older.all_next) {
+            if (older != e and older.read_transition_active and older.state == .resource_blocked and older.sequence < e.sequence) {
+                self.mutex.unlock();
+                return false;
+            }
+        }
+        const count_limit = self.config.max_operations - @min(@as(usize, 4), self.config.max_operations / 2) - self.boundedCountLimit();
+        const count_used = self.metrics.operations - self.metrics.control_operations - self.metrics.bounded_read_operations - self.metrics.read_transition_operations;
+        const bytes_used = self.metrics.retained_bytes - self.metrics.control_retained_bytes - self.metrics.bounded_read_bytes - self.metrics.read_transition_bytes;
+        if (count_used >= count_limit or e.bytes > self.config.generalMetadataBytes() - bytes_used) {
+            self.mutex.unlock();
+            return false;
+        }
+        if (e.read_resource_transfer) |transfer| if (!transfer.try_general(transfer.context)) {
+            self.mutex.unlock();
+            return false;
+        };
+        self.metrics.read_transition_operations -= 1;
+        self.metrics.read_transition_bytes -= e.bytes;
+        e.read_transition_active = false;
+        e.read_lane = e.read_transition_target;
+        self.releaseReadTransitionCredit(e);
+        self.mutex.unlock();
+        return true;
+    }
+
+    /// Adopt a larger immutable input footprint under the same foreground root.
+    /// Credits never shrink before owning finish. Original control/ordinary
+    /// metadata partition and all clock/cancellation authority remain unchanged.
+    pub fn growInputBytes(self: *Scheduler, e: *Entry, bytes: u64) !void {
+        try e.options.check();
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return error.SchedulerClosed;
+        if (e.scheduler != self or e.state != .running or e.parent != null or e.children != 0 or
+            e.retainedPhase() or e.completion_options != null or e.cleanup_options != null) return error.InvalidRunnableTransition;
+        if (e.cpu_borrow_budget != null and bytes != e.bytes) return error.InvalidRunnableTransition;
+        if (bytes < e.bytes) return error.InvalidRunnableDemand;
+        if (self.boundedRead(e) and bytes != e.bytes) return error.InvalidRunnableTransition;
+        const delta = bytes - e.bytes;
+        const limit = if (e.reserved_control) self.config.control_bytes else self.config.max_bytes - self.config.control_bytes - (if (self.config.readIsolation()) self.boundedByteLimit() else 0);
+        const used = if (e.reserved_control) self.metrics.control_retained_bytes else self.metrics.retained_bytes - self.metrics.control_retained_bytes - self.metrics.bounded_read_bytes - self.metrics.read_transition_bytes;
+        if (delta > limit - used) {
+            self.metrics.rejected +|= 1;
+            return error.SchedulerFull;
+        }
+        if (e.reserved_control) self.metrics.control_retained_bytes += delta;
+        self.metrics.retained_bytes += delta;
+        e.bytes = bytes;
+        e.options.retained_bytes = bytes;
+    }
+
+    /// Incremental, conservative charge for actual retained read obligations.
+    /// Unlike resizing untrusted input, this may follow preauthorized cleanup
+    /// reservation. It grants no CPU, changes no clock/class, and never waits.
+    /// A caller already owns the stable root through all physical dependents.
+    pub fn retainReadBytes(self: *Scheduler, e: *Entry, additional: u64) !void {
+        try self.checkAuthority(e);
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return error.SchedulerClosed;
+        if (e.scheduler != self or e.parent != null or e.class != .query or
+            e.retainedPhase() or e.completion_options != null or e.read_transition_active or
+            (e.state != .running and e.state != .resource_blocked and e.state != .output_blocked)) return error.InvalidRunnableTransition;
+        if (e.cpu_borrow_budget != null and additional != 0) return error.InvalidRunnableTransition;
+        const total = std.math.add(u64, e.bytes, additional) catch return error.InvalidRunnableDemand;
+        const bounded = self.boundedRead(e);
+        if (bounded) {
+            const budget = e.read_transition_budget orelse return error.InvalidRunnableTransition;
+            if (total > budget.max_retained_bytes) return error.InvalidRunnableDemand;
+        }
+        const limit = if (bounded) self.boundedByteLimit() else self.config.max_bytes - self.config.control_bytes - (if (self.config.readIsolation()) self.boundedByteLimit() else 0);
+        const used = if (bounded) self.metrics.bounded_read_bytes else self.metrics.retained_bytes - self.metrics.control_retained_bytes - self.metrics.bounded_read_bytes - self.metrics.read_transition_bytes;
+        if (additional > limit -| used) {
+            self.metrics.rejected +|= 1;
+            return error.SchedulerFull;
+        }
+        if (bounded) self.metrics.bounded_read_bytes += additional;
+        self.metrics.retained_bytes += additional;
+        e.bytes = total;
+        e.options.retained_bytes = total;
+        if (e.cleanup_options) |*cleanup| cleanup.retained_bytes = total;
+    }
+
+    /// Tighten a native-clock deadline before publishing children. Decoding a
+    /// body timeout after admission must never grant a fresh execution budget.
+    pub fn tightenDeadline(self: *Scheduler, e: *Entry, deadline_ns: u64) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return error.SchedulerClosed;
+        if (e.scheduler != self or e.state != .running or e.parent != null or e.children != 0 or
+            e.retainedPhase() or e.completion_options != null or e.cleanup_options != null) return error.InvalidRunnableTransition;
+        e.options.deadline_ns = @min(e.options.deadline_ns orelse deadline_ns, deadline_ns);
     }
 
     /// Reserve completion ownership while the original foreground execution
@@ -645,7 +1617,7 @@ pub const Scheduler = struct {
         defer self.mutex.unlock();
         if (e.scheduler != self or e.state != .running or
             (e.class != .write and e.class != .control) or
-            e.completion_options != null or e.retainedPhase() or e.parent != null) return error.InvalidRunnableTransition;
+            e.completion_options != null or e.cpu_borrow_budget != null or e.retainedPhase() or e.parent != null) return error.InvalidRunnableTransition;
         if (self.closed) return error.SchedulerClosed;
         if (completion.retained_bytes > e.bytes) return error.InvalidRunnableDemand;
         var options = completion;
@@ -697,6 +1669,7 @@ pub const Scheduler = struct {
     /// and must join or transfer physical ownership before owning finish.
     pub fn activateCleanup(self: *Scheduler, e: *Entry) !void {
         var cleanup = e.cleanup_options orelse return error.InvalidRunnableTransition;
+        const foreground_now = e.options.now();
         const now = cleanup.now();
         if (e.cleanup_duration_ns) |duration| {
             cleanup.deadline_ns = std.math.add(u64, now, duration) catch return error.InvalidArgument;
@@ -718,19 +1691,23 @@ pub const Scheduler = struct {
         // Foreground children are fenced above. Retire the old team grant before
         // changing its CPU partition; cleanup is serial and cannot publish new
         // foreground children. Operation/policy class and bytes remain retained.
-        if (running and isolated) self.used[self.cpuIndex(e)] -= e.slots;
+        const released_cpu = running and (isolated or e.borrowed_read_cpu);
+        if (released_cpu) self.releaseCpu(e, foreground_now) else if (running) self.settleServiceLocked(e, foreground_now);
+        e.cpu_borrow_budget = null;
         if (isolated) e.slots = 1;
         e.options = cleanup;
         e.cleanup_options = cleanup;
         e.cleanup_duration_ns = null;
         e.cleanup_active = true;
+        e.pending_resources = null;
         // Inactive write completion was never accepted. Its authorization
         // cannot survive a transfer into physical cleanup.
         e.completion_options = null;
         e.failure = null;
+        e.continuation = true;
         e.bypasses = 0;
         e.waited = false;
-        if (!running or isolated) {
+        if (!running or released_cpu) {
             self.sequence +|= 1;
             e.sequence = self.sequence;
             self.enqueue(e, now);
@@ -746,11 +1723,13 @@ pub const Scheduler = struct {
         try e.options.check();
         const completion = e.completion_options orelse return error.InvalidRunnableTransition;
         try completion.check();
+        const foreground_now = e.options.now();
         self.lock();
         defer self.mutex.unlock();
-        if (e.scheduler != self or e.state != .running or e.retainedPhase() or e.children != 0 or e.parent != null) return error.InvalidRunnableTransition;
+        if (e.scheduler != self or e.state != .running or e.retainedPhase() or e.cpu_borrow_budget != null or e.children != 0 or e.parent != null) return error.InvalidRunnableTransition;
         if (self.closed) return error.SchedulerClosed;
         const options = e.completion_options orelse return error.InvalidRunnableTransition;
+        self.settleServiceLocked(e, foreground_now);
         e.options = options;
         e.completion_active = true;
         // No queue time from the foreground phase governs this retained grant.
@@ -758,13 +1737,17 @@ pub const Scheduler = struct {
     }
 
     pub fn finish(self: *Scheduler, e: *Entry) void {
+        // The owner retains clock receivers through this call; an idempotent
+        // repeated finish must never call an already retired receiver.
+        if (e.scheduler == null) return;
+        const now = e.options.now();
         self.lock();
         defer self.mutex.unlock();
         if (e.scheduler == null) return;
         std.debug.assert(e.scheduler == self and e.children == 0);
         switch (e.state) {
             .queued => self.unlink(e),
-            .running => self.used[self.cpuIndex(e)] -= e.slots,
+            .running => self.releaseCpu(e, now),
             .resource_blocked => self.metrics.resource_blocked -= 1,
             .output_blocked => self.metrics.output_blocked -= 1,
             else => {},
@@ -773,6 +1756,16 @@ pub const Scheduler = struct {
         if (e.all_next) |n| n.all_previous = e.all_previous;
         e.all_next = null;
         e.all_previous = null;
+        if (e.read_transition_active) {
+            self.metrics.read_transition_operations -= 1;
+            self.metrics.read_transition_bytes -= e.bytes;
+        } else if (self.boundedRead(e)) {
+            self.metrics.bounded_read_operations -= 1;
+            self.metrics.bounded_read_bytes -= e.bytes;
+        }
+        e.read_transition_active = false;
+        self.releaseReadTransitionCredit(e);
+        e.read_resource_transfer = null;
         self.metrics.operations -= 1;
         self.metrics.retained_bytes -= e.bytes;
         if (e.parent) |parent| {
@@ -791,7 +1784,10 @@ pub const Scheduler = struct {
             e.protected_cleanup_root = false;
         }
         e.state = .finished;
+        e.cpu_borrow_budget = null;
+        std.debug.assert(!e.borrowed_read_cpu);
         e.scheduler = null;
+        e.pending_resources = null;
         e.completion_options = null;
         e.completion_active = false;
         e.cleanup_options = null;
@@ -824,16 +1820,22 @@ pub const Scheduler = struct {
         defer self.mutex.unlock();
         return self.statsLocked();
     }
-    pub fn policyAndStats(self: *Scheduler) struct { config: Config, stats: Stats } {
+    pub fn policyAndStats(self: *Scheduler) struct { config: Config, stats: Stats, service: ServiceStats } {
         self.lock();
         defer self.mutex.unlock();
-        return .{ .config = self.config, .stats = self.statsLocked() };
+        var service = self.work_service;
+        service.adjustment_slot_ns = self.work_adjustment_ns;
+        return .{ .config = self.config, .stats = self.statsLocked(), .service = service };
     }
     fn statsLocked(self: *const Scheduler) Stats {
         var result = self.metrics;
         result.runnable_slots = self.ordinaryUsed() + self.used[4] + self.used[5];
         result.control_slots = self.used[4] + self.used[5];
         result.cleanup_runnable_slots = self.used[5];
+        result.bounded_read_slots = self.used[6];
+        result.cpu_borrowed_slots = @intFromBool(self.cpu_borrower != null);
+        result.cpu_borrow_grants = self.cpu_borrow_grants;
+        result.cpu_borrow_returns = self.cpu_borrow_returns;
         return result;
     }
 };
@@ -855,6 +1857,14 @@ pub const NodeOwner = struct {
         if (self.closed) return error.SchedulerClosed;
         self.borrowers += 1;
     }
+    /// A consumer retained before closure may still retire its own physical
+    /// resources. A fresh unpinned consumer cannot resurrect a closed owner.
+    pub fn retainCleanup(self: *NodeOwner) !void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.closed and self.borrowers == 0) return error.SchedulerClosed;
+        self.borrowers += 1;
+    }
     pub fn release(self: *NodeOwner) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
@@ -872,7 +1882,8 @@ pub const NodeOwner = struct {
     }
     pub fn tryDeinit(self: *NodeOwner) !void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        if (self.borrowers != 0 or self.scheduler.stats().operations != 0) {
+        const retained = self.scheduler.stats();
+        if (self.borrowers != 0 or retained.operations != 0 or retained.retained_bytes != 0) {
             self.mutex.unlock();
             return error.InvalidRunnableTransition;
         }
@@ -894,6 +1905,7 @@ pub const Execution = struct {
     borrowed: ?Borrow = null,
     child_pending: bool = false,
     quantum_start_ns: u64 = 0,
+    read_sample_ns: u64 = 0,
     checkpoints: u32 = 0,
     /// Changes only after a successful grant. Readers use it to invalidate
     /// authority checks across cooperative yields and resource/output waits.
@@ -903,6 +1915,8 @@ pub const Execution = struct {
         ptr: *anyopaque,
         class: Class,
         current_class: ?*const fn (*anyopaque) anyerror!Class = null,
+        cpu_borrow: ?*const fn (*anyopaque, ?CpuBorrowBudget) anyerror!void = null,
+        request_resources: ?*const fn (*anyopaque, GrantResources) anyerror!void = null,
         checkpoint: *const fn (*anyopaque) anyerror!void,
         check_lifetime: *const fn (*anyopaque) anyerror!void,
         park: *const fn (*anyopaque, State) anyerror!void,
@@ -933,7 +1947,155 @@ pub const Execution = struct {
     /// One stable capsule can account for a bounded CPU team. Its demand stays
     /// attached across yields and waits, independently of retained memory.
     pub fn startWithSlots(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class, slots: usize) !void {
-        return self.startRoot(scheduler, options, class, slots, false);
+        return self.startRoot(scheduler, options, class, slots, false, .general, null, null);
+    }
+
+    /// Native owning executors only: initial CPU publication and a complete
+    /// prepared resource bundle share one grant. There is no unscheduled fallback.
+    /// Resource ownership remains with the caller through physical retirement.
+    pub fn startWithResources(self: *Execution, scheduler: *Scheduler, options: admission.Options, class: Class, slots: usize, resources: GrantResources) !void {
+        return self.startRoot(scheduler, options, class, slots, false, .general, null, resources);
+    }
+    pub fn requestResources(self: *Execution, resources: GrantResources) !void {
+        if (self.borrowed) |borrow| {
+            try self.checkLifetime();
+            const callback = borrow.request_resources orelse return error.UnsupportedOperation;
+            return callback(borrow.ptr, resources);
+        }
+        const e = if (self.entry) |*value| value else return error.InvalidRunnableTransition;
+        const owner = try schedulerFor(e, false);
+        try owner.requestResources(e, resources);
+    }
+
+    /// Synchronous native-owner stage transition. Participant metadata may be
+    /// temporary: every return detaches it under the owner lock, including a
+    /// refused reentry which retains the root for physical cleanup. Borrowed
+    /// owners require an explicit detachable capability and are rejected before
+    /// parking; ordinary requestResources retains its longer-lived contract.
+    pub fn enterWithResources(self: *Execution, resources: GrantResources, restriction: ?AdmissionCheck) !void {
+        if (self.borrowed != null) return error.ExecutionWaitUnsupported;
+        const e = if (self.entry) |*value| value else return error.InvalidRunnableTransition;
+        const owner = try schedulerFor(e, false);
+        const class = try self.retainedClass();
+        if (class == .control or e.retainedPhase() or e.pending_resources != null) return error.InvalidRunnableTransition;
+        try self.park(.resource_blocked);
+        try self.requestResources(resources);
+        defer owner.detachResources(e, resources);
+        try self.enterWithCheck(class, restriction);
+    }
+
+    /// Prepared cooperative stages only. Disable before unqualified work.
+    pub fn startBorrowable(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class, budget: CpuBorrowBudget) !void {
+        return self.startRoot(scheduler, options, class, 1, false, .general, budget, null);
+    }
+    pub fn enableCpuBorrow(self: *Execution, budget: CpuBorrowBudget) !void {
+        if (self.child_pending) return error.InvalidRunnableTransition;
+        if (self.borrowed) |borrow| {
+            const callback = borrow.cpu_borrow orelse return error.UnsupportedOperation;
+            return callback(borrow.ptr, budget);
+        }
+        const e = if (self.entry) |*value| value else return;
+        const owner = try schedulerFor(e, true);
+        try owner.enableCpuBorrow(e, budget);
+    }
+    /// Leave a qualified stage before arbitrary policy, allocation or IO work.
+    /// Ordinary checkpoints must not refresh their quantum or generation merely
+    /// because a validator runs. Opaque owners require the checked capability.
+    pub fn endCpuBorrowStage(self: *Execution) !void {
+        if (self.child_pending) return error.InvalidRunnableTransition;
+        if (self.borrowed != null) return self.disableCpuBorrow();
+        const e = if (self.entry) |*value| value else return;
+        const owner = try schedulerFor(e, true);
+        owner.lock();
+        const enabled = e.cpu_borrow_budget != null;
+        owner.mutex.unlock();
+        if (enabled) try self.disableCpuBorrow();
+    }
+
+    pub fn disableCpuBorrow(self: *Execution) !void {
+        if (self.child_pending) return error.InvalidRunnableTransition;
+        if (self.borrowed) |borrow| {
+            const callback = borrow.cpu_borrow orelse return error.UnsupportedOperation;
+            try callback(borrow.ptr, null);
+            self.resume_generation +%= 1;
+            return;
+        }
+        const e = if (self.entry) |*value| value else return;
+        const owner = try schedulerFor(e, true);
+        try owner.disableCpuBorrow(e);
+        try owner.waitRetained(e);
+        self.resume_generation +%= 1;
+        self.quantum_start_ns = e.options.now();
+        self.read_sample_ns = self.quantum_start_ns;
+        self.checkpoints = 0;
+    }
+
+    /// Trusted server classification only. A bounded operator must have a
+    /// verified fixed footprint, one worker, no child fanout and no promotion
+    /// to mutation/completion. Unknown plans always enter the general lane.
+    pub fn startRead(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, lane: ReadLane) !void {
+        return self.startRoot(scheduler, options, .query, 1, false, lane, null, null);
+    }
+
+    /// Both transition credits and finite cleanup authority exist before the
+    /// caller may publish its first operator resource or execute query work.
+    pub fn startDemotableRead(self: *Execution, owner: *Scheduler, options: admission.Options, budget: ReadTransitionBudget, cleanup: admission.Options, cleanup_duration_ns: u64) !void {
+        if (self.entry != null or self.borrowed != null) return error.InvalidRunnableTransition;
+        self.entry = .{ .options = options, .class = .query, .read_lane = .bounded, .bytes = options.retained_bytes, .read_transition_budget = budget };
+        errdefer self.finish();
+        try owner.submit(&self.entry.?);
+        try owner.wait(&self.entry.?);
+        try owner.reserveCleanupFor(&self.entry.?, cleanup, cleanup_duration_ns);
+        self.quantum_start_ns = options.now();
+        self.read_sample_ns = self.quantum_start_ns;
+        self.resume_generation +%= 1;
+    }
+
+    fn measureReadWork(self: *Execution, owner: *Scheduler, e: *Entry) void {
+        const now = e.options.now();
+        owner.lock();
+        if (e.scheduler == owner and e.state == .running and e.read_transition_budget != null and !e.retainedPhase())
+            e.measured_read_work_ns +|= now -| self.read_sample_ns;
+        owner.mutex.unlock();
+        self.read_sample_ns = now;
+    }
+
+    pub fn demoteRead(self: *Execution, target: ReadLane) !void {
+        if (self.child_pending or self.borrowed != null) return error.InvalidRunnableTransition;
+        const e = if (self.entry) |*entry| entry else return error.InvalidRunnableTransition;
+        const owner = try schedulerFor(e, true);
+        self.measureReadWork(owner, e);
+        try owner.beginReadDemotion(e, target);
+        while (!(try owner.tryCompleteReadDemotion(e))) {
+            e.options.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                owner.failWait(e, err, true);
+                return err;
+            };
+        }
+        try owner.unblock(e);
+        try owner.waitRetained(e);
+        self.quantum_start_ns = e.options.now();
+        self.read_sample_ns = self.quantum_start_ns;
+        self.checkpoints = 0;
+        self.resume_generation +%= 1;
+    }
+
+    pub fn classifyRead(self: *Execution, lane: ReadLane) !void {
+        if (lane == .bounded) return error.InvalidRunnableTransition;
+        // Older opaque owners retain the conservative general classification.
+        if (self.borrowed != null) return;
+        const e = if (self.entry) |*entry| entry else return;
+        const owner = try schedulerFor(e, true);
+        try owner.checkAuthority(e);
+        if (e.read_lane == lane) return;
+        try owner.block(e, .resource_blocked);
+        try owner.reclassifyReadBlocked(e, lane);
+        try owner.unblock(e);
+        try owner.waitRetained(e);
+        self.resume_generation +%= 1;
+        self.quantum_start_ns = e.options.now();
+        self.read_sample_ns = self.quantum_start_ns;
+        self.checkpoints = 0;
     }
 
     /// Independent finite cleanup authority, never a refreshed read scope.
@@ -941,13 +2103,13 @@ pub const Execution = struct {
     pub fn startCleanupRoot(self: *Execution, scheduler: *Scheduler, options: admission.Options) !void {
         if (options.deadline_ns == null or options.allow_wait) return error.InvalidArgument;
         if (options.deadline_ns.? > options.now() +| (250 * std.time.ns_per_ms)) return error.InvalidArgument;
-        return self.startRoot(scheduler, options, .control, 1, true);
+        return self.startRoot(scheduler, options, .control, 1, true, .general, null, null);
     }
 
-    fn startRoot(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class, slots: usize, protected_cleanup: bool) !void {
+    fn startRoot(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class, slots: usize, protected_cleanup: bool, read_lane: ReadLane, cpu_borrow_budget: ?CpuBorrowBudget, resources: ?GrantResources) !void {
         std.debug.assert(self.entry == null and self.borrowed == null);
         const owner = scheduler orelse return;
-        self.entry = .{ .options = options, .class = class, .slots = slots, .bytes = options.retained_bytes, .protected_cleanup_root = protected_cleanup };
+        self.entry = .{ .options = options, .class = class, .read_lane = read_lane, .slots = slots, .bytes = options.retained_bytes, .protected_cleanup_root = protected_cleanup, .cpu_borrow_budget = cpu_borrow_budget, .pending_resources = resources };
         errdefer self.finish();
         try owner.submit(&self.entry.?);
         // A new cleanup root has no published consumer yet. Respect its
@@ -955,6 +2117,7 @@ pub const Execution = struct {
         if (protected_cleanup) try owner.waitImpl(&self.entry.?, false, null) else try owner.wait(&self.entry.?);
         self.resume_generation +%= 1;
         self.quantum_start_ns = options.now();
+        self.read_sample_ns = self.quantum_start_ns;
     }
     /// Stable child metadata and the independent worker IO must outlive every
     /// physical task join. Finishing the parent with live children is invalid.
@@ -1003,6 +2166,7 @@ pub const Execution = struct {
         try owner.waitRetained(e);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
+        self.read_sample_ns = self.quantum_start_ns;
         self.checkpoints = 0;
     }
 
@@ -1036,6 +2200,38 @@ pub const Execution = struct {
         if (options.deadline_ns) |deadline| if (options.now() >= deadline) return error.DeadlineExceeded;
     }
 
+    pub fn growInputBytes(self: *Execution, bytes: u64) !void {
+        if (self.child_pending) return error.InvalidRunnableTransition;
+        if (self.borrowed != null) return error.ExecutionWaitUnsupported;
+        const e = if (self.entry) |*entry| entry else return;
+        const owner = try schedulerFor(e, true);
+        try owner.growInputBytes(e, bytes);
+    }
+
+    pub fn retainReadBytes(self: *Execution, additional: u64) !void {
+        if (self.child_pending or self.borrowed != null) return error.InvalidRunnableTransition;
+        const e = if (self.entry) |*entry| entry else return error.InvalidRunnableTransition;
+        const owner = try schedulerFor(e, false);
+        try owner.retainReadBytes(e, additional);
+    }
+
+    pub fn tightenDeadline(self: *Execution, deadline_ns: u64) !void {
+        if (self.child_pending or self.borrowed != null) return error.InvalidRunnableTransition;
+        const e = if (self.entry) |*entry| entry else return;
+        const owner = try schedulerFor(e, true);
+        try owner.tightenDeadline(e, deadline_ns);
+        try self.checkLifetime();
+    }
+
+    /// A resume-time fence rejects execution and descendants, retaining every
+    /// reservation for physical cleanup. Preserve the first terminal cause.
+    pub fn rejectRetained(self: *Execution, cause: anyerror) !void {
+        if (self.child_pending or self.borrowed != null) return error.InvalidRunnableTransition;
+        const e = if (self.entry) |*entry| entry else return;
+        const owner = try schedulerFor(e, false);
+        owner.failWait(e, cause, true);
+    }
+
     /// Reserve bounded parallel CPU on this same execution before publishing
     /// child work. Children borrow the team grant and must all join before any
     /// resize, park, checkpoint or finish. Physical IO ownership and accepted
@@ -1051,6 +2247,7 @@ pub const Execution = struct {
         try owner.waitRetained(e);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
+        self.read_sample_ns = self.quantum_start_ns;
         self.checkpoints = 0;
     }
     pub fn checkpoint(self: *Execution) !void {
@@ -1065,6 +2262,10 @@ pub const Execution = struct {
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, true);
         owner.checkAuthority(e) catch |err| {
+            if (owner.borrowingCpu(e)) {
+                owner.failWait(e, err, true);
+                return err;
+            }
             if (err == error.SchedulerClosed) {
                 self.checkpoints +|= 1;
                 // Preserve the existing safe-quantum CPU return so accepted
@@ -1075,13 +2276,21 @@ pub const Execution = struct {
             }
             return err;
         };
+        self.measureReadWork(owner, e);
+        if (e.read_transition_budget) |budget| {
+            if (!e.read_transition_active and owner.boundedRead(e) and e.measured_read_work_ns > budget.estimated_work_ns) {
+                try self.demoteRead(.general);
+                return;
+            }
+        }
         self.checkpoints +|= 1;
-        if (self.checkpoints < owner.config.checkpoint_budget and
+        if (!owner.returnBorrowRequested(e) and self.checkpoints < owner.config.checkpoint_budget and
             e.options.now() -| self.quantum_start_ns < @as(u64, owner.config.quantum_ms) * std.time.ns_per_ms) return;
         try owner.yield(e);
         try owner.waitRetained(e);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
+        self.read_sample_ns = self.quantum_start_ns;
         self.checkpoints = 0;
     }
     pub fn park(self: *Execution, reason: State) !void {
@@ -1089,10 +2298,32 @@ pub const Execution = struct {
         if (self.borrowed) |borrow| return borrow.park(borrow.ptr, reason);
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, false);
+        self.measureReadWork(owner, e);
         try owner.block(e, reason);
     }
     pub fn enter(self: *Execution, class: Class) !void {
         return self.enterWithCheck(class, null);
+    }
+    /// Acquire a move-only admission lease while the original root is parked.
+    /// Preserve its address, bytes, clock and cancellation authority across the
+    /// phase change. A lease acquired before failed resume is retired here.
+    /// The operation must use the original request options; it must not create
+    /// another runnable root or refresh the request deadline.
+    pub fn acquirePhaseLease(self: *Execution, class: Class, comptime operation: anytype, args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(operation)).@"fn".return_type.?).error_union.payload {
+        if (self.entry == null and self.borrowed == null) return @call(.auto, operation, args);
+        try self.checkLifetime();
+        const previous_class = try self.retainedClass();
+        try self.park(.resource_blocked);
+        var lease = @call(.auto, operation, args) catch |err| {
+            // Even a refused acquisition resumes the original owner before
+            // propagating the failure. Failed resume keeps its retained root.
+            try self.enter(previous_class);
+            return err;
+        };
+        errdefer lease.release();
+        try self.enter(class);
+        try self.checkLifetime();
+        return lease;
     }
     pub fn enterWithCheck(self: *Execution, class: Class, restriction: ?AdmissionCheck) !void {
         if (self.child_pending) return error.InvalidRunnableTransition;
@@ -1120,6 +2351,7 @@ pub const Execution = struct {
         try owner.waitRetainedWithCheck(e, restriction);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
+        self.read_sample_ns = self.quantum_start_ns;
         self.checkpoints = 0;
     }
     /// The independent Io/deadline and all retained resources must be owned
@@ -1142,6 +2374,7 @@ pub const Execution = struct {
         try options.check();
         try owner.activateCompletion(e);
         self.quantum_start_ns = options.now();
+        self.read_sample_ns = self.quantum_start_ns;
         self.checkpoints = 0;
     }
     /// Read the retained completion fence without issuing a new deadline.
@@ -1177,6 +2410,7 @@ pub const Execution = struct {
         try owner.waitRetained(e);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
+        self.read_sample_ns = self.quantum_start_ns;
         self.checkpoints = 0;
     }
     pub fn finish(self: *Execution) void {
@@ -1346,6 +2580,193 @@ test "runnable scheduler weighted sharing charges slots across busy classes" {
     try std.testing.expect(counts[1] >= 10 and counts[1] <= 11);
 }
 
+test "runnable scheduler weighted sharing preserves mixed team slot demand under fragmented capacity" {
+    var scheduler = try Scheduler.init(.{ .slots = 3, .weights = .{ 2, 1, 1, 1 }, .max_operations = 256 });
+    defer scheduler.close();
+    var holder = testEntry(.background, 2, 0);
+    try scheduler.submit(&holder);
+    defer scheduler.finish(&holder);
+    var queries: [96]Entry = undefined;
+    var writes: [96]Entry = undefined;
+    for (&queries) |*entry| entry.* = testEntry(.query, 1, 0);
+    for (&writes) |*entry| entry.* = testEntry(.write, 2, 0);
+    defer for (&queries) |*entry| scheduler.finish(entry);
+    defer for (&writes) |*entry| scheduler.finish(entry);
+    for (&queries, &writes) |*query, *write| {
+        try scheduler.submit(query);
+        try scheduler.submit(write);
+    }
+    var health = testEntry(.control, 1, 0);
+    try scheduler.submit(&health);
+    try std.testing.expectEqual(State.running, scheduler.state(&health));
+    scheduler.finish(&health);
+    scheduler.finish(&holder);
+    for (0..60) |_| {
+        const running = blk: {
+            for (&queries) |*entry| if (scheduler.state(entry) == .running) break :blk entry;
+            for (&writes) |*entry| if (scheduler.state(entry) == .running) break :blk entry;
+            return error.NoRunnableWork;
+        };
+        scheduler.finish(running);
+    }
+    const grants = scheduler.stats().grants;
+    // Both classes remain backlogged. A two-slot write pays twice a one-slot
+    // query: 2:1 weights should grant roughly four queries per write, with a
+    // bounded deficit/grant-in-flight tolerance.
+    const write_charge = grants[1] * 2;
+    if (grants[0] < write_charge * 2 -| 4 or grants[0] > write_charge * 2 + 4)
+        std.debug.print("mixed team grants query={d} write={d}\n", .{ grants[0], grants[1] });
+    try std.testing.expect(grants[0] >= write_charge * 2 -| 4);
+    try std.testing.expect(grants[0] <= write_charge * 2 + 4);
+}
+
+test "runnable scheduler isolated teams retain earned weighted share while bounded reads progress" {
+    inline for (.{ Class.write, Class.inference, Class.background }) |team_class| {
+        inline for (.{ ReadLane.general, ReadLane.analytical }) |lane| {
+            inline for (.{ false, true }) |bounded_busy| {
+                var owner = try Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .weights = .{ 2, 1, 1, 1 }, .max_operations = 512, .max_backfills = 65535 });
+                defer owner.close();
+                var holder = testEntry(.background, 2, 0);
+                try owner.submit(&holder);
+                defer owner.finish(&holder);
+                const initial_team_grants = owner.stats().grants[@backingInt(team_class)];
+                var queries: [96]Entry = undefined;
+                var writes: [96]Entry = undefined;
+                for (&queries) |*entry| {
+                    entry.* = testEntry(.query, 1, 0);
+                    entry.read_lane = lane;
+                }
+                for (&writes) |*entry| entry.* = testEntry(team_class, 2, 0);
+                defer for (&queries) |*entry| owner.finish(entry);
+                defer for (&writes) |*entry| owner.finish(entry);
+                for (&queries, &writes) |*query, *write| {
+                    try owner.submit(query);
+                    try owner.submit(write);
+                }
+                var bounded = testEntry(.query, 1, 0);
+                bounded.read_lane = .bounded;
+                if (bounded_busy) try owner.submit(&bounded);
+                defer owner.finish(&bounded);
+                var health = testEntry(.control, 1, 0);
+                try owner.submit(&health);
+                try std.testing.expectEqual(State.running, owner.state(&health));
+                owner.finish(&health);
+                owner.finish(&holder);
+                for (0..60) |_| {
+                    if (bounded_busy) {
+                        try owner.yield(&bounded);
+                        try std.testing.expectEqual(State.running, owner.state(&bounded));
+                    }
+                    const running = blk: {
+                        for (&queries) |*entry| if (owner.state(entry) == .running) break :blk entry;
+                        for (&writes) |*entry| if (owner.state(entry) == .running) break :blk entry;
+                        return error.NoRunnableWork;
+                    };
+                    owner.finish(running);
+                }
+                const observed = owner.stats();
+                const query_charge = observed.grants[@backingInt(Class.query)];
+                const team_charge = (observed.grants[@backingInt(team_class)] - initial_team_grants) * 2;
+                std.debug.print("isolated team service team={s} lane={s} query={d} team_slots={d} bounded={d}\n", .{ @tagName(team_class), @tagName(lane), query_charge, team_charge, observed.read_lane_grants[@backingInt(ReadLane.bounded)] });
+                // A paid team must assemble its slots before the backfill starvation
+                // threshold. Query weight includes both read partitions; when busy,
+                // the independent bounded partition stays productive.
+                try std.testing.expect(team_charge > 0);
+                try std.testing.expect(query_charge >= team_charge * 2 -| 4);
+                try std.testing.expect(query_charge <= team_charge * 2 + 4);
+                try std.testing.expectEqual(@as(u64, if (bounded_busy) 61 else 0), observed.read_lane_grants[@backingInt(ReadLane.bounded)]);
+            }
+        }
+    }
+}
+
+test "runnable scheduler earned team share stops draining when queued authority expires" {
+    const Token = struct {
+        fn requested(raw: *const anyopaque) bool {
+            const value: *const bool = @ptrCast(@alignCast(raw));
+            return value.*;
+        }
+    };
+    inline for (.{ false, true }) |isolation| {
+        for ([_]bool{ false, true }) |cancel| {
+            var scheduler = try Scheduler.init(.{ .slots = if (isolation) 5 else 3, .cleanup_slots = if (isolation) 1 else 0, .read_isolation = isolation, .weights = .{ 1, 2, 1, 1 } });
+            defer scheduler.close();
+            var holder = testEntry(.background, 2, 1);
+            var first = testEntry(.query, 1, 3);
+            var second = testEntry(.query, 1, 7);
+            var team = testEntry(.write, 2, 11);
+            defer scheduler.finish(&holder);
+            defer scheduler.finish(&first);
+            defer scheduler.finish(&second);
+            defer scheduler.finish(&team);
+            try scheduler.submit(&holder);
+            try scheduler.submit(&first);
+            try scheduler.submit(&second);
+            try scheduler.submit(&team);
+            scheduler.finish(&holder);
+            try std.testing.expectEqual(State.running, scheduler.state(&first));
+            try std.testing.expectEqual(State.queued, scheduler.state(&second));
+            try std.testing.expectEqual(State.queued, scheduler.state(&team));
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 21), scheduler.stats().retained_bytes);
+            var health = testEntry(.control, 1, 0);
+            try scheduler.submit(&health);
+            try std.testing.expectEqual(State.running, scheduler.state(&health));
+            scheduler.finish(&health);
+            var canceled = cancel;
+            if (cancel) team.options.cancellation = .{ .ptr = &canceled, .requested = Token.requested } else team.options.deadline_ns = 0;
+            const cause: anyerror = if (cancel) error.Canceled else error.DeadlineExceeded;
+            try std.testing.expectError(cause, scheduler.wait(&team));
+            try std.testing.expectEqual(State.finished, scheduler.state(&team));
+            try std.testing.expectEqual(State.running, scheduler.state(&second));
+            try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 10), scheduler.stats().retained_bytes);
+        }
+    }
+}
+
+test "runnable scheduler retained refusal preserves its first cause before later fences" {
+    const Fence = struct {
+        calls: usize = 0,
+        cause: anyerror,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return self.cause;
+        }
+    };
+    for ([_]bool{ false, true }) |later_restriction| {
+        var scheduler = try Scheduler.init(.{ .slots = 3 });
+        defer scheduler.close();
+        var entry = testEntry(.write, 2, 23);
+        defer scheduler.finish(&entry);
+        try scheduler.submit(&entry);
+        var original: Fence = .{ .cause = error.CatalogGenerationChanged };
+        try std.testing.expectError(error.CatalogGenerationChanged, scheduler.waitRetainedWithCheck(&entry, .{ .context = &original, .check = Fence.check }));
+        try std.testing.expectEqual(@as(usize, 1), original.calls);
+        try std.testing.expectEqual(State.stopped, scheduler.state(&entry));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        entry.options.deadline_ns = 0;
+        var later: Fence = .{ .cause = error.Forbidden };
+        const restriction: ?AdmissionCheck = if (later_restriction) .{ .context = &later, .check = Fence.check } else null;
+        try std.testing.expectError(error.CatalogGenerationChanged, scheduler.waitRetainedWithCheck(&entry, restriction));
+        try std.testing.expectEqual(@as(usize, 0), later.calls);
+        try std.testing.expectEqual(error.CatalogGenerationChanged, entry.failure.?);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        var health = testEntry(.control, 1, 0);
+        try scheduler.submit(&health);
+        try std.testing.expectEqual(State.running, scheduler.state(&health));
+        scheduler.finish(&health);
+        scheduler.finish(&entry);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
 test "runnable scheduler cancellation after grant returns every reservation" {
     var s = try Scheduler.init(.{ .slots = 2 });
     var holder = testEntry(.query, 1, 5);
@@ -1502,6 +2923,157 @@ test "runnable scheduler execution quanta preserve deadline and parked ownership
     try std.testing.expectError(error.DeadlineExceeded, exec.checkpoint());
     try std.testing.expectEqual(@as(u64, 3), exec.resume_generation);
     try std.testing.expectEqual(@as(?u64, 10 * std.time.ns_per_ms), exec.entry.?.options.deadline_ns);
+}
+
+test "runnable phase admission retains one root and retires leases after failed resume" {
+    const Case = enum { success, refused, canceled, deadline, shutdown };
+    const Signal = struct {
+        canceled: bool = false,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled;
+        }
+    };
+    const Acquire = struct {
+        scheduler: *Scheduler,
+        root: *Execution,
+        controller: *admission.Controller,
+        signal: *Signal,
+        case: Case,
+        fn run(self: *@This()) !admission.Controller.Lease {
+            try std.testing.expectEqual(State.resource_blocked, self.scheduler.state(&self.root.entry.?));
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 77), self.scheduler.stats().retained_bytes);
+            // The parked root does not prevent an ordinary peer or a control
+            // operation from running while coarse admission is acquired.
+            var peer: Execution = .{};
+            try peer.start(self.scheduler, .{ .io = std.testing.io }, .query);
+            defer peer.finish();
+            var control: Execution = .{};
+            try control.start(self.scheduler, .{ .io = std.testing.io }, .control);
+            defer control.finish();
+            if (self.case == .refused) return error.AdmissionFull;
+            const lease = self.controller.tryAcquireLease() orelse return error.AdmissionFull;
+            switch (self.case) {
+                .canceled => self.signal.canceled = true,
+                .deadline => VirtualClock.value = 10,
+                .shutdown => self.scheduler.close(),
+                else => {},
+            }
+            return lease;
+        }
+    };
+    for (std.enums.values(Case)) |case| {
+        VirtualClock.value = 0;
+        defer VirtualClock.value = 0;
+        var signal: Signal = .{};
+        var scheduler = try Scheduler.init(.{ .slots = 2 });
+        var controller = admission.Controller.init(1);
+        var root: Execution = .{};
+        try root.start(&scheduler, .{
+            .io = std.testing.io,
+            .native_now_ns = VirtualClock.now,
+            .deadline_ns = 10,
+            .cancellation = .{ .ptr = &signal, .requested = Signal.requested },
+            .retained_bytes = 77,
+        }, .query);
+        const original = &root.entry.?;
+        var acquire: Acquire = .{ .scheduler = &scheduler, .root = &root, .controller = &controller, .signal = &signal, .case = case };
+        const result = root.acquirePhaseLease(.write, Acquire.run, .{&acquire});
+        if (case == .success) {
+            var lease = try result;
+            try std.testing.expectEqual(Class.write, try root.retainedClass());
+            try std.testing.expectEqual(State.running, scheduler.state(original));
+            lease.release();
+        } else try std.testing.expectError(switch (case) {
+            .refused => error.AdmissionFull,
+            .canceled => error.Canceled,
+            .deadline => error.DeadlineExceeded,
+            .shutdown => error.SchedulerClosed,
+            .success => unreachable,
+        }, result);
+        try std.testing.expect(original == &root.entry.?);
+        try std.testing.expectEqual(@as(?u64, 10), root.entry.?.options.deadline_ns);
+        try std.testing.expect(root.entry.?.options.cancellation.?.ptr == @as(*const anyopaque, &signal));
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 77), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), controller.stats().in_flight);
+        if (case == .refused) try std.testing.expectEqual(State.running, scheduler.state(original));
+        root.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "runnable input growth preserves original root and metadata partition through control promotion" {
+    var owner = try Scheduler.init(.{ .slots = 2, .max_operations = 8, .max_bytes = 100, .control_bytes = 20 });
+    var root: Execution = .{};
+    try root.start(&owner, .{ .io = std.testing.io, .retained_bytes = 20 }, .query);
+    defer root.finish();
+    const original = &root.entry.?;
+    const sequence = original.sequence;
+    try root.growInputBytes(50);
+    try std.testing.expect(original == &root.entry.?);
+    try std.testing.expectEqual(sequence, original.sequence);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 50), owner.stats().retained_bytes);
+    try root.park(.resource_blocked);
+    try root.enter(.control);
+    try std.testing.expectError(error.SchedulerFull, root.growInputBytes(81));
+    try std.testing.expectEqual(@as(u64, 50), original.bytes);
+    try root.growInputBytes(80);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().control_retained_bytes);
+    try std.testing.expectEqual(@as(u64, 80), owner.stats().retained_bytes);
+    try root.park(.output_blocked);
+    var control: Execution = .{};
+    try control.start(&owner, .{ .io = std.testing.io, .retained_bytes = 15 }, .control);
+    defer control.finish();
+    try std.testing.expectError(error.SchedulerFull, control.growInputBytes(21));
+    try std.testing.expectEqual(@as(u64, 15), owner.stats().control_retained_bytes);
+}
+
+test "runnable input growth rejects shrinking and preserves original deadline cancellation and cleanup fences" {
+    const Signal = struct {
+        canceled: bool = false,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled;
+        }
+    };
+    VirtualClock.value = 0;
+    defer VirtualClock.value = 0;
+    var signal: Signal = .{};
+    var owner = try Scheduler.init(.{ .slots = 2 });
+    var root: Execution = .{};
+    try root.start(&owner, .{ .io = std.testing.io, .native_now_ns = VirtualClock.now, .deadline_ns = 100, .retained_bytes = 17, .cancellation = .{ .ptr = &signal, .requested = Signal.requested } }, .query);
+    defer root.finish();
+    try std.testing.expectError(error.InvalidRunnableDemand, root.growInputBytes(16));
+    try root.growInputBytes(33);
+    try std.testing.expectEqual(@as(?u64, 100), root.entry.?.options.deadline_ns);
+    try std.testing.expect(root.entry.?.options.cancellation.?.ptr == @as(*const anyopaque, &signal));
+    signal.canceled = true;
+    try std.testing.expectError(error.Canceled, root.growInputBytes(34));
+    signal.canceled = false;
+    VirtualClock.value = 100;
+    try std.testing.expectError(error.DeadlineExceeded, root.growInputBytes(34));
+    VirtualClock.value = 0;
+    try root.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = VirtualClock.now }, 100);
+    try std.testing.expectError(error.InvalidRunnableTransition, root.growInputBytes(34));
+    try std.testing.expectEqual(@as(u64, 33), owner.stats().retained_bytes);
+}
+
+test "runnable phase admission disabled owner preserves coarse lease behavior" {
+    var controller = admission.Controller.init(1);
+    const Acquire = struct {
+        fn run(owner: *admission.Controller) !admission.Controller.Lease {
+            return owner.tryAcquireLease() orelse error.AdmissionFull;
+        }
+    };
+    var root: Execution = .{};
+    var lease = try root.acquirePhaseLease(.query, Acquire.run, .{&controller});
+    try std.testing.expectEqual(@as(usize, 1), controller.stats().in_flight);
+    try std.testing.expect(root.entry == null);
+    lease.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.stats().in_flight);
 }
 
 test "runnable scheduler checkpoint work budget and disabled execution" {
@@ -3133,4 +4705,1895 @@ test "runnable scheduler retained cleanup waits fairly for isolated capacity wit
     holder.finish();
     try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
     try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+}
+
+test "runnable scheduler closed ordinary admission preserves finite independent cleanup reserve" {
+    const Clock = struct {
+        fn now() u64 {
+            return 100;
+        }
+    };
+    var scheduler = try Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+    defer scheduler.close();
+    scheduler.close();
+    var ordinary: Execution = .{};
+    try std.testing.expectError(error.SchedulerClosed, ordinary.start(&scheduler, .{ .io = std.testing.io }, .query));
+    var health: Execution = .{};
+    try std.testing.expectError(error.SchedulerClosed, health.start(&scheduler, .{ .io = std.testing.io }, .control));
+    var cleanup: Execution = .{};
+    defer cleanup.finish();
+    try cleanup.startCleanupRoot(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .native_now_ns = Clock.now, .deadline_ns = 200, .retained_bytes = 23 });
+    try cleanup.checkLifetime();
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+    // Still one protected CPU reservation, even after ordinary admission closes.
+    var second: Execution = .{};
+    defer second.finish();
+    const refused = second.startCleanupRoot(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .native_now_ns = Clock.now, .deadline_ns = 200, .retained_bytes = 7 });
+    if (refused) |_| return error.TestUnexpectedResult else |_| {}
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    cleanup.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "runnable scheduler automatic capacity respects quota ceilings memory and protected progress" {
+    const Clock = struct {
+        fn now() u64 {
+            return 100;
+        }
+    };
+    const platform = @import("antfly_platform");
+    const automatic: Config = .{ .capacity_mode = .automatic };
+    for ([_]u64{ 250, 1000, 2000, 3500, 8000, 64000 }) |millicpus| {
+        const policy = try automatic.resolveCapacity(.{ .millicpus = millicpus, .source = .cgroup_v2 }, .{ .limit_bytes = 64 << 20, .source = .cgroup_v2 });
+        try std.testing.expectEqual(@max(@as(usize, 3), @min(@as(usize, 8), @as(usize, @intCast(millicpus / 1000)))), policy.slots);
+        try std.testing.expectEqual(@as(usize, 1), policy.control_slots);
+        try std.testing.expectEqual(@as(usize, 1), policy.cleanup_slots);
+        try std.testing.expectEqual(@as(u64, 2 << 20), policy.max_bytes);
+        try std.testing.expectEqual(automatic.max_wait_ms, policy.max_wait_ms);
+        var scheduler = try Scheduler.init(.{ .slots = policy.slots, .cleanup_slots = policy.cleanup_slots, .max_bytes = policy.max_bytes });
+        defer scheduler.close();
+        var ordinary: Execution = .{};
+        try ordinary.startWithSlots(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 23 }, .query, policy.ordinarySlots());
+        defer ordinary.finish();
+        var health: Execution = .{};
+        try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 5 }, .control);
+        defer health.finish();
+        var cleanup: Execution = .{};
+        try cleanup.startCleanupRoot(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 7, .deadline_ns = 200, .native_now_ns = Clock.now });
+        defer cleanup.finish();
+        try std.testing.expectEqual(policy.slots, scheduler.stats().runnable_slots);
+        ordinary.finish();
+        health.finish();
+        cleanup.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+    const fixed: Config = .{};
+    try std.testing.expectEqualDeep(fixed, try fixed.resolveCapacity(.{ .millicpus = 250 }, .{ .limit_bytes = 1 }));
+    const unknown = try automatic.resolveCapacity(.{}, .{});
+    try std.testing.expectEqual(@as(usize, 3), unknown.slots);
+    try std.testing.expectEqual(automatic.max_bytes, unknown.max_bytes);
+    try std.testing.expectError(error.InvalidRunnablePolicy, automatic.resolveCapacity(.{}, .{ .limit_bytes = 1 << 20 }));
+    var detected = try Scheduler.init(automatic);
+    defer detected.close();
+    const expected = try automatic.resolveCapacity(platform.process_memory.cpuCapacity(), platform.process_memory.systemEnvelope());
+    try std.testing.expectEqualDeep(expected, detected.policyAndStats().config);
+}
+
+test "runnable read lanes preserve bounded CPU count and bytes under general saturation" {
+    const io = std.testing.io;
+    var owner = try Scheduler.init(.{ .slots = 4, .control_slots = 1, .cleanup_slots = 1, .read_isolation = true, .max_operations = 12, .max_bytes = 8192, .control_bytes = 1024 });
+    defer owner.close();
+    var general: [6]Entry = undefined;
+    for (&general) |*entry| {
+        entry.* = .{ .options = .{ .io = io }, .class = .query, .bytes = 100 };
+        try owner.submit(entry);
+    }
+    defer for (&general) |*entry| owner.finish(entry);
+    try std.testing.expectEqual(@as(usize, 1), owner.ordinaryUsed());
+    var denied: Entry = .{ .options = .{ .io = io }, .class = .write, .bytes = 100 };
+    try std.testing.expectError(error.SchedulerFull, owner.submit(&denied));
+    var bounded: Entry = .{ .options = .{ .io = io }, .class = .query, .read_lane = .bounded, .bytes = 100 };
+    try owner.submit(&bounded);
+    defer owner.finish(&bounded);
+    try std.testing.expectEqual(State.running, bounded.state);
+    try std.testing.expectEqual(@as(usize, 2), owner.ordinaryUsed());
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().bounded_read_operations);
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.growInputBytes(&bounded, 101));
+    var child: Entry = .{ .options = .{ .io = io }, .class = .query, .bytes = @sizeOf(Entry) };
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.submitChild(&bounded, &child, io));
+    var control: Entry = .{ .options = .{ .io = io }, .class = .control, .bytes = 100 };
+    try owner.submit(&control);
+    defer owner.finish(&control);
+    try std.testing.expectEqual(State.running, control.state);
+    try owner.block(&bounded, .output_blocked);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().bounded_read_slots);
+    // Blocked bounded owners retain their count and byte floor, and general
+    // work cannot borrow the slot and strand a later output resumption.
+    try std.testing.expectEqual(@as(usize, 1), owner.ordinaryUsed());
+    try owner.unblock(&bounded);
+    try std.testing.expectEqual(State.running, bounded.state);
+    owner.finish(&bounded);
+    for (&general) |*entry| owner.finish(entry);
+    owner.finish(&control);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().bounded_read_operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().bounded_read_bytes);
+}
+
+test "runnable read lanes isolate metadata and analytical service with original cancellation" {
+    const io = std.testing.io;
+    var owner = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .read_isolation = true, .max_operations = 12, .max_bytes = 4096, .control_bytes = 1024 });
+    defer owner.close();
+    var general: Entry = .{ .options = .{ .io = io }, .class = .query, .bytes = 2304 };
+    try owner.submit(&general);
+    defer owner.finish(&general);
+    var overflow: Entry = .{ .options = .{ .io = io }, .class = .background, .bytes = 1 };
+    try std.testing.expectError(error.SchedulerFull, owner.submit(&overflow));
+    var bounded: Entry = .{ .options = .{ .io = io }, .class = .query, .read_lane = .bounded, .bytes = 768 };
+    try owner.submit(&bounded);
+    defer owner.finish(&bounded);
+    try std.testing.expectEqual(State.running, bounded.state);
+    owner.finish(&general);
+    const Cancel = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    var canceled = false;
+    var analytical: Entry = .{ .options = .{ .io = io, .cancellation = .{ .ptr = &canceled, .requested = Cancel.requested } }, .class = .query, .read_lane = .analytical, .bytes = 100 };
+    try owner.submit(&analytical);
+    defer owner.finish(&analytical);
+    try std.testing.expectEqual(State.running, analytical.state);
+    var peer: Entry = .{ .options = .{ .io = io }, .class = .query, .bytes = 100 };
+    try owner.submit(&peer);
+    defer owner.finish(&peer);
+    for (0..40) |_| {
+        if (analytical.state == .running) try owner.yield(&analytical);
+        if (peer.state == .running) try owner.yield(&peer);
+    }
+    const grants = owner.stats().read_lane_grants;
+    try std.testing.expect(grants[@backingInt(ReadLane.general)] > 10);
+    try std.testing.expect(grants[@backingInt(ReadLane.analytical)] > 10);
+    if (analytical.state == .running) try owner.block(&analytical, .resource_blocked);
+    canceled = true;
+    try std.testing.expectError(error.Canceled, owner.unblock(&analytical));
+    try std.testing.expect(analytical.state != .running);
+    owner.finish(&analytical);
+    owner.finish(&bounded);
+    owner.finish(&peer);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+}
+
+test "runnable read lanes automatic policy preserves small envelopes and fixed rollback" {
+    const platform = @import("antfly_platform");
+    const memory: platform.process_memory.Envelope = .{ .limit_bytes = 64 << 20, .source = .cgroup_v2 };
+    const automatic: Config = .{ .capacity_mode = .automatic };
+    const small = try automatic.resolveCapacity(.{ .millicpus = 1000, .source = .cgroup_v2 }, memory);
+    try std.testing.expect(!small.readIsolation());
+    try std.testing.expectEqual(@as(usize, 1), small.generalSlots());
+    const large = try automatic.resolveCapacity(.{ .millicpus = 8000, .source = .cgroup_v2 }, memory);
+    try std.testing.expect(large.readIsolation());
+    try std.testing.expectEqual(large.ordinarySlots() - 1, large.generalSlots());
+    const fixed: Config = .{ .slots = 8, .cleanup_slots = 1 };
+    try std.testing.expectEqualDeep(fixed, try fixed.resolveForStartup(1));
+    try std.testing.expectEqual(fixed.ordinarySlots(), fixed.generalSlots());
+    try std.testing.expectError(error.InvalidRunnablePolicy, (Config{ .slots = 3, .cleanup_slots = 1, .read_isolation = true }).validate());
+    var constrained = automatic;
+    constrained.max_operations = 4;
+    const low_count = try constrained.resolveCapacity(.{ .millicpus = 8000, .source = .cgroup_v2 }, memory);
+    try std.testing.expect(!low_count.readIsolation());
+}
+
+test "runnable read lanes reserve managed cleanup before publishing an isolated owner" {
+    var too_small = try Scheduler.init(.{ .slots = 3, .read_isolation = true });
+    defer too_small.close();
+    try std.testing.expectError(error.ManagerCleanupCapacityUnavailable, too_small.ensureCleanupCpuBeforePublication());
+    try std.testing.expectEqual(@as(usize, 0), too_small.config.cleanup_slots);
+    var owner = try Scheduler.init(.{ .slots = 4, .read_isolation = true });
+    defer owner.close();
+    try owner.ensureCleanupCpuBeforePublication();
+    try std.testing.expectEqual(@as(usize, 1), owner.config.cleanup_slots);
+    try std.testing.expectEqual(@as(usize, 1), owner.config.generalSlots());
+    try owner.config.validate();
+}
+
+test "runnable read lanes preserve query class weight with an idle bounded lane" {
+    var owner = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .read_isolation = true });
+    defer owner.close();
+    var entries: [6]Entry = undefined;
+    for (&entries, 0..) |*entry, index| {
+        entry.* = .{ .options = .{ .io = std.testing.io }, .class = if (index < 4) .query else .write, .read_lane = if (index >= 2 and index < 4) .analytical else .general, .bytes = 100 };
+        try owner.submit(entry);
+    }
+    defer for (&entries) |*entry| owner.finish(entry);
+    for (0..240) |_| {
+        const running = for (&entries) |*entry| {
+            if (entry.state == .running) break entry;
+        } else return error.NoRunnablePeer;
+        try owner.yield(running);
+    }
+    const observed = owner.stats();
+    try std.testing.expect(observed.grants[0] >= observed.grants[1] * 2 -| 8);
+    try std.testing.expect(observed.grants[0] <= observed.grants[1] * 2 + 8);
+    try std.testing.expect(observed.read_lane_grants[@backingInt(ReadLane.general)] > 30);
+    try std.testing.expect(observed.read_lane_grants[@backingInt(ReadLane.analytical)] > 30);
+    for (&entries) |*entry| owner.finish(entry);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+}
+
+test "runnable read lanes automatic sizing honors explicit isolation override" {
+    const memory: @import("antfly_platform").process_memory.Envelope = .{ .limit_bytes = 64 << 20, .source = .cgroup_v2 };
+    const disabled: Config = .{ .capacity_mode = .automatic, .read_isolation = false };
+    const effective = try disabled.resolveCapacity(.{ .millicpus = 8000, .source = .cgroup_v2 }, memory);
+    try std.testing.expect(!effective.readIsolation());
+    try std.testing.expectEqual(effective.ordinarySlots(), effective.generalSlots());
+    const required: Config = .{ .capacity_mode = .automatic, .read_isolation = true };
+    try std.testing.expectError(error.InvalidRunnablePolicy, required.resolveCapacity(.{ .millicpus = 1000, .source = .cgroup_v2 }, memory));
+}
+
+test "runnable read lanes demotion transfers once while general capacity is full" {
+    const io = std.testing.io;
+    var owner = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .read_isolation = true, .max_operations = 12, .max_bytes = 8192, .control_bytes = 1024 });
+    defer owner.close();
+    var general: [6]Entry = undefined;
+    for (&general) |*entry| {
+        entry.* = .{ .options = .{ .io = io }, .class = .query, .bytes = 100 };
+        try owner.submit(entry);
+    }
+    defer for (&general) |*entry| owner.finish(entry);
+    var read: Execution = .{};
+    defer read.finish();
+    try read.startDemotableRead(&owner, .{ .io = io, .retained_bytes = 100 }, .{ .max_retained_bytes = 100, .max_wait_ms = 100, .estimated_work_ns = 1 }, .{ .io = io }, 250 * std.time.ns_per_ms);
+    const entry = &read.entry.?;
+    const before = owner.stats();
+    try std.testing.expectEqual(@as(usize, 7), before.operations);
+    try std.testing.expectEqual(@as(usize, 1), before.read_transition_reserved_operations);
+    try owner.beginReadDemotion(entry, .analytical);
+    try std.testing.expect(!(try owner.tryCompleteReadDemotion(entry)));
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.unblock(entry));
+    const waiting = owner.stats();
+    try std.testing.expectEqual(before.operations, waiting.operations);
+    try std.testing.expectEqual(before.retained_bytes, waiting.retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), waiting.bounded_read_operations);
+    try std.testing.expectEqual(@as(usize, 1), waiting.read_transition_operations);
+    try std.testing.expectEqual(@as(usize, 0), waiting.bounded_read_slots);
+    var peer: Execution = .{};
+    defer peer.finish();
+    try peer.startRead(&owner, .{ .io = io, .allow_wait = false, .retained_bytes = 100 }, .bounded);
+    try std.testing.expectEqual(State.running, peer.entry.?.state);
+    owner.finish(&general[0]);
+    try std.testing.expect(try owner.tryCompleteReadDemotion(entry));
+    try std.testing.expectEqual(ReadLane.analytical, entry.read_lane);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().read_transition_reserved_operations);
+    try owner.unblock(entry);
+    for (&general) |*other| owner.finish(other);
+    try owner.waitRetained(entry);
+    try std.testing.expectEqual(State.running, entry.state);
+    read.finish();
+    peer.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().read_transition_reserved_bytes);
+}
+
+test "runnable read lanes transition expiry cancellation and close retain joined cleanup ownership" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    const Mode = enum { timeout, deadline, cancel, close };
+    for (std.enums.values(Mode)) |mode| {
+        Clock.tick = 0;
+        var canceled = false;
+        var owner = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .read_isolation = true });
+        defer owner.close();
+        var read: Execution = .{};
+        defer read.finish();
+        try read.startDemotableRead(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100 * std.time.ns_per_ms, .cancellation = .{ .ptr = &canceled, .requested = Clock.requested }, .retained_bytes = 100 }, .{ .max_retained_bytes = 100, .max_wait_ms = 25, .estimated_work_ns = 1 }, .{ .io = std.testing.io, .native_now_ns = Clock.now }, 250 * std.time.ns_per_ms);
+        try owner.beginReadDemotion(&read.entry.?, .general);
+        const cause: anyerror = switch (mode) {
+            .timeout => blk: {
+                Clock.tick = 25 * std.time.ns_per_ms;
+                break :blk error.RunnableWaitTimeout;
+            },
+            .deadline => blk: {
+                Clock.tick = 100 * std.time.ns_per_ms;
+                break :blk error.DeadlineExceeded;
+            },
+            .cancel => blk: {
+                canceled = true;
+                break :blk error.Canceled;
+            },
+            .close => blk: {
+                owner.close();
+                break :blk error.SchedulerClosed;
+            },
+        };
+        try std.testing.expectError(cause, owner.tryCompleteReadDemotion(&read.entry.?));
+        try std.testing.expectEqual(State.stopped, read.entry.?.state);
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 100), owner.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+        Clock.tick = 200 * std.time.ns_per_ms;
+        try std.testing.expectError(cause, owner.tryCompleteReadDemotion(&read.entry.?));
+        try read.activateCleanup();
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().cleanup_runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().read_transition_operations);
+        read.finish();
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().read_transition_reserved_operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().read_transition_reserved_bytes);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().read_transition_operations);
+    }
+}
+
+test "runnable read lanes measured excess work demotes and repays bounded service debt" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    var owner = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .read_isolation = true, .quantum_ms = 2 });
+    defer owner.close();
+    var read: Execution = .{};
+    defer read.finish();
+    try read.startDemotableRead(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now, .retained_bytes = 100 }, .{ .max_retained_bytes = 100, .max_wait_ms = 25, .estimated_work_ns = std.time.ns_per_ms }, .{ .io = std.testing.io, .native_now_ns = Clock.now }, 250 * std.time.ns_per_ms);
+    Clock.tick = 10 * std.time.ns_per_ms;
+    try read.checkpoint();
+    try std.testing.expectEqual(ReadLane.general, read.entry.?.read_lane);
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_ms), read.entry.?.measured_read_work_ns);
+    try std.testing.expectEqual(@as(u64, 4), owner.stats().read_service_debt_paid);
+    try std.testing.expectEqual(@as(u64, 1), owner.stats().read_demotions);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().read_transition_reserved_operations);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    read.finish();
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+}
+
+test "runnable read lanes concurrent demotion wait lends CPU and retains canceled resources" {
+    const io = std.testing.io;
+    const Job = struct {
+        read: *Execution,
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            defer self.done.store(true, .release);
+            self.read.demoteRead(.general) catch |err| {
+                self.failure = err;
+            };
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    var owner = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .read_isolation = true, .max_operations = 12, .max_wait_ms = 5000 });
+    defer owner.close();
+    var general: [6]Entry = undefined;
+    for (&general) |*entry| {
+        entry.* = .{ .options = .{ .io = io }, .class = .query, .bytes = 100 };
+        try owner.submit(entry);
+    }
+    defer for (&general) |*entry| owner.finish(entry);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var read: Execution = .{};
+    defer read.finish();
+    try read.startDemotableRead(&owner, .{ .io = io, .retained_bytes = 100, .cancellation = .{ .ptr = &canceled, .requested = Job.requested } }, .{ .max_retained_bytes = 100, .max_wait_ms = 5000, .estimated_work_ns = 1 }, .{ .io = io }, 250 * std.time.ns_per_ms);
+    var job: Job = .{ .read = &read };
+    var future = try io.concurrent(Job.run, .{&job});
+    defer future.cancel(io);
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+    while (owner.stats().read_transition_operations == 0) {
+        if (job.done.load(.acquire)) return job.failure orelse error.DemotionDidNotWait;
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.DemotionDidNotWait;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    var peer: Execution = .{};
+    defer peer.finish();
+    try peer.startRead(&owner, .{ .io = io, .allow_wait = false, .retained_bytes = 100 }, .bounded);
+    var health: Execution = .{};
+    defer health.finish();
+    try health.start(&owner, .{ .io = io, .allow_wait = false, .retained_bytes = 100 }, .control);
+    canceled.store(true, .release);
+    future.await(io);
+    try std.testing.expectEqual(error.Canceled, job.failure.?);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().read_transition_operations);
+    try read.activateCleanup();
+    try std.testing.expectEqual(owner.config.slots, owner.stats().runnable_slots);
+    read.finish();
+    peer.finish();
+    health.finish();
+    for (&general) |*entry| owner.finish(entry);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().read_transition_reserved_bytes);
+}
+
+test "runnable read lanes transition admission rejects insufficient credits before publication" {
+    var owner = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .read_isolation = true, .max_operations = 12 });
+    defer owner.close();
+    for ([_]ReadTransitionBudget{
+        .{ .max_retained_bytes = 99, .max_wait_ms = 25, .estimated_work_ns = 1 },
+        .{ .max_retained_bytes = 100, .max_wait_ms = 0, .estimated_work_ns = 1 },
+        .{ .max_retained_bytes = 100, .max_wait_ms = 251, .estimated_work_ns = 1 },
+        .{ .max_retained_bytes = 100, .max_wait_ms = 25, .estimated_work_ns = 0 },
+    }) |budget| {
+        var read: Execution = .{};
+        defer read.finish();
+        try std.testing.expectError(error.InvalidRunnableDemand, read.startDemotableRead(&owner, .{ .io = std.testing.io, .retained_bytes = 100 }, budget, .{ .io = std.testing.io }, std.time.ns_per_s));
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().read_transition_reserved_bytes);
+    }
+    var oversized: Execution = .{};
+    defer oversized.finish();
+    try std.testing.expectError(error.SchedulerFull, oversized.startDemotableRead(&owner, .{ .io = std.testing.io, .retained_bytes = 100 }, .{ .max_retained_bytes = owner.config.boundedReadMetadataBytes(), .max_wait_ms = 25, .estimated_work_ns = 1 }, .{ .io = std.testing.io }, std.time.ns_per_s));
+    var bad_cleanup: Execution = .{};
+    defer bad_cleanup.finish();
+    try std.testing.expectError(error.InvalidArgument, bad_cleanup.startDemotableRead(&owner, .{ .io = std.testing.io, .retained_bytes = 100 }, .{ .max_retained_bytes = 100, .max_wait_ms = 25, .estimated_work_ns = 1 }, .{ .io = std.testing.io }, 0));
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().read_transition_reserved_operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().read_transition_reserved_bytes);
+}
+
+test "runnable scheduler retained read bytes accumulate after cleanup reservation without lending or refreshing authority" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    Clock.value = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 2, .max_operations = 4, .max_bytes = 192, .control_bytes = 64 });
+    defer scheduler.close();
+    var read: Execution = .{};
+    defer read.finish();
+    try read.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 50, .retained_bytes = 17 }, .query);
+    try read.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now }, 100);
+    try read.retainReadBytes(11);
+    try read.park(.output_blocked);
+    try read.retainReadBytes(13);
+    try std.testing.expectEqual(@as(u64, 41), scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 50), read.entry.?.options.deadline_ns.?);
+    try std.testing.expectEqual(@as(u64, 100), read.entry.?.cleanup_duration_ns.?);
+    try std.testing.expectEqual(@as(u64, 41), read.entry.?.cleanup_options.?.retained_bytes);
+    try read.retainReadBytes(87);
+    try std.testing.expectError(error.SchedulerFull, read.retainReadBytes(1));
+    try std.testing.expectEqual(@as(u64, 128), scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(u64, 128), read.entry.?.cleanup_options.?.retained_bytes);
+    try std.testing.expectError(error.InvalidRunnableDemand, read.retainReadBytes(std.math.maxInt(u64)));
+    Clock.value = 51;
+    try std.testing.expectError(error.DeadlineExceeded, read.retainReadBytes(0));
+    try std.testing.expectEqual(@as(u64, 128), scheduler.stats().retained_bytes);
+    try read.activateCleanup();
+    try std.testing.expectError(error.InvalidRunnableTransition, read.retainReadBytes(1));
+    try std.testing.expectEqual(@as(u64, 151), read.entry.?.options.deadline_ns.?);
+    read.finish();
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+}
+
+test "runnable scheduler retained read bytes preserve bounded continuation and partition limits" {
+    var scheduler = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .read_isolation = true, .max_operations = 12, .max_bytes = 8192, .control_bytes = 1024 });
+    defer scheduler.close();
+    var read: Execution = .{};
+    defer read.finish();
+    try read.startDemotableRead(&scheduler, .{ .io = std.testing.io, .retained_bytes = 100 }, .{ .max_retained_bytes = 128, .max_wait_ms = 25, .estimated_work_ns = 1 }, .{ .io = std.testing.io }, 100 * std.time.ns_per_ms);
+    try read.retainReadBytes(28);
+    try std.testing.expectEqual(@as(u64, 128), scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(u64, 128), scheduler.stats().bounded_read_bytes);
+    try std.testing.expectEqual(@as(u64, 128), scheduler.stats().read_transition_reserved_bytes);
+    try std.testing.expectError(error.InvalidRunnableDemand, read.retainReadBytes(1));
+    try std.testing.expectEqual(@as(u64, 128), scheduler.stats().bounded_read_bytes);
+    read.finish();
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().bounded_read_bytes);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().read_transition_reserved_bytes);
+    var write: Execution = .{};
+    defer write.finish();
+    try write.start(&scheduler, .{ .io = std.testing.io }, .write);
+    try std.testing.expectError(error.InvalidRunnableTransition, write.retainReadBytes(1));
+}
+
+test "runnable scheduler persistent control baseline reserves idle bytes without operation or CPU grants" {
+    var owner = try NodeOwner.init(.{ .slots = 2, .max_operations = 4, .max_bytes = 1024, .control_bytes = 256, .read_isolation = false });
+    var owner_live = true;
+    defer if (owner_live) owner.deinit();
+    var first = try owner.scheduler.reserveControlBaseline(32);
+    defer first.release();
+    var second = try owner.scheduler.reserveControlBaseline(32);
+    defer second.release();
+    try std.testing.expectError(error.SchedulerFull, owner.scheduler.reserveControlBaseline(1));
+    try std.testing.expectError(error.InvalidArgument, owner.scheduler.reserveControlBaseline(0));
+    try std.testing.expectEqual(@as(usize, 0), owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 64), owner.scheduler.stats().control_retained_bytes);
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.tryDeinit());
+    var query: Execution = .{};
+    defer query.finish();
+    try query.start(&owner.scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 768 }, .query);
+    var health: Execution = .{};
+    defer health.finish();
+    try health.start(&owner.scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 192 }, .control);
+    try std.testing.expectEqual(@as(u64, 1024), owner.scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 2), owner.scheduler.stats().operations);
+    health.finish();
+    query.finish();
+    var cleanup: Execution = .{};
+    defer cleanup.finish();
+    const Clock = struct {
+        fn now() u64 {
+            return 100;
+        }
+    };
+    try cleanup.startCleanupRoot(&owner.scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 128, .native_now_ns = Clock.now, .deadline_ns = 200 });
+    try cleanup.park(.resource_blocked);
+    try health.start(&owner.scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 64 }, .control);
+    try std.testing.expectEqual(@as(u64, 256), owner.scheduler.stats().control_retained_bytes);
+    try std.testing.expectEqual(@as(usize, 2), owner.scheduler.stats().operations);
+    health.finish();
+    cleanup.finish();
+    owner.close();
+    try std.testing.expectError(error.SchedulerClosed, owner.scheduler.reserveControlBaseline(1));
+    first.release();
+    try std.testing.expectEqual(@as(u64, 32), owner.scheduler.stats().retained_bytes);
+    second.release();
+    try std.testing.expectEqual(@as(u64, 0), owner.scheduler.stats().retained_bytes);
+    try owner.tryDeinit();
+    owner_live = false;
+}
+
+test "runnable CPU loan requires eligibility and returns before protected read execution" {
+    inline for (.{ State.resource_blocked, State.output_blocked }) |reason| {
+        var owner = try Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2 });
+        defer owner.close();
+        var base = testEntry(.background, 1, 11);
+        var ordinary = testEntry(.query, 1, 13);
+        var loan = testEntry(.write, 1, 17);
+        loan.cpu_borrow_budget = .{ .max_non_yield_ns = 1000 };
+        var protected = testEntry(.query, 1, 19);
+        protected.read_lane = .bounded;
+        defer owner.finish(&base);
+        defer owner.finish(&ordinary);
+        defer owner.finish(&loan);
+        defer owner.finish(&protected);
+        try owner.submit(&base);
+        try owner.submit(&ordinary);
+        try std.testing.expectEqual(State.queued, owner.state(&ordinary));
+        try owner.submit(&loan);
+        try std.testing.expectEqual(State.running, owner.state(&loan));
+        try std.testing.expectEqual(@as(usize, 1), owner.cpuBorrowStats().active);
+        var floor = testEntry(.query, 1, 7);
+        floor.read_lane = .bounded;
+        defer owner.finish(&floor);
+        try owner.submit(&floor);
+        try std.testing.expectEqual(State.running, owner.state(&floor));
+        try std.testing.expectEqual(State.running, owner.state(&loan));
+        try std.testing.expectEqual(@as(usize, 1), owner.cpuBorrowStats().active);
+        var health = testEntry(.control, 1, 0);
+        defer owner.finish(&health);
+        var cleanup = testEntry(.control, 1, 0);
+        cleanup.protected_cleanup_root = true;
+        cleanup.options.allow_wait = false;
+        cleanup.options.deadline_ns = cleanup.options.now() + 100 * std.time.ns_per_ms;
+        defer owner.finish(&cleanup);
+        try owner.submit(&health);
+        try owner.submit(&cleanup);
+        try std.testing.expectEqual(State.running, owner.state(&health));
+        try std.testing.expectEqual(State.running, owner.state(&cleanup));
+        try std.testing.expectEqual(owner.config.slots, owner.stats().runnable_slots);
+        owner.finish(&health);
+        owner.finish(&cleanup);
+        try owner.submit(&protected);
+        try std.testing.expectEqual(State.queued, owner.state(&protected));
+        const before = owner.stats();
+        try owner.yield(&loan);
+        try std.testing.expectEqual(State.running, owner.state(&protected));
+        try std.testing.expectEqual(State.queued, owner.state(&loan));
+        try std.testing.expectEqual(before.operations, owner.stats().operations);
+        try std.testing.expectEqual(before.retained_bytes, owner.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+        owner.finish(&protected);
+        try std.testing.expectEqual(State.running, owner.state(&loan));
+        try owner.block(&loan, reason);
+        try std.testing.expectEqual(@as(?CpuBorrowBudget, null), loan.cpu_borrow_budget);
+        try owner.unblock(&loan);
+        try std.testing.expectEqual(State.queued, owner.state(&loan));
+        try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+        owner.finish(&floor);
+        owner.finish(&base);
+        owner.finish(&ordinary);
+        owner.finish(&loan);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+        try std.testing.expectEqual(owner.cpuBorrowStats().grants, owner.cpuBorrowStats().returns);
+    }
+}
+
+test "runnable CPU loan moves to released general capacity without revoking live execution" {
+    var owner = try Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2 });
+    defer owner.close();
+    var base = testEntry(.background, 1, 11);
+    var loan = testEntry(.query, 1, 17);
+    loan.cpu_borrow_budget = .{ .max_non_yield_ns = 1000 };
+    var protected = testEntry(.query, 1, 19);
+    protected.read_lane = .bounded;
+    defer owner.finish(&base);
+    defer owner.finish(&loan);
+    defer owner.finish(&protected);
+    try owner.submit(&base);
+    try owner.submit(&loan);
+    try owner.submit(&protected);
+    owner.finish(&base);
+    try std.testing.expectEqual(State.running, owner.state(&loan));
+    try std.testing.expectEqual(State.running, owner.state(&protected));
+    try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+    try std.testing.expectEqual(@as(usize, 2), owner.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 36), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(u64, 1), owner.cpuBorrowStats().returns);
+}
+
+test "runnable CPU loan checkpoint returns before quantum and preserves original lifetime" {
+    const io = std.testing.io;
+    const Clock = struct {
+        fn now() u64 {
+            return 0;
+        }
+    };
+    const Worker = struct {
+        fn run(execution: *Execution) !void {
+            try execution.checkpoint();
+        }
+    };
+    var owner = try Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2, .max_wait_ms = 5000, .checkpoint_budget = 64 });
+    defer owner.close();
+    var base = testEntry(.background, 1, 11);
+    try owner.submit(&base);
+    defer owner.finish(&base);
+    var loan: Execution = .{};
+    defer loan.finish();
+    try loan.startBorrowable(&owner, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 1000000, .retained_bytes = 17 }, .query, .{ .max_non_yield_ns = 1000 });
+    const original = loan.entry.?.options.deadline_ns;
+    var floor = testEntry(.query, 1, 0);
+    floor.read_lane = .bounded;
+    try owner.submit(&floor);
+    defer owner.finish(&floor);
+    try std.testing.expectEqual(State.running, owner.state(&floor));
+    try std.testing.expectEqual(@as(usize, 1), owner.cpuBorrowStats().active);
+    var protected = testEntry(.query, 1, 19);
+    protected.read_lane = .bounded;
+    try owner.submit(&protected);
+    defer owner.finish(&protected);
+    var future = try io.concurrent(Worker.run, .{&loan});
+    defer future.cancel(io) catch {};
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+    while (owner.state(&protected) != .running) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.CpuLoanDidNotReturn;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(State.queued, owner.state(&loan.entry.?));
+    try std.testing.expectEqual(@as(u64, 47), owner.stats().retained_bytes);
+    owner.finish(&protected);
+    try future.await(io);
+    try std.testing.expectEqual(original, loan.entry.?.options.deadline_ns);
+    try std.testing.expectEqual(@as(u64, 2), loan.resume_generation);
+    try std.testing.expectEqual(@as(u64, 2), owner.cpuBorrowStats().grants);
+}
+
+test "runnable CPU loan cancellation expiry and close retain cleanup ownership" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const Token = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    inline for (.{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        Clock.tick = 0;
+        var canceled = false;
+        var owner = try Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2 });
+        defer owner.close();
+        var base = testEntry(.background, 1, 11);
+        try owner.submit(&base);
+        defer owner.finish(&base);
+        var loan: Execution = .{};
+        defer loan.finish();
+        try loan.startBorrowable(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .retained_bytes = 17, .cancellation = .{ .ptr = &canceled, .requested = Token.requested } }, .query, .{ .max_non_yield_ns = 1000 });
+        try loan.reserveCleanupFor(.{ .io = std.testing.io }, 100 * std.time.ns_per_ms);
+        if (cause == error.Canceled) canceled = true else if (cause == error.DeadlineExceeded) Clock.tick = 10 else owner.close();
+        try std.testing.expectError(cause, loan.checkpoint());
+        try std.testing.expectEqual(State.stopped, owner.state(&loan.entry.?));
+        try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+        try std.testing.expectEqual(@as(u64, 28), owner.stats().retained_bytes);
+        try loan.activateCleanup();
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().cleanup_runnable_slots);
+        try std.testing.expectEqual(@as(?CpuBorrowBudget, null), loan.entry.?.cpu_borrow_budget);
+        loan.finish();
+        owner.finish(&base);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    }
+}
+
+test "runnable CPU loan rejects unsafe growth fanout promotion and invalid work bounds" {
+    var owner = try Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true });
+    defer owner.close();
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.startBorrowable(&owner, .{ .io = std.testing.io, .retained_bytes = 17 }, .write, .{ .max_non_yield_ns = 1000 });
+    try std.testing.expectError(error.InvalidRunnableTransition, execution.resizeTeam(2));
+    try std.testing.expectError(error.InvalidRunnableTransition, execution.growInputBytes(18));
+    try std.testing.expectError(error.InvalidRunnableTransition, execution.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) }));
+    var child: Execution = .{};
+    defer child.finish();
+    try std.testing.expectError(error.InvalidRunnableTransition, child.reserveChild(&execution, std.testing.io, @sizeOf(Execution)));
+    try execution.disableCpuBorrow();
+    try execution.resizeTeam(2);
+    try std.testing.expectEqual(@as(usize, 2), execution.entry.?.slots);
+    try execution.resizeTeam(1);
+    try execution.enableCpuBorrow(.{ .max_non_yield_ns = 1000 });
+    try std.testing.expectError(error.InvalidRunnableTransition, execution.resizeTeam(2));
+    try execution.disableCpuBorrow();
+    try execution.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) });
+    try std.testing.expectError(error.InvalidRunnableTransition, execution.enableCpuBorrow(.{ .max_non_yield_ns = 1000 }));
+    inline for (.{ @as(u64, 0), @as(u64, 101 * std.time.ns_per_ms) }) |bound| {
+        var invalid = testEntry(.query, 1, 0);
+        invalid.cpu_borrow_budget = .{ .max_non_yield_ns = bound };
+        try std.testing.expectError(error.InvalidRunnableTransition, owner.submit(&invalid));
+        try std.testing.expectEqual(State.fresh, invalid.state);
+    }
+}
+
+test "runnable CPU loan disable reacquires general authority before an unqualified phase" {
+    const io = std.testing.io;
+    const Worker = struct {
+        fn run(execution: *Execution) !void {
+            try execution.disableCpuBorrow();
+        }
+    };
+    var owner = try Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2, .max_wait_ms = 5000 });
+    defer owner.close();
+    var base = testEntry(.background, 1, 11);
+    try owner.submit(&base);
+    defer owner.finish(&base);
+    var loan: Execution = .{};
+    defer loan.finish();
+    try loan.startBorrowable(&owner, .{ .io = io, .retained_bytes = 17 }, .query, .{ .max_non_yield_ns = 1000 });
+    var future = try io.concurrent(Worker.run, .{&loan});
+    defer future.cancel(io) catch {};
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+    while (owner.state(&loan.entry.?) != .queued) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.CpuLoanDisableDidNotWait;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+    try std.testing.expectEqual(@as(u64, 28), owner.stats().retained_bytes);
+    owner.finish(&base);
+    try future.await(io);
+    try std.testing.expectEqual(@as(?CpuBorrowBudget, null), loan.entry.?.cpu_borrow_budget);
+    try std.testing.expectEqual(State.running, owner.state(&loan.entry.?));
+    try std.testing.expectEqual(@as(u64, 1), owner.cpuBorrowStats().grants);
+}
+
+test "runnable CPU loan cleanup never carries a loan into dedicated or legacy cleanup" {
+    inline for (.{ @as(usize, 0), @as(usize, 1) }) |cleanup_slots| {
+        var owner = try Scheduler.init(.{ .slots = 4 + cleanup_slots, .cleanup_slots = cleanup_slots, .read_isolation = true, .bounded_read_slots = 2 });
+        defer owner.close();
+        var base = testEntry(.background, 1, 11);
+        try owner.submit(&base);
+        defer owner.finish(&base);
+        var loan: Execution = .{};
+        defer loan.finish();
+        try loan.startBorrowable(&owner, .{ .io = std.testing.io, .retained_bytes = 17 }, .query, .{ .max_non_yield_ns = 1000 });
+        try loan.reserveCleanupFor(.{ .io = std.testing.io }, 100 * std.time.ns_per_ms);
+        try owner.activateCleanup(&loan.entry.?);
+        try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+        try std.testing.expectEqual(@as(?CpuBorrowBudget, null), loan.entry.?.cpu_borrow_budget);
+        if (cleanup_slots == 0) try std.testing.expectEqual(State.queued, owner.state(&loan.entry.?)) else try std.testing.expectEqual(@as(usize, 1), owner.stats().cleanup_runnable_slots);
+        owner.finish(&base);
+        try owner.waitRetained(&loan.entry.?);
+        loan.finish();
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+        try std.testing.expectEqual(owner.cpuBorrowStats().grants, owner.cpuBorrowStats().returns);
+    }
+}
+
+test "runnable CPU loan preserves the default hard floor without a borrower checkpoint" {
+    var owner = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .read_isolation = true });
+    defer owner.close();
+    var base = testEntry(.background, 1, 11);
+    defer owner.finish(&base);
+    try owner.submit(&base);
+    var loan = testEntry(.write, 1, 17);
+    loan.cpu_borrow_budget = .{ .max_non_yield_ns = 1000 };
+    defer owner.finish(&loan);
+    try owner.submit(&loan);
+    try std.testing.expectEqual(State.queued, owner.state(&loan));
+    try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+    var floor = testEntry(.query, 1, 19);
+    floor.read_lane = .bounded;
+    defer owner.finish(&floor);
+    try owner.submit(&floor);
+    try std.testing.expectEqual(State.running, owner.state(&floor));
+    try std.testing.expectEqual(State.running, owner.state(&base));
+    try std.testing.expectEqual(@as(u64, 0), owner.cpuBorrowStats().grants);
+}
+
+test "runnable CPU loan elastic reserves keep a hard floor at every bounded occupancy" {
+    for ([_]usize{ 2, 3, 4 }) |reserve| {
+        for (0..reserve) |occupied| {
+            var owner = try Scheduler.init(.{ .slots = reserve + 3, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = reserve });
+            defer owner.close();
+            var base = testEntry(.background, 1, 11);
+            defer owner.finish(&base);
+            try owner.submit(&base);
+            var reads: [4]Entry = undefined;
+            var count: usize = 0;
+            defer for (reads[0..count]) |*read| owner.finish(read);
+            for (0..occupied) |_| {
+                reads[count] = testEntry(.query, 1, 1);
+                reads[count].read_lane = .bounded;
+                try owner.submit(&reads[count]);
+                try std.testing.expectEqual(State.running, owner.state(&reads[count]));
+                count += 1;
+            }
+            var loan = testEntry(.write, 1, 17);
+            loan.cpu_borrow_budget = .{ .max_non_yield_ns = 1000 };
+            defer owner.finish(&loan);
+            try owner.submit(&loan);
+            try std.testing.expectEqual(State.running, owner.state(&loan));
+            try std.testing.expectEqual(@as(usize, 1), owner.cpuBorrowStats().active);
+            // No checkpoint, yield, or block from the borrower. If the floor
+            // was idle it must admit a bounded read immediately.
+            if (occupied == 0) {
+                reads[count] = testEntry(.query, 1, 1);
+                reads[count].read_lane = .bounded;
+                try owner.submit(&reads[count]);
+                try std.testing.expectEqual(State.running, owner.state(&reads[count]));
+                count += 1;
+            }
+            var second = testEntry(.inference, 1, 23);
+            second.cpu_borrow_budget = .{ .max_non_yield_ns = 1000 };
+            defer owner.finish(&second);
+            try owner.submit(&second);
+            try std.testing.expectEqual(State.queued, owner.state(&second));
+            try std.testing.expectEqual(State.running, owner.state(&loan));
+            try std.testing.expectEqual(@as(usize, 1), owner.cpuBorrowStats().active);
+            try std.testing.expect(owner.stats().runnable_slots <= owner.config.slots);
+            try std.testing.expectEqual(@as(u64, 51 + count), owner.stats().retained_bytes);
+        }
+    }
+}
+
+test "runnable scheduler bounded CPU reserve validates startup and preserves cleanup" {
+    for ([_]usize{ 0, 65534, std.math.maxInt(usize) }) |reserve| {
+        try std.testing.expectError(error.InvalidRunnablePolicy, (Config{ .bounded_read_slots = reserve }).validate());
+    }
+    const explicit: Config = .{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2 };
+    try explicit.validateManagedCleanupCapacity();
+    try std.testing.expectEqual(@as(usize, 1), explicit.generalSlots());
+    try std.testing.expectEqual(@as(usize, 1), explicit.boundedReadFloorSlots());
+    try std.testing.expectEqual(@as(usize, 1), explicit.cpuBorrowSlots());
+    try std.testing.expectError(error.InvalidRunnablePolicy, (Config{ .slots = 4, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2 }).validate());
+    try std.testing.expectError(error.ManagerCleanupCapacityUnavailable, (Config{ .slots = 4, .read_isolation = true, .bounded_read_slots = 2 }).validateManagedCleanupCapacity());
+    const automatic: Config = .{ .capacity_mode = .automatic, .bounded_read_slots = 2 };
+    const small = try automatic.resolveCapacity(.{ .millicpus = 4000, .source = .cgroup_v2 }, .{});
+    try std.testing.expect(!small.readIsolation());
+    try std.testing.expectEqual(@as(usize, 2), small.generalSlots());
+    const large = try automatic.resolveCapacity(.{ .millicpus = 5000, .source = .cgroup_v2 }, .{});
+    try std.testing.expect(large.readIsolation());
+    try std.testing.expectEqual(@as(usize, 1), large.generalSlots());
+    const required: Config = .{ .capacity_mode = .automatic, .bounded_read_slots = 2, .read_isolation = true };
+    try std.testing.expectError(error.InvalidRunnablePolicy, required.resolveCapacity(.{ .millicpus = 4000, .source = .cgroup_v2 }, .{}));
+    var unpublished = try Scheduler.init(.{ .slots = 5, .read_isolation = true, .bounded_read_slots = 2 });
+    defer unpublished.close();
+    try unpublished.ensureCleanupCpuBeforePublication();
+    try std.testing.expectEqual(@as(usize, 1), unpublished.config.cleanup_slots);
+    try std.testing.expectEqual(@as(usize, 1), unpublished.config.generalSlots());
+}
+
+test "runnable CPU loan stage exit preserves ordinary quantum and clears eligibility once" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var owner = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .read_isolation = true });
+    defer owner.close();
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 1000, .retained_bytes = 17 }, .query);
+    Clock.tick = 10;
+    try execution.checkpoint();
+    const generation = execution.resume_generation;
+    const quantum = execution.quantum_start_ns;
+    const sample = execution.read_sample_ns;
+    const checkpoints = execution.checkpoints;
+    for (0..8) |_| try execution.endCpuBorrowStage();
+    try std.testing.expectEqual(generation, execution.resume_generation);
+    try std.testing.expectEqual(quantum, execution.quantum_start_ns);
+    try std.testing.expectEqual(sample, execution.read_sample_ns);
+    try std.testing.expectEqual(checkpoints, execution.checkpoints);
+    try execution.enableCpuBorrow(.{ .max_non_yield_ns = 100 });
+    Clock.tick = 20;
+    try execution.endCpuBorrowStage();
+    try std.testing.expectEqual(@as(?CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+    try std.testing.expectEqual(generation + 1, execution.resume_generation);
+    try std.testing.expectEqual(@as(u64, 1000), execution.entry.?.options.deadline_ns.?);
+    try std.testing.expectEqual(@as(u64, 17), owner.stats().retained_bytes);
+    const after = execution.resume_generation;
+    Clock.tick = 30;
+    try execution.endCpuBorrowStage();
+    try std.testing.expectEqual(after, execution.resume_generation);
+    try std.testing.expectEqual(@as(u64, 20), execution.quantum_start_ns);
+    try std.testing.expectEqual(@as(u64, 0), owner.cpuBorrowStats().grants);
+}
+
+test "runnable CPU loan transfers a live validated grant without suspending or refreshing authority" {
+    const Clock = struct {
+        fn now() u64 {
+            return 0;
+        }
+    };
+    for ([_]usize{ 1, 2 }) |reserve| {
+        var owner = try Scheduler.init(.{ .slots = reserve + 3, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = reserve });
+        defer owner.close();
+        var execution: Execution = .{};
+        defer execution.finish();
+        try execution.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 1000000, .retained_bytes = 17 }, .query);
+        try execution.checkpoint();
+        var peer = testEntry(.write, 1, 13);
+        try owner.submit(&peer);
+        defer owner.finish(&peer);
+        try std.testing.expectEqual(State.queued, owner.state(&peer));
+        const generation = execution.resume_generation;
+        const quantum = execution.quantum_start_ns;
+        const checkpoints = execution.checkpoints;
+        try execution.enableCpuBorrow(.{ .max_non_yield_ns = 1000 });
+        try std.testing.expectEqual(State.running, owner.state(&execution.entry.?));
+        try std.testing.expectEqual(if (reserve == 1) State.queued else State.running, owner.state(&peer));
+        try std.testing.expectEqual(reserve == 2, execution.entry.?.borrowed_read_cpu);
+        try std.testing.expectEqual(generation, execution.resume_generation);
+        try std.testing.expectEqual(quantum, execution.quantum_start_ns);
+        try std.testing.expectEqual(checkpoints, execution.checkpoints);
+        var floor = testEntry(.query, 1, 19);
+        floor.read_lane = .bounded;
+        try owner.submit(&floor);
+        defer owner.finish(&floor);
+        var health = testEntry(.control, 1, 0);
+        try owner.submit(&health);
+        defer owner.finish(&health);
+        var cleanup = testEntry(.control, 1, 0);
+        cleanup.protected_cleanup_root = true;
+        cleanup.options.allow_wait = false;
+        cleanup.options.deadline_ns = cleanup.options.now() + 100 * std.time.ns_per_ms;
+        try owner.submit(&cleanup);
+        defer owner.finish(&cleanup);
+        try std.testing.expectEqual(State.running, owner.state(&floor));
+        try std.testing.expectEqual(State.running, owner.state(&health));
+        try std.testing.expectEqual(State.running, owner.state(&cleanup));
+        try std.testing.expectEqual(owner.config.slots, owner.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 49), owner.stats().retained_bytes);
+        try execution.park(.resource_blocked);
+        try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+        try std.testing.expectEqual(@as(?CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+        try std.testing.expectEqual(State.running, owner.state(&peer));
+        owner.finish(&peer);
+        try execution.enter(.query);
+        try std.testing.expectEqual(@as(u64, 1000000), execution.entry.?.options.deadline_ns.?);
+        owner.finish(&health);
+        owner.finish(&cleanup);
+        owner.finish(&floor);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+        try std.testing.expectEqual(owner.cpuBorrowStats().grants, owner.cpuBorrowStats().returns);
+    }
+}
+
+test "runnable CPU loan live transfer preserves team assembly when released capacity cannot fit" {
+    var owner = try Scheduler.init(.{ .slots = 6, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2 });
+    defer owner.close();
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.start(&owner, .{ .io = std.testing.io, .retained_bytes = 17 }, .query);
+    var base = testEntry(.background, 1, 11);
+    try owner.submit(&base);
+    defer owner.finish(&base);
+    var team = testEntry(.write, 2, 13);
+    try owner.submit(&team);
+    defer owner.finish(&team);
+    try execution.enableCpuBorrow(.{ .max_non_yield_ns = 1000 });
+    try std.testing.expectEqual(State.queued, owner.state(&team));
+    try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+    try std.testing.expect(!execution.entry.?.borrowed_read_cpu);
+    try std.testing.expectEqual(@as(usize, 2), owner.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 41), owner.stats().retained_bytes);
+    try execution.park(.resource_blocked);
+    try std.testing.expectEqual(State.queued, owner.state(&team));
+    owner.finish(&base);
+    try std.testing.expectEqual(State.running, owner.state(&team));
+    owner.finish(&team);
+    try execution.enter(.query);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(owner.cpuBorrowStats().grants, owner.cpuBorrowStats().returns);
+}
+
+test "runnable scheduler bounds class lookahead and reveals fitting work after head retirement" {
+    inline for (.{ false, true }) |isolated| {
+        var scheduler = try Scheduler.init(.{ .slots = if (isolated) 6 else 5, .cleanup_slots = 1, .read_isolation = isolated, .max_backfills = 65535 });
+        var holder = testEntry(.query, 2, 0);
+        var blocked: [max_backfill_lookahead + 1]Entry = undefined;
+        for (&blocked) |*entry| entry.* = testEntry(.write, 2, 0);
+        var fitting = testEntry(.write, 1, 0);
+        var control = testEntry(.control, 1, 0);
+        var bounded = testEntry(.query, 1, 0);
+        bounded.read_lane = .bounded;
+        var cleanup: Execution = .{};
+        defer cleanup.finish();
+        defer scheduler.finish(&bounded);
+        defer scheduler.finish(&holder);
+        defer for (&blocked) |*entry| scheduler.finish(entry);
+        defer scheduler.finish(&fitting);
+        defer scheduler.finish(&control);
+        try scheduler.submit(&holder);
+        for (&blocked) |*entry| try scheduler.submit(entry);
+        try scheduler.submit(&fitting);
+        // Increasing the bypass-count limit does not make selection scan a whole
+        // queue. The fitting operation is just beyond the bounded window.
+        try std.testing.expectEqual(State.queued, scheduler.state(&fitting));
+        try scheduler.submit(&control);
+        try std.testing.expectEqual(State.running, scheduler.state(&control));
+        if (isolated) {
+            try scheduler.submit(&bounded);
+            try std.testing.expectEqual(State.running, scheduler.state(&bounded));
+        }
+        try cleanup.startCleanupRoot(&scheduler, .{ .io = std.testing.io, .deadline_ns = holder.options.now() + 200 * std.time.ns_per_ms, .allow_wait = false });
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().cleanup_runnable_slots);
+        scheduler.finish(&blocked[0]);
+        try std.testing.expectEqual(State.running, scheduler.state(&fitting));
+        scheduler.finish(&fitting);
+        scheduler.finish(&holder);
+        for (blocked[1..]) |*entry| {
+            try std.testing.expectEqual(State.running, scheduler.state(entry));
+            scheduler.finish(entry);
+        }
+        scheduler.finish(&control);
+        scheduler.finish(&bounded);
+        cleanup.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    }
+}
+
+test "runnable scheduler discovers continuations independently of full fresh lookahead" {
+    inline for (.{ false, true }) |isolated| {
+        inline for (.{ State.resource_blocked, State.output_blocked }) |reason| {
+            var scheduler = try Scheduler.init(.{ .slots = if (isolated) 6 else 5, .cleanup_slots = 1, .read_isolation = isolated });
+            var resumed = testEntry(.write, 1, 37);
+            var holder = testEntry(.query, 2, 11);
+            var starts: [max_backfill_lookahead + 1]Entry = undefined;
+            for (&starts) |*entry| entry.* = testEntry(.write, 2, 5);
+            var hidden_start = testEntry(.write, 1, 13);
+            defer scheduler.finish(&resumed);
+            defer scheduler.finish(&holder);
+            defer for (&starts) |*entry| scheduler.finish(entry);
+            defer scheduler.finish(&hidden_start);
+            try scheduler.submit(&resumed);
+            try scheduler.block(&resumed, reason);
+            try scheduler.submit(&holder);
+            for (&starts) |*entry| try scheduler.submit(entry);
+            try scheduler.submit(&hidden_start);
+            try std.testing.expectEqual(State.queued, scheduler.state(&hidden_start));
+            const before = scheduler.stats();
+            const original_io = resumed.options.io;
+            try scheduler.unblock(&resumed);
+            try std.testing.expectEqual(State.running, scheduler.state(&resumed));
+            try std.testing.expectEqual(State.queued, scheduler.state(&hidden_start));
+            try std.testing.expectEqual(before.operations, scheduler.stats().operations);
+            try std.testing.expectEqual(before.retained_bytes, scheduler.stats().retained_bytes);
+            try std.testing.expectEqual(original_io, resumed.options.io);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().output_blocked);
+            scheduler.finish(&resumed);
+            // The independent continuation window does not widen fresh scans.
+            try std.testing.expectEqual(State.queued, scheduler.state(&hidden_start));
+            scheduler.finish(&starts[0]);
+            try std.testing.expectEqual(State.running, scheduler.state(&hidden_start));
+            scheduler.finish(&hidden_start);
+            scheduler.finish(&holder);
+            for (starts[1..]) |*entry| {
+                try std.testing.expectEqual(State.running, scheduler.state(entry));
+                scheduler.finish(entry);
+            }
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().queued);
+        }
+    }
+}
+
+test "runnable scheduler merges fresh and resumed service in enqueue order and closes both" {
+    var scheduler = try Scheduler.init(.{ .slots = 2 });
+    var resumed = testEntry(.write, 1, 17);
+    var holder = testEntry(.query, 1, 19);
+    var fresh = testEntry(.write, 1, 23);
+    var younger = testEntry(.write, 1, 29);
+    defer scheduler.finish(&resumed);
+    defer scheduler.finish(&holder);
+    defer scheduler.finish(&fresh);
+    defer scheduler.finish(&younger);
+    try scheduler.submit(&resumed);
+    try scheduler.block(&resumed, .resource_blocked);
+    try scheduler.submit(&holder);
+    try scheduler.submit(&fresh);
+    try scheduler.unblock(&resumed);
+    scheduler.finish(&holder);
+    try std.testing.expectEqual(State.running, scheduler.state(&fresh));
+    try std.testing.expectEqual(State.queued, scheduler.state(&resumed));
+    scheduler.finish(&fresh);
+    try std.testing.expectEqual(State.running, scheduler.state(&resumed));
+    try scheduler.submit(&younger);
+    try scheduler.yield(&resumed);
+    try std.testing.expectEqual(State.running, scheduler.state(&younger));
+    try std.testing.expectEqual(State.queued, scheduler.state(&resumed));
+    scheduler.close();
+    try std.testing.expectEqual(State.stopped, scheduler.state(&resumed));
+    try std.testing.expectEqual(error.SchedulerClosed, resumed.failure.?);
+    try std.testing.expectEqual(State.running, scheduler.state(&younger));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().queued);
+    try std.testing.expectEqual(@as(u64, 46), scheduler.stats().retained_bytes);
+    scheduler.finish(&younger);
+    scheduler.finish(&resumed);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+}
+
+test "runnable scheduler bounds continuation lookahead independently of fresh candidates" {
+    var scheduler = try Scheduler.init(.{ .slots = 4, .max_backfills = 65535 });
+    var resumed: [max_backfill_lookahead + 1]Entry = undefined;
+    for (&resumed) |*entry| entry.* = testEntry(.write, 2, 5);
+    var hidden = testEntry(.write, 1, 7);
+    var holder = testEntry(.query, 2, 11);
+    var fresh = testEntry(.write, 1, 13);
+    defer for (&resumed) |*entry| scheduler.finish(entry);
+    defer scheduler.finish(&hidden);
+    defer scheduler.finish(&holder);
+    defer scheduler.finish(&fresh);
+    for (&resumed) |*entry| {
+        try scheduler.submit(entry);
+        try scheduler.block(entry, .resource_blocked);
+    }
+    try scheduler.submit(&hidden);
+    try scheduler.block(&hidden, .output_blocked);
+    try scheduler.submit(&holder);
+    for (&resumed) |*entry| try scheduler.unblock(entry);
+    try scheduler.unblock(&hidden);
+    try std.testing.expectEqual(State.queued, scheduler.state(&hidden));
+    try scheduler.submit(&fresh);
+    try std.testing.expectEqual(State.running, scheduler.state(&fresh));
+    try std.testing.expectEqual(State.queued, scheduler.state(&hidden));
+    scheduler.finish(&fresh);
+    scheduler.finish(&resumed[0]);
+    try std.testing.expectEqual(State.running, scheduler.state(&hidden));
+    scheduler.finish(&hidden);
+    scheduler.finish(&holder);
+    for (resumed[1..]) |*entry| {
+        try std.testing.expectEqual(State.running, scheduler.state(entry));
+        scheduler.finish(entry);
+    }
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().queued);
+}
+
+test "runnable scheduler discovers reserved child reentry before its first CPU grant" {
+    var scheduler = try Scheduler.init(.{ .slots = 4 });
+    var parent = testEntry(.query, 1, 17);
+    var child = testEntry(.query, 1, @sizeOf(Entry));
+    var holder = testEntry(.query, 1, 19);
+    var starts: [max_backfill_lookahead + 1]Entry = undefined;
+    for (&starts) |*entry| entry.* = testEntry(.query, 2, 23);
+    defer scheduler.finish(&parent);
+    defer scheduler.finish(&child);
+    defer scheduler.finish(&holder);
+    defer for (&starts) |*entry| scheduler.finish(entry);
+    try scheduler.submit(&parent);
+    try scheduler.reserveChild(&parent, &child, std.testing.io);
+    try std.testing.expectEqual(State.resource_blocked, scheduler.state(&child));
+    try scheduler.submit(&holder);
+    for (&starts) |*entry| try scheduler.submit(entry);
+    const before = scheduler.stats();
+    try scheduler.unblock(&child);
+    try std.testing.expectEqual(State.running, scheduler.state(&child));
+    try std.testing.expectEqual(before.operations, scheduler.stats().operations);
+    try std.testing.expectEqual(before.retained_bytes, scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), parent.children);
+    scheduler.finish(&child);
+    try std.testing.expectEqual(@as(usize, 0), parent.children);
+    scheduler.finish(&holder);
+    scheduler.finish(&parent);
+    for (&starts) |*entry| {
+        try std.testing.expectEqual(State.running, scheduler.state(entry));
+        scheduler.finish(entry);
+    }
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().queued);
+}
+
+test "runnable synchronous resource stage detaches temporary callbacks on policy and resource refusal" {
+    const Stage = struct {
+        probes: usize = 0,
+        acquisitions: usize = 0,
+        policy_denied: bool,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.policy_denied) return error.Forbidden;
+        }
+        fn probe(raw: *anyopaque) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.probes += 1;
+            return @backingInt(GrantResources.Probe.too_large);
+        }
+        fn acquire(raw: *anyopaque) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.acquisitions += 1;
+            return @backingInt(GrantResources.Acquire.acquired);
+        }
+    };
+    for ([_]bool{ true, false }) |policy_denied| {
+        var scheduler = try Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 72 }, .query);
+        defer execution.finish();
+        var stage: Stage = .{ .policy_denied = policy_denied };
+        try std.testing.expectError(if (policy_denied) error.Forbidden else error.ResourceRequestTooLarge, execution.enterWithResources(.{ .context = &stage, .probe = Stage.probe, .acquire = Stage.acquire }, .{ .context = &stage, .check = Stage.check }));
+        try std.testing.expect(execution.entry.?.pending_resources == null);
+        try std.testing.expectEqual(State.stopped, execution.entry.?.state);
+        try std.testing.expectEqual(@as(usize, if (policy_denied) 0 else 1), stage.probes);
+        try std.testing.expectEqual(@as(usize, 0), stage.acquisitions);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 72), scheduler.stats().retained_bytes);
+        scheduler.notifyResourceProgress();
+        try std.testing.expectEqual(@as(usize, if (policy_denied) 0 else 1), stage.probes);
+    }
+    var scheduler = try Scheduler.init(.{ .slots = 2 });
+    defer scheduler.close();
+    var control: Execution = .{};
+    try control.start(&scheduler, .{ .io = std.testing.io }, .control);
+    defer control.finish();
+    var stage: Stage = .{ .policy_denied = false };
+    try std.testing.expectError(error.InvalidRunnableTransition, control.enterWithResources(.{ .context = &stage, .probe = Stage.probe, .acquire = Stage.acquire }, null));
+    try std.testing.expectEqual(State.running, control.entry.?.state);
+    try std.testing.expectEqual(@as(usize, 0), stage.probes);
+}
+
+test "runnable scheduler ages sparse backfills on the original clock while retained owners and controls progress" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .weights = .{ 1, 1, 1, 1 }, .max_backfills = 65535 });
+    var resumed = testEntry(.inference, 1, 17);
+    var holder = testEntry(.write, 2, 19);
+    var large = testEntry(.query, 3, 23);
+    var small: [3]Entry = undefined;
+    for (&small) |*e| e.* = testEntry(.query, 1, 29);
+    var control = testEntry(.control, 1, 31);
+    defer scheduler.finish(&resumed);
+    defer scheduler.finish(&holder);
+    defer scheduler.finish(&large);
+    defer scheduler.finish(&control);
+    defer for (&small) |*e| scheduler.finish(e);
+    resumed.options.native_now_ns = Clock.now;
+    holder.options.native_now_ns = Clock.now;
+    large.options.native_now_ns = Clock.now;
+    large.options.deadline_ns = std.time.ns_per_s;
+    try scheduler.submit(&resumed);
+    try scheduler.block(&resumed, .resource_blocked);
+    try scheduler.submit(&holder);
+    try scheduler.submit(&large);
+    const original = large.queued_since_ns;
+    try scheduler.submit(&small[0]);
+    try std.testing.expectEqual(State.running, scheduler.state(&small[0]));
+    scheduler.finish(&small[0]);
+    Clock.tick = scheduler.config.backfillAgeNs() - 1;
+    try scheduler.submit(&small[1]);
+    try std.testing.expectEqual(State.running, scheduler.state(&small[1]));
+    scheduler.finish(&small[1]);
+    Clock.tick += 1;
+    try scheduler.pollWait(&large);
+    try scheduler.submit(&small[2]);
+    try std.testing.expectEqual(State.queued, scheduler.state(&small[2]));
+    try std.testing.expectEqual(@as(u16, 2), large.bypasses);
+    try std.testing.expectEqual(original, large.queued_since_ns);
+    const before = scheduler.stats();
+    try scheduler.unblock(&resumed);
+    try std.testing.expectEqual(State.running, scheduler.state(&resumed));
+    try std.testing.expectEqual(State.queued, scheduler.state(&small[2]));
+    try std.testing.expectEqual(before.operations, scheduler.stats().operations);
+    try std.testing.expectEqual(before.retained_bytes, scheduler.stats().retained_bytes);
+    try scheduler.submit(&control);
+    try std.testing.expectEqual(State.running, scheduler.state(&control));
+    var cleanup: Execution = .{};
+    defer cleanup.finish();
+    try cleanup.startCleanupRoot(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .deadline_ns = control.options.now() + 100 * std.time.ns_per_ms });
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().cleanup_runnable_slots);
+    scheduler.finish(&resumed);
+    scheduler.finish(&holder);
+    try std.testing.expectEqual(State.running, scheduler.state(&large));
+    try std.testing.expectEqual(State.queued, scheduler.state(&small[2]));
+    try std.testing.expectEqual(@as(?u64, std.time.ns_per_s), large.options.deadline_ns);
+    scheduler.finish(&large);
+    try std.testing.expectEqual(State.running, scheduler.state(&small[2]));
+    try std.testing.expectEqual(@as(u64, 2), scheduler.metrics.grants[@backingInt(Class.inference)]);
+}
+
+test "runnable scheduler orders aged barriers by enqueue sequence across unrelated original clocks" {
+    const OlderClock = struct {
+        var tick: u64 = 100 * std.time.ns_per_s;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const YoungerClock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    OlderClock.tick = 100 * std.time.ns_per_s;
+    YoungerClock.tick = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 4, .weights = .{ 1, 1, 1, 1 }, .max_backfills = 65535 });
+    var holder = testEntry(.background, 2, 0);
+    var older = testEntry(.query, 3, 0);
+    var younger = testEntry(.write, 3, 0);
+    defer scheduler.finish(&holder);
+    defer scheduler.finish(&older);
+    defer scheduler.finish(&younger);
+    older.options.native_now_ns = OlderClock.now;
+    younger.options.native_now_ns = YoungerClock.now;
+    try scheduler.submit(&holder);
+    try scheduler.submit(&older);
+    try scheduler.submit(&younger);
+    OlderClock.tick += scheduler.config.backfillAgeNs();
+    YoungerClock.tick += scheduler.config.backfillAgeNs();
+    try scheduler.pollWait(&older);
+    try scheduler.pollWait(&younger);
+    try std.testing.expect(scheduler.resource_barrier == &older);
+    scheduler.finish(&holder);
+    try std.testing.expectEqual(State.running, scheduler.state(&older));
+    try std.testing.expectEqual(State.queued, scheduler.state(&younger));
+    scheduler.finish(&older);
+    try std.testing.expectEqual(State.running, scheduler.state(&younger));
+    // The barrier is a paid class admission, including the direct dispatch path.
+    try std.testing.expect(scheduler.credits[1] < younger.slots);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms / 4), (Config{ .max_wait_ms = 1 }).backfillAgeNs());
+    try std.testing.expectEqual(@as(u64, 25 * std.time.ns_per_ms), (Config{ .max_wait_ms = 60000 }).backfillAgeNs());
+}
+
+test "runnable scheduler retires aged CPU barriers on original cancellation and deadline without releasing retained ownership" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const Token = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    for ([_]bool{ false, true }) |cancel| {
+        Clock.tick = 0;
+        var canceled = false;
+        var scheduler = try Scheduler.init(.{ .slots = 4, .weights = .{ 1, 1, 1, 1 }, .max_backfills = 65535 });
+        var holder = testEntry(.write, 2, 19);
+        var large = testEntry(.query, 3, 23);
+        var small = testEntry(.query, 1, 29);
+        var younger = testEntry(.query, 1, 31);
+        large.options.native_now_ns = Clock.now;
+        large.options.deadline_ns = scheduler.config.backfillAgeNs() + 1;
+        large.options.cancellation = .{ .ptr = &canceled, .requested = Token.requested };
+        defer scheduler.finish(&holder);
+        defer scheduler.finish(&large);
+        defer scheduler.finish(&small);
+        defer scheduler.finish(&younger);
+        try scheduler.submit(&holder);
+        try scheduler.submit(&large);
+        try scheduler.submit(&small);
+        scheduler.finish(&small);
+        Clock.tick = scheduler.config.backfillAgeNs();
+        try scheduler.pollWait(&large);
+        try scheduler.submit(&younger);
+        try std.testing.expectEqual(State.queued, scheduler.state(&younger));
+        if (cancel) canceled = true else Clock.tick += 1;
+        try std.testing.expectError(if (cancel) error.Canceled else error.DeadlineExceeded, scheduler.waitRetained(&large));
+        try std.testing.expectEqual(State.stopped, scheduler.state(&large));
+        try std.testing.expectEqual(State.running, scheduler.state(&younger));
+        try std.testing.expectEqual(@as(usize, 3), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 19 + 23 + 31), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(u64, 0), large.queued_since_ns);
+        try std.testing.expect(scheduler.resource_barrier == null);
+    }
+}
+
+test "runnable scheduler draining continuations preserve class shares and reserved team credit" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 4, .weights = .{ 1, 2, 1, 1 }, .max_backfills = 65535 });
+    var owners: [3][24]Entry = undefined;
+    for (&owners, [_]Class{ .query, .write, .inference }) |*lane, class| for (lane) |*e| {
+        e.* = testEntry(class, 1, 0);
+        e.options.native_now_ns = Clock.now;
+    };
+    defer for (&owners) |*lane| for (lane) |*e| scheduler.finish(e);
+    for (&owners) |*lane| for (lane) |*e| {
+        try scheduler.submit(e);
+        try scheduler.block(e, .resource_blocked);
+    };
+    var holder = testEntry(.background, 2, 0);
+    var large = testEntry(.query, 3, 0);
+    var small = testEntry(.query, 1, 0);
+    holder.options.native_now_ns = Clock.now;
+    large.options.native_now_ns = Clock.now;
+    small.options.native_now_ns = Clock.now;
+    defer scheduler.finish(&holder);
+    defer scheduler.finish(&large);
+    defer scheduler.finish(&small);
+    try scheduler.submit(&holder);
+    try scheduler.submit(&large);
+    try scheduler.submit(&small);
+    scheduler.finish(&small);
+    // Exercise the earned-round drain path, with the team's admission cost
+    // already accumulated. Other tests cover age before that cost is earned.
+    scheduler.credits[0] = large.slots;
+    Clock.tick = scheduler.config.backfillAgeNs();
+    try scheduler.pollWait(&large);
+    const baseline = scheduler.stats().grants;
+    for (&owners) |*lane| for (lane) |*e| try scheduler.unblock(e);
+    for (0..40) |_| {
+        const running = found: for (&owners) |*lane| {
+            for (lane) |*e| if (scheduler.state(e) == .running) break :found e;
+        } else return error.NoRunnableContinuation;
+        scheduler.finish(running);
+        try std.testing.expectEqual(State.queued, scheduler.state(&large));
+        try std.testing.expect(scheduler.credits[0] >= large.slots);
+        try std.testing.expect(scheduler.credits[0] <= scheduler.config.slots + scheduler.weight(0));
+    }
+    const grants = scheduler.stats().grants;
+    const reads = grants[0] - baseline[0];
+    const writes = grants[1] - baseline[1];
+    const inference = grants[2] - baseline[2];
+    try std.testing.expectEqual(@as(u64, 41), reads + writes + inference);
+    try std.testing.expect(reads >= 9 and reads <= 12);
+    try std.testing.expect(writes >= 19 and writes <= 22);
+    try std.testing.expect(inference >= 9 and inference <= 12);
+}
+
+test "runnable scheduler aged paid barrier reconciles retained debt before its CPU grant" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 4, .weights = .{ 1, 1, 1, 1 }, .max_backfills = 65535 });
+    var holder = testEntry(.write, 2, 0);
+    var large = testEntry(.query, 3, 0);
+    var small = testEntry(.query, 1, 0);
+    defer scheduler.finish(&holder);
+    defer scheduler.finish(&large);
+    defer scheduler.finish(&small);
+    large.options.native_now_ns = Clock.now;
+    try scheduler.submit(&holder);
+    try scheduler.submit(&large);
+    try scheduler.submit(&small);
+    scheduler.finish(&small);
+    large.service_debt = 64;
+    scheduler.credits[0] = large.slots;
+    Clock.tick = scheduler.config.backfillAgeNs();
+    try scheduler.pollWait(&large);
+    try std.testing.expectEqual(State.queued, scheduler.state(&large));
+    scheduler.finish(&holder);
+    try std.testing.expectEqual(State.running, scheduler.state(&large));
+    try std.testing.expectEqual(@as(usize, 0), large.service_debt);
+    try std.testing.expectEqual(@as(u64, 64), scheduler.stats().read_service_debt_paid);
+    try std.testing.expect(scheduler.credits[0] < large.slots);
+}
+
+test "runnable scheduler age observation never calls an original host clock under its owner lock" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        var owner: ?*Scheduler = null;
+        var called_locked: bool = false;
+        fn now() u64 {
+            if (owner) |scheduler| {
+                if (scheduler.mutex.tryLock()) scheduler.mutex.unlock() else called_locked = true;
+            }
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    Clock.called_locked = false;
+    var scheduler = try Scheduler.init(.{ .slots = 4, .weights = .{ 1, 1, 1, 1 }, .max_backfills = 65535 });
+    Clock.owner = &scheduler;
+    defer Clock.owner = null;
+    var holder = testEntry(.write, 2, 0);
+    var large = testEntry(.query, 3, 0);
+    var small = testEntry(.query, 1, 0);
+    var younger = testEntry(.query, 1, 0);
+    holder.options.native_now_ns = Clock.now;
+    large.options.native_now_ns = Clock.now;
+    small.options.native_now_ns = Clock.now;
+    younger.options.native_now_ns = Clock.now;
+    defer scheduler.finish(&holder);
+    defer scheduler.finish(&large);
+    defer scheduler.finish(&small);
+    defer scheduler.finish(&younger);
+    try scheduler.submit(&holder);
+    try scheduler.submit(&large);
+    try scheduler.submit(&small);
+    scheduler.finish(&small);
+    Clock.tick = scheduler.config.backfillAgeNs();
+    try scheduler.pollWait(&large);
+    try std.testing.expect(large.age_protected);
+    try scheduler.submit(&younger);
+    try std.testing.expectEqual(State.queued, scheduler.state(&younger));
+    scheduler.finish(&holder);
+    try std.testing.expectEqual(State.running, scheduler.state(&large));
+    try std.testing.expect(!Clock.called_locked);
+}
+
+test "runnable measured service preserves class overrun debt across owning finish and new roots" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 2, .weights = .{ 1, 1, 1, 1 }, .quantum_ms = 1 });
+    var expensive: Execution = .{};
+    try expensive.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .query);
+    Clock.tick = 5 * std.time.ns_per_ms;
+    expensive.finish();
+    const spent = scheduler.serviceStats();
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), spent.estimated_slot_ns[0]);
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_ms), spent.observed_slot_ns[0]);
+    try std.testing.expectEqual(-@as(i128, 4 * std.time.ns_per_ms), spent.adjustment_slot_ns[0]);
+    var holder = testEntry(.background, 1, 0);
+    var next = testEntry(.query, 1, 0);
+    var peers: [5]Entry = undefined;
+    for (&peers) |*e| e.* = testEntry(.write, 1, 0);
+    defer scheduler.finish(&holder);
+    defer scheduler.finish(&next);
+    defer for (&peers) |*e| scheduler.finish(e);
+    try scheduler.submit(&holder);
+    try scheduler.submit(&next);
+    for (&peers) |*e| try scheduler.submit(e);
+    scheduler.finish(&holder);
+    for (peers[0..4]) |*e| {
+        try std.testing.expectEqual(State.running, scheduler.state(e));
+        try std.testing.expectEqual(State.queued, scheduler.state(&next));
+        scheduler.finish(e);
+    }
+    try std.testing.expectEqual(State.running, scheduler.state(&next));
+    try std.testing.expectEqual(@as(u64, 4 * std.time.ns_per_ms), scheduler.serviceStats().debt_paid_slot_ns[0]);
+}
+
+test "runnable measured service refunds fractional estimates and excludes parked time" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 2, .weights = .{ 1, 1, 1, 1 }, .quantum_ms = 1 });
+    var execution: Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .query);
+    Clock.tick = std.time.ns_per_ms / 4;
+    try execution.park(.resource_blocked);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms / 4), scheduler.serviceStats().observed_slot_ns[0]);
+    try std.testing.expectEqual(@as(i128, 3 * std.time.ns_per_ms / 4), scheduler.serviceStats().adjustment_slot_ns[0]);
+    Clock.tick += 100 * std.time.ns_per_s;
+    try execution.enter(.query);
+    Clock.tick += std.time.ns_per_ms / 4;
+    execution.finish();
+    const stats = scheduler.serviceStats();
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), stats.estimated_slot_ns[0]);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms / 2), stats.observed_slot_ns[0]);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), stats.refunded_slot_ns[0]);
+    try std.testing.expectEqual(@as(i128, std.time.ns_per_ms / 2), stats.adjustment_slot_ns[0]);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+}
+
+test "runnable measured service preserves weighted slot time for short and underestimated requests" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    for ([_]bool{ false, true }) |continuations| for ([_]u64{ std.time.ns_per_ms / 4, 4 * std.time.ns_per_ms }) |query_cost| {
+        Clock.tick = 0;
+        var scheduler = try Scheduler.init(.{ .slots = 2, .weights = .{ 2, 1, 1, 1 }, .quantum_ms = 1, .max_operations = 512, .max_wait_ms = 60000 });
+        var holder = testEntry(.background, 1, 0);
+        var queries: [256]Entry = undefined;
+        var writes: [128]Entry = undefined;
+        for (&queries) |*e| {
+            e.* = testEntry(.query, 1, 0);
+            e.options.native_now_ns = Clock.now;
+        }
+        for (&writes) |*e| {
+            e.* = testEntry(.write, 1, 0);
+            e.options.native_now_ns = Clock.now;
+        }
+        defer scheduler.finish(&holder);
+        defer for (&queries) |*e| scheduler.finish(e);
+        defer for (&writes) |*e| scheduler.finish(e);
+        try scheduler.submit(&holder);
+        for (queries[0..if (continuations) 1 else queries.len]) |*e| try scheduler.submit(e);
+        for (writes[0..if (continuations) 1 else writes.len]) |*e| try scheduler.submit(e);
+        scheduler.finish(&holder);
+        var q: usize = 0;
+        var w: usize = 0;
+        for (0..90) |_| {
+            const query_index = if (continuations) 0 else q;
+            const write_index = if (continuations) 0 else w;
+            const query = scheduler.state(&queries[query_index]) == .running;
+            const running = if (query) &queries[query_index] else &writes[write_index];
+            try std.testing.expectEqual(State.running, scheduler.state(running));
+            try scheduler.waitRetained(running);
+            Clock.tick += if (query) query_cost else std.time.ns_per_ms;
+            if (continuations) try scheduler.yield(running) else scheduler.finish(running);
+            if (query) q += 1 else w += 1;
+            for (scheduler.credits, 0..) |credit, c| try std.testing.expect(credit <= scheduler.config.slots + scheduler.weight(c));
+        }
+        const observed = scheduler.serviceStats();
+        const query_time = @as(u64, @intCast(q)) * query_cost;
+        const write_time = @as(u64, @intCast(w)) * std.time.ns_per_ms;
+        try std.testing.expectEqual(query_time, observed.observed_slot_ns[0]);
+        try std.testing.expectEqual(write_time, observed.observed_slot_ns[1]);
+        try std.testing.expect(write_time != 0);
+        try std.testing.expect(query_time <= 2 * write_time + 8 * std.time.ns_per_ms);
+        try std.testing.expect(2 * write_time <= query_time + 8 * std.time.ns_per_ms);
+        if (query_cost < std.time.ns_per_ms) try std.testing.expect(observed.refunded_slot_ns[0] != 0) else try std.testing.expect(observed.debt_paid_slot_ns[0] != 0);
+    };
+}
+
+test "runnable measured service samples team shrink without charging parked growth twice" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 5, .weights = .{ 1, 1, 1, 1 }, .quantum_ms = 1 });
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .query);
+    Clock.tick += std.time.ns_per_ms;
+    try execution.resizeTeam(3);
+    Clock.tick += std.time.ns_per_ms;
+    try execution.resizeTeam(1);
+    Clock.tick += 2 * std.time.ns_per_ms;
+    execution.finish();
+    const stats = scheduler.serviceStats();
+    try std.testing.expectEqual(@as(u64, 4 * std.time.ns_per_ms), stats.estimated_slot_ns[0]);
+    try std.testing.expectEqual(@as(u64, 6 * std.time.ns_per_ms), stats.observed_slot_ns[0]);
+    try std.testing.expectEqual(-@as(i128, 2 * std.time.ns_per_ms), stats.adjustment_slot_ns[0]);
+    execution.finish();
+    try std.testing.expectEqualDeep(stats, scheduler.serviceStats());
+}
+
+test "runnable measured service retains origin debt through class changes and CPU loans" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 3, .quantum_ms = 1 });
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .query);
+    Clock.tick += 4 * std.time.ns_per_ms;
+    try execution.park(.resource_blocked);
+    try execution.enter(.write);
+    Clock.tick += std.time.ns_per_ms;
+    execution.finish();
+    const stats = scheduler.serviceStats();
+    try std.testing.expectEqual(@as(u64, 4 * std.time.ns_per_ms), stats.observed_slot_ns[0]);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), stats.observed_slot_ns[1]);
+    try std.testing.expectEqual(-@as(i128, 3 * std.time.ns_per_ms), stats.adjustment_slot_ns[0]);
+    try std.testing.expectEqual(@as(i128, 0), stats.adjustment_slot_ns[1]);
+    var isolated = try Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2, .quantum_ms = 1 });
+    var base = testEntry(.background, 1, 0);
+    defer isolated.finish(&base);
+    try isolated.submit(&base);
+    var loan: Execution = .{};
+    defer loan.finish();
+    try loan.startBorrowable(&isolated, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .write, .{ .max_non_yield_ns = 1000 });
+    try std.testing.expectEqual(@as(usize, 1), isolated.cpuBorrowStats().active);
+    Clock.tick += 100;
+    loan.finish();
+    try std.testing.expectEqual(@as(u64, 100), isolated.serviceStats().observed_slot_ns[1]);
+    try std.testing.expectEqual(@as(u64, 0), isolated.serviceStats().observed_slot_ns[4]);
+    try std.testing.expectEqual(@as(usize, 0), isolated.cpuBorrowStats().active);
+}
+
+test "runnable measured service preserves independent completion cleanup and health progress while class debt remains" {
+    const Foreground = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const Completion = struct {
+        fn now() u64 {
+            return std.time.ns_per_s;
+        }
+    };
+    Foreground.tick = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 4, .cleanup_slots = 1, .weights = .{ 1, 1, 1, 1 }, .quantum_ms = 1 });
+    var write: Execution = .{};
+    defer write.finish();
+    try write.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Foreground.now }, .write);
+    try write.reserveCompletion(.{ .io = std.testing.io, .native_now_ns = Completion.now, .deadline_ns = 2 * std.time.ns_per_s });
+    Foreground.tick = 5 * std.time.ns_per_ms;
+    try write.activateCompletion();
+    try write.park(.resource_blocked);
+    var holder = testEntry(.query, 2, 0);
+    var fresh = testEntry(.write, 1, 0);
+    var health = testEntry(.control, 1, 0);
+    defer scheduler.finish(&holder);
+    defer scheduler.finish(&fresh);
+    defer scheduler.finish(&health);
+    try scheduler.submit(&holder);
+    try scheduler.submit(&fresh);
+    try scheduler.unblock(&write.entry.?);
+    try scheduler.submit(&health);
+    try std.testing.expectEqual(State.running, scheduler.state(&health));
+    var cleanup: Execution = .{};
+    defer cleanup.finish();
+    try cleanup.startCleanupRoot(&scheduler, .{ .io = std.testing.io, .native_now_ns = Completion.now, .deadline_ns = std.time.ns_per_s + 100 * std.time.ns_per_ms, .allow_wait = false });
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().cleanup_runnable_slots);
+    scheduler.finish(&holder);
+    try std.testing.expectEqual(State.running, scheduler.state(&fresh));
+    try std.testing.expectEqual(State.running, scheduler.state(&write.entry.?));
+    try scheduler.waitRetained(&write.entry.?);
+    write.finish();
+    const stats = scheduler.serviceStats();
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_ms), stats.observed_slot_ns[1]);
+    try std.testing.expectEqual(-@as(i128, 4 * std.time.ns_per_ms), stats.adjustment_slot_ns[1]);
+    try std.testing.expectEqual(@as(u64, 0), stats.debt_paid_slot_ns[1]);
+}
+
+test "runnable measured service bounds extreme work and preserves estimates for unobserved invalid and zero clocks" {
+    const Mode = enum { unobserved, zero, backwards, extreme };
+    const Clock = struct {
+        var tick: u64 = 0;
+        var retired: bool = false;
+        fn now() u64 {
+            std.debug.assert(!retired);
+            return tick;
+        }
+    };
+    for (std.enums.values(Mode)) |mode| {
+        Clock.tick = if (mode == .backwards) 10 * std.time.ns_per_ms else 0;
+        Clock.retired = false;
+        var scheduler = try Scheduler.init(.{ .slots = 3, .quantum_ms = 1 });
+        var item = testEntry(.query, 2, 0);
+        item.options.native_now_ns = Clock.now;
+        try scheduler.submit(&item);
+        if (mode != .unobserved) try scheduler.waitRetained(&item);
+        Clock.tick = if (mode == .extreme) std.math.maxInt(u64) else if (mode == .unobserved) 5 * std.time.ns_per_ms else 0;
+        scheduler.finish(&item);
+        const stats = scheduler.serviceStats();
+        if (mode == .extreme) {
+            try std.testing.expectEqual(-@as(i128, 64 * std.time.ns_per_ms), stats.adjustment_slot_ns[0]);
+            try std.testing.expectEqual(@as(u64, 1), stats.clipped_adjustments[0]);
+            try std.testing.expectEqual(std.math.maxInt(u64), stats.observed_slot_ns[0]);
+        } else {
+            try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), stats.unobserved_estimate_ns[0]);
+            try std.testing.expectEqual(@as(i128, 0), stats.adjustment_slot_ns[0]);
+        }
+        Clock.retired = true;
+        scheduler.finish(&item);
+        try std.testing.expectEqualDeep(stats, scheduler.serviceStats());
+    }
+}
+
+test "runnable measured service refunds short cooperative yields without an artificial quantum floor" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 2, .quantum_ms = 1 });
+    var query: Execution = .{};
+    defer query.finish();
+    try query.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .query);
+    for (0..2) |_| {
+        Clock.tick += 100;
+        try scheduler.yield(&query.entry.?);
+        try scheduler.waitRetained(&query.entry.?);
+    }
+    try std.testing.expectEqual(@as(u64, 200), scheduler.serviceStats().observed_slot_ns[0]);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), scheduler.serviceStats().refunded_slot_ns[0]);
+    Clock.tick += 100;
+    query.finish();
+    const stats = scheduler.serviceStats();
+    try std.testing.expectEqual(@as(u64, 300), stats.observed_slot_ns[0]);
+    try std.testing.expectEqual(@as(u64, 2 * std.time.ns_per_ms), stats.refunded_slot_ns[0]);
+    try std.testing.expectEqual(@as(i128, std.time.ns_per_ms - 300), stats.adjustment_slot_ns[0]);
+}
+
+test "runnable measured service protects earned team credit while an overrunning continuation retires" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try Scheduler.init(.{ .slots = 4, .weights = .{ 1, 1, 1, 1 }, .quantum_ms = 1, .max_backfills = 65535 });
+    var owner: Execution = .{};
+    defer owner.finish();
+    var holder = testEntry(.write, 2, 0);
+    var team = testEntry(.query, 3, 0);
+    team.options.native_now_ns = Clock.now;
+    defer scheduler.finish(&holder);
+    defer scheduler.finish(&team);
+    try owner.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .query);
+    try owner.park(.resource_blocked);
+    try scheduler.submit(&holder);
+    try scheduler.submit(&team);
+    scheduler.credits[0] = team.slots;
+    Clock.tick = scheduler.config.backfillAgeNs();
+    try scheduler.pollWait(&team);
+    try owner.enter(.query);
+    Clock.tick += 5 * std.time.ns_per_ms;
+    try owner.park(.resource_blocked);
+    try std.testing.expectEqual(State.queued, scheduler.state(&team));
+    try std.testing.expectEqual(team.slots, scheduler.credits[0]);
+    try std.testing.expectEqual(-@as(i128, 4 * std.time.ns_per_ms), scheduler.serviceStats().adjustment_slot_ns[0]);
+    scheduler.finish(&holder);
+    try std.testing.expectEqual(State.running, scheduler.state(&team));
+    try std.testing.expectEqual(@as(u64, 4 * std.time.ns_per_ms), scheduler.serviceStats().debt_paid_slot_ns[0]);
 }

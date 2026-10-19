@@ -2104,7 +2104,7 @@ const PortableImportStage = struct {
                 // The staging store generated its own local footprint while
                 // importing. Never overwrite destination epochs/cursors with
                 // those facts; destination mutation hooks observe the bytes.
-                if (@import("../artifact_footprint.zig").isKey(key)) return .@"continue";
+                if (@import("../artifact_footprint.zig").isKey(key) or @import("../artifact_replay_inventory.zig").isMetadataKey(key)) return .@"continue";
                 const entry_bytes = key.len +| value.len;
                 if (state.writes.items.len != 0 and
                     (state.writes.items.len >= portable_import_publish_batch_entries or
@@ -3081,6 +3081,10 @@ const DocumentPrimaryReadWindow = struct {
 const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 };
 
 pub const DB = struct {
+    pub fn createStandaloneResourceManager(allocator: Allocator) !*resource_manager_mod.ResourceManager {
+        return resource_manager_mod.SharedResourceManager.create(allocator, standaloneResourceManagerOptions(allocator));
+    }
+
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
     native_query_warming: @import("native_query_warming.zig").Owner = .{},
@@ -3292,20 +3296,49 @@ pub const DB = struct {
     pub const lockApplyForPortableRuntime = local_mutation.lockApplyForPortableRuntime;
 
     fn lockApplySharedForPortableRuntime(self: *DB) !void {
-        try self.enforcePortableRuntimeGate();
-        lockApplyShared(self);
-        errdefer self.core.unlockApplyShared();
-        try self.enforcePortableRuntimeGate();
-        // A failed split may have withdrawn only some graph owners. Keep the
-        // live handle closed to reads until the durable retirement is repaired.
-        const pending = self.core.store.get(self.alloc, graph_split_retire_cursor_key) catch |err| switch (err) {
-            error.NotFound => null,
+        return self.lockApplySharedForPortableRuntimeWithAdmission(null);
+    }
+
+    fn readMaintenanceMarkerWithAdmission(self: *DB, key: []const u8, control: ?@import("../../common/read_admission.zig").Port) !bool {
+        if (control) |port| {
+            var read = try self.core.store.beginReadTxnWithAdmission(.transient, port);
+            defer read.abort();
+            var values: [1]?[]const u8 = .{null};
+            // Presence only: scope errors (including NotFound) must propagate
+            // through the admitted erasure rather than becoming absence.
+            try read.getManySortedWithAdmission(&.{key}, &values, port);
+            return values[0] != null;
+        }
+        const pending = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return false,
             else => return err,
         };
-        if (pending) |cursor| {
-            self.alloc.free(cursor);
+        self.alloc.free(pending);
+        return true;
+    }
+
+    fn enforceReadPortableRuntimeGateWithAdmission(self: *DB, control: ?@import("../../common/read_admission.zig").Port) !void {
+        if (control) |port| {
+            try port.checkLifetime();
+            if (self.local_execution.vector_migration_reopen_required.load(.acquire)) return error.VectorMigrationRecoveryRequired;
+            try enforcePortableRuntimeGateOptional(&self.async_context.portable_runtime_activation_pending);
+            if (self.local_execution.graph_merge_import_recovery_pending.load(.acquire)) return error.GraphMaintenanceInProgress;
+            if (openModeRequiresReadOnlyBackends(self.open_mode) and try self.readMaintenanceMarkerWithAdmission(graph_merge_import_recovery_key, port)) return error.GraphMaintenanceInProgress;
+        } else try self.enforcePortableRuntimeGate();
+    }
+
+    fn lockApplySharedForPortableRuntimeWithAdmission(self: *DB, control: ?@import("../../common/read_admission.zig").Port) !void {
+        if (control) |port| try port.checkpoint();
+        try self.enforceReadPortableRuntimeGateWithAdmission(control);
+        if (control) |port| try @import("../../common/read_admission.zig").lockShared(self.core.apply_mutex, port) else lockApplyShared(self);
+        errdefer self.core.unlockApplyShared();
+        var retained: @import("../../common/read_admission.zig").RetainedDependency = .{};
+        const captured = retained.bind(control);
+        try self.enforceReadPortableRuntimeGateWithAdmission(captured);
+        // A failed split may have withdrawn only some graph owners. Keep the
+        // live handle closed to reads until the durable retirement is repaired.
+        if (try self.readMaintenanceMarkerWithAdmission(graph_split_retire_cursor_key, captured))
             return error.GraphMaintenanceInProgress;
-        }
         if (self.core.index_manager.graphOwnershipCleanupPending())
             return error.GraphMaintenanceInProgress;
     }
@@ -3549,12 +3582,45 @@ pub const DB = struct {
 
     pub fn captureRelationalStatementSnapshot(self: *DB) !RelationalStatementSnapshot {
         if (comptime storage_engine.enabled) return storage_engine.call("captureRelationalStatementSnapshot", .{self});
+        return self.captureRelationalStatementSnapshotWithAdmission(null);
+    }
+
+    fn prepareReadRowPolicyWithAdmission(self: *DB, control: ?@import("../../common/read_admission.zig").Port) !void {
+        if (control) |port| {
+            try port.checkLifetime();
+            if (self.local_execution.row_policy_gate.currentPhase() != .preparing) return;
+            // Replicas finish committed policy transitions on later admission.
+            // Preserve that progress path without waiting for apply while a
+            // coordinator may already retain other owners' statement fences.
+            var retained: @import("../../common/read_admission.zig").RetainedDependency = .{};
+            const captured = retained.bind(port);
+            try self.enforceReadPortableRuntimeGateWithAdmission(captured);
+            if (!self.core.tryLockApplyExclusive()) return error.Backpressured;
+            defer self.core.unlockApply();
+            try self.enforceReadPortableRuntimeGateWithAdmission(captured);
+            try port.checkLifetime();
+            const pending = (try self.pendingRowPolicyReceipt()) orelse return;
+            // This maintenance publication has its existing durable decision
+            // and mandatory completion tail. No foreground check is inserted
+            // after that decision or inside its write transaction.
+            _ = self.finalizePendingRowPolicyReceiptLocked(pending) catch |err| switch (err) {
+                error.RowPolicyReadersActive => return,
+                else => return err,
+            };
+        } else try self.maybeFinalizePendingRowPolicyPublication();
+    }
+
+    pub fn captureRelationalStatementSnapshotWithAdmission(self: *DB, original: ?@import("../../common/read_admission.zig").Port) !RelationalStatementSnapshot {
+        if (comptime storage_engine.enabled) return storage_engine.call("captureRelationalStatementSnapshotWithAdmission", .{ self, original });
+        var retained: @import("../../common/read_admission.zig").RetainedDependency = .{};
+        const control = retained.bind(original);
+        if (control) |port| try port.checkpoint();
         // Capturing a visibility cut does not expose row bytes. A protected
         // statement captures only the owner policy epoch; each later scan
         // must present an authenticated proof for that same epoch and retain
         // its own bounded policy lease. An unprotected cut instead pins a raw
         // lease so activation cannot overtake an in-flight statement.
-        try self.maybeFinalizePendingRowPolicyPublication();
+        try self.prepareReadRowPolicyWithAdmission(control);
         const initial_phase = self.local_execution.row_policy_gate.currentPhase();
         var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = if (initial_phase == .disabled)
             try self.local_execution.row_policy_gate.enterRawRead()
@@ -3565,17 +3631,18 @@ pub const DB = struct {
         errdefer if (row_policy_lease) |*lease| lease.release();
         const policy_generation = self.local_execution.row_policy_gate.generation.load(.acquire);
         const policy_epoch = self.local_execution.row_policy_gate.catalog_epoch.load(.acquire);
-        try self.lockApplySharedForPortableRuntime();
+        try self.lockApplySharedForPortableRuntimeWithAdmission(control);
         defer self.core.unlockApplyShared();
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
         defer view.release();
         if (view.storageMode() != .relational) return error.RelationalTableRequired;
-        var read = try self.core.store.beginReadTxn();
+        var read = if (control) |port| try self.core.store.beginReadTxnWithAdmission(.retain, port) else try self.core.store.beginReadTxn();
         errdefer read.abort();
         if (self.local_execution.row_policy_gate.currentPhase() != initial_phase or
             self.local_execution.row_policy_gate.generation.load(.acquire) != policy_generation or
             self.local_execution.row_policy_gate.catalog_epoch.load(.acquire) != policy_epoch)
             return error.RowPolicyCatalogChanged;
+        if (control) |port| try port.checkpoint();
         return .{
             .row_policy_lease = row_policy_lease,
             .row_policy_phase = initial_phase,
@@ -3596,10 +3663,17 @@ pub const DB = struct {
     }
 
     fn beginRelationalRowsAtSnapshot(self: *DB, alloc: Allocator, request: RelationalRows.Request, statement: ?*RelationalStatementSnapshot) !RelationalRows.Reader {
+        return self.beginRelationalRowsAtSnapshotWithAdmission(alloc, request, statement, null);
+    }
+
+    fn beginRelationalRowsAtSnapshotWithAdmission(self: *DB, alloc: Allocator, request: RelationalRows.Request, statement: ?*RelationalStatementSnapshot, control: ?@import("../../common/read_admission.zig").Port) !RelationalRows.Reader {
+        if (control) |port| try port.checkpoint();
         // A delayed scan may use only the primary path. READY index state and
         // auto-index plans can change after the original visibility cut.
         if (statement != null and (request.index != null or request.auto_index)) return error.SqlStatementSnapshotRequired;
-        try self.lockApplySharedForPortableRuntime();
+        var retained: @import("../../common/read_admission.zig").RetainedDependency = .{};
+        const capture_control = retained.bind(control);
+        try self.lockApplySharedForPortableRuntimeWithAdmission(capture_control);
         var locked = true;
         defer if (locked) self.core.unlockApplyShared();
         var view = self.core.acquireSchemaView() orelse return error.RelationalTableRequired;
@@ -3607,7 +3681,7 @@ pub const DB = struct {
         if (statement) |cut| if (view.version() != cut.schema_version) return error.PreparedGenerationChanged;
         var indexes = self.core.relational_indexes.acquire();
         defer if (indexes) |*pinned| pinned.deinit();
-        const read_snapshot = if (statement) |cut| try cut.read.forkRead() else try self.core.store.beginReadTxn();
+        const read_snapshot = if (statement) |cut| try cut.read.forkRead() else if (capture_control) |port| try self.core.store.beginReadTxnWithAdmission(.retain, port) else try self.core.store.beginReadTxn();
         const authenticated = self.core.store.valuesAreAuthenticated();
         const now = currentTimeNs();
         self.core.unlockApplyShared();
@@ -3615,7 +3689,7 @@ pub const DB = struct {
         // Immutable pins and the read transaction were captured together.
         // Allocation, predicate compilation, readiness I/O and cardinality
         // probes must not hold the global apply publication fence.
-        return try RelationalRows.Reader.openSnapshot(alloc, read_snapshot, authenticated, view, indexes, request, now);
+        return try RelationalRows.Reader.openSnapshotWithAdmission(alloc, read_snapshot, authenticated, view, indexes, request, now, control);
     }
 
     pub fn relationalIndexBuildStatus(self: *DB, name: []const u8) !RelationalIndexBuildStatus {
@@ -3674,6 +3748,7 @@ pub const DB = struct {
     /// only for rolling-upgrade recovery. A changed/missing mirror cannot
     /// silently discard a durability obligation.
     pub const flushDurableReplicationOutboxes = local_mutation.flushDurableReplicationOutboxes;
+    pub const flushDurableReplicationOutboxesStep = local_mutation.flushDurableReplicationOutboxesStep;
     pub const flushDurableReplicationOutboxesWithAdmission = local_mutation.flushDurableReplicationOutboxesWithAdmission;
     pub const flushDurableReplicationOutboxesWithAdmissionAndRoot = local_mutation.flushDurableReplicationOutboxesWithAdmissionAndRoot;
 
@@ -3693,7 +3768,7 @@ pub const DB = struct {
     /// The dedicated owner gives this retry state an independent maintenance
     /// probe and makes close a lifetime barrier for every borrowed callback.
     fn publicationOutboxRecoveryPort(self: *DB) @import("publication_recovery_owner.zig").Owner.Port {
-        return .{ .ptr = self, .eligible = outboxRecoveryEligible, .closing = outboxRecoveryClosing, .pending = outboxRecoveryPending, .may_disarm = outboxRecoveryMayDisarm, .now = outboxRecoveryNow, .drain = outboxRecoveryDrain, .retry_delay = outboxRecoveryDelay, .report = outboxRecoveryReport };
+        return .{ .ptr = self, .eligible = outboxRecoveryEligible, .closing = outboxRecoveryClosing, .pending = outboxRecoveryPending, .may_disarm = outboxRecoveryMayDisarm, .now = outboxRecoveryNow, .drain = outboxRecoveryDrain, .bounded_drain = outboxRecoveryReservedDrain, .progress = outboxRecoveryProgress, .retry_delay = outboxRecoveryDelay, .report = outboxRecoveryReport };
     }
 
     pub fn scheduleDurableReplicationOutboxRecovery(self: *DB) void {
@@ -3723,7 +3798,37 @@ pub const DB = struct {
     }
     fn outboxRecoveryDrain(ptr: *anyopaque) !void {
         const self: *DB = @ptrCast(@alignCast(ptr));
-        try self.flushDurableReplicationOutboxes();
+        // Standard publishers expose polling. Legacy custom publishers retain
+        // their explicit blocking contract on the ordinary maintenance lane;
+        // an opted-in polling attempt itself never falls back to waiting.
+        inline for (.{ self.local_execution.replication_async_batch_mirror, self.local_execution.replication_async_effect_mirror, self.local_execution.replication_async_metadata_mirror }) |configured| {
+            if (configured) |mirror| if (mirror.publisher.poll_completion == null) return self.flushDurableReplicationOutboxes();
+        }
+        try self.flushDurableReplicationOutboxesStep();
+    }
+    fn outboxRecoveryReservedDrain(ptr: *anyopaque) !void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        inline for (.{ self.local_execution.replication_async_batch_mirror, self.local_execution.replication_async_effect_mirror, self.local_execution.replication_async_metadata_mirror }) |configured| {
+            if (configured) |mirror| if (mirror.publisher.poll_completion == null or mirror.publisher.vtable.recover_with_admission == null) return error.PublicationRecoveryNeedsMaintenance;
+        }
+        try local_mutation.flushDurableReplicationOutboxesReservedStep(self);
+    }
+    fn outboxRecoveryProgress(ptr: *anyopaque) @import("publication_outbox_recovery.zig").Driver.Progress {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        const capture = &self.local_execution.replication_intent_capture;
+        // Generation remains observable even if the state lock is contended;
+        // losing a probe must never look like new progress on its next read.
+        var progress: @import("publication_outbox_recovery.zig").Driver.Progress = .{ .generation = capture.progress_generation.load(.acquire) };
+        if (capture.mutex.tryLock()) {
+            progress.generation = capture.progress_generation.load(.acquire);
+            progress.runnable = capture.hasWork();
+            capture.mutex.unlock();
+        }
+        // Probe independently: never nest capture and provider locks. WAL
+        // matching can remain runnable after capture has detached its value.
+        const provider = self.local_execution.replication_recovery_cursor.progress();
+        progress.provider = .{ .generation = provider.generation, .runnable = provider.runnable };
+        return progress;
     }
     fn outboxRecoveryDelay(ptr: *anyopaque, failure_streak: u32) u64 {
         const self: *DB = @ptrCast(@alignCast(ptr));
@@ -3787,6 +3892,17 @@ pub const DB = struct {
                     }
                 }
             }
+            var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
+            const bind_cache_resource_manager = opts.resource_manager != null;
+            if (opts.resource_manager == null) {
+                const manager = try alloc.create(resource_manager_mod.ResourceManager);
+                manager.* = resource_manager_mod.ResourceManager.init(standaloneResourceManagerOptions(alloc));
+                owned_resource_manager = manager;
+                opts.resource_manager = manager;
+            }
+            errdefer if (owned_resource_manager) |manager| {
+                manager.releaseOwned(alloc);
+            };
             const runtime_alloc = backgroundRuntimeAllocator(alloc);
             var owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
             errdefer if (owned_backend_runtime) |*handle| handle.deinit();
@@ -3794,10 +3910,11 @@ pub const DB = struct {
                 if (opts.executor.backend == .manual and
                     opts.physical_root_mode == .filesystem_managed)
                 {
-                    owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.initManualWithOwnedFilesystemIo(runtime_alloc);
+                    owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.initManualWithOwnedFilesystemIoAndParent(runtime_alloc, opts.resource_manager.?.memoryParentPort());
                 } else {
                     owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(runtime_alloc, .{
                         .backend = opts.executor.backend,
+                        .memory_parent = opts.resource_manager.?.memoryParentPort(),
                     });
                 }
                 break :blk_runtime owned_backend_runtime.?.runtime;
@@ -3829,18 +3946,6 @@ pub const DB = struct {
             const open_started_ns = monotonicTimeNs();
             const replication_write_gate = if (opts.replication_write_gate) |gate| gate.pinned() else null;
             var profile = OpenProfile{};
-            var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
-            const bind_cache_resource_manager = opts.resource_manager != null;
-            if (opts.resource_manager == null) {
-                const manager = try alloc.create(resource_manager_mod.ResourceManager);
-                manager.* = resource_manager_mod.ResourceManager.init(standaloneResourceManagerOptions(alloc));
-                owned_resource_manager = manager;
-                opts.resource_manager = manager;
-            }
-            errdefer if (owned_resource_manager) |manager| {
-                manager.deinit(alloc);
-                alloc.destroy(manager);
-            };
             var owned_async_context: ?*AsyncContext = null;
             var owned_executor: ?*derived_executor_mod.Executor = null;
             errdefer {
@@ -4027,6 +4132,8 @@ pub const DB = struct {
                 .replication_async_batch_mirror = opts.replication_async_batch_mirror,
                 .replication_async_metadata_mirror = opts.replication_async_metadata_mirror,
                 .replication_write_gate = replication_write_gate,
+                .replication_recovery_cursor = .init(runtime_alloc),
+                .replication_intent_capture = .init(runtime_alloc),
                 .optional_runtime_workers_enabled = false,
             };
             var db = DB{
@@ -6130,6 +6237,10 @@ pub const DB = struct {
         // after `core.deinit()`, which destroys the manager the leases name.
         self.async_context.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.async_context);
+        // All publication/recovery jobs have joined. Pending owned reads may
+        // pin storage and must retire before core/backend/allocator teardown.
+        self.local_execution.replication_intent_capture.reset();
+        self.local_execution.replication_recovery_cursor.reset();
         // A bounded source mark owns a read transaction on core's backend.
         // Workers are stopped; release it before core destroys that backend.
         if (self.local_execution.source_vectors.load(.acquire)) |source| source.cancelMarking();
@@ -6156,8 +6267,7 @@ pub const DB = struct {
         self.retained_remote_query_lease = null;
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.owned_resource_manager) |manager| {
-            manager.deinit(self.alloc);
-            self.alloc.destroy(manager);
+            manager.releaseOwned(self.alloc);
         }
         if (self.local_execution.row_policy_bundle) |*bundle| bundle.deinit();
         self.local_execution.row_policy_bundle = null;
@@ -7254,10 +7364,34 @@ pub const DB = struct {
     /// lifetime and CPU owner. Controls are not serialized or used to cancel
     /// an already durable write. Post-commit visibility has its own token.
     pub fn batchWithAdmissionControls(self: *DB, req: types.BatchRequest, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition, visibility_cancellation: types.CancellationToken) anyerror!void {
+        return self.batchWithAdmissionControlsAndCallbacks(req, controls, visibility_cancellation, null, null);
+    }
+
+    pub fn batchWithAdmissionControlsAndCallbacks(self: *DB, req: types.BatchRequest, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition, visibility_cancellation: types.CancellationToken, dispatcher: ?DocumentArtifactChildRangeDispatcher, observer: ?CommittedBatchEffectsObserver) anyerror!void {
+        return self.batchWithAdmissionControlsAndMutationRoot(req, controls, visibility_cancellation, null, dispatcher, observer);
+    }
+
+    /// Nested callers pass their original capture root. Top-level callers own
+    /// one fresh retired root until all synchronous mutation work returns.
+    pub fn batchWithAdmissionControlsAndMutationRoot(self: *DB, req: types.BatchRequest, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition, visibility_cancellation: types.CancellationToken, enclosing_root: ?*@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.RootSharedLease, dispatcher: ?DocumentArtifactChildRangeDispatcher, observer: ?CommittedBatchEffectsObserver) anyerror!void {
+        return self.batchWithAdmissionControlsAndRootContext(req, controls, visibility_cancellation, .{ .root = enclosing_root }, dispatcher, observer);
+    }
+
+    pub fn batchWithAdmissionControlsAndRootContext(self: *DB, req: types.BatchRequest, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition, visibility_cancellation: types.CancellationToken, roots: @import("../../api/batch_execution_admission.zig").RootContext, dispatcher: ?DocumentArtifactChildRangeDispatcher, observer: ?CommittedBatchEffectsObserver) anyerror!void {
         try controls.lifetime.check();
+        try roots.validate();
+        var invocation: @import("mutation_admission.zig").InvocationRoot = .{};
+        defer invocation.deinit();
+        const root = try invocation.bind(self.replicationMutationBarrier(), roots.root);
         const opts: BatchExecutionOptions = .{
+            .mutation_root = root,
+            .enclosing_mutation_retirement = roots.retirement,
+            .committed_visibility_wait = roots.committed_visibility,
             .admission_controls = controls,
+            .avoid_admission_capacity_cycle = true,
             .visibility_cancellation = visibility_cancellation,
+            .document_child_range_dispatcher = dispatcher,
+            .committed_batch_effects_observer = observer,
         };
         if (benchMetricsEnabled()) {
             var profile: BatchProfile = .{};
@@ -7769,12 +7903,12 @@ pub const DB = struct {
         return self.applyRowPolicyPublicationInternal(bundle_bytes, request, identity, null);
     }
 
-    fn finishRowPolicyReplicationCommitLocked(self: *DB, payload: ?[]const u8, outbox_key: ?[]const u8, apply_held: *bool, replication_mutation: *?MutationBarrier.ExclusiveLease) !void {
+    fn finishRowPolicyReplicationCommitLocked(self: *DB, payload: ?[]const u8, prepared: ?*const replication_contract.PreparedPublication, outbox_key: ?[]const u8, apply_held: *bool, replication_mutation: *?MutationBarrier.ExclusiveLease) !void {
         const encoded = payload orelse return;
         var ctx = self.batchContext();
         var deferred = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&ctx));
         defer deferred.releaseTransition();
-        deferred.append(appendReplicationEncodedSchemaMetadataCommitLockedContext(&ctx, encoded) catch {
+        deferred.append(appendPreparedMetadataCommitLockedContext(&ctx, encoded, prepared, true) catch {
             self.core.unlockApply();
             apply_held.* = false;
             if (replication_mutation.*) |*lease| lease.release();
@@ -7862,6 +7996,8 @@ pub const DB = struct {
             if (replication_lsn) |lsn| try self.recordReplicationApplied(lsn);
             return already;
         }
+        var prepared_metadata_publication = try prepareMetadataPublication(self, .row_policy, replication_payload);
+        defer if (prepared_metadata_publication) |*prepared| prepared.deinit();
         const phase = installed.parsed.value.phase;
         const pending_phase = phase == .pending_install or phase == .pending_disable;
         try self.lockApplyForPortableRuntime();
@@ -7952,7 +8088,8 @@ pub const DB = struct {
             var receipt_key_buf: [128]u8 = undefined;
             const receipt_key = try expected_receipt.key(&receipt_key_buf);
             var stage_txn = try self.core.store.beginWriteTxn();
-            errdefer stage_txn.abort();
+            var stage_txn_open = true;
+            errdefer if (stage_txn_open) stage_txn.abort();
             try stage_txn.put(row_policy_bundle_mod.candidate_key, bundle_bytes);
             try stage_txn.put(receipt_key, &encoded_receipt);
             try stage_txn.put(receipt.key, receipt.value);
@@ -7969,10 +8106,11 @@ pub const DB = struct {
                 self.local_execution.row_policy_replication_outbox_pending.store(true, .release);
             }
             try stage_txn.commit();
+            stage_txn_open = false;
             if (replication_outbox != null) {
                 schedule_replication_recovery_on_exit = true;
             }
-            try self.finishRowPolicyReplicationCommitLocked(replication_payload, if (replication_outbox) |outbox| outbox.key else null, &apply_held, &replication_mutation);
+            try self.finishRowPolicyReplicationCommitLocked(replication_payload, if (prepared_metadata_publication) |*prepared| prepared else null, if (replication_outbox) |outbox| outbox.key else null, &apply_held, &replication_mutation);
             return expected_receipt;
         }
         if (phase == .serving_install or phase == .serving_disable) {
@@ -8003,7 +8141,8 @@ pub const DB = struct {
         const catalog_bytes = next.encode();
         const encoded_pending = expected_receipt.encode();
         var txn = try self.core.store.beginWriteTxn();
-        errdefer txn.abort();
+        var txn_open = true;
+        errdefer if (txn_open) txn.abort();
         try txn.put(row_policy_bundle_mod.key, bundle_bytes);
         if (pending_phase) try txn.put(row_policy_bundle_mod.candidate_key, bundle_bytes);
         if (phase == .serving_install or phase == .serving_disable) try txn.delete(row_policy_bundle_mod.candidate_key);
@@ -8021,13 +8160,14 @@ pub const DB = struct {
             self.local_execution.row_policy_replication_outbox_pending.store(true, .release);
         }
         try txn.commit();
+        txn_open = false;
         if (replication_outbox != null) {
             schedule_replication_recovery_on_exit = true;
         }
         self.core.table_catalog = next;
         // Keep the old immutable bundle alive for previously admitted bound
         // readers. The receipt probe swaps it only after those leases drain.
-        try self.finishRowPolicyReplicationCommitLocked(replication_payload, if (replication_outbox) |outbox| outbox.key else null, &apply_held, &replication_mutation);
+        try self.finishRowPolicyReplicationCommitLocked(replication_payload, if (prepared_metadata_publication) |*prepared| prepared else null, if (replication_outbox) |outbox| outbox.key else null, &apply_held, &replication_mutation);
         return null;
     }
 
@@ -8440,6 +8580,13 @@ pub const DB = struct {
         // derived inline-edge/job maintenance. It cannot mutate user rows,
         // and must progress while a policy publication is preparing or active.
         const graph_cleanup_maintenance = req.graph_endpoint_cleanup;
+        if (opts.avoid_admission_capacity_cycle and !opts.bypass_replication_write_gate and !openModeRequiresReadOnlyBackends(self.open_mode)) {
+            // Preserve read-only/policy rejection before any recovery attempt.
+            // Recover before acquiring this invocation's policy lease. The
+            // core rechecks afterward, rejecting a raced obligation rather
+            // than waiting while retaining that newly acquired service lease.
+            try @import("replication_startup_admission.zig").ensurePreDecisionBeforePolicyWithRoot(self, opts.admission_controls, opts.mutation_root);
+        }
         if (!trusted_replay and !graph_cleanup_maintenance) try self.maybeFinalizePendingRowPolicyPublication();
         if (req.row_policy_principal_proof.len != 0) {
             if (req.row_policy_admitted_at_seconds <= 0 or req.row_policy_database.len == 0 or
@@ -8466,7 +8613,10 @@ pub const DB = struct {
         defer if (row_policy_lease) |*lease| lease.release();
         var policy_opts = opts;
         if (verified_principal) |*principal| policy_opts.row_policy_principal = &principal.value;
-        if (row_policy_lease) |*lease| policy_opts.row_policy_lease = lease;
+        if (row_policy_lease) |*lease| {
+            policy_opts.row_policy_lease = lease;
+            policy_opts.row_policy_retirement = lease;
+        }
         // A topology rewrite cannot inherit an active policy by copying row
         // bytes: the new owner would lack an authenticated, descriptor-bound
         // policy publication. Until coordinated bundle handoff exists, reject
@@ -8665,6 +8815,7 @@ pub const DB = struct {
         };
         apply_opts.row_policy_principal = policy_opts.row_policy_principal;
         apply_opts.row_policy_lease = policy_opts.row_policy_lease;
+        apply_opts.row_policy_retirement = policy_opts.row_policy_retirement;
         self.batchInternalWithPreparationAllocator(apply_req, profile, apply_opts, &preparation.guard) catch |err|
             return preparation.mapError(err);
     }
@@ -22729,6 +22880,8 @@ pub const DB = struct {
             &.{.{ .key = durable_replication_schema_outbox_key.?, .value = outbox }}
         else
             &.{};
+        var prepared_metadata_publication = try prepareMetadataPublication(self, .schema, durable_replication_schema_payload);
+        defer if (prepared_metadata_publication) |*prepared| prepared.deinit();
         var prepared_schema = try self.core.prepareSchemaMetadata(table_schema, schema_metadata_writes);
         defer prepared_schema.deinit();
         try self.lockApplyForPortableRuntime();
@@ -22753,7 +22906,7 @@ pub const DB = struct {
         defer deferred_replication_gates.releaseTransition();
         var post_commit_error: ?anyerror = null;
         if (durable_replication_schema_payload) |payload|
-            deferred_replication_gates.append(appendReplicationEncodedSchemaMetadataCommitLockedContext(&ctx, payload) catch |err| blk: {
+            deferred_replication_gates.append(appendPreparedMetadataCommitLockedContext(&ctx, payload, if (prepared_metadata_publication) |*prepared| prepared else null, false) catch |err| blk: {
                 post_commit_error = err;
                 break :blk null;
             })
@@ -23477,6 +23630,8 @@ pub const DB = struct {
             schema_metadata_writes[schema_metadata_write_count] = .{ .key = admission.source_install_receipt_key, .value = &source_receipt_buffer };
             schema_metadata_write_count += 1;
         }
+        var prepared_metadata_publication = try prepareMetadataPublication(self, .schema, durable_replication_schema_payload);
+        defer if (prepared_metadata_publication) |*prepared| prepared.deinit();
         var prepared_schema = if (publication != null)
             try self.core.prepareSchemaMetadataPublishedChild(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count])
         else if (expected_version) |expected|
@@ -23538,7 +23693,7 @@ pub const DB = struct {
         defer deferred_replication_gates.releaseTransition();
         var post_commit_error: ?anyerror = null;
         if (replication_schema_payload) |payload|
-            deferred_replication_gates.append(appendReplicationEncodedSchemaMetadataCommitLockedContext(&ctx, payload) catch |err| blk: {
+            deferred_replication_gates.append(appendPreparedMetadataCommitLockedContext(&ctx, payload, if (prepared_metadata_publication) |*prepared| prepared else null, false) catch |err| blk: {
                 post_commit_error = err;
                 break :blk null;
             })
@@ -23677,18 +23832,23 @@ pub const DB = struct {
         return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, null);
     }
 
+    pub fn beginTransactionScopedWithAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !transactions_mod.TxnId {
+        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, controls);
+    }
+
     fn beginTransactionScopedInternal(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !transactions_mod.TxnId {
         if (controls) |original| try original.lifetime.check();
+        const admission = @import("mutation_admission.zig");
+        var replication_mutation = try admission.acquireBeginReplicationMutationShared(self, controls);
+        defer if (replication_mutation) |*lease| lease.release();
+        // Policy may have changed while CPU was lent at replication admission.
+        // Recheck/pin it only after that wait, then retain CPU through all local
+        // service holders until they release before the replication lease.
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
-        const admission = @import("mutation_admission.zig");
-        // Publication may need CPU to retire this policy lease. Keep the
-        // original lifetime without transferring CPU inside that dependency.
         const retained_controls = admission.retainedLeaseControls(controls);
-        var replication_mutation = try admission.acquireReplicationMutationShared(self, retained_controls);
-        defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try admission.lockApply(self, retained_controls);
+        try admission.lockApplyPreDecision(self, retained_controls);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
@@ -23696,13 +23856,16 @@ pub const DB = struct {
             defer read.abort();
             try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, scope);
         }
-        return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+        var begin_admission: admission.IntentCollection = .{};
+        const read_control = begin_admission.bindPreDecisionBeforeMutation(retained_controls, self.core.apply_mutex.io, null);
+        return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionWithAdmission(
             txn_id,
             timestamp_ns,
             created_at_ns,
             participants,
             coordinator,
             retain_terminal,
+            read_control,
         );
     }
 
@@ -23849,7 +24012,7 @@ pub const DB = struct {
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         const admission = @import("mutation_admission.zig");
-        var replication_mutation = try admission.acquireReplicationMutationShared(self, controls);
+        var replication_mutation = try admission.acquireReplicationMutationSharedPreDecisionScoped(self, controls, admission.receiverMutationRoot(self));
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
         try self.writeTransactionInternal(txn_id, req, null, if (replication_mutation != null) admission.retainedLeaseControls(controls) else controls);
@@ -24125,7 +24288,10 @@ pub const DB = struct {
             }
         }
 
-        try @import("mutation_admission.zig").lockApply(self, controls);
+        if (ordered_receipt == null and controls != null)
+            try @import("mutation_admission.zig").lockApplyPreDecision(self, controls)
+        else
+            try @import("mutation_admission.zig").lockApply(self, controls);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
@@ -24265,11 +24431,15 @@ pub const DB = struct {
                 .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans },
             );
         } else {
-            try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+            var intent_admission: @import("mutation_admission.zig").IntentCollection = .{};
+            // Still pre-decision, with policy/apply ownership retained. Reject
+            // contended capture instead of waiting for a parked producer's CPU.
+            const original = intent_admission.bindPreDecisionBeforeMutation(controls, self.core.apply_mutex.io, null);
+            try self.core.writeIntentsExtraBatchWithAdmission(txn_id, intents.items, predicates.items, .{
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
                 .index_span_digests = index_spans,
-            });
+            }, original);
         }
     }
 
@@ -24642,6 +24812,19 @@ pub const DB = struct {
         try self.resolveTransactionIntentsInternalWithControls(txn_id, status, commit_version, sync_level, cancellation, null, null, admission.acquisition(&budget));
     }
 
+    /// Local resolution and self-ack share one physical batch. Retained
+    /// coordinators defer committed self-ack under the existing apply lock.
+    pub fn resolveTransactionIntentsAndAcknowledgeParticipant(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, sync_level: types.SyncLevel, cancellation: types.CancellationToken, participant: []const u8, execution: ?@import("antfly_runtime_abi").runnable_abi.Borrowed) !void {
+        if (execution) |original| {
+            try original.checkLifetime();
+            const admission = @import("../../api/mutation_admission_controls.zig");
+            var budget = admission.init(.{ .cancellation = cancellation }, original, self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+            try self.resolveTransactionIntentsInternalWithAcknowledgementPolicy(txn_id, status, commit_version, sync_level, cancellation, null, participant, admission.acquisition(&budget), true);
+        } else {
+            try self.resolveTransactionIntentsInternalWithAcknowledgementPolicy(txn_id, status, commit_version, sync_level, cancellation, null, participant, null, true);
+        }
+    }
+
     pub fn resolveReplicatedTransactionAtOrderedReceipt(
         self: *DB,
         txn_id: transactions_mod.TxnId,
@@ -24666,9 +24849,11 @@ pub const DB = struct {
 
     pub const resolveTransactionIntentsInternal = local_mutation.resolveTransactionIntentsInternal;
     pub const resolveTransactionIntentsInternalWithControls = local_mutation.resolveTransactionIntentsInternalWithControls;
+    pub const resolveTransactionIntentsInternalWithAcknowledgementPolicy = local_mutation.resolveTransactionIntentsInternalWithAcknowledgementPolicy;
 
     pub const resolveTransactionIntentsPrepared = local_mutation.resolveTransactionIntentsPrepared;
     pub const resolveTransactionIntentsPreparedWithControls = local_mutation.resolveTransactionIntentsPreparedWithControls;
+    pub const resolveTransactionIntentsPreparedWithAcknowledgementPolicy = local_mutation.resolveTransactionIntentsPreparedWithAcknowledgementPolicy;
 
     pub fn abortTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
         try self.resolveTransactionIntents(txn_id, .aborted, timestamp_ns);
@@ -25379,7 +25564,7 @@ pub const DB = struct {
         defer self.core.index_manager.catalog_mutex.unlockExclusive();
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
-        try self.requireOnlineArtifactCatalogMutableWithContextLocked(&txn, context);
+        try self.requireOnlineArtifactCatalogMutableForExpectedLocked(&txn, context, command.catalogs);
         try self.requireArtifactReconcileUnfenced(&txn, context);
         const stamp = try self.core.index_manager.alignRowDerivedArtifactCatalogNoLock(&txn, command.catalogs, configs);
         try txn.commit();
@@ -26874,20 +27059,40 @@ pub const DB = struct {
 
     pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("markTransactionParticipantResolved", .{ self, txn_id, participant });
-        var replication_mutation = self.acquireReplicationMutationShared();
+        return self.markTransactionParticipantResolvedWithOptionalAdmissionControls(txn_id, participant, null);
+    }
+
+    pub fn markTransactionParticipantResolvedWithAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+        return self.markTransactionParticipantResolvedWithOptionalAdmissionControls(txn_id, participant, controls);
+    }
+
+    fn markTransactionParticipantResolvedWithOptionalAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+        if (controls) |original| try original.lifetime.check();
+        const admission = @import("mutation_admission.zig");
+        var replication_mutation = try admission.acquireReplicationMutationShared(self, controls);
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.lockApplyForPortableRuntime();
+        try admission.lockApply(self, if (replication_mutation != null) admission.retainedLeaseControls(controls) else controls);
         defer self.core.unlockApply();
         try self.core.markTransactionParticipantResolved(txn_id, participant);
     }
 
     pub fn markTransactionParticipantsResolved(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("markTransactionParticipantsResolved", .{ self, txn_id, participants });
-        var replication_mutation = self.acquireReplicationMutationShared();
+        return self.markTransactionParticipantsResolvedWithOptionalAdmissionControls(txn_id, participants, null);
+    }
+
+    pub fn markTransactionParticipantsResolvedWithAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+        return self.markTransactionParticipantsResolvedWithOptionalAdmissionControls(txn_id, participants, controls);
+    }
+
+    fn markTransactionParticipantsResolvedWithOptionalAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+        if (controls) |original| try original.lifetime.check();
+        const admission = @import("mutation_admission.zig");
+        var replication_mutation = try admission.acquireReplicationMutationShared(self, controls);
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.lockApplyForPortableRuntime();
+        try admission.lockApply(self, if (replication_mutation != null) admission.retainedLeaseControls(controls) else controls);
         defer self.core.unlockApply();
         try self.core.markTransactionParticipantsResolvedExtraBatch(txn_id, participants, .{});
     }
@@ -26944,7 +27149,16 @@ pub const DB = struct {
         retained_cutoff_timestamp: u64,
     ) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("cleanupTransactionMetadataIfEligible", .{ self, txn_id, cutoff_timestamp, retained_cutoff_timestamp });
-        try self.lockApplyForPortableRuntime();
+        return self.cleanupTransactionMetadataIfEligibleWithOptionalAdmissionControls(txn_id, cutoff_timestamp, retained_cutoff_timestamp, null);
+    }
+
+    pub fn cleanupTransactionMetadataIfEligibleWithAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, cutoff_timestamp: u64, retained_cutoff_timestamp: u64, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !bool {
+        return self.cleanupTransactionMetadataIfEligibleWithOptionalAdmissionControls(txn_id, cutoff_timestamp, retained_cutoff_timestamp, controls);
+    }
+
+    fn cleanupTransactionMetadataIfEligibleWithOptionalAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, cutoff_timestamp: u64, retained_cutoff_timestamp: u64, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !bool {
+        if (controls) |original| try original.lifetime.check();
+        try @import("mutation_admission.zig").lockApply(self, controls);
         defer self.core.unlockApply();
         return try self.core.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
     }
@@ -26994,14 +27208,31 @@ pub const DB = struct {
         const txns = try self.core.listTransactions(self.alloc);
         defer self.alloc.free(txns);
         var resolved_finalized: u64 = 0;
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
         for (txns) |txn| {
+            const has_preparation = txn.status == .committed and
+                (try manager.hasPreparedEffects(txn.txn_id) or try manager.hasPreparationRequirement(txn.txn_id));
             if (txn.status == .pending or
-                (!(try self.core.transactionHasIntents(txn.txn_id)) and !(try self.core.transactionHasReplicationOutbox(txn.txn_id)))) continue;
+                (!has_preparation and !(try self.core.transactionHasIntents(txn.txn_id)) and !(try self.core.transactionHasReplicationOutbox(txn.txn_id)))) continue;
             const resolve_version = if (txn.status == .committed and txn.commit_version != 0)
                 txn.commit_version
             else
                 resolution_timestamp;
-            try self.resolveTransactionIntentsWithSyncLevel(txn.txn_id, txn.status, resolve_version, .propose);
+            self.resolveTransactionIntentsWithSyncLevel(txn.txn_id, txn.status, resolve_version, .propose) catch |err| switch (err) {
+                // A generic sweep cannot repair or reinterpret an accepted contract.
+                // Keep its obligation and let unrelated legacy recovery drain.
+                error.PreparedGenerationChanged,
+                error.PreparedEffectsRequired,
+                error.PreparedEffectsMismatch,
+                error.InvalidPreparedEffects,
+                error.PreparationContractConflict,
+                error.InvalidPreparationRequirement,
+                error.UnsupportedVersion,
+                error.InvalidTxnRecord,
+                => continue,
+                else => return err,
+            };
             resolved_finalized += 1;
         }
         return resolved_finalized;
@@ -27687,6 +27918,18 @@ pub const DB = struct {
         return state.found;
     }
 
+    fn preparedCatalogLeaseHeldLocked(self: *DB) !bool {
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
+        return try manager.hasPreparedCatalogLease();
+    }
+
+    fn checkPreparedCatalogLease(self: *DB) !void {
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        if (try self.preparedCatalogLeaseHeldLocked()) return error.SchemaInUse;
+    }
+
     /// Artifact and resolver catalog changes alter the source's materialized
     /// state contract. REF3 retains primary-row and coordinated-integrity
     /// effects, not independently produced graph/vector/enrichment effects.
@@ -27704,6 +27947,17 @@ pub const DB = struct {
     }
 
     fn requireOnlineArtifactCatalogMutableWithContextLocked(self: *DB, txn: anytype, context: ?@import("artifact_reconcile_intent.zig").Context) !void {
+        return self.requireOnlineArtifactCatalogMutableForExpectedLocked(txn, context, null);
+    }
+
+    fn requireOnlineArtifactCatalogMutableForExpectedLocked(self: *DB, txn: anytype, context: ?@import("artifact_reconcile_intent.zig").Context, expected: ?@import("artifact_inventory.zig").Catalogs) !void {
+        const inventory = @import("artifact_inventory.zig");
+        const leased = try self.preparedCatalogLeaseHeldLocked();
+        if (expected) |catalogs| {
+            try inventory.requirePreparedCatalogUnchangedWhileLeased(txn, inventory.index_key, catalogs.indexes, leased);
+            try inventory.requirePreparedCatalogUnchangedWhileLeased(txn, inventory.enrichment_key, catalogs.enrichments, leased);
+            try inventory.requirePreparedCatalogUnchangedWhileLeased(txn, inventory.resolver_key, catalogs.resolvers, leased);
+        } else if (leased) return error.SchemaInUse;
         if (context) |value| try @import("artifact_reconcile_intent.zig").requireContext(self.alloc, txn, value) else try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
         var namespace: [24]u8 = undefined;
         doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
@@ -28086,6 +28340,7 @@ pub const DB = struct {
             var probe = try self.core.store.beginReadTxn();
             defer probe.abort();
             try self.requireArtifactReconcileUnfenced(&probe, context);
+            if (try self.preparedCatalogLeaseHeldLocked()) return error.SchemaInUse;
         }
         try self.enforceVectorMigrationConfigurationGate();
         // Generated artifact namespaces can be shared across differently named
@@ -28924,6 +29179,41 @@ pub const DB = struct {
         }
     }
 
+    /// Permanently require readers that understand required prepared effects.
+    /// This explicit local activation is not a distributed capability vote.
+    /// Ordered catalogs and legacy preparation metadata need coordinated
+    /// migration; silently rewriting their authority would invalidate digests.
+    pub fn enablePreparedTransactionProtocol(self: *DB) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("enablePreparedTransactionProtocol", .{self});
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        try self.enforceReplicationWriteGate();
+        var structural = self.beginIndexStructuralMutation("prepared transaction protocol activation", "*");
+        defer structural.deinit();
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        self.core.requirePreparedTransactionProtocol(null) catch |err| switch (err) {
+            error.PreparedTransactionProtocolDisabled => {
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                if (try manager.hasPreparationMetadata()) return error.PreparedTransactionMigrationRequired;
+                var probe = try self.core.store.beginProbeTxn();
+                defer probe.abort();
+                try self.requireOnlineArtifactCatalogMutableLocked(&probe);
+                const ordered = probe.get(@import("artifact_inventory.zig").ordered_key) catch |read_err| switch (read_err) {
+                    error.NotFound => null,
+                    else => return read_err,
+                };
+                if (ordered != null) return error.PreparedTransactionMigrationRequired;
+                try self.enforceReplicationWriteGate();
+                try self.core.index_manager.aggregateAuthoritativeReaderVersion(self.core.store, @import("catalog/resolver_catalog.zig").prepared_transaction_reader_version);
+                return;
+            },
+            else => return err,
+        };
+    }
+
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("addIndex", .{ self, cfg });
         _ = try self.addIndexWithAdmission(cfg, .ordinary);
@@ -28983,6 +29273,7 @@ pub const DB = struct {
         try self.enforceReplicationWriteGate();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        if (try self.core.index_manager.enrichmentConfigMatches(cfg)) return .unchanged;
         {
             var probe = try self.core.store.beginProbeTxn();
             defer probe.abort();
@@ -29029,6 +29320,7 @@ pub const DB = struct {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
+        try self.checkPreparedCatalogLease();
         {
             var activity = try self.acquireResolverCatalogActivity(true);
             defer activity.deinit();
@@ -29079,6 +29371,7 @@ pub const DB = struct {
             // Do not wait for distributed callbacks, rewrite the catalog, or
             // retire a serving owner just because replay is currently active.
             if (!options.migrate_namespace and self.core.index_manager.resolverConfigMatches(cfg)) break :blk .updated_no_backfill;
+            try self.checkPreparedCatalogLease();
             var activity = try self.acquireResolverCatalogActivity(options.drain_backfill or options.wait_for_activity);
             defer activity.deinit();
             try self.lockApplyForPortableRuntime();
@@ -29216,6 +29509,7 @@ pub const DB = struct {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         if (context == null) try self.enforceReplicationWriteGate();
+        try self.checkPreparedCatalogLease();
         {
             var activity = try self.acquireResolverCatalogActivity(false);
             defer activity.deinit();
@@ -30927,7 +31221,7 @@ pub const DB = struct {
                     .cancellation = guard.token(),
                 });
                 outcome catch |err| switch (err) {
-                    error.EnrichmentWaitCanceled => {
+                    error.EnrichmentWaitCanceled, error.DerivedTargetAdvanceStuck => {
                         try self.checkTargetAdvanceNoProgress(options.no_progress_timeout_ns);
                         continue;
                     },
@@ -31044,6 +31338,10 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
         deadline_ns: ?u64,
     ) !void {
+        return self.runEnrichmentUntilWithExecutionWait(sequence, cancellation, deadline_ns, null);
+    }
+
+    fn runEnrichmentUntilWithExecutionWait(self: *DB, sequence: u64, cancellation: types.CancellationToken, deadline_ns: ?u64, boundary: ?@import("../../common/execution_wait.zig").Boundary) !void {
         if (sequence == 0) return;
         if (self.enrichment_runtime) |runtime| {
             if (!self.local_execution.optional_runtime_workers_enabled) {
@@ -31063,7 +31361,7 @@ pub const DB = struct {
                 return;
             }
             runtime.notifySequence(sequence);
-            try runtime.waitForAppliedWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+            try runtime.waitForAppliedWithExecutionWait(sequence, cancellation, deadline_ns, boundary);
         }
     }
 
@@ -31232,12 +31530,23 @@ pub const DB = struct {
             .deadline_ns = deadline_ns,
             .clock = self.backend_runtime.monotonicClock(),
         };
+        return self.runMaintenanceUntilWithVisibilityWait(sequence, sync_targets, wait, completion, lifetime);
+    }
+
+    fn runMaintenanceUntilWithVisibilityWait(
+        self: *DB,
+        sequence: u64,
+        sync_targets: ManagedSyncTargets,
+        wait: derived_executor_mod.VisibilityWait,
+        completion: EnrichmentCompletion,
+        lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !void {
         const original = @import("../../common/seed_snapshot_lifetime.zig");
         try original.checkpoint(lifetime);
         var stable_target = sequence;
         while (true) {
             try original.checkpoint(lifetime);
-            const outcome = self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+            const outcome = self.runEnrichmentUntilWithExecutionWait(stable_target, wait.cancellation, wait.deadline_ns, wait.execution_wait);
             outcome catch |err| {
                 if (completion != .settled_requests or err != error.EnrichmentWorkerFailed) return err;
             };
@@ -35336,6 +35645,12 @@ pub const DB = struct {
     /// conservative as before).
     pub fn waitForSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("waitForSyncLevelWithCancellation", .{ self, sync_level, sequence, sync_targets, cancellation, skip_enrichment_runtime_wait });
+        return self.waitForSyncLevelWithExecutionWait(sync_level, sequence, sync_targets, cancellation, skip_enrichment_runtime_wait, null);
+    }
+
+    /// Boundary is borrowed from the original execution after service holders
+    /// retire. Only derived polling sleeps lend CPU; inline application retains it.
+    pub fn waitForSyncLevelWithExecutionWait(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool, boundary: ?@import("../../common/execution_wait.zig").Boundary) !void {
         const timeout_ms = if (self.enrichment_runtime) |runtime|
             runtime.syncWaitTimeoutMs()
         else
@@ -35347,19 +35662,20 @@ pub const DB = struct {
             .cancellation = cancellation,
             .deadline_ns = deadline_ns,
             .clock = visibility_clock,
+            .execution_wait = boundary,
         };
         switch (sync_level) {
             .propose, .write => {},
             .enrichments => {
                 if (!skip_enrichment_runtime_wait)
-                    try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+                    try self.runEnrichmentUntilWithExecutionWait(sequence, cancellation, deadline_ns, boundary);
             },
             .full_text => {
                 try self.runDerivedUntilTargetsWithVisibilityWait(sequence, sync_targets.full_text_indexes, wait);
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.full_text_indexes);
             },
             .full_index => {
-                try self.runMaintenanceUntilWithCancellation(sequence, sync_targets, cancellation, deadline_ns);
+                try self.runMaintenanceUntilWithVisibilityWait(sequence, sync_targets, wait, .successful_requests, null);
                 if (self.text_merge_runtime == null) {
                     try wait.check();
                     try self.drainScheduledTextMerges();
@@ -36638,83 +36954,18 @@ pub const DB = struct {
     }
 
     fn portableImportTargetEmptyLocked(self: *DB, alloc: Allocator) !bool {
-        var read = try self.core.store.beginReadTxn();
-        defer read.abort();
-        try @import("artifact_reconcile_intent.zig").requireAbsent(&read);
-        if (self.core.schema != null) return false;
-        // Every Lite database is now provisioned with the default full-text
-        // index at creation, matching the server's table-create behavior, so
-        // a target carrying only that pristine index is still eligible for a
-        // full physical import. Anything beyond that single default index
-        // means the target has been configured and must not be silently
-        // overwritten.
-        switch (self.core.indexCount()) {
-            0 => {},
-            1 => {
-                const configs = try self.core.listIndexes(alloc);
-                defer types.freeIndexConfigs(alloc, configs);
-                if (configs.len != 1 or configs[0].kind != .full_text or
-                    !std.mem.eql(u8, configs[0].name, "full_text_index_v0")) return false;
-            },
-            else => return false,
-        }
+        return self.portableImportTargetEmptyLockedWithAdmission(alloc, null);
+    }
 
-        // Primary rows can be empty while durable identity tombstones and
-        // forward/reverse mappings remain. Publishing over that state would
-        // combine two identity generations, so validate the catalog first and
-        // then require its pristine cardinalities rather than relying only on
-        // the visible document count.
-        doc_identity.validateStoreAlloc(alloc, self.core.store) catch |err| switch (err) {
-            error.InvalidDocIdentity => return false,
-            else => return err,
-        };
-        const identity_stats = try doc_identity.fullStatsFromStore(self.core.store);
-        if (identity_stats.next_ordinal != 1 or
-            identity_stats.allocated_ordinals != 0 or
-            identity_stats.state_rows != 0 or
-            identity_stats.live_ordinals != 0 or
-            identity_stats.tombstone_ordinals != 0 or
-            identity_stats.visibility_chunks != 0 or
-            identity_stats.visibility_deleted_ordinals != 0 or
-            identity_stats.visibility_mask_bytes != 0 or
-            identity_stats.visibility_repair_count != 0)
-        {
-            return false;
-        }
-
-        const lower = [_]u8{internal_keys.user_namespace};
-        const upper = [_]u8{internal_keys.user_namespace + 1};
-        const Probe = struct {
-            found: bool = false,
-
-            fn visit(ctx: ?*anyopaque, _: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
-                const probe: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-                probe.found = true;
-                return .stop;
-            }
-        };
-        var probe = Probe{};
-        try self.core.store.scanWithContext(&lower, &upper, .{}, &probe, Probe.visit);
-        if (probe.found) return false;
-
-        const transactions = try self.core.listTransactions(alloc);
-        defer alloc.free(transactions);
-        if (transactions.len != 0) return false;
-
-        const enrichments = try self.core.listEnrichments(alloc);
-        defer types.freeEnrichmentConfigs(alloc, enrichments);
-        if (enrichments.len != 0) return false;
-
-        const resolvers = try self.core.listResolvers(alloc);
-        defer {
-            for (resolvers) |*resolver| resolver.deinit(alloc);
-            if (resolvers.len > 0) alloc.free(resolvers);
-        }
-        if (resolvers.len != 0) return false;
-
-        const public_schema_json = try self.core.getStoreValue(alloc, public_schema_json_key);
-        defer if (public_schema_json) |value| alloc.free(value);
-        if (public_schema_json != null) return false;
+    fn portableImportTargetEmptyLockedWithAdmission(self: *DB, alloc: Allocator, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !bool {
+        var admission: @import("mutation_admission.zig").IntentCollection = .{};
+        const control = admission.bindPreDecisionBeforeMutation(controls, self.core.apply_mutex.io, null);
+        if (!try @import("portable_pristine_target.zig").check(self.core.store, alloc, .{
+            .schema_present = self.core.schema != null,
+            .indexes_allowed = self.core.index_manager.portableTargetIndexesAllowed(),
+            .enrichments_present = self.core.index_manager.hasEnrichments(),
+            .resolvers_present = self.core.index_manager.hasResolvers(),
+        }, control)) return false;
 
         // Report permanent durable disqualification before transient activity
         // so clients never retry a target that can only be rejected. A pristine
@@ -38089,16 +38340,27 @@ pub const DB = struct {
         context: anytype,
         comptime adopt: anytype,
     ) !void {
+        return self.adoptPreparedPortableGenerationIfEmptyWithAdmissionControls(alloc, prepared_runtime, context, adopt, null);
+    }
+
+    pub fn adoptPreparedPortableGenerationIfEmptyWithAdmissionControls(
+        self: *DB,
+        alloc: Allocator,
+        prepared_runtime: *PreparedPortableRuntimeMetadata,
+        context: anytype,
+        comptime adopt: anytype,
+        controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+    ) !void {
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
-        lockApply(self);
+        if (controls) |original| try original.lifetime.check();
+        try @import("portable_publication_admission.zig").acquire(self, alloc, &prepared_runtime.row_policy_lease, controls, portableImportTargetEmptyLockedWithAdmission);
         var apply_locked = true;
         defer if (apply_locked) self.core.unlockApply();
-        if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
-        try self.core.store.beginPortableImportPublication(
-            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io,
-        );
         var publication_fenced = true;
         defer if (publication_fenced) self.core.store.finishPortableImportPublication();
+        // Last caller-admission check before irreversible publication. After
+        // adopt returns, metadata/activation must complete despite cancellation.
+        if (controls) |original| try original.lifetime.check();
         const publication = try adopt(context);
         self.applyPreparedPortableRuntimeMetadataLocked(prepared_runtime);
         // The durable generation and its schema now agree. Lock-free point
@@ -38130,7 +38392,18 @@ pub const DB = struct {
         target_identity: doc_identity.Namespace,
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("importPortableIntoEmpty", .{ self, alloc, backup, target_identity });
+        return self.importPortableIntoEmptyWithAdmissionControls(alloc, backup, target_identity, null);
+    }
+
+    pub fn importPortableIntoEmptyWithAdmissionControls(
+        self: *DB,
+        alloc: Allocator,
+        backup: []const u8,
+        target_identity: doc_identity.Namespace,
+        controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+    ) !void {
         if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
+        if (controls) |original| try original.lifetime.check();
         var stage = try PortableImportStage.init(alloc, self.core.path, backup, .{});
         defer stage.deinit();
         portable_backup.validateCompleteDatabaseImageAlloc(alloc, &stage.store) catch |err| switch (err) {
@@ -38141,15 +38414,12 @@ pub const DB = struct {
         var prepared = try self.preparePortableRuntimeMetadata(&stage.store, target_identity);
         defer prepared.deinit();
 
-        lockApply(self);
+        try @import("portable_publication_admission.zig").acquire(self, alloc, &prepared.row_policy_lease, controls, portableImportTargetEmptyLockedWithAdmission);
         var apply_locked = true;
         defer if (apply_locked) self.core.unlockApply();
-        if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
-        try self.core.store.beginPortableImportPublication(
-            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io,
-        );
         var publication_fenced = true;
         defer if (publication_fenced) self.core.store.finishPortableImportPublication();
+        if (controls) |original| try original.lifetime.check();
         try stage.publish(self.core.store);
 
         self.applyPreparedPortableRuntimeMetadataLocked(&prepared);
@@ -39625,7 +39895,12 @@ pub const DB = struct {
     /// of those owners to finish resolution. Never drain it under this fence.
     pub fn tryStatementReadFence(self: *DB) !?StatementReadFence {
         if (comptime storage_engine.enabled) return storage_engine.call("tryStatementReadFence", .{self});
-        return self.tryPrimaryReadFence(false);
+        return self.tryStatementReadFenceWithAdmission(null);
+    }
+    pub fn tryStatementReadFenceWithAdmission(self: *DB, control: ?@import("../../common/read_admission.zig").Port) !?StatementReadFence {
+        if (comptime storage_engine.enabled) return storage_engine.call("tryStatementReadFenceWithAdmission", .{ self, control });
+        if (control) |port| try port.checkpoint();
+        return self.tryPrimaryReadFenceWithAdmission(false, control);
     }
 
     /// A complete embedded backup excludes native intents and captures only
@@ -39637,6 +39912,12 @@ pub const DB = struct {
     }
 
     fn tryPrimaryReadFence(self: *DB, allow_unresolved: bool) !?StatementReadFence {
+        return self.tryPrimaryReadFenceWithAdmission(allow_unresolved, null);
+    }
+    fn tryPrimaryReadFenceWithAdmission(self: *DB, allow_unresolved: bool, original: ?@import("../../common/read_admission.zig").Port) !?StatementReadFence {
+        var retained: @import("../../common/read_admission.zig").RetainedDependency = .{};
+        const control = retained.bind(original);
+        if (control) |port| try port.checkpoint();
         var primary = self.core.snapshot_admission.tryAcquireCapture() orelse return null;
         errdefer primary.release();
         var replay = self.core.snapshot_replay_admission.tryAcquireCapture() orelse {
@@ -39649,11 +39930,12 @@ pub const DB = struct {
         // would incorrectly reject ordinary SQL on such tables.
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
-        if (!allow_unresolved and try manager.hasUnresolvedWriteIntents()) {
+        if (!allow_unresolved and try manager.hasUnresolvedWriteIntentsWithAdmission(control)) {
             replay.release();
             primary.release();
             return null;
         }
+        if (control) |port| try port.checkpoint();
         return .{ .primary = primary, .replay = replay };
     }
 
@@ -39666,10 +39948,18 @@ pub const DB = struct {
 
     pub fn openDocumentReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
         if (comptime storage_engine.enabled) return storage_engine.call("openDocumentReadSession", .{ self, alloc, from_key, to_key, opts });
-        try self.maybeFinalizePendingRowPolicyPublication();
+        return self.openDocumentReadSessionWithAdmission(alloc, from_key, to_key, opts, null);
+    }
+
+    pub fn openDocumentReadSessionWithAdmission(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, control: ?@import("../../common/read_admission.zig").Port) !*DocumentReadSession {
+        if (comptime storage_engine.enabled) return storage_engine.call("openDocumentReadSessionWithAdmission", .{ self, alloc, from_key, to_key, opts, control });
+        if (control) |port| try port.checkpoint();
+        try self.prepareReadRowPolicyWithAdmission(control);
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         errdefer row_policy_lease.release();
-        try self.lockApplySharedForPortableRuntime();
+        var retained: @import("../../common/read_admission.zig").RetainedDependency = .{};
+        const capture_control = retained.bind(control);
+        try self.lockApplySharedForPortableRuntimeWithAdmission(capture_control);
         var locked = true;
         defer if (locked) self.core.unlockApplyShared();
         var schema = self.core.acquireSchemaView();
@@ -39679,11 +39969,11 @@ pub const DB = struct {
         defer alloc.free(start);
         const end = try alloc.dupe(u8, borrowed.end);
         defer alloc.free(end);
-        const txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        const txn = if (capture_control) |port| try self.core.store.beginReadTxnWithAdmission(.transient, port) else try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
         const now = currentTimeNs();
         self.core.unlockApplyShared();
         locked = false;
-        const session = try DocumentReadSession.openSnapshot(alloc, self.core.store, txn, schema, .{ .start = start, .end = end }, from_key, to_key, opts, now);
+        const session = try DocumentReadSession.openSnapshotWithAdmission(alloc, self.core.store, txn, schema, .{ .start = start, .end = end }, from_key, to_key, opts, now, control);
         session.row_policy_lease = row_policy_lease;
         return session;
     }
@@ -39695,7 +39985,13 @@ pub const DB = struct {
 
     pub fn openRelationalReadSessionAtSnapshot(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*RelationalStatementSnapshot) !*RelationalReadSession {
         if (comptime storage_engine.enabled) return storage_engine.call("openRelationalReadSessionAtSnapshot", .{ self, alloc, from_key, to_key, opts, statement });
-        try self.maybeFinalizePendingRowPolicyPublication();
+        return self.openRelationalReadSessionAtSnapshotWithAdmission(alloc, from_key, to_key, opts, statement, null);
+    }
+
+    pub fn openRelationalReadSessionAtSnapshotWithAdmission(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*RelationalStatementSnapshot, control: ?@import("../../common/read_admission.zig").Port) !*RelationalReadSession {
+        if (comptime storage_engine.enabled) return storage_engine.call("openRelationalReadSessionAtSnapshotWithAdmission", .{ self, alloc, from_key, to_key, opts, statement, control });
+        if (control) |port| try port.checkpoint();
+        try self.prepareReadRowPolicyWithAdmission(control);
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*proof| proof.deinit();
         var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {
@@ -39830,7 +40126,7 @@ pub const DB = struct {
             break :blk active;
         } else null;
         errdefer if (filter) |active| Filter.destroy(alloc, active);
-        session.reader = try self.beginRelationalRowsAtSnapshot(alloc, .{
+        session.reader = try self.beginRelationalRowsAtSnapshotWithAdmission(alloc, .{
             .index = parsed.value.index,
             .auto_index = parsed.value.auto_index,
             .include_primary_digest = opts.include_content_hashes,
@@ -39844,12 +40140,14 @@ pub const DB = struct {
             .primary_upper = if (to_key.len != 0) .{ .key = to_key, .inclusive = !opts.exclusive_to } else null,
             .expected_schema_version = parsed.value.schema_version orelse view.version(),
             .row_filter = if (filter) |active| .{ .context = active, .matches = Filter.matches } else null,
-        }, statement);
+        }, statement, control);
         session.filter_context = filter;
         session.destroy_filter = Filter.destroy;
         errdefer session.reader.deinit();
         if (opts.include_range_proofs) {
             const tracking = @import("../range_protection.zig");
+            var metadata = @import("../../common/read_admission.zig").MetadataRead(@TypeOf(&session.reader.read)).init(alloc, &session.reader.read, control);
+            defer metadata.deinit();
             if (session.reader.index) |index| {
                 const prefix = try @import("relational_index_records.zig").forwardPrefix(index.id());
                 const next = if (parsed.value.after == null and lower != null and upper != null and
@@ -39861,12 +40159,14 @@ pub const DB = struct {
                     null;
                 if (next) |exclusive_end| {
                     if (std.mem.eql(u8, exclusive_end, session.reader.upper)) {
-                        session.range_proofs = try tracking.captureIndex(alloc, &session.reader.read, index.id().encode(), session.reader.lower[prefix.len..]);
+                        session.range_proofs = try tracking.captureIndex(alloc, &metadata, index.id().encode(), session.reader.lower[prefix.len..]);
                     }
                 }
             }
-            if (session.range_proofs == null) session.range_proofs = try tracking.capture(alloc, &session.reader.read, from_key, to_key);
+            if (session.range_proofs == null) session.range_proofs = try tracking.capture(alloc, &metadata, from_key, to_key);
         }
+        errdefer if (session.range_proofs) |proofs| alloc.free(proofs);
+        if (control) |port| try port.checkpoint();
         session.row_policy_lease = row_policy_lease;
         return session;
     }
@@ -50085,6 +50385,7 @@ const PrimaryReplicationEffect = struct {
     payload: ?[]u8 = null,
     key: ?[]u8 = null,
     value: ?[]u8 = null,
+    prepared: ?replication_contract.PreparedPublication = null,
 
     fn prepare(ctx: *const BatchExecutionContext, writes: []const docstore_mod.KVPair, deletes: []const []const u8, replay: []const u8) !@This() {
         const mirror = ctx.replication_async_effect_mirror orelse return .{};
@@ -50108,10 +50409,13 @@ const PrimaryReplicationEffect = struct {
         const key = try durableReplicationOutboxKeyAlloc(ctx.alloc, .primary_effect, from_lsn, ctx.root_generation, payload);
         errdefer ctx.alloc.free(key);
         const value = try encodeDurableReplicationOutboxAlloc(ctx.alloc, from_lsn, payload);
-        return .{ .payload = payload, .key = key, .value = value };
+        errdefer ctx.alloc.free(value);
+        const prepared = try mirror.publisher.prepare(mirror, .primary_effect, payload, ctx.identity_namespace, null);
+        return .{ .payload = payload, .key = key, .value = value, .prepared = prepared };
     }
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.prepared) |*prepared| prepared.deinit();
         if (self.payload) |bytes| alloc.free(bytes);
         if (self.key) |bytes| alloc.free(bytes);
         if (self.value) |bytes| alloc.free(bytes);
@@ -50130,7 +50434,7 @@ const PrimaryReplicationEffect = struct {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         // A failed append keeps the outbox, even under asynchronous policy.
-        const lsn = mirror.publisher.publish(mirror, .primary_effect, payload, ctx.identity_namespace) catch |err| {
+        const lsn = (if (self.prepared) |*prepared| prepared.publish() else mirror.publisher.publish(mirror, .primary_effect, payload, ctx.identity_namespace)) catch |err| {
             if (ctx.async_context) |async_ctx| async_ctx.primary_replication_append_pending.store(true, .release);
             noteReplicationMirrorFailure(mirror, "primary effect", err);
             return err;
@@ -51501,6 +51805,21 @@ fn appendReplicationSchemaMetadataCommitLockedContext(
 ) !?ReplicationDeferredCommitGate {
     const projected = replicationCommitContext(ctx);
     return try replication_commit.appendReplicationSchemaMetadataCommitLockedContext(&projected, table_schema, public_schema_json);
+}
+
+fn prepareMetadataPublication(self: *DB, kind: durable_outbox.Kind, payload: ?[]const u8) !?replication_contract.PreparedPublication {
+    const encoded = payload orelse return null;
+    const mirror = self.local_execution.replication_async_metadata_mirror orelse return error.ReplicationPublisherUnavailable;
+    return mirror.publisher.prepare(mirror, kind, encoded, self.core.identity_namespace, null);
+}
+
+fn appendPreparedMetadataCommitLockedContext(ctx: *const BatchExecutionContext, payload: []const u8, prepared: ?*const replication_contract.PreparedPublication, strict_append: bool) !?ReplicationDeferredCommitGate {
+    const projected = replicationCommitContext(ctx);
+    if (prepared) |funding| {
+        const mirror = ctx.replication_async_metadata_mirror orelse return error.ReplicationPublisherUnavailable;
+        return replication_commit.appendPreparedPublicationCommitLockedContext(&projected, mirror, funding, strict_append);
+    }
+    return replication_commit.appendReplicationEncodedSchemaMetadataCommitLockedContextStrict(&projected, payload, strict_append);
 }
 
 fn appendReplicationEncodedSchemaMetadataCommitLockedContext(
@@ -62097,6 +62416,40 @@ test "db controlled mutation admission BEGIN and prepare preserve terminal clean
     try std.testing.expectEqualStrings("{}", recovered);
 }
 
+test "db controlled mutation admission callbacks reject before resource access" {
+    const Reject = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+    };
+    var db: DB = undefined;
+    const marker: u8 = 0;
+    try std.testing.expectError(error.DeadlineExceeded, db.batchWithAdmissionControlsAndCallbacks(.{}, .{ .lifetime = .{ .context = &marker, .check_fn = Reject.check } }, .none, null, null));
+}
+
+test "db controlled mutation admission real borrowed receiver rejects conflicting root before resource access" {
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    var barrier: Barrier = .{};
+    var inherited = Barrier.RootSharedLease.initRetired(&barrier);
+    defer inherited.release();
+    var conflicting = Barrier.RootSharedLease.initRetired(&barrier);
+    defer conflicting.release();
+    // Only the invocation root is initialized. Rejection must precede access
+    // to every borrowed DB resource, preparation allocation and side effect.
+    var receiver: LocalMutationExecution = undefined;
+    receiver.mutation_root = &inherited;
+    var guard: execution_resources.PreparedRowAllocator = .{ .child = std.testing.allocator, .io = std.testing.io };
+    try std.testing.expectError(error.InvalidArgument, receiver.batchInternalWithPreparationAllocator(
+        .{ .sync_level = .propose },
+        null,
+        .{ .mutation_root = &conflicting },
+        &guard,
+    ));
+    try std.testing.expect(receiver.mutation_root == &inherited);
+    try std.testing.expect(!inherited.held and inherited.borrowers.load(.acquire) == 0);
+    try std.testing.expect(!conflicting.held and conflicting.borrowers.load(.acquire) == 0);
+}
+
 test "db controlled mutation admission rejects before effects and releases service fences" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db-controlled-admission");
@@ -68845,7 +69198,14 @@ test "db portable publication waits for admitted readers and rejects new ones" {
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            self.store.beginPortableImportPublication(self.io) catch |err| {
+            const Wait = struct {
+                fn life(_: *const anyopaque) !void {}
+                fn boundary(_: *anyopaque) !void {}
+            };
+            self.store.beginPortableImportPublicationWithAdmission(self.io, .{
+                .lifetime = .{ .context = self, .check_fn = Wait.life },
+                .execution_wait = .{ .ptr = self, .begin = Wait.boundary, .end = Wait.boundary },
+            }) catch |err| {
                 self.err = err;
                 self.returned.store(true, .release);
                 return;
@@ -124110,6 +124470,542 @@ test "db aborted transaction preserves prior committed state and version" {
     try std.testing.expectEqual(@as(u64, 9_300), try db.getTimestamp(alloc, "doc:txn_abort_preserve"));
 }
 
+test "db prepared transaction effects required protocol activation is durable and permanent" {
+    const a = std.testing.allocator;
+    const catalog = @import("catalog/resolver_catalog.zig");
+    const inventory = @import("artifact_inventory.zig");
+    var directory = try TestDirectory.init("prepared-protocol-activation");
+    defer directory.cleanup();
+    const id: types.TxnId = @splat(0xd1);
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        try std.testing.expectError(error.PreparedTransactionProtocolDisabled, db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, true, true, .{ .mode = .synchronous }, .{}, null));
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(id));
+        try db.enablePreparedTransactionProtocol();
+        try db.core.requirePreparedTransactionProtocol(null);
+        _ = try db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, true, true, .{ .mode = .synchronous }, .{}, null);
+        // Activation retries remain legal with new required metadata present.
+        try db.enablePreparedTransactionProtocol();
+        try db.resolveTransactionIntents(id, .aborted, 2);
+        try db.addIndex(.{ .name = "after_activation", .kind = .full_text, .config_json = "{}" });
+        try db.addEnrichment(.{ .name = "producer", .kind = .asset, .field = "body", .content_type = "text/plain" });
+        try db.addResolver(.{ .name = "identity", .table = "default", .source_artifact = "producer", .resolution_artifact = "resolved", .key_template = "{{ _entity.text }}", .promote = false });
+        try std.testing.expect(try db.removeResolver("identity"));
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u32, 5), try catalog.readAuthoritativeReaderVersion(&read, catalog.supported_reader_version));
+        try std.testing.expectEqual(@as(u32, 5), try catalog.catalogReaderVersion(a, try read.get(inventory.resolver_key)));
+        // Exercise the exact version predicate used by the previous reader.
+        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, catalog.readMinimumReaderVersion(&read, 4));
+    }
+    var reopened = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer reopened.close();
+    try reopened.core.requirePreparedTransactionProtocol(null);
+    try reopened.enablePreparedTransactionProtocol();
+}
+
+test "db prepared transaction effects required protocol activation rejects unfenced metadata and ordered authority" {
+    const a = std.testing.allocator;
+    const catalog = @import("catalog/resolver_catalog.zig");
+    const inventory = @import("artifact_inventory.zig");
+    var directory = try TestDirectory.init("prepared-protocol-migration");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const id: types.TxnId = @splat(0xd2);
+    const required = transactions_mod.makePreparationRequirementKey(id);
+    const frame = transactions_mod.makePreparedEffectsKey(id);
+    for ([_][]const u8{ &required, &frame, inventory.ordered_key }) |key| {
+        try db.core.store.put(key, "opaque migration fixture");
+        try std.testing.expectError(error.PreparedTransactionMigrationRequired, db.enablePreparedTransactionProtocol());
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u32, 1), try catalog.readMinimumReaderVersion(&read, catalog.supported_reader_version));
+            try std.testing.expectError(error.NotFound, read.get(inventory.resolver_key));
+        }
+        try db.core.store.delete(key);
+    }
+    // A temporary version reservation is insufficient. Upgrade its permanent
+    // baseline as well, so cancelling a replacement cannot downgrade the file.
+    try db.core.store.put(catalog.replacement_reader_base_key, "1");
+    try db.core.store.put(catalog.minimum_reader_key, "4");
+    try db.enablePreparedTransactionProtocol();
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualStrings("5", try read.get(catalog.replacement_reader_base_key));
+    try std.testing.expectEqualStrings("5", try read.get(catalog.minimum_reader_key));
+}
+
+test "db prepared transaction effects required protocol rejects incomplete activation" {
+    const a = std.testing.allocator;
+    const catalog = @import("catalog/resolver_catalog.zig");
+    var directory = try TestDirectory.init("prepared-protocol-corrupt");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.core.store.put(catalog.minimum_reader_key, "5");
+    try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
+    try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.enablePreparedTransactionProtocol());
+    try db.core.store.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":5,\"resolvers\":[]}");
+    try db.core.store.put(catalog.replacement_reader_base_key, "4");
+    try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
+}
+
+test "db prepared transaction effects required protocol preserves every admission rejection" {
+    const a = std.testing.allocator;
+    const admission = @import("../../common/read_admission.zig");
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        rejection: anyerror = error.NotFound,
+        fn check(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const at = self.calls;
+            self.calls += 1;
+            if (at == self.fail_at) return self.rejection;
+        }
+    };
+    var directory = try TestDirectory.init("prepared-protocol-control");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    for ([_]bool{ false, true }) |enabled| {
+        if (enabled) try db.enablePreparedTransactionProtocol();
+        var baseline: Control = .{};
+        const baseline_payload: admission.Payload = .{ .ptr = &baseline, .vtable = &.{ .checkpoint = Control.check } };
+        const result = db.core.requirePreparedTransactionProtocol(.init(&baseline_payload));
+        if (enabled) try result else try std.testing.expectError(error.PreparedTransactionProtocolDisabled, result);
+        try std.testing.expect(baseline.calls > 1);
+        for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.MemoryLimitExceeded }) |rejection| {
+            for (0..baseline.calls) |fail_at| {
+                var control: Control = .{ .fail_at = fail_at, .rejection = rejection };
+                const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+                try std.testing.expectError(rejection, db.core.requirePreparedTransactionProtocol(.init(&payload)));
+            }
+        }
+    }
+}
+
+test "db prepared transaction effects required begin gates legacy commit" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("required-prepare-db");
+    defer directory.cleanup();
+    var db = try DB.open(a, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    try db.enablePreparedTransactionProtocol();
+    const id: types.TxnId = @splat(0xc1);
+    const catalogs: [32]u8 = @splat(71);
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        _ = try db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, true, true, .{ .mode = .synchronous }, .{}, null);
+    }
+    try db.writeTransaction(id, .{ .writes = &.{.{ .key = "required", .value = "{}" }} });
+    try std.testing.expectError(error.PreparedEffectsRequired, db.resolveTransactionIntents(id, .committed, 2));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+    try std.testing.expect((try db.get(a, "required")) == null);
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        const contract = try manager.preparedEffectsContract(id, catalogs, .synchronous, null);
+        const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = contract, .effects = .{} }, null);
+        defer a.free(frame);
+        try manager.sealPreparedEffects(id, frame, catalogs, .synchronous, null);
+    }
+    // The ordinary materializer must not discard even an empty accepted plan.
+    // Plan-aware generated materialization is a separate integration step.
+    try std.testing.expectError(error.PreparedGenerationChanged, db.resolveTransactionIntents(id, .committed, 2));
+    try std.testing.expect((try db.get(a, "required")) == null);
+    try db.resolveTransactionIntents(id, .aborted, 2);
+    var manager = try db.core.initTxnManager();
+    defer manager.deinit();
+    try std.testing.expect(!try manager.hasPreparationRequirement(id));
+    try std.testing.expect(!try manager.hasPreparedEffects(id));
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 0), (try @import("../publication_backlog.zig").load(&read)).?.records);
+}
+
+test "db prepared transaction effects required recovery defers accepted plans" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("required-prepare-recovery");
+    defer directory.cleanup();
+    var db = try DB.open(a, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    try db.enablePreparedTransactionProtocol();
+    const id: types.TxnId = @splat(0xc2);
+    const catalogs: [32]u8 = @splat(73);
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        _ = try db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, true, true, .{ .mode = .synchronous }, .{}, null);
+    }
+    try db.writeTransaction(id, .{ .writes = &.{.{ .key = "required-recovery", .value = "{}" }} });
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        const contract = try manager.preparedEffectsContract(id, catalogs, .synchronous, null);
+        const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = contract, .effects = .{} }, null);
+        defer a.free(frame);
+        try manager.sealPreparedEffects(id, frame, catalogs, .synchronous, null);
+        // Model a learned durable coordinator decision without pretending its
+        // participant effects were materialized. Keep the actual v6 revision,
+        // lease and row intent; changing that wire format must update this fixture.
+        const key = transactions_mod.records_prefix.* ++ id;
+        const raw = try db.core.store.get(a, &key);
+        defer a.free(raw);
+        try std.testing.expectEqual(@as(usize, 53), raw.len);
+        raw[0] = @backingInt(transactions_mod.TxnStatus.committed);
+        std.mem.writeInt(u64, raw[9..17], 2, .little);
+        std.mem.writeInt(u64, raw[25..33], 2, .little);
+        try std.testing.expectEqual(@as(u8, 0), raw[52]);
+        try db.core.store.put(&key, raw);
+    }
+    const stats = try db.recoverTransactions(100, 101);
+    try std.testing.expectEqual(@as(u64, 1), stats.deferred_unresolved);
+    try std.testing.expectEqual(@as(u64, 0), stats.resolved_finalized);
+    try std.testing.expectEqual(@as(u64, 0), stats.cleaned_records);
+    var manager = try db.core.initTxnManager();
+    defer manager.deinit();
+    try std.testing.expect(try manager.hasIntents(id));
+    try std.testing.expect(try manager.hasPreparationRequirement(id));
+    try std.testing.expect(try manager.hasPreparedEffects(id));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 3), (try @import("../publication_backlog.zig").load(&read)).?.records);
+    }
+    // Corrupt accepted metadata must remain deferred without blocking an
+    // unrelated legacy transaction's completion and history cleanup.
+    const frame_key = transactions_mod.makePreparedEffectsKey(id);
+    const corrupt = try db.core.store.get(a, &frame_key);
+    defer a.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    try db.core.store.put(&frame_key, corrupt);
+    const legacy = try db.beginTransaction(5);
+    try db.writeTransaction(legacy, .{ .writes = &.{.{ .key = "unrelated-legacy", .value = "{}" }} });
+    try db.resolveTransactionIntents(legacy, .committed, 6);
+    const again = try db.recoverTransactions(100, 101);
+    try std.testing.expectEqual(@as(u64, 1), again.deferred_unresolved);
+    try std.testing.expectEqual(@as(u64, 1), again.cleaned_records);
+}
+
+test "db prepared transaction effects required materialization survives reopen without row intents" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |has_row| {
+        var directory = try TestDirectory.init("accepted-materialization");
+        defer directory.cleanup();
+        const id: types.TxnId = @splat(0xc3);
+        const artifact_key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "accepted");
+        defer a.free(artifact_key);
+        const deleted_key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "old");
+        defer a.free(deleted_key);
+        {
+            var db = try DB.open(a, std.mem.span(directory.path().ptr), .{ .start_index_workers = false });
+            defer db.close();
+            try db.core.store.put(deleted_key, "old-output");
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            var manager = try db.core.initTxnManager();
+            defer manager.deinit();
+            try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+            try manager.writeIntents(id, if (has_row) &.{.{ .key = "doc", .value = "{}" }} else &.{}, &.{});
+            const catalog = try db.core.preparedEffectsCatalogDigest(null);
+            const contract = try manager.preparedEffectsContract(id, catalog, .synchronous, null);
+            const codec = @import("prepared_transaction_effects.zig");
+            const frame = try codec.encode(a, .{ .contract = contract, .effects = .{
+                .artifact_writes = @constCast(&[_]types.BatchWrite{.{ .key = artifact_key, .value = "accepted-output" }}),
+                .artifact_delete_keys = &.{deleted_key},
+                .documents = &.{.{ .key = "doc", .action = .preserve_base_document }},
+            } }, null);
+            defer a.free(frame);
+            try manager.sealPreparedEffects(id, frame, catalog, .synchronous, null);
+        }
+        var db = try DB.open(a, std.mem.span(directory.path().ptr), .{ .start_index_workers = false });
+        defer db.close();
+        try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 2, .propose);
+        const value = try db.core.store.get(a, artifact_key);
+        defer a.free(value);
+        try std.testing.expectEqualStrings("accepted-output", value);
+        try std.testing.expectError(error.NotFound, db.core.store.get(a, deleted_key));
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(id));
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try std.testing.expect(!try manager.hasPreparedEffects(id));
+        try std.testing.expect(!try manager.hasPreparationRequirement(id));
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 0), (try @import("../publication_backlog.zig").load(&read)).?.records);
+        const entries = try db.core.store.iterateReplayFrom(a, 1);
+        defer {
+            for (entries) |*entry| entry.deinit(a);
+            a.free(entries);
+        }
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        var record = try change_journal_mod.decodeRecord(a, entries[0].payload);
+        defer record.deinit();
+        var found = false;
+        for (record.record.changed_artifact_keys) |key| if (std.mem.eql(u8, artifact_key, key)) {
+            found = true;
+        };
+        try std.testing.expect(found);
+        const sequence = db.core.nextDerivedAppendSequence();
+        try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 999, .write);
+        try std.testing.expectEqual(sequence, db.core.nextDerivedAppendSequence());
+    }
+}
+
+test "db prepared transaction effects required materialization fences changed catalog and namespace" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("accepted-materialization-catalog");
+    defer directory.cleanup();
+    var db = try DB.open(a, std.mem.span(directory.path().ptr), .{ .start_index_workers = false });
+    defer db.close();
+    const id: types.TxnId = @splat(0xc4);
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+        try manager.writeIntents(id, &.{.{ .key = "doc", .value = "{}" }}, &.{});
+        const catalog = try db.core.preparedEffectsCatalogDigest(null);
+        const contract = try manager.preparedEffectsContract(id, catalog, .deferred, null);
+        const codec = @import("prepared_transaction_effects.zig");
+        const frame = try codec.encode(a, .{ .contract = contract, .effects = .{} }, null);
+        defer a.free(frame);
+        try manager.sealPreparedEffects(id, frame, catalog, .deferred, null);
+        const namespace = db.core.identity_namespace;
+        db.core.identity_namespace.shard_id +%= 1;
+        try std.testing.expect(!std.mem.eql(u8, &catalog, &try db.core.preparedEffectsCatalogDigest(null)));
+        db.core.identity_namespace = namespace;
+    }
+    try std.testing.expectError(error.SchemaInUse, db.addIndex(.{ .name = "new-text", .kind = .full_text, .config_json = "{}" }));
+    // Raw backend/import corruption is not a serving catalog publication. The
+    // materializer must still fence it rather than treating a pin as proof.
+    try db.core.store.put(index_catalog_key, "corrupt-catalog-after-seal");
+    try std.testing.expectError(error.PreparedGenerationChanged, db.resolveTransactionIntents(id, .committed, 2));
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(id));
+    try std.testing.expect((try db.get(a, "doc")) == null);
+    try db.resolveTransactionIntents(id, .aborted, 2);
+}
+
+test "db prepared transaction effects required materialization never reruns synchronous producer" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("accepted-materialization-producer");
+    defer directory.cleanup();
+    var producer = TestAssetProducer{};
+    var db = try DB.open(a, std.mem.span(directory.path().ptr), .{ .start_index_workers = false, .enrichment = .{ .asset_producer = producer.producer() } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "accepted", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}" });
+    const id: types.TxnId = @splat(0xc5);
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "accepted");
+    defer a.free(key);
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+        try manager.writeIntents(id, &.{.{ .key = "doc", .value = "{\"body\":\"would invoke generator\"}" }}, &.{});
+        const catalog = try db.core.preparedEffectsCatalogDigest(null);
+        const contract = try manager.preparedEffectsContract(id, catalog, .synchronous, null);
+        const codec = @import("prepared_transaction_effects.zig");
+        const frame = try codec.encode(a, .{ .contract = contract, .effects = .{ .artifact_writes = @constCast(&[_]types.BatchWrite{.{ .key = key, .value = "accepted-before-decision" }}) } }, null);
+        defer a.free(frame);
+        try manager.sealPreparedEffects(id, frame, catalog, .synchronous, null);
+    }
+    try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 2, .enrichments);
+    try std.testing.expectEqual(@as(usize, 0), producer.generator_calls);
+    const value = try db.core.store.get(a, key);
+    defer a.free(value);
+    try std.testing.expectEqualStrings("accepted-before-decision", value);
+    try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 2, .propose);
+    try std.testing.expectEqual(@as(usize, 0), producer.generator_calls);
+}
+
+test "db prepared transaction effects required recovery consumes accepted plan with no row intents" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("accepted-materialization-recovery");
+    defer directory.cleanup();
+    var db = try DB.open(a, std.mem.span(directory.path().ptr), .{ .start_index_workers = false });
+    defer db.close();
+    const id: types.TxnId = @splat(0xc6);
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "accepted");
+    defer a.free(key);
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+        try manager.writeIntents(id, &.{}, &.{});
+        const catalog = try db.core.preparedEffectsCatalogDigest(null);
+        const contract = try manager.preparedEffectsContract(id, catalog, .synchronous, null);
+        const codec = @import("prepared_transaction_effects.zig");
+        const frame = try codec.encode(a, .{ .contract = contract, .effects = .{ .artifact_writes = @constCast(&[_]types.BatchWrite{.{ .key = key, .value = "accepted-recovery-output" }}) } }, null);
+        defer a.free(frame);
+        try manager.sealPreparedEffects(id, frame, catalog, .synchronous, null);
+        const record_key = transactions_mod.records_prefix.* ++ id;
+        const raw = try db.core.store.get(a, &record_key);
+        defer a.free(raw);
+        try std.testing.expectEqual(@as(usize, 53), raw.len);
+        raw[0] = @backingInt(transactions_mod.TxnStatus.committed);
+        std.mem.writeInt(u64, raw[9..17], 2, .little);
+        std.mem.writeInt(u64, raw[25..33], 2, .little);
+        try db.core.store.put(&record_key, raw);
+    }
+    const stats = try db.recoverTransactions(100, 101);
+    try std.testing.expectEqual(@as(u64, 1), stats.resolved_finalized);
+    try std.testing.expectEqual(@as(u64, 0), stats.deferred_unresolved);
+    const value = try db.core.store.get(a, key);
+    defer a.free(value);
+    try std.testing.expectEqualStrings("accepted-recovery-output", value);
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 0), (try @import("../publication_backlog.zig").load(&read)).?.records);
+}
+
+test "db prepared transaction effects required catalog lease survives reopen and releases at resolution" {
+    const a = std.testing.allocator;
+    const options: OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false };
+    const producer: types.EnrichmentConfig = .{ .name = "producer", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" };
+    const resolver: index_manager_mod.ResolverConfig = .{ .name = "identity", .table = "default", .source_artifact = "producer", .resolution_artifact = "resolved", .key_template = "{{ _entity.text }}", .promote = false };
+    for ([_]transactions_mod.TxnStatus{ .committed, .aborted }) |decision| {
+        var directory = try TestDirectory.init("prepared-catalog-lease");
+        defer directory.cleanup();
+        const id: types.TxnId = @splat(0xe2);
+        var expected: [32]u8 = undefined;
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            try db.addIndex(.{ .name = "existing", .kind = .full_text, .config_json = "{}" });
+            try db.addEnrichment(producer);
+            try db.addResolver(resolver);
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            var manager = try db.core.initTxnManager();
+            defer manager.deinit();
+            try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+            try manager.writeIntents(id, &.{.{ .key = "doc", .value = "{}" }}, &.{});
+            expected = try db.core.preparedEffectsCatalogDigest(null);
+            const contract = try manager.preparedEffectsContract(id, expected, .synchronous, null);
+            const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = contract, .effects = .{} }, null);
+            defer a.free(frame);
+            try db.core.sealPreparedTransactionEffects(id, frame, .synchronous, null);
+        }
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try std.testing.expectError(error.SchemaInUse, db.addIndex(.{ .name = "new", .kind = .full_text, .config_json = "{}" }));
+        try std.testing.expectError(error.SchemaInUse, db.admitManagedIndex(.{ .name = "managed", .kind = .full_text, .config_json = "{}" }));
+        try std.testing.expectError(error.SchemaInUse, db.deleteIndex("existing"));
+        try std.testing.expectEqual(index_manager_mod.IndexManager.EnrichmentUpsertResult.unchanged, try db.upsertEnrichment(producer));
+        try db.upsertResolver(resolver);
+        var changed_producer = producer;
+        changed_producer.field = "different";
+        try std.testing.expectError(error.SchemaInUse, db.upsertEnrichment(changed_producer));
+        try std.testing.expectError(error.SchemaInUse, db.deleteEnrichment(.asset, "producer"));
+        var added_producer = producer;
+        added_producer.name = "new-producer";
+        try std.testing.expectError(error.SchemaInUse, db.addEnrichment(added_producer));
+        var changed_resolver = resolver;
+        changed_resolver.key_template = "changed/{{ _entity.text }}";
+        try std.testing.expectError(error.SchemaInUse, db.upsertResolver(changed_resolver));
+        try std.testing.expectError(error.SchemaInUse, db.removeResolverWithoutDrain("identity"));
+        var added_resolver = resolver;
+        added_resolver.name = "new-resolver";
+        try std.testing.expectError(error.SchemaInUse, db.addResolver(added_resolver));
+        {
+            const inventory = @import("artifact_inventory.zig");
+            const reconcile = @import("artifact_reconcile_intent.zig");
+            var command = try db.artifactInventoryCommand(a);
+            defer command.catalogs.deinit(a);
+            const configs = try db.listIndexes(a);
+            defer types.freeIndexConfigs(a, configs);
+            const context = blk: {
+                db.core.lockApply();
+                defer db.core.unlockApply();
+                var write = try db.core.store.beginWriteTxn();
+                errdefer write.abort();
+                const value = try reconcile.stage(a, &write, .{ .artifact_catalog = @as(?inventory.Command, command) }, .{ .term = @as(u64, 1), .index = @as(u64, 10) });
+                try write.commit();
+                break :blk value;
+            };
+            // Authenticated reconciliation is not a lease bypass. Exact
+            // alignment is still legal and leaves accepted catalog bytes intact.
+            try std.testing.expectError(error.SchemaInUse, db.reconcileArtifactAddEnrichment(added_producer, context));
+            var wrong_context = context;
+            wrong_context.token[0] ^= 1;
+            try std.testing.expectError(error.ArtifactCatalogEpochChanged, db.alignOrderedArtifactCatalog(command, configs, wrong_context));
+            try db.alignOrderedArtifactCatalog(command, configs, context);
+            {
+                db.core.lockApply();
+                defer db.core.unlockApply();
+                try std.testing.expectEqualSlices(u8, &expected, &try db.core.preparedEffectsCatalogDigest(null));
+                var write = try db.core.store.beginWriteTxn();
+                errdefer write.abort();
+                try reconcile.clear(a, &write, command, 10);
+                try write.commit();
+            }
+        }
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            // Bypassing the outer DB facade must still hit the persistence
+            // fence and roll back the speculative in-memory producer change.
+            try std.testing.expectError(error.SchemaInUse, db.core.addEnrichment(added_producer));
+            try std.testing.expect(db.core.index_manager.getEnrichment(.asset, added_producer.name) == null);
+            try std.testing.expectEqualSlices(u8, &expected, &try db.core.preparedEffectsCatalogDigest(null));
+        }
+        try db.resolveTransactionIntents(id, decision, 2);
+        try db.addEnrichment(added_producer);
+        try std.testing.expect(try db.deleteIndex("existing"));
+    }
+}
+
+test "db prepared transaction effects required catalog lease rejects stale speculative seal without pinning" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("prepared-catalog-stale-seal");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const id: types.TxnId = @splat(0xe3);
+    var frame: []u8 = undefined;
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+        try manager.writeIntents(id, &.{}, &.{});
+        const contract = try manager.preparedEffectsContract(id, try db.core.preparedEffectsCatalogDigest(null), .deferred, null);
+        frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = contract, .effects = .{} }, null);
+    }
+    defer a.free(frame);
+    // Speculative producer work owns no catalog fence. A publication before
+    // final sealing invalidates it and leaves no durable lease behind.
+    try db.addIndex(.{ .name = "before-seal", .kind = .full_text, .config_json = "{}" });
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try std.testing.expectError(error.PreparedEffectsMismatch, db.core.sealPreparedTransactionEffects(id, frame, .deferred, null));
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(!try @import("artifact_inventory.zig").hasPreparedCatalogLease(&read));
+    }
+    try db.addIndex(.{ .name = "after-rejection", .kind = .full_text, .config_json = "{}" });
+    try db.resolveTransactionIntents(id, .aborted, 2);
+}
+
 test "db explicit resolveTransactionIntents applies participant-style commit version" {
     const alloc = std.testing.allocator;
 
@@ -141080,4 +141976,617 @@ test "public graph metric borrowed wire document scan producers preserve project
     visitor = .{ .fail = true };
     try std.testing.expectError(error.Canceled, db.scanVisit(a, "", "", opts, .{ .context = &visitor, .visit = Visitor.visit, .borrow_documents = true }));
     try std.testing.expectEqual(@as(usize, 1), visitor.count);
+}
+
+const PublicationStepTestPublisher = struct {
+    expected_payload: ?[]const u8 = null,
+    ready: std.atomic.Value(bool) = .init(false),
+    fenced: std.atomic.Value(bool) = .init(false),
+    blocking_calls: std.atomic.Value(usize) = .init(0),
+    recovery_calls: std.atomic.Value(usize) = .init(0),
+    recovered: std.atomic.Value(bool) = .init(false),
+    controlled_calls: std.atomic.Value(usize) = .init(0),
+    matching_entered: std.atomic.Value(bool) = .init(false),
+    matching_retired: std.atomic.Value(bool) = .init(false),
+    block_matching: bool = false,
+    cancel_matching: std.atomic.Value(bool) = .init(false),
+    unexpected_matching_error: std.atomic.Value(bool) = .init(false),
+    transition: std.atomic.Mutex = .unlocked,
+    barrier: MutationBarrier = .{},
+    fn cast(ptr: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn next(_: *anyopaque) u64 {
+        return 7;
+    }
+    fn identity(_: *anyopaque) @import("replication_contract.zig").Publisher.Identity {
+        return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
+    }
+    fn publish(_: ReplicationAsyncEffectMirror, _: @import("durable_outbox.zig").Kind, _: []const u8, _: doc_identity.Namespace) !u64 {
+        return error.UnexpectedPublication;
+    }
+    fn recover(m: ReplicationAsyncEffectMirror, kind: @import("durable_outbox.zig").Kind, obligation: @import("durable_outbox.zig").DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+        try std.testing.expectEqual(@import("durable_outbox.zig").Kind.replay, kind);
+        try std.testing.expectEqual(@as(u64, 7), obligation.from_lsn);
+        const self = cast(m.publisher.ptr);
+        try std.testing.expectEqualStrings(self.expected_payload orelse "persisted", obligation.payload);
+        _ = self.recovery_calls.fetchAdd(1, .release);
+        self.recovered.store(true, .release);
+        return 7;
+    }
+    fn recoverWithAdmission(m: ReplicationAsyncEffectMirror, kind: @import("durable_outbox.zig").Kind, obligation: @import("durable_outbox.zig").DurableReplicationOutbox, namespace: doc_identity.Namespace, control: @import("../../common/read_admission.zig").Port) !u64 {
+        const self = cast(m.publisher.ptr);
+        _ = self.controlled_calls.fetchAdd(1, .release);
+        try std.testing.expect(!try control.hasExecutionWait());
+        try control.checkpoint();
+        if (self.block_matching) {
+            defer self.matching_retired.store(true, .release);
+            self.matching_entered.store(true, .release);
+            const end = monotonicTimeNs() + 5 * std.time.ns_per_s;
+            while (true) {
+                control.checkpoint() catch |err| {
+                    if (err == error.Canceled) self.cancel_matching.store(true, .release) else self.unexpected_matching_error.store(true, .release);
+                    return err;
+                };
+                // A regression must fail instead of hanging DB.close forever.
+                if (monotonicTimeNs() >= end) {
+                    self.unexpected_matching_error.store(true, .release);
+                    return error.MatchingCloseTimeout;
+                }
+                @import("antfly_platform").time.yieldNow();
+            }
+        }
+        return recover(m, kind, obligation, namespace);
+    }
+    fn preflight(_: ReplicationAsyncEffectMirror, _: bool) !void {}
+    fn complete(m: ReplicationAsyncEffectMirror, _: u64) !void {
+        _ = cast(m.publisher.ptr).blocking_calls.fetchAdd(1, .release);
+    }
+    fn poll(m: ReplicationAsyncEffectMirror, lsn: u64) !bool {
+        try std.testing.expectEqual(@as(u64, 7), lsn);
+        return cast(m.publisher.ptr).ready.load(.acquire);
+    }
+    fn check(ptr: *const anyopaque) !void {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        if (self.fenced.load(.acquire)) return error.PrimaryFenced;
+    }
+    fn mirror(self: *@This()) ReplicationAsyncEffectMirror {
+        return .{ .publisher = .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .recover_with_admission = recoverWithAdmission, .preflight = preflight, .complete = complete }, .poll_completion = poll }, .mutation_barrier = &self.barrier, .transition_mutex = &self.transition, .requirements = .{ .synchronous = true, .durable_outbox = true } };
+    }
+    fn options(self: *@This()) OpenOptions {
+        return .{ .start_index_workers = false, .start_optional_runtimes = false, .start_optional_runtime_workers = false, .ttl_cleanup = .{ .enabled = false }, .replication_async_effect_mirror = self.mirror(), .replication_write_gate = .{ .borrowed = .{ .ptr = self, .check_fn = check } } };
+    }
+    fn insert(db: *DB) ![]u8 {
+        const key = try durableReplicationOutboxKeyAlloc(std.testing.allocator, .replay, 7, 1, "persisted");
+        errdefer std.testing.allocator.free(key);
+        const value = try encodeDurableReplicationOutboxAlloc(std.testing.allocator, 7, "persisted");
+        defer std.testing.allocator.free(value);
+        try db.core.store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+        db.local_execution.durable_replication_outbox_maybe.store(true, .release);
+        return key;
+    }
+    fn expectPending(db: *DB, key: []const u8) !void {
+        const value = try db.core.store.get(std.testing.allocator, key);
+        defer std.testing.allocator.free(value);
+        const obligation = try decodeDurableReplicationOutbox(value);
+        try std.testing.expectEqual(@as(u64, 7), obligation.from_lsn);
+        try std.testing.expectEqualStrings("persisted", obligation.payload);
+    }
+};
+
+fn drainPublicationDebtForTest(db: *DB) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    for (0..1000) |_| {
+        if (!db.local_execution.durable_replication_outbox_maybe.load(.acquire)) return;
+        DB.outboxRecoveryDrain(db) catch |err| if (err != error.CommitCompletionPending) return err;
+    }
+    return error.TestPublicationDidNotFinish;
+}
+
+test "publication recovery step preserves persisted intent through pending fencing and reopen" {
+    var directory = try TestDirectory.init("publication-step-reopen");
+    defer directory.cleanup();
+    var publisher: PublicationStepTestPublisher = .{};
+    var key: ?[]u8 = null;
+    defer if (key) |owned| std.testing.allocator.free(owned);
+    {
+        var db = try DB.open(std.testing.allocator, directory.path(), publisher.options());
+        defer db.close();
+        key = try PublicationStepTestPublisher.insert(&db);
+        var polls: usize = 0;
+        while (publisher.recovery_calls.load(.acquire) == 0) : (polls += 1) {
+            try std.testing.expect(polls < 1000);
+            try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+        }
+        try PublicationStepTestPublisher.expectPending(&db, key.?);
+        publisher.fenced.store(true, .release);
+        try std.testing.expectError(error.PrimaryFenced, DB.outboxRecoveryDrain(&db));
+        try PublicationStepTestPublisher.expectPending(&db, key.?);
+        publisher.fenced.store(false, .release);
+    }
+    {
+        var db = try DB.open(std.testing.allocator, directory.path(), publisher.options());
+        defer db.close();
+        try PublicationStepTestPublisher.expectPending(&db, key.?);
+        try std.testing.expect(db.local_execution.durable_replication_outbox_maybe.load(.acquire));
+        // Exercise the actual resident retry owner, not just the direct helper.
+        db.stable_address = true;
+        db.scheduleDurableReplicationOutboxRecovery();
+        db.backend_runtime.durable_jobs.drainOwner(db.publication_recovery.owner_id);
+        try PublicationStepTestPublisher.expectPending(&db, key.?);
+        try std.testing.expectEqual(@as(u32, 0), db.publication_recovery.driver.failure_streak);
+        publisher.ready.store(true, .release);
+        const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+        while (db.local_execution.durable_replication_outbox_maybe.load(.acquire) and monotonicTimeNs() < deadline) {
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        db.backend_runtime.durable_jobs.drainOwner(db.publication_recovery.owner_id);
+        try std.testing.expect(!db.local_execution.durable_replication_outbox_maybe.load(.acquire));
+        try std.testing.expectError(error.NotFound, db.core.store.get(std.testing.allocator, key.?));
+    }
+    try std.testing.expectEqual(@as(usize, 0), publisher.blocking_calls.load(.acquire));
+    try std.testing.expect(publisher.recovery_calls.load(.acquire) >= 2);
+}
+
+test "publication recovery step yields at DB service fences and retains legacy publisher contract" {
+    var directory = try TestDirectory.init("publication-step-fences");
+    defer directory.cleanup();
+    var publisher: PublicationStepTestPublisher = .{};
+    var db = try DB.open(std.testing.allocator, directory.path(), publisher.options());
+    defer db.close();
+    const key = try PublicationStepTestPublisher.insert(&db);
+    defer std.testing.allocator.free(key);
+    const io = db.backend_runtime.io().?;
+    try std.testing.expect(db.local_execution.durable_replication_flush_mutex.tryLock());
+    const flush = DB.outboxRecoveryDrain(&db);
+    db.local_execution.durable_replication_flush_mutex.unlock(io);
+    try std.testing.expectError(error.CommitCompletionPending, flush);
+    try std.testing.expect(db.core.apply_mutex.tryLockExclusiveForAdmission());
+    const apply = DB.outboxRecoveryDrain(&db);
+    db.core.unlockApply();
+    try std.testing.expectError(error.CommitCompletionPending, apply);
+    var captured = publisher.barrier.tryAcquireExclusive() orelse return error.TestExpectedEqual;
+    const capture = DB.outboxRecoveryDrain(&db);
+    captured.release();
+    try std.testing.expectError(error.CommitCompletionPending, capture);
+    try std.testing.expect(publisher.transition.tryLock());
+    const transition = DB.outboxRecoveryDrain(&db);
+    publisher.transition.unlock();
+    try std.testing.expectError(error.CommitCompletionPending, transition);
+    try std.testing.expectEqual(@as(usize, 0), publisher.recovery_calls.load(.acquire));
+    try PublicationStepTestPublisher.expectPending(&db, key);
+    // Legacy callers have not opted into polling. Their ordinary maintenance
+    // binding still completes through the original publisher contract.
+    db.local_execution.replication_async_effect_mirror.?.publisher.poll_completion = null;
+    try DB.outboxRecoveryDrain(&db);
+    try std.testing.expectEqual(@as(usize, 1), publisher.blocking_calls.load(.acquire));
+    try std.testing.expectError(error.NotFound, db.core.store.get(std.testing.allocator, key));
+}
+
+test "publication recovery step borrows owned shutdown lifetime and joins matching before DB retirement" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("publication-step-close-matching");
+    defer directory.cleanup();
+    var publisher: PublicationStepTestPublisher = .{ .block_matching = true };
+    var db = try DB.open(a, directory.path(), publisher.options());
+    var closed = false;
+    defer if (!closed) db.close();
+    const key = try PublicationStepTestPublisher.insert(&db);
+    defer a.free(key);
+    db.stable_address = true;
+    db.scheduleDurableReplicationOutboxRecovery();
+    const end = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!publisher.matching_entered.load(.acquire) and monotonicTimeNs() < end) {
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(publisher.matching_entered.load(.acquire));
+    db.close();
+    closed = true;
+    try std.testing.expect(publisher.matching_retired.load(.acquire));
+    try std.testing.expect(publisher.cancel_matching.load(.acquire));
+    try std.testing.expect(!publisher.unexpected_matching_error.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), publisher.recovery_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), publisher.blocking_calls.load(.acquire));
+    // Close cannot turn cancellation before append into an acknowledgement.
+    // A new lifetime resumes the same persisted obligation after reopen.
+    publisher.block_matching = false;
+    publisher.ready.store(true, .release);
+    var reopened = try DB.open(a, directory.path(), publisher.options());
+    defer reopened.close();
+    try PublicationStepTestPublisher.expectPending(&reopened, key);
+    try drainPublicationDebtForTest(&reopened);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(a, key));
+    try std.testing.expectEqual(@as(usize, 1), publisher.recovery_calls.load(.acquire));
+}
+
+test "publication recovery step checks DB and retry owner shutdown before publication fences" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("publication-step-closed-entry");
+    defer directory.cleanup();
+    var publisher: PublicationStepTestPublisher = .{};
+    var db = try DB.open(a, directory.path(), publisher.options());
+    defer db.close();
+    const key = try PublicationStepTestPublisher.insert(&db);
+    defer a.free(key);
+    db.async_context.background_closing.store(true, .release);
+    const closing = DB.outboxRecoveryDrain(&db);
+    db.async_context.background_closing.store(false, .release);
+    try std.testing.expectError(error.Canceled, closing);
+    db.publication_recovery.stopping.store(true, .release);
+    const stopping = DB.outboxRecoveryDrain(&db);
+    db.publication_recovery.stopping.store(false, .release);
+    try std.testing.expectError(error.Canceled, stopping);
+    try std.testing.expectEqual(@as(usize, 0), publisher.controlled_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), publisher.recovery_calls.load(.acquire));
+    try PublicationStepTestPublisher.expectPending(&db, key);
+    // The rejected calls did not take either publication fence.
+    const io = db.backend_runtime.io().?;
+    try std.testing.expect(db.local_execution.durable_replication_flush_mutex.tryLock());
+    db.local_execution.durable_replication_flush_mutex.unlock(io);
+    try std.testing.expect(publisher.transition.tryLock());
+    publisher.transition.unlock();
+}
+
+test "publication recovery step owned capture bounds copy attempts reuses verified bytes and retires on clear" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("publication-step-owned-value");
+    defer directory.cleanup();
+    const payload = try a.alloc(u8, 256 * 1024 + 17);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i);
+    var publisher: PublicationStepTestPublisher = .{ .expected_payload = payload };
+    var db = try DB.open(a, directory.path(), publisher.options());
+    defer db.close();
+    const key = try durableReplicationOutboxKeyAlloc(a, .replay, 7, 1, payload);
+    defer a.free(key);
+    const raw = try encodeDurableReplicationOutboxAlloc(a, 7, payload);
+    defer a.free(raw);
+    try db.core.store.put(key, raw);
+    db.local_execution.durable_replication_outbox_maybe.store(true, .release);
+    try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+    const capture = &db.local_execution.replication_intent_capture;
+    try std.testing.expect(capture.hasWork());
+    try std.testing.expect(db.core.store.portableImportHasReaders());
+    try std.testing.expectEqual(@as(usize, 0), publisher.controlled_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), db.core.store.portable_import_reader_state.load(.acquire));
+    try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+    try std.testing.expectEqual(@as(usize, 1), db.core.store.portable_import_reader_state.load(.acquire));
+    var polls: usize = 0;
+    while (capture.value == null) : (polls += 1) {
+        try std.testing.expect(polls < 1000);
+        try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+    }
+    try std.testing.expect(polls > 0);
+    const saved = capture.value.?.raw.bytes().ptr;
+    try std.testing.expectEqualSlices(u8, payload, capture.value.?.borrow().payload);
+    polls = 0;
+    while (publisher.recovery_calls.load(.acquire) == 0) : (polls += 1) {
+        try std.testing.expect(polls < 1000);
+        try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+        try std.testing.expectEqual(saved, capture.value.?.raw.bytes().ptr);
+    }
+    try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+    try std.testing.expectEqual(saved, capture.value.?.raw.bytes().ptr);
+    try std.testing.expect(!db.core.store.portableImportHasReaders());
+    publisher.ready.store(true, .release);
+    try DB.outboxRecoveryDrain(&db);
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, key));
+    try std.testing.expect(capture.value == null and capture.read == null and capture.key == null);
+    try std.testing.expectEqualSlices(u8, key, &capture.after.?);
+    try drainPublicationDebtForTest(&db);
+    try std.testing.expect(!db.local_execution.durable_replication_outbox_maybe.load(.acquire));
+
+    // Foreground clearing a pending captured key must release its import and
+    // backend reader before returning, without waiting for another retry.
+    publisher.ready.store(false, .release);
+    try db.core.store.put(key, raw);
+    db.local_execution.durable_replication_outbox_maybe.store(true, .release);
+    try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+    try std.testing.expect(capture.hasWork());
+    try db.clearDurableReplicationOutbox(key);
+    try std.testing.expect(!capture.hasWork());
+    try std.testing.expect(!db.core.store.portableImportHasReaders());
+}
+
+test "publication recovery step owned capture joins pending source read before close and resumes durable bytes after reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("publication-step-owned-close");
+    defer directory.cleanup();
+    const payload = try a.alloc(u8, 256 * 1024 + 17);
+    defer a.free(payload);
+    @memset(payload, 'v');
+    var publisher: PublicationStepTestPublisher = .{ .expected_payload = payload };
+    const key = try durableReplicationOutboxKeyAlloc(a, .replay, 7, 1, payload);
+    defer a.free(key);
+    const raw = try encodeDurableReplicationOutboxAlloc(a, 7, payload);
+    defer a.free(raw);
+    {
+        var db = try DB.open(a, directory.path(), publisher.options());
+        defer db.close();
+        try db.core.store.put(key, raw);
+        db.local_execution.durable_replication_outbox_maybe.store(true, .release);
+        try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+        try std.testing.expect(db.local_execution.replication_intent_capture.hasWork());
+        try std.testing.expect(db.core.store.portableImportHasReaders());
+        try std.testing.expectEqual(@as(usize, 0), publisher.controlled_calls.load(.acquire));
+    }
+    publisher.ready.store(true, .release);
+    var reopened = try DB.open(a, directory.path(), publisher.options());
+    defer reopened.close();
+    var polls: usize = 0;
+    while (reopened.local_execution.durable_replication_outbox_maybe.load(.acquire)) : (polls += 1) {
+        try std.testing.expect(polls < 1000);
+        DB.outboxRecoveryDrain(&reopened) catch |err| if (err != error.CommitCompletionPending) return err;
+    }
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(a, key));
+    try std.testing.expectEqual(@as(usize, 0), publisher.blocking_calls.load(.acquire));
+    try std.testing.expect(publisher.recovery_calls.load(.acquire) > 0);
+}
+
+test "publication recovery step owned capture progresses while import publication holds apply" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("publication-step-owned-import");
+    defer directory.cleanup();
+    const payload = try a.alloc(u8, 256 * 1024 + 17);
+    defer a.free(payload);
+    @memset(payload, 'i');
+    var publisher: PublicationStepTestPublisher = .{ .expected_payload = payload };
+    var db = try DB.open(a, directory.path(), publisher.options());
+    defer db.close();
+    const key = try durableReplicationOutboxKeyAlloc(a, .replay, 7, 1, payload);
+    defer a.free(key);
+    const raw = try encodeDurableReplicationOutboxAlloc(a, 7, payload);
+    defer a.free(raw);
+    try db.core.store.put(key, raw);
+    db.local_execution.durable_replication_outbox_maybe.store(true, .release);
+    try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+    try std.testing.expect(db.core.store.portableImportHasReaders());
+    try std.testing.expect(db.core.apply_mutex.tryLockExclusiveForAdmission());
+    var apply_held = true;
+    defer if (apply_held) db.core.unlockApply();
+    try db.core.store.claimPortableImportPublicationWithAdmission(null);
+    var import_held = true;
+    defer if (import_held) db.core.store.cancelPortableImportPublication();
+    // An importing writer may await readers while holding apply. Existing
+    // immutable capture must advance and release its reader without that fence.
+    var polls: usize = 0;
+    while (db.core.store.portableImportHasReaders()) : (polls += 1) {
+        try std.testing.expect(polls < 1000);
+        try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+    }
+    try std.testing.expect(polls > 0);
+    try std.testing.expectEqual(@as(usize, 0), publisher.controlled_calls.load(.acquire));
+    db.core.store.cancelPortableImportPublication();
+    import_held = false;
+    db.core.unlockApply();
+    apply_held = false;
+    publisher.ready.store(true, .release);
+    polls = 0;
+    while (db.local_execution.durable_replication_outbox_maybe.load(.acquire)) : (polls += 1) {
+        try std.testing.expect(polls < 1000);
+        DB.outboxRecoveryDrain(&db) catch |err| if (err != error.CommitCompletionPending) return err;
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, key));
+
+    // Blocking empty reconciliation must also retire an earlier polling read.
+    try db.core.store.put(key, raw);
+    db.local_execution.durable_replication_outbox_maybe.store(true, .release);
+    try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+    try std.testing.expect(db.core.store.portableImportHasReaders());
+    try db.core.store.putBatch(&.{}, &.{key});
+    try db.flushDurableReplicationOutboxes();
+    try std.testing.expect(!db.core.store.portableImportHasReaders());
+    try std.testing.expect(db.local_execution.replication_intent_capture.read == null);
+    try std.testing.expect(!db.local_execution.durable_replication_outbox_maybe.load(.acquire));
+}
+
+test "publication recovery step legacy portable admission refuses reader contention and releases the sole ordinary CPU for resumption" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("portable-legacy-reader-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    var prepared = try db.preparePortableRuntimeMetadata(db.core.store, db.core.identity_namespace);
+    defer prepared.deinit();
+    const generation = db.core.root_generation;
+    const namespace = db.core.identity_namespace;
+    var reader = try db.core.store.beginReadTxn();
+    var reader_open = true;
+    defer if (reader_open) reader.abort();
+    const runnable = @import("../../common/runnable_scheduler.zig");
+    var scheduler = try runnable.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var importer: runnable.Execution = .{};
+    defer importer.finish();
+    try importer.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .write);
+    var health: runnable.Execution = .{};
+    defer health.finish();
+    try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+    var resumed: runnable.Execution = .{};
+    defer resumed.finish();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, resumed.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query));
+    const Probe = struct {
+        db: *DB,
+        prepared: *DB.PreparedPortableRuntimeMetadata,
+        returned: std.atomic.Value(bool) = .init(false),
+        calls: usize = 0,
+        result: ?anyerror = null,
+        fn publish(self: *@This()) !DB.PortableGenerationPublication {
+            self.calls += 1;
+            try std.testing.expect(self.db.core.store.portableImportPublicationInProgress());
+            try std.testing.expect(!self.db.core.store.portableImportHasReaders());
+            // Stop before the irreversible callback changes a generation. The
+            // caller's failure cleanup must release both transferred fences.
+            return error.TestPortablePublicationReached;
+        }
+        fn run(self: *@This()) void {
+            self.db.adoptPreparedPortableGenerationIfEmpty(std.testing.allocator, self.prepared, self, publish) catch |err| {
+                self.result = err;
+            };
+            self.returned.store(true, .release);
+        }
+    };
+    var probe: Probe = .{ .db = &db, .prepared = &prepared };
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
+    var joined = false;
+    defer if (!joined) {
+        if (reader_open) {
+            reader.abort();
+            reader_open = false;
+        }
+        thread.join();
+    };
+    // The watchdog retires the reader if the existing refusal contract regresses,
+    // so a regression fails instead of hanging. Health owns independent control
+    // capacity; ordinary resumption stays unavailable until the importer exits.
+    const deadline = monotonicTimeNs() + std.time.ns_per_s;
+    while (!probe.returned.load(.acquire) and monotonicTimeNs() < deadline) @import("antfly_platform").time.yieldNow();
+    const refused_without_reader_retirement = probe.returned.load(.acquire);
+    if (!refused_without_reader_retirement) {
+        reader.abort();
+        reader_open = false;
+    }
+    thread.join();
+    joined = true;
+    try std.testing.expect(refused_without_reader_retirement);
+    try std.testing.expectEqual(@as(?anyerror, error.Backpressured), probe.result);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expect(db.core.store.portableImportHasReaders());
+    try std.testing.expect(!db.core.store.portableImportPublicationInProgress());
+    try std.testing.expect(db.core.apply_mutex.tryLockExclusiveForAdmission());
+    db.core.unlockApply();
+    try prepared.row_policy_lease.checkAt(0);
+    try health.checkLifetime();
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+
+    importer.finish();
+    try resumed.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query);
+    try std.testing.expect(!try reader.contains("missing-user-key"));
+    reader.abort();
+    reader_open = false;
+    resumed.finish();
+    try std.testing.expect(!db.core.store.portableImportHasReaders());
+
+    // Retrying the same prepared image after the reader retires reaches the
+    // publication callback, then its deliberate error releases both fences.
+    try importer.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .write);
+    try std.testing.expectError(error.TestPortablePublicationReached, db.adoptPreparedPortableGenerationIfEmpty(a, &prepared, &probe, Probe.publish));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(!db.core.store.portableImportPublicationInProgress());
+    try std.testing.expect(db.core.apply_mutex.tryLockExclusiveForAdmission());
+    db.core.unlockApply();
+    try std.testing.expectEqual(generation, db.core.root_generation);
+    try std.testing.expect(namespace.eql(db.core.identity_namespace));
+
+    // A caller must not withdraw somebody else's publication exclusion.
+    try db.core.store.claimPortableImportPublicationWithAdmission(null);
+    var foreign_publication = true;
+    defer if (foreign_publication) db.core.store.cancelPortableImportPublication();
+    try std.testing.expectError(error.PortableImportPublicationInProgress, db.adoptPreparedPortableGenerationIfEmpty(a, &prepared, &probe, Probe.publish));
+    try std.testing.expect(db.core.store.portableImportPublicationInProgress());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    db.core.store.cancelPortableImportPublication();
+    foreign_publication = false;
+    try db.core.store.put("\x01doc", "opaque");
+    try std.testing.expectError(error.LiteImportTargetNotEmpty, db.adoptPreparedPortableGenerationIfEmpty(a, &prepared, &probe, Probe.publish));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(!db.core.store.portableImportPublicationInProgress());
+    try std.testing.expect(db.core.apply_mutex.tryLockExclusiveForAdmission());
+    db.core.unlockApply();
+}
+
+test "publication recovery step owned key scan rejects stale empty snapshot after a late intent insert" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("publication-key-late-insert");
+    defer directory.cleanup();
+    var publisher: PublicationStepTestPublisher = .{};
+    var db = try DB.open(a, directory.path(), publisher.options());
+    defer db.close();
+    db.local_execution.durable_replication_outbox_maybe.store(true, .release);
+    try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+    try std.testing.expect(db.local_execution.replication_intent_capture.discovery != null);
+    const selected_revision = db.local_execution.replication_intent_capture.discovery.?.query_revision;
+    const key = try PublicationStepTestPublisher.insert(&db);
+    defer a.free(key);
+    try std.testing.expect(db.core.store.query_generation_revision.load(.acquire) != selected_revision);
+    publisher.ready.store(true, .release);
+    try drainPublicationDebtForTest(&db);
+    try std.testing.expect(publisher.recovery_calls.load(.acquire) > 0);
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, key));
+    try std.testing.expect(!db.core.store.portableImportHasReaders());
+}
+
+test "publication recovery step owned key scan invalidates captured bytes across same-identity import publication" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("publication-key-import-revision");
+    defer directory.cleanup();
+    var publisher: PublicationStepTestPublisher = .{};
+    var db = try DB.open(a, directory.path(), publisher.options());
+    defer db.close();
+    const key = try PublicationStepTestPublisher.insert(&db);
+    defer a.free(key);
+    var polls: usize = 0;
+    while (publisher.recovery_calls.load(.acquire) == 0) : (polls += 1) {
+        try std.testing.expect(polls < 1000);
+        try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+    }
+    const before = publisher.recovery_calls.load(.acquire);
+    const namespace = db.core.identity_namespace;
+    const generation = db.core.root_generation;
+    const old_revision = try db.core.store.portableImportRevision();
+    try std.testing.expect(!db.core.store.portableImportHasReaders());
+    try db.core.store.claimPortableImportPublicationWithAdmission(null);
+    db.core.store.finishPortableImportPublication();
+    const revision = try db.core.store.portableImportRevision();
+    try std.testing.expectEqual(old_revision + 1, revision);
+    try std.testing.expectError(error.CommitCompletionPending, DB.outboxRecoveryDrain(&db));
+    try std.testing.expectEqual(before, publisher.recovery_calls.load(.acquire));
+    try std.testing.expect(db.local_execution.replication_intent_capture.value == null);
+    try std.testing.expectEqual(revision, db.local_execution.replication_intent_capture.source_revision);
+    try std.testing.expect(namespace.eql(db.core.identity_namespace));
+    try std.testing.expectEqual(generation, db.core.root_generation);
+    publisher.ready.store(true, .release);
+    try drainPublicationDebtForTest(&db);
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, key));
+}
+
+test "publication recovery step owned capture reserved lane refuses legacy bytes before materialization" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("publication-reserved-legacy");
+    defer directory.cleanup();
+    var publisher: PublicationStepTestPublisher = .{};
+    var db = try DB.open(a, directory.path(), publisher.options());
+    defer db.close();
+    const key = @import("durable_outbox.zig").replication_batch_outbox_key;
+    const raw = "deliberately malformed legacy value";
+    try db.core.store.putBatch(&.{.{ .key = key, .value = raw }}, &.{});
+    db.local_execution.durable_replication_outbox_maybe.store(true, .release);
+    var refused = false;
+    for (0..1000) |_| {
+        DB.outboxRecoveryReservedDrain(&db) catch |err| {
+            if (err == error.CommitCompletionPending) continue;
+            try std.testing.expectEqual(error.PublicationRecoveryNeedsMaintenance, err);
+            refused = true;
+            break;
+        };
+        return error.TestExpectedLegacyRefusal;
+    }
+    try std.testing.expect(refused);
+    try std.testing.expectEqual(@as(usize, 0), publisher.recovery_calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), publisher.blocking_calls.load(.acquire));
+    try std.testing.expect(!db.core.store.portableImportHasReaders());
+    const stored = try db.core.store.get(a, key);
+    defer a.free(stored);
+    try std.testing.expectEqualStrings(raw, stored);
+    // A publisher without the cooperative admission callback also stays off
+    // reserved workers, even if it exposes a completion poll.
+    var vtable = db.local_execution.replication_async_effect_mirror.?.publisher.vtable.*;
+    vtable.recover_with_admission = null;
+    db.local_execution.replication_async_effect_mirror.?.publisher.vtable = &vtable;
+    try std.testing.expectError(error.PublicationRecoveryNeedsMaintenance, DB.outboxRecoveryReservedDrain(&db));
 }

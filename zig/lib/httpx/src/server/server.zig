@@ -43,6 +43,7 @@ const array_list_writer_mod = @import("../util/array_list_writer.zig");
 const arrayListWriter = array_list_writer_mod.arrayListWriter;
 const serializeToSlice = array_list_writer_mod.serializeToSlice;
 const mem = std.mem;
+const RequestControl = @import("../net/socket.zig").WriteControl;
 const posix = std.posix;
 const Allocator = mem.Allocator;
 const Io = std.Io;
@@ -161,6 +162,9 @@ pub const ServerConfig = struct {
     body_read_timeout_ms: u64 = 120_000,
     /// Per-write socket timeout for response delivery. Zero disables it.
     response_write_timeout_ms: u64 = 30_000,
+    /// Total request lifetime from ingress through output retirement. Zero
+    /// leaves policy to the embedding application; Antfly supplies a finite cap.
+    request_timeout_ms: u64 = 0,
     /// Independent, fail-fast protected execution for errors and terminal resets.
     cleanup_execution: ?CleanupExecution = null,
     keep_alive_timeout_ms: u64 = 60_000,
@@ -434,11 +438,15 @@ pub const Context = struct {
     /// that cannot expose their concrete listener state to the handler.
     cancellation_probe: ?CancellationProbe = null,
     /// Optional application-owned absolute monotonic deadline established by
-    /// ingress middleware. The HTTP library carries but does not interpret it.
+    /// ingress middleware. A paired Io authority lets transport reads/writes
+    /// enforce it; a null authority remains an application-native contract.
     application_deadline_ns: ?u64 = null,
     /// Clock authority paired with the application deadline. Null leaves
     /// interpretation to an application's native-clock contract.
     application_deadline_io: ?Io = null,
+    /// Explicit source for application-native timestamps. Projection changes
+    /// transport controls, never the timestamp consumed by native execution.
+    application_deadline_clock: ?*const fn () u64 = null,
     /// Records malformed application deadline metadata so authentication can
     /// run before an application-specific validation response is disclosed.
     application_deadline_invalid: bool = false,
@@ -481,6 +489,26 @@ pub const Context = struct {
         start: *const fn (?*anyopaque, u16, []const u8, *const Headers) anyerror!void,
         write: *const fn (?*anyopaque, []const u8) anyerror!void,
         close: *const fn (?*anyopaque) anyerror!void,
+        start_controlled: ?*const fn (?*anyopaque, u16, []const u8, *const Headers, RequestControl) anyerror!void = null,
+        write_controlled: ?*const fn (?*anyopaque, []const u8, RequestControl) anyerror!void = null,
+        close_controlled: ?*const fn (?*anyopaque, RequestControl) anyerror!void = null,
+
+        fn startWithControl(self: @This(), status_code: u16, content_type: []const u8, headers: *const Headers, control: RequestControl) !void {
+            if (control.active() and (self.start_controlled == null or self.write_controlled == null or self.close_controlled == null)) return error.RequestControlUnavailable;
+            if (self.start_controlled) |call| return call(self.ptr, status_code, content_type, headers, control);
+            if (control.active()) return error.RequestControlUnavailable;
+            return self.start(self.ptr, status_code, content_type, headers);
+        }
+        fn writeWithControl(self: @This(), bytes: []const u8, control: RequestControl) !void {
+            if (self.write_controlled) |call| return call(self.ptr, bytes, control);
+            if (control.active()) return error.RequestControlUnavailable;
+            return self.write(self.ptr, bytes);
+        }
+        fn closeWithControl(self: @This(), control: RequestControl) !void {
+            if (self.close_controlled) |call| return call(self.ptr, control);
+            if (control.active()) return error.RequestControlUnavailable;
+            return self.close(self.ptr);
+        }
     };
 
     pub const BodyDelegate = struct {
@@ -488,6 +516,14 @@ pub const Context = struct {
         read_all: *const fn (?*anyopaque) anyerror!?[]const u8,
         read: ?*const fn (?*anyopaque, []u8) anyerror!usize = null,
         streaming: bool,
+        read_all_controlled: ?*const fn (?*anyopaque, RequestControl) anyerror!?[]const u8 = null,
+        read_controlled: ?*const fn (?*anyopaque, []u8, RequestControl) anyerror!usize = null,
+
+        fn readAllWithControl(self: @This(), control: RequestControl) !?[]const u8 {
+            if (self.read_all_controlled) |call| return call(self.ptr, control);
+            if (control.active()) return error.RequestControlUnavailable;
+            return self.read_all(self.ptr);
+        }
     };
 
     pub const RequestBodyReader = struct {
@@ -532,6 +568,50 @@ pub const Context = struct {
             if (existing.dtor) |d| d(existing.ptr);
         }
         try self.data.?.put(key, .{ .ptr = ptr, .dtor = dtor });
+    }
+
+    /// Copy the known-clock request ceiling into every physical output control.
+    /// Application callbacks retain their own cancellation and wait ownership.
+    pub fn requestWriteControl(self: *const Self, control: @import("../net/socket.zig").WriteControl) @import("../net/socket.zig").WriteControl {
+        const deadline = self.application_deadline_ns orelse return control;
+        if (self.application_deadline_io) |authority| return control.withDeadline(authority, deadline);
+        const source_now = self.application_deadline_clock orelse return control;
+        // Sample the target first so callback time cannot extend the budget.
+        const target_now: u64 = @intCast(@max(0, Io.Clock.awake.now(self.io).nanoseconds));
+        return control.withDeadline(self.io, target_now +| (deadline -| source_now()));
+    }
+
+    /// Native execution adapters historically interpret an unpaired timestamp
+    /// in their own native clock. Preserve that contract while projecting any
+    /// explicitly paired Io/native authority. Transport output controls still
+    /// refuse to invent an authority for an unknown timestamp.
+    pub fn nativeDeadlineInClock(self: *const Self, target_clock: *const fn () u64) ?u64 {
+        const deadline = self.application_deadline_ns orelse return null;
+        if (self.application_deadline_io) |source_io| {
+            const target_now = target_clock();
+            const source_now: u64 = @intCast(@max(0, Io.Clock.awake.now(source_io).nanoseconds));
+            return target_now +| (deadline -| source_now);
+        }
+        if (self.application_deadline_clock) |source_clock| {
+            if (source_clock == target_clock) return deadline;
+            const target_now = target_clock();
+            return target_now +| (deadline -| source_clock());
+        }
+        return deadline;
+    }
+
+    fn constrainBodyDeadline(self: *Self) !void {
+        const control = self.requestWriteControl(.{});
+        const remaining = try control.timeout(null);
+        const ms = remaining orelse return;
+        const deadline = deadlineAfter(self.io, ms);
+        if (self.h2_body_reader) |reader| reader.deadline_ms = earlierDeadline(reader.deadline_ms, deadline);
+    }
+
+    fn installRequestDeadline(self: *Self, deadline_ms: i64) void {
+        if (deadline_ms == 0) return;
+        self.application_deadline_ns = @as(u64, @intCast(@max(0, deadline_ms))) *| std.time.ns_per_ms;
+        self.application_deadline_io = self.io;
     }
 
     /// Retrieves a stored pointer by key.
@@ -754,6 +834,7 @@ pub const Context = struct {
         chunk_remaining: u64 = 0,
         line_buf: [256]u8 = undefined,
         owned_body: ?[]u8 = null,
+        control: RequestControl = .{},
 
         pub const ChunkState = enum { size, data, crlf, trailer, done };
 
@@ -770,6 +851,7 @@ pub const Context = struct {
         }
 
         pub fn read(self: *H1StreamReader, dest: []u8) !usize {
+            try self.control.check();
             if (dest.len == 0) return 0;
             if (!self.chunked) {
                 if (self.remaining == 0) return 0;
@@ -820,6 +902,7 @@ pub const Context = struct {
         /// Deliver raw transport bytes: the parser's leftover first, then the
         /// socket. Returns 0 only when the peer closed the connection.
         fn readRaw(self: *H1StreamReader, dest: []u8) !usize {
+            try self.control.check();
             if (self.leftover.* > 0) {
                 const n = @min(dest.len, self.leftover.*);
                 @memcpy(dest[0..n], self.buffer[0..n]);
@@ -829,7 +912,7 @@ pub const Context = struct {
                 return n;
             }
             try applyReadDeadline(self.sock, self.io, self.deadline_ms);
-            return try self.sock.recv(dest);
+            return try self.sock.recvControlled(dest, self.control);
         }
 
         /// Consume one CRLF-terminated line from the leftover buffer, refilling
@@ -837,6 +920,7 @@ pub const Context = struct {
         /// and is valid until the next call.
         fn takeLine(self: *H1StreamReader) ![]const u8 {
             while (true) {
+                try self.control.check();
                 const buffered = self.buffer[0..self.leftover.*];
                 if (std.mem.indexOfScalar(u8, buffered, '\n')) |nl| {
                     var line_len = nl;
@@ -852,10 +936,30 @@ pub const Context = struct {
                 }
                 if (self.leftover.* >= self.buffer.len) return error.InvalidChunkedEncoding;
                 try applyReadDeadline(self.sock, self.io, self.deadline_ms);
-                const n = try self.sock.recv(self.buffer[self.leftover.*..]);
+                const n = try self.sock.recvControlled(self.buffer[self.leftover.*..], self.control);
                 if (n == 0) return error.EndOfStream;
                 self.leftover.* += n;
             }
+        }
+
+        pub fn readAllControlled(self: *H1StreamReader, control: RequestControl) !?[]const u8 {
+            return readAllErasedControlled(self, control);
+        }
+
+        fn readErasedControlled(ptr: ?*anyopaque, dest: []u8, control: RequestControl) anyerror!usize {
+            const self: *H1StreamReader = @ptrCast(@alignCast(ptr orelse return error.EndOfStream));
+            const previous = self.control;
+            self.control = control;
+            defer self.control = previous;
+            return self.read(dest);
+        }
+
+        fn readAllErasedControlled(ptr: ?*anyopaque, control: RequestControl) anyerror!?[]const u8 {
+            const self: *H1StreamReader = @ptrCast(@alignCast(ptr orelse return error.EndOfStream));
+            const previous = self.control;
+            self.control = control;
+            defer self.control = previous;
+            return readAllErased(ptr);
         }
 
         fn readErased(ptr: ?*anyopaque, dest: []u8) anyerror!usize {
@@ -905,11 +1009,13 @@ pub const Context = struct {
         /// here would renew after each DATA frame and permit an endless
         /// trickle upload to retain application admission.
         deadline_ms: i64 = 0,
+        control: RequestControl = .{},
 
         /// Reads available body data into `buf`. Returns 0 on EOF.
         /// Returns error.Timeout once the shared body deadline expires.
         pub fn read(self: *H2StreamReader, buf: []u8) !usize {
             while (true) {
+                try self.control.check();
                 const avail = self.h2_stream.data_buf.items.len - self.h2_stream.read_offset;
                 if (avail > 0) {
                     const n = @min(avail, buf.len);
@@ -931,19 +1037,45 @@ pub const Context = struct {
                 if (self.h2_stream.stream_error) |err| return err;
                 if (self.h2_stream.completed) return 0;
 
-                const timeout: Io.Timeout = if (self.deadline_ms > 0) blk: {
-                    const remaining_ms = self.deadline_ms - milliTimestamp(self.io);
-                    if (remaining_ms <= 0) return error.Timeout;
-                    break :blk .{ .duration = .{
-                        .raw = Io.Duration.fromMilliseconds(@intCast(remaining_ms)),
-                        .clock = .awake,
-                    } };
-                } else .none;
-                self.data_event.waitTimeout(self.io, timeout) catch |err| switch (err) {
-                    error.Timeout => return error.Timeout,
-                    error.Canceled => return error.Canceled,
+                const phase_ms: ?u64 = if (self.deadline_ms > 0) blk: {
+                    const remaining = self.deadline_ms - milliTimestamp(self.io);
+                    if (remaining <= 0) return error.Timeout;
+                    break :blk @intCast(remaining);
+                } else null;
+                const remaining = try self.control.timeout(phase_ms);
+                // Check-only cancellation callbacks also need a bounded wakeup.
+                const wait_ms = if (self.control.active()) @min(remaining orelse 50, 50) else remaining;
+                const timeout: Io.Timeout = if (wait_ms) |ms| .{ .duration = .{
+                    .raw = Io.Duration.fromMilliseconds(@intCast(ms)),
+                    .clock = .awake,
+                } } else .none;
+                self.control.withWait(waitForData, .{ self, timeout }) catch |err| switch (err) {
+                    error.Timeout => {
+                        try self.control.check();
+                        if (self.deadline_ms > 0 and milliTimestamp(self.io) >= self.deadline_ms) return error.Timeout;
+                        continue;
+                    },
+                    else => return err,
                 };
             }
+        }
+
+        fn waitForData(self: *@This(), timeout: Io.Timeout) !void {
+            try self.data_event.waitTimeout(self.io, timeout);
+        }
+
+        pub fn readControlled(self: *@This(), buf: []u8, control: RequestControl) !usize {
+            const previous = self.control;
+            self.control = control;
+            defer self.control = previous;
+            return self.read(buf);
+        }
+
+        pub fn readAllControlled(self: *@This(), allocator: Allocator, control: RequestControl) ![]u8 {
+            const previous = self.control;
+            self.control = control;
+            defer self.control = previous;
+            return self.readAll(allocator);
         }
 
         /// Reads all remaining body data into a single owned slice.
@@ -964,16 +1096,24 @@ pub const Context = struct {
     /// when needed. Ordinary HTTP/1 requests return request.body directly;
     /// opted-in fixed-length HTTP/1 and streaming HTTP/2 bodies are read once.
     pub fn body(self: *Self) !?[]const u8 {
+        return self.bodyControlled(.{});
+    }
+
+    pub fn bodyControlled(self: *Self, caller_control: RequestControl) !?[]const u8 {
+        const control = self.requestWriteControl(caller_control);
+        try control.check();
+        try self.constrainBodyDeadline();
         if (self.request.body != null) return self.request.body;
         if (self.body_delegate) |delegate| {
-            const data = try delegate.read_all(delegate.ptr);
+            const data = try delegate.readAllWithControl(control);
+            try control.check();
             self.request.body = data;
             self.request.body_owned = false;
             self.body_delegate = null;
             return data;
         }
         if (self.h2_body_reader) |reader| {
-            const data = reader.readAll(self.request.allocator) catch |err| switch (err) {
+            const data = reader.readAllControlled(self.request.allocator, control) catch |err| switch (err) {
                 error.EndOfStream => {
                     if (self.bodyFramingRequiresEndStream()) return err;
                     self.h2_body_reader = null;
@@ -984,6 +1124,7 @@ pub const Context = struct {
             self.request.body = data;
             self.request.body_owned = true;
             self.h2_body_reader = null;
+            try control.check();
             return self.request.body;
         }
         return null;
@@ -998,6 +1139,8 @@ pub const Context = struct {
     }
 
     fn readBodyChunk(self: *Self, dest: []u8) !usize {
+        try self.requestWriteControl(.{}).check();
+        try self.constrainBodyDeadline();
         if (dest.len == 0) return 0;
         if (self.request.body) |body_bytes| {
             if (self.body_read_offset >= body_bytes.len) return 0;
@@ -1007,14 +1150,19 @@ pub const Context = struct {
             return n;
         }
         if (self.body_delegate) |delegate| {
-            if (delegate.read) |read| return read(delegate.ptr, dest);
-            const data = (try delegate.read_all(delegate.ptr)) orelse return 0;
+            const control = self.requestWriteControl(.{});
+            if (delegate.read_controlled) |read| return read(delegate.ptr, dest, control);
+            if (delegate.read) |read| {
+                if (control.active()) return error.RequestControlUnavailable;
+                return read(delegate.ptr, dest);
+            }
+            const data = (try delegate.readAllWithControl(self.requestWriteControl(.{}))) orelse return 0;
             self.request.body = data;
             self.request.body_owned = false;
             self.body_delegate = null;
             return self.readBodyChunk(dest);
         }
-        if (self.h2_body_reader) |reader| return reader.read(dest);
+        if (self.h2_body_reader) |reader| return reader.readControlled(dest, self.requestWriteControl(.{}));
         return 0;
     }
 
@@ -1132,7 +1280,8 @@ pub const Context = struct {
         return self.streamH2Controlled(status_code, extra_headers, .{});
     }
 
-    pub fn streamH2Controlled(self: *Self, status_code: u16, extra_headers: []const hpack.HeaderEntry, control: @import("../net/socket.zig").WriteControl) !H2StreamWriter {
+    pub fn streamH2Controlled(self: *Self, status_code: u16, extra_headers: []const hpack.HeaderEntry, caller_control: @import("../net/socket.zig").WriteControl) !H2StreamWriter {
+        const control = self.requestWriteControl(caller_control);
         try control.check();
         const h2 = self.h2 orelse return error.NotH2;
         const sock = self.h2_sock orelse return error.NotH2;
@@ -1182,7 +1331,7 @@ pub const Context = struct {
             if (data.len == 0) return;
 
             if (self.delegate) |delegate| {
-                try delegate.write(delegate.ptr, data);
+                try delegate.writeWithControl(data, self.control);
             } else if (self.h2_writer) |*w| {
                 try w.write(data);
             } else if (self.h1_sock) |sock| {
@@ -1222,7 +1371,7 @@ pub const Context = struct {
             self.closed = true;
 
             if (self.delegate) |delegate| {
-                try delegate.close(delegate.ptr);
+                try delegate.closeWithControl(self.control);
             } else if (self.h2_writer) |*w| {
                 try w.close();
             } else if (self.h1_sock) |sock| {
@@ -1319,13 +1468,14 @@ pub const Context = struct {
         return self.streamResponseWithContentTypeControlled(status_code, content_type, .{});
     }
 
-    pub fn streamResponseWithContentTypeControlled(self: *Self, status_code: u16, content_type: []const u8, control: @import("../net/socket.zig").WriteControl) !StreamWriter {
+    pub fn streamResponseWithContentTypeControlled(self: *Self, status_code: u16, content_type: []const u8, caller_control: @import("../net/socket.zig").WriteControl) !StreamWriter {
+        const control = self.requestWriteControl(caller_control);
         try control.check();
         if (self.stream_delegate) |delegate| {
             _ = try self.response.header(HeaderName.CONTENT_TYPE, content_type);
             self.response.headers.removeAll(HeaderName.CONTENT_LENGTH);
             self.response.headers.removeAll(HeaderName.TRANSFER_ENCODING);
-            try delegate.start(delegate.ptr, status_code, content_type, &self.response.headers);
+            try delegate.startWithControl(status_code, content_type, &self.response.headers, control);
             return .{ .h1_sock = null, .h2_writer = null, .delegate = delegate, .control = control };
         }
         // Middleware has already established response policy (e.g. CORS).
@@ -2284,6 +2434,7 @@ pub const Server = struct {
             error.ConnectionResetByPeer,
             error.BrokenPipe,
             error.RecvFailed,
+            error.HttpFrameReadTimeout,
             error.SendFailed,
             error.InvalidSocketOption,
             => {},
@@ -2361,7 +2512,8 @@ pub const Server = struct {
         // A single TCP recv may return only part of the 24-byte H2 preface.
         // The h2 preface is "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (24 bytes).
         var peek_buf: [8192]u8 = undefined;
-        const first_header_deadline_ms = deadlineAfter(self.io, self.config.header_read_timeout_ms);
+        const first_request_deadline_ms = deadlineAfter(self.io, self.config.request_timeout_ms);
+        const first_header_deadline_ms = earlierDeadline(deadlineAfter(self.io, self.config.header_read_timeout_ms), first_request_deadline_ms);
         try applyReadDeadline(&sock, self.io, first_header_deadline_ms);
         var first_n = try sock.recv(&peek_buf);
         if (first_n == 0) return;
@@ -2410,6 +2562,7 @@ pub const Server = struct {
             // Keep-alive idle, header ingress, and body ingress are separate
             // absolute phases. Bytes cannot renew any of these deadlines.
             var waiting_for_request_bytes = !first_request and leftover == 0;
+            var request_deadline_ms = if (first_request) first_request_deadline_ms else if (!waiting_for_request_bytes) deadlineAfter(self.io, self.config.request_timeout_ms) else 0;
             var body_deadline_started = false;
             var deadline_ms = if (first_request)
                 first_header_deadline_ms
@@ -2418,6 +2571,8 @@ pub const Server = struct {
                     self.io,
                     if (waiting_for_request_bytes) self.config.keep_alive_timeout_ms else self.config.header_read_timeout_ms,
                 );
+
+            deadline_ms = earlierDeadline(deadline_ms, request_deadline_ms);
 
             // Feed any leftover bytes from the previous request (pipelining)
             // before reading from the socket.
@@ -2459,7 +2614,7 @@ pub const Server = struct {
                 }
                 if (!body_deadline_started and parser.hasCompleteHeaders() and !parser.isComplete()) {
                     body_deadline_started = true;
-                    deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms);
+                    deadline_ms = earlierDeadline(deadlineAfter(self.io, self.config.body_read_timeout_ms), request_deadline_ms);
                 }
             }
 
@@ -2488,7 +2643,8 @@ pub const Server = struct {
                     };
                     if (waiting_for_request_bytes and received > 0) {
                         waiting_for_request_bytes = false;
-                        deadline_ms = deadlineAfter(self.io, self.config.header_read_timeout_ms);
+                        request_deadline_ms = deadlineAfter(self.io, self.config.request_timeout_ms);
+                        deadline_ms = earlierDeadline(deadlineAfter(self.io, self.config.header_read_timeout_ms), request_deadline_ms);
                     }
                     break :blk received;
                 };
@@ -2531,7 +2687,7 @@ pub const Server = struct {
                 }
                 if (!body_deadline_started and parser.hasCompleteHeaders() and !parser.isComplete()) {
                     body_deadline_started = true;
-                    deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms);
+                    deadline_ms = earlierDeadline(deadlineAfter(self.io, self.config.body_read_timeout_ms), request_deadline_ms);
                 }
             }
 
@@ -2593,12 +2749,13 @@ pub const Server = struct {
                 // the upgrade handler releases it as soon as that request
                 // finishes, before entering the long-lived frame loop.
                 request_active = false;
-                return self.handleH2cUpgrade(&connection.control, &sock, &req, buffer[0..leftover]);
+                return self.handleH2cUpgrade(&connection.control, &sock, &req, buffer[0..leftover], request_deadline_ms);
             }
 
             var application_scope: ApplicationMemoryScope = .{ .child = self.applicationAllocator(&req), .shared = self.applicationQuota(&req) };
             defer application_scope.deinit();
             var ctx = Context.init(application_scope.allocator(), self.io, &req);
+            ctx.installRequestDeadline(request_deadline_ms);
             ctx.max_file_size = self.config.max_file_size;
             ctx.max_request_body_size = resolveRequestBodyLimit(self, req.method, req.uri.path) orelse self.config.max_body_size;
             req.body_budget = parser.body_budget;
@@ -2613,13 +2770,15 @@ pub const Server = struct {
                 .remaining = if (parser.chunked) 0 else parser.content_length.?,
                 .chunked = parser.chunked,
                 .max_body = ctx.max_request_body_size,
-                .deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms),
+                .deadline_ms = earlierDeadline(deadlineAfter(self.io, self.config.body_read_timeout_ms), request_deadline_ms),
             } else null;
             defer if (h1_stream_reader) |*reader| reader.deinit();
             if (h1_stream_reader) |*reader| {
                 ctx.body_delegate = .{
                     .ptr = reader,
                     .read_all = Context.H1StreamReader.readAllErased,
+                    .read_all_controlled = Context.H1StreamReader.readAllErasedControlled,
+                    .read_controlled = Context.H1StreamReader.readErasedControlled,
                     .read = Context.H1StreamReader.readErased,
                     .streaming = true,
                 };
@@ -2724,7 +2883,7 @@ pub const Server = struct {
             try ensureContentLengthHeader(&response);
             try ensureDateHeader(self.io, &response);
 
-            try sendBuffered(self.allocator, &sock, &response);
+            try sendBufferedControlled(self.allocator, &sock, &response, ctx.requestWriteControl(.{}));
 
             self.finishRequest();
             request_active = false;
@@ -2754,6 +2913,7 @@ pub const Server = struct {
                         reader.read(&drain_buf) catch return
                     else blk: {
                         const to_read = @min(remaining, drain_buf.len);
+                        applyReadDeadline(&sock, self.io, request_deadline_ms) catch return;
                         break :blk sock.recv(drain_buf[0..@intCast(to_read)]) catch return;
                     };
                     if (n == 0) return;
@@ -2838,7 +2998,7 @@ pub const Server = struct {
     /// Sends 101 Switching Protocols, handles the original request as stream 1,
     /// then enters the normal H2 receive loop for subsequent requests.
     /// `initial_h2_data` contains any bytes pipelined beyond the upgrade request.
-    fn handleH2cUpgrade(self: *Self, control: *ConnectionControl, sock: *Socket, original_req: *Request, initial_h2_data: []const u8) !void {
+    fn handleH2cUpgrade(self: *Self, control: *ConnectionControl, sock: *Socket, original_req: *Request, initial_h2_data: []const u8, request_deadline_ms: i64) !void {
         var stream1_request_active = true;
         defer if (stream1_request_active) self.finishRequest();
         // 1. Send 101 Switching Protocols.
@@ -2877,7 +3037,7 @@ pub const Server = struct {
         // RFC 7540 §3.2: The client sends its connection preface immediately
         // after the 101 response. We must process it before sending any
         // stream-level frames so flow control settings are applied correctly.
-        var h2c_reader = H2SocketReader{ .socket = sock, .initial = initial_h2_data, .initial_pos = 0 };
+        var h2c_reader = H2SocketReader{ .socket = sock, .initial = initial_h2_data, .initial_pos = 0, .clock_io = self.io, .header_timeout_ms = self.config.header_read_timeout_ms, .request_timeout_ms = self.config.request_timeout_ms, .inherited_deadline_ms = request_deadline_ms };
 
         try h2.readClientPreface(&h2c_reader);
 
@@ -2890,7 +3050,8 @@ pub const Server = struct {
         try h2.handleSettings(&settings_frame, sock);
 
         // 6. Handle the original HTTP/1.1 request as stream 1.
-        _ = try h2.stream_manager.getOrCreateStream(1);
+        const initial_stream = try h2.stream_manager.getOrCreateStream(1);
+        initial_stream.request_deadline_ms = request_deadline_ms;
         original_req.version = .HTTP_2;
         var stream1_processed = false;
         var stream1_future = self.requestIo().concurrent(
@@ -2924,6 +3085,8 @@ pub const Server = struct {
             // correct last_stream_id and clients don't retry it (RFC 7540 §6.8).
             h2.last_processed_stream_id = 1;
         }
+
+        h2c_reader.inherited_deadline_ms = 0;
 
         // 7. Enter the normal H2 receive loop for subsequent requests.
 
@@ -2965,8 +3128,15 @@ pub const Server = struct {
             }
 
             const maybe_sid = h2.processOneFrameLocked(&h2c_reader, sock) catch |err| switch (err) {
-                error.ConnectionClosed => break,
-                error.RecvFailed => continue,
+                error.ConnectionClosed, error.RecvFailed => break,
+                error.HttpFrameReadTimeout => {
+                    // Bytes from an incomplete frame cannot be retried as a
+                    // new frame. Interrupt all physical I/O before joined
+                    // teardown; attempting a blocked GOAWAY would add delay.
+                    sock.shutdown();
+                    return err;
+                },
+                error.Timeout => continue,
                 else => {
                     // RFC 7540 §5.4.1: Send GOAWAY with the correct error
                     // code before closing on connection-level errors.
@@ -3033,7 +3203,7 @@ pub const Server = struct {
         }
 
         // Wrap socket in a reader that first yields `initial_data`, then reads from socket.
-        var h2_reader = H2SocketReader{ .socket = sock, .initial = initial_data, .initial_pos = 0 };
+        var h2_reader = H2SocketReader{ .socket = sock, .initial = initial_data, .initial_pos = 0, .clock_io = self.io, .header_timeout_ms = self.config.header_read_timeout_ms, .request_timeout_ms = self.config.request_timeout_ms };
 
         // RFC 7540 §3.5: Server SETTINGS MUST be the first frame the server sends.
         // Send our SETTINGS before reading/ACKing the client's.
@@ -3100,10 +3270,17 @@ pub const Server = struct {
             }
 
             const maybe_sid = h2.processOneFrameLocked(&h2_reader, sock) catch |err| switch (err) {
-                error.ConnectionClosed => break,
-                // Socket recv timeout (from h2_idle_timeout_ms) surfaces as
-                // RecvFailed. Re-enter the loop so the idle check runs.
-                error.RecvFailed => continue,
+                error.ConnectionClosed, error.RecvFailed => break,
+                error.HttpFrameReadTimeout => {
+                    // Bytes from an incomplete frame cannot be retried as a
+                    // new frame. Interrupt all physical I/O before joined
+                    // teardown; attempting a blocked GOAWAY would add delay.
+                    sock.shutdown();
+                    return err;
+                },
+                // Socket distinguishes idle timeout from a terminal receive
+                // failure. A reset must wake/join pending response owners.
+                error.Timeout => continue,
                 else => {
                     // RFC 7540 §5.4.1: Send GOAWAY with the correct error
                     // code before closing on connection-level errors.
@@ -3317,7 +3494,7 @@ pub const Server = struct {
                 .h2_stream = stream,
                 .io = self.io,
                 .data_event = data_event,
-                .deadline_ms = deadlineAfter(self.io, self.config.body_read_timeout_ms),
+                .deadline_ms = earlierDeadline(deadlineAfter(self.io, self.config.body_read_timeout_ms), stream.request_deadline_ms),
             };
         }
 
@@ -3472,6 +3649,7 @@ pub const Server = struct {
         ctx.h2_body_reader = body_reader;
         ctx.h2_stream_id = stream_id;
         if (getH2Stream(h2, stream_id)) |stream| {
+            ctx.installRequestDeadline(stream.request_deadline_ms);
             ctx.cancellation = &stream.cancellation;
             req.body_budget = stream.data_budget orelse &self.body_budget;
         }
@@ -3556,34 +3734,33 @@ pub const Server = struct {
 
         // Build response headers outside the lock.
         var resp_extra = std.ArrayListUnmanaged(hpack.HeaderEntry).empty;
-        defer resp_extra.deinit(self.allocator);
+        defer resp_extra.deinit(response.allocator);
 
-        try appendH2ResponseHeaders(self.allocator, &resp_extra, &response.headers);
+        try appendH2ResponseHeaders(response.allocator, &resp_extra, &response.headers);
 
         var status_buf: [3]u8 = undefined;
         const h2_headers = try H2Connection.buildResponseHeaders(
             response.status.code,
             resp_extra.items,
             &status_buf,
-            self.allocator,
+            response.allocator,
         );
-        defer self.allocator.free(h2_headers);
+        defer response.allocator.free(h2_headers);
 
         const has_body = response.body != null and response.body.?.len > 0;
 
         // Acquire write mutex for HPACK encoding + frame serialization.
-        h2.write_mutex.lockUncancelable(h2.io);
-        defer h2.write_mutex.unlock(h2.io);
-
-        h2.sendHeaders(sock, stream_id, h2_headers, !has_body) catch |err| {
+        const output_control = ctx.requestWriteControl(.{});
+        var writer = @import("../net/socket.zig").ControlledWriter{ .socket = sock, .control = output_control };
+        h2.sendHeadersControlled(&writer, stream_id, h2_headers, !has_body, output_control) catch |err| {
             // Mark stream closed so activeStreamCount doesn't keep counting it.
-            if (h2.stream_manager.getStream(stream_id)) |s| s.reset();
+            cancelH2StreamWithExecution(self.config.cleanup_execution, h2, sock, stream_id);
             return err;
         };
 
         if (has_body) {
-            h2.writeDataBlocking(sock, stream_id, response.body.?, true) catch |err| {
-                if (h2.stream_manager.getStream(stream_id)) |s| s.reset();
+            h2.writeDataBlockingControlled(&writer, stream_id, response.body.?, true, output_control) catch |err| {
+                cancelH2StreamWithExecution(self.config.cleanup_execution, h2, sock, stream_id);
                 return err;
             };
         }
@@ -3703,6 +3880,8 @@ pub const Server = struct {
 
         const stream = h2.stream_manager.getStream(stream_id) orelse return false;
         if (!stream.got_headers or stream.data_event != null) return false;
+        if (stream.request_deadline_ms == 0)
+            stream.request_deadline_ms = deadlineAfter(self.io, self.config.request_timeout_ms);
         if (stream.stream_error) |err| {
             // DATA can arrive in the same receive-pump turn as HEADERS and
             // exceed admission limits before a handler fiber is claimed.
@@ -3912,9 +4091,27 @@ pub const Server = struct {
     /// Serializes a response to memory, then sends in a single writeAll call
     /// to avoid per-header syscalls through the unbuffered SocketWriter.
     fn sendBuffered(allocator: Allocator, socket: *Socket, resp: *Response) !void {
+        return sendBufferedControlled(allocator, socket, resp, .{});
+    }
+
+    fn sendBufferedControlled(allocator: Allocator, socket: *Socket, resp: *Response, control: @import("../net/socket.zig").WriteControl) !void {
+        try control.check();
+        var output = @import("../net/socket.zig").ControlledWriter{ .socket = socket, .control = control };
+        if (resp.header_arena != null) {
+            // Reserved serverless headers fit in this bounded scratch. Send the
+            // already-owned body separately rather than allocating a wire copy.
+            var scratch: [8 * 1024]u8 = undefined;
+            var writer = std.Io.Writer.fixed(&scratch);
+            try writer.print("{s} {d} {s}\r\n", .{ resp.version.toString(), resp.status.code, resp.status.phrase });
+            try resp.headers.serialize(&writer);
+            try writer.writeAll("\r\n");
+            try output.writeAll(writer.buffered());
+            if (resp.body) |body| try output.writeAll(body);
+            return;
+        }
         const bytes = try serializeToSlice(allocator, resp);
         defer allocator.free(bytes);
-        try socket.sendAll(bytes);
+        try output.writeAll(bytes);
     }
 
     /// RFC 7231 §7.1.1.2: Origin servers MUST send a Date header field
@@ -4019,13 +4216,23 @@ pub const Server = struct {
             .server = self,
             .route_handler = route_handler,
         };
-        return MiddlewareExecState.advance(ctx, &state);
+        try ctx.requestWriteControl(.{}).check();
+        var response = try MiddlewareExecState.advance(ctx, &state);
+        errdefer response.deinit();
+        try ctx.requestWriteControl(.{}).check();
+        return response;
     }
 };
 
 /// Socket creation and listener wakeups must share an I/O handle namespace.
 /// Keep this selection in one place so execution-lane changes cannot split
 /// the bind and wake paths again.
+fn earlierDeadline(left: i64, right: i64) i64 {
+    if (left == 0) return right;
+    if (right == 0) return left;
+    return @min(left, right);
+}
+
 fn listenerSocketIo(lease: *const HttpRuntime.ListenerLease) Io {
     return lease.connectionIo();
 }
@@ -4116,16 +4323,63 @@ const H2SocketReader = struct {
     socket: *Socket,
     initial: []const u8,
     initial_pos: usize,
+    clock_io: ?Io = null,
+    header_timeout_ms: u64 = 0,
+    request_timeout_ms: u64 = 0,
+    inherited_deadline_ms: i64 = 0,
+    frame_bytes: usize = 0,
+    frame_deadline_ms: i64 = 0,
+    request_deadline_ms: i64 = 0,
+    terminal: bool = false,
 
-    pub fn read(self: *H2SocketReader, buf: []u8) !usize {
-        if (self.initial_pos < self.initial.len) {
-            const avail = self.initial.len - self.initial_pos;
-            const n = @min(avail, buf.len);
-            @memcpy(buf[0..n], self.initial[self.initial_pos .. self.initial_pos + n]);
-            self.initial_pos += n;
-            return n;
+    fn clock(self: *const H2SocketReader) Io {
+        return self.clock_io orelse self.socket.io;
+    }
+    pub fn beginFrameRead(self: *H2SocketReader) !void {
+        if (self.terminal) return error.HttpFrameReadTimeout;
+        self.frame_bytes = 0;
+        self.frame_deadline_ms = self.inherited_deadline_ms;
+        self.request_deadline_ms = self.inherited_deadline_ms;
+    }
+    pub fn frameRequestDeadlineMs(self: *const H2SocketReader) i64 {
+        return self.request_deadline_ms;
+    }
+    fn budgetFrom(now_ms: i64, timeout_ms: u64) i64 {
+        if (timeout_ms == 0) return 0;
+        return now_ms +| @as(i64, @intCast(@min(timeout_ms, @as(u64, std.math.maxInt(i64)))));
+    }
+    fn control(self: *const H2SocketReader) @import("../net/socket.zig").WriteControl {
+        const deadline = earlierDeadline(self.frame_deadline_ms, self.inherited_deadline_ms);
+        return if (deadline == 0) .{} else (@import("../net/socket.zig").WriteControl{}).withDeadline(self.clock(), @as(u64, @intCast(@max(0, deadline))) *| std.time.ns_per_ms);
+    }
+    fn failure(self: *H2SocketReader, err: anyerror) anyerror {
+        if (err == error.Timeout and (self.frame_bytes != 0 or self.inherited_deadline_ms != 0)) {
+            self.terminal = true;
+            return error.HttpFrameReadTimeout;
         }
-        return self.socket.recv(buf);
+        return err;
+    }
+    pub fn read(self: *H2SocketReader, buf: []u8) !usize {
+        if (self.terminal) return error.HttpFrameReadTimeout;
+        if (buf.len == 0) return 0;
+        self.control().check() catch |err| return self.failure(err);
+        const n = if (self.initial_pos < self.initial.len) copied: {
+            const avail = self.initial.len - self.initial_pos;
+            const count = @min(avail, buf.len);
+            @memcpy(buf[0..count], self.initial[self.initial_pos .. self.initial_pos + count]);
+            self.initial_pos += count;
+            break :copied count;
+        } else self.socket.recvControlled(buf, self.control()) catch |err| return self.failure(err);
+        if (n != 0 and self.frame_bytes == 0) {
+            // Idle time before a new frame is separate from request work.
+            // Once bytes are observed, no read or CONTINUATION renews time.
+            const started = milliTimestamp(self.clock());
+            self.request_deadline_ms = earlierDeadline(budgetFrom(started, self.request_timeout_ms), self.inherited_deadline_ms);
+            self.frame_deadline_ms = earlierDeadline(budgetFrom(started, self.header_timeout_ms), self.request_deadline_ms);
+        }
+        self.frame_bytes += n;
+        self.control().check() catch |err| return self.failure(err);
+        return n;
     }
 };
 
@@ -6579,59 +6833,62 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
             return ctx.text("B");
         }
     };
-    State.first_saw_buffered_input.store(false, .release);
-    State.second_handled.store(false, .release);
+    for ([_]u64{ 0, 5000 }) |lifetime_ms| {
+        State.first_saw_buffered_input.store(false, .release);
+        State.second_handled.store(false, .release);
 
-    const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
-    defer io_impl.deinit();
-    var server = Server.initWithConfig(allocator, io_impl.io(), .{
-        .host = "127.0.0.1",
-        .port = 0,
-    });
-    defer server.deinit();
-    try server.get("/a", State.handler);
-    try server.get("/b", State.handler);
-    try server.bind();
-    const address = server.boundAddress().?;
+        const allocator = std.testing.allocator;
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        var server = Server.initWithConfig(allocator, io_impl.io(), .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .request_timeout_ms = lifetime_ms,
+        });
+        defer server.deinit();
+        try server.get("/a", State.handler);
+        try server.get("/b", State.handler);
+        try server.bind();
+        const address = server.boundAddress().?;
 
-    var listener_thread = try std.testing.io.concurrent(struct {
-        fn run(s: *Server) void {
-            s.listen() catch |err| std.debug.panic("pipeline listener failed: {}", .{err});
+        var listener_thread = try std.testing.io.concurrent(struct {
+            fn run(s: *Server) void {
+                s.listen() catch |err| std.debug.panic("pipeline listener failed: {}", .{err});
+            }
+        }.run, .{&server});
+        defer {
+            server.stop();
+            listener_thread.await(std.testing.io);
         }
-    }.run, .{&server});
-    defer {
-        server.stop();
-        listener_thread.await(std.testing.io);
+        while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+
+        const client_io = std.Io.Threaded.global_single_threaded.io();
+        var client = try Socket.connect(address, client_io);
+        defer client.close();
+        try client.setRecvTimeout(5_000);
+        // A and B deliberately share one write. The client half-closes only after
+        // both complete requests are in flight, so EOF must not cancel A while B
+        // is already held by the server's connection buffer.
+        try client.sendAll(
+            "GET /a HTTP/1.1\r\nHost: test\r\n\r\n" ++
+                "GET /b HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+        );
+        try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
+
+        var response: [1024]u8 = undefined;
+        var response_len: usize = 0;
+        while (true) {
+            const n = try client.recv(response[response_len..]);
+            if (n == 0) break;
+            response_len += n;
+            if (response_len == response.len) return error.TestUnexpectedResult;
+        }
+
+        try std.testing.expect(State.first_saw_buffered_input.load(.acquire));
+        try std.testing.expect(State.second_handled.load(.acquire));
+        try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nA") != null);
+        try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nB") != null);
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-
-    const client_io = std.Io.Threaded.global_single_threaded.io();
-    var client = try Socket.connect(address, client_io);
-    defer client.close();
-    try client.setRecvTimeout(5_000);
-    // A and B deliberately share one write. The client half-closes only after
-    // both complete requests are in flight, so EOF must not cancel A while B
-    // is already held by the server's connection buffer.
-    try client.sendAll(
-        "GET /a HTTP/1.1\r\nHost: test\r\n\r\n" ++
-            "GET /b HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
-    );
-    try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
-
-    var response: [1024]u8 = undefined;
-    var response_len: usize = 0;
-    while (true) {
-        const n = try client.recv(response[response_len..]);
-        if (n == 0) break;
-        response_len += n;
-        if (response_len == response.len) return error.TestUnexpectedResult;
-    }
-
-    try std.testing.expect(State.first_saw_buffered_input.load(.acquire));
-    try std.testing.expect(State.second_handled.load(.acquire));
-    try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nA") != null);
-    try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nB") != null);
 }
 
 test "H1 client cancellation reaches active server work" {
@@ -6723,47 +6980,50 @@ test "H1 orderly half close does not cancel an active response" {
             return ctx.text("complete");
         }
     };
-    State.canceled.store(true, .release);
+    for ([_]u64{ 0, 5000 }) |lifetime_ms| {
+        State.canceled.store(true, .release);
 
-    const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
-    defer io_impl.deinit();
-    var server = Server.initWithConfig(allocator, io_impl.io(), .{
-        .host = "127.0.0.1",
-        .port = 0,
-    });
-    defer server.deinit();
-    try server.get("/slow", State.handler);
-    try server.bind();
+        const allocator = std.testing.allocator;
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        var server = Server.initWithConfig(allocator, io_impl.io(), .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .request_timeout_ms = lifetime_ms,
+        });
+        defer server.deinit();
+        try server.get("/slow", State.handler);
+        try server.bind();
 
-    var listener_thread = try std.testing.io.concurrent(struct {
-        fn run(s: *Server) void {
-            s.listen() catch |err| std.debug.panic("half-close listener failed: {}", .{err});
+        var listener_thread = try std.testing.io.concurrent(struct {
+            fn run(s: *Server) void {
+                s.listen() catch |err| std.debug.panic("half-close listener failed: {}", .{err});
+            }
+        }.run, .{&server});
+        defer {
+            server.stop();
+            listener_thread.await(std.testing.io);
         }
-    }.run, .{&server});
-    defer {
-        server.stop();
-        listener_thread.await(std.testing.io);
-    }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
-    var client = try Socket.connect(server.boundAddress().?, client_io);
-    defer client.close();
-    try client.setRecvTimeout(5_000);
-    try client.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
-    try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
+        const client_io = std.Io.Threaded.global_single_threaded.io();
+        var client = try Socket.connect(server.boundAddress().?, client_io);
+        defer client.close();
+        try client.setRecvTimeout(5_000);
+        try client.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+        try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
 
-    var response: [1024]u8 = undefined;
-    var response_len: usize = 0;
-    while (true) {
-        const n = try client.recv(response[response_len..]);
-        if (n == 0) break;
-        response_len += n;
+        var response: [1024]u8 = undefined;
+        var response_len: usize = 0;
+        while (true) {
+            const n = try client.recv(response[response_len..]);
+            if (n == 0) break;
+            response_len += n;
+        }
+        try std.testing.expect(mem.indexOf(u8, response[0..response_len], "complete") != null);
+        try std.testing.expect(!State.canceled.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), server.httpRuntimeStats().h1_hard_disconnect_cancellations_total);
     }
-    try std.testing.expect(mem.indexOf(u8, response[0..response_len], "complete") != null);
-    try std.testing.expect(!State.canceled.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 0), server.httpRuntimeStats().h1_hard_disconnect_cancellations_total);
 }
 
 test "H1 hard disconnect remains observable behind pipelined input" {
@@ -6851,45 +7111,48 @@ test "H1 context does not treat a partial pipeline suffix as buffered input" {
             return ctx.text("A");
         }
     };
-    State.first_saw_buffered_input.store(true, .release);
+    for ([_]u64{ 0, 5000 }) |lifetime_ms| {
+        State.first_saw_buffered_input.store(true, .release);
 
-    const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
-    defer io_impl.deinit();
-    var server = Server.initWithConfig(allocator, io_impl.io(), .{
-        .host = "127.0.0.1",
-        .port = 0,
-    });
-    defer server.deinit();
-    try server.get("/a", State.handler);
-    try server.bind();
-    const address = server.boundAddress().?;
+        const allocator = std.testing.allocator;
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        var server = Server.initWithConfig(allocator, io_impl.io(), .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .request_timeout_ms = lifetime_ms,
+        });
+        defer server.deinit();
+        try server.get("/a", State.handler);
+        try server.bind();
+        const address = server.boundAddress().?;
 
-    var listener_thread = try std.testing.io.concurrent(struct {
-        fn run(s: *Server) void {
-            s.listen() catch |err| std.debug.panic("partial-pipeline listener failed: {}", .{err});
+        var listener_thread = try std.testing.io.concurrent(struct {
+            fn run(s: *Server) void {
+                s.listen() catch |err| std.debug.panic("partial-pipeline listener failed: {}", .{err});
+            }
+        }.run, .{&server});
+        defer {
+            server.stop();
+            listener_thread.await(std.testing.io);
         }
-    }.run, .{&server});
-    defer {
-        server.stop();
-        listener_thread.await(std.testing.io);
+        while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+
+        const client_io = std.Io.Threaded.global_single_threaded.io();
+        var client = try Socket.connect(address, client_io);
+        defer client.close();
+        try client.setRecvTimeout(5_000);
+        // The trailing G starts a second request but cannot complete one. The
+        // parser must report that distinction even though an orderly FIN remains
+        // non-cancelling for the response already in progress.
+        try client.sendAll("GET /a HTTP/1.1\r\nHost: test\r\n\r\nG");
+        try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
+
+        var response: [1024]u8 = undefined;
+        while (try client.recv(&response) != 0) {}
+
+        try std.testing.expect(!State.first_saw_buffered_input.load(.acquire));
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-
-    const client_io = std.Io.Threaded.global_single_threaded.io();
-    var client = try Socket.connect(address, client_io);
-    defer client.close();
-    try client.setRecvTimeout(5_000);
-    // The trailing G starts a second request but cannot complete one. The
-    // parser must report that distinction even though an orderly FIN remains
-    // non-cancelling for the response already in progress.
-    try client.sendAll("GET /a HTTP/1.1\r\nHost: test\r\n\r\nG");
-    try client_io.vtable.netShutdown(client_io.userdata, client.handle, .send);
-
-    var response: [1024]u8 = undefined;
-    while (try client.recv(&response) != 0) {}
-
-    try std.testing.expect(!State.first_saw_buffered_input.load(.acquire));
 }
 
 test "connection interruption preserves the fiber-owned descriptor" {
@@ -7450,6 +7713,18 @@ test "HTTP controlled streaming rejects expired headers and retains controls on 
         starts: usize = 0,
         writes: usize = 0,
         closes: usize = 0,
+        fn startControlled(raw: ?*anyopaque, status: u16, content_type: []const u8, headers: *const Headers, control: RequestControl) !void {
+            try control.check();
+            return start(raw, status, content_type, headers);
+        }
+        fn writeControlled(raw: ?*anyopaque, bytes: []const u8, control: RequestControl) !void {
+            try control.check();
+            return write(raw, bytes);
+        }
+        fn closeControlled(raw: ?*anyopaque, control: RequestControl) !void {
+            try control.check();
+            return close(raw);
+        }
         fn start(raw: ?*anyopaque, _: u16, _: []const u8, _: *const Headers) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.starts += 1;
@@ -7469,7 +7744,7 @@ test "HTTP controlled streaming rejects expired headers and retains controls on 
     defer context.deinit();
     var control = Control{};
     var sink = Sink{};
-    context.stream_delegate = .{ .ptr = &sink, .start = Sink.start, .write = Sink.write, .close = Sink.close };
+    context.stream_delegate = .{ .ptr = &sink, .start = Sink.start, .write = Sink.write, .close = Sink.close, .start_controlled = Sink.startControlled, .write_controlled = Sink.writeControlled, .close_controlled = Sink.closeControlled };
     const view: @import("../net/socket.zig").WriteControl = .{ .ptr = &control, .check_fn = Control.check };
     try std.testing.expectError(error.Timeout, context.streamResponseWithContentTypeControlled(200, "text/plain", view));
     try std.testing.expectEqual(@as(usize, 0), sink.starts);
@@ -8170,4 +8445,359 @@ test "HTTP controlled owned error cleanup admission denial emits no response and
 
 test "HTTP controlled owned error cleanup retires denied resume before releasing its retained owner" {
     try OwnedCleanupTest.run(.denied_resume);
+}
+
+test "HTTP request lifetime bounds buffered work stalled input and trickling H1 output" {
+    const State = struct {
+        var called: std.atomic.Value(bool) = .init(false);
+        var stream_expired: std.atomic.Value(bool) = .init(false);
+        fn handle(ctx: *Context) !Response {
+            called.store(true, .release);
+            if (mem.eql(u8, ctx.request.uri.path, "/stream")) {
+                var output = try ctx.streamResponse(200);
+                defer output.close() catch {};
+                for (0..1000) |_| {
+                    output.write("progress\n") catch |err| {
+                        stream_expired.store(err == error.Timeout, .release);
+                        return err;
+                    };
+                    try ctx.io.sleep(.fromMilliseconds(5), .awake);
+                }
+                return error.TestLifetimeWasRenewed;
+            }
+            try ctx.io.sleep(.fromMilliseconds(200), .awake);
+            return ctx.text("late-success-must-not-be-published");
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "/buffered", "/upload", "/stream" }) |path| {
+        State.called.store(false, .release);
+        State.stream_expired.store(false, .release);
+        var backend = std.Io.Threaded.init(alloc, .{});
+        defer backend.deinit();
+        var server = Server.initWithConfig(alloc, backend.io(), .{ .host = "127.0.0.1", .port = 0, .request_timeout_ms = 100, .header_read_timeout_ms = 2000, .body_read_timeout_ms = 2000, .h1_disconnect_cancellation = .disabled });
+        defer server.deinit();
+        try server.post(path, State.handle);
+        try server.bind();
+        var listener = try std.testing.io.concurrent(struct {
+            fn run(s: *Server) void {
+                s.listen() catch {};
+            }
+        }.run, .{&server});
+        defer {
+            server.stop();
+            listener.await(std.testing.io);
+        }
+        while (!server.listen_started.load(.acquire)) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        var peer = try Socket.connect(server.boundAddress().?, std.testing.io);
+        defer peer.close();
+        try peer.setRecvTimeout(5000);
+        const upload = mem.eql(u8, path, "/upload");
+        const request = try std.fmt.allocPrint(alloc, "POST {s} HTTP/1.1\r\nHost: test\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ path, @as(u8, if (upload) 3 else 0), if (upload) "x" else "" });
+        defer alloc.free(request);
+        try peer.sendAll(request);
+        var bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer bytes.deinit(alloc);
+        var buffer: [4096]u8 = undefined;
+        while (true) {
+            const n = try peer.recv(&buffer);
+            if (n == 0) break;
+            try std.testing.expect(bytes.items.len + n < 64 * 1024);
+            try bytes.appendSlice(alloc, buffer[0..n]);
+        }
+        try std.testing.expect(mem.indexOf(u8, bytes.items, "late-success-must-not-be-published") == null);
+        if (mem.eql(u8, path, "/stream")) {
+            try std.testing.expect(State.stream_expired.load(.acquire));
+            try std.testing.expect(mem.indexOf(u8, bytes.items, " 200 ") != null);
+            try std.testing.expect(mem.indexOf(u8, bytes.items, " 408 ") == null);
+        } else {
+            try std.testing.expect(mem.indexOf(u8, bytes.items, " 408 ") != null);
+            try std.testing.expectEqual(!upload, State.called.load(.acquire));
+        }
+    }
+}
+
+test "HTTP request lifetime expires a buffered H2 flow wait without closing another stream" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    sender.enableNativeTimeouts();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    peer.socket.enableNativeTimeouts();
+    try peer.socket.setRecvTimeout(1000);
+    var h2 = H2Connection.initServer(alloc, io);
+    defer h2.deinit();
+    const first = try h2.stream_manager.getOrCreateStream(1);
+    first.state = .open;
+    first.send_window = 0;
+    first.request_deadline_ms = deadlineAfter(io, 100);
+    var server = Server.init(alloc, io);
+    defer server.deinit();
+    try server.get("/body", struct {
+        fn handle(ctx: *Context) !Response {
+            return ctx.text("bounded-response");
+        }
+    }.handle);
+    var request = try Request.init(alloc, .GET, "/body");
+    defer request.deinit();
+    try std.testing.expectError(error.Timeout, server.routeAndRespondH2(&h2, &sender, 1, &request, null));
+    try std.testing.expectEqual(.closed, first.state);
+    const second = try h2.stream_manager.getOrCreateStream(3);
+    second.state = .open;
+    second.request_deadline_ms = deadlineAfter(io, 5000);
+    try server.routeAndRespondH2(&h2, &sender, 3, &request, null);
+    var wire: [4096]u8 = undefined;
+    const received = try peer.socket.recv(&wire);
+    try std.testing.expect(received > 0);
+    try std.testing.expect(sender.request_deadline_ms == null);
+}
+
+test "HTTP request lifetime body budget preserves expiry between entry and physical read" {
+    const FakeClock = struct {
+        var timestamp_ns: i96 = 0;
+        fn now(_: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            return .{ .nanoseconds = timestamp_ns };
+        }
+    };
+    var vtable = Io.failing.vtable.*;
+    vtable.now = FakeClock.now;
+    const io: Io = .{ .userdata = null, .vtable = &vtable };
+    var request = try Request.init(std.testing.allocator, .GET, "/body");
+    defer request.deinit();
+    var ctx = Context.init(std.testing.allocator, io, &request);
+    defer ctx.deinit();
+    ctx.application_deadline_ns = 10;
+    ctx.application_deadline_io = io;
+    FakeClock.timestamp_ns = 0;
+    try ctx.requestWriteControl(.{}).check();
+    FakeClock.timestamp_ns = 10;
+    try std.testing.expectError(error.Timeout, ctx.constrainBodyDeadline());
+}
+
+test "HTTP request lifetime H2 continuation cannot renew the original frame budget" {
+    const FakeClock = struct {
+        var ticks: i96 = 0;
+        fn now(_: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            const value = ticks;
+            ticks += 100 * std.time.ns_per_ms;
+            return .{ .nanoseconds = value };
+        }
+    };
+    var vtable = Io.failing.vtable.*;
+    vtable.now = FakeClock.now;
+    const clock_io: Io = .{ .userdata = null, .vtable = &vtable };
+    const io = std.testing.io;
+    var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var socket = try Socket.connect(listener.getLocalAddress(), io);
+    defer socket.close();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    // Indexed :method GET, :scheme http, :path /, split over HEADERS and
+    // CONTINUATION. One logical header block retains its first-frame budget.
+    const wire = [_]u8{ 0, 0, 1, 1, 1, 0, 0, 0, 1, 0x82, 0, 0, 2, 9, 4, 0, 0, 0, 1, 0x86, 0x84 };
+    for ([_][2]u64{ .{ 450, 5000 }, .{ 5000, 450 } }) |limits| {
+        var h2 = H2Connection.initServer(std.testing.allocator, io);
+        defer h2.deinit();
+        FakeClock.ticks = 0;
+        var reader: H2SocketReader = .{ .socket = &socket, .initial = &wire, .initial_pos = 0, .clock_io = clock_io, .header_timeout_ms = limits[0], .request_timeout_ms = limits[1] };
+        const result = h2.readFrame(&reader);
+        defer if (result) |owned| {
+            var frame = owned;
+            frame.deinit(std.testing.allocator);
+        } else |_| {};
+        try std.testing.expectError(error.HttpFrameReadTimeout, result);
+        try std.testing.expect(h2.continuation_stream_id == null);
+        FakeClock.ticks = 0;
+        // Reversing a test clock cannot make a consumed partial frame reusable.
+        try std.testing.expectError(error.HttpFrameReadTimeout, h2.readFrame(&reader));
+    }
+}
+
+test "HTTP request lifetime H2 stalled framing closes the physical connection before dispatch" {
+    const State = struct {
+        var called: std.atomic.Value(bool) = .init(false);
+        fn handle(ctx: *Context) !Response {
+            called.store(true, .release);
+            return ctx.text("unexpected-dispatch");
+        }
+    };
+    // Partial frame header, partial HEADERS payload, and a complete HEADERS
+    // whose CONTINUATION never arrives. Neither phase nor request time may
+    // restart while the frame pump waits for the remaining bytes.
+    const fragments = [_][]const u8{
+        &.{ 0, 0 },
+        &.{ 0, 0, 3, 1, 5, 0, 0, 0, 1, 0x82 },
+        &.{ 0, 0, 1, 1, 1, 0, 0, 0, 1, 0x82 },
+    };
+    const alloc = std.testing.allocator;
+    for ([_][2]u64{ .{ 100, 2000 }, .{ 2000, 100 } }) |limits| {
+        for (fragments) |fragment| {
+            State.called.store(false, .release);
+            var backend = std.Io.Threaded.init(alloc, .{});
+            defer backend.deinit();
+            var server = Server.initWithConfig(alloc, backend.io(), .{
+                .host = "127.0.0.1",
+                .port = 0,
+                .header_read_timeout_ms = limits[0],
+                .request_timeout_ms = limits[1],
+                .h2_idle_timeout_ms = 2000,
+            });
+            defer server.deinit();
+            try server.get("/", State.handle);
+            try server.bind();
+            var listening = try std.testing.io.concurrent(struct {
+                fn run(s: *Server) void {
+                    s.listen() catch {};
+                }
+            }.run, .{&server});
+            defer {
+                server.stop();
+                listening.await(std.testing.io);
+            }
+            while (!server.listen_started.load(.acquire)) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            var peer = try Socket.connect(server.boundAddress().?, std.testing.io);
+            defer peer.close();
+            peer.enableNativeTimeouts();
+            // A missing deadline would wait for the 2-second idle/phase cap
+            // and fail this receive, rather than being hidden by test teardown.
+            try peer.setRecvTimeout(1000);
+            try peer.sendAll("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" ++ "\x00\x00\x00\x04\x00\x00\x00\x00\x00");
+            try peer.sendAll(fragment);
+            var wire: [4096]u8 = undefined;
+            var received: usize = 0;
+            while (true) {
+                const count = try peer.recv(&wire);
+                if (count == 0) break;
+                received += count;
+                try std.testing.expect(received < 64 * 1024);
+            }
+            try std.testing.expect(received > 0); // Server SETTINGS proves H2 ingress.
+            try std.testing.expect(!State.called.load(.acquire));
+        }
+    }
+}
+
+test "HTTP request lifetime H2 idle receive timeout permits a fresh frame" {
+    const io = std.testing.io;
+    var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var socket = try Socket.connect(listener.getLocalAddress(), io);
+    defer socket.close();
+    socket.enableNativeTimeouts();
+    try socket.setRecvTimeout(10);
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    var h2 = H2Connection.initServer(std.testing.allocator, io);
+    defer h2.deinit();
+    var reader: H2SocketReader = .{ .socket = &socket, .initial = &.{}, .initial_pos = 0, .clock_io = io, .header_timeout_ms = 2000, .request_timeout_ms = 100 };
+    try std.testing.expectError(error.Timeout, h2.readFrame(&reader));
+    try std.testing.expect(!reader.terminal);
+    try std.testing.expectEqual(@as(usize, 0), reader.frame_bytes);
+    try peer.socket.sendAll(&.{ 0, 0, 3, 1, 5, 0, 0, 0, 1, 0x82, 0x86, 0x84 });
+    var frame = try h2.readFrame(&reader);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u31, 1), frame.header.stream_id);
+    try std.testing.expect(frame.request_deadline_ms > milliTimestamp(io));
+    try std.testing.expect(!reader.terminal);
+}
+
+test "HTTP request lifetime H2 completed headers retain their predecode deadline" {
+    const FakeClock = struct {
+        var timestamp_ns: i96 = 0;
+        fn now(_: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            return .{ .nanoseconds = timestamp_ns };
+        }
+    };
+    var vtable = Io.failing.vtable.*;
+    vtable.now = FakeClock.now;
+    const clock_io: Io = .{ .userdata = null, .vtable = &vtable };
+    const io = std.testing.io;
+    var listener = try @import("../net/socket.zig").TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var socket = try Socket.connect(listener.getLocalAddress(), io);
+    defer socket.close();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    const wire = [_]u8{ 0, 0, 3, 1, 5, 0, 0, 0, 1, 0x82, 0x86, 0x84 };
+    var h2 = H2Connection.initServer(std.testing.allocator, io);
+    defer h2.deinit();
+    FakeClock.timestamp_ns = 0;
+    var reader: H2SocketReader = .{ .socket = &socket, .initial = &wire, .initial_pos = 0, .clock_io = clock_io, .header_timeout_ms = 5000, .request_timeout_ms = 450 };
+    var frame = try h2.readFrame(&reader);
+    defer frame.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 450), frame.request_deadline_ms);
+    FakeClock.timestamp_ns = 300 * std.time.ns_per_ms;
+    try h2.deliverToMailbox(&frame);
+    try std.testing.expectEqual(@as(i64, 450), h2.stream_manager.getStream(1).?.request_deadline_ms);
+}
+
+test "HTTP request lifetime projects an explicit native clock without changing application authority" {
+    const Clock = struct {
+        var native_ns: u64 = 500 * std.time.ns_per_s;
+        var io_ns: i96 = 10 * std.time.ns_per_s;
+        fn native() u64 {
+            return native_ns;
+        }
+        fn now(_: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            return .{ .nanoseconds = io_ns };
+        }
+    };
+    var vtable = Io.failing.vtable.*;
+    vtable.now = Clock.now;
+    const io: Io = .{ .userdata = null, .vtable = &vtable };
+    var request = try Request.init(std.testing.allocator, .GET, "/");
+    defer request.deinit();
+    var context = Context.init(std.testing.allocator, io, &request);
+    defer context.deinit();
+    context.application_deadline_ns = Clock.native_ns + 200 * std.time.ns_per_ms;
+    // Unknown native timestamps must never acquire an invented clock authority.
+    try std.testing.expect(!context.requestWriteControl(.{}).active());
+    context.application_deadline_clock = Clock.native;
+    const first = context.requestWriteControl(.{});
+    try std.testing.expectEqual(@as(?u64, @intCast(Clock.io_ns + 200 * std.time.ns_per_ms)), first.deadline_ns);
+    Clock.native_ns += 100 * std.time.ns_per_ms;
+    Clock.io_ns += 100 * std.time.ns_per_ms;
+    try std.testing.expectEqual(first.deadline_ns, context.requestWriteControl(.{}).deadline_ns);
+    try std.testing.expectEqual(@as(?u64, 500 * std.time.ns_per_s + 200 * std.time.ns_per_ms), context.application_deadline_ns);
+    try std.testing.expect(context.application_deadline_io == null);
+    context.application_deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, context.requestWriteControl(.{}).check());
+}
+
+test "HTTP request lifetime native conversion samples target before an advancing source" {
+    const Clock = struct {
+        var native_ns: u64 = 10 * std.time.ns_per_s;
+        fn native() u64 {
+            return native_ns;
+        }
+        fn now(_: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            native_ns += 100 * std.time.ns_per_ms;
+            return .{ .nanoseconds = 500 * std.time.ns_per_s };
+        }
+    };
+    var vtable = Io.failing.vtable.*;
+    vtable.now = Clock.now;
+    const source_io: Io = .{ .userdata = null, .vtable = &vtable };
+    var request = try Request.init(std.testing.allocator, .GET, "/");
+    defer request.deinit();
+    var context = Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    Clock.native_ns = 10 * std.time.ns_per_s;
+    context.application_deadline_ns = 500 * std.time.ns_per_s + 200 * std.time.ns_per_ms;
+    context.application_deadline_io = source_io;
+    try std.testing.expectEqual(@as(?u64, 10 * std.time.ns_per_s + 200 * std.time.ns_per_ms), context.nativeDeadlineInClock(Clock.native));
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s + 100 * std.time.ns_per_ms), Clock.native_ns);
+    context.application_deadline_io = null;
+    context.application_deadline_clock = Clock.native;
+    context.application_deadline_ns = 0;
+    try std.testing.expectEqual(@as(?u64, 0), context.nativeDeadlineInClock(Clock.native));
+    context.application_deadline_clock = null;
+    context.application_deadline_ns = 123;
+    try std.testing.expectEqual(@as(?u64, 123), context.nativeDeadlineInClock(Clock.native));
+    try std.testing.expect(!context.requestWriteControl(.{}).active());
 }

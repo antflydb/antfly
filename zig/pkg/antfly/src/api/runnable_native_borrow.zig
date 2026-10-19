@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Stable local adapter for native read kernels borrowing an opaque admitted
 //! execution. Root adapters never finish the ingress owner's operation. Child
@@ -29,6 +41,8 @@ pub const Bridge = struct {
             .ptr = self,
             .class = try currentClass(self),
             .current_class = currentClass,
+            .cpu_borrow = if (self.borrow.cpu_borrow != null) cpuBorrow else null,
+            .request_resources = if (self.borrow.request_resources != null) requestResources else null,
             .checkpoint = checkpoint,
             .check_lifetime = lifetime,
             .park = park,
@@ -40,6 +54,15 @@ pub const Bridge = struct {
         });
     }
 
+    fn requestResources(raw: *anyopaque, resources: native.GrantResources) !void {
+        const self = from(raw);
+        const participant = @import("runnable_resource_bridge.zig").send(resources);
+        try self.borrow.requestResources(&participant);
+    }
+    fn cpuBorrow(raw: *anyopaque, budget: ?native.CpuBorrowBudget) !void {
+        const self = from(raw);
+        try self.borrow.setCpuBorrow(&.{ .enabled = @intFromBool(budget != null), .max_non_yield_ns = if (budget) |value| value.max_non_yield_ns else 0 });
+    }
     fn from(raw: *anyopaque) *Bridge {
         return @ptrCast(@alignCast(raw));
     }
@@ -441,4 +464,312 @@ test "native execution borrow carries production HTTP read capability through a 
     try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
     original.finish();
     try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+}
+
+test "native execution borrow CPU loan return revalidates production read authority without retiring root" {
+    const io = std.testing.io;
+    const Policy = struct {
+        execution: *native.Execution,
+        revoked: std.atomic.Value(bool) = .init(false),
+        checks: std.atomic.Value(usize) = .init(0),
+        fn check(raw: *anyopaque, _: abi.Borrowed) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.execution.entry.?.borrowed_read_cpu or self.execution.entry.?.cpu_borrow_budget != null) return error.InvalidRunnableTransition;
+            _ = self.checks.fetchAdd(1, .acq_rel);
+            if (self.revoked.load(.acquire)) return error.Forbidden;
+        }
+    };
+    const Worker = struct {
+        fn run(execution: *native.Execution) !void {
+            try execution.checkpoint();
+        }
+    };
+    inline for (.{ false, true }) |revoke| {
+        var owner = try native.Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2, .checkpoint_budget = 1, .max_wait_ms = 5000 });
+        defer owner.close();
+        var original: native.Execution = .{};
+        defer original.finish();
+        const deadline = @as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)) + 5 * std.time.ns_per_s;
+        try original.start(&owner, .{ .io = io, .deadline_ns = deadline, .retained_bytes = 23 }, .query);
+        var policy: Policy = .{ .execution = &original };
+        var read: @import("runnable_local_read.zig").Read = .{ .execution = &original, .allocator = std.testing.allocator, .validation = .{ .context = &policy, .check = Policy.check } };
+        var team = try read.team();
+        var bridge = try Bridge.init(&team.borrow, std.testing.allocator);
+        var adapter: native.Execution = .{};
+        try bridge.bind(&adapter);
+        defer adapter.finish();
+        try adapter.enableCpuBorrow(.{ .max_non_yield_ns = 1000 });
+        var peer: native.Entry = .{ .options = .{ .io = io }, .class = .background, .cpu_borrow_budget = .{ .max_non_yield_ns = 1000 } };
+        try owner.submit(&peer);
+        defer owner.finish(&peer);
+        // Returning the base CPU converts the peer's loan into base capacity;
+        // the same checked root then receives the idle reserved CPU instead.
+        try original.checkpoint();
+        try std.testing.expect(original.entry.?.borrowed_read_cpu);
+        try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+        var floor: native.Entry = .{ .options = .{ .io = io }, .class = .query, .read_lane = .bounded };
+        try owner.submit(&floor);
+        defer owner.finish(&floor);
+        try std.testing.expectEqual(native.State.running, owner.state(&floor));
+        const before_checks = policy.checks.load(.acquire);
+        var future = try io.concurrent(Worker.run, .{&adapter});
+        defer future.cancel(io) catch {};
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+        while (owner.state(&original.entry.?) != .queued) {
+            if (owner.state(&original.entry.?) == .stopped) return future.await(io);
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.CheckedCpuLoanDidNotWait;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(before_checks, policy.checks.load(.acquire));
+        try std.testing.expectEqual(native.State.running, owner.state(&floor));
+        try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+        policy.revoked.store(revoke, .release);
+        owner.finish(&peer);
+        if (revoke) try std.testing.expectError(error.Forbidden, future.await(io)) else try future.await(io);
+        owner.finish(&floor);
+        try std.testing.expectEqual(deadline, original.entry.?.options.deadline_ns.?);
+        try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
+        try std.testing.expectEqual(if (revoke) native.State.stopped else native.State.running, owner.state(&original.entry.?));
+        try std.testing.expect(policy.checks.load(.acquire) == before_checks + 1);
+        adapter.finish();
+        // A root adapter never owns its ingress root's finish.
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        original.finish();
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    }
+}
+
+test "native execution borrow absent CPU loan capability refuses before changing root ownership" {
+    var owner = try native.Scheduler.init(.{ .slots = 2 });
+    defer owner.close();
+    var original: native.Execution = .{};
+    defer original.finish();
+    try original.start(&owner, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+    var authority: TestAuthority = .{ .execution = &original };
+    var port = authority.borrowed();
+    var bridge = try Bridge.init(&port, std.testing.allocator);
+    var adapter: native.Execution = .{};
+    try bridge.bind(&adapter);
+    defer adapter.finish();
+    try std.testing.expectError(error.UnsupportedOperation, adapter.enableCpuBorrow(.{ .max_non_yield_ns = 1000 }));
+    try std.testing.expectError(error.UnsupportedOperation, adapter.disableCpuBorrow());
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
+}
+
+test "native execution borrow validation fences stopped roots through cached and reentrant policy checks" {
+    const Mode = enum { expired, canceled, closed };
+    const Phase = enum { callback, cached, reentrant };
+    const Read = @import("runnable_local_read.zig").Read;
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    const Policy = struct {
+        owner: *native.Scheduler,
+        canceled: *bool,
+        mode: Mode,
+        armed: bool = false,
+        reentrant: bool = false,
+        read: ?*Read = null,
+        checks: usize = 0,
+        nested_failure: ?anyerror = null,
+        fn stop(self: *@This()) void {
+            switch (self.mode) {
+                .expired => Clock.tick = 100,
+                .canceled => self.canceled.* = true,
+                .closed => self.owner.close(),
+            }
+        }
+        fn check(raw: *anyopaque, _: abi.Borrowed) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (!self.armed) return;
+            self.stop();
+            if (self.reentrant) {
+                self.read.?.validateCurrent() catch |err| {
+                    self.nested_failure = err;
+                    return error.Forbidden;
+                };
+                return error.InvalidRunnableTransition;
+            }
+        }
+    };
+    inline for (.{ Phase.callback, Phase.cached, Phase.reentrant }) |phase| {
+        inline for (.{ Mode.expired, Mode.canceled, Mode.closed }) |mode| {
+            Clock.tick = 0;
+            var canceled = false;
+            var owner = try native.Scheduler.init(.{ .slots = 2 });
+            defer owner.close();
+            var original: native.Execution = .{};
+            defer original.finish();
+            try original.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = Clock.canceled } }, .query);
+            var policy: Policy = .{ .owner = &owner, .canceled = &canceled, .mode = mode, .reentrant = phase == .reentrant };
+            var read: Read = .{ .execution = &original, .allocator = std.testing.allocator, .validation = .{ .context = &policy, .check = Policy.check } };
+            policy.read = &read;
+            if (phase == .cached) {
+                try read.validateCurrent();
+                policy.stop();
+            } else policy.armed = true;
+            const expected = switch (mode) {
+                .expired => error.DeadlineExceeded,
+                .canceled => error.Canceled,
+                .closed => error.SchedulerClosed,
+            };
+            try std.testing.expectError(expected, read.validateCurrent());
+            try std.testing.expect(read.validation.?.failure.? == expected);
+            try std.testing.expect(read.validation.?.last_generation == null);
+            try std.testing.expect(!read.validation.?.active);
+            if (phase == .reentrant) try std.testing.expect(policy.nested_failure.? == expected);
+            try std.testing.expectEqual(@as(usize, 1), policy.checks);
+            try std.testing.expectEqual(native.State.stopped, owner.state(&original.entry.?));
+            try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
+            try std.testing.expectEqual(@as(u64, 100), original.entry.?.options.deadline_ns.?);
+            Clock.tick = 0;
+            canceled = false;
+            try std.testing.expectError(expected, read.validateCurrent());
+            try std.testing.expectEqual(@as(usize, 1), policy.checks);
+            original.finish();
+            try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+        }
+    }
+}
+
+test "native execution borrow child activation rejects lifetime stopped during policy without retiring receivers" {
+    const Mode = enum { expired, canceled, closed };
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    const Policy = struct {
+        owner: *native.Scheduler,
+        canceled: *bool,
+        mode: Mode,
+        checks: usize = 0,
+        armed: bool = false,
+        fn check(raw: *anyopaque, _: abi.Borrowed) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (!self.armed) return;
+            switch (self.mode) {
+                .expired => Clock.tick = 100,
+                .canceled => self.canceled.* = true,
+                .closed => self.owner.close(),
+            }
+        }
+    };
+    inline for (.{ Mode.expired, Mode.canceled, Mode.closed }) |mode| {
+        Clock.tick = 0;
+        var canceled = false;
+        var owner = try native.Scheduler.init(.{ .slots = 2 });
+        defer owner.close();
+        var original: native.Execution = .{};
+        defer original.finish();
+        try original.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = Clock.canceled } }, .query);
+        var policy: Policy = .{ .owner = &owner, .canceled = &canceled, .mode = mode };
+        var read: @import("runnable_local_read.zig").Read = .{ .execution = &original, .allocator = std.testing.allocator, .validation = .{ .context = &policy, .check = Policy.check } };
+        var team = try read.team();
+        var bridge = try Bridge.init(&team.borrow, std.testing.allocator);
+        var parent: native.Execution = .{};
+        try bridge.bind(&parent);
+        defer parent.finish();
+        var child: native.Execution = .{};
+        defer child.finish();
+        try child.reserveChild(&parent, std.testing.io, @sizeOf(native.Execution) + 31);
+        const retained = owner.stats().retained_bytes;
+        policy.armed = true;
+        try parent.park(.resource_blocked);
+        const expected = switch (mode) {
+            .expired => error.DeadlineExceeded,
+            .canceled => error.Canceled,
+            .closed => error.SchedulerClosed,
+        };
+        try std.testing.expectError(expected, child.activateChild());
+        try std.testing.expectError(expected, child.checkLifetime());
+        try std.testing.expectEqual(@as(usize, 2), policy.checks);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+        try std.testing.expectEqual(retained, owner.stats().retained_bytes);
+        child.finish();
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
+        try std.testing.expectEqual(@as(u64, 100), original.entry.?.options.deadline_ns.?);
+        original.finish();
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    }
+}
+
+test "native execution borrow checked reentry retains caller restrictions across nonyielding policy validation" {
+    const Policy = struct {
+        stopped: bool = false,
+        armed: bool = false,
+        checks: usize = 0,
+        cause: anyerror,
+        fn validate(raw: *anyopaque, _: abi.Borrowed) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.armed) self.stopped = true;
+        }
+        fn restrict(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.stopped) return self.cause;
+        }
+    };
+    inline for (.{ false, true }) |use_child| {
+        inline for (.{ error.CatalogRoutingSnapshotTimeout, error.Canceled, error.PreDecisionDeadlineExceeded }) |cause| {
+            var owner = try native.Scheduler.init(.{ .slots = 2 });
+            defer owner.close();
+            var original: native.Execution = .{};
+            defer original.finish();
+            try original.start(&owner, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+            var policy: Policy = .{ .cause = cause };
+            var read: @import("runnable_local_read.zig").Read = .{ .execution = &original, .allocator = std.testing.allocator, .validation = .{ .context = &policy, .check = Policy.validate } };
+            var team = try read.team();
+            var bridge = try Bridge.init(&team.borrow, std.testing.allocator);
+            var parent: native.Execution = .{};
+            try bridge.bind(&parent);
+            defer parent.finish();
+            var child: native.Execution = .{};
+            defer child.finish();
+            if (use_child) try child.reserveChild(&parent, std.testing.io, @sizeOf(native.Execution) + 31);
+            try parent.park(.resource_blocked);
+            if (use_child) {
+                try child.activateChild();
+                try child.park(.resource_blocked);
+            }
+            const retained = owner.stats().retained_bytes;
+            const before = policy.checks;
+            policy.armed = true;
+            const execution = if (use_child) &child else &parent;
+            try std.testing.expectError(cause, execution.enterWithCheck(.query, .{ .context = &policy, .check = Policy.restrict }));
+            try std.testing.expectEqual(before + 1, policy.checks);
+            try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, if (use_child) 2 else 1), owner.stats().operations);
+            try std.testing.expectEqual(retained, owner.stats().retained_bytes);
+            policy.stopped = false;
+            try std.testing.expectError(cause, execution.checkLifetime());
+            if (use_child) try original.checkLifetime() else try std.testing.expect(read.validation.?.last_generation == null);
+            child.finish();
+            parent.finish();
+            try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
+            original.finish();
+            try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+        }
+    }
 }

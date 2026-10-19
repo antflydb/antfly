@@ -91,6 +91,7 @@ pub const Handle = struct {
     readable_lease_hook: ?ReadableLeaseHook = null,
     owned_lite_backend: ?lite_backend.Handle = null,
     owned_lite_runtime: ?db_mod.background_runtime.BackendRuntimeHandle = null,
+    owned_lite_resource_manager: @FieldType(db_mod.OpenOptions, "resource_manager") = null,
     lite_profile: ?lite_backend.Profile = null,
     lite_inference_status: ?lite_backend.InferenceStatus = null,
     storage_owner_path: ?[]u8 = null,
@@ -267,6 +268,9 @@ pub fn closeHandle(handle: *Handle) void {
         backend.deinit();
     }
     if (handle.owned_lite_runtime) |*runtime| runtime.deinit();
+    if (handle.owned_lite_resource_manager) |manager| {
+        manager.releaseOwned(handle.alloc);
+    }
     if (handle.storage_owner_path) |path| handle.alloc.free(path);
     if (handle.storage_owner_table_name) |table_name| handle.alloc.free(table_name);
     if (handle.row_policy_authority_secret) |secret| {

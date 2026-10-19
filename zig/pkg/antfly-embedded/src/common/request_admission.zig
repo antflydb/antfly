@@ -76,6 +76,8 @@ pub fn appendPrometheusMetrics(
     try prometheus.appendPromMetric(writer, names.peak_in_flight, "gauge", names.peak_help, stats.peak_in_flight);
     try prometheus.appendPromMetric(writer, names.rejected_total, "counter", names.rejected_help, stats.rejected_total);
     const prefix = "antfly_admission_" ++ @tagName(class);
+    if (stats.granted_total) |count|
+        try prometheus.appendPromMetric(writer, prefix ++ "_granted_requests_total", "counter", "Operation admission grants, including fail-fast and queued leases", count);
     try prometheus.appendPromMetric(writer, prefix ++ "_configured_capacity_requests", "gauge", "Startup admission reservation; zero means unlimited", stats.configured_capacity);
     try prometheus.appendPromMetric(writer, prefix ++ "_policy_version", "gauge", "Node-local admission policy version", stats.policy_version);
     try prometheus.appendPromMetric(writer, prefix ++ "_policy_retired_requests_total", "counter", "Waiters retired by policy shrink or suspension", stats.policy_retired_total);
@@ -112,6 +114,7 @@ test "request admission bounds positive capacity and preserves unlimited mode" {
     try std.testing.expect(!bounded.tryAcquire());
     bounded.release();
     try std.testing.expectEqual(@as(u64, 1), bounded.stats().rejected_total);
+    try std.testing.expectEqual(@as(u64, 1), bounded.stats().granted_total.?);
 
     var unlimited = RequestAdmission.init(0);
     try std.testing.expect(unlimited.tryAcquire());
@@ -119,6 +122,7 @@ test "request admission bounds positive capacity and preserves unlimited mode" {
     unlimited.release();
     unlimited.release();
     try std.testing.expectEqual(@as(usize, 2), unlimited.stats().peak_in_flight);
+    try std.testing.expectEqual(@as(u64, 2), unlimited.stats().granted_total.?);
 }
 
 test "request admission lease releases exactly once" {
@@ -131,6 +135,7 @@ test "request admission lease releases exactly once" {
     try std.testing.expectEqual(@as(usize, 0), admission.stats().in_flight);
     var second = admission.tryAcquireLease() orelse return error.TestUnexpectedResult;
     second.release();
+    try std.testing.expectEqual(@as(u64, 2), admission.stats().granted_total.?);
 }
 
 test "request admission metrics use the shared admission namespace" {
@@ -141,6 +146,7 @@ test "request admission metrics use the shared admission namespace" {
         .in_flight = 2,
         .peak_in_flight = 4,
         .rejected_total = 1,
+        .granted_total = 7,
     });
     try appendPrometheusMetrics(&output.writer, .write, .{
         .capacity = 16,
@@ -157,6 +163,8 @@ test "request admission metrics use the shared admission namespace" {
     const rendered = output.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_capacity_requests 32\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_rejected_requests_total 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_query_granted_requests_total 7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_write_granted_requests_total") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_write_capacity_requests 16\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_write_rejected_requests_total 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "antfly_admission_inference_capacity_requests 8\n") != null);

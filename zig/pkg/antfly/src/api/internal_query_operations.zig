@@ -86,6 +86,7 @@ pub const CatalogSource = struct {
 pub const QueryRouter = struct {
     ptr: *anyopaque,
     route_query_to_read_schema: *const fn (ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) anyerror!void,
+    route_with_context: ?*const fn (*anyopaque, std.mem.Allocator, @import("antfly_local_sources").api_operation.RequestContext, []const u8, *db_mod.types.SearchRequest) anyerror!void = null,
 
     fn route(self: QueryRouter, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
         return try self.route_query_to_read_schema(self.ptr, table_name, req);
@@ -134,6 +135,8 @@ pub const Context = struct {
         var request = try query_contract.parseQueryRequestWithDeadline(alloc, semantic_resolver.iface(), table_name, body, deadline);
         request.req.execution_deadline_ns = deadline;
         request.req.cancellation = context.cancellation;
+        request.req.execution_runnable = if (context.execution_team) |team| team.borrow else null;
+        request.req.execution_remote_query = context.execution_remote_query;
         request.req.graph_execution_limits = self.graph_execution_limits;
         errdefer request.deinit(alloc);
         try context.ensureActive();
@@ -143,6 +146,10 @@ pub const Context = struct {
     /// Route a planned request to the schema generation that owns the read.
     pub fn routeQuery(self: Context, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
         return self.query_router.route(table_name, req);
+    }
+    pub fn routeQueryWithContext(self: Context, alloc: std.mem.Allocator, request: @import("antfly_local_sources").api_operation.RequestContext, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
+        const callback = self.query_router.route_with_context orelse return error.ExecutionWaitUnsupported;
+        return callback(self.query_router.ptr, alloc, request, table_name, req);
     }
 };
 

@@ -72,6 +72,16 @@ pub const Admission = struct {
     waiting: usize = 0,
     waiting_bytes: usize = 0,
     closed: bool = false,
+    first_waiter: ?*Waiter = null,
+    last_waiter: ?*Waiter = null,
+    // Caller-owned synchronous frames, bounded by max_waiters. No task or
+    // allocation is created for queue membership; request bytes retain their
+    // existing charge and the caller retains its stack until acquisition ends.
+    const Waiter = struct {
+        previous: ?*Waiter = null,
+        next: ?*Waiter = null,
+        key: []const u8,
+    };
     const Endpoint = struct { active: usize = 0, owners: usize = 0 };
     pub const Lease = struct {
         owner: ?*Admission = null,
@@ -99,7 +109,7 @@ pub const Admission = struct {
         self.changed.broadcast(self.io);
     }
     pub fn deinit(self: *Admission) void {
-        std.debug.assert(self.active == 0 and self.waiting == 0 and self.endpoints.count() == 0);
+        std.debug.assert(self.active == 0 and self.waiting == 0 and self.first_waiter == null and self.last_waiter == null and self.endpoints.count() == 0);
         self.endpoints.deinit(self.alloc);
     }
     pub fn snapshot(self: *Admission) Snapshot {
@@ -115,6 +125,33 @@ pub const Admission = struct {
             self.alloc.free(removed.key);
         }
     }
+    /// Global age order among callers whose endpoint can use capacity. An
+    /// endpoint-local limit must not strand a free slot at another endpoint.
+    fn firstEligibleWaiter(self: *Admission) ?*Waiter {
+        if (self.active >= self.config.max_active) return null;
+        var candidate = self.first_waiter;
+        while (candidate) |waiter| : (candidate = waiter.next) {
+            const endpoint = self.endpoints.get(waiter.key).?;
+            if (endpoint.active < self.config.max_per_endpoint) return waiter;
+        }
+        return null;
+    }
+    fn appendWaiter(self: *Admission, waiter: *Waiter) void {
+        waiter.previous = self.last_waiter;
+        waiter.next = null;
+        if (self.last_waiter) |previous| previous.next = waiter else self.first_waiter = waiter;
+        self.last_waiter = waiter;
+    }
+    fn removeWaiter(self: *Admission, waiter: *Waiter) void {
+        if (waiter.previous) |previous| previous.next = waiter.next else self.first_waiter = waiter.next;
+        if (waiter.next) |next| next.previous = waiter.previous else self.last_waiter = waiter.previous;
+        waiter.previous = null;
+        waiter.next = null;
+        // Grant or refusal can make a different queued caller eligible even
+        // without a connection release. Preserve the lost-wakeup generation.
+        self.changed_generation +%= 1;
+        self.changed.broadcast(self.io);
+    }
     pub fn acquire(self: *Admission, host: []const u8, port: u16, options: Options) !Lease {
         try options.check();
         self.mutex.lockUncancelable(self.io);
@@ -128,7 +165,7 @@ pub const Admission = struct {
         var buffer: [280]u8 = undefined;
         const key = try std.fmt.bufPrint(&buffer, "{s}:{d}", .{ host, port });
         const endpoint_active = if (self.endpoints.get(key)) |entry| entry.active else 0;
-        const must_wait = self.active >= self.config.max_active or endpoint_active >= self.config.max_per_endpoint;
+        const must_wait = self.active >= self.config.max_active or endpoint_active >= self.config.max_per_endpoint or self.firstEligibleWaiter() != null;
         if (must_wait and (self.config.max_waiters == 0 or self.waiting >= self.config.max_waiters or
             options.retained_bytes > self.config.max_wait_bytes -| self.waiting_bytes)) return error.OutboundCapacityUnavailable;
         const found = try self.endpoints.getOrPut(self.alloc, key);
@@ -142,8 +179,10 @@ pub const Admission = struct {
         const owned_key = found.key_ptr.*;
         found.value_ptr.owners += 1;
         errdefer self.dropOwner(owned_key);
+        var waiter: Waiter = .{ .key = owned_key };
         var queued = false;
         defer if (queued) {
+            self.removeWaiter(&waiter);
             self.waiting -= 1;
             self.waiting_bytes -= options.retained_bytes;
         };
@@ -156,13 +195,16 @@ pub const Admission = struct {
             if (options.deadline_ms) |original| if (current >= original) return error.Timeout;
             if (queued and current >= deadline) return error.Timeout;
             const entry = self.endpoints.getPtr(owned_key).?;
-            if (self.active < self.config.max_active and entry.active < self.config.max_per_endpoint) {
+            const first_eligible = self.firstEligibleWaiter();
+            const owns_turn = if (queued) first_eligible == &waiter else first_eligible == null;
+            if (owns_turn and self.active < self.config.max_active and entry.active < self.config.max_per_endpoint) {
                 self.active += 1;
                 entry.active += 1;
                 return .{ .owner = self, .key = owned_key };
             }
             if (!queued) {
                 if (self.config.max_wait_ms == 0) return error.OutboundCapacityUnavailable;
+                self.appendWaiter(&waiter);
                 queued = true;
                 self.waiting += 1;
                 self.waiting_bytes += options.retained_bytes;
@@ -366,4 +408,239 @@ test "outbound admission capacity release during parking cannot miss the wakeup"
     try std.testing.expect(Io.Clock.awake.now(io).nanoseconds - before < std.time.ns_per_s);
     try std.testing.expectEqual(@as(usize, 1), state.ends);
     try std.testing.expectEqual(@as(u64, 1), generation);
+}
+
+test "outbound admission preserves an older eligible waiter against a new arrival" {
+    const State = struct {
+        owner: *Admission,
+        held: *Admission.Lease,
+        newcomer_barged: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.owner.mutex.tryLock());
+            self.owner.mutex.unlock(self.owner.io);
+            self.begins += 1;
+            try std.testing.expectEqual(@as(usize, 1), self.owner.snapshot().waiting);
+            // Capacity becomes free after the older caller has queued but
+            // before it resumes. A newly arriving caller cannot overtake it.
+            self.held.release();
+            if (self.owner.acquire("same-peer", 80, .{})) |value| {
+                var lease = value;
+                self.newcomer_barged = true;
+                lease.release();
+            } else |err| try std.testing.expectEqual(error.OutboundCapacityUnavailable, err);
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.owner.mutex.tryLock());
+            self.owner.mutex.unlock(self.owner.io);
+            self.ends += 1;
+        }
+    };
+    var owner = Admission.init(std.testing.allocator, std.testing.io, .{ .max_active = 1, .max_per_endpoint = 1, .max_waiters = 1, .max_wait_bytes = 7, .max_wait_ms = 1000 });
+    defer owner.deinit();
+    var held = try owner.acquire("same-peer", 80, .{});
+    defer held.release();
+    var state: State = .{ .owner = &owner, .held = &held };
+    var older = try owner.acquire("same-peer", 80, .{ .retained_bytes = 7, .deadline_ms = nowMs(owner.io) + 1000, .execution_wait = .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end } });
+    older.release();
+    try std.testing.expect(!state.newcomer_barged);
+    try std.testing.expectEqual(@as(usize, 1), state.begins);
+    try std.testing.expectEqual(state.begins, state.ends);
+    const snapshot = owner.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), snapshot.active);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.waiting);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.waiting_bytes);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.endpoints);
+}
+
+test "outbound admission preserves global waiter order across different peers" {
+    const State = struct {
+        owner: *Admission,
+        held: *Admission.Lease,
+        newcomer_barged: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.owner.mutex.tryLock());
+            self.owner.mutex.unlock(self.owner.io);
+            self.begins += 1;
+            try std.testing.expectEqual(@as(usize, 1), self.owner.snapshot().waiting);
+            // Capacity becomes free after the older caller has queued but
+            // before it resumes. A newly arriving caller cannot overtake it.
+            self.held.release();
+            if (self.owner.acquire("other-peer", 80, .{})) |value| {
+                var lease = value;
+                self.newcomer_barged = true;
+                lease.release();
+            } else |err| try std.testing.expectEqual(error.OutboundCapacityUnavailable, err);
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.owner.mutex.tryLock());
+            self.owner.mutex.unlock(self.owner.io);
+            self.ends += 1;
+        }
+    };
+    var owner = Admission.init(std.testing.allocator, std.testing.io, .{ .max_active = 1, .max_per_endpoint = 1, .max_waiters = 1, .max_wait_bytes = 7, .max_wait_ms = 1000 });
+    defer owner.deinit();
+    var held = try owner.acquire("same-peer", 80, .{});
+    defer held.release();
+    var state: State = .{ .owner = &owner, .held = &held };
+    var older = try owner.acquire("same-peer", 80, .{ .retained_bytes = 7, .deadline_ms = nowMs(owner.io) + 1000, .execution_wait = .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end } });
+    older.release();
+    try std.testing.expect(!state.newcomer_barged);
+    try std.testing.expectEqual(@as(usize, 1), state.begins);
+    try std.testing.expectEqual(state.begins, state.ends);
+    const snapshot = owner.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), snapshot.active);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.waiting);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.waiting_bytes);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.endpoints);
+}
+
+test "outbound admission keeps an eligible peer moving behind a blocked endpoint" {
+    const State = struct {
+        owner: *Admission,
+        held: *Admission.Lease,
+        other_progressed: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.begins += 1;
+            try std.testing.expectEqual(@as(usize, 1), self.owner.snapshot().waiting);
+            // The older caller cannot use the remaining global slot because
+            // its endpoint is full. A different endpoint can use that slot.
+            var other = try self.owner.acquire("healthy-peer", 80, .{ .deadline_ms = nowMs(self.owner.io) + 50 });
+            try std.testing.expectEqual(@as(usize, 2), self.owner.snapshot().active);
+            self.other_progressed = true;
+            other.release();
+            self.held.release();
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.ends += 1;
+        }
+    };
+    var owner = Admission.init(std.testing.allocator, std.testing.io, .{ .max_active = 2, .max_per_endpoint = 1, .max_waiters = 1, .max_wait_bytes = 7, .max_wait_ms = 1000 });
+    defer owner.deinit();
+    var held = try owner.acquire("blocked-peer", 80, .{});
+    defer held.release();
+    var state: State = .{ .owner = &owner, .held = &held };
+    var older = try owner.acquire("blocked-peer", 80, .{ .retained_bytes = 7, .deadline_ms = nowMs(owner.io) + 1000, .execution_wait = .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end } });
+    older.release();
+    try std.testing.expect(state.other_progressed);
+    try std.testing.expectEqual(@as(usize, 1), state.begins);
+    try std.testing.expectEqual(state.begins, state.ends);
+    const snapshot = owner.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), snapshot.active);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.waiting);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.waiting_bytes);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.endpoints);
+}
+
+test "outbound admission cancellation unlinks every waiter position without changing survivor order" {
+    const State = struct {
+        owner: *Admission,
+        id: usize,
+        deadline: i64,
+        order: *[2]usize,
+        next_order: *std.atomic.Value(usize),
+        canceled: std.atomic.Value(bool) = .init(false),
+        granted: std.atomic.Value(bool) = .init(false),
+        outcome: std.atomic.Value(u8) = .init(0),
+        release: Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn isCanceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.canceled.load(.acquire);
+        }
+        fn run(self: *@This()) void {
+            var lease = self.owner.acquire("ordered-peer", 80, .{ .deadline_ms = self.deadline, .retained_bytes = 8, .context = self, .cancelled = isCanceled }) catch |err| {
+                self.failure = err;
+                self.outcome.store(if (err == error.Cancelled) 1 else 3, .release);
+                return;
+            };
+            defer lease.release();
+            const position = self.next_order.fetchAdd(1, .acq_rel);
+            if (position >= self.order.len) {
+                self.failure = error.TestCanceledWaiterWasGranted;
+                self.outcome.store(3, .release);
+                return;
+            }
+            self.order[position] = self.id;
+            self.granted.store(true, .release);
+            self.release.waitTimeout(self.owner.io, .{ .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = @as(i96, self.deadline) * std.time.ns_per_ms } } }) catch |err| {
+                self.failure = err;
+                self.outcome.store(3, .release);
+                return;
+            };
+            lease.release();
+            self.outcome.store(2, .release);
+        }
+        fn waitOutcome(self: *@This(), expected: u8) !void {
+            while (self.outcome.load(.acquire) == 0) {
+                if (nowMs(self.owner.io) >= self.deadline) return error.TestWaiterDidNotFinish;
+                try self.owner.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            if (self.outcome.load(.acquire) != expected) return self.failure orelse error.TestUnexpectedWaiterOutcome;
+        }
+        fn waitGrant(self: *@This()) !void {
+            while (!self.granted.load(.acquire)) {
+                if (self.outcome.load(.acquire) != 0) return self.failure orelse error.TestWaiterExitedBeforeGrant;
+                if (nowMs(self.owner.io) >= self.deadline) return error.TestWaiterWasStarved;
+                try self.owner.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+        fn waitCount(owner: *Admission, count: usize, deadline: i64) !void {
+            while (owner.snapshot().waiting != count) {
+                if (nowMs(owner.io) >= deadline) return error.TestQueueCountDidNotConverge;
+                try owner.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    for (0..3) |canceled_position| {
+        var owner = Admission.init(std.testing.allocator, std.testing.io, .{ .max_active = 1, .max_per_endpoint = 1, .max_waiters = 3, .max_wait_bytes = 24, .max_wait_ms = 5000 });
+        defer owner.deinit();
+        var held = try owner.acquire("ordered-peer", 80, .{});
+        defer held.release();
+        const deadline = nowMs(owner.io) + 5000;
+        var order: [2]usize = undefined;
+        var next_order: std.atomic.Value(usize) = .init(0);
+        var states: [3]State = undefined;
+        var group: Io.Group = .init;
+        defer group.cancel(owner.io);
+        for (&states, 0..) |*state, id| {
+            state.* = .{ .owner = &owner, .id = id, .deadline = deadline, .order = &order, .next_order = &next_order };
+            try group.concurrent(owner.io, State.run, .{state});
+            try State.waitCount(&owner, id + 1, deadline);
+        }
+        states[canceled_position].canceled.store(true, .release);
+        try states[canceled_position].waitOutcome(1);
+        try State.waitCount(&owner, 2, deadline);
+        try std.testing.expectEqual(@as(usize, 16), owner.snapshot().waiting_bytes);
+        held.release();
+        var expected_order: [2]usize = undefined;
+        var position: usize = 0;
+        for (&states, 0..) |*state, id| {
+            if (id == canceled_position) continue;
+            expected_order[position] = id;
+            position += 1;
+            try state.waitGrant();
+            try std.testing.expectEqual(@as(usize, 1), owner.snapshot().active);
+            state.release.set(owner.io);
+            try state.waitOutcome(2);
+        }
+        try std.testing.expectEqualDeep(expected_order, order);
+        try std.testing.expectEqual(@as(usize, 2), next_order.load(.acquire));
+        const snapshot = owner.snapshot();
+        try std.testing.expectEqual(@as(usize, 0), snapshot.active);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.waiting);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.waiting_bytes);
+        try std.testing.expectEqual(@as(usize, 0), snapshot.endpoints);
+    }
 }

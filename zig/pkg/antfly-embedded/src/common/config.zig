@@ -40,6 +40,14 @@ pub const default_health_port: u16 = 4200;
 pub const default_query_max_concurrent_requests: u32 = 32;
 pub const default_write_max_concurrent_requests: u32 = 16;
 pub const default_inference_max_concurrent_requests: u32 = 32;
+// Managed nodes reserve fixed sender/cleanup metadata before request publication.
+// The generic fixed scheduler keeps its smaller opt-in policy.
+pub const default_runnable_policy: @import("runnable_scheduler.zig").Config = .{ .capacity_mode = .automatic, .max_bytes = 16 << 20, .control_bytes = 8 << 20 };
+pub const default_query_waiting: @import("bounded_admission.zig").Waiting = .{
+    .max_queued_requests = 8,
+    .max_queued_bytes = 8 << 20,
+    .max_wait_ms = 250,
+};
 pub const default_mcp_max_tool_result_bytes: u32 = 96 * 1024;
 pub const minimum_mcp_max_tool_result_bytes: u32 = 512;
 pub const default_backup_operation_timeout_ms: u64 = 60 * 60 * 1_000;
@@ -94,16 +102,43 @@ pub const Config = struct {
         /// Zero disables this foreground admission class. Transport safeguards
         /// and inference admission remain independent.
         max_concurrent_requests: u32,
-        waiting: @import("bounded_admission.zig").Waiting = .{},
+    };
+
+    pub const QueryAdmissionConfig = struct {
+        max_concurrent_requests: u32,
+        waiting: @import("bounded_admission.zig").Waiting = default_query_waiting,
     };
 
     pub const AdmissionConfig = struct {
-        runnable: ?@import("runnable_scheduler.zig").Config = null,
+        /// One HTTP request/stream ceiling from ingress through delivery.
+        /// Accepted durable work retains independent completion ownership.
+        max_request_duration_ms: u64 = 300_000,
+        runnable: ?@import("runnable_scheduler.zig").Config = default_runnable_policy,
         max_request_memory_bytes: u64 = 256 << 20,
         max_retained_memory_bytes: u64 = 256 << 20,
-        query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
+        query: QueryAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
         write: RequestAdmissionConfig = .{ .max_concurrent_requests = default_write_max_concurrent_requests },
         inference: RequestAdmissionConfig = .{ .max_concurrent_requests = default_inference_max_concurrent_requests },
+
+        /// Resolve one node-wide startup envelope before reserving API/control
+        /// memory. Fixed policy remains authoritative; automatic values are
+        /// ceilings, and request/state pools each receive at most 1/8.
+        pub fn resolveForStartup(self: @This(), process_limit_bytes: u64) !@This() {
+            const requested = self.runnable orelse return self;
+            if (requested.capacity_mode == .fixed) return self;
+            const Runnable = @import("runnable_scheduler.zig").Config;
+            const envelope = Runnable.startupMemoryEnvelope(process_limit_bytes);
+            var effective = self;
+            effective.runnable = try requested.resolveCapacity(@import("antfly_platform").process_memory.cpuCapacity(), envelope);
+            if (envelope.limit_bytes != 0) {
+                const pool_limit = envelope.limit_bytes / 8;
+                effective.max_request_memory_bytes = @min(self.max_request_memory_bytes, pool_limit);
+                effective.max_retained_memory_bytes = @min(self.max_retained_memory_bytes, pool_limit);
+            }
+            if (effective.max_request_memory_bytes < 1 << 20 or effective.max_retained_memory_bytes < 1 << 20)
+                return error.InvalidConfig;
+            return effective;
+        }
     };
 
     pub const McpConfig = struct {
@@ -799,18 +834,22 @@ pub const Config = struct {
             else => return error.InvalidConfig,
         };
         var canonical_inference_max_concurrent_requests: ?u32 = null;
-        var query_waiting: @import("bounded_admission.zig").Waiting = .{};
-        var runnable_policy: ?@import("runnable_scheduler.zig").Config = null;
+        var query_waiting = default_query_waiting;
+        var query_waiting_explicit = false;
+        var runnable_policy: ?@import("runnable_scheduler.zig").Config = default_runnable_policy;
+        var max_request_duration_ms: u64 = 300_000;
         var max_request_memory_bytes: u64 = 256 << 20;
         var max_retained_memory_bytes: u64 = 256 << 20;
         if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "runnable", "max_request_memory_bytes", "max_retained_memory_bytes" });
+            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "runnable", "max_request_duration_ms", "max_request_memory_bytes", "max_retained_memory_bytes" });
             const admission_object = switch (admission_value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
             };
             if (admission_object.get("runnable")) |value| {
-                if (value != .null) {
+                if (value == .null) {
+                    runnable_policy = null;
+                } else {
                     var policy = std.json.parseFromValue(@import("runnable_scheduler.zig").Config, alloc, value, .{}) catch |err| switch (err) {
                         error.OutOfMemory => return err,
                         else => return error.InvalidConfig,
@@ -820,6 +859,8 @@ pub const Config = struct {
                     runnable_policy = policy.value;
                 }
             }
+            max_request_duration_ms = try optionalU64Field(admission_object, "max_request_duration_ms") orelse 300_000;
+            if (max_request_duration_ms == 0 or max_request_duration_ms > 86_400_000) return error.InvalidConfig;
             max_request_memory_bytes = try optionalU64Field(admission_object, "max_request_memory_bytes") orelse 256 << 20;
             max_retained_memory_bytes = try optionalU64Field(admission_object, "max_retained_memory_bytes") orelse 256 << 20;
             if (max_retained_memory_bytes < 1 << 20 or max_retained_memory_bytes > std.math.maxInt(usize)) return error.InvalidConfig;
@@ -828,6 +869,7 @@ pub const Config = struct {
                 try validateObjectMemberFields(admission_object, "query", &.{ "max_concurrent_requests", "waiting" });
                 const query_object = admission_object.get("query").?.object;
                 if (query_object.get("waiting")) |waiting_value| {
+                    query_waiting_explicit = true;
                     try validateObjectMemberFields(query_object, "waiting", &.{ "max_queued_requests", "max_queued_bytes", "max_wait_ms" });
                     const waiting_object = switch (waiting_value) {
                         .object => |object| object,
@@ -852,6 +894,9 @@ pub const Config = struct {
                 );
             }
         }
+        // Null rolls back new dispatch and implicit waiting. A separately
+        // configured queue remains an explicit operator choice.
+        if (runnable_policy == null and !query_waiting_explicit) query_waiting = .{};
         var legacy_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("inference")) |inference_value| {
             const inference_object = switch (inference_value) {
@@ -1006,6 +1051,7 @@ pub const Config = struct {
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
             .admission = .{
                 .runnable = runnable_policy,
+                .max_request_duration_ms = max_request_duration_ms,
                 .max_request_memory_bytes = max_request_memory_bytes,
                 .max_retained_memory_bytes = max_retained_memory_bytes,
                 .query = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
@@ -3949,7 +3995,7 @@ test "common config bootstraps named secret sources before resolving credentials
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"secrets\":{\"environment\":\"false\"}}"));
 }
 
-test "config query waiting validates complete bounds and keeps legacy defaults" {
+test "config query waiting validates complete bounds and automatic defaults" {
     var cfg = try Config.parseFromSlice(std.testing.allocator,
         \\{"admission":{"query":{"max_concurrent_requests":4,"waiting":{"max_queued_requests":8,"max_queued_bytes":1048576,"max_wait_ms":100}}}}
     );
@@ -3960,7 +4006,7 @@ test "config query waiting validates complete bounds and keeps legacy defaults" 
     try std.testing.expectEqual(@as(u32, 100), cfg.admission.query.waiting.max_wait_ms);
     var legacy = try Config.parseFromSlice(std.testing.allocator, "{}");
     defer legacy.deinit();
-    try std.testing.expectEqual(@as(u32, 0), legacy.admission.query.waiting.max_wait_ms);
+    try std.testing.expectEqualDeep(default_query_waiting, legacy.admission.query.waiting);
     for ([_][]const u8{
         \\{"admission":{"query":{"waiting":{"max_wait_ms":1}}}}
         ,
@@ -4107,14 +4153,15 @@ test "common config parses ChatGPT connector policy and rejects misspellings" {
     }
 }
 
-test "config runnable scheduler validates canonical opt-in policy" {
+test "config runnable scheduler validates canonical policy and explicit rollback" {
     const alloc = std.testing.allocator;
     var legacy = try Config.parseFromSlice(alloc, "{}");
     defer legacy.deinit();
-    try std.testing.expect(legacy.admission.runnable == null);
+    try std.testing.expectEqualDeep(default_runnable_policy, legacy.admission.runnable.?);
     var disabled = try Config.parseFromSlice(alloc, "{\"admission\":{\"runnable\":null}}");
     defer disabled.deinit();
     try std.testing.expect(disabled.admission.runnable == null);
+    try std.testing.expectEqual(@as(u32, 0), disabled.admission.query.waiting.max_wait_ms);
     var defaults = try Config.parseFromSlice(alloc,
         \\{"admission":{"runnable":{}}}
     );
@@ -4134,6 +4181,16 @@ test "config runnable scheduler validates canonical opt-in policy" {
     var reopened = try Config.parseFromSlice(alloc, body);
     defer reopened.deinit();
     try std.testing.expectEqualDeep(policy, reopened.admission.runnable.?);
+    var elastic = try Config.parseFromSlice(alloc,
+        \\{"admission":{"runnable":{"slots":5,"cleanup_slots":1,"read_isolation":true,"bounded_read_slots":2}}}
+    );
+    defer elastic.deinit();
+    try std.testing.expectEqual(@as(usize, 2), elastic.admission.runnable.?.bounded_read_slots);
+    const elastic_body = try std.json.Stringify.valueAlloc(alloc, .{ .admission = .{ .runnable = elastic.admission.runnable.? } }, .{});
+    defer alloc.free(elastic_body);
+    var elastic_reopened = try Config.parseFromSlice(alloc, elastic_body);
+    defer elastic_reopened.deinit();
+    try std.testing.expectEqualDeep(elastic.admission.runnable.?, elastic_reopened.admission.runnable.?);
     for ([_][]const u8{
         \\{"admission":{"runnable":{"slots":2}}}
         ,
@@ -4174,4 +4231,19 @@ test "external lake cursor retention and capacity policy reject unbounded admiss
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_cuts\":0}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_retained_bytes\":0}}}",
     }) |bytes| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, bytes));
+}
+
+test "common config HTTP lifetime has finite defaults and validates explicit duration" {
+    const a = std.testing.allocator;
+    var defaults = try Config.parseFromSlice(a, "{}");
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(u64, 300_000), defaults.admission.max_request_duration_ms);
+    var configured = try Config.parseFromSlice(a, "{\"admission\":{\"max_request_duration_ms\":1234}}");
+    defer configured.deinit();
+    try std.testing.expectEqual(@as(u64, 1234), configured.admission.max_request_duration_ms);
+    for ([_][]const u8{ "0", "-1", "86400001", "\"invalid\"" }) |value| {
+        const input = try std.fmt.allocPrint(a, "{{\"admission\":{{\"max_request_duration_ms\":{s}}}}}", .{value});
+        defer a.free(input);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, input));
+    }
 }

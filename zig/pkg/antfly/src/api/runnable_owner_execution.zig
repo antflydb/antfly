@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! API-kernel-owned execution capsules. Foreign archives see only checked
 //! C callbacks, stable statuses and opaque handles.
@@ -15,7 +27,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .check_lifetime = checkLifetime, .current_class = currentClass };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .check_lifetime = checkLifetime, .current_class = currentClass, .cpu_borrow = cpuBorrow, .request_resources = requestResources };
     }
 };
 
@@ -59,10 +71,11 @@ fn start(raw: *anyopaque, options: *const abi.Start) callconv(.c) runtime.error_
 }
 fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
     try options.validate();
+    const resource = if (options.resources) |value| try @import("runnable_resource_bridge.zig").receive(value) else null;
     const owner = state(raw);
-    try owner.owner.retain();
-    errdefer owner.owner.release();
     const cleanup = options.cleanup != 0;
+    if (cleanup) try owner.owner.retainCleanup() else try owner.owner.retain();
+    errdefer owner.owner.release();
     if (cleanup) {
         const config = owner.owner.scheduler.config;
         // One cleanup root may retain at most half the control byte reserve.
@@ -99,9 +112,25 @@ fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
     if (cleanup) {
         if (options.class != @backingInt(abi.Class.control) or options.slots != 1) return error.InvalidArgument;
         try value.execution.startCleanupRoot(&owner.owner.scheduler, execution_options);
+    } else if (resource) |participant| {
+        try value.execution.startWithResources(&owner.owner.scheduler, execution_options, std.enums.fromInt(runnable.Class, options.class) orelse return error.InvalidArgument, options.slots, participant);
     } else try value.execution.startWithSlots(&owner.owner.scheduler, execution_options, std.enums.fromInt(runnable.Class, options.class) orelse return error.InvalidArgument, options.slots);
     options.out_handle.* = value;
 }
+fn requestResources(raw: *anyopaque, resources: *const abi.ResourceBundle) callconv(.c) runtime.error_abi.Status {
+    const participant = @import("runnable_resource_bridge.zig").receive(resources) catch |err| return runtime.error_abi.statusFromError(err);
+    capsule(raw).execution.requestResources(participant) catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+fn cpuBorrow(raw: *anyopaque, options: *const abi.CpuBorrow) callconv(.c) runtime.error_abi.Status {
+    options.validate() catch |err| return runtime.error_abi.statusFromError(err);
+    const value = capsule(raw);
+    if (options.enabled != 0) {
+        value.execution.enableCpuBorrow(.{ .max_non_yield_ns = options.max_non_yield_ns }) catch |err| return runtime.error_abi.statusFromError(err);
+    } else value.execution.disableCpuBorrow() catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+
 fn reserveChild(raw: *anyopaque, options: *const abi.ChildStart) callconv(.c) runtime.error_abi.Status {
     reserveChildChecked(raw, options) catch |err| return runtime.error_abi.statusFromError(err);
     return .ok;
@@ -999,4 +1028,72 @@ test "runnable execution port checks parked lifetime without CPU grants or owner
         try std.testing.expectEqual(before.retained_bytes, after.retained_bytes);
         try std.testing.expectEqual(before.grants[0], after.grants[0]);
     }
+}
+
+test "runnable execution retained consumer admits protected cleanup after ordinary closure" {
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }), .native_now_ns = TestClock.now };
+    const port = owner.port();
+    var lease = try abi.Lease.init(port);
+    owner.owner.close();
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var handle: ?*anyopaque = null;
+    const options: abi.Start = .{ .io = &io_borrow, .class = @backingInt(abi.Class.control), .slots = 1, .cleanup = 1, .allow_wait = 0, .has_deadline = 1, .native_deadline = 1, .deadline_ns = TestClock.now() + 100 * std.time.ns_per_ms, .retained_bytes = 23, .out_handle = &handle };
+    try std.testing.expect(port.start(port.context, &options).isOk());
+    try std.testing.expect(handle != null);
+    try std.testing.expectEqual(@as(usize, 2), owner.owner.borrowers);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    const charged = owner.owner.scheduler.stats().retained_bytes;
+    try std.testing.expect(charged >= 23);
+    var other: ?*anyopaque = null;
+    var ordinary = options;
+    ordinary.cleanup = 0;
+    ordinary.class = @backingInt(abi.Class.query);
+    ordinary.out_handle = &other;
+    try std.testing.expectEqual(error.SchedulerClosed, runtime.error_abi.errorFromStatus(port.start(port.context, &ordinary)));
+    try std.testing.expect(other == null);
+    port.finish(handle.?);
+    handle = null;
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+    try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().retained_bytes);
+    lease.deinit();
+    try std.testing.expectEqual(error.SchedulerClosed, runtime.error_abi.errorFromStatus(port.start(port.context, &options)));
+    try std.testing.expect(handle == null);
+    try owner.owner.tryDeinit();
+}
+
+test "runnable execution CPU borrow port preserves capsule ownership and returns checked errors" {
+    var value: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true }), .native_now_ns = TestClock.now };
+    defer value.owner.tryDeinit() catch @panic("owner leaked");
+    const port = value.port();
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var handle: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.Class.query), .retained_bytes = 17, .out_handle = &handle }).isOk());
+    defer if (handle) |active| port.finish(active);
+    const retained = value.owner.scheduler.stats().retained_bytes;
+    const borrow = try abi.Borrowed.fromOwner(port, handle.?, 1, .query);
+    try borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 });
+    try std.testing.expectError(error.InvalidRunnableTransition, port.resizeTeam(handle.?, 2));
+    var malformed: abi.CpuBorrow = .{ .enabled = 1, .max_non_yield_ns = 1000 };
+    malformed.struct_size -= 1;
+    try std.testing.expectEqual(error.UnsupportedVersion, runtime.error_abi.errorFromStatus(port.cpu_borrow.?(handle.?, &malformed)));
+    try std.testing.expectEqual(retained, value.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), value.owner.scheduler.stats().operations);
+    var stale = port;
+    stale.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, stale.setCpuBorrow(handle.?, &.{ .enabled = 0 }));
+    stale = port;
+    stale.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, stale.setCpuBorrow(handle.?, &.{ .enabled = 0 }));
+    stale = port;
+    stale.cpu_borrow = null;
+    try std.testing.expectError(error.UnsupportedOperation, stale.setCpuBorrow(handle.?, &.{ .enabled = 0 }));
+    try port.setCpuBorrow(handle.?, &.{ .enabled = 0 });
+    try std.testing.expectEqual(@as(?runnable.CpuBorrowBudget, null), capsule(handle.?).execution.entry.?.cpu_borrow_budget);
+    try std.testing.expectEqual(@as(usize, 1), value.owner.borrowers);
+    port.finish(handle.?);
+    handle = null;
+    try std.testing.expectEqual(@as(u64, 0), value.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), value.owner.borrowers);
 }

@@ -17,14 +17,16 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
 
-pub const version: u32 = 10;
+pub const version: u32 = 14;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
 pub const Envelope = struct { operation: Operation, options: []const u8 = "", data: []const u8 };
-pub const Operation = enum { initialize, configure, provider, http, reserve, retain, release, prompt_cache, tokenizer_cache };
+pub const Operation = enum { initialize, configure, provider, http, reserve, retain, transfer, release, prompt_cache, tokenizer_cache, transient_host };
 pub const Reply = struct { status: bridge.Status = .ok, options: []const u8 = "" };
 pub const Event = struct {
+    /// Absolute process-monotonic ceiling projected before the child callback.
+    deadline_ns: ?u64 = null,
     kind: enum { progress, stream_start, stream_write, stream_close },
     status: u16 = 200,
     headers: []const Header = &.{},
@@ -350,6 +352,7 @@ pub const Http = struct {
 };
 pub const HttpResponse = struct { status: u16, headers: []const Header };
 pub const Reservation = struct { lease: usize = 0, amounts: bridge.AdmissionAmounts };
+pub const Transfer = struct { source: usize, destination: usize, amounts: bridge.AdmissionAmounts };
 pub const Observation = struct { key: usize, previous: u64, next: u64 };
 
 test "inference worker logical body limit matches the public HTTP contract" {

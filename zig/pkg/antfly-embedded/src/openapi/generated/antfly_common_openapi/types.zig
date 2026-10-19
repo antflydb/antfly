@@ -13,11 +13,13 @@ const antfly_provider_openapi = @import("antfly_provider_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
-/// Node-local foreground database request admission settings.
+/// Node-local foreground database request admission settings. Omitted runnable policy enables automatic startup sizing; omitted query waiting allows eight requests and eight MiB of retained input for at most 250 milliseconds. Explicit runnable null disables scheduling and implicit waiting. Explicit operation counts, including zero, retain their meanings.
 pub const AdmissionConfig = struct {
-    /// Aggregate API-owned durable session and job storage, protocol sessions, provider state and catalogue/cache allocations. Shared across persistent owners and independent of request, transport, storage-engine and model envelopes.
+    /// Aggregate API-owned durable session and job storage, protocol sessions, provider state and catalogue/cache allocations. Shared across persistent owners and independent of request, transport, storage-engine and model envelopes. In automatic runnable mode this is an upper bound, additionally limited to 1/8 of the effective process memory budget.
     max_retained_memory_bytes: ?u64 = null,
-    /// Aggregate API request, response, SQL plan, and in-memory transaction allocation envelope. One eighth, capped at 16 MiB, is reserved for verified SQL control work. Storage, inference, transport, and durable completion retain separate envelopes.
+    /// Absolute HTTP request and stream lifetime in milliseconds, from ingress through response delivery. Shorter forwarded and query budgets still apply. Expiry bounds caller work and waiting; accepted durable decisions retain their independent completion and recovery ownership.
+    max_request_duration_ms: ?u64 = null,
+    /// Aggregate API request, response, SQL plan, and in-memory transaction allocation envelope. One eighth, capped at 16 MiB, is reserved for verified SQL control work. Storage, inference, transport, and durable completion retain separate envelopes. In automatic runnable mode this is an upper bound, additionally limited to 1/8 of the effective process memory budget.
     max_request_memory_bytes: ?u64 = null,
     runnable: OpenApiOptionalNullable(std.meta.Child(RunnableSchedulingConfig)) = .absent,
     query: ?QueryAdmissionConfig = null,
@@ -27,6 +29,7 @@ pub const AdmissionConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "max_retained_memory_bytes", "max_retained_memory_bytes", true },
+        .{ "max_request_duration_ms", "max_request_duration_ms", true },
         .{ "max_request_memory_bytes", "max_request_memory_bytes", true },
         .{ "runnable", "runnable", false },
         .{ "query", "query", true },
@@ -46,6 +49,10 @@ pub const AdmissionConfig = struct {
         try jw.beginObject();
         if (self.max_retained_memory_bytes) |value| {
             try jw.objectField("max_retained_memory_bytes");
+            try jw.write(value);
+        }
+        if (self.max_request_duration_ms) |value| {
+            try jw.objectField("max_request_duration_ms");
             try jw.write(value);
         }
         if (self.max_request_memory_bytes) |value| {
@@ -2253,7 +2260,7 @@ pub const PgwireConfig = struct {
 
 pub const QueryAdmissionConfig = struct {
     waiting: ?QueryAdmissionWaiting = null,
-    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Contextual REST and native SQL reads can opt into bounded waiting using admission.query.waiting. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
+    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Supported contextual reads wait within the bounded admission.query.waiting policy before excess work returns HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Explicit empty waiting settings retain immediate rejection. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
     max_concurrent_requests: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -2284,7 +2291,7 @@ pub const QueryAdmissionConfig = struct {
     }
 };
 
-/// Opt-in bounded waiting for contextual REST and native SQL reads. Waiting retains a runtime task and owned input; existing executor and transport bounds still apply. Write, inference, MCP, and legacy direct calls remain fail-fast. All three limits must be positive to enable waiting, or all zero to disable it. These are queued input limits, not total heap limits.
+/// Bounded waiting for contextual REST, native SQL and managed serverless reads. Omitting admission.query.waiting uses eight queued requests, eight MiB of retained input and a 250 millisecond ceiling when scheduling is enabled. An explicit object uses the zero property defaults: {} is fail-fast. Waiting retains a bounded runtime task and owned input; existing executor and transport bounds still apply. Write, inference, MCP, and unsupported legacy direct calls remain fail-fast. All three limits must be positive to enable waiting, or all zero to disable it. These are queued input limits, not total heap limits.
 pub const QueryAdmissionWaiting = struct {
     max_queued_requests: ?i64 = null,
     max_queued_bytes: ?i64 = null,
@@ -2324,12 +2331,18 @@ pub const QueryAdmissionWaiting = struct {
 };
 
 pub const RunnableSchedulingConfigValue = struct {
-    /// Total CPU slots including health/control and cleanup reserves. Managed startup requires at least one ordinary slot after both reserves.
+    /// Fixed preserves declared capacity. Automatic uses affinity and visible CPU quotas, with a protected-lane floor inside the declared slot ceiling, and limits metadata to 1/32 of the effective host/container/process memory budget. Request and retained-state pools each receive at most 1/8 of that budget. Resolution is frozen before publication; active policy is never resized.
+    capacity_mode: ?[]const u8 = null,
+    /// Total runnable slots, or the upper bound in automatic mode, including health/control and cleanup reserves. Managed startup requires at least one ordinary slot after both reserves. Protected lanes can share OS CPU time on small quotas and do not promise dedicated cores.
     slots: ?i64 = null,
     /// Health/control CPU slots reserved within slots, independently from cleanup. The combined reserves must leave at least one ordinary slot.
     control_slots: ?i64 = null,
     /// Dedicated cleanup CPU slots drawn from slots. Managed startup establishes one slot when zero is configured, before publishing work; it does not increase the total slot limit.
     cleanup_slots: ?i64 = null,
+    /// Reserve bounded_read_slots ordinary CPU slots, including one nonborrowable floor, and one quarter of ordinary scheduling entries and metadata for server-verified bounded reads. General reads, analytical reads and other ordinary classes share the remainder. Omitted or null selects automatic isolation only in automatic capacity mode with enough ordinary slots for the configured bounded reserve plus one general slot and eight entries; fixed mode defaults to disabled. Explicit false disables isolation, including in automatic mode. Explicit true requires sufficient capacity, including managed cleanup, or startup fails. Unverified plans cannot claim the bounded lane. When enabled, production startup carves one quarter of the ordinary request heap into finite read pools, with half for demoted reads and one quarter each for bounded and transition allocations. This reduces the ordinary heap without increasing max_request_memory_bytes. Existing control and retained-state envelopes remain separate. Only verified operators may use the protected pools; this does not bound every backend allocation or preempt non-yielding work.
+    read_isolation: OpenApiOptionalNullable(bool) = .absent,
+    /// Bounded-read CPU reserve within the total slot ceiling when read isolation is enabled. One slot is a nonborrowable floor. Only capacity above that floor may lend a CPU to a server-verified stage; at most one CPU loan is supported. The default reserves only the floor and permits no CPU lending. The reserve must leave at least one general slot after health and cleanup; automatic isolation is disabled when that capacity is unavailable unless explicitly required.
+    bounded_read_slots: ?i64 = null,
     /// Query, write, inference and background slot-service weights.
     weights: ?[]const i64 = null,
     /// Outstanding operation entries including protected controls. Managed startup requires at least two control entries, reserved within this bound.
@@ -2345,9 +2358,12 @@ pub const RunnableSchedulingConfigValue = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "capacity_mode", "capacity_mode", true },
         .{ "slots", "slots", true },
         .{ "control_slots", "control_slots", true },
         .{ "cleanup_slots", "cleanup_slots", true },
+        .{ "read_isolation", "read_isolation", false },
+        .{ "bounded_read_slots", "bounded_read_slots", true },
         .{ "weights", "weights", true },
         .{ "max_operations", "max_operations", true },
         .{ "max_bytes", "max_bytes", true },
@@ -2368,6 +2384,10 @@ pub const RunnableSchedulingConfigValue = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.capacity_mode) |value| {
+            try jw.objectField("capacity_mode");
+            try jw.write(value);
+        }
         if (self.slots) |value| {
             try jw.objectField("slots");
             try jw.write(value);
@@ -2378,6 +2398,21 @@ pub const RunnableSchedulingConfigValue = struct {
         }
         if (self.cleanup_slots) |value| {
             try jw.objectField("cleanup_slots");
+            try jw.write(value);
+        }
+        switch (self.read_isolation) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("read_isolation");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("read_isolation");
+                try jw.write(value);
+            },
+        }
+        if (self.bounded_read_slots) |value| {
+            try jw.objectField("bounded_read_slots");
             try jw.write(value);
         }
         if (self.weights) |value| {
@@ -2416,7 +2451,7 @@ pub const RunnableSchedulingConfigValue = struct {
     }
 };
 
-/// Opt-in fixed runnable scheduling across execution classes. Omit or set null to preserve existing dispatch. Outstanding operation admission and retained memory remain separately bounded. Automatic defaults are not qualified.
+/// Node-wide runnable scheduling across execution classes. Omitting admission.runnable enables automatic initial sizing using the declared defaults as ceilings. Setting null disables runnable scheduling and implicit query waiting. An explicit object uses its property defaults, including fixed mode unless capacity_mode is supplied. Automatic mode resolves once before node publication and preserves protected health and cleanup capacity.
 pub const RunnableSchedulingConfig = ?RunnableSchedulingConfigValue;
 
 pub const S3ExternalIoConfig = struct {

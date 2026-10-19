@@ -7,6 +7,7 @@ import gzip
 import copy
 import pathlib
 from run_local import configuration_for_policy
+from load_clients import service_diagnostics
 
 
 def compare(baseline, candidate):
@@ -21,7 +22,9 @@ def compare(baseline, candidate):
             failures.append(label + " binary identity missing")
     if baseline.get("binary_sha256") == candidate.get("binary_sha256"):
         runnable_comparison = candidate.get("policy") == "runnable"
-        failfast_comparison = runnable_comparison and baseline.get("policy") == "failfast"
+        failfast_comparison = (
+            runnable_comparison and baseline.get("policy") == "failfast"
+        )
         configurations = []
         for receipt in (baseline, candidate):
             config = copy.deepcopy(receipt.get("configuration"))
@@ -61,7 +64,9 @@ def compare(baseline, candidate):
                 + (
                     "runnable scheduling and query waiting"
                     if failfast_comparison
-                    else "runnable scheduling" if runnable_comparison else "query waiting"
+                    else "runnable scheduling"
+                    if runnable_comparison
+                    else "query waiting"
                 )
             )
     limits = candidate["manifest"]["comparison_thresholds"]
@@ -73,6 +78,47 @@ def compare(baseline, candidate):
     comparisons = []
     for name in sorted(expected & baseline_phases.keys() & candidate_phases.keys()):
         old, new = baseline_phases[name], candidate_phases[name]
+        phase_policy = next(
+            p for p in candidate["manifest"]["phases"] if p["name"] == name
+        )
+        minimum_service = phase_policy.get("thresholds", {}).get(
+            "runnable_observed_slot_ns_min", 0
+        )
+        if type(minimum_service) is not int or minimum_service < 0:
+            failures.append(name + ": invalid observed service threshold")
+        elif minimum_service:
+            for label, receipt, phase in (
+                ("baseline", baseline, old),
+                ("candidate", candidate, new),
+            ):
+                if receipt.get("policy") != "runnable":
+                    continue
+                prefix = label + " " + name + ": "
+                try:
+                    observed = service_diagnostics(
+                        (phase.get("workload_before") or {}).get("runnable") or {},
+                        (phase.get("workload_after") or {}).get("runnable") or {},
+                    )
+                except (RuntimeError, TypeError, AttributeError):
+                    failures.append(prefix + "invalid runnable service snapshots")
+                    continue
+                recorded = phase.get("runnable_diagnostics")
+                if (
+                    not isinstance(recorded, dict)
+                    or recorded.get("service") != observed
+                ):
+                    failures.append(
+                        prefix + "service diagnostics differ from snapshots"
+                    )
+                if not observed["available"]:
+                    failures.append(
+                        prefix + "runnable service observations were not measured"
+                    )
+                elif sum(observed["counters"]["observed_slot_ns"]) < minimum_service:
+                    failures.append(
+                        prefix
+                        + "runnable observed service was below the declared minimum"
+                    )
         if (
             old["offered"] != new["offered"]
             or old.get("retries") != 0

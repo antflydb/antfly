@@ -424,3 +424,40 @@ Inline media uses `{type: "media", mime_type, data}` with base64 data; immutable
 HTTP/S3 objects use a version-pinned `ChunkSourceReference`. See the
 [shared contract](../../../docs/plans/model-aware-media-chunking.md) for source
 security, rendering policies, limits and native database integration.
+
+### Local request admission
+
+Both `AntflyClient` and `InferenceClient` default to 100 active requests, 100
+queued requests, and a one-second queue wait. Response bodies retain their slot
+until EOF, read failure, or completed cancellation. Streaming consumers should
+finish or close their iterator; stopping an NDJSON scan or inference generator
+early cancels its response, including `chunkAndEmbedStream`. Model-aware chunk
+requests share admission with other requests on that owner. Raw responses from
+`client.api` must be consumed or canceled by their caller.
+
+```typescript
+import { AntflyClient, InferenceClient, RequestAdmission } from "@antfly/sdk";
+
+const admission = new RequestAdmission({
+  maxConcurrent: 8,
+  maxQueued: 16,
+  maxWaitMs: 250,
+});
+const db = new AntflyClient({ baseUrl, requestAdmission: admission });
+const ai = new InferenceClient({ baseUrl, requestAdmission: admission });
+```
+
+Pass an options object instead to create a separate owner for one client. Set
+`maxQueued` or `maxWaitMs` to zero for immediate refusal while busy. Queue order
+is FIFO; expired, aborted and closed waiters are removed. The caller's original
+`AbortSignal` covers both waiting and fetch without a refreshed timeout. Local
+refusals throw `ClientCapacityError` with `reason` (`queue_full`, `wait_timeout`,
+or `closed`) and `requestSent: false`; they send no request and trigger no retry.
+
+`admission.stats` reports active and queued counts. `close()` on a client closes
+its admission owner, including any other clients explicitly sharing that owner,
+and wakes queued callers. Active bodies keep their slots until they retire.
+The JavaScript runtime owns the underlying HTTP connection pool; closing local
+admission does not close that pool. Request serialization can precede admission,
+and these count limits do not bound caller-owned payloads, cloned response
+buffers, or total SDK heap. Server admission still enforces node capacity.

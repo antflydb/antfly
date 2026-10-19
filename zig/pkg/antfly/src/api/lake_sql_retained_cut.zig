@@ -57,21 +57,31 @@ pub fn save(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io,
     return @import("lake_generation_envelope.zig").encode(a, prefix, object);
 }
 pub fn load(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table: catalog.Table, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {
-    const value = try loadDescriptor(a, store, identity, token, table.id, now, cancellation);
+    return loadFor(a, store, identity, token, table, now, cancellation, .{});
+}
+pub fn loadFor(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table: catalog.Table, now: u64, cancellation: @import("antfly_cancellation").CancellationToken, context: local.serverless_query_lake_read_context.Context) !Descriptor {
+    try context.ensureActive();
+    const value = try loadDescriptorFor(a, store, identity, token, table.id, now, cancellation, context);
     if (value.schema_version != table.schema_version or value.object_generation != (if (table.external_indexes) |indexes| indexes.object_generation else 0)) return error.CatalogGenerationChanged;
+    try context.ensureActive();
     return value;
 }
 pub fn loadDescriptor(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table_id: u64, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {
+    return loadDescriptorFor(a, store, identity, token, table_id, now, cancellation, .{});
+}
+pub fn loadDescriptorFor(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table_id: u64, now: u64, cancellation: @import("antfly_cancellation").CancellationToken, context: local.serverless_query_lake_read_context.Context) !Descriptor {
+    try context.ensureActive();
     if (!std.mem.startsWith(u8, token, prefix)) return error.CatalogGenerationChanged;
     const envelope = try @import("lake_generation_envelope.zig").decode(a, prefix, token, max_bytes);
     defer if (envelope.generation) |generation| a.free(generation);
     const id = envelope.id;
     const scope = (try artifacts.uploadScopeFromArtifactId(id)) orelse return error.CatalogGenerationChanged;
     if (!std.mem.eql(u8, &scope.domain, &domain(table_id, identity))) return error.CatalogGenerationChanged;
-    const bytes = try @import("lake_generation_envelope.zig").read(store, envelope, cancellation);
+    const bytes = try @import("lake_generation_envelope.zig").readFor(store, envelope, cancellation, context);
     defer store.allocator.free(bytes);
     const value = try std.json.parseFromSliceLeaky(Descriptor, a, bytes, .{ .allocate = .alloc_always });
     if (value.version != 1 or value.table_id != table_id or value.expires_ms <= now or value.expires_ms != scope.fencingToken()) return error.CatalogGenerationChanged;
+    try context.ensureActive();
     return value;
 }
 

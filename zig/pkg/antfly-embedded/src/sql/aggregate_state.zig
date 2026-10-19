@@ -19,6 +19,7 @@ const std = @import("std");
 const operators = @import("operators.zig");
 const Datum = @import("scalar.zig").Datum;
 const A = std.mem.Allocator;
+const Work = @import("operator_work.zig");
 pub const Column = struct {
     const Integer = struct { count: u64 = 0, sum: i128 = 0, selected: i64 = 0 };
     const Number = struct { count: u64 = 0, sum: f64 = 0, compensation: f64 = 0, mean: f64 = 0, selected: f64 = 0 };
@@ -94,6 +95,10 @@ pub const Column = struct {
         }
     }
     pub fn append(self: *Column, a: A) !void {
+        return self.appendControlled(a, null);
+    }
+    pub fn appendControlled(self: *Column, a: A, control: ?Work.Control) !void {
+        try Work.poll(control);
         try operators.Aggregate.validate(self.spec.kind, self.spec.input_type);
         switch (self.values) {
             .fixed => |*values| try values.append(a, .{ .alloc = a }),
@@ -112,6 +117,10 @@ pub const Column = struct {
         }
     }
     pub fn snapshot(self: *const Column, a: A, index: usize) !operators.Aggregate {
+        return self.snapshotControlled(a, index, null);
+    }
+    pub fn snapshotControlled(self: *const Column, a: A, index: usize, control: ?Work.Control) !operators.Aggregate {
+        try Work.poll(control);
         var state: operators.Aggregate = .{ .alloc = a, .kind = self.spec.kind, .input_type = self.spec.input_type, .input_element = self.spec.input_element, .boolean = self.spec.kind == .bool_and };
         var selected: ?Datum = null;
         var fixed_digits: @import("numeric_value.zig").ScaledInteger = undefined;
@@ -128,7 +137,7 @@ pub const Column = struct {
             .exact => |v| {
                 const reducer = try a.create(@import("numeric_aggregate.zig").Reducer);
                 errdefer a.destroy(reducer);
-                reducer.* = try v.items[index].clone(a);
+                reducer.* = try v.items[index].cloneControlled(a, control);
                 state.numeric = reducer;
                 state.count = reducer.state.count;
             },
@@ -158,7 +167,7 @@ pub const Column = struct {
         if ((self.spec.kind == .min or self.spec.kind == .max) and state.count != 0) {
             // Snapshot ownership belongs to the caller's arena, not live state.
             const RowOwner = @TypeOf(state.selected.?);
-            state.selected = try RowOwner.init(a, .{ .values = &.{selected.?}, .keys = &.{}, .ordinal = 0 });
+            state.selected = try RowOwner.initControlled(a, .{ .values = &.{selected.?}, .keys = &.{}, .ordinal = 0 }, control);
         }
         return state;
     }
@@ -179,7 +188,7 @@ pub const Column = struct {
             .bytes, .dynamic, .exact, .fixed => unreachable,
         }
     }
-    fn promote(self: *Column, a: A) !void {
+    fn promote(self: *Column, a: A, control: ?Work.Control) !void {
         var states: std.ArrayList(operators.Aggregate) = .empty;
         errdefer {
             for (states.items) |*state| state.deinit();
@@ -189,7 +198,7 @@ pub const Column = struct {
             inline else => |values| values.items.len,
         };
         try states.ensureTotalCapacity(a, count);
-        for (0..count) |index| states.appendAssumeCapacity(try self.snapshot(a, index));
+        for (0..count) |index| states.appendAssumeCapacity(try self.snapshotControlled(a, index, control));
         self.clear(a);
         self.values = .{ .dynamic = states };
     }
@@ -259,14 +268,18 @@ pub const Column = struct {
         return .{ .coefficient = coefficient, .scale = number.scale };
     }
     pub fn update(self: *Column, a: A, index: usize, value: Datum) !void {
-        if (self.values == .dynamic) return self.values.dynamic.items[index].update(value);
+        return self.updateControlled(a, index, value, null);
+    }
+    pub fn updateControlled(self: *Column, a: A, index: usize, value: Datum, control: ?Work.Control) !void {
+        try Work.poll(control);
+        if (self.values == .dynamic) return self.values.dynamic.items[index].updateControlled(value, control);
         if (value.sql_null) return;
         if (self.values == .fixed) {
             if (fixedValue(value)) |fixed| return self.values.fixed.items[index].add(fixed.coefficient, fixed.scale, 1, self.spec.kind == .min);
-            try self.promote(a);
-            return self.values.dynamic.items[index].update(value);
+            try self.promote(a, control);
+            return self.values.dynamic.items[index].updateControlled(value, control);
         }
-        if (self.values == .exact) return self.values.exact.items[index].add((value.numeric orelse return error.SqlTypeMismatch).*);
+        if (self.values == .exact) return self.values.exact.items[index].addControlled((value.numeric orelse return error.SqlTypeMismatch).*, control);
         if (self.spec.kind == .min or self.spec.kind == .max) {
             const compatible = switch (self.values) {
                 .integers => value.value == .integer,
@@ -276,8 +289,8 @@ pub const Column = struct {
                 else => unreachable,
             };
             if (!compatible) {
-                try self.promote(a);
-                return self.values.dynamic.items[index].update(value);
+                try self.promote(a, control);
+                return self.values.dynamic.items[index].updateControlled(value, control);
             }
             var count: u64 = 0;
             var prior: ?Datum = null;
@@ -305,7 +318,7 @@ pub const Column = struct {
                 else => unreachable,
             }
             if (count == std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
-            const replace = count == 0 or (try @import("scalar.zig").compareDatums(value, prior.?)) == (if (self.spec.kind == .min) std.math.Order.lt else .gt);
+            const replace = count == 0 or (try @import("scalar.zig").compareDatumsControlled(value, prior.?, control)) == (if (self.spec.kind == .min) std.math.Order.lt else .gt);
             switch (self.values) {
                 .integers => |*v| {
                     v.items[index].count += 1;
@@ -321,7 +334,7 @@ pub const Column = struct {
                 },
                 .bytes => |*v| {
                     if (replace) {
-                        const owned = try a.dupe(u8, value.value.string);
+                        const owned = try Work.dupe(u8, a, value.value.string, control);
                         if (v.items[index].value) |bytes| a.free(bytes);
                         v.items[index].value = owned;
                     }
@@ -331,30 +344,39 @@ pub const Column = struct {
             }
             return;
         }
-        var state = try self.snapshot(a, index);
-        try state.update(value);
+        var state = try self.snapshotControlled(a, index, control);
+        try state.updateControlled(value, control);
         self.set(index, state);
     }
     /// Dispatch once per aggregate vector. Each group's lane order remains
     /// stable, including compensated floating reductions in the fallback.
     pub fn updateBatch(self: *Column, a: A, ids: []const usize, values: []const Datum) !void {
+        return self.updateBatchControlled(a, ids, values, null);
+    }
+    pub fn updateBatchControlled(self: *Column, a: A, ids: []const usize, values: []const Datum, control: ?Work.Control) !void {
+        try Work.poll(control);
         if (ids.len != values.len) return error.InvalidSqlBackendResponse;
         switch (self.values) {
             .counts => |*counts| for (ids, values) |id, value| {
+                try Work.poll(control);
                 if (value.sql_null) continue;
                 counts.items[id] = std.math.add(u64, counts.items[id], 1) catch return error.SqlNumericOutOfRange;
                 if (counts.items[id] > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
             },
             .integers => |*integers| {
                 if (self.spec.kind != .sum) {
-                    for (ids, values) |id, value| try self.update(a, id, value);
+                    for (ids, values) |id, value| try self.updateControlled(a, id, value, control);
                     return;
                 }
-                for (values) |value| if (!value.sql_null and value.value != .integer) {
-                    for (ids, values) |id, cell| try self.update(a, id, cell);
-                    return;
-                };
+                for (values) |value| {
+                    try Work.poll(control);
+                    if (!value.sql_null and value.value != .integer) {
+                        for (ids, values) |id, cell| try self.updateControlled(a, id, cell, control);
+                        return;
+                    }
+                }
                 for (ids, values) |id, value| {
+                    try Work.poll(control);
                     if (value.sql_null) continue;
                     const state = &integers.items[id];
                     state.sum = std.math.add(i128, state.sum, value.value.integer) catch return error.SqlNumericOutOfRange;
@@ -364,11 +386,15 @@ pub const Column = struct {
             },
             .booleans => |*booleans| {
                 if (self.spec.kind != .bool_and and self.spec.kind != .bool_or) {
-                    for (ids, values) |id, value| try self.update(a, id, value);
+                    for (ids, values) |id, value| try self.updateControlled(a, id, value, control);
                     return;
                 }
-                for (values) |value| if (!value.sql_null and value.value != .bool) return error.SqlTypeMismatch;
+                for (values) |value| {
+                    try Work.poll(control);
+                    if (!value.sql_null and value.value != .bool) return error.SqlTypeMismatch;
+                }
                 for (ids, values) |id, value| {
+                    try Work.poll(control);
                     if (value.sql_null) continue;
                     const state = &booleans.items[id];
                     state.value = if (self.spec.kind == .bool_and) state.value and value.value.bool else state.value or value.value.bool;
@@ -376,13 +402,17 @@ pub const Column = struct {
                     if (state.count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
                 }
             },
-            else => for (ids, values) |id, value| try self.update(a, id, value),
+            else => for (ids, values) |id, value| try self.updateControlled(a, id, value, control),
         }
     }
     /// Consume a borrowed physical vector without expanding dictionary IDs.
     /// Iterate source lanes in order so floating and dynamic reductions retain
     /// exactly the same update order as the scalar path.
     pub fn updateEncoded(self: *Column, a: A, ids: []const usize, batch: @import("execution_batch.zig").Batch) !void {
+        return self.updateEncodedControlled(a, ids, batch, null);
+    }
+    pub fn updateEncodedControlled(self: *Column, a: A, ids: []const usize, batch: @import("execution_batch.zig").Batch, control: ?Work.Control) !void {
+        try Work.poll(control);
         if (batch.width() != 1 or batch.len() != ids.len) return error.InvalidSqlBackendResponse;
         if (batch == .reader) if (batch.reader.cohort) |cohort| {
             return self.updateCohort(a, ids, cohort.source.*, cohort.positions);
@@ -412,21 +442,23 @@ pub const Column = struct {
         };
         if (try batch.physicalColumn(scratch.allocator(), 0)) |physical| if (try self.updatePhysical(a, ids, physical)) return;
         switch (batch) {
-            .vectors => |vectors| return self.updateBatch(a, ids, vectors.values[0]),
+            .vectors => |vectors| return self.updateBatchControlled(a, ids, vectors.values[0], control),
             .dictionary => |dictionary| {
                 if (self.values == .counts) {
                     for (ids, dictionary.indices) |id, index| {
+                        try Work.poll(control);
                         if (index >= dictionary.values.len) return error.InvalidSqlBackendResponse;
                         if (!dictionary.values[index].sql_null) self.values.counts.items[id] = try mergedCount(self.values.counts.items[id], 1);
                     }
                     return;
                 }
                 for (ids, dictionary.indices) |id, index| {
+                    try Work.poll(control);
                     if (index >= dictionary.values.len) return error.InvalidSqlBackendResponse;
-                    try self.update(a, id, dictionary.values[index]);
+                    try self.updateControlled(a, id, dictionary.values[index], control);
                 }
             },
-            else => for (ids, 0..) |id, index| try self.update(a, id, try batch.cell(scratch.allocator(), index, 0)),
+            else => for (ids, 0..) |id, index| try self.updateControlled(a, id, try batch.cellControlled(scratch.allocator(), index, 0, control), control),
         }
     }
     pub fn updateCohort(self: *Column, a: A, ids: []const usize, source: @import("execution_batch.zig").Batch, positions: []const usize) !void {
@@ -584,7 +616,7 @@ pub const Column = struct {
                             continue;
                         }
                     }
-                    if (self.values != .dynamic) try self.promote(a);
+                    if (self.values != .dynamic) try self.promote(a, null);
                     var state = try operators.Aggregate.initTyped(a, self.spec.kind, self.spec.input_type, self.spec.input_element);
                     defer state.deinit();
                     try state.update(from.selected);
@@ -631,7 +663,7 @@ pub const Column = struct {
         if (indices) |selected| if (selected.len != ids.len) return error.InvalidSqlBackendResponse;
         if (!std.meta.eql(self.spec, source.spec)) return error.InvalidSqlBackendResponse;
         if (std.meta.activeTag(self.values) != std.meta.activeTag(source.values)) {
-            if (self.values != .dynamic) try self.promote(a);
+            if (self.values != .dynamic) try self.promote(a, null);
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             for (ids, 0..) |id, offset| {
@@ -723,13 +755,17 @@ pub const Column = struct {
         return 0;
     }
     pub fn mergeExact(self: *Column, a: A, index: usize, state: operators.Aggregate) !void {
+        return self.mergeExactControlled(a, index, state, null);
+    }
+    pub fn mergeExactControlled(self: *Column, a: A, index: usize, state: operators.Aggregate, control: ?Work.Control) !void {
+        try Work.poll(control);
         if (state.kind != self.spec.kind or state.input_type != self.spec.input_type or state.input_element != self.spec.input_element or state.distinct != self.spec.distinct) return error.InvalidSqlBackendResponse;
         if (self.values == .exact) {
             const reducer = state.numeric orelse return error.InvalidSqlBackendResponse;
             if (reducer.state.count != state.count) return error.InvalidSqlBackendResponse;
-            return self.values.exact.items[index].merge(reducer.state);
+            return self.values.exact.items[index].mergeControlled(reducer.state, control);
         }
-        if (self.values == .dynamic) return @import("aggregate_partial.zig").merge(&self.values.dynamic.items[index], state);
+        if (self.values == .dynamic) return @import("aggregate_partial.zig").mergeControlled(&self.values.dynamic.items[index], state, control);
         if (self.spec.kind == .min or self.spec.kind == .max) {
             if (state.count == 0) return;
             const prior = switch (self.values) {
@@ -738,7 +774,7 @@ pub const Column = struct {
             };
             const total = std.math.add(u64, prior, state.count) catch return error.SqlNumericOutOfRange;
             if (total > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
-            try self.update(a, index, state.selected.?.row.values[0]);
+            try self.updateControlled(a, index, state.selected.?.row.values[0], control);
             switch (self.values) {
                 .counts => unreachable,
                 .exact => unreachable,
@@ -748,8 +784,8 @@ pub const Column = struct {
             return;
         }
         if (self.values == .numbers) {
-            var target = try self.snapshot(a, index);
-            try @import("aggregate_partial.zig").merge(&target, state);
+            var target = try self.snapshotControlled(a, index, control);
+            try @import("aggregate_partial.zig").mergeControlled(&target, state, control);
             self.set(index, target);
             return;
         }
@@ -776,9 +812,13 @@ pub const Column = struct {
         }
     }
     pub fn finish(self: *const Column, index: usize) !Datum {
+        return self.finishControlled(index, null);
+    }
+    pub fn finishControlled(self: *const Column, index: usize, control: ?Work.Control) !Datum {
+        try Work.poll(control);
         if (self.values == .fixed) return self.values.fixed.items[index].finish();
-        if (self.values == .exact) return if (try self.values.exact.items[index].finish(self.spec.kind == .avg)) |value| Datum.typedNumeric(value) else .{};
-        if (self.values == .dynamic) return self.values.dynamic.items[index].finish();
+        if (self.values == .exact) return if (try self.values.exact.items[index].finishControlled(self.spec.kind == .avg, control)) |value| Datum.typedNumeric(value) else .{};
+        if (self.values == .dynamic) return self.values.dynamic.items[index].finishControlled(control);
         if (self.spec.kind == .min or self.spec.kind == .max) return switch (self.values) {
             .integers => |v| if (v.items[index].count == 0) .{} else Datum.json(.{ .integer = v.items[index].selected }),
             .numbers => |v| if (v.items[index].count == 0) .{} else Datum.json(.{ .float = v.items[index].selected }),
@@ -786,7 +826,7 @@ pub const Column = struct {
             .bytes => |v| if (v.items[index].value) |bytes| Datum.json(.{ .string = bytes }) else .{},
             else => unreachable,
         };
-        return (try self.snapshot(std.heap.page_allocator, index)).finish();
+        return (try self.snapshotControlled(std.heap.page_allocator, index, control)).finishControlled(control);
     }
 };
 

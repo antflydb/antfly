@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Preauthorized, joined completion on an existing execution. Reserve before
 //! SQL sealing or participant acceptance. The callback owns all storage-child
@@ -14,6 +26,11 @@ pub const Task = struct {
     node: *Node,
     future: std.Io.Future(anyerror!void),
     joined: bool = false,
+
+    /// Fixed retained task metadata, charged before reserving the worker.
+    pub fn retainedBytes() usize {
+        return @sizeOf(Node) + @sizeOf(Task);
+    }
 
     const Node = struct {
         allocator: std.mem.Allocator,

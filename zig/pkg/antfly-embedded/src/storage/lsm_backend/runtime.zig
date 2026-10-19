@@ -574,6 +574,14 @@ fn invalidateSnapshot(snapshot: *?State, allocator: Allocator) void {
 }
 
 fn runtimeScratchAllocator(fallback: Allocator) Allocator {
+    // Preserve an explicitly supplied reclaimable root instead of escaping
+    // its process ceiling through libc. Unwrap result arenas so scratch frees
+    // remain independent, and never introduce reclaim callbacks under locks.
+    if (@import("../resource_manager.zig").BudgetedAllocator.fromAllocator(fallback)) |root| {
+        return root.threadSafeNoReclaimAllocator();
+    }
+    if (@import("runtime_memory_abi").Allocator.isStdAdapter(fallback)) return fallback;
+
     if (comptime builtin.os.tag == .freestanding) return fallback;
     if (comptime builtin.link_libc) return std.heap.c_allocator;
     if (comptime builtin.single_threaded) return fallback;
@@ -693,6 +701,11 @@ pub fn BoundStore(comptime BackendType: type) type {
         backend: *BackendType,
         namespace: backend_types.Namespace,
 
+        pub fn publicationGate(self: *@This()) ?*std.atomic.Mutex {
+            if (@hasField(BackendType, "publication_backlog_mutex")) return &self.backend.publication_backlog_mutex;
+            return null;
+        }
+
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{
                 .ordered_ranges = true,
@@ -705,6 +718,14 @@ pub fn BoundStore(comptime BackendType: type) type {
                 .single_writer = true,
                 .read_snapshots = .snapshot,
             };
+        }
+
+        pub fn beginOwnedKeyCursor(self: *@This(), allocator: Allocator, control: read_admission.Port) !OwnedNamespaceKeyCursor(BackendType) {
+            return self.backend.beginOwnedKeyCursor(allocator, self.namespace, control);
+        }
+
+        pub fn beginOwnedValueRead(self: *@This(), allocator: Allocator, key: []const u8, control: read_admission.Port) !OwnedNamespaceValueRead(BackendType) {
+            return self.backend.beginOwnedValueRead(allocator, self.namespace, key, control);
         }
 
         pub fn beginRead(self: *@This()) !LocalReadTxn {
@@ -3486,8 +3507,8 @@ fn lowerBoundRunStart(keys: []const []const u8, namespace: backend_types.Namespa
 /// published LSM version. Mutable cache-index hints in Run are only accessed
 /// under the backend mutex; lazy Bloom ownership is disabled for these runs.
 pub const ReadVersion = struct {
-    build_mu: std.Io.Mutex = .init,
-    build_fallback_mu: std.atomic.Mutex = .unlocked,
+    // Backend-mutex protected. No builder owns a service mutex while yielding.
+    preparing: bool = false,
     prepared: bool = true,
     references: std.atomic.Value(usize) = .init(1),
     retired_next: ?*ReadVersion = null,
@@ -3632,6 +3653,10 @@ const RunReadView = struct {
         if (self.directory() == null) try self.prepare(backend);
     }
 
+    fn prepareCursorWithAdmission(self: *RunReadView, backend: anytype, control: read_admission.Port) !void {
+        if (self.directory() == null) try self.prepareWithAdmission(backend, control);
+    }
+
     /// Caller holds the backend mutex. Publishing a new run set invalidates
     /// the backend's reference; readers continue owning the previous version.
     fn pin(backend: anytype, allocator: Allocator) !RunReadView {
@@ -3666,7 +3691,7 @@ const RunReadView = struct {
     }
 
     fn prepareWithAdmission(self: *RunReadView, backend: anytype, control: read_admission.Port) !void {
-        try control.checkpoint();
+        try control.checkLifetime();
         if (self.version) |version| {
             if (comptime !@hasDecl(@TypeOf(backend.*), "prepareReadVersionWithAdmission")) return error.ExecutionWaitUnsupported;
             try backend.prepareReadVersionWithAdmission(version, control);
@@ -3674,7 +3699,7 @@ const RunReadView = struct {
             self.l0_groups = version.l0_groups;
             self.levels = version.levels;
         }
-        try control.checkpoint();
+        try control.checkLifetime();
     }
 
     fn release(self: RunReadView, backend: anytype) void {
@@ -3940,19 +3965,30 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         }
 
         fn openControlled(backend: *BackendType, namespace: backend_types.Namespace, control: ?read_admission.Port) !@This() {
-            const locked = if (control) |budget| try lockBackendWithAdmission(BackendType, backend, budget) else lockBackend(BackendType, backend);
+            var captured = try openCaptured(backend, namespace, control);
+            errdefer captured.abort();
+            // The backend mutex has been released. Rejection discards the
+            // complete capture before publishing it to the caller.
+            if (control) |owner| try owner.checkpoint();
+            return captured;
+        }
+
+        fn openCaptured(backend: *BackendType, namespace: backend_types.Namespace, original: ?read_admission.Port) !@This() {
+            const locked = if (original) |budget| try lockBackendWithAdmission(BackendType, backend, budget) else lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            var retained: read_admission.RetainedDependency = .{};
+            const control = retained.bind(original);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             try retainReadReader(BackendType, backend, .bound_read_txn);
             errdefer releaseReadReader(BackendType, backend, .bound_read_txn);
-            if (control) |budget| try budget.checkpoint();
+            if (control) |budget| try budget.checkLifetime();
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else
                 &.{};
             errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
-            if (control) |budget| try budget.checkpoint();
+            if (control) |budget| try budget.checkLifetime();
             const mutable_snapshot = try snapshotReadMutable(BackendType, backend, .bound_read_txn);
             errdefer {
                 if (mutable_snapshot.owned) {
@@ -3963,11 +3999,11 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                     releaseMutableReadSnapshot(BackendType, backend, mutable_snapshot.state, false);
                 }
             }
-            if (control) |budget| try budget.checkpoint();
+            if (control) |budget| try budget.checkLifetime();
             var read_view = try RunReadView.pin(backend, metadata_allocator);
             errdefer read_view.release(backend);
-            try read_view.prepareCursor(backend);
-            if (control) |budget| try budget.checkpoint();
+            if (control) |owner| try read_view.prepareCursorWithAdmission(backend, owner) else try read_view.prepareCursor(backend);
+            if (control) |budget| try budget.checkLifetime();
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -4214,6 +4250,15 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         }
 
         fn openControlled(backend: *BackendType, namespace: backend_types.Namespace, control: ?read_admission.Port) !@This() {
+            var captured = try openCaptured(backend, namespace, control);
+            errdefer captured.abort();
+            // The backend mutex has been released. Rejection discards the
+            // complete capture before publishing it to the caller.
+            if (control) |owner| try owner.checkpoint();
+            return captured;
+        }
+
+        fn openCaptured(backend: *BackendType, namespace: backend_types.Namespace, control: ?read_admission.Port) !@This() {
             const locked = if (control) |owner| try lockBackendWithAdmission(BackendType, backend, owner) else lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             try retainReadReader(BackendType, backend, .probe_txn);
@@ -4222,7 +4267,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             const stable_point_view = backend.mutable.entryCount() == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
             const read_view = if (stable_point_view) try RunReadView.pin(backend, metadata_allocator) else null;
             errdefer if (read_view) |view| view.release(backend);
-            if (control) |owner| try owner.checkpoint();
+            if (control) |owner| try owner.checkLifetime();
             return .{
                 .allocator = runtimeScratchAllocator(backend.allocator),
                 .metadata_allocator = metadata_allocator,
@@ -4750,6 +4795,13 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
         }
 
         fn openWithPurpose(backend: *BackendType, namespace: backend_types.Namespace, purpose: Purpose, control: ?read_admission.Port) !@This() {
+            var captured = try openCaptured(backend, namespace, purpose, control);
+            errdefer captured.abort();
+            if (control) |owner| try owner.checkpoint();
+            return captured;
+        }
+
+        fn openCaptured(backend: *BackendType, namespace: backend_types.Namespace, purpose: Purpose, control: ?read_admission.Port) !@This() {
             const locked = if (control) |owner| try lockBackendWithAdmission(BackendType, backend, owner) else lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
@@ -4812,8 +4864,8 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
             var read_view = try RunReadView.pin(backend, metadata_allocator);
             errdefer read_view.release(backend);
-            try read_view.prepareCursor(backend);
-            if (control) |owner| try owner.checkpoint();
+            if (control) |owner| try read_view.prepareCursorWithAdmission(backend, owner) else try read_view.prepareCursor(backend);
+            if (control) |owner| try owner.checkLifetime();
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -5705,17 +5757,36 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
         planning_scratch: BatchScratch.ProbeScratch = .{},
 
         pub fn open(backend: *BackendType) !@This() {
-            const locked = lockBackend(BackendType, backend);
+            return try openControlled(backend, null);
+        }
+
+        pub fn openWithAdmission(backend: *BackendType, control: read_admission.Port) !@This() {
+            return try openControlled(backend, control);
+        }
+
+        fn openControlled(backend: *BackendType, control: ?read_admission.Port) !@This() {
+            var captured = try openCaptured(backend, control);
+            errdefer captured.abort();
+            if (control) |owner| try owner.checkpoint();
+            return captured;
+        }
+
+        fn openCaptured(backend: *BackendType, original: ?read_admission.Port) !@This() {
+            const locked = if (original) |owner| try lockBackendWithAdmission(BackendType, backend, owner) else lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
+            var retained: read_admission.RetainedDependency = .{};
+            const control = retained.bind(original);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             try retainReadReader(BackendType, backend, .namespace_read_txn);
             errdefer releaseReadReader(BackendType, backend, .namespace_read_txn);
+            if (control) |owner| try owner.checkLifetime();
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else
                 &.{};
             errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
+            if (control) |owner| try owner.checkLifetime();
             const mutable_snapshot = try snapshotReadMutable(BackendType, backend, .namespace_read_txn);
             errdefer {
                 if (mutable_snapshot.owned) {
@@ -5726,9 +5797,11 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
                     releaseMutableReadSnapshot(BackendType, backend, mutable_snapshot.state, false);
                 }
             }
+            if (control) |owner| try owner.checkLifetime();
             var read_view = try RunReadView.pin(backend, metadata_allocator);
             errdefer read_view.release(backend);
-            try read_view.prepareCursor(backend);
+            if (control) |owner| try read_view.prepareCursorWithAdmission(backend, owner) else try read_view.prepareCursor(backend);
+            if (control) |owner| try owner.checkLifetime();
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -5768,6 +5841,16 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             return try getFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, &self.last_l0_group_index, &self.read_hint, &self.held_blocks, &self.held_values, self.allocator, namespace, key);
         }
 
+        pub fn getWithAdmission(self: *@This(), namespace: backend_types.Namespace, key: []const u8, control: read_admission.Port) ![]const u8 {
+            try control.checkpoint();
+            self.backend.recordPointGet();
+            const keys = [_][]const u8{key};
+            var values: [1]?[]const u8 = .{null};
+            _ = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, namespace, &keys, &values, &self.planning_scratch, self.metadata_allocator, control);
+            try control.checkpoint();
+            return values[0] orelse error.NotFound;
+        }
+
         pub fn getManySorted(self: *@This(), namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
@@ -5780,6 +5863,718 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
         pub fn openCursor(self: *@This(), namespace: backend_types.Namespace) !LocalCursor {
             const cursor_alloc = runtimeScratchAllocator(self.allocator);
             return try LocalCursor.initView(cursor_alloc, self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, namespace, false);
+        }
+    };
+}
+
+/// Detached data ownership. Value may be an interior slice of a verified table
+/// block; retain its original allocation until deinit, even after backend close.
+pub const OwnedNamespaceValue = struct {
+    allocator: Allocator,
+    allocation: []u8,
+    offset: usize = 0,
+    len: usize,
+    pub fn bytes(self: @This()) []const u8 {
+        return self.allocation[self.offset..][0..self.len];
+    }
+    pub fn deinit(self: *@This()) void {
+        self.allocator.free(self.allocation);
+        self.* = undefined;
+    }
+};
+
+/// A caller-funded immutable-run index continuation. Footer and metadata use
+/// one bound source, never a whole-file fallback or a reopened generation.
+/// Source open, allocator internals and snapshot acquisition remain separate
+/// resource/CPU work. Physical reads and metadata CRC use at most quantum;
+/// footer validation consumes its fixed 48-byte record.
+pub fn OwnedRunIndexRead(comptime BackendType: type) type {
+    const Source = BackendType.RunRangeReader;
+    return struct {
+        pub const Status = enum { pending, ready };
+        const Phase = enum { footer, allocate, metadata, decode, ready, taken, failed, closed };
+        backend: *BackendType,
+        allocator: Allocator,
+        path: ?[]u8,
+        source: ?Source,
+        file_size: usize,
+        footer_bytes: [lsm_table_file.footer_len]u8 = undefined,
+        footer: ?lsm_table_file.Footer = null,
+        position: usize = 0,
+        metadata: ?[]u8 = null,
+        decoder: ?lsm_table_file.IndexDecodeCursor = null,
+        phase: Phase = .footer,
+        failure: ?anyerror = null,
+        load_ns: u64 = 0,
+        decode_ns: u64 = 0,
+
+        pub fn init(backend: *BackendType, allocator: Allocator, path: []const u8, file_size: u64, control: ?read_admission.Port) !@This() {
+            if (control) |port| try port.checkpoint();
+            if (file_size > repository_mod.maxRunFileReadBytes()) return error.FileTooBig;
+            if (file_size < lsm_table_file.header_len + lsm_table_file.footer_len) return error.InvalidTableFile;
+            const owned_path = try allocator.dupe(u8, path);
+            errdefer allocator.free(owned_path);
+            var source = try backend.openRunRangeReaderWithAdmission(owned_path, 0, @intCast(file_size), control);
+            errdefer source.deinit();
+            if (control) |port| try port.checkpoint();
+            return .{ .backend = backend, .allocator = allocator, .path = owned_path, .source = source, .file_size = @intCast(file_size) };
+        }
+        pub fn step(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (quantum == 0 or quantum > 65536) return error.InvalidArgument;
+            if (self.failure) |err| return err;
+            if (self.phase == .closed or self.phase == .taken) return error.TransactionClosed;
+            const decoding = self.phase == .decode;
+            const started = self.backend.readStatsNowNs();
+            defer {
+                const elapsed = self.backend.readStatsElapsedNs(started);
+                if (decoding) self.decode_ns +|= elapsed else self.load_ns +|= elapsed;
+            }
+            return self.advance(quantum, control) catch |err| {
+                const cause = if (control) |port| blk: {
+                    port.checkpoint() catch |original| break :blk original;
+                    break :blk err;
+                } else err;
+                self.deinit();
+                self.failure = cause;
+                self.phase = .failed;
+                return cause;
+            };
+        }
+        fn advance(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (control) |port| try port.checkpoint();
+            switch (self.phase) {
+                .ready => return .ready,
+                .footer => {
+                    const take = @min(quantum, self.footer_bytes.len - self.position);
+                    try self.source.?.readInto(self.file_size - self.footer_bytes.len + self.position, self.footer_bytes[self.position..][0..take], control);
+                    self.position += take;
+                    if (self.position == self.footer_bytes.len) {
+                        if (!lsm_table_file.hasFooterMagic(&self.footer_bytes)) return error.UnsupportedVersion;
+                        const footer = try lsm_table_file.decodeFooterBytes(&self.footer_bytes);
+                        const end = self.file_size - lsm_table_file.footer_len;
+                        if (footer.metadata_offset > end or footer.metadata_len != end - footer.metadata_offset) return error.InvalidTableFile;
+                        self.footer = footer;
+                        self.position = 0;
+                        self.phase = .allocate;
+                    }
+                },
+                .allocate => {
+                    self.metadata = try self.allocator.alloc(u8, self.footer.?.metadata_len);
+                    self.phase = .metadata;
+                },
+                .metadata => {
+                    const bytes = self.metadata.?;
+                    const take = @min(quantum, bytes.len - self.position);
+                    try self.source.?.readInto(self.footer.?.metadata_offset + self.position, bytes[self.position..][0..take], control);
+                    self.position += take;
+                    if (self.position == bytes.len) {
+                        self.decoder = lsm_table_file.IndexDecodeCursor.init(self.allocator, self.footer.?, bytes);
+                        self.metadata = null;
+                        self.retireSource();
+                        self.phase = .decode;
+                    }
+                },
+                .decode => if (try self.decoder.?.step(quantum, control) == .ready) {
+                    self.phase = .ready;
+                },
+                else => unreachable,
+            }
+            if (control) |port| try port.checkpoint();
+            return if (self.phase == .ready) .ready else .pending;
+        }
+        pub fn takeOutput(self: *@This()) !lsm_table_file.RetainedIndex {
+            if (self.failure) |err| return err;
+            if (self.phase != .ready) return error.InvalidArgument;
+            const index = try self.decoder.?.takeOutput();
+            self.decoder.?.deinit();
+            self.decoder = null;
+            self.backend.recordTableIndexLoad(self.load_ns +| self.decode_ns);
+            self.backend.recordTableIndexDecode(self.decode_ns);
+            self.phase = .taken;
+            return index;
+        }
+        fn retireSource(self: *@This()) void {
+            if (self.source) |*source| source.deinit();
+            self.source = null;
+            if (self.path) |path| self.allocator.free(path);
+            self.path = null;
+        }
+        pub fn deinit(self: *@This()) void {
+            if (self.decoder) |*decoder| decoder.deinit();
+            self.decoder = null;
+            if (self.metadata) |bytes| self.allocator.free(bytes);
+            self.metadata = null;
+            self.retireSource();
+            self.phase = .closed;
+        }
+    };
+}
+
+/// Owns the namespace snapshot as well as lookup/decode progress. No control,
+/// stack key or self-relative cursor escapes a step. Pending owners must join
+/// retirement before backend close; backend reader pins prevent early teardown.
+/// Snapshot capture and allocation remain separate metadata work,
+/// not yet byte-bounded physical continuations for every provider/codec.
+pub fn OwnedNamespaceValueRead(comptime BackendType: type) type {
+    const Txn = NamespaceReadTxn(BackendType);
+    const Block = OwnedRunBlockRead(BackendType);
+    const Directory = @import("run_directory.zig").Directory;
+    return struct {
+        pub const Status = enum { pending, ready };
+        const Phase = enum { mutable, immutable, runs, run_state, index, block_init, block_decode, block_search, copy_allocate, copy, ready, taken, failed, closed };
+        backend: *BackendType,
+        allocator: Allocator,
+        txn: ?Txn,
+        namespace: backend_types.Namespace,
+        key: []u8,
+        directory_cursor: ?Directory.ReadPointCursor = null,
+        immutable_index: usize = 0,
+        run_index: usize = 0,
+        current_run: ?Run = null,
+        index: ?lsm_table_file.RetainedIndex = null,
+        index_read: ?OwnedRunIndexRead(BackendType) = null,
+        block_index: usize = 0,
+        block: ?Block = null,
+        decoded: ?[]u8 = null,
+        copy_source: ?[]const u8 = null,
+        copy_offset: usize = 0,
+        result: ?OwnedNamespaceValue = null,
+        phase: Phase = .mutable,
+        failure: ?anyerror = null,
+
+        pub fn init(backend: *BackendType, allocator: Allocator, namespace: backend_types.Namespace, key: []const u8, control: ?read_admission.Port) !@This() {
+            if (control) |port| try port.checkpoint();
+            const owned_key = try allocator.dupe(u8, key);
+            errdefer allocator.free(owned_key);
+            var owned_namespace = namespace;
+            owned_namespace.name = if (namespace.name) |name| try allocator.dupe(u8, name) else null;
+            errdefer if (owned_namespace.name) |name| allocator.free(name);
+            var txn = if (control) |port| try Txn.openWithAdmission(backend, port) else try Txn.open(backend);
+            errdefer txn.abort();
+            if (control) |port| try port.checkpoint();
+            backend.recordPointGet();
+            return .{ .backend = backend, .allocator = allocator, .txn = txn, .namespace = owned_namespace, .key = owned_key, .directory_cursor = if (txn.read_view.directory()) |directory| directory.readPoint(owned_namespace.name, owned_key) else null };
+        }
+
+        pub fn step(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (quantum == 0 or quantum > Block.max_step_bytes) return error.InvalidArgument;
+            switch (self.phase) {
+                .failed => return self.failure.?,
+                .closed, .taken => return error.InvalidArgument,
+                else => {},
+            }
+            return self.advance(quantum, control) catch |err| {
+                const cause = if (control) |port| blk: {
+                    port.checkpoint() catch |original| break :blk original;
+                    break :blk err;
+                } else err;
+                self.discardResult();
+                self.retireWorking();
+                self.phase = .failed;
+                self.failure = cause;
+                return cause;
+            };
+        }
+
+        fn selectEntry(self: *@This(), entry: anytype) !void {
+            if (entry.tombstone) return error.NotFound;
+            self.copy_source = entry.value;
+            self.phase = .copy_allocate;
+        }
+
+        fn advance(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (control) |port| try port.checkpoint();
+            switch (self.phase) {
+                .ready => return .ready,
+                .mutable => {
+                    const state = self.txn.?.mutable_snapshot;
+                    if (state.findIndex(self.namespace, self.key)) |index| {
+                        self.backend.recordMutableHit();
+                        try self.selectEntry(state.entryAt(index));
+                    } else self.phase = .immutable;
+                },
+                .immutable => {
+                    const states = self.txn.?.immutable_memtables;
+                    if (self.immutable_index < states.len) {
+                        const state = states[self.immutable_index];
+                        self.immutable_index += 1;
+                        if (state.findIndex(self.namespace, self.key)) |index| {
+                            self.backend.recordMutableHit();
+                            try self.selectEntry(state.entryAt(index));
+                        }
+                    } else self.phase = .runs;
+                },
+                .runs => {
+                    const run = if (self.directory_cursor) |*cursor| blk: {
+                        var credits: usize = 64;
+                        if (cursor.nextWithBudget(&credits)) |handle| break :blk handle.run.*;
+                        if (cursor.done()) return error.NotFound;
+                        return .pending;
+                    } else blk: {
+                        const runs = self.txn.?.read_view.runs;
+                        if (self.run_index == runs.len) return error.NotFound;
+                        const candidate = runs[self.run_index];
+                        self.run_index += 1;
+                        break :blk candidate;
+                    };
+                    if (runMayContain(run, self.namespace, self.key)) {
+                        self.current_run = run;
+                        self.current_run.?.shared_read_version = true;
+                        self.backend.recordRunProbe();
+                        self.phase = if (run.state != null) .run_state else .index;
+                    }
+                },
+                .run_state => {
+                    const state = &self.current_run.?.state.?;
+                    if (state.findIndex(self.namespace, self.key)) |index| try self.selectEntry(state.entryAt(index)) else {
+                        self.current_run = null;
+                        self.phase = .runs;
+                    }
+                },
+                .index => {
+                    const path = self.current_run.?.path orelse return error.RunStateUnavailable;
+                    if (self.index_read == null) {
+                        self.index_read = try OwnedRunIndexRead(BackendType).init(self.backend, self.allocator, path, self.current_run.?.size_bytes, control);
+                        return .pending;
+                    }
+                    if (try self.index_read.?.step(quantum, control) != .ready) return .pending;
+                    self.index = try self.index_read.?.takeOutput();
+                    self.index_read.?.deinit();
+                    self.index_read = null;
+                    try requireTableBlocks(self.index.?.view());
+                    if (self.index.?.view().findBlockIndex(self.namespace.name, self.key)) |block_index| {
+                        const block = self.index.?.view().blocks[block_index];
+                        if (block.mayContainKeyByBounds(self.namespace.name, self.key) and block.maybeContains(self.namespace.name, self.key)) {
+                            self.block_index = block_index;
+                            self.phase = .block_init;
+                        } else self.nextRun();
+                    } else self.nextRun();
+                },
+                .block_init => {
+                    const window = self.index.?.view().blockWindow(self.block_index);
+                    const offset = std.math.add(u64, self.index.?.view().entry_data_start, window.physicalRelativeOffset()) catch return error.InvalidTableFile;
+                    self.block = try Block.init(self.backend, self.allocator, self.current_run.?.path.?, offset, window, control);
+                    self.phase = .block_decode;
+                },
+                .block_decode => if (try self.block.?.step(quantum, control) == .ready) {
+                    self.decoded = try self.block.?.takeOutput();
+                    self.block.?.deinit();
+                    self.block = null;
+                    self.phase = .block_search;
+                },
+                .block_search => {
+                    if (try lsm_table_file.findExactEntryInBlock(self.index.?.view(), self.decoded.?, self.block_index, self.namespace.name, self.key)) |positioned| {
+                        const entry = positioned.entry;
+                        if (entry.tombstone) return error.NotFound;
+                        const offset = @intFromPtr(entry.value.ptr) - @intFromPtr(self.decoded.?.ptr);
+                        self.result = .{ .allocator = self.allocator, .allocation = self.decoded.?, .offset = offset, .len = entry.value.len };
+                        self.decoded = null;
+                        if (self.current_run.?.level == 0) self.backend.recordL0Hit() else self.backend.recordLevelHit();
+                        if (control) |port| try port.checkpoint();
+                        self.retireWorking();
+                        self.phase = .ready;
+                        return .ready;
+                    }
+                    self.nextRun();
+                },
+                .copy_allocate => {
+                    self.result = .{ .allocator = self.allocator, .allocation = try self.allocator.alloc(u8, self.copy_source.?.len), .len = self.copy_source.?.len };
+                    self.phase = .copy;
+                },
+                .copy => {
+                    const source = self.copy_source.?;
+                    const take = @min(quantum, source.len - self.copy_offset);
+                    @memcpy(self.result.?.allocation[self.copy_offset..][0..take], source[self.copy_offset..][0..take]);
+                    self.copy_offset += take;
+                    if (self.copy_offset == source.len) {
+                        if (control) |port| try port.checkpoint();
+                        self.retireWorking();
+                        self.phase = .ready;
+                        return .ready;
+                    }
+                },
+                else => unreachable,
+            }
+            if (control) |port| try port.checkpoint();
+            return .pending;
+        }
+
+        fn nextRun(self: *@This()) void {
+            if (self.decoded) |bytes| self.allocator.free(bytes);
+            self.decoded = null;
+            if (self.index_read) |*read| read.deinit();
+            self.index_read = null;
+            if (self.index) |*index| index.deinit();
+            self.index = null;
+            self.current_run = null;
+            self.phase = .runs;
+        }
+
+        pub fn takeOutput(self: *@This()) !OwnedNamespaceValue {
+            if (self.phase != .ready) return error.InvalidArgument;
+            const result = self.result.?;
+            self.result = null;
+            self.phase = .taken;
+            return result;
+        }
+
+        fn discardResult(self: *@This()) void {
+            if (self.result) |*result| result.deinit();
+            self.result = null;
+        }
+
+        fn retireWorking(self: *@This()) void {
+            if (self.block) |*block| block.deinit();
+            self.block = null;
+            self.nextRun();
+            self.copy_source = null;
+            self.directory_cursor = null;
+            self.allocator.free(self.key);
+            self.key = &.{};
+            if (self.namespace.name) |name| self.allocator.free(name);
+            self.namespace.name = null;
+            // Last backend-dependent action: close can proceed as soon as this
+            // snapshot reader pin retires. Do not touch backend afterward.
+            if (self.txn) |*txn| txn.abort();
+            self.txn = null;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            self.discardResult();
+            self.retireWorking();
+            self.phase = .closed;
+        }
+    };
+}
+
+/// Reusable snapshot key cursor. Each step decodes at most one block quantum,
+/// probes one row, advances one source, or copies one key quantum. Index loads,
+/// snapshot capture and allocations remain separate metadata work. Key views
+/// borrow this owner until seek/handoff/deinit; no control borrow is retained.
+pub fn OwnedNamespaceKeyCursor(comptime BackendType: type) type {
+    const Txn = NamespaceReadTxn(BackendType);
+    const Block = OwnedRunBlockRead(BackendType);
+    const Directory = @import("run_directory.zig").Directory;
+    return struct {
+        pub const Status = enum { pending, ready };
+        const Phase = enum { idle, mutable, immutable, runs, run_state, index, block_init, block_decode, search, candidate, copy_allocate, copy, finish, ready, transferred, failed, closed };
+        backend: *BackendType,
+        allocator: Allocator,
+        txn: ?Txn,
+        namespace: backend_types.Namespace,
+        lower: []u8 = &.{},
+        upper: ?[]u8 = null,
+        exclusive: bool = false,
+        directory_cursor: ?Directory.Cursor = null,
+        immutable_index: usize = 0,
+        run_index: usize = 0,
+        current_run: ?Run = null,
+        index: ?lsm_table_file.RetainedIndex = null,
+        index_read: ?OwnedRunIndexRead(BackendType) = null,
+        block_index: usize = 0,
+        block: ?Block = null,
+        decoded: ?[]u8 = null,
+        lo: usize = 0,
+        hi: usize = 0,
+        best: ?OwnedNamespaceValue = null,
+        best_tombstone: bool = false,
+        candidate_tombstone: bool = false,
+        candidate: ?OwnedNamespaceValue = null,
+        copy_source: ?[]const u8 = null,
+        copy_offset: usize = 0,
+        next_phase: Phase = .runs,
+        phase: Phase = .idle,
+        failure: ?anyerror = null,
+
+        pub fn init(backend: *BackendType, allocator: Allocator, namespace: backend_types.Namespace, control: ?read_admission.Port) !@This() {
+            if (control) |port| try port.checkpoint();
+            var owned_namespace = namespace;
+            owned_namespace.name = if (namespace.name) |name| try allocator.dupe(u8, name) else null;
+            errdefer if (owned_namespace.name) |name| allocator.free(name);
+            var txn = if (control) |port| try Txn.openWithAdmission(backend, port) else try Txn.open(backend);
+            errdefer txn.abort();
+            if (control) |port| try port.checkpoint();
+            return .{ .backend = backend, .allocator = allocator, .txn = txn, .namespace = owned_namespace };
+        }
+        fn checkOpen(self: *const @This()) !void {
+            if (self.failure) |err| return err;
+            if (self.phase == .closed or self.phase == .transferred) return error.TransactionClosed;
+        }
+        pub fn seek(self: *@This(), lower: []const u8, upper: ?[]const u8, exclusive: bool, control: ?read_admission.Port) !void {
+            try self.checkOpen();
+            if (control) |port| try port.checkpoint();
+            const owned_lower = try self.allocator.dupe(u8, lower);
+            errdefer self.allocator.free(owned_lower);
+            const owned_upper = if (upper) |limit| try self.allocator.dupe(u8, limit) else null;
+            errdefer if (owned_upper) |limit| self.allocator.free(limit);
+            if (control) |port| try port.checkpoint();
+            self.clearQuery();
+            self.lower = owned_lower;
+            self.upper = owned_upper;
+            self.exclusive = exclusive;
+            self.restartSources();
+            // Callers may pass key() or previous bounds back into seek.
+            // clearQuery retired those borrows; compare the owned copies.
+            if (self.upper) |limit| {
+                if (std.mem.order(u8, self.lower, limit) != .lt) self.phase = .ready;
+            }
+        }
+        fn restartSources(self: *@This()) void {
+            self.immutable_index = 0;
+            self.run_index = 0;
+            self.directory_cursor = if (self.txn.?.read_view.directory()) |directory| directory.readCursor() else null;
+            self.phase = .mutable;
+        }
+        pub fn step(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (quantum == 0 or quantum > Block.max_step_bytes) return error.InvalidArgument;
+            try self.checkOpen();
+            if (self.phase == .idle) return error.InvalidArgument;
+            return self.advance(quantum, control) catch |err| {
+                const cause = if (control) |port| blk: {
+                    port.checkpoint() catch |original| break :blk original;
+                    break :blk err;
+                } else err;
+                self.deinit();
+                self.failure = cause;
+                self.phase = .failed;
+                return cause;
+            };
+        }
+        fn consider(self: *@This(), entry: anytype, next_phase: Phase) void {
+            self.next_phase = next_phase;
+            if (self.upper) |upper| if (std.mem.order(u8, entry.key, upper) != .lt) {
+                self.endSource();
+                return;
+            };
+            // Sources are visited newest first; equal keys retain the newer
+            // value or tombstone already selected.
+            if (self.best) |best| if (std.mem.order(u8, entry.key, best.bytes()) != .lt) {
+                self.endSource();
+                return;
+            };
+            self.copy_source = entry.key;
+            self.candidate_tombstone = entry.tombstone;
+            self.copy_offset = 0;
+            self.phase = .copy_allocate;
+        }
+        fn stateCandidate(self: *@This(), state: *const State, next_phase: Phase) void {
+            if (nextStateIndex(state, self.namespace, self.lower, !self.exclusive)) |row|
+                self.consider(state.entryAt(row), next_phase)
+            else {
+                self.next_phase = next_phase;
+                self.endSource();
+            }
+        }
+        fn blockEntry(self: *@This(), row: usize) !lsm_table_file.Entry {
+            const index = self.index.?.view();
+            const start = index.entryStartInBlock(row, self.block_index);
+            const base = index.blocks[self.block_index].relative_offset;
+            if (start < base) return error.InvalidTableFile;
+            return lsm_table_file.parseEntryAt(self.decoded.?, start - base);
+        }
+        fn advance(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (control) |port| try port.checkpoint();
+            switch (self.phase) {
+                .ready => return .ready,
+                .mutable => self.stateCandidate(self.txn.?.mutable_snapshot, .immutable),
+                .immutable => {
+                    const states = self.txn.?.immutable_memtables;
+                    if (self.immutable_index == states.len) self.phase = .runs else {
+                        const state = states[self.immutable_index];
+                        self.immutable_index += 1;
+                        self.stateCandidate(state, .immutable);
+                    }
+                },
+                .runs => {
+                    const run = if (self.directory_cursor) |*cursor| blk: {
+                        const handle = cursor.next() orelse {
+                            self.phase = .finish;
+                            break :blk null;
+                        };
+                        break :blk @as(?Run, handle.run.*);
+                    } else blk: {
+                        const runs = self.txn.?.read_view.runs;
+                        if (self.run_index == runs.len) {
+                            self.phase = .finish;
+                            break :blk null;
+                        }
+                        const next = runs[self.run_index];
+                        self.run_index += 1;
+                        break :blk @as(?Run, next);
+                    };
+                    if (run) |candidate| if (runMayContainAtOrAfter(candidate, self.namespace, self.lower) and
+                        compareNamespace(self.namespace, .{ .name = candidate.smallest_namespace_name }) != .lt and
+                        (self.upper == null or compareRunBound(candidate.smallest_namespace_name, candidate.smallest_key, self.namespace.name, self.upper.?) == .lt))
+                    {
+                        self.current_run = candidate;
+                        self.current_run.?.shared_read_version = true;
+                        self.phase = if (candidate.state != null) .run_state else .index;
+                    };
+                },
+                .run_state => self.stateCandidate(&self.current_run.?.state.?, .runs),
+                .index => {
+                    if (self.index_read == null) {
+                        self.index_read = try OwnedRunIndexRead(BackendType).init(self.backend, self.allocator, self.current_run.?.path orelse return error.RunStateUnavailable, self.current_run.?.size_bytes, control);
+                        return .pending;
+                    }
+                    if (try self.index_read.?.step(quantum, control) != .ready) return .pending;
+                    self.index = try self.index_read.?.takeOutput();
+                    self.index_read.?.deinit();
+                    self.index_read = null;
+                    try requireTableBlocks(self.index.?.view());
+                    if (self.index.?.view().findBlockLowerBound(self.namespace.name, self.lower)) |block_index| {
+                        self.block_index = block_index;
+                        self.phase = .block_init;
+                    } else self.endRun();
+                },
+                .block_init => {
+                    if (self.block_index == self.index.?.view().blockCount()) self.endRun() else {
+                        const meta = self.index.?.view().blocks[self.block_index];
+                        const past_upper = if (self.upper) |upper| if (meta.smallest_key) |smallest| compareRunBound(meta.smallest_namespace_name, smallest, self.namespace.name, upper) != .lt else false else false;
+                        const lower_order = compareRunBound(meta.largest_namespace_name, meta.largest_key, self.namespace.name, self.lower);
+                        if (past_upper or compareNamespace(self.namespace, .{ .name = meta.smallest_namespace_name }) == .lt) {
+                            self.endRun();
+                        } else if (lower_order == .lt or (lower_order == .eq and self.exclusive)) {
+                            self.block_index += 1;
+                        } else {
+                            const window = self.index.?.view().blockWindow(self.block_index);
+                            const offset = std.math.add(u64, self.index.?.view().entry_data_start, window.physicalRelativeOffset()) catch return error.InvalidTableFile;
+                            self.block = try Block.init(self.backend, self.allocator, self.current_run.?.path.?, offset, window, control);
+                            self.phase = .block_decode;
+                        }
+                    }
+                },
+                .block_decode => if (try self.block.?.step(quantum, control) == .ready) {
+                    self.decoded = try self.block.?.takeOutput();
+                    self.block.?.deinit();
+                    self.block = null;
+                    const meta = self.index.?.view().blocks[self.block_index];
+                    self.lo = meta.first_entry_index;
+                    self.hi = self.lo + meta.entry_count;
+                    self.phase = .search;
+                },
+                .search => {
+                    if (self.lo < self.hi) {
+                        const mid = self.lo + (self.hi - self.lo) / 2;
+                        const entry = try self.blockEntry(mid);
+                        const order = compareRunBound(entry.namespace_name, entry.key, self.namespace.name, self.lower);
+                        if (order == .lt or (order == .eq and self.exclusive)) self.lo = mid + 1 else self.hi = mid;
+                    } else self.phase = .candidate;
+                },
+                .candidate => {
+                    const meta = self.index.?.view().blocks[self.block_index];
+                    if (self.lo == meta.first_entry_index + meta.entry_count) {
+                        self.clearBlock();
+                        self.block_index += 1;
+                        self.phase = .block_init;
+                    } else {
+                        const entry = try self.blockEntry(self.lo);
+                        const order = compareNamespace(.{ .name = entry.namespace_name }, self.namespace);
+                        if (order == .eq) self.consider(entry, .runs) else if (order == .gt) self.endRun() else return error.InvalidTableFile;
+                    }
+                },
+                .copy_allocate => {
+                    self.candidate = .{ .allocator = self.allocator, .allocation = try self.allocator.alloc(u8, self.copy_source.?.len), .len = self.copy_source.?.len };
+                    self.phase = .copy;
+                },
+                .copy => {
+                    const take = @min(quantum, self.copy_source.?.len - self.copy_offset);
+                    @memcpy(self.candidate.?.allocation[self.copy_offset..][0..take], self.copy_source.?[self.copy_offset..][0..take]);
+                    self.copy_offset += take;
+                    if (self.copy_offset == self.copy_source.?.len) {
+                        if (self.best) |*best| best.deinit();
+                        self.best = self.candidate;
+                        self.candidate = null;
+                        self.best_tombstone = self.candidate_tombstone;
+                        self.endSource();
+                    }
+                },
+                .finish => {
+                    if (self.best_tombstone and self.best != null) {
+                        // A newest tombstone hides every older copy. Seek the
+                        // next key in the same pinned snapshot, never live tip.
+                        self.allocator.free(self.lower);
+                        self.lower = self.best.?.allocation;
+                        self.best = null;
+                        self.best_tombstone = false;
+                        self.exclusive = true;
+                        self.restartSources();
+                    } else self.phase = .ready;
+                },
+                else => unreachable,
+            }
+            if (control) |port| try port.checkpoint();
+            return if (self.phase == .ready) .ready else .pending;
+        }
+        pub fn key(self: *const @This()) !?[]const u8 {
+            try self.checkOpen();
+            if (self.phase != .ready) return error.InvalidArgument;
+            return if (self.best) |best| best.bytes() else null;
+        }
+        /// Transfer the very same snapshot into point-value capture. No key or
+        /// namespace is borrowed, no allocator bridge is replaced, no new read
+        /// observes an intervening mutation. This cursor becomes inert.
+        pub fn intoValueRead(self: *@This(), control: ?read_admission.Port) !OwnedNamespaceValueRead(BackendType) {
+            try self.checkOpen();
+            if (self.phase != .ready) return error.InvalidArgument;
+            if (control) |port| try port.checkpoint();
+            const best = self.best orelse return error.NotFound;
+            const txn = self.txn.?;
+            const result: OwnedNamespaceValueRead(BackendType) = .{
+                .backend = self.backend,
+                .allocator = self.allocator,
+                .txn = txn,
+                .namespace = self.namespace,
+                .key = best.allocation,
+                .directory_cursor = if (txn.read_view.directory()) |directory| directory.readPoint(self.namespace.name, best.bytes()) else null,
+            };
+            self.txn = null;
+            self.namespace.name = null;
+            self.best = null;
+            self.clearQuery();
+            self.phase = .transferred;
+            return result;
+        }
+        fn clearBlock(self: *@This()) void {
+            if (self.block) |*block| block.deinit();
+            self.block = null;
+            if (self.decoded) |bytes| self.allocator.free(bytes);
+            self.decoded = null;
+        }
+        fn endRun(self: *@This()) void {
+            self.clearBlock();
+            if (self.index_read) |*read| read.deinit();
+            self.index_read = null;
+            if (self.index) |*index| index.deinit();
+            self.index = null;
+            self.current_run = null;
+            self.phase = .runs;
+        }
+        fn endSource(self: *@This()) void {
+            self.copy_source = null;
+            if (self.next_phase == .runs) self.endRun() else self.phase = self.next_phase;
+        }
+        fn clearQuery(self: *@This()) void {
+            self.endRun();
+            if (self.candidate) |*candidate| candidate.deinit();
+            self.candidate = null;
+            if (self.best) |*best| best.deinit();
+            self.best = null;
+            self.best_tombstone = false;
+            self.copy_source = null;
+            self.allocator.free(self.lower);
+            self.lower = &.{};
+            if (self.upper) |upper| self.allocator.free(upper);
+            self.upper = null;
+            self.directory_cursor = null;
+        }
+        pub fn deinit(self: *@This()) void {
+            self.clearQuery();
+            if (self.namespace.name) |name| self.allocator.free(name);
+            self.namespace.name = null;
+            if (self.txn) |*txn| txn.abort(); // Final backend-dependent action.
+            self.txn = null;
+            self.phase = .closed;
         }
     };
 }
@@ -9147,8 +9942,330 @@ fn loadDecodedLocalBlock(backend: anytype, allocator: Allocator, path: []const u
     return loadDecodedLocalBlockWithAdmission(backend, allocator, path, offset, window, null);
 }
 
+/// The source binding and input window belong to the enclosing read operation.
+/// Per-step adapters borrow controls; no control is retained by this owner.
+fn BufferedRunBlock(comptime Source: type) type {
+    return struct {
+        source: Source,
+        bytes: []u8,
+        length: usize,
+        start: usize = 0,
+        valid: usize = 0,
+        physical_bytes: usize = 0,
+        decode_pass: bool = false,
+        decode_crc: @import("antfly_hash").Crc32 = .init(),
+        verified_bytes: usize = 0,
+
+        fn beginDecode(self: *@This()) void {
+            self.valid = 0;
+            self.decode_pass = true;
+        }
+
+        fn window(self: *@This(), offset: usize, max_len: usize, control: ?read_admission.Port) ![]const u8 {
+            if (offset > self.length) return error.InvalidArgument;
+            if (max_len == 0 or offset == self.length) return &.{};
+            if (self.bytes.len == 0) return error.InvalidArgument;
+            if (self.valid == 0 or offset < self.start or offset - self.start >= self.valid) {
+                const start = offset / self.bytes.len * self.bytes.len;
+                const take = @min(self.bytes.len, self.length - start);
+                // A failed provider may partially overwrite bytes. Never leave
+                // stale cache metadata pointing at that partial refill.
+                self.valid = 0;
+                self.physical_bytes += take;
+                try self.source.readInto(@intCast(start), self.bytes[0..take], control);
+                self.start = start;
+                self.valid = take;
+                if (self.decode_pass) {
+                    if (start != self.verified_bytes) return error.CorruptInput;
+                    self.decode_crc.update(self.bytes[0..take]);
+                    self.verified_bytes += take;
+                }
+            }
+            const local = offset - self.start;
+            return self.bytes[local..][0..@min(max_len, self.valid - local)];
+        }
+
+        const Borrow = struct {
+            owner: *BufferedRunBlock(Source),
+            length: usize,
+            control: ?read_admission.Port,
+            pub fn window(self: @This(), offset: usize, max_len: usize) ![]const u8 {
+                return self.owner.window(offset, max_len, self.control);
+            }
+            pub fn readInto(self: @This(), offset: u64, out: []u8) !void {
+                var copied: usize = 0;
+                const start = std.math.cast(usize, offset) orelse return error.InvalidArgument;
+                if (start > self.length or out.len > self.length - start) return error.InvalidArgument;
+                while (copied < out.len) {
+                    const bytes = try self.window(start + copied, out.len - copied);
+                    @memcpy(out[copied..][0..bytes.len], bytes);
+                    copied += bytes.len;
+                }
+            }
+        };
+    };
+}
+
+/// Movable ownership of a funded raw, Snappy or prefix block materialization. Pending
+/// callers pin the immutable run version and backend until retirement. The
+/// input path, source use, workspace and partial output belong to this owner;
+/// prefix variants also own their funded encoded/intermediate buffers.
+/// Controls and self-relative adapters exist only within each step. Output's
+/// allocator must outlive its eventual transfer or destruction.
+pub fn OwnedRunBlockRead(comptime BackendType: type) type {
+    const Source = BackendType.RunRangeReader;
+    const Reader = BufferedRunBlock(Source);
+    return struct {
+        pub const max_step_bytes: usize = 64 * 1024;
+        pub const Status = enum { pending, ready };
+        const Phase = enum { allocate_output, raw, compressed, prefix_input_allocate, prefix_input, prefix_prepare, prefix_snappy_allocate, prefix_snappy, prefix_expand, ready, taken, failed, closed };
+        backend: *BackendType,
+        allocator: Allocator,
+        work: ?LocalReader.Workspace,
+        reader: ?Reader,
+        window: lsm_table_file.EntryDataWindow,
+        cursor: lsm_table_file.BlockDecodeCursor,
+        output: ?[]u8 = null,
+        prefix_input: ?[]u8 = null,
+        prefix_intermediate: ?[]u8 = null,
+        prefix_offset: usize = 0,
+        prefix_crc: @import("antfly_hash").Crc32 = .init(),
+        prefix_decoder: @import("../../encoding/snappy.zig").DecodeCursor = .init(0, 0),
+        prefix_expander: lsm_table_file.PrefixDecodeCursor = .init(0, 0),
+        raw_offset: usize = 0,
+        raw_crc: @import("antfly_hash").Crc32 = .init(),
+        phase: Phase,
+        failure: ?anyerror = null,
+        started_ns: u64,
+
+        pub fn init(backend: *BackendType, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow, control: ?read_admission.Port) !@This() {
+            if (control) |port| try port.checkpoint();
+            const prefix = window.compression == .prefix or window.compression == .prefix_snappy;
+            const input_len: usize = window.physicalLen();
+            if (window.compression == .none and input_len != window.len) return error.InvalidTableFile;
+            const window_len: usize = if (window.compression == .none or prefix) 0 else @min(input_len, max_step_bytes);
+            const result_bytes = std.math.add(usize, window.len, @sizeOf(SharedBytes)) catch return error.InvalidTableFile;
+            const prefix_ceiling = if (window.compression == .prefix_snappy)
+                std.math.add(usize, std.math.mul(usize, window.len, 2) catch return error.InvalidTableFile, 32) catch return error.InvalidTableFile
+            else
+                0;
+            const encoded_bytes = if (prefix) input_len else 0;
+            const encoded_work = std.math.add(usize, encoded_bytes, prefix_ceiling) catch return error.InvalidTableFile;
+            const arena_bytes = try LocalReader.streamingScratchBound(path.len, window_len);
+            const retained = std.math.add(usize, encoded_work, arena_bytes) catch return error.InvalidTableFile;
+            const working = std.math.add(usize, result_bytes, retained) catch return error.InvalidTableFile;
+            var work = try backend.local_reader.acquireWithAdmission(backend.allocator, backend.options.resource_manager, backend.manifestCoordinationIo(), working, backend.options.local_decode_working_bytes, result_bytes, control);
+            errdefer work.release();
+            const scratch = work.allocator();
+            const owned_path = try scratch.dupe(u8, path);
+            var source = try backend.openRunRangeReaderWithAdmission(owned_path, offset, input_len, control);
+            errdefer source.deinit();
+            const bytes = try scratch.alloc(u8, window_len);
+            if (control) |port| try port.checkpoint();
+            return .{
+                .backend = backend,
+                .allocator = allocator,
+                .work = work,
+                .reader = .{ .source = source, .bytes = bytes, .length = input_len },
+                .window = window,
+                .cursor = try lsm_table_file.BlockDecodeCursor.init(if (prefix) .none else window.compression, if (prefix) window.len else input_len, window.len, window.checksum),
+                .phase = if (prefix) .prefix_input_allocate else if (window.compression == .none) .allocate_output else .compressed,
+                .started_ns = backend.readStatsNowNs(),
+            };
+        }
+
+        /// Returns after one finite decode/checksum/copy step or one funded
+        /// output allocation. Allocator work is separate from byte quanta.
+        /// Source refills remain at most 64 KiB each (up to two per step).
+        pub fn step(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (quantum == 0 or quantum > max_step_bytes) return error.InvalidArgument;
+            switch (self.phase) {
+                .failed => return self.failure.?,
+                .taken, .closed => return error.InvalidArgument,
+                else => {},
+            }
+            return self.advance(quantum, control) catch |err| {
+                // Original authority takes precedence over a simultaneous
+                // provider/codec failure, before unconditional retirement.
+                const cause = if (control) |port| blk: {
+                    port.checkpoint() catch |original| break :blk original;
+                    break :blk err;
+                } else err;
+                self.discardOutput();
+                self.retireWorking();
+                self.phase = .failed;
+                self.failure = cause;
+                return cause;
+            };
+        }
+
+        fn advance(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+            if (control) |port| try port.checkpoint();
+            switch (self.phase) {
+                .ready => return .ready,
+                .allocate_output => {
+                    self.output = try self.allocator.alloc(u8, self.window.len);
+                    if (control) |port| try port.checkpoint();
+                    self.phase = if (self.window.compression == .prefix or self.window.compression == .prefix_snappy) .prefix_expand else if (self.window.compression == .none) .raw else .compressed;
+                    return .pending;
+                },
+                .prefix_input_allocate => {
+                    // Prefix variants currently retain a whole encoded buffer,
+                    // admitted up front. Physical reads and expansion resume;
+                    // there is no synchronous full-block get or decode fallback.
+                    self.prefix_input = try self.allocator.alloc(u8, self.window.physicalLen());
+                    self.phase = .prefix_input;
+                    if (control) |port| try port.checkpoint();
+                    return .pending;
+                },
+                .prefix_input => {
+                    const bytes = self.prefix_input.?;
+                    const take = @min(quantum, bytes.len - self.prefix_offset);
+                    const reader = &self.reader.?;
+                    if (take != 0) {
+                        try reader.source.readInto(@intCast(self.prefix_offset), bytes[self.prefix_offset..][0..take], control);
+                        reader.physical_bytes += take;
+                        self.prefix_crc.update(bytes[self.prefix_offset..][0..take]);
+                        self.prefix_offset += take;
+                    }
+                    if (control) |port| try port.checkpoint();
+                    if (self.prefix_offset == bytes.len) {
+                        if (self.prefix_crc.final() != self.window.checksum) return error.TableBlockChecksumMismatch;
+                        self.phase = .prefix_prepare;
+                    }
+                    return .pending;
+                },
+                .prefix_prepare => {
+                    if (self.window.compression == .prefix_snappy) {
+                        try lsm_table_file.validatePrefixDecodedSize(self.prefix_input.?, self.window.len);
+                        const len = try @import("../../encoding/snappy.zig").decodedLen(self.prefix_input.?);
+                        self.prefix_decoder = .init(self.prefix_input.?.len, len);
+                        self.phase = .prefix_snappy_allocate;
+                    } else {
+                        self.prefix_expander = .init(self.prefix_input.?.len, self.window.len);
+                        self.phase = .prefix_expand;
+                    }
+                    if (control) |port| try port.checkpoint();
+                    return .pending;
+                },
+                .prefix_snappy_allocate => {
+                    self.prefix_intermediate = try self.allocator.alloc(u8, self.prefix_decoder.output_len);
+                    self.phase = .prefix_snappy;
+                    if (control) |port| try port.checkpoint();
+                    return .pending;
+                },
+                .prefix_snappy => {
+                    const progress = try self.prefix_decoder.step(self.prefix_input.?, self.prefix_intermediate.?, quantum);
+                    if (control) |port| try port.checkpoint();
+                    if (progress.done) {
+                        self.prefix_expander = .init(self.prefix_intermediate.?.len, self.window.len);
+                        self.phase = .prefix_expand;
+                    }
+                    return .pending;
+                },
+                .prefix_expand => {
+                    const input = self.prefix_intermediate orelse self.prefix_input.?;
+                    const progress = try self.prefix_expander.step(input, self.output, quantum);
+                    if (control) |port| try port.checkpoint();
+                    switch (progress.status) {
+                        .pending => return .pending,
+                        .needs_output => {
+                            self.phase = .allocate_output;
+                            return .pending;
+                        },
+                        .done => {},
+                    }
+                },
+                .raw => {
+                    const out = self.output.?;
+                    const take = @min(out.len - self.raw_offset, quantum);
+                    const reader = &self.reader.?;
+                    reader.physical_bytes += take;
+                    if (take != 0) try reader.source.readInto(@intCast(self.raw_offset), out[self.raw_offset..][0..take], control);
+                    self.raw_crc.update(out[self.raw_offset..][0..take]);
+                    self.raw_offset += take;
+                    if (control) |port| try port.checkpoint();
+                    if (self.raw_offset != out.len) return .pending;
+                    if (self.raw_crc.final() != self.window.checksum) return error.TableBlockChecksumMismatch;
+                },
+                .compressed => {
+                    const reader = &self.reader.?;
+                    const borrow: Reader.Borrow = .{ .owner = reader, .length = reader.length, .control = control };
+                    const progress = try self.cursor.stepFromReader(borrow, self.output, quantum);
+                    if (control) |port| try port.checkpoint();
+                    if (!reader.decode_pass and self.cursor.phase == .header) reader.beginDecode();
+                    switch (progress.status) {
+                        .pending => return .pending,
+                        .needs_output => {
+                            std.debug.assert(self.output == null);
+                            self.phase = .allocate_output;
+                            return .pending;
+                        },
+                        .done => if (reader.verified_bytes != reader.length or reader.decode_crc.final() != self.window.checksum)
+                            return error.TableBlockChecksumMismatch,
+                    }
+                },
+                else => unreachable,
+            }
+            self.retireWorking();
+            self.phase = .ready;
+            return .ready;
+        }
+
+        /// Transfer bytes exactly once, only after complete verification. This
+        /// moves data ownership; publication still needs the caller's authority.
+        pub fn takeOutput(self: *@This()) ![]u8 {
+            if (self.phase != .ready) return error.InvalidArgument;
+            const bytes = self.output.?;
+            self.output = null;
+            self.phase = .taken;
+            return bytes;
+        }
+
+        fn discardOutput(self: *@This()) void {
+            if (self.output) |bytes| self.allocator.free(bytes);
+            self.output = null;
+        }
+
+        fn retireWorking(self: *@This()) void {
+            if (self.prefix_input) |bytes| self.allocator.free(bytes);
+            self.prefix_input = null;
+            if (self.prefix_intermediate) |bytes| self.allocator.free(bytes);
+            self.prefix_intermediate = null;
+            if (self.reader) |*reader| {
+                self.backend.recordTableBlockLoad(reader.physical_bytes, self.backend.readStatsElapsedNs(self.started_ns));
+                reader.source.deinit();
+                self.reader = null;
+            }
+            if (self.work) |*work| {
+                work.release();
+                self.work = null;
+            }
+        }
+
+        /// Pending, ready and failed states all retire without a port or a new
+        /// execution grant. Ready/failure already released backend dependencies.
+        pub fn deinit(self: *@This()) void {
+            self.discardOutput();
+            self.retireWorking();
+            self.phase = .closed;
+        }
+    };
+}
+
+fn loadStreamingLocalBlock(backend: anytype, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow, control: ?read_admission.Port) ![]u8 {
+    var operation = try OwnedRunBlockRead(@TypeOf(backend.*)).init(backend, allocator, path, offset, window, control);
+    defer operation.deinit();
+    while (try operation.step(64 * 1024, control) == .pending) {}
+    return operation.takeOutput();
+}
+
 fn loadDecodedLocalBlockWithAdmission(backend: anytype, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow, control: ?read_admission.Port) ![]u8 {
     if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
+        if (comptime @hasDecl(@TypeOf(backend.*), "openRunRangeReaderWithAdmission")) {
+            if ((window.compression == .none or window.compression == .snappy) and backend.supportsRunRangeReader(control))
+                return loadStreamingLocalBlock(backend, allocator, path, offset, window, control);
+        }
         var work = try localWorkspaceWithAdmission(backend, window, false, control);
         defer work.release();
         if (window.compression == .none) {
@@ -9216,6 +10333,32 @@ fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_
     return lease;
 }
 
+fn localDecodeKey(run: *const Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, admit: bool) !LocalReader.Key {
+    return .{
+        .path = run.path orelse return error.RunStateUnavailable,
+        .generation = run.read_identity,
+        .run_id = run.id,
+        .offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(),
+        .physical_len = window.physicalLen(),
+        .logical_len = window.len,
+        .compression = window.compression,
+        .checksum = window.checksum,
+        .admit = admit,
+    };
+}
+
+/// Retire the peer reference before any retry. Never restart flight election:
+/// a failed producer allows one independent physical attempt, with the same scope.
+fn waitLocalBlockOrDecode(backend: anytype, flight: *LocalReader.Flight, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, admit: bool, control: ?read_admission.Port) !*SharedBytes {
+    const result = backend.local_reader.waitWithAdmission(flight, control);
+    backend.local_reader.releaseFlight(flight);
+    return result catch |cause| {
+        if (cause != error.LocalDecodeProducerFailed) return cause;
+        if (control) |budget| try budget.checkpoint();
+        return loadLocalBlockCandidate(backend, run, index, window, false, admit, control);
+    };
+}
+
 fn joinLocalBlockDecode(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow) !?*SharedBytes {
     return joinLocalBlockDecodeWithAdmission(backend, run, index, window, null);
 }
@@ -9228,11 +10371,8 @@ fn joinLocalBlockDecodeWithAdmission(
     control: ?read_admission.Port,
 ) !?*SharedBytes {
     if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
-        const path = run.path orelse return null;
-        const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-        const flight = try backend.local_reader.joinWithAdmission(path, run.id, offset, window.physicalLen(), true, control) orelse return null;
-        defer backend.local_reader.releaseFlight(flight);
-        return try backend.local_reader.waitWithAdmission(flight, control);
+        const flight = try backend.local_reader.joinWithAdmission(try localDecodeKey(run, index, window, true), control) orelse return null;
+        return waitLocalBlockOrDecode(backend, flight, run, index, window, true, control);
     }
     return null;
 }
@@ -9247,15 +10387,10 @@ fn loadLocalBlockLeaseWithAdmission(backend: anytype, run: *Run, index: *const l
         // Joining a publisher while holding the writer mutex would deadlock.
         // Locked callers decode independently through the same bounded pool.
         if (!backend_locked) {
-            const path = run.path orelse return error.RunStateUnavailable;
-            const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-            const ticket = backend.local_reader.beginWithAdmission(backend.allocator, backend.manifestCoordinationIo(), path, run.id, offset, window.physicalLen(), admit, control) catch |err| blk: {
-                if (control != null) return err;
-                break :blk null;
-            };
+            const ticket = try backend.local_reader.beginWithAdmission(backend.allocator, backend.manifestCoordinationIo(), try localDecodeKey(run, index, window, admit), control);
             if (ticket) |owned| {
+                if (!owned.leader) return waitLocalBlockOrDecode(backend, owned.flight, run, index, window, admit, control);
                 defer backend.local_reader.releaseFlight(owned.flight);
-                if (!owned.leader) return backend.local_reader.waitWithAdmission(owned.flight, control);
                 const payload = loadLocalBlockCandidate(backend, run, index, window, false, admit, control);
                 backend.local_reader.finish(owned.flight, payload);
                 return payload;
@@ -14327,4 +15462,971 @@ test "public graph metric borrowed wire LSM write presence and key cursor preser
     try Check.entry(try cursor.prev(), "a");
     try Check.entry(try cursor.seekAtOrBefore("b"), "a");
     try std.testing.expectEqualStrings("old", try pinned.get("a"));
+}
+
+test "WAL allocator owner point scratch preserves budget and ABI roots outside result arenas" {
+    const resources = @import("../resource_manager.zig");
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 }, .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var budget = resources.BudgetedAllocator.initReclaiming(&manager, .lsm_in_memory_state, std.testing.allocator, 1);
+    defer budget.deinit();
+    budget.credit_quantum = 1;
+    var arena = std.heap.ArenaAllocator.init(budget.threadSafeAllocator());
+    defer arena.deinit();
+    const scratch = runtimeScratchAllocator(arena.allocator());
+    const bytes = try scratch.alloc(u8, 64);
+    try std.testing.expectEqual(@as(u64, 64), budget.liveBytesThreadSafe());
+    try std.testing.expect(arena.state.used_list == null and arena.state.free_list == null);
+    scratch.free(bytes);
+    try std.testing.expectEqual(@as(u64, 0), budget.liveBytesThreadSafe());
+    try std.testing.expectError(error.OutOfMemory, scratch.alloc(u8, 2 * 1024 * 1024));
+    var root = budget.threadSafeNoReclaimAllocator();
+    const descriptor = @import("runtime_memory_abi").Allocator.fromStd(&root);
+    const bridged = runtimeScratchAllocator(descriptor.asStd());
+    try std.testing.expectError(error.OutOfMemory, bridged.alloc(u8, 2 * 1024 * 1024));
+    try std.testing.expectEqual(@as(u64, 0), budget.liveBytesThreadSafe());
+}
+
+test "LSM streaming block keeps one source lease and bounded physical windows across verification passes" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        bytes: []const u8,
+        opens: usize = 0,
+        closes: usize = 0,
+        uses: usize = 0,
+        largest: usize = 0,
+        total: usize = 0,
+        reads: usize = 0,
+        fail_at: ?usize = null,
+        mutate_second_pass: bool = false,
+        var current: *@This() = undefined;
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) !@import("../../segment_source.zig").Source {
+            const self = current;
+            self.opens += 1;
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .acquire_use = acquire, .release_use = release } };
+        }
+        fn direct(_: *anyopaque, _: []const u8, offset: u64, out: []u8) !void {
+            return read(current, offset, out);
+        }
+        fn controlled(_: *anyopaque, _: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+            try control.checkpoint();
+            try read(current, offset, out);
+            try control.checkpoint();
+        }
+        fn acquire(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.uses += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.uses -= 1;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.uses == 0);
+            self.closes += 1;
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            self.largest = @max(self.largest, out.len);
+            if (self.fail_at == self.reads) {
+                @memset(out, 0xff);
+                return error.TestWindowFault;
+            }
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+            if (self.mutate_second_pass and self.total >= self.bytes.len and offset + out.len == self.bytes.len)
+                out[out.len - 1] ^= 1;
+            self.total += out.len;
+        }
+    };
+    const plain = try a.alloc(u8, 256 * 1024 + 31);
+    defer a.free(plain);
+    var random = std.Random.DefaultPrng.init(92814);
+    random.random().bytes(plain);
+    const encoded = try @import("../../encoding/snappy.zig").encode(a, plain);
+    defer a.free(encoded);
+    for ([_]lsm_table_file.BlockCompression{ .none, .snappy }) |compression| {
+        const bytes = if (compression == .none) plain else encoded;
+        for ([_]bool{ false, true }) |leased| {
+            for (0..5) |mode| {
+                var memory = storage_io.MemoryStorage.init(a);
+                defer memory.deinit();
+                var fixture: Fixture = .{ .bytes = bytes, .fail_at = if (mode == 1) 2 else null, .mutate_second_pass = mode == 2 and compression == .snappy };
+                var storage = memory.storage();
+                var vtable = storage.vtable.*;
+                vtable.open_leased_immutable_source = if (leased) Fixture.open else null;
+                vtable.read_file_range_into = Fixture.direct;
+                vtable.read_file_range_into_with_admission = Fixture.controlled;
+                storage.vtable = &vtable;
+                Fixture.current = &fixture;
+                var backend = @import("../lsm_backend.zig").Backend.init(a, .{ .storage = storage, .local_decode_working_bytes = plain.len + 140 * 1024 });
+                var backend_live = true;
+                defer if (backend_live) backend.close();
+                const Budget = struct {
+                    checks: usize = 0,
+                    pub fn waitForProgress(_: *@This()) !void {
+                        return error.TestUnexpectedWindowWait;
+                    }
+                    pub fn checkpoint(self: *@This()) !void {
+                        self.checks += 1;
+                        if (self.checks >= 12) return error.TestOriginalWindowRejection;
+                    }
+                };
+                var budget: Budget = .{};
+                var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+                const authority = adapter.payload();
+                var refused = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                // The test calls the exact production loader on an immutable source;
+                // no filesystem paths are opened by this initialized backend.
+                const result = loadDecodedLocalBlockWithAdmission(&backend, if (mode == 4) refused.allocator() else a, "immutable-run", 0, .{ .relative_offset = 0, .len = @intCast(plain.len), .physical_len = @intCast(bytes.len), .compression = compression, .checksum = @import("antfly_hash").Crc32.hash(bytes) }, if (mode == 3) .init(&authority) else null);
+                if (mode == 3) {
+                    try std.testing.expectError(error.TestOriginalWindowRejection, result);
+                } else if (mode == 4) {
+                    try std.testing.expectError(error.OutOfMemory, result);
+                } else if (mode == 1) {
+                    try std.testing.expectError(error.TestWindowFault, result);
+                } else if (mode == 2 and compression == .snappy) {
+                    try std.testing.expectError(error.TableBlockChecksumMismatch, result);
+                } else {
+                    const output = try result;
+                    defer a.free(output);
+                    try std.testing.expectEqualSlices(u8, plain, output);
+                    try std.testing.expectEqual(bytes.len * @as(usize, if (compression == .none) 1 else 2), fixture.total);
+                    try std.testing.expectEqual(fixture.total, backend.snapshotReadStats().table_block_bytes);
+                }
+                try std.testing.expect(fixture.largest <= 64 * 1024);
+                if (mode == 3) {
+                    try std.testing.expect(fixture.opens <= @as(usize, if (leased) 1 else 0));
+                } else try std.testing.expectEqual(@as(usize, if (leased) 1 else 0), fixture.opens);
+                try std.testing.expectEqual(@as(usize, 0), fixture.uses);
+                try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+                backend.close();
+                backend_live = false;
+                try std.testing.expectEqual(fixture.opens, fixture.closes);
+            }
+        }
+    }
+}
+
+fn qualifyOwnedRunBlock(comptime fail: bool) !void {
+    const a = std.testing.allocator;
+    const scheduling = @import("../../common/runnable_scheduler.zig");
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Owner = OwnedRunBlockRead(Backend);
+    try std.testing.expect(@sizeOf(Owner) < 2048);
+    const Scope = struct {
+        execution: scheduling.Execution = .{},
+        valid: bool = true,
+        reject: bool = false,
+        pub fn checkLifetime(self: *@This()) !void {
+            if (!self.valid) return error.TestExpiredStepBorrow;
+            if (self.reject) return error.TestOwnedReadOriginalRejection;
+            try self.execution.checkLifetime();
+        }
+        pub fn checkpoint(self: *@This()) !void {
+            try self.checkLifetime();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedOwnerWait;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkLifetime();
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.checkLifetime();
+            try self.execution.enter(.query);
+        }
+        pub fn executionBoundary(self: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+            return .{ .ptr = self, .begin = begin, .end = end };
+        }
+    };
+    const Fixture = struct {
+        bytes: []const u8,
+        total: usize = 0,
+        uses: usize = 0,
+        closes: usize = 0,
+        reads: usize = 0,
+        fail_after: ?usize = null,
+        reject_original: bool = false,
+        scope: ?*Scope = null,
+        var current: *@This() = undefined;
+        fn open(_: *anyopaque, _: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
+            try std.testing.expectEqualStrings("immutable-owned-run", path);
+            return .{ .ranges = .{ .ptr = current, .length = current.bytes.len, .read_into = read, .close = close, .acquire_use = acquire, .release_use = release } };
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            try std.testing.expect(out.len <= 64 * 1024);
+            if (self.fail_after) |limit| if (self.total >= limit) {
+                @memset(out, 0xaa);
+                if (self.reject_original) self.scope.?.reject = true;
+                return error.TestOwnedReadFault;
+            };
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+            self.total += out.len;
+        }
+        fn direct(_: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+            try std.testing.expectEqualStrings("immutable-owned-run", path);
+            return read(current, offset, out);
+        }
+        fn controlled(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+            try control.checkpoint();
+            try direct(ptr, path, offset, out);
+            try control.checkpoint();
+        }
+        fn acquire(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.uses += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.uses -= 1;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.uses == 0);
+            self.closes += 1;
+        }
+    };
+    const plain = try a.alloc(u8, 128 * 1024 + 53);
+    defer a.free(plain);
+    var random = std.Random.DefaultPrng.init(293061);
+    random.random().bytes(plain);
+    const encoded = try @import("../../encoding/snappy.zig").encode(a, plain);
+    defer a.free(encoded);
+    // One valid prefix record with a long value, used in both prefix variants.
+    const prefix_raw = try a.alloc(u8, 16 + plain.len);
+    defer a.free(prefix_raw);
+    prefix_raw[0] = 0;
+    std.mem.writeInt(u32, prefix_raw[1..5], 0, .little);
+    std.mem.writeInt(u32, prefix_raw[5..9], 3, .little);
+    std.mem.writeInt(u32, prefix_raw[9..13], @intCast(plain.len), .little);
+    @memcpy(prefix_raw[13..16], "key");
+    @memcpy(prefix_raw[16..], plain);
+    const prefix = try a.alloc(u8, 24 + 20 + plain.len + 4);
+    defer a.free(prefix);
+    @memcpy(prefix[0..8], "ALSMPFX1");
+    std.mem.writeInt(u32, prefix[8..12], 1, .little);
+    std.mem.writeInt(u32, prefix[12..16], 16, .little);
+    std.mem.writeInt(u32, prefix[16..20], 1, .little);
+    std.mem.writeInt(u32, prefix[20..24], @intCast(20 + plain.len), .little);
+    prefix[24] = 0;
+    std.mem.writeInt(u32, prefix[25..29], 0, .little);
+    std.mem.writeInt(u32, prefix[29..33], 0, .little);
+    std.mem.writeInt(u32, prefix[33..37], 3, .little);
+    std.mem.writeInt(u32, prefix[37..41], @intCast(plain.len), .little);
+    @memcpy(prefix[41..44], "key");
+    @memcpy(prefix[44..][0..plain.len], plain);
+    std.mem.writeInt(u32, prefix[44 + plain.len ..][0..4], 0, .little);
+    const prefix_snappy = try @import("../../encoding/snappy.zig").encode(a, prefix);
+    defer a.free(prefix_snappy);
+    for ([_]lsm_table_file.BlockCompression{ .none, .snappy, .prefix, .prefix_snappy }) |compression| {
+        const bytes = switch (compression) {
+            .none => plain,
+            .snappy => encoded,
+            .prefix => prefix,
+            .prefix_snappy => prefix_snappy,
+        };
+        const expected = if (compression == .prefix or compression == .prefix_snappy) prefix_raw else plain;
+        for ([_]bool{ false, true }) |leased| {
+            for (0..@as(usize, if (fail) 3 else 1)) |mode| {
+                var scheduler = try scheduling.Scheduler.init(.{ .slots = 2 });
+                defer scheduler.close();
+                var fixture: Fixture = .{ .bytes = bytes, .fail_after = if (!fail or mode == 2) null else if (compression == .snappy) bytes.len + 64 * 1024 else 4093, .reject_original = mode == 1 };
+                Fixture.current = &fixture;
+                var memory = storage_io.MemoryStorage.init(a);
+                defer memory.deinit();
+                var storage = memory.storage();
+                var table = storage.vtable.*;
+                table.open_leased_immutable_source = if (leased) Fixture.open else null;
+                table.read_file_range_into = Fixture.direct;
+                table.read_file_range_into_with_admission = Fixture.controlled;
+                storage.vtable = &table;
+                var backend = Backend.init(a, .{ .storage = storage, .local_decode_working_bytes = expected.len * 4 + 256 * 1024 });
+                var backend_live = true;
+                defer if (backend_live) backend.close();
+                var path = "immutable-owned-run".*;
+                var owners: [2]?Owner = .{ try Owner.init(&backend, a, &path, 0, .{ .relative_offset = 0, .len = @intCast(expected.len), .physical_len = @intCast(bytes.len), .compression = compression, .checksum = @import("antfly_hash").Crc32.hash(bytes) }, null), null };
+                @memset(&path, 0xaa);
+                var active: usize = 0;
+                defer if (owners[active]) |*owner| owner.deinit();
+                try std.testing.expectError(error.InvalidArgument, owners[active].?.takeOutput());
+                try std.testing.expectError(error.InvalidArgument, owners[active].?.step(0, null));
+                try std.testing.expectError(error.InvalidArgument, owners[active].?.step(64 * 1024 + 1, null));
+                var steps: usize = 0;
+                while (true) {
+                    steps += 1;
+                    try std.testing.expect(steps < 1024);
+                    var scope: Scope = .{};
+                    try scope.execution.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query);
+                    var adapter: read_admission.Adapter(*Scope) = .{ .budget = &scope };
+                    const payload = adapter.payload();
+                    fixture.scope = &scope;
+                    const before = fixture.total;
+                    const allocated_before = owners[active].?.output != null;
+                    const input_before = owners[active].?.cursor.decoder.input_offset;
+                    const raw_before = owners[active].?.raw_offset;
+                    const result = owners[active].?.step(4093, .init(&payload));
+                    if (!allocated_before and owners[active].?.output != null) {
+                        // Allocation is a distinct schedulable step, with no
+                        // physical input or codec progress folded into it.
+                        try std.testing.expectEqual(before, fixture.total);
+                        try std.testing.expectEqual(input_before, owners[active].?.cursor.decoder.input_offset);
+                        try std.testing.expectEqual(raw_before, owners[active].?.raw_offset);
+                    }
+                    scope.execution.finish();
+                    scope.valid = false;
+                    fixture.scope = null;
+                    try std.testing.expect(fixture.total - before <= 128 * 1024);
+                    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+                    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                    var health: scheduling.Execution = .{};
+                    try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                    health.finish();
+                    // Move progress out of the stack slot used by this step.
+                    // The old slot is destroyed without retiring the moved owner.
+                    owners[1 - active] = owners[active];
+                    owners[active] = null;
+                    active = 1 - active;
+                    if (fail and mode == 2 and owners[active].?.output != null and
+                        (owners[active].?.raw_offset != 0 or owners[active].?.cursor.decoder.output_offset != 0 or owners[active].?.prefix_expander.output_offset != 0))
+                    {
+                        owners[active].?.deinit();
+                        try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+                        try std.testing.expectEqual(@as(usize, 0), fixture.uses);
+                        break;
+                    }
+                    if (result) |status| {
+                        if (status == .pending) continue;
+                        try std.testing.expect(!fail);
+                        try std.testing.expectEqual(bytes.len * @as(usize, if (compression == .snappy) 2 else 1), fixture.total);
+                        try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+                        try std.testing.expectEqual(@as(usize, 0), fixture.uses);
+                        backend.close();
+                        backend_live = false;
+                        backend = undefined;
+                        try std.testing.expectEqual(Owner.Status.ready, try owners[active].?.step(1, null));
+                        const output = try owners[active].?.takeOutput();
+                        defer a.free(output);
+                        try std.testing.expectEqualSlices(u8, expected, output);
+                        try std.testing.expectError(error.InvalidArgument, owners[active].?.takeOutput());
+                        break;
+                    } else |err| {
+                        try std.testing.expect(fail and mode != 2);
+                        const cause = if (mode == 1) error.TestOwnedReadOriginalRejection else error.TestOwnedReadFault;
+                        try std.testing.expectEqual(cause, err);
+                        try std.testing.expect(owners[active].?.output == null and owners[active].?.reader == null and owners[active].?.work == null);
+                        try std.testing.expectEqual(@as(usize, 0), fixture.uses);
+                        try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+                        backend.close();
+                        backend_live = false;
+                        backend = undefined;
+                        try std.testing.expectError(cause, owners[active].?.step(1, null));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "LSM owned block read moves between finite worker steps with fresh borrows and detached verified output" {
+    try qualifyOwnedRunBlock(false);
+}
+
+test "LSM owned block read retires partial state on failure rejection and abandonment without a live grant" {
+    try qualifyOwnedRunBlock(true);
+}
+
+const OwnedValueTestStorage = struct {
+    fn read(raw: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+        const memory: *storage_io.MemoryStorage = @ptrCast(@alignCast(raw));
+        const platform = @import("antfly_platform");
+        platform.sync.lockYielding(&memory.mutex);
+        defer memory.mutex.unlock();
+        const bytes = memory.files.get(path) orelse return error.FileNotFound;
+        if (offset > bytes.len or out.len > bytes.len - offset) return error.EndOfStream;
+        @memcpy(out, bytes[@intCast(offset)..][0..out.len]);
+    }
+    fn controlled(raw: *anyopaque, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+        try control.checkpoint();
+        try read(raw, path, offset, out);
+        try control.checkpoint();
+    }
+};
+
+fn drainOwnedValueForTest(owner: anytype) !OwnedNamespaceValue {
+    const Budget = struct {
+        valid: bool = true,
+        pub fn checkpoint(self: *@This()) !void {
+            if (!self.valid) return error.TestExpiredNamespaceBorrow;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedNamespaceWait;
+        }
+    };
+    var steps: usize = 0;
+    while (true) {
+        steps += 1;
+        try std.testing.expect(steps < 4096);
+        var budget: Budget = .{};
+        var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const state = try owner.step(4093, .init(&payload));
+        budget.valid = false;
+        if (state == .ready) return owner.takeOutput();
+    }
+}
+
+test "LSM owned namespace read preserves captured versions namespace isolation and detached values across source families" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const plain = try a.alloc(u8, 128 * 1024 + 53);
+    defer a.free(plain);
+    @memset(plain, 'v');
+    for ([_]bool{ false, true }) |private| {
+        test_private_read_versions = private;
+        defer test_private_read_versions = false;
+        for (0..5) |mode| {
+            var memory = storage_io.MemoryStorage.init(a);
+            defer memory.deinit();
+            var storage = memory.storage();
+            var table = storage.vtable.*;
+            table.read_file_range_into = OwnedValueTestStorage.read;
+            table.read_file_range_into_with_admission = OwnedValueTestStorage.controlled;
+            storage.vtable = &table;
+            var backend = if (mode == 3) Backend.init(a, .{ .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 10000 }) else try Backend.open(a, "/owned-value", .{ .storage = storage, .wal_enabled = false, .flush_threshold = if (mode == 0 or mode == 4) std.math.maxInt(usize) else 1, .compact_threshold_runs = 10000, .table_block_compression = if (mode == 1) .none else .snappy_adaptive, .read_snapshot_rotate_mutable_bytes = if (mode == 4) 1 else 0 });
+            var backend_live = true;
+            defer if (backend_live) backend.close();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{ .name = "docs" }, "key", plain);
+                try write.put(.{ .name = "other" }, "key", "isolated");
+                try write.commit();
+            }
+            var name = "docs".*;
+            var key = "key".*;
+            var owner = try backend.beginOwnedValueRead(a, .{ .name = &name }, &key, null);
+            defer owner.deinit();
+            if (mode == 3) {
+                try std.testing.expect(backend.runs.count() > 0);
+                try std.testing.expect(backend.runs.at(0).state != null);
+            }
+            if (mode == 4) {
+                try std.testing.expect(owner.txn.?.immutable_memtables.len > 0);
+                try std.testing.expectEqual(@as(usize, 0), owner.txn.?.mutable_snapshot.entryCount());
+            }
+            @memset(&name, 0xaa);
+            @memset(&key, 0xaa);
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{ .name = "docs" }, "key", "newer");
+                try write.commit();
+            }
+            // Move the operation, including its snapshot and directory cursor.
+            var moved = owner;
+            owner = undefined;
+            defer moved.deinit();
+            // Prevent the original deferred cleanup from touching moved state.
+            owner = .{ .backend = undefined, .allocator = a, .txn = null, .namespace = .{}, .key = &.{}, .phase = .closed };
+            var value = try drainOwnedValueForTest(&moved);
+            defer value.deinit();
+            try std.testing.expectEqualSlices(u8, plain, value.bytes());
+            try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+            try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+            var other = try backend.beginOwnedValueRead(a, .{ .name = "other" }, "key", null);
+            defer other.deinit();
+            var isolated = try drainOwnedValueForTest(&other);
+            defer isolated.deinit();
+            try std.testing.expectEqualStrings("isolated", isolated.bytes());
+            backend.close();
+            backend_live = false;
+            backend = undefined;
+            try std.testing.expectEqualSlices(u8, plain, value.bytes());
+            try std.testing.expectError(error.InvalidArgument, moved.takeOutput());
+        }
+    }
+}
+
+test "LSM owned namespace read honors newest tombstones and retires snapshot and partial result on rejection" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    var memory = storage_io.MemoryStorage.init(a);
+    defer memory.deinit();
+    var storage = memory.storage();
+    var table = storage.vtable.*;
+    table.read_file_range_into = OwnedValueTestStorage.read;
+    table.read_file_range_into_with_admission = OwnedValueTestStorage.controlled;
+    storage.vtable = &table;
+    var backend = try Backend.open(a, "/owned-value-retire", .{ .storage = storage, .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 10000 });
+    defer backend.close();
+    const value: [128 * 1024]u8 = @splat('x');
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "removed", "old");
+        try write.put(.{}, "large", &value);
+        try write.commit();
+    }
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.delete(.{}, "removed");
+        try write.commit();
+    }
+    for ([_][]const u8{ "removed", "missing" }) |key| {
+        var owner = try backend.beginOwnedValueRead(a, .{}, key, null);
+        defer owner.deinit();
+        try std.testing.expectError(error.NotFound, drainOwnedValueForTest(&owner));
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+        try std.testing.expectError(error.NotFound, owner.step(1, null));
+    }
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {
+            return error.TestOwnedNamespaceRejection;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedNamespaceWait;
+        }
+    };
+    var owner = try backend.beginOwnedValueRead(a, .{}, "large", null);
+    defer owner.deinit();
+    var steps: usize = 0;
+    while (owner.block == null or owner.block.?.output == null) {
+        steps += 1;
+        try std.testing.expect(steps < 256);
+        try std.testing.expectEqual(@TypeOf(owner).Status.pending, try owner.step(4093, null));
+    }
+    var budget: Budget = .{};
+    var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    try std.testing.expectError(error.TestOwnedNamespaceRejection, owner.step(4093, .init(&payload)));
+    try std.testing.expect(owner.txn == null and owner.block == null and owner.result == null);
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+}
+
+test "LSM owned namespace read pending cleanup joins backend close without a current execution grant" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    for ([_]bool{ false, true }) |flushed| {
+        var memory = storage_io.MemoryStorage.init(a);
+        defer memory.deinit();
+        var storage = memory.storage();
+        var table = storage.vtable.*;
+        table.read_file_range_into = OwnedValueTestStorage.read;
+        table.read_file_range_into_with_admission = OwnedValueTestStorage.controlled;
+        storage.vtable = &table;
+        var backend = try Backend.open(a, "/owned-close", .{ .storage = storage, .wal_enabled = false, .flush_threshold = if (flushed) 1 else std.math.maxInt(usize), .compact_threshold_runs = 10000 });
+        var backend_live = true;
+        defer if (backend_live) backend.close();
+        const value: [128 * 1024]u8 = @splat('z');
+        {
+            var write = try backend.beginWrite();
+            errdefer write.abort();
+            try write.put(.{}, "large", &value);
+            try write.commit();
+        }
+        var owner = try backend.beginOwnedValueRead(a, .{}, "large", null);
+        defer owner.deinit();
+        while (if (flushed) owner.block == null or owner.block.?.output == null else owner.copy_offset == 0)
+            try std.testing.expectEqual(@TypeOf(owner).Status.pending, try owner.step(4093, null));
+        if (flushed) {
+            try std.testing.expectEqual(@TypeOf(owner).Status.pending, try owner.step(4093, null));
+            try std.testing.expectEqual(@as(usize, 1), backend.local_reader.active);
+        }
+        const Closing = struct {
+            backend: *Backend,
+            started: std.Io.Event = .unset,
+            done: std.atomic.Value(bool) = .init(false),
+            fn run(self: *@This()) void {
+                self.started.set(std.testing.io);
+                self.backend.close();
+                self.done.store(true, .release);
+            }
+        };
+        var closing: Closing = .{ .backend = &backend };
+        const thread = try std.Thread.spawn(.{}, Closing.run, .{&closing});
+        backend_live = false;
+        var joined = false;
+        defer if (!joined) {
+            owner.deinit();
+            thread.join();
+        };
+        closing.started.waitUncancelable(std.testing.io);
+        const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+        while (!backend.closing.load(.acquire)) {
+            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.TestBackendCloseDidNotStart;
+            platform_time.yieldBriefly();
+        }
+        try std.testing.expect(!closing.done.load(.acquire));
+        try std.testing.expectError(error.BackendClosing, backend.beginOwnedValueRead(a, .{}, "another", null));
+        owner.deinit();
+        thread.join();
+        joined = true;
+        try std.testing.expect(closing.done.load(.acquire));
+    }
+}
+
+fn drainOwnedKeyForTest(cursor: anytype, quantum: usize) !?[]const u8 {
+    var steps: usize = 0;
+    while (try cursor.step(quantum, null) != .ready) : (steps += 1) try std.testing.expect(steps < 100000);
+    return cursor.key();
+}
+
+test "LSM owned namespace key cursor preserves snapshot tombstones bounds moves and same-snapshot value handoff" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const value = try a.alloc(u8, 128 * 1024 + 17);
+    defer a.free(value);
+    @memset(value, 'v');
+    for ([_]bool{ false, true }) |private| {
+        test_private_read_versions = private;
+        defer test_private_read_versions = false;
+        for (0..4) |mode| {
+            var memory = storage_io.MemoryStorage.init(a);
+            defer memory.deinit();
+            var storage = memory.storage();
+            var table = storage.vtable.*;
+            table.read_file_range_into = OwnedValueTestStorage.read;
+            table.read_file_range_into_with_admission = OwnedValueTestStorage.controlled;
+            storage.vtable = &table;
+            var backend = if (mode == 3) Backend.init(a, .{ .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 10000 }) else try Backend.open(a, "/owned-key", .{ .storage = storage, .wal_enabled = false, .flush_threshold = if (mode == 0) std.math.maxInt(usize) else 1, .compact_threshold_runs = 10000, .table_block_compression = if (mode == 1) .none else .snappy_adaptive });
+            defer backend.close();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{ .name = "docs" }, "a", "removed");
+                try write.put(.{ .name = "docs" }, "b", value);
+                try write.put(.{ .name = "docs" }, "c", "tail");
+                try write.put(.{ .name = "other" }, "a", "isolated");
+                try write.commit();
+            }
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.delete(.{ .name = "docs" }, "a");
+                try write.put(.{ .name = "docs" }, "c", "new tail");
+                try write.commit();
+            }
+            var cursor = try backend.beginOwnedKeyCursor(a, .{ .name = "docs" }, null);
+            defer cursor.deinit();
+            var lower = "a".*;
+            var upper = "d".*;
+            try cursor.seek(&lower, &upper, false, null);
+            @memset(&lower, 0xdd);
+            @memset(&upper, 0xdd);
+            // Later writes cannot change any query or the value handoff.
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{ .name = "docs" }, "a", "revived after snapshot");
+                try write.put(.{ .name = "docs" }, "b", "replaced after snapshot");
+                try write.commit();
+            }
+            try std.testing.expectEqualStrings("b", (try drainOwnedKeyForTest(&cursor, 4093)).?);
+            const borrowed_lower = (try cursor.key()).?;
+            try cursor.seek(borrowed_lower, "d", true, null);
+            try std.testing.expectEqualStrings("c", (try drainOwnedKeyForTest(&cursor, 4093)).?);
+            const borrowed_both = (try cursor.key()).?;
+            try cursor.seek(borrowed_both, borrowed_both, false, null);
+            try std.testing.expect((try drainOwnedKeyForTest(&cursor, 1)) == null);
+            try cursor.seek("b", "c", false, null);
+            try std.testing.expectEqualStrings("b", (try drainOwnedKeyForTest(&cursor, 4093)).?);
+            var moved = cursor;
+            cursor = .{ .backend = undefined, .allocator = a, .txn = null, .namespace = .{}, .phase = .closed };
+            defer moved.deinit();
+            var point = try moved.intoValueRead(null);
+            defer point.deinit();
+            try std.testing.expectError(error.TransactionClosed, moved.step(1, null));
+            try std.testing.expectEqual(@as(usize, 1), backend.active_readers);
+            var result = try drainOwnedValueForTest(&point);
+            defer result.deinit();
+            try std.testing.expectEqualSlices(u8, value, result.bytes());
+            try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+            try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+        }
+    }
+}
+
+test "LSM owned namespace key cursor rejects original cancellation and unwinds caller allocation refusal" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    var backend = Backend.init(a, .{ .wal_enabled = false });
+    defer backend.close();
+    {
+        var write = try backend.beginWrite();
+        errdefer write.abort();
+        try write.put(.{}, "key", "value");
+        try write.commit();
+    }
+    const Probe = struct {
+        fn run(root: Allocator, source: *Backend) !void {
+            var cursor = try source.beginOwnedKeyCursor(root, .{}, null);
+            defer cursor.deinit();
+            try cursor.seek("", "z", false, null);
+            try std.testing.expectEqualStrings("key", (try drainOwnedKeyForTest(&cursor, 1)).?);
+            var point = try cursor.intoValueRead(null);
+            defer point.deinit();
+            var result = try drainOwnedValueForTest(&point);
+            defer result.deinit();
+            try std.testing.expectEqualStrings("value", result.bytes());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{&backend});
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {
+            return error.TestOwnedKeyOriginalRejection;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedKeyWait;
+        }
+    };
+    var budget: Budget = .{};
+    var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    var cursor = try backend.beginOwnedKeyCursor(a, .{}, null);
+    defer cursor.deinit();
+    try cursor.seek("", "z", false, null);
+    _ = try cursor.step(1, null);
+    try std.testing.expectError(error.TestOwnedKeyOriginalRejection, cursor.step(1, .init(&payload)));
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    try std.testing.expectError(error.TestOwnedKeyOriginalRejection, cursor.step(1, null));
+}
+
+test "LSM owned namespace cold index reads only bounded metadata windows and detaches before backend close" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Fixture = struct {
+        var current: *@This() = undefined;
+        limit: usize = 0,
+        calls: usize = 0,
+        total: usize = 0,
+        fn read(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+            try std.testing.expect(out.len <= current.limit);
+            current.calls += 1;
+            current.total += out.len;
+            try OwnedValueTestStorage.read(ptr, path, offset, out);
+        }
+        fn controlled(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+            try control.checkpoint();
+            try read(ptr, path, offset, out);
+            try control.checkpoint();
+        }
+    };
+    var fixture: Fixture = .{};
+    Fixture.current = &fixture;
+    var memory = storage_io.MemoryStorage.init(a);
+    defer memory.deinit();
+    var storage = memory.storage();
+    var vtable = storage.vtable.*;
+    vtable.read_file_range_into = Fixture.read;
+    vtable.read_file_range_into_with_admission = Fixture.controlled;
+    storage.vtable = &vtable;
+    const keys = try a.alloc(u8, 32 * 4096);
+    defer a.free(keys);
+    const value: [lsm_table_file.default_block_size]u8 = @splat('v');
+    var entries: [32]lsm_table_file.Entry = undefined;
+    for (&entries, 0..) |*entry, i| {
+        const key = keys[i * 4096 ..][0..4096];
+        @memset(key, 'k');
+        key[key.len - 1] = @intCast(i);
+        entry.* = .{ .namespace_name = "docs", .key = key, .value = &value };
+    }
+    const encoded = try lsm_table_file.encodeAlloc(a, &entries);
+    defer a.free(encoded);
+    try storage.writeFileAbsolute("owned-index-file", encoded);
+    const footer = try lsm_table_file.decodeFooter(encoded);
+    try std.testing.expect(footer.metadata_len > 65536);
+    var backend = Backend.init(a, .{ .storage = storage });
+    var backend_live = true;
+    defer if (backend_live) backend.close();
+    const Owner = OwnedRunIndexRead(Backend);
+    var path = "owned-index-file".*;
+    var owner = try Owner.init(&backend, a, &path, encoded.len, null);
+    defer owner.deinit();
+    @memset(&path, 0xdd);
+    fixture.limit = 7;
+    _ = try owner.step(7, null);
+    var moved = owner;
+    owner = .{ .backend = &backend, .allocator = a, .path = null, .source = null, .file_size = encoded.len, .phase = .closed };
+    defer moved.deinit();
+    var polls: usize = 0;
+    while (true) : (polls += 1) {
+        try std.testing.expect(polls < 100000);
+        fixture.limit = if (polls % 2 == 0) 127 else 4093;
+        fixture.calls = 0;
+        const state = try moved.step(fixture.limit, null);
+        try std.testing.expect(fixture.calls <= 1);
+        if (state == .ready) break;
+    }
+    try std.testing.expectEqual(lsm_table_file.footer_len + footer.metadata_len, fixture.total);
+    var index = try moved.takeOutput();
+    defer index.deinit();
+    try std.testing.expect(moved.source == null and moved.path == null);
+    backend.close();
+    backend_live = false;
+    try std.testing.expectEqual(@as(usize, entries.len), index.view().entryCount());
+    try std.testing.expectEqualSlices(u8, entries[0].key, index.view().blocks[0].smallest_key.?);
+}
+
+test "LSM owned namespace cold index unwinds allocator refusal and original cancellation during partial physical read" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    var memory = storage_io.MemoryStorage.init(a);
+    defer memory.deinit();
+    var storage = memory.storage();
+    var vtable = storage.vtable.*;
+    vtable.read_file_range_into = OwnedValueTestStorage.read;
+    vtable.read_file_range_into_with_admission = OwnedValueTestStorage.controlled;
+    storage.vtable = &vtable;
+    const entries = [_]lsm_table_file.Entry{.{ .key = "key", .value = "value" }};
+    const encoded = try lsm_table_file.encodeAlloc(a, &entries);
+    defer a.free(encoded);
+    try storage.writeFileAbsolute("owned-index-file", encoded);
+    var backend = Backend.init(a, .{ .storage = storage });
+    defer backend.close();
+    const Probe = struct {
+        fn run(root: Allocator, source: *Backend, size: usize) !void {
+            var owner = try OwnedRunIndexRead(Backend).init(source, root, "owned-index-file", size, null);
+            defer owner.deinit();
+            var polls: usize = 0;
+            while (try owner.step(7, null) != .ready) : (polls += 1) try std.testing.expect(polls < 10000);
+            var index = try owner.takeOutput();
+            defer index.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{ &backend, encoded.len });
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {
+            return error.TestColdIndexOriginal;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedColdIndexWait;
+        }
+    };
+    var budget: Budget = .{};
+    var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    var owner = try OwnedRunIndexRead(Backend).init(&backend, a, "owned-index-file", encoded.len, null);
+    defer owner.deinit();
+    _ = try owner.step(7, null);
+    try std.testing.expectError(error.TestColdIndexOriginal, owner.step(7, .init(&payload)));
+    try std.testing.expect(owner.source == null and owner.path == null and owner.metadata == null);
+    try std.testing.expectError(error.TestColdIndexOriginal, owner.step(7, null));
+}
+
+test "LSM owned namespace cold index pins one leased generation and preserves mid-read original refusal" {
+    const a = std.testing.allocator;
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Budget = struct {
+        reject: bool = false,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.reject) return error.TestIndexLeasedOriginal;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedIndexLeasedWait;
+        }
+    };
+    const Generation = struct {
+        var current: *@This() = undefined;
+        bytes: []const u8,
+        opens: usize = 0,
+        closes: usize = 0,
+        uses: usize = 0,
+        fail: bool = false,
+        original: ?*Budget = null,
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) !@import("../../segment_source.zig").Source {
+            current.opens += 1;
+            return .{ .ranges = .{ .ptr = current, .length = current.bytes.len, .read_into = read, .close = close, .acquire_use = acquire, .release_use = release } };
+        }
+        fn read(ptr: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(out.len <= 7);
+            if (self.fail) {
+                if (self.original) |budget| budget.reject = true;
+                @memset(out, 0xaa);
+                return error.TestIndexLeasedProviderFault;
+            }
+            if (offset > self.bytes.len or out.len > self.bytes.len - offset) return error.EndOfStream;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn acquire(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.uses += 1;
+            return true;
+        }
+        fn release(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.uses > 0);
+            self.uses -= 1;
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            std.debug.assert(self.uses == 0);
+            self.closes += 1;
+        }
+    };
+    const first = [_]lsm_table_file.Entry{.{ .key = "first-key", .value = "first-value" }};
+    const second = [_]lsm_table_file.Entry{.{ .key = "other-key", .value = "other-value" }};
+    const bytes1 = try lsm_table_file.encodeAlloc(a, &first);
+    defer a.free(bytes1);
+    const bytes2 = try lsm_table_file.encodeAlloc(a, &second);
+    defer a.free(bytes2);
+    try std.testing.expectEqual(bytes1.len, bytes2.len);
+    for (0..3) |mode| {
+        var memory = storage_io.MemoryStorage.init(a);
+        defer memory.deinit();
+        var storage = memory.storage();
+        var vtable = storage.vtable.*;
+        vtable.open_leased_immutable_source = Generation.open;
+        storage.vtable = &vtable;
+        var old: Generation = .{ .bytes = bytes1 };
+        var replacement: Generation = .{ .bytes = bytes2 };
+        Generation.current = &old;
+        var backend = Backend.init(a, .{ .storage = storage });
+        var backend_live = true;
+        defer if (backend_live) backend.close();
+        var owner = try OwnedRunIndexRead(Backend).init(&backend, a, "leased-index", bytes1.len, null);
+        defer owner.deinit();
+        var polls: usize = 0;
+        while (owner.phase == .footer) : (polls += 1) {
+            try std.testing.expect(polls < 100);
+            _ = try owner.step(7, null);
+        }
+        Generation.current = &replacement;
+        if (mode != 0) {
+            // The footer has been validated; fail during its metadata read.
+            _ = try owner.step(7, null);
+            var budget: Budget = .{};
+            var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+            const payload = adapter.payload();
+            old.fail = true;
+            old.original = if (mode == 2) &budget else null;
+            if (mode == 2) try std.testing.expectError(error.TestIndexLeasedOriginal, owner.step(7, .init(&payload))) else try std.testing.expectError(error.TestIndexLeasedProviderFault, owner.step(7, null));
+            try std.testing.expect(owner.source == null and owner.metadata == null and owner.decoder == null);
+        } else {
+            while (try owner.step(7, null) != .ready) : (polls += 1) try std.testing.expect(polls < 10000);
+            var index = try owner.takeOutput();
+            defer index.deinit();
+            try std.testing.expectEqualStrings("first-key", index.view().blocks[0].largest_key);
+        }
+        try std.testing.expectEqual(@as(usize, 1), old.opens);
+        try std.testing.expectEqual(@as(usize, 0), old.uses);
+        try std.testing.expectEqual(@as(usize, 0), replacement.opens);
+        backend.close();
+        backend_live = false;
+        try std.testing.expectEqual(@as(usize, 1), old.closes);
+        try std.testing.expectEqual(@as(usize, 0), replacement.closes);
+    }
 }

@@ -1,0 +1,15 @@
+{
+  "source": "Zig 0.17.0 pinned toolchain std/fmt/parse_float",
+  "files_sha256": {
+    "convert_slow.zig": "66bd9d921bf451a45371802f0719281c07cd3ccf9f3e00c2547cdc56773e2838",
+    "convert_hex.zig": "790ae260931c199b4c5a04fcd848131503890098dbc131faea48da34629ec4ec",
+    "parse.zig": "8dabeac30309345acf8c9243c32512ea382e8d7f015e93917cd8afab00879bb3",
+    "decimal.zig": "3f4f7b94b6426ae200a4893b6637db54fcbcaa65bc20c213daadc06b75abb02e",
+    "convert_eisel_lemire.zig": "fe5eb3deb6d6a636c45b74414ef47f1c47732e28be7d8dc3f1731e83c450a30a",
+    "common.zig": "37bce3d8d63a6eee782bf67c736b607e9530fc846e71b3a91e0056051d24b908",
+    "FloatInfo.zig": "e6c0dc76d43bb06776e52ca379fe9bd6ad93fb50882f20b4a9e5f806c2f7fd8a",
+    "convert_fast.zig": "a94f72ab00b6a0e0c7eee8e8b5d8ef72c729a1678f4196899785cd6fc0ab9137",
+    "FloatStream.zig": "c5fe2015d1fc7c2e16d46195de63780474e7543528e41c51882afc7f6985a4b3"
+  },
+  "entry_sha256": "af1991ffdb2790bdc4f0874292c1db96a8e7d401287efe2b8c20e303f3013908"
+}

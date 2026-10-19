@@ -132,7 +132,7 @@ pub const Value = struct {
         if (bytes > limits.bytes) return error.SqlProgramLimitExceeded;
         for (elements) |element| {
             try validateElement(kind, element, work);
-            bytes = std.math.add(usize, bytes, try operators.datumBytes(element)) catch return error.SqlProgramLimitExceeded;
+            bytes = std.math.add(usize, bytes, try operators.datumBytesControlled(element, work)) catch return error.SqlProgramLimitExceeded;
             if (bytes > limits.bytes) return error.SqlProgramLimitExceeded;
         }
         return .{ .element_type = kind, .dimensions = if (empty) &.{} else dimensions, .elements = elements, .prepared_footprint = bytes - (if (empty) dimensions.len * @sizeOf(Dimension) else 0) };
@@ -384,9 +384,7 @@ pub fn validateElement(kind: ElementType, element: Element, budget: *Budget) !vo
         },
         .text => {
             if (value != .string) return error.SqlTypeMismatch;
-            try budget.consume(value.string.len);
-            if (!std.unicode.utf8ValidateSlice(value.string)) return error.SqlInvalidTextEncoding;
-            if (std.mem.indexOfScalar(u8, value.string, 0) != null) return error.SqlUntranslatableCharacter;
+            try json_order.validateText(value.string, budget);
         },
         .uuid => {
             if (value != .string or value.string.len != 36) return error.SqlTypeMismatch;

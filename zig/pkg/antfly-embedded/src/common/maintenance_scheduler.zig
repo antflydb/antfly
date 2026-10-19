@@ -24,6 +24,9 @@ const Io = std.Io;
 const runnable = @import("antfly_runtime_abi").runnable_abi;
 const errors = @import("antfly_runtime_abi").error_abi;
 const native = @import("antfly_runtime_abi").native_abi;
+const callback_bridge = @import("../storage/named_callback.zig");
+const RunnableCallbacks = struct { step: *const fn (*anyopaque, runnable.Borrowed) anyerror!?u64 };
+const RunnableBoundary = callback_bridge.Boundary(RunnableCallbacks);
 
 pub const Scheduler = struct {
     pub const Class = enum { maintenance, producer, derived, propagation };
@@ -44,6 +47,27 @@ pub const Scheduler = struct {
             if (self.budget_ns == 0 or self.budget_ns > 60 * std.time.ns_per_s or self.retained_bytes > std.math.maxInt(u64) - @sizeOf(Task)) return error.InvalidArgument;
         }
     };
+    pub const RegistrationSpec = struct {
+        class: Class = .maintenance,
+        context: *anyopaque,
+        step: ?*const fn (*anyopaque) ?u64 = null,
+        runnable_step: ?*const fn (*anyopaque, runnable.Borrowed) anyerror!?u64 = null,
+        pass: ?RunnablePass = null,
+        callback_dispatch: callback_bridge.Dispatch = RunnableBoundary.local_dispatch,
+    };
+    pub const RemoteHandle = struct {
+        context: *anyopaque,
+        finish_fn: *const fn (*anyopaque, bool) void,
+        stop_fn: *const fn (*anyopaque) void,
+    };
+    pub const RemotePort = struct {
+        context: *anyopaque,
+        register_fn: *const fn (*anyopaque, RegistrationSpec) anyerror!RemoteHandle,
+        wake_fn: *const fn (*anyopaque, *anyopaque) void,
+        close_admission_fn: *const fn (*anyopaque) void,
+        snapshot_fn: *const fn (*anyopaque) Stats,
+    };
+    remote: ?RemotePort = null,
     runnable_owner: ?runnable.Lease = null,
     runnable_closing: std.atomic.Value(bool) = .init(false),
     runnable_admissions: std.atomic.Value(u64) = .init(0),
@@ -86,6 +110,7 @@ pub const Scheduler = struct {
     };
 
     pub fn snapshot(self: *Scheduler) Stats {
+        if (self.remote) |port| return port.snapshot_fn(port.context);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return .{
@@ -122,8 +147,21 @@ pub const Scheduler = struct {
     };
 
     pub const Handle = struct {
-        task: *Task,
+        task: *Task = undefined,
+        remote: ?RemoteHandle = null,
+        remote_scheduler: ?*Scheduler = null,
 
+        pub fn requestStop(self: *Handle) void {
+            if (self.remote) |port| {
+                port.stop_fn(port.context);
+                return;
+            }
+            const scheduler = self.task.scheduler;
+            scheduler.mutex.lockUncancelable(scheduler.io);
+            defer scheduler.mutex.unlock(scheduler.io);
+            self.task.canceled.store(true, .release);
+            scheduler.changed.set(scheduler.io);
+        }
         pub fn await(self: *Handle, _: Io) void {
             self.finish(false);
         }
@@ -132,6 +170,12 @@ pub const Scheduler = struct {
         }
 
         fn finish(self: *Handle, cancel_active: bool) void {
+            if (self.remote) |port| {
+                port.finish_fn(port.context, cancel_active);
+                self.remote_scheduler.?.releaseRegistration();
+                self.* = undefined;
+                return;
+            }
             const task = self.task;
             const scheduler = task.scheduler;
             const alloc = scheduler.alloc;
@@ -161,6 +205,19 @@ pub const Scheduler = struct {
         }
     };
 
+    /// A context-local lifetime wrapper; it owns no executor or coordinator.
+    pub fn createRemote(alloc: std.mem.Allocator, io: Io, port: RemotePort) !*Scheduler {
+        const stats = port.snapshot_fn(port.context);
+        const self = try alloc.create(Scheduler);
+        self.* = .{ .alloc = alloc, .io = io, .max_active = stats.max_active, .max_registrations = stats.max_registrations, .remote = port };
+        return self;
+    }
+    fn registerRemote(self: *Scheduler, spec: RegistrationSpec) !Handle {
+        try self.reserveRegistration();
+        errdefer self.releaseRegistration();
+        const port = self.remote.?;
+        return .{ .remote = try port.register_fn(port.context, spec), .remote_scheduler = self };
+    }
     pub fn create(alloc: std.mem.Allocator, io: Io, max_active: usize) !*Scheduler {
         return createWithRunnableOwner(alloc, io, max_active, null);
     }
@@ -194,6 +251,13 @@ pub const Scheduler = struct {
     /// Deny new registrations and callback dispatch before other runtime
     /// leases drain. Existing handles still own their physical callback joins.
     pub fn closeAdmission(self: *Scheduler) void {
+        if (self.remote) |port| {
+            self.mutex.lockUncancelable(self.io);
+            self.stopping = true;
+            self.mutex.unlock(self.io);
+            port.close_admission_fn(port.context);
+            return;
+        }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.stopping = true;
@@ -225,6 +289,7 @@ pub const Scheduler = struct {
                 return step(@ptrCast(@alignCast(raw)));
             }
         };
+        if (self.remote != null) return self.registerRemote(.{ .class = class, .context = context, .step = Adapter.call });
         try self.reserveRegistration();
         errdefer self.releaseRegistration();
         const task = try self.alloc.create(Task);
@@ -246,12 +311,13 @@ pub const Scheduler = struct {
     /// or occupying a native runnable queue. Resumption uses the same capsule.
     pub fn registerRunnableClass(self: *Scheduler, class: Class, pass: RunnablePass, context: anytype, comptime step: fn (@TypeOf(context), runnable.Borrowed) anyerror!?u64) !Handle {
         try pass.validate();
-        if (self.runnable_owner == null) return error.ExecutionWaitUnsupported;
         const Adapter = struct {
             fn call(raw: *anyopaque, borrow: runnable.Borrowed) anyerror!?u64 {
                 return step(@ptrCast(@alignCast(raw)), borrow);
             }
         };
+        if (self.remote != null) return self.registerRemote(.{ .class = class, .context = context, .runnable_step = Adapter.call, .pass = pass });
+        if (self.runnable_owner == null) return error.ExecutionWaitUnsupported;
         try self.reserveRegistration();
         errdefer self.releaseRegistration();
         const task = try self.alloc.create(Task);
@@ -290,6 +356,10 @@ pub const Scheduler = struct {
     /// Notifications coalesce even during a running pass. Lookup avoids
     /// exposing handle lifetime to concurrent producers and shutdown callers.
     pub fn wake(self: *Scheduler, context: *anyopaque) void {
+        if (self.remote) |port| {
+            port.wake_fn(port.context, context);
+            return;
+        }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.tasks.items) |task| if (task.context == context) {
@@ -407,6 +477,7 @@ pub const Scheduler = struct {
                 const index = (start + offset) % count;
                 const task = self.tasks.items[index];
                 if (task.future != null) continue;
+                if (task.canceled.load(.acquire)) continue;
                 if (task.notified) task.due_ms = 0;
                 const class_index = @backingInt(task.class);
                 // Producer passes may wait for derived publication. Reserved

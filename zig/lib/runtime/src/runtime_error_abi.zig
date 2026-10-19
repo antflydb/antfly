@@ -874,6 +874,17 @@ pub const Detail = enum(c_int) {
     backend_runtime_unavailable,
     invalid_runnable_demand,
     sql_write_capacity_unavailable,
+    remote_membership_changed,
+    remote_membership_unavailable,
+    invalid_remote_membership,
+    remote_coordinator_not_member,
+    remote_node_draining,
+    remote_worker_identity_changed,
+    remote_worker_not_member,
+    remote_outcome_uncertain,
+    remote_read_unavailable,
+    unsupported_remote_attempt_protocol,
+    resource_accounting_mismatch,
 };
 
 pub const Status = extern struct {
@@ -895,8 +906,19 @@ pub fn statusFromError(err: anyerror) Status {
         error.SchedulerClosed => status(.unavailable, .scheduler_closed),
         error.SchedulerFull => status(.retryable, .scheduler_full),
         error.InvalidRunnableTransition => status(.internal, .invalid_runnable_transition),
+        error.ResourceAccountingMismatch => status(.internal, .resource_accounting_mismatch),
         error.InvalidRunnableDemand => status(.invalid_argument, .invalid_runnable_demand),
         error.SqlWriteCapacityUnavailable => status(.unavailable, .sql_write_capacity_unavailable),
+        error.RemoteMembershipChanged => status(.forbidden, .remote_membership_changed),
+        error.RemoteMembershipUnavailable => status(.unavailable, .remote_membership_unavailable),
+        error.InvalidRemoteMembership => status(.forbidden, .invalid_remote_membership),
+        error.RemoteCoordinatorNotMember => status(.forbidden, .remote_coordinator_not_member),
+        error.RemoteNodeDraining => status(.unavailable, .remote_node_draining),
+        error.RemoteWorkerIdentityChanged => status(.forbidden, .remote_worker_identity_changed),
+        error.RemoteWorkerNotMember => status(.forbidden, .remote_worker_not_member),
+        error.RemoteOutcomeUncertain => status(.unavailable, .remote_outcome_uncertain),
+        error.RemoteReadUnavailable => status(.unavailable, .remote_read_unavailable),
+        error.UnsupportedRemoteAttemptProtocol => status(.unsupported, .unsupported_remote_attempt_protocol),
         error.InvalidReadFenceTransition => status(.internal, .invalid_read_fence_transition),
         error.ExecutionWaitUnsupported => status(.unsupported, .execution_wait_unsupported),
         error.ReadSafetyBarrierUnavailable => status(.unavailable, .read_safety_barrier_unavailable),
@@ -1693,8 +1715,19 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .scheduler_closed => "SchedulerClosed",
         .scheduler_full => "SchedulerFull",
         .invalid_runnable_transition => "InvalidRunnableTransition",
+        .resource_accounting_mismatch => "ResourceAccountingMismatch",
         .invalid_runnable_demand => "InvalidRunnableDemand",
         .sql_write_capacity_unavailable => "SqlWriteCapacityUnavailable",
+        .remote_membership_changed => "RemoteMembershipChanged",
+        .remote_membership_unavailable => "RemoteMembershipUnavailable",
+        .invalid_remote_membership => "InvalidRemoteMembership",
+        .remote_coordinator_not_member => "RemoteCoordinatorNotMember",
+        .remote_node_draining => "RemoteNodeDraining",
+        .remote_worker_identity_changed => "RemoteWorkerIdentityChanged",
+        .remote_worker_not_member => "RemoteWorkerNotMember",
+        .remote_outcome_uncertain => "RemoteOutcomeUncertain",
+        .remote_read_unavailable => "RemoteReadUnavailable",
+        .unsupported_remote_attempt_protocol => "UnsupportedRemoteAttemptProtocol",
         .invalid_read_fence_transition => "InvalidReadFenceTransition",
         .execution_wait_unsupported => "ExecutionWaitUnsupported",
         .read_safety_barrier_unavailable => "ReadSafetyBarrierUnavailable",
@@ -2803,4 +2836,42 @@ test "merged runtime error details preserve main wire identifiers" {
     try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
     try std.testing.expectEqual(@as(c_int, 676), @backingInt(Detail.model_chunk_audio_too_large));
     try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
+}
+
+test "remote membership resume failures preserve append-only pooling detail identities" {
+    try std.testing.expectEqual(@backingInt(Detail.sql_write_capacity_unavailable) + 1, @backingInt(Detail.remote_membership_changed));
+    inline for (.{ error.RemoteMembershipChanged, error.RemoteMembershipUnavailable, error.InvalidRemoteMembership, error.RemoteCoordinatorNotMember, error.RemoteNodeDraining, error.RemoteWorkerIdentityChanged, error.RemoteWorkerNotMember }) |err| {
+        const value = statusFromError(err);
+        try std.testing.expectEqual(err, errorFromStatus(value));
+        try std.testing.expect(value.detail >= @backingInt(Detail.remote_membership_changed));
+        try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = value.detail }));
+    }
+}
+
+test "remote query uncertainty retains its append-only unavailable identity" {
+    const value = statusFromError(error.RemoteOutcomeUncertain);
+    try std.testing.expectEqual(@backingInt(Code.unavailable), value.code);
+    try std.testing.expectEqual(@backingInt(Detail.remote_worker_not_member) + 1, @backingInt(Detail.remote_outcome_uncertain));
+    try std.testing.expectEqual(error.RemoteOutcomeUncertain, errorFromStatus(value));
+}
+
+test "remote read readiness and verified negative retain append-only boundary identities" {
+    try std.testing.expectEqual(@backingInt(Detail.remote_outcome_uncertain) + 1, @backingInt(Detail.remote_read_unavailable));
+    try std.testing.expectEqual(@backingInt(Detail.remote_read_unavailable) + 1, @backingInt(Detail.unsupported_remote_attempt_protocol));
+    inline for (.{ error.RemoteReadUnavailable, error.UnsupportedRemoteAttemptProtocol }) |err| {
+        const encoded = statusFromError(err);
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(encoded));
+        try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = encoded.detail }));
+    }
+    try std.testing.expectEqual(@backingInt(Code.unavailable), statusFromError(error.RemoteReadUnavailable).code);
+    try std.testing.expectEqual(@backingInt(Code.unsupported), statusFromError(error.UnsupportedRemoteAttemptProtocol).code);
+}
+
+test "resource bundle accounting status is append only and cannot become retryable" {
+    try std.testing.expectEqual(@backingInt(Detail.unsupported_remote_attempt_protocol) + 1, @backingInt(Detail.resource_accounting_mismatch));
+    const encoded = statusFromError(error.ResourceAccountingMismatch);
+    try std.testing.expectEqual(@backingInt(Code.internal), encoded.code);
+    try std.testing.expectEqual(error.ResourceAccountingMismatch, errorFromStatus(encoded));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.retryable), .detail = encoded.detail }));
 }

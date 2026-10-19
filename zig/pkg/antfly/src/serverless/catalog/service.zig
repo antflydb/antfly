@@ -972,7 +972,7 @@ pub const CatalogService = struct {
         defer self.freeTables(self.alloc, tables);
         for (tables) |table| {
             if (!std.mem.eql(u8, table.namespace, namespace)) continue;
-            const effective_policy = effectivePolicyForTable(policy, table.indexes_json) catch return error.InvalidTableIndexMetadata;
+            const effective_policy = try effectivePolicyForTable(self.alloc, policy, table.indexes_json);
             var external_binding = try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
             defer if (external_binding) |*binding| binding.deinit(self.alloc);
             const default_indexes = table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}");
@@ -1276,20 +1276,24 @@ pub const CatalogService = struct {
     }
 
     fn effectivePolicyForTable(
+        alloc: Allocator,
         base_policy: catalog_types.NamespacePolicy,
         indexes_json: []const u8,
     ) !catalog_types.NamespacePolicy {
         var effective = base_policy;
-        if (!effective.chunk_embeddings_enabled and try tableRequiresChunkEmbeddings(indexes_json)) {
+        if (!effective.chunk_embeddings_enabled and try tableRequiresChunkEmbeddings(alloc, indexes_json)) {
             effective.chunk_embeddings_enabled = true;
         }
         return effective;
     }
 
-    fn tableRequiresChunkEmbeddings(indexes_json: []const u8) !bool {
+    fn tableRequiresChunkEmbeddings(alloc: Allocator, indexes_json: []const u8) !bool {
         if (indexes_json.len == 0 or std.mem.eql(u8, indexes_json, "{}")) return false;
 
-        var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, indexes_json, .{});
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidTableIndexMetadata,
+        };
         defer parsed.deinit();
         const object = switch (parsed.value) {
             .object => |object| object,
@@ -1326,6 +1330,21 @@ pub const CatalogService = struct {
         return try self.store.setPolicy(namespace, policy);
     }
 };
+
+test "serverless execution catalog index policy uses caller memory and preserves allocation failure" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            const policy = try CatalogService.effectivePolicyForTable(alloc, .{}, "{\"dense\":{\"type\":\"embeddings\",\"chunker\":{}}}");
+            try std.testing.expect(policy.chunk_embeddings_enabled);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    var budget = @import("antfly_local_sources").storage_test_allocator.BoundedAllocator.init(std.testing.allocator, 0);
+    defer std.debug.assert(budget.deinit() == 0);
+    try std.testing.expectError(error.OutOfMemory, Fixture.run(budget.allocator()));
+    try std.testing.expectError(error.InvalidTableIndexMetadata, CatalogService.effectivePolicyForTable(std.testing.allocator, .{}, "["));
+}
 
 /// Status and publication share the same metadata-only external reconciliation.
 /// Managed namespace adjacency aliases never stand in for external projections.

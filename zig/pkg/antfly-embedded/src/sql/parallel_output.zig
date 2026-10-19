@@ -126,13 +126,17 @@ pub const Pipe = struct {
     /// A memo is scoped to both this producer lease and destination block.
     /// Counting generations are fresh for each fitting-prefix attempt, while
     /// hash resolutions and accepted owned payloads survive within the cohort.
+    fn leaseCheckpoint(raw: ?*anyopaque) !void {
+        const self: *Pipe = @ptrCast(@alignCast(raw.?));
+        try self.manager.checkFor(self.producer_execution);
+    }
     fn appendCohort(self: *Pipe, values: Batch, keys: Batch, ordinals: []const u64, begin: usize) !usize {
         const block = self.pending.?;
         var work = std.heap.ArenaAllocator.init(self.manager.allocator());
         defer work.deinit();
-        var value_memo = Store.JsonLease.init(self.manager.allocator());
+        var value_memo = Store.JsonLease.initControlled(self.manager.allocator(), .{ .ptr = self, .checkpoint = leaseCheckpoint });
         defer value_memo.deinit();
-        var key_memo = Store.JsonLease.init(self.manager.allocator());
+        var key_memo = Store.JsonLease.initControlled(self.manager.allocator(), .{ .ptr = self, .checkpoint = leaseCheckpoint });
         defer key_memo.deinit();
         defer self.json_hash_bytes +|= value_memo.hashed_bytes +| key_memo.hashed_bytes;
         var consumed: usize = 0;
@@ -522,4 +526,39 @@ test "SQL native worker cohorts share oversized payloads and bound distinct rows
         try Fixture.run(std.testing.allocator, distinct);
         try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{distinct});
     }
+}
+
+test "SQL native output pipe interrupts a single large leased payload before publication" {
+    const Fixture = struct {
+        calls: usize = 0,
+        text: []const u8,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 12) return error.OriginalPipePayloadCanceled;
+        }
+        fn json(raw: *anyopaque, _: usize, _: usize) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.text;
+        }
+        fn cell(_: *anyopaque, _: A, _: usize, _: usize) !@import("scalar.zig").Datum {
+            return error.UnexpectedScalarMaterialization;
+        }
+    };
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, 256 * 1024);
+    defer a.free(text);
+    @memset(text, 'x');
+    text[0] = '"';
+    text[text.len - 1] = '"';
+    var fixture: Fixture = .{ .text = text };
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &fixture, .checkpoint = Fixture.check };
+    defer manager.deinit();
+    const pipe = try Pipe.create(&manager, 8192);
+    defer pipe.close();
+    const values: Batch = .{ .reader = .{ .ptr = &fixture, .read = Fixture.cell, .read_json = Fixture.json, .count = 1, .width = 1 } };
+    try std.testing.expectError(error.OriginalPipePayloadCanceled, pipe.appendBatch(values, .{ .rows = &.{&.{}} }, &.{0}));
+    try std.testing.expectEqual(@as(usize, 12), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 0), pipe.pending.?.ordinals.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pipe.pending.?.values.len);
 }

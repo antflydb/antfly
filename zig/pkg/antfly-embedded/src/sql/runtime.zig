@@ -376,6 +376,14 @@ pub const Context = struct {
     pub fn checkpoint(self: Context) !void {
         try self.backend.vtable.checkpoint(self.backend.ptr);
     }
+    pub fn workControl(self: *Context) @import("operator_work.zig").Control {
+        return .{ .ptr = self, .checkpoint = struct {
+            fn check(raw: ?*anyopaque) !void {
+                const context: *Context = @ptrCast(@alignCast(raw.?));
+                try context.checkpoint();
+            }
+        }.check };
+    }
 
     /// Evaluate one owner-demanded scalar on the active statement cut. The
     /// native backend owns the cut and accumulates every point/range proof in
@@ -830,6 +838,7 @@ pub const Context = struct {
             const orders = try self.arena.alloc(operators.Order, self.binding.order_keys.len);
             for (self.binding.order_keys, orders) |key, *order| order.* = .{ .descending = key.descending, .nulls_first = key.nulls_first };
             top_k = try operators.TopK.initWithSpill(self.alloc, offset + limit + @intFromBool(statement.limit == null), orders, self.limits.retained_bytes, self.spill);
+            top_k.?.control = self.workControl();
         }
         const deferred = try self.arena.alloc(bool, fields.items.len);
         @memset(deferred, false);
@@ -6002,4 +6011,109 @@ test "SQL REAL pushed comparisons preserve declared float8 parameter operands" {
     var real = try execute(a, real_backend, &equality, &.{.{ .float = 0.1 }}, .{});
     defer real.deinit();
     try std.testing.expectEqual(@as(usize, 1), real.output.rows.len);
+}
+
+test "SQL grouped coordinator scratch reaches native aggregation and preserves declined fallback" {
+    const scheduling = @import("parallel_scheduler.zig");
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Mode = enum { granted, declined, canceled };
+    const Source = struct {
+        mode: Mode,
+        calls: usize = 0,
+        live: usize = 0,
+        fn acquire(raw: *anyopaque, bytes: usize) !?scheduling.ScratchLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // A direct numeric projection can independently offer its fixed
+            // accelerator. Decline that optional stage so this test observes
+            // the grouping vector's own request and cancellation boundary.
+            if (bytes == @import("typed_kernel.zig").PreparedNumeric.scratch_bytes) return null;
+            self.calls += 1;
+            if (bytes == 0 or bytes > @import("operators.zig").Grouped.batchScratchBytes(64, false).?) return error.UnexpectedGroupingScratchSize;
+            switch (self.mode) {
+                .declined => return null,
+                .canceled => return error.Canceled,
+                .granted => {},
+            }
+            self.live += 1;
+            return .{ .allocator = std.testing.allocator, .context = self, .release = release };
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.live -= 1;
+        }
+    };
+    const Native = struct {
+        fn rows(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return error.UnexpectedJsonCursor;
+        }
+        fn columns(raw: *anyopaque, a: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
+            const state: *TestBackend.Statement.State = @ptrCast(@alignCast(raw));
+            const total = state.owner.backend.row_count;
+            const first = if (state.after) |key| (try std.fmt.parseInt(usize, key, 10)) + 1 else 0;
+            const count = @min(limit, total - first);
+            const refs = try a.alloc(@import("../storage/rowsource/types.zig").RowRef, count);
+            const values = try a.alloc(i64, count);
+            const selection = try a.alloc(usize, count);
+            for (refs, values, selection, first..) |*ref, *value, *selected, index| {
+                ref.* = .{ .relational_key = try std.fmt.allocPrint(a, "{d}", .{index}) };
+                value.* = 9007199254740993;
+                selected.* = index - first;
+            }
+            if (state.after) |key| state.owner.alloc.free(key);
+            state.after = if (first + count < total) try std.fmt.allocPrint(state.owner.alloc, "{d}", .{first + count - 1}) else null;
+            const vectors = try a.alloc(@import("../storage/rowsource/types.zig").ColumnVector, 1);
+            vectors[0] = .{ .name = "id", .values = .{ .i64 = values } };
+            return .{ .batch = .{ .snapshot = .{ .table_id = "things", .snapshot_id = "pinned" }, .row_refs = refs, .columns = vectors }, .selection = selection, .after = state.after };
+        }
+        fn singleColumns(raw: *anyopaque, a: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
+            const owner: *TestBackend.Statement = @ptrCast(@alignCast(raw));
+            return columns(&owner.states[0], a, limit);
+        }
+        fn openScan(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            const statement = try open(raw, a, &.{.{ .table = table, .request = request }});
+            return .{ .ptr = statement.ptr, .next = rows, .next_columns = singleColumns, .close = TestBackend.Statement.close };
+        }
+        fn open(raw: *anyopaque, a: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const statement = try TestBackend.openStatement(raw, a, scans);
+            const owner: *TestBackend.Statement = @ptrCast(@alignCast(statement.ptr));
+            for (owner.cursors) |*cursor| {
+                cursor.next = rows;
+                cursor.next_columns = columns;
+            }
+            return statement;
+        }
+    };
+    const a = std.testing.allocator;
+    var compiled = try compiler.compile(a, "SELECT id, count(*) AS n FROM things GROUP BY id", .{});
+    defer compiled.deinit();
+    for (std.enums.values(Mode)) |mode| {
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 72 }, .query);
+        defer execution.finish();
+        var source: Source = .{ .mode = mode };
+        var fixture: TestBackend = .{ .row_count = 64 };
+        var backend = fixture.iface();
+        var vtable = backend.vtable.*;
+        vtable.open_scan = Native.openScan;
+        backend.vtable = &vtable;
+        backend.coordinator_scope = .{ .execution = &execution, .allocator = a, .scratch = .{ .context = &source, .acquire = Source.acquire } };
+        const result = execute(a, backend, &compiled, &.{}, .{ .page_rows = 16 });
+        if (mode == .canceled) {
+            try std.testing.expectError(error.Canceled, result);
+        } else {
+            var actual = try result;
+            defer actual.deinit();
+            try std.testing.expectEqual(@as(usize, 1), actual.output.rows.len);
+            try std.testing.expectEqualStrings("9007199254740993", actual.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("64", actual.output.rows[0][1].string);
+        }
+        if (source.calls == 0) return error.GroupingScratchWasNotReached;
+        try std.testing.expectEqual(@as(usize, 0), source.live);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 72), scheduler.stats().retained_bytes);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    }
 }

@@ -111,6 +111,13 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
 
 const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.WaitBudget;
 
+/// Synchronous setup borrow from the local query capsule. It never becomes
+/// a remote retention parent; setup publishes only independent node owners.
+pub const RemoteReadSetup = struct {
+    ptr: *anyopaque,
+    prepare: *const fn (*anyopaque) anyerror!void,
+};
+
 pub const Adapter = struct {
     lake_visibility: enum { committed, accepted } = .committed,
     read_requirements: @import("antfly_local_sources").sql_read_requirements.Requirements = .{},
@@ -127,6 +134,9 @@ pub const Adapter = struct {
     identity: *?http_server.AuthenticatedIdentity,
     context: operation.RequestContext,
     runnable: ?*http_server.RunnableScheduler.Execution = null,
+    read_remote_setup: ?RemoteReadSetup = null,
+    read_retirement: ?@import("retained_read_retirement.zig").Binding = null,
+    read_remote_executor: ?@import("antfly_local_sources").common_http_http_common.RequestExecutor = null,
     /// Stable receivers for preauthorized physical read cleanup, retained by
     /// this Adapter through every child join and the owning execution finish.
     cleanup_phase: ?@import("runnable_local_cleanup.zig").Cleanup = null,
@@ -139,6 +149,12 @@ pub const Adapter = struct {
     /// its bounded team on the same retained execution.
     serial_execution: bool = false,
     read_guard: ?read_fence.Guard = null,
+    /// Preauthorized foreground storage for policy validation across CPU-stage
+    /// handoff. It outlives every policy callback and is retired with the fence.
+    read_policy_memory: ?@import("read_policy_memory.zig").Reservation = null,
+    /// The synchronous HTTP worker keeps this owned guard through response
+    /// serialization. That caller must end the fence before retiring its root.
+    retain_read_guard: bool = false,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
     /// Borrowed from the pinned connection request, never retained by a plan.
@@ -237,7 +253,7 @@ pub const Adapter = struct {
             }
         }
         if (self.runnable != null and (compiled.statement == .select or compiled.statement == .explain)) try self.beginReadFence();
-        defer self.endReadFence();
+        defer if (!self.retain_read_guard) self.endReadFence();
         const state_alloc = if (@import("sql_control.zig").isControl(compiled.statement)) self.server.controlAllocator() else self.server.alloc;
         var zig017_return_error: ?anyerror = null;
         var decision_runtime: ?@import("antfly_local_sources").functions_runtime.Runtime = null;
@@ -517,14 +533,11 @@ pub const Adapter = struct {
                     // The immutable cut is captured before INSERT-source and
                     // conflict-owner reads. Unsupported distributed ownership
                     // refuses this capability rather than mixing snapshots.
-                    dynamic = (reads.openRelationalStatementSnapshot(alloc, table.physical_name, table.schema_version, .read_index, self.context.cancellation, ((self.context.platformDeadline() catch |zig017_err| {
+                    dynamic = self.captureDynamicStatement(alloc, reads, table.physical_name, table.schema_version) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
-                    })).deadline_ns) catch |zig017_err| {
-                        zig017_return_error = zig017_err;
-                        return zig017_err;
-                    });
-                    if (dynamic.?.vtable.open_guarded == null) return zig017_failure: {
+                    };
+                    if (dynamic.?.vtable.open_guarded == null and dynamic.?.vtable.open_guarded_with_admission == null) return zig017_failure: {
                         zig017_return_error = error.SqlRangeTrackingRequired;
                         break :zig017_failure error.SqlRangeTrackingRequired;
                     };
@@ -620,18 +633,53 @@ pub const Adapter = struct {
         self.read_guard = read_fence.Guard.init(self.server.alloc);
     }
 
+    pub fn reserveReadValidationMemory(self: *Adapter, bytes: usize) !void {
+        if (self.read_policy_memory != null or self.read_guard == null or self.read_guard.?.validating) return error.InvalidReadFenceTransition;
+        const execution = self.runnable orelse return error.InvalidRunnableTransition;
+        try execution.checkLifetime();
+        try self.context.ensureActive();
+        const entry = execution.entry orelse return error.InvalidRunnableTransition;
+        if (entry.state != .running or entry.class != .query or entry.slots != 1 or entry.parent != null or entry.children != 0 or
+            entry.cpu_borrow_budget != null or entry.cleanup_active or entry.completion_active or entry.protected_cleanup_root or
+            entry.read_lane == .bounded or entry.read_transition_active or entry.completion_options != null)
+            return error.InvalidRunnableTransition;
+        const memory = self.server.request_memory orelse return error.ExecutionWaitUnsupported;
+        self.read_policy_memory = try @import("read_policy_memory.zig").Reservation.init(memory.allocator(false), bytes);
+        errdefer {
+            self.read_policy_memory.?.deinit();
+            self.read_policy_memory = null;
+        }
+        // Refuse insufficient storage before the stage can borrow CPU. This
+        // preflights the current policy shape, not every possible future schema.
+        try self.validateReadFence(true);
+        // Metadata validation may wait in another clock/cancellation domain.
+        // Publish the reservation only while the original execution is live.
+        try execution.checkLifetime();
+    }
+
     pub fn endReadFence(self: *Adapter) void {
+        if (self.read_policy_memory) |*memory| memory.deinit();
+        self.read_policy_memory = null;
         if (self.read_guard) |*guard| guard.deinit();
         self.read_guard = null;
     }
 
     pub fn validateReadFence(self: *Adapter, force: bool) !void {
         const guard = if (self.read_guard) |*value| value else return;
+        // A cached guard is authority only within its original live execution.
+        // Refusal must also discard a successful check from an earlier call.
+        errdefer guard.checked_generation = null;
         const execution = self.runnable orelse return error.InvalidReadFenceTransition;
+        try execution.checkLifetime();
         const entry = if (execution.entry) |*value| value else return error.InvalidReadFenceTransition;
-        const scratch = if (entry.class == .control) self.server.controlAllocator() else self.server.alloc;
+        const reserved = if (self.read_policy_memory) |*memory| memory else null;
+        const scratch = if (reserved) |memory| try memory.begin() else if (entry.class == .control) self.server.controlAllocator() else self.server.alloc;
+        defer if (reserved) |memory| memory.end();
         try guard.check(scratch, execution.resume_generation, force, .{ .ptr = self, .check = validateReadPins });
         try self.context.ensureActive();
+        // Catalog/policy IO may use another clock or cancellation domain. Its
+        // successful result cannot revive an owner stopped during that wait.
+        try execution.checkLifetime();
     }
 
     fn captureReadFence(self: *Adapter, table: catalog.Table) !void {
@@ -659,6 +707,10 @@ pub const Adapter = struct {
 
     fn validateReadPins(raw: *anyopaque, alloc: std.mem.Allocator, tables: []const read_fence.Table) !void {
         const self: *Adapter = @ptrCast(@alignCast(raw));
+        // Only actual validation crosses the prepared-stage boundary. Cached
+        // checks perform no catalog IO and must not refresh an ordinary quantum.
+        const execution = self.runnable orelse return error.InvalidReadFenceTransition;
+        try execution.endCpuBorrowStage();
         try self.context.ensureActive();
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -677,7 +729,10 @@ pub const Adapter = struct {
             if (table.table_id != pinned.id or !std.mem.eql(u8, table.name, pinned.physical)) return error.CatalogGenerationChanged;
             const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
             if (definition.table_id != pinned.id) return error.CatalogGenerationChanged;
-            const binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), scratch, definition.schema_json, table.table_id, table.name);
+            const binding = if (self.read_policy_memory != null)
+                try @import("sql_schema_cache.zig").Cache.resolveUncached(self.server.sqlPlanCacheIo(), scratch, definition.schema_json, table.table_id, table.name)
+            else
+                try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), scratch, definition.schema_json, table.table_id, table.name);
             if (binding.schema_version != pinned.schema_version) return error.CatalogGenerationChanged;
             const policy = try self.readPolicyGeneration(scratch, pinned.id, pinned.schema_version);
             if (!std.meta.eql(policy, pinned.row_policy)) return error.RowPolicyCatalogChanged;
@@ -688,11 +743,11 @@ pub const Adapter = struct {
             var fresh: http_server.AuthenticatedIdentity = undefined;
             if (admitted.live_user_manager) |manager| {
                 if (!admitted.is_internal_service) {
-                    var snapshot = manager.snapshotCredentialPolicies(admitted.credential_principal) catch |err| switch (err) {
+                    var snapshot = manager.snapshotCredentialPoliciesAlloc(scratch, admitted.credential_principal) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.Forbidden,
                     };
-                    defer snapshot.deinit(manager.alloc);
+                    defer snapshot.deinit(scratch);
                     if (!std.mem.eql(u8, admitted.username, snapshot.policy.username)) return error.Forbidden;
                     if (admitted.user_instance_id) |instance| if (!std.mem.eql(u8, &instance, &snapshot.instance_id)) return error.Forbidden;
                     // Native row-policy proofs can use roles and metadata
@@ -735,7 +790,13 @@ pub const Adapter = struct {
     }
 
     fn cpuScope(self: *Adapter) ?@import("antfly_local_sources").sql_parallel_scheduler.ExecutionScope {
-        if (self.serial_execution or self.read_guard == null) return null;
+        if (self.serial_execution) return null;
+        const coordinator = self.coordinatorScope() orelse return null;
+        return .{ .execution = coordinator.execution, .allocator = coordinator.allocator, .io = self.server.embedding_provider_runtime.io, .wait = .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd }, .checkpoint = checkpoint, .scratch = coordinator.scratch };
+    }
+
+    fn coordinatorScope(self: *Adapter) ?@import("antfly_local_sources").sql_parallel_scheduler.CoordinatorScope {
+        if (self.read_guard == null) return null;
         const execution = self.runnable orelse return null;
         const entry = execution.entry orelse return null;
         if (entry.class != .query or entry.slots != 1 or entry.cleanup_active or entry.completion_active) return null;
@@ -743,16 +804,65 @@ pub const Adapter = struct {
         return .{
             .execution = execution,
             .allocator = memory.allocator(false),
-            .io = self.server.embedding_provider_runtime.io,
-            .wait = .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd },
+            .check = .{ .context = self, .check = checkpoint },
+            .scratch = .{ .context = self, .acquire = acquireNumericScratch },
         };
+    }
+
+    const NumericScratch = struct {
+        const Budget = @import("../common/allocation_budget.zig");
+        metadata: std.mem.Allocator,
+        fixed: Budget.Fixed,
+        chosen: bool = false,
+
+        fn probe(_: *anyopaque) callconv(.c) c_int {
+            // The serial alternative needs no incremental scratch. Both
+            // alternatives use the same paid original CPU continuation.
+            return @backingInt(http_server.RunnableScheduler.GrantResources.Probe.ready);
+        }
+        fn acquire(raw: *anyopaque) callconv(.c) c_int {
+            const self: *NumericScratch = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.chosen);
+            self.chosen = true;
+            _ = self.fixed.tryAcquire();
+            return @backingInt(http_server.RunnableScheduler.GrantResources.Acquire.acquired);
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *NumericScratch = @ptrCast(@alignCast(raw));
+            self.fixed.deinit();
+            self.metadata.destroy(self);
+        }
+    };
+
+    fn acquireNumericScratch(raw: *anyopaque, bytes: usize) !?@import("antfly_local_sources").sql_parallel_scheduler.ScratchLease {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        const scope = self.coordinatorScope() orelse return null;
+        const memory = self.server.request_memory orelse return null;
+        const ticket = scope.allocator.create(NumericScratch) catch return null;
+        ticket.* = .{ .metadata = scope.allocator, .fixed = .{ .budget = &memory.foreground, .bytes = bytes } };
+        var transferred = false;
+        defer if (!transferred) NumericScratch.release(ticket);
+        try scope.checkpointCurrent();
+        // Queue restrictions cannot run a CPU checkpoint while parked. The
+        // original lifetime is checked by enter; validate full read policy on
+        // the running coordinator immediately afterwards, before any math.
+        try scope.execution.enterWithResources(.{ .context = ticket, .probe = NumericScratch.probe, .acquire = NumericScratch.acquire }, .{ .context = self, .check = numericScratchQueueCheck });
+        try scope.checkpointCurrent();
+        if (!ticket.fixed.reserved) return null;
+        transferred = true;
+        return .{ .allocator = ticket.fixed.allocator(), .context = ticket, .release = NumericScratch.release };
+    }
+
+    fn numericScratchQueueCheck(raw: *anyopaque) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        try self.context.ensureActive();
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .cpu_scope = self.cpuScope(), .execution_io = if (self.runnable == null and !self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_io = if (self.runnable != null or self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_wait = if (self.runnable != null) .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd } else null, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .cpu_scope = self.cpuScope(), .coordinator_scope = self.coordinatorScope(), .execution_io = if (self.runnable == null and !self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_io = if (self.runnable != null or self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_wait = if (self.runnable != null) .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd } else null, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -855,6 +965,24 @@ pub const Adapter = struct {
         if (self.cleanup_phase == null) self.cleanup_phase = @import("runnable_local_cleanup.zig").Cleanup.init(execution) catch null;
         const Callback = struct {
             const runtime = @import("antfly_runtime_abi");
+            fn cpuBorrow(raw: *anyopaque, options: *const runtime.runnable_abi.CpuBorrow) callconv(.c) runtime.error_abi.Status {
+                options.validate() catch |err| return runtime.error_abi.statusFromError(err);
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                const active_execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                if (options.enabled != 0) {
+                    adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                    if (adapter.read_guard == null) return runtime.error_abi.statusFromError(error.InvalidReadFenceTransition);
+                    if (adapter.read_guard.?.tables.items.len != 0 and adapter.read_policy_memory == null)
+                        return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                    adapter.validateReadFence(false) catch |err| return runtime.error_abi.statusFromError(err);
+                    active_execution.enableCpuBorrow(.{ .max_non_yield_ns = options.max_non_yield_ns }) catch |err| return runtime.error_abi.statusFromError(err);
+                } else {
+                    active_execution.disableCpuBorrow() catch |err| return runtime.error_abi.statusFromError(err);
+                    adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                    adapter.validateReadFence(false) catch |err| return runtime.error_abi.statusFromError(err);
+                }
+                return .ok;
+            }
             fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
                 const adapter: *Adapter = @ptrCast(@alignCast(raw));
                 const active_execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
@@ -944,7 +1072,7 @@ pub const Adapter = struct {
                 return .ok;
             }
         };
-        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .enter_checked = Callback.enterChecked, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null, .reserve_child = Callback.reserveChild, .check_lifetime = Callback.lifetime, .current_class = Callback.currentClass };
+        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .enter_checked = Callback.enterChecked, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null, .reserve_child = Callback.reserveChild, .check_lifetime = Callback.lifetime, .current_class = Callback.currentClass, .cpu_borrow = Callback.cpuBorrow };
     }
 
     fn spillWaitEnd(ptr: *anyopaque) !void {
@@ -972,8 +1100,11 @@ pub const Adapter = struct {
     }
 
     fn scalarCheckpoint(ptr: ?*anyopaque) !void {
-        // Explicitly non-suspending: only cancellation/deadline inspection.
-        try checkpoint(ptr.?);
+        // Native scalar frames cannot yield or perform catalog/policy IO.
+        // The coordinator owns full read validation at safe boundaries.
+        const self: *Adapter = @ptrCast(@alignCast(ptr.?));
+        var admission: ReadAdmission = .{ .adapter = self };
+        try admission.checkLifetime();
     }
 
     fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
@@ -1071,16 +1202,16 @@ pub const Adapter = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var store = try @import("lake_index_store.zig").Store.openNative(scratch, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        var store = try @import("lake_index_store.zig").Store.openNativeFor(scratch, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.lakeReadContext(null));
         defer store.deinit();
         var artifacts = store.artifactStore();
         const identity = try @import("native_retained_cut.zig").storeIdentity(scratch, store.locator);
         const normalized = try self.context.platformDeadline();
-        const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = try self.lakeReadContext(normalized.deadline_ns);
         for (entries) |entry| {
             try self.context.ensureActive();
             const token = try std.json.parseFromSliceLeaky([]const u8, scratch, entry.document_json orelse return error.CatalogGenerationChanged, .{});
-            const cut = try @import("lake_sql_retained_cut.zig").loadDescriptor(scratch, &artifacts, identity, token, entry.version, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.context.cancellation);
+            const cut = try @import("lake_sql_retained_cut.zig").loadDescriptorFor(scratch, &artifacts, identity, token, entry.version, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.context.cancellation, context);
             const table = try resolve(self, scratch, cut.name orelse return error.CatalogGenerationChanged, .read);
             if (table.id != cut.table_id or table.schema_version != cut.schema_version or !std.mem.eql(u8, table.physical_name, entry.table_name) or (if (table.external_indexes) |indexes| indexes.object_generation else 0) != cut.object_generation) return error.SqlWriteConflict;
             const binding = (table.external_base_source orelse return error.SqlWriteConflict).binding;
@@ -1180,7 +1311,69 @@ pub const Adapter = struct {
         return scan_request;
     }
 
+    fn lakeLifetime(raw: *anyopaque) !void {
+        var admission: ReadAdmission = .{ .adapter = @ptrCast(@alignCast(raw)) };
+        try admission.checkLifetime();
+    }
+    fn lakeReadContext(self: *Adapter, deadline: ?u64) !@import("antfly_local_sources").serverless_query_lake_read_context.Context {
+        const normalized = try self.context.platformDeadline();
+        const original = normalized.deadline_ns;
+        return .{
+            .io = self.server.embedding_provider_runtime.io,
+            .deadline_ns = if (deadline) |limit| @min(limit, original orelse limit) else original,
+            .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn),
+            .additional_checkpoint = .{ .ptr = self, .check = checkpoint },
+            .authority = .{ .ptr = self, .check = lakeLifetime },
+            .wait = if (self.read_guard != null and self.runnable != null) .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd } else null,
+        };
+    }
+
+    fn prepareRemoteRead(self: *Adapter) !void {
+        if (self.read_remote_setup) |setup| try setup.prepare(setup.ptr);
+    }
+
+    const ReadAdmission = struct {
+        adapter: *Adapter,
+        pub fn remoteExecutor(self: *@This()) !?@import("antfly_local_sources").common_http_http_common.RequestExecutor {
+            try self.adapter.prepareRemoteRead();
+            return self.adapter.read_remote_executor;
+        }
+        pub fn retirementBinding(self: *@This()) !?@import("retained_read_retirement.zig").Binding {
+            try self.adapter.prepareRemoteRead();
+            return self.adapter.read_retirement;
+        }
+        pub fn checkpoint(self: *@This()) !void {
+            try Adapter.checkpoint(self.adapter);
+        }
+        pub fn checkLifetime(self: *@This()) !void {
+            if (try self.adapter.activeCleanup()) |borrow| return borrow.checkLifetime();
+            try self.adapter.context.ensureActive();
+            if (self.adapter.runnable) |execution| try execution.checkLifetime() else if (self.adapter.write_execution) |execution| try execution.checkLifetime();
+        }
+        pub fn deadlineNs(self: *@This()) !?u64 {
+            // Protected cleanup has independent finite execution authority.
+            if (try self.adapter.activeCleanup() != null) return null;
+            return (try self.adapter.context.platformDeadline()).deadline_ns;
+        }
+        pub fn executionBoundary(self: *@This()) ?@import("antfly_local_sources").common_execution_wait.Boundary {
+            if (self.adapter.read_guard == null or self.adapter.runnable == null) return null;
+            return .{ .ptr = self.adapter, .begin = spillWaitBegin, .end = spillWaitEnd };
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            try self.checkpoint();
+            if (self.adapter.context.fanout_io) |borrow| {
+                var receiver = try borrow.receive();
+                try self.sleep(receiver.io());
+            } else try self.sleep(self.adapter.server.sharedApiIo() orelse return error.ExecutionWaitUnsupported);
+            try self.checkpoint();
+        }
+        fn sleep(self: *@This(), io: std.Io) !void {
+            if (self.executionBoundary()) |boundary| try boundary.run(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(1), std.Io.Clock.awake }) else try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    };
+
     const ReadCursor = struct {
+        failed: bool = false,
         alloc: std.mem.Allocator,
         adapter: *Adapter,
         schema_version: u32,
@@ -1233,18 +1426,25 @@ pub const Adapter = struct {
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *ReadCursor = @ptrCast(@alignCast(ptr));
             self.retireColumns();
+            if (self.failed) return error.RetainedReadRestartRequired;
             try checkpoint(self.adapter);
-            var page = try self.view.next(alloc, limit);
+            errdefer self.failed = true;
+            var budget: ReadAdmission = .{ .adapter = self.adapter };
+            var bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &budget };
+            const payload = bridge.payload();
+            var page = try self.view.nextWithAdmission(alloc, limit, @import("antfly_local_sources").common_read_admission.Port.init(&payload));
             errdefer page.deinit();
             try checkpoint(self.adapter);
             if (page.rows.len > limit) return error.InvalidSqlBackendResponse;
             const rows = try page.arena.allocator().alloc(catalog.Row, page.rows.len);
             const layout = try self.projection.pageLayout(page.arena.allocator());
             for (page.rows, rows) |row, *out| {
+                try checkpoint(self.adapter);
                 if (row.schema_version != self.schema_version) return error.CatalogGenerationChanged;
                 if (self.require_primary_digest and row.expected_content_digest == null) return error.InvalidSqlBackendResponse;
                 out.* = try self.projection.adaptBorrowed(page.arena.allocator(), layout, row.sqlRow());
             }
+            try checkpoint(self.adapter);
             return .{ .rows = rows, .after = page.after, .storage_page = page };
         }
 
@@ -1260,7 +1460,11 @@ pub const Adapter = struct {
     fn openScan(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         if (table.external_base_source != null) return try self.openLakeScan(alloc, table, request);
-        if (self.range_reads != null) {
+        // The admitted statement entry carries the original read port through
+        // snapshot creation, signed remote dispatch and physical retirement.
+        // The legacy single-read callback has no admission argument.
+        const admitted_statement = self.runnable != null and (if (self.server.table_reads) |source| source.vtable.open_relational_statement_with_admission != null else false);
+        if (self.range_reads != null or admitted_statement) {
             const statement = try openStatement(ptr, alloc, &.{.{ .table = table, .request = request }});
             errdefer statement.close(statement.ptr);
             const wrapper = try alloc.create(SingleStatementCursor);
@@ -1395,9 +1599,9 @@ pub const Adapter = struct {
         try self.checkLakeRead(sa, table);
         try self.server.prepareLakeCache();
         const normalized = try self.context.platformDeadline();
-        var context: local.serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        var context: local.serverless_query_lake_read_context.Context = try self.lakeReadContext(normalized.deadline_ns);
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
-        var source = try @import("lake_published_navigation.zig").open(a, self.server, table.id, if (table.external_indexes) |indexes| indexes.catalog_json else "", .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), if (self.cpuScope()) |scope| context.withExecution(scope.execution) else context, self.context, null);
+        var source = try @import("lake_published_navigation.zig").openFor(a, self.server, table.id, if (table.external_indexes) |indexes| indexes.catalog_json else "", .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, self.context, null, if (self.cpuScope()) |scope| scope.execution else null);
         defer source.deinit();
         const owner = try a.create(AggregateArtifactCursor);
         owner.a = a;
@@ -1405,7 +1609,7 @@ pub const Adapter = struct {
         owner.arena = .init(a);
         var keep_owner = false;
         defer if (!keep_owner) owner.destroyControl();
-        owner.store = @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir) catch |err| {
+        owner.store = @import("lake_index_store.zig").Store.openNativeFor(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.lakeReadContext(null)) catch |err| {
             try context.ensureActive();
             if (err == error.OutOfMemory) return err;
             return null;
@@ -1528,10 +1732,10 @@ pub const Adapter = struct {
         defer held.deinit(self.server.alloc);
         if (held.version != table.id or held.document_json == null) return error.CatalogGenerationChanged;
         const token = try std.json.parseFromSliceLeaky([]const u8, a, held.document_json.?, .{ .allocate = .alloc_always });
-        var store = try @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        var store = try @import("lake_index_store.zig").Store.openNativeFor(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.lakeReadContext(null));
         defer store.deinit();
         var artifacts = store.artifactStore();
-        const cut = try @import("lake_sql_retained_cut.zig").load(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.context.cancellation);
+        const cut = try @import("lake_sql_retained_cut.zig").loadFor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.context.cancellation, try self.lakeReadContext(null));
         var normalized = try self.context.platformDeadline();
         const time = @import("antfly_platform").time;
         const wall_now = time.realtimeNs() / std.time.ns_per_ms;
@@ -1540,27 +1744,30 @@ pub const Adapter = struct {
         normalized.deadline_ns = @min(normalized.deadline_ns orelse expiry_deadline, expiry_deadline);
         self.context = normalized;
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
-        var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, table.external_base_source.?.binding, options, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .load);
+        var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, table.external_base_source.?.binding, options, try self.lakeReadContext(normalized.deadline_ns), .load);
         defer current.deinit(a);
         const root = try @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata.parse(a, current.table.metadata_json);
         const metadata = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.metadata;
         if (!std.mem.eql(u8, try metadata.str(try metadata.get(root, "table-uuid")), cut.table_uuid)) return error.CatalogGenerationChanged;
+        try Adapter.checkpoint(self);
         return cut;
     }
     fn saveSqlLakeCut(self: *Adapter, a: std.mem.Allocator, table: catalog.Table, cut: @import("lake_sql_retained_cut.zig").Descriptor, options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !void {
         const id = self.active_transaction orelse return error.SqlTransactionNotActive;
-        var opened = try @import("../serverless/lake_ingestion.zig").openQueue(a, table.external_base_source.?.binding, options);
+        var opened = try @import("../serverless/lake_ingestion.zig").openQueueFor(a, table.external_base_source.?.binding, options, context);
         defer opened.deinit();
         const pins = @import("../serverless/lake_snapshot_pins.zig");
         const pin: pins.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = try pins.namespace(a, opened.prefix, table.external_base_source.?.binding, cut.table_uuid), .context = context };
         const now = @import("antfly_platform").time.realtimeNs();
         if (cut.expires_ms <= now / std.time.ns_per_ms) return error.CatalogGenerationChanged;
         _ = try pin.acquireFor(a, cut.snapshot_id, now, (cut.expires_ms - now / std.time.ns_per_ms) * std.time.ns_per_ms);
-        var store = try @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        var store = try @import("lake_index_store.zig").Store.openNativeFor(a, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir, try self.lakeReadContext(null));
         defer store.deinit();
         var artifacts = store.artifactStore();
         const token = try @import("lake_sql_retained_cut.zig").save(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), self.server.embedding_provider_runtime.io, cut, self.context.cancellation);
-        try self.server.txn_sessions.bindLakeCut(self.server.alloc, id, table.physical_name, table.id, try std.json.Stringify.valueAlloc(a, token, .{}));
+        const encoded = try std.json.Stringify.valueAlloc(a, token, .{});
+        try Adapter.checkpoint(self);
+        try self.server.txn_sessions.bindLakeCut(self.server.alloc, id, table.physical_name, table.id, encoded);
     }
 
     /// Wait before opening or persisting a new snapshot. A retained transaction
@@ -1581,7 +1788,7 @@ pub const Adapter = struct {
         const deadline = @min(wait_deadline, normalized.deadline_ns orelse wait_deadline);
         // Zero permits one readiness check under the statement's I/O budget.
         // Positive budgets also bound catalog and WAL I/O, not just sleeps.
-        const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = if (wait_ms == 0) normalized.deadline_ns else deadline, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = try self.lakeReadContext(if (wait_ms == 0) normalized.deadline_ns else deadline);
         var first = true;
         while (true) {
             try normalized.ensureActive();
@@ -1708,9 +1915,9 @@ pub const Adapter = struct {
                 const ready_metadata = if (retained == null) try self.awaitSqlReceipt(scratch.allocator(), alloc, request.table) else null;
                 const normalized = try self.context.platformDeadline();
                 const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| .{ .metadata_location = @constCast(cut.metadata_location), .metadata_json = @constCast(cut.metadata_json) } else ready_metadata, .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = request.table.id, .catalog_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0 };
-                source.* = try @import("lake_published_navigation.zig").open(alloc, self.server, request.table.id, if (request.table.external_indexes) |indexes| indexes.catalog_json else "", schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, self.context, null);
+                source.* = try @import("lake_published_navigation.zig").openFor(alloc, self.server, request.table.id, if (request.table.external_indexes) |indexes| indexes.catalog_json else "", schema, lake_options.lakeOptions(), try self.lakeReadContext(normalized.deadline_ns), self.context, null, if (self.cpuScope()) |scope| scope.execution else null);
                 errdefer source.deinit();
-                try source.attachCache(&self.server.lake_read_cache, schema.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+                try source.attachCache(&self.server.lake_read_cache, schema.external_base_source.?.binding, try self.lakeReadContext(normalized.deadline_ns));
                 if (retained) |cut| {
                     if (!std.mem.eql(u8, source.inventory.snapshot_id, cut.snapshot_id)) return error.CatalogGenerationChanged;
                     const oa = owner.overlay_arena.?.allocator();
@@ -1721,7 +1928,7 @@ pub const Adapter = struct {
                     if (owner.overlay_arena == null) owner.overlay_arena = .init(alloc);
                     const oa = owner.overlay_arena.?.allocator();
                     const binding = schema.external_base_source.?.binding;
-                    const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+                    const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = try self.lakeReadContext(normalized.deadline_ns);
                     var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(alloc, binding, lake_options, context, .load);
                     defer current.deinit(alloc);
                     const pinned_metadata = source.catalog_metadata orelse return error.InvalidLakeMetadata;
@@ -1942,6 +2149,13 @@ pub const Adapter = struct {
         }
     };
 
+    fn captureDynamicStatement(self: *Adapter, alloc: std.mem.Allocator, reads: @import("antfly_local_sources").api_table_read_source.TableReadSource, table: []const u8, schema_version: u32) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot {
+        var budget: ReadAdmission = .{ .adapter = self };
+        var bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &budget };
+        const payload = bridge.payload();
+        return reads.openRelationalStatementSnapshotWithAdmission(alloc, table, schema_version, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns, .init(&payload));
+    }
+
     fn openDynamicStatement(self: *Adapter, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) !catalog.StatementRead {
         const snapshot = self.dynamic_snapshot orelse return error.SqlStatementSnapshotRequired;
         const bound_table = self.dynamic_table orelse return error.SqlStatementSnapshotRequired;
@@ -1970,6 +2184,10 @@ pub const Adapter = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const temporary = scratch.allocator();
+        var budget: ReadAdmission = .{ .adapter = self };
+        var bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &budget };
+        const payload = bridge.payload();
+        const control = @import("antfly_local_sources").common_read_admission.Port.init(&payload);
         for (requests, views, wrappers, cursors) |request, *view, *wrapper, *cursor| {
             try self.context.ensureActive();
             if (!std.mem.eql(u8, request.table.physical_name, bound_table)) return error.SqlStatementSnapshotRequired;
@@ -1981,7 +2199,7 @@ pub const Adapter = struct {
             if (query.index_equality != null) return error.SqlStatementSnapshotRequired;
             query.primary_order = true;
             const scan_request = try self.prepareScan(temporary, request.table, query);
-            const guarded = snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }) catch |err| blk: {
+            const guarded = snapshot.openGuardedWithAdmission(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }, control) catch |err| blk: {
                 if (err != error.SqlRangeTrackingRequired or retained.view_count != 0 or observed.tables.len != 0) return err;
                 // Activate the capability before any row or absence has been
                 // observed, then replace the stale cut. Once a view exists we
@@ -1989,10 +2207,10 @@ pub const Adapter = struct {
                 const writes = self.server.table_writes orelse return err;
                 try writes.activateRangeTracking(temporary, bound_table, self.context);
                 const reads = self.server.table_reads orelse return error.SqlStatementSnapshotRequired;
-                const replacement = try reads.openRelationalStatementSnapshot(alloc, bound_table, request.table.schema_version, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns);
+                const replacement = try self.captureDynamicStatement(alloc, reads, bound_table, request.table.schema_version);
                 snapshot.deinit();
                 snapshot.* = replacement;
-                break :blk try snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts });
+                break :blk try snapshot.openGuardedWithAdmission(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }, control);
             };
             defer {
                 for (guarded.owner_proofs) |owner| alloc.free(owner.proofs);
@@ -2051,7 +2269,11 @@ pub const Adapter = struct {
         }
         const cursors = try alloc.alloc(catalog.Cursor, requests.len);
         errdefer alloc.free(cursors);
-        const native = read_source.openRelationalStatement(alloc, scans, .read_index) catch |err| blk: {
+        var creation_budget: ReadAdmission = .{ .adapter = self };
+        var creation_bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &creation_budget };
+        const creation_payload = creation_bridge.payload();
+        const creation_control = @import("antfly_local_sources").common_read_admission.Port.init(&creation_payload);
+        const native = read_source.openRelationalStatementWithAdmission(alloc, scans, .read_index, creation_control) catch |err| blk: {
             if (err != error.SqlRangeTrackingRequired or self.range_reads == null) return err;
             const writes = self.server.table_writes orelse return error.SqlRangeTrackingRequired;
             // Activation is a replicated, idempotent capability transition.
@@ -2063,7 +2285,7 @@ pub const Adapter = struct {
                 try self.verify(temporary, request.table);
                 try writes.activateRangeTracking(temporary, request.table.physical_name, self.context);
             }
-            break :blk try read_source.openRelationalStatement(alloc, scans, .read_index);
+            break :blk try read_source.openRelationalStatementWithAdmission(alloc, scans, .read_index, creation_control);
         };
         errdefer native.deinit();
         if (native.views.len != requests.len) return error.InvalidSqlBackendResponse;
@@ -2072,7 +2294,7 @@ pub const Adapter = struct {
         for (requests, native.views, wrappers, cursors) |request, view, *wrapper, *cursor| {
             try self.verify(temporary, request.table);
             if (self.range_reads) |observed| {
-                const proofs = try native.rangeProofs(temporary, wrapped);
+                const proofs = try native.rangeProofsWithAdmission(temporary, wrapped, creation_control);
                 if (proofs.len == 0) return error.InvalidSqlBackendResponse;
                 if (request.request.index_equality != null) {
                     for (proofs) |owner| {
@@ -2134,7 +2356,10 @@ pub const Adapter = struct {
             .cancellation = self.context.cancellation,
         }, .read_index)) orelse return error.UnsupportedSqlExecution;
         defer view.deinit();
-        const normalized = try view.normalize(alloc, writes);
+        var budget: ReadAdmission = .{ .adapter = self };
+        var bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &budget };
+        const payload = bridge.payload();
+        const normalized = try view.normalizeWithAdmission(alloc, writes, @import("antfly_local_sources").common_read_admission.Port.init(&payload));
         const result = try images.merge(alloc, input, normalized);
         // RETURNING requires SELECT policy on the resulting row as well as
         // write authority. Do not publish postimages that an ordinary read hides.
@@ -2208,7 +2433,10 @@ pub const Adapter = struct {
                 }, .read_index)) orelse return error.UnsupportedSqlExecution;
                 defer view.deinit();
                 try self.verify(alloc, table);
-                break :blk try view.normalize(alloc, writes.items);
+                var budget: ReadAdmission = .{ .adapter = self };
+                var bridge = @import("antfly_local_sources").common_read_admission.Adapter(*ReadAdmission){ .budget = &budget };
+                const payload = bridge.payload();
+                break :blk try view.normalizeWithAdmission(alloc, writes.items, @import("antfly_local_sources").common_read_admission.Port.init(&payload));
             } else writes.items;
             const scope = table.scope orelse return error.InvalidSqlBackendResponse;
             const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(alloc);
@@ -4759,6 +4987,1240 @@ test "SQL read resume fences receipt polling sleep lends CPU and retains the ori
     }
 }
 
+test "SQL retained cursor admission lends original CPU and prevents replay after rejected pages" {
+    const a = std.testing.allocator;
+    const scheduler = http_server.RunnableScheduler;
+    const clock = @import("antfly_platform").time;
+    const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+    const Mode = enum { success, canceled, expired, rejected_resume, late_cancel };
+    const Fixture = struct {
+        adapter: *Adapter,
+        scheduler: *scheduler.Scheduler,
+        signal: *std.atomic.Value(bool),
+        mode: Mode,
+        calls: usize = 0,
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn legacy(_: *anyopaque, _: std.mem.Allocator, _: u32) !View.Page {
+            return error.TestLegacyCursorEscape;
+        }
+        fn close(_: *anyopaque) void {}
+        fn next(raw: *anyopaque, alloc: std.mem.Allocator, _: u32, control: View.Admission) !View.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try control.checkpoint();
+            try std.testing.expectEqual(self.adapter.context.deadline_ns, try control.deadlineNs());
+            try control.waitForProgress();
+            const wait = (try control.executionWait()) orelse return error.TestMissingSqlExecution;
+            try wait.beginWait();
+            try control.checkLifetime();
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 17), self.scheduler.stats().retained_bytes);
+            var health: scheduler.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+            switch (self.mode) {
+                .canceled => self.signal.store(true, .release),
+                .expired => self.adapter.context.deadline_ns = 0,
+                .rejected_resume => self.scheduler.close(),
+                .success, .late_cancel => {},
+            }
+            try wait.endWait();
+            if (self.mode == .late_cancel) self.signal.store(true, .release);
+            return .{ .arena = .init(alloc), .rows = &.{}, .after = null };
+        }
+    };
+    for ([_]Mode{ .success, .canceled, .expired, .rejected_resume, .late_cancel }) |mode| {
+        var scheduling = try scheduler.Scheduler.init(.{ .slots = 2 });
+        var signal = std.atomic.Value(bool).init(false);
+        var execution: scheduler.Execution = .{};
+        const deadline = clock.monotonicNs() + std.time.ns_per_s;
+        try execution.start(&scheduling, .{ .io = std.testing.io, .allow_wait = false, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 17, .cancellation = .{ .ptr = &signal, .requested = Fixture.canceled } }, .query);
+        defer execution.finish();
+        // An empty guard deliberately needs no catalog callback, but the real
+        // guard/resume machinery and original execution remain active.
+        var server: http_server.ApiHttpServer = undefined;
+        server.alloc = a;
+        var adapter: Adapter = .{ .server = &server, .identity = undefined, .runnable = &execution, .context = .{ .deadline_ns = deadline, .cancellation = .fromAtomic(&signal), .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io) } };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        var fixture: Fixture = .{ .adapter = &adapter, .scheduler = &scheduling, .signal = &signal, .mode = mode };
+        var projection = try @import("antfly_local_sources").sql_document_row.Projection.init(a, .{ .id = 1, .physical_name = "rows", .schema_version = 5, .storage_mode = .document, .columns = &.{} }, &.{"_id"});
+        defer projection.deinit(a);
+        var cursor: Adapter.ReadCursor = .{ .alloc = a, .adapter = &adapter, .schema_version = 5, .projection = projection, .view = .{ .ptr = &fixture, .vtable = &.{ .next = Fixture.legacy, .next_with_admission = Fixture.next, .close = Fixture.close } } };
+        const result = Adapter.ReadCursor.next(&cursor, a, 1);
+        if (mode == .success) {
+            (try result).deinit();
+            execution.finish();
+            var second: scheduler.Execution = .{};
+            try second.start(&scheduling, .{ .io = std.testing.io, .allow_wait = false, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 17 }, .query);
+            defer second.finish();
+            adapter.runnable = &second;
+            (try Adapter.ReadCursor.next(&cursor, a, 1)).deinit();
+            try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+        } else {
+            try std.testing.expectError(switch (mode) {
+                .canceled, .late_cancel => error.Canceled,
+                .expired => error.DeadlineExceeded,
+                .rejected_resume => error.SchedulerClosed,
+                .success => unreachable,
+            }, result);
+            try std.testing.expect(cursor.failed);
+            try std.testing.expectError(error.RetainedReadRestartRequired, Adapter.ReadCursor.next(&cursor, a, 1));
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        }
+    }
+}
+
+test "SQL lake request admission lends CPU for artifact catalog WAL and pin providers" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const scheduling = http_server.RunnableScheduler;
+    const clock = @import("antfly_platform").time;
+    const Context = local.serverless_query_lake_read_context.Context;
+    const Mode = enum { success, canceled, expired, rejected_resume, forbidden };
+    const Stage = enum { artifact, catalog, wal, pin };
+    const Probe = struct {
+        adapter: *Adapter,
+        scheduler: *scheduling.Scheduler,
+        signal: *std.atomic.Value(bool),
+        context: Context = .{},
+        mode: Mode,
+        enabled: bool = false,
+        denied: bool = false,
+        ends: usize = 0,
+        reject_at: usize,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try Adapter.checkpoint(self.adapter);
+            if (self.denied) return error.Forbidden;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try Adapter.spillWaitBegin(self.adapter);
+            // The SQL-owned authority hook must remain valid without CPU.
+            try self.context.checkLifetime();
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 17), self.scheduler.stats().retained_bytes);
+            var health: scheduling.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.enabled) {
+                self.ends += 1;
+                if (self.ends == self.reject_at) switch (self.mode) {
+                    .success => {},
+                    .canceled => self.signal.store(true, .release),
+                    .expired => self.adapter.context.deadline_ns = 0,
+                    .rejected_resume => self.scheduler.close(),
+                    .forbidden => self.denied = true,
+                };
+            }
+            try Adapter.spillWaitEnd(self.adapter);
+        }
+    };
+    const Operation = struct {
+        fn run(arena: std.mem.Allocator, stage: Stage, store: *@import("lake_index_store.zig").Store, context: Context, token: []const u8, identity: [32]u8) !void {
+            switch (stage) {
+                .artifact => {
+                    var artifacts = store.artifactStore();
+                    const cut = try @import("lake_sql_retained_cut.zig").loadFor(arena, &artifacts, identity, token, .{ .id = 7, .physical_name = "docs", .schema_version = 1, .columns = &.{} }, 1001, .none, context);
+                    try std.testing.expectEqualStrings("42", cut.snapshot_id);
+                    try std.testing.expectEqual(@as(u64, 8), cut.pending.lsn);
+                },
+                .catalog => {
+                    var managed: local.serverless_external_source_mod.lake_catalog.managed.Managed = .{ .client = store.opened.client, .bucket = store.opened.bucket, .prefix = "catalog", .source_uri = "file:///fixture", .context = context };
+                    var table = try managed.load(arena);
+                    defer table.deinit(arena);
+                    try std.testing.expect(table.metadata_json.len != 0);
+                },
+                .wal => {
+                    const wal: @import("../serverless/lake_wal.zig").Store = .{ .client = store.opened.client, .bucket = store.opened.bucket, .prefix = "wal", .context = context };
+                    try std.testing.expectEqual(null, try wal.latest(arena));
+                },
+                .pin => {
+                    const pins: @import("../serverless/lake_snapshot_pins.zig").Store = .{ .client = store.opened.client, .bucket = store.opened.bucket, .prefix = "pins", .context = context };
+                    const now = clock.realtimeNs();
+                    const deadline = try pins.acquireFor(arena, "42", now, std.time.ns_per_s);
+                    try std.testing.expect(deadline >= now);
+                },
+            }
+        }
+    };
+    for ([_]Stage{ .artifact, .catalog, .wal, .pin }) |stage| for ([_]Mode{ .success, .canceled, .expired, .rejected_resume, .forbidden }) |mode| {
+        if (mode == .forbidden and stage != .wal) continue;
+        var directory = try local.common_test_directory.TestDirectory.init("sql-lake-call-admission");
+        defer directory.cleanup();
+        var scheduler = try scheduling.Scheduler.init(.{ .slots = 2 });
+        var execution: scheduling.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+        defer execution.finish();
+        var signal = std.atomic.Value(bool).init(false);
+        var server: http_server.ApiHttpServer = undefined;
+        server.alloc = a;
+        server.embedding_provider_runtime.io = std.testing.io;
+        var adapter: Adapter = .{ .server = &server, .identity = undefined, .runnable = &execution, .context = .{ .deadline_ns = clock.monotonicNs() + 10 * std.time.ns_per_s, .cancellation = .fromAtomic(&signal) } };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        var probe: Probe = .{ .adapter = &adapter, .scheduler = &scheduler, .signal = &signal, .mode = mode, .reject_at = if (stage == .pin) 3 else 1 };
+        probe.context = try adapter.lakeReadContext(null);
+        try std.testing.expect(probe.context.wait != null);
+        probe.context.wait = .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end };
+        probe.context.additional_checkpoint = .{ .ptr = &probe, .check = Probe.check };
+        var store = try @import("lake_index_store.zig").Store.openNativeFor(a, null, null, false, .standalone, directory.path(), probe.context);
+        defer store.deinit();
+        const identity = try @import("native_retained_cut.zig").storeIdentity(a, store.locator);
+        var artifacts = store.artifactStore();
+        const token = try @import("lake_sql_retained_cut.zig").save(a, &artifacts, identity, std.testing.io, .{ .table_id = 7, .schema_version = 1, .object_generation = 0, .expires_ms = 1000 + @import("lake_sql_retained_cut.zig").ttl_ms, .metadata_location = "file:///fixture/metadata.json", .metadata_json = "{}", .table_uuid = "fixture", .snapshot_id = "42", .pending = .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{} } }, .none);
+        defer a.free(token);
+        if (stage == .catalog) {
+            // Seed a real filesystem catalog before testing its read boundary.
+            var managed: local.serverless_external_source_mod.lake_catalog.managed.Managed = .{ .client = store.opened.client, .bucket = store.opened.bucket, .prefix = "catalog", .source_uri = "file:///fixture" };
+            var seeded = try managed.create(a, "create", "{\"schema\":{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"type\":\"long\",\"required\":true}]}}", 1);
+            seeded.deinit(a);
+        }
+        probe.enabled = true;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        // Selection/cursor CPU scopes may replace the primary checkpoint;
+        // SQL's additional authority check must survive that adaptation.
+        var call_context = probe.context.withExecution(&execution);
+        call_context.wait = probe.context.wait;
+        const result = Operation.run(arena.allocator(), stage, &store, call_context, token, identity);
+        if (mode == .success) try result else try std.testing.expectError(switch (mode) {
+            .canceled => error.Canceled,
+            .expired => error.DeadlineExceeded,
+            .rejected_resume => error.SchedulerClosed,
+            .forbidden => error.Forbidden,
+            .success => unreachable,
+        }, result);
+        try std.testing.expect(probe.ends >= probe.reject_at);
+        if (stage == .pin) {
+            // A rejected grant after PUT may leave an expiring retention pin;
+            // it must not turn into a published query result or lose the pin.
+            const persisted: @import("../serverless/lake_snapshot_pins.zig").Store = .{ .client = store.opened.client, .bucket = store.opened.bucket, .prefix = "pins" };
+            try std.testing.expect((try persisted.deadline(a, "42")) != 0);
+        }
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+test "SQL prepared numeric serial owner publishes coordinator scope without parallel scope and charges foreground scratch" {
+    const a = std.testing.allocator;
+    const Prepared = @import("antfly_local_sources").sql_typed_kernel.PreparedNumeric;
+    const Partitioned = @import("../common/allocation_budget.zig").Partitioned;
+    const required = Prepared.scratch_bytes + Partitioned.overhead(.of(Prepared));
+    var memory: Partitioned = .{ .foreground = .{ .child = a, .limit = required }, .control = .{ .child = a, .limit = 64 } };
+    var server: http_server.ApiHttpServer = undefined;
+    server.alloc = a;
+    server.request_memory = &memory;
+    server.embedding_provider_runtime.io = std.testing.io;
+    var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2 });
+    defer scheduler.close();
+    var execution: http_server.RunnableScheduler.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .query);
+    defer execution.finish();
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution, .serial_execution = true };
+    try adapter.beginReadFence();
+    defer adapter.endReadFence();
+    try std.testing.expect(adapter.cpuScope() == null);
+    const scope = adapter.coordinatorScope().?;
+    try std.testing.expect(scope.execution == &execution);
+    try std.testing.expect(scope.check != null);
+    try std.testing.expect(scope.check.?.context == @as(*anyopaque, @ptrCast(&adapter)));
+    var compiled = try @import("antfly_local_sources").sql_compiler.compileScalar(a, "1 + 2", .{});
+    defer compiled.deinit();
+    var program = try @import("antfly_local_sources").sql_scalar.bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    const stage = (try Prepared.init(scope.allocator, &program)).?;
+    var stage_live = true;
+    defer if (stage_live) stage.deinit();
+    try std.testing.expectEqual(required, memory.foreground.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+    try std.testing.expectError(error.OutOfMemory, scope.allocator.alloc(u8, 1));
+    const control = try memory.allocator(true).alloc(u8, 1);
+    memory.allocator(true).free(control);
+    stage.deinit();
+    stage_live = false;
+    try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+    adapter.serial_execution = false;
+    try std.testing.expect(adapter.cpuScope().?.execution == scope.execution);
+}
+
+test "SQL scalar lifetime callbacks do not yield allocate or validate catalog inside native frames" {
+    const a = std.testing.allocator;
+    const Source = struct {
+        calls: usize = 0,
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedScalarStatus;
+        }
+        fn catalogRead(raw: *anyopaque, _: std.mem.Allocator, _: operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.ScalarFrameAttemptedCatalogIo;
+        }
+    };
+    const Signal = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    var source: Source = .{};
+    var server: http_server.ApiHttpServer = undefined;
+    server.alloc = a;
+    server.source = .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalogRead, .supports_query_definitions = true } };
+    var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+    defer scheduler.close();
+    var canceled: std.atomic.Value(bool) = .init(false);
+    const clock = @import("antfly_platform").time.monotonicNs;
+    const deadline = clock() + 30 * std.time.ns_per_s;
+    var execution: http_server.RunnableScheduler.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock, .deadline_ns = deadline, .retained_bytes = 17, .cancellation = .{ .ptr = &canceled, .requested = Signal.requested } }, .query);
+    defer execution.finish();
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{ .deadline_ns = deadline, .cancellation = .fromAtomic(&canceled) }, .runnable = &execution };
+    try adapter.beginReadFence();
+    defer adapter.endReadFence();
+    try adapter.read_guard.?.capture(.{ .database = "main", .namespace = "public", .name = "docs", .physical = "physical", .id = 1, .schema_version = 1, .catalog_revision = 7, .filter = null });
+    const generation = execution.resume_generation;
+    for (0..16) |_| try Adapter.scalarCheckpoint(&adapter);
+    try std.testing.expectEqual(generation, execution.resume_generation);
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    try std.testing.expect(adapter.read_guard.?.checked_generation == null);
+    var unavailable = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    server.alloc = unavailable.allocator();
+    try Adapter.scalarCheckpoint(&adapter);
+    try std.testing.expectEqual(@as(usize, 0), unavailable.allocations);
+    server.alloc = a;
+    // The ordinary coordinator boundary still performs full read validation.
+    try std.testing.expectError(error.ScalarFrameAttemptedCatalogIo, Adapter.checkpoint(&adapter));
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    const after_coordinator = execution.resume_generation;
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, Adapter.scalarCheckpoint(&adapter));
+    canceled.store(false, .release);
+    adapter.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, Adapter.scalarCheckpoint(&adapter));
+    try std.testing.expectEqual(after_coordinator, execution.resume_generation);
+    try std.testing.expectEqual(deadline, execution.entry.?.options.deadline_ns.?);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+}
+
+test "SQL scalar lifetime callbacks inspect write execution without a foreground runnable" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+    defer scheduler.close();
+    var execution: http_server.RunnableScheduler.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 19 }, .write);
+    defer execution.finish();
+    var adapter: Adapter = .{ .server = undefined, .identity = undefined, .context = .{}, .write_execution = &execution };
+    const generation = execution.resume_generation;
+    try Adapter.scalarCheckpoint(&adapter);
+    Clock.tick = 100;
+    try std.testing.expectError(error.DeadlineExceeded, Adapter.scalarCheckpoint(&adapter));
+    try std.testing.expectEqual(generation, execution.resume_generation);
+    try std.testing.expectEqual(@as(u64, 100), execution.entry.?.options.deadline_ns.?);
+    try std.testing.expectEqual(@as(u64, 19), scheduler.stats().retained_bytes);
+}
+
+test "SQL scalar lifetime callbacks preserve preauthorized cleanup after foreground cancellation and close" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const Signal = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    Clock.tick = 0;
+    var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 3, .cleanup_slots = 1, .checkpoint_budget = 1 });
+    defer scheduler.close();
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var execution: http_server.RunnableScheduler.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 50, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = Signal.requested } }, .query);
+    defer execution.finish();
+    var adapter: Adapter = .{ .server = undefined, .identity = undefined, .context = .{ .deadline_ns = 0, .cancellation = .fromAtomic(&canceled) }, .runnable = &execution };
+    adapter.cleanup_phase = try @import("runnable_local_cleanup.zig").Cleanup.init(&execution);
+    try execution.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now }, 100);
+    canceled.store(true, .release);
+    try execution.activateCleanup();
+    scheduler.close();
+    const generation = execution.resume_generation;
+    try Adapter.scalarCheckpoint(&adapter);
+    try std.testing.expectEqual(generation, execution.resume_generation);
+    try std.testing.expectEqual(@as(u64, 100), execution.entry.?.options.deadline_ns.?);
+    Clock.tick = 100;
+    try std.testing.expectError(error.DeadlineExceeded, Adapter.scalarCheckpoint(&adapter));
+    try std.testing.expectEqual(generation, execution.resume_generation);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+}
+
+test "SQL CPU loan policy validation waits for ordinary CPU and retains original failures" {
+    const native = http_server.RunnableScheduler;
+    const io = std.testing.io;
+    const Clock = struct {
+        var tick: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return tick.load(.acquire);
+        }
+    };
+    const Source = struct {
+        execution: *native.Execution,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return error.UnexpectedSqlPolicyStatus;
+        }
+        fn catalogRead(raw: *anyopaque, _: std.mem.Allocator, _: operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            if (self.execution.entry.?.borrowed_read_cpu or self.execution.entry.?.cpu_borrow_budget != null) return error.InvalidRunnableTransition;
+            return error.Forbidden;
+        }
+    };
+    const Signal = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const Worker = struct {
+        fn run(adapter: *Adapter) !void {
+            try Adapter.checkpoint(adapter);
+        }
+    };
+    const Mode = enum { catalog_refusal, canceled, expired, closed };
+    inline for (.{ Mode.catalog_refusal, Mode.canceled, Mode.expired, Mode.closed }) |mode| {
+        Clock.tick.store(0, .release);
+        var scheduler = try native.Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var base: native.Entry = .{ .options = .{ .io = io }, .class = .background, .bytes = 11 };
+        try scheduler.submit(&base);
+        defer scheduler.finish(&base);
+        var execution: native.Execution = .{};
+        defer execution.finish();
+        var source: Source = .{ .execution = &execution };
+        var server: http_server.ApiHttpServer = undefined;
+        server.alloc = std.testing.allocator;
+        server.source = .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalogRead, .supports_query_definitions = true } };
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{ .cancellation = .fromAtomic(&canceled) }, .runnable = &execution };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        try adapter.read_guard.?.capture(.{ .database = "main", .namespace = "public", .name = "docs", .physical = "physical", .id = 1, .schema_version = 1, .catalog_revision = 7, .filter = null });
+        try execution.startBorrowable(&scheduler, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = Signal.requested } }, .query, .{ .max_non_yield_ns = 1000 });
+        try std.testing.expectEqual(@as(usize, 1), scheduler.cpuBorrowStats().active);
+        var floor: native.Entry = .{ .options = .{ .io = io }, .class = .query, .read_lane = .bounded, .bytes = 7 };
+        try scheduler.submit(&floor);
+        defer scheduler.finish(&floor);
+        try std.testing.expectEqual(native.State.running, scheduler.state(&floor));
+        var future = try io.concurrent(Worker.run, .{&adapter});
+        defer future.cancel(io) catch {};
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+        while (scheduler.state(&execution.entry.?) != .queued) {
+            if (source.calls.load(.acquire) != 0) return future.await(io);
+            if (scheduler.state(&execution.entry.?) == .stopped) return future.await(io);
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.SqlPolicyDidNotReturnCpuLoan;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 0), source.calls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.cpuBorrowStats().active);
+        try std.testing.expectEqual(native.State.running, scheduler.state(&floor));
+        try std.testing.expectEqual(@as(u64, 41), scheduler.stats().retained_bytes);
+        switch (mode) {
+            .catalog_refusal => scheduler.finish(&base),
+            .canceled => canceled.store(true, .release),
+            .expired => Clock.tick.store(100, .release),
+            .closed => scheduler.close(),
+        }
+        const expected = switch (mode) {
+            .catalog_refusal => error.Forbidden,
+            .canceled => error.Canceled,
+            .expired => error.DeadlineExceeded,
+            .closed => error.SchedulerClosed,
+        };
+        try std.testing.expectError(expected, future.await(io));
+        try std.testing.expectEqual(@as(usize, if (mode == .catalog_refusal) 1 else 0), source.calls.load(.acquire));
+        try std.testing.expectEqual(@as(?u64, null), adapter.read_guard.?.checked_generation);
+        try std.testing.expectEqual(@as(u64, 100), execution.entry.?.options.deadline_ns.?);
+        try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+        scheduler.finish(&base);
+        scheduler.finish(&floor);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "SQL CPU loan policy validation exposes checked stage transitions without retiring ingress" {
+    const runtime = @import("antfly_runtime_abi");
+    const native = http_server.RunnableScheduler;
+    const io = std.testing.io;
+    const Worker = struct {
+        fn run(borrow: runtime.runnable_abi.Borrowed) !void {
+            try borrow.setCpuBorrow(&.{ .enabled = 0 });
+        }
+    };
+    var owner = try native.Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2, .checkpoint_budget = 1, .max_wait_ms = 5000 });
+    defer owner.close();
+    var execution: native.Execution = .{};
+    defer execution.finish();
+    const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    try execution.start(&owner, .{ .io = io, .native_now_ns = @import("antfly_platform").time.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23 }, .query);
+    var server: http_server.ApiHttpServer = undefined;
+    server.alloc = std.testing.allocator;
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution };
+    const borrow = adapter.providerRunnable().?;
+    try std.testing.expectError(error.InvalidReadFenceTransition, borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 }));
+    try adapter.beginReadFence();
+    defer adapter.endReadFence();
+    var malformed: runtime.runnable_abi.CpuBorrow = .{ .enabled = 1, .max_non_yield_ns = 1000 };
+    malformed.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrow.setCpuBorrow(&malformed));
+    malformed = .{ .enabled = 2, .max_non_yield_ns = 1000 };
+    try std.testing.expectError(error.InvalidArgument, borrow.setCpuBorrow(&malformed));
+    try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+    const generation = execution.resume_generation;
+    try borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 });
+    try std.testing.expectEqual(generation, execution.resume_generation);
+    var peer: native.Entry = .{ .options = .{ .io = io }, .class = .background, .cpu_borrow_budget = .{ .max_non_yield_ns = 1000 } };
+    try owner.submit(&peer);
+    defer owner.finish(&peer);
+    try std.testing.expect(borrow.checkpoint(borrow.context).isOk());
+    try std.testing.expect(execution.entry.?.borrowed_read_cpu);
+    var floor: native.Entry = .{ .options = .{ .io = io }, .class = .query, .read_lane = .bounded };
+    try owner.submit(&floor);
+    defer owner.finish(&floor);
+    try std.testing.expectEqual(native.State.running, owner.state(&floor));
+    var future = try io.concurrent(Worker.run, .{borrow});
+    defer future.cancel(io) catch {};
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+    while (owner.state(&execution.entry.?) != .queued) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.SqlCpuBorrowDisableDidNotWait;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(native.State.running, owner.state(&floor));
+    try std.testing.expectEqual(@as(usize, 0), owner.cpuBorrowStats().active);
+    owner.finish(&peer);
+    try future.await(io);
+    try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+    try std.testing.expectEqual(deadline, execution.entry.?.options.deadline_ns.?);
+    owner.finish(&floor);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
+    // Ending a stage must clear eligibility even when the foreground SQL
+    // context has expired independently of the retained execution deadline.
+    try borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 });
+    adapter.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, borrow.setCpuBorrow(&.{ .enabled = 0 }));
+    try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+    try std.testing.expectEqual(deadline, execution.entry.?.options.deadline_ns.?);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+}
+
+test "SQL CPU loan policy validation resumes captured numeric work under unchanged and revoked authority" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const local = @import("antfly_local_sources");
+    const native = http_server.RunnableScheduler;
+    const Prepared = local.sql_typed_kernel.PreparedNumeric;
+    const Partitioned = @import("../common/allocation_budget.zig").Partitioned;
+    const users_api = @import("../usermgr/mod.zig");
+    const casbin = @import("antfly_casbin");
+    const Mode = enum { success, cache_busy, catalog_changed, policy_changed, credential_revoked, policy_expanded };
+    const Clock = struct {
+        fn now() u64 {
+            return 0;
+        }
+    };
+    const Source = struct {
+        execution: *native.Execution,
+        resolves: std.atomic.Value(usize) = .init(0),
+        policies: std.atomic.Value(usize) = .init(0),
+        revision: std.atomic.Value(u64) = .init(19),
+        generation: std.atomic.Value(u64) = .init(2),
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"tenant":{"type":"keyword"}},"additionalProperties":false}}}}
+        ;
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.execution.entry.?.borrowed_read_cpu or self.execution.entry.?.cpu_borrow_budget != null) return error.InvalidRunnableTransition;
+            if (call == .policy_publication_status) {
+                try std.testing.expect(context.row_policy_install_authority);
+                _ = self.policies.fetchAdd(1, .acq_rel);
+                const generation = self.generation.load(.acquire);
+                const stamp: local.system_catalog_policies.PublicationStamp = .{ .table_id = 7, .schema_version = 1, .generation = generation, .catalog_epoch = if (generation == 2) 3 else 4, .phase = .active };
+                return std.json.Stringify.valueAlloc(alloc, stamp, .{});
+            }
+            if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
+            _ = self.resolves.fetchAdd(1, .acq_rel);
+            try std.testing.expectEqual(@as(usize, 1), call.resolve_many.targets.len);
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "private-7", .query_definition = .{ .table_id = 7, .schema_json = schema_json, .read_schema_json = "", .indexes_json = "{}" } }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = self.revision.load(.acquire), .tables = &tables }, .{});
+        }
+    };
+    const Input = struct {
+        count: usize = 64,
+        calls: *usize,
+        ordinal: u32,
+        pub fn cell(self: @This(), _: std.mem.Allocator, _: usize, ordinal: u32) !local.sql_scalar.Datum {
+            if (ordinal != self.ordinal) return error.InvalidSqlBackendResponse;
+            self.calls.* += 1;
+            return local.sql_scalar.Datum.json(.{ .integer = 41 });
+        }
+    };
+    const Worker = struct {
+        fn run(borrow: @import("antfly_runtime_abi").runnable_abi.Borrowed) !void {
+            try borrow.setCpuBorrow(&.{ .enabled = 0 });
+        }
+    };
+    inline for (.{ Mode.success, Mode.cache_busy, Mode.catalog_changed, Mode.policy_changed, Mode.credential_revoked, Mode.policy_expanded }) |mode| {
+        var store = users_api.MemoryStore.init(a);
+        defer store.deinit();
+        var policies = casbin.MemoryAdapter.init(a);
+        defer policies.deinit();
+        var users = try users_api.UserManager.init(a, store.iface(), try users_api.initDefaultEnforcer(a, policies.iface()));
+        defer users.deinit();
+        var permission = try users_api.Permission.initOwned(a, .table, "*", .read);
+        defer permission.deinit(a);
+        var user = try users.createUserWithMetadata("alice", "secret", &.{permission}, "{\"tenant\":\"initial\"}");
+        defer user.deinit(a);
+        try users.setRowFilter("alice", "docs", "{\"term\":{\"tenant\":\"initial\"}}");
+        const principal = try a.dupe(u8, "basic:alice");
+        defer a.free(principal);
+        var snapshot = try users.snapshotCredentialPolicies(principal);
+        defer snapshot.deinit(a);
+        var identity = try http_server.cloneCatalogIdentity(a, .{ .user_instance_id = snapshot.instance_id, .username = snapshot.policy.username, .credential_principal = principal, .permissions = snapshot.policy.permissions, .row_filter = snapshot.policy.row_filter, .metadata_json = snapshot.policy.metadata_json, .roles = snapshot.policy.roles, .live_user_manager = &users });
+        defer identity.?.deinit(a);
+        var scheduler = try native.Scheduler.init(.{ .slots = 5, .cleanup_slots = 1, .read_isolation = true, .bounded_read_slots = 2, .max_wait_ms = 5000 });
+        defer scheduler.close();
+        var execution: native.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 1000000, .retained_bytes = 23 }, .query);
+        var source: Source = .{ .execution = &execution };
+        var server = http_server.ApiHttpServer.init(a, .{ .auth_enabled = true, .user_manager = &users, .imported_runtime_io = .{ .api = io } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.resolve, .supports_query_definitions = true } }, null, null);
+        defer server.deinit();
+        var forced_cache_busy = false;
+        defer if (forced_cache_busy) {
+            server.sql_schema_cache.builds = 0;
+            for (server.sql_schema_cache.slots[0..4]) |*slot| slot.building = false;
+        };
+        try std.testing.expect(server.request_memory == null);
+        const memory = try a.create(Partitioned);
+        const scratch_bytes = Prepared.scratch_bytes + Partitioned.overhead(.of(Prepared));
+        const policy_bytes = 64 << 10;
+        const policy_charge = policy_bytes + Partitioned.overhead(.of(u8));
+        memory.* = .{ .foreground = .{ .child = a, .limit = scratch_bytes + policy_charge }, .control = .{ .child = a, .limit = 64 } };
+        server.request_memory = memory;
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution, .serial_execution = true };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const table = try Adapter.resolve(&adapter, arena.allocator(), .{ .table = "docs" }, .read);
+        try std.testing.expectEqual(@as(u64, 7), table.id);
+        try std.testing.expectEqual(@as(u64, 2), adapter.read_guard.?.tables.items[0].row_policy.?.generation);
+        const scope = adapter.coordinatorScope().?;
+        try std.testing.expect(adapter.cpuScope() == null);
+        const scalar_columns = try arena.allocator().alloc(local.sql_scalar.Column, table.columns.len);
+        for (table.columns, scalar_columns) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type };
+        const ordinal: u32 = for (scalar_columns, 0..) |column, index| {
+            if (std.mem.eql(u8, column.name, "n")) break @intCast(index);
+        } else return error.MissingNumericColumn;
+        var compiled = try local.sql_compiler.compileScalar(a, "n + 1", .{});
+        defer compiled.deinit();
+        var program = try local.sql_scalar.bind(a, compiled.expression, scalar_columns, &.{}, .{});
+        defer program.deinit();
+        const stage = (try Prepared.init(scope.allocator, &program)).?;
+        var stage_live = true;
+        defer if (stage_live) stage.deinit();
+        var input_calls: usize = 0;
+        try stage.prepare(Input{ .calls = &input_calls, .ordinal = ordinal }, &.{});
+        while (stage.next_instruction < program.root) try std.testing.expect((try stage.step()) == null);
+        try std.testing.expectEqual(.binary, std.meta.activeTag(stage.instructions[program.root].operation));
+        try std.testing.expectEqual(scratch_bytes, memory.foreground.stats().used_bytes);
+        const borrow = adapter.providerRunnable().?;
+        try std.testing.expectError(error.InvalidRunnableTransition, borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 }));
+        // Actual validation must succeed from the reserved region even while
+        // its foreground parent is completely occupied. No separate catalog
+        // allocator may hide an allocation escape in this schedule.
+        server.alloc = memory.allocator(false);
+        defer server.alloc = a;
+        try std.testing.expectError(error.OutOfMemory, adapter.reserveReadValidationMemory(1));
+        try std.testing.expect(adapter.read_policy_memory == null);
+        try std.testing.expectEqual(scratch_bytes, memory.foreground.stats().used_bytes);
+        try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+        try adapter.reserveReadValidationMemory(policy_bytes);
+        try std.testing.expectEqual(scratch_bytes + policy_charge, memory.foreground.stats().used_bytes);
+        try std.testing.expectError(error.OutOfMemory, scope.allocator.alloc(u8, 1));
+        // The former unreserved validation path cannot allocate at this heap
+        // pressure. The reservation must complete the same real validation.
+        try std.testing.expectError(error.OutOfMemory, adapter.read_guard.?.check(server.alloc, execution.resume_generation, true, .{ .ptr = &adapter, .check = Adapter.validateReadPins }));
+        try adapter.validateReadFence(true);
+        const control = try memory.allocator(true).alloc(u8, 1);
+        defer memory.allocator(true).free(control);
+        const resolves = source.resolves.load(.acquire);
+        const policy_calls = source.policies.load(.acquire);
+        const generation = execution.resume_generation;
+        var peer: native.Entry = .{ .options = .{ .io = io }, .class = .write, .bytes = 17 };
+        try scheduler.submit(&peer);
+        defer scheduler.finish(&peer);
+        try std.testing.expectEqual(native.State.queued, scheduler.state(&peer));
+        try borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 });
+        try std.testing.expect(execution.entry.?.borrowed_read_cpu);
+        try std.testing.expectEqual(native.State.running, scheduler.state(&peer));
+        try std.testing.expectEqual(generation, execution.resume_generation);
+        try std.testing.expectEqual(resolves, source.resolves.load(.acquire));
+        try std.testing.expectEqual(policy_calls, source.policies.load(.acquire));
+        var floor: native.Entry = .{ .options = .{ .io = io }, .class = .query, .read_lane = .bounded };
+        try scheduler.submit(&floor);
+        defer scheduler.finish(&floor);
+        try std.testing.expectEqual(native.State.running, scheduler.state(&floor));
+        // The actual addition computes private intermediate values on the same
+        // validated grant. It neither publishes output nor crosses an IO edge.
+        try std.testing.expect((try stage.step()) == null);
+        try std.testing.expectEqual(@as(usize, 64), input_calls);
+        try std.testing.expectEqual(scratch_bytes + policy_charge, memory.foreground.stats().used_bytes);
+        var future = try io.concurrent(Worker.run, .{borrow});
+        defer future.cancel(io) catch {};
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+        while (scheduler.state(&execution.entry.?) != .queued) {
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.CapturedStageDidNotReturnLoan;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(resolves, source.resolves.load(.acquire));
+        try std.testing.expectEqual(policy_calls, source.policies.load(.acquire));
+        try std.testing.expectEqual(native.State.running, scheduler.state(&floor));
+        switch (mode) {
+            .success => {},
+            .cache_busy => {
+                // Force the real uncached derivation path after warm preflight.
+                // These counters model four occupied builder slots; this is not
+                // an assertion about four independently running cache workers.
+                server.sql_schema_cache.deinit();
+                server.sql_schema_cache = .init(a);
+                server.sql_schema_cache.builds = 4;
+                for (server.sql_schema_cache.slots[0..4]) |*slot| slot.building = true;
+                forced_cache_busy = true;
+            },
+            .catalog_changed => source.revision.store(20, .release),
+            .policy_changed => source.generation.store(3, .release),
+            .credential_revoked => try users.removePermissionFromUser("alice", "*", .table),
+            .policy_expanded => {
+                // Live policy can grow after preflight. Its owned snapshot must
+                // refuse within the existing reservation, with no heap fallback.
+                const expanded = try a.alloc(u8, policy_bytes * 2);
+                defer a.free(expanded);
+                @memset(expanded, 'x');
+                const filter = try std.fmt.allocPrint(a, "{{\"term\":{{\"tenant\":\"{s}\"}}}}", .{expanded});
+                defer a.free(filter);
+                try users.setRowFilter("alice", "docs", filter);
+            },
+        }
+        scheduler.finish(&peer);
+        if (mode == .success or mode == .cache_busy) {
+            try future.await(io);
+            const output = (try stage.step()).?;
+            for (output) |value| try std.testing.expectEqual(@as(i64, 42), value.value.integer);
+            try std.testing.expectEqual(execution.resume_generation, adapter.read_guard.?.checked_generation.?);
+        } else try std.testing.expectError(switch (mode) {
+            .catalog_changed => error.CatalogGenerationChanged,
+            .policy_changed => error.RowPolicyCatalogChanged,
+            .credential_revoked => error.Forbidden,
+            .policy_expanded => error.OutOfMemory,
+            else => unreachable,
+        }, future.await(io));
+        if (mode == .policy_expanded) {
+            // A failed revalidation cannot cache authority or retain an active
+            // arena. The root and reservation stay owned until explicit finish.
+            try std.testing.expect(adapter.read_guard.?.checked_generation == null);
+            try std.testing.expect(!adapter.read_guard.?.validating);
+            try std.testing.expect(!adapter.read_policy_memory.?.active);
+            try std.testing.expectEqual(scratch_bytes + policy_charge, memory.foreground.stats().used_bytes);
+            const control_after_refusal = try memory.allocator(true).alloc(u8, 1);
+            memory.allocator(true).free(control_after_refusal);
+            try users.setRowFilter("alice", "docs", "{\"term\":{\"tenant\":\"initial\"}}");
+            // This only checks bounded arena reuse after failure. The failed
+            // operation's private numeric result is never exposed.
+            try adapter.validateReadFence(true);
+            try std.testing.expect(!adapter.read_policy_memory.?.active);
+            try std.testing.expectEqual(scratch_bytes + policy_charge, memory.foreground.stats().used_bytes);
+        }
+        try std.testing.expect(source.resolves.load(.acquire) > resolves);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.cpuBorrowStats().active);
+        try std.testing.expectEqual(@as(?native.CpuBorrowBudget, null), execution.entry.?.cpu_borrow_budget);
+        try std.testing.expectEqual(@as(u64, 1000000), execution.entry.?.options.deadline_ns.?);
+        scheduler.finish(&floor);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        stage.deinit();
+        stage_live = false;
+        try std.testing.expectEqual(policy_charge, memory.foreground.stats().used_bytes);
+        adapter.endReadFence();
+        try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    }
+}
+
+test "SQL CPU loan policy validation preflight never publishes reservations after original lifetime stops" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const native = http_server.RunnableScheduler;
+    const Partitioned = @import("../common/allocation_budget.zig").Partitioned;
+    const Mode = enum { expired, canceled, closed };
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const Signal = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    const Source = struct {
+        mode: Mode,
+        scheduler: *native.Scheduler,
+        canceled: *bool,
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .policy_publication_status) {
+                const result = try alloc.dupe(u8, "null");
+                switch (self.mode) {
+                    .expired => Clock.tick = 100,
+                    .canceled => self.canceled.* = true,
+                    .closed => self.scheduler.close(),
+                }
+                return result;
+            }
+            if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
+            const schema_json =
+                \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+            ;
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "private-7", .query_definition = .{ .table_id = 7, .schema_json = schema_json, .read_schema_json = "", .indexes_json = "{}" } }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 19, .tables = &tables }, .{});
+        }
+    };
+    inline for (.{ Mode.expired, Mode.canceled, Mode.closed }) |mode| {
+        Clock.tick = 0;
+        var canceled = false;
+        var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: native.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = Signal.requested } }, .query);
+        var source: Source = .{ .mode = mode, .scheduler = &scheduler, .canceled = &canceled };
+        var server = http_server.ApiHttpServer.init(a, .{ .imported_runtime_io = .{ .api = io } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.resolve } }, null, null);
+        defer server.deinit();
+        const memory = try a.create(Partitioned);
+        const bytes = 64 << 10;
+        memory.* = .{ .foreground = .{ .child = a, .limit = bytes + Partitioned.overhead(.of(u8)) }, .control = .{ .child = a, .limit = 64 } };
+        server.request_memory = memory;
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        // The SQL context intentionally has independent clocks/tokens. The
+        // original execution must still fence the post-validation handoff.
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        try adapter.read_guard.?.capture(.{ .database = "default", .namespace = "public", .name = "docs", .physical = "private-7", .id = 7, .schema_version = 1, .catalog_revision = 19, .filter = null });
+        const expected = switch (mode) {
+            .expired => error.DeadlineExceeded,
+            .canceled => error.Canceled,
+            .closed => error.SchedulerClosed,
+        };
+        try std.testing.expectError(expected, adapter.reserveReadValidationMemory(bytes));
+        try std.testing.expect(adapter.read_policy_memory == null);
+        try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(u64, 100), execution.entry.?.options.deadline_ns.?);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    }
+}
+
+test "SQL CPU loan policy validation fences original lifetime after metadata and cached checks" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const native = http_server.RunnableScheduler;
+    const Partitioned = @import("../common/allocation_budget.zig").Partitioned;
+    const Mode = enum { expired, canceled, closed };
+    const Phase = enum { forced, cached, cpu_return };
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const Signal = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    const Source = struct {
+        mode: Mode,
+        scheduler: *native.Scheduler,
+        canceled: *bool,
+        stop_on_policy: bool = false,
+        fn stop(self: *@This()) void {
+            switch (self.mode) {
+                .expired => Clock.tick = 100,
+                .canceled => self.canceled.* = true,
+                .closed => self.scheduler.close(),
+            }
+        }
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .policy_publication_status) {
+                const result = try alloc.dupe(u8, "null");
+                if (self.stop_on_policy) self.stop();
+                return result;
+            }
+            if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
+            const schema_json =
+                \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+            ;
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "private-7", .query_definition = .{ .table_id = 7, .schema_json = schema_json, .read_schema_json = "", .indexes_json = "{}" } }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 19, .tables = &tables }, .{});
+        }
+    };
+    inline for (.{ Phase.forced, Phase.cached, Phase.cpu_return }) |phase| {
+        inline for (.{ Mode.expired, Mode.canceled, Mode.closed }) |mode| {
+            Clock.tick = 0;
+            var canceled = false;
+            var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+            defer scheduler.close();
+            var execution: native.Execution = .{};
+            defer execution.finish();
+            try execution.start(&scheduler, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = Signal.requested } }, .query);
+            var source: Source = .{ .mode = mode, .scheduler = &scheduler, .canceled = &canceled };
+            var server = http_server.ApiHttpServer.init(a, .{ .imported_runtime_io = .{ .api = io } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.resolve } }, null, null);
+            defer server.deinit();
+            const memory = try a.create(Partitioned);
+            const bytes = 64 << 10;
+            memory.* = .{ .foreground = .{ .child = a, .limit = bytes + Partitioned.overhead(.of(u8)) }, .control = .{ .child = a, .limit = 64 } };
+            server.request_memory = memory;
+            var identity: ?http_server.AuthenticatedIdentity = null;
+            // The SQL context intentionally has independent clocks/tokens. The
+            // original execution must still fence the post-validation handoff.
+            var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution };
+            try adapter.beginReadFence();
+            defer adapter.endReadFence();
+            try adapter.read_guard.?.capture(.{ .database = "default", .namespace = "public", .name = "docs", .physical = "private-7", .id = 7, .schema_version = 1, .catalog_revision = 19, .filter = null });
+            const expected = switch (mode) {
+                .expired => error.DeadlineExceeded,
+                .canceled => error.Canceled,
+                .closed => error.SchedulerClosed,
+            };
+            try adapter.reserveReadValidationMemory(bytes);
+            const charge = bytes + Partitioned.overhead(.of(u8));
+            try std.testing.expectEqual(charge, memory.foreground.stats().used_bytes);
+            const borrow = adapter.providerRunnable().?;
+            if (phase == .cpu_return) try borrow.setCpuBorrow(&.{ .enabled = 1, .max_non_yield_ns = 1000 });
+            if (phase == .cached) source.stop() else source.stop_on_policy = true;
+            const outcome = if (phase == .cpu_return)
+                borrow.setCpuBorrow(&.{ .enabled = 0 })
+            else
+                adapter.validateReadFence(phase == .forced);
+            try std.testing.expectError(expected, outcome);
+            try std.testing.expect(adapter.read_guard.?.checked_generation == null);
+            try std.testing.expect(!adapter.read_guard.?.validating);
+            try std.testing.expect(!adapter.read_policy_memory.?.active);
+            try std.testing.expect(execution.entry.?.cpu_borrow_budget == null);
+            try std.testing.expectEqual(charge, memory.foreground.stats().used_bytes);
+            adapter.endReadFence();
+            try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+            try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+            try std.testing.expectEqual(@as(u64, 100), execution.entry.?.options.deadline_ns.?);
+            execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        }
+    }
+}
+
+test "SQL prepared numeric serial owner bundles scratch with original CPU and preserves fallback and cancellation" {
+    const a = std.testing.allocator;
+    const Budget = @import("../common/allocation_budget.zig");
+    const Prepared = @import("antfly_local_sources").sql_typed_kernel.PreparedNumeric;
+    const Mode = enum { success, busy, denied, unsupported, canceled, expired, metadata_oom, backing_oom, partition_denied, missing_cap };
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const Node = struct {
+        mode: Mode,
+        used: usize = 0,
+        peak: usize = 0,
+        attempts: usize = 0,
+        signal: *std.atomic.Value(bool),
+        fn reserve(raw: *anyopaque, bytes: usize) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.used += bytes;
+            self.peak = @max(self.peak, self.used);
+            return true;
+        }
+        fn attempt(raw: *anyopaque, bytes: usize) callconv(.c) Budget.Accounting.TryReserve {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts += 1;
+            switch (self.mode) {
+                .busy => return .busy,
+                .denied => return .denied,
+                .unsupported => return .unsupported,
+                .canceled => self.signal.store(true, .release),
+                .expired => Clock.tick = 100,
+                .success, .metadata_oom, .backing_oom, .partition_denied, .missing_cap => {},
+            }
+            _ = reserve(raw, bytes);
+            return .reserved;
+        }
+        fn release(raw: *anyopaque, bytes: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.used -= bytes;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    var compiled = try @import("antfly_local_sources").sql_compiler.compileScalar(a, "n * 2 + 1", .{});
+    defer compiled.deinit();
+    const columns = [_]@import("antfly_local_sources").sql_scalar.Column{.{ .name = "n", .type = .integer }};
+    var program = try @import("antfly_local_sources").sql_scalar.bind(a, compiled.expression, &columns, &.{}, .{});
+    defer program.deinit();
+    const page: catalog.ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{.{ .relational_key = "r" }}, .columns = &.{.{ .name = "n", .values = .{ .i64 = &.{7} } }} }, .selection = &.{0} };
+    for (std.enums.values(Mode)) |mode| {
+        Clock.tick = 0;
+        var signal: std.atomic.Value(bool) = .init(false);
+        var node: Node = .{ .mode = mode, .signal = &signal };
+        var backing = std.testing.FailingAllocator.init(a, .{ .fail_index = if (mode == .metadata_oom) 0 else if (mode == .backing_oom) 1 else std.math.maxInt(usize) });
+        const metadata = @sizeOf(Adapter.NumericScratch) + Budget.Partitioned.overhead(.of(Adapter.NumericScratch));
+        var memory: Budget.Partitioned = .{ .foreground = .{ .child = backing.allocator(), .limit = if (mode == .partition_denied) metadata else 1 << 20, .accounting = .{ .ptr = &node, .reserve_fn = Node.reserve, .try_reserve_fn = if (mode == .missing_cap) null else Node.attempt, .release_fn = Node.release } }, .control = .{ .child = a, .limit = 64 } };
+        var server: http_server.ApiHttpServer = undefined;
+        server.alloc = a;
+        server.request_memory = &memory;
+        server.embedding_provider_runtime.io = std.testing.io;
+        var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: http_server.RunnableScheduler.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 72, .cancellation = .{ .ptr = &signal, .requested = Node.canceled } }, .query);
+        defer execution.finish();
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution, .serial_execution = true };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        const grants = scheduler.stats().grants[@backingInt(http_server.RunnableScheduler.Class.query)];
+        const evaluated = @import("antfly_local_sources").sql_vector_eval.evaluateColumnsWithScopes(a, &program, page, &columns, &.{}, null, null, adapter.coordinatorScope());
+        if (mode == .canceled or mode == .expired) {
+            try std.testing.expectError(if (mode == .canceled) error.Canceled else error.DeadlineExceeded, evaluated);
+        } else {
+            const values = (try evaluated).?;
+            defer a.free(values);
+            try std.testing.expectEqual(@as(i64, 15), values[0].value.integer);
+            try std.testing.expectEqual(grants + @as(u64, if (mode == .metadata_oom) 0 else 1), scheduler.stats().grants[@backingInt(http_server.RunnableScheduler.Class.query)]);
+        }
+        const attempted: usize = if (mode == .metadata_oom or mode == .partition_denied or mode == .missing_cap) 0 else 1;
+        const reserved = mode == .success or mode == .canceled or mode == .expired or mode == .backing_oom;
+        // Metadata accounting precedes the physical allocation attempt,
+        // including a backing OOM which rolls that charge back.
+        const expected_peak = metadata + @as(usize, if (reserved) Prepared.scratch_bytes else 0);
+        try std.testing.expectEqual(expected_peak, node.peak);
+        try std.testing.expectEqual(attempted, node.attempts);
+        try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+        try std.testing.expectEqual(@as(usize, 0), node.used);
+        try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 72), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(?u64, 100), execution.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+        try std.testing.expect(execution.entry.?.pending_resources == null);
+        // Dispatch after retirement must never call the temporary ticket again.
+        scheduler.notifyResourceProgress();
+        try std.testing.expectEqual(attempted, node.attempts);
+    }
+}
+
+test "SQL grouped coordinator scratch preserves exact batches and row fallback under original authority" {
+    const local = @import("antfly_local_sources");
+    const Budget = @import("../common/allocation_budget.zig");
+    const Groups = local.sql_operators.Grouped;
+    const Datum = local.sql_scalar.Datum;
+    const Mode = enum { success, denied, backing_oom, canceled, expired, hash_canceled, estimate_canceled };
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    const count = 64;
+    const scratch_bytes = comptime Groups.batchScratchBytes(count, false).?;
+    const metadata = @sizeOf(Adapter.NumericScratch) + Budget.Partitioned.overhead(.of(Adapter.NumericScratch));
+    const Node = struct {
+        mode: Mode,
+        signal: *std.atomic.Value(bool),
+        backing: *std.testing.FailingAllocator,
+        metadata_bytes: usize,
+        used: usize = 0,
+        peak: usize = 0,
+        attempts: usize = 0,
+        physical_retirement_checked: bool = false,
+        fn reserve(raw: *anyopaque, bytes: usize) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.used += bytes;
+            self.peak = @max(self.peak, self.used);
+            return true;
+        }
+        fn attempt(raw: *anyopaque, bytes: usize) callconv(.c) Budget.Accounting.TryReserve {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(bytes == scratch_bytes);
+            self.attempts += 1;
+            switch (self.mode) {
+                .denied => return .denied,
+                .canceled => self.signal.store(true, .release),
+                .expired => Clock.tick = 100,
+                else => {},
+            }
+            _ = reserve(raw, bytes);
+            return .reserved;
+        }
+        fn release(raw: *anyopaque, bytes: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (bytes == scratch_bytes) {
+                // Only the ticket's metadata may remain physically allocated
+                // when the fixed vector reservation is returned to the node.
+                std.debug.assert(self.backing.allocated_bytes - self.backing.freed_bytes == self.metadata_bytes);
+                self.physical_retirement_checked = true;
+            }
+            self.used -= bytes;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const a = std.testing.allocator;
+    const specs = [_]local.sql_operators.AggregateSpec{ .{ .kind = .count, .input_type = .integer }, .{ .kind = .sum, .input_type = .integer } };
+    const key = Datum.json(.{ .integer = 7 });
+    const value = Datum.json(.{ .integer = 9007199254740993 });
+    const keys: [count]Datum = @splat(key);
+    const values: [count]Datum = @splat(value);
+    const indices: [count]u32 = @splat(0);
+    const Batch = local.sql_execution_batch.Batch;
+    const encoded_key: Batch = .{ .dictionary = .{ .values = &.{key}, .indices = &indices } };
+    const encoded_value: Batch = .{ .dictionary = .{ .values = &.{value}, .indices = &indices } };
+    for ([_]bool{ false, true }) |encoded| for (std.enums.values(Mode)) |mode| {
+        Clock.tick = 0;
+        var signal: std.atomic.Value(bool) = .init(false);
+        var backing = std.testing.FailingAllocator.init(a, .{ .fail_index = if (mode == .backing_oom) 1 else std.math.maxInt(usize) });
+        var node: Node = .{ .mode = mode, .signal = &signal, .backing = &backing, .metadata_bytes = metadata };
+        var memory: Budget.Partitioned = .{ .foreground = .{ .child = backing.allocator(), .limit = 1 << 20, .accounting = .{ .ptr = &node, .reserve_fn = Node.reserve, .try_reserve_fn = Node.attempt, .release_fn = Node.release } }, .control = .{ .child = a, .limit = 64 } };
+        var server: http_server.ApiHttpServer = undefined;
+        server.alloc = a;
+        server.request_memory = &memory;
+        server.embedding_provider_runtime.io = std.testing.io;
+        var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: http_server.RunnableScheduler.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 72, .cancellation = .{ .ptr = &signal, .requested = Node.canceled } }, .query);
+        defer execution.finish();
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution, .serial_execution = true };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        const HashCheck = struct {
+            adapter: *Adapter,
+            node: *Node,
+            signal: *std.atomic.Value(bool),
+            triggered: bool = false,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.node.mode == .estimate_canceled or (self.node.mode == .hash_canceled and self.node.backing.allocated_bytes - self.node.backing.freed_bytes == self.node.metadata_bytes + scratch_bytes)) {
+                    // Estimation stops before reservation; the later hash
+                    // mode stops only when the vector is physically live.
+                    std.debug.assert(self.node.backing.allocated_bytes - self.node.backing.freed_bytes == (if (self.node.mode == .estimate_canceled) @as(usize, 0) else self.node.metadata_bytes + scratch_bytes));
+                    self.triggered = true;
+                    self.signal.store(true, .release);
+                }
+                try Adapter.checkpoint(self.adapter);
+            }
+        };
+        var hash_check: HashCheck = .{ .adapter = &adapter, .node = &node, .signal = &signal };
+        var scope = adapter.coordinatorScope().?;
+        scope.check = .{ .context = &hash_check, .check = HashCheck.check };
+        const group = try Groups.create(a, &specs, .{ .coordinator_scope = scope });
+        defer group.deinit();
+        const result = if (encoded) group.addEncodedColumns(&.{encoded_key}, &.{ encoded_value, encoded_value }, count) else group.addColumns(&.{&keys}, &.{ &values, &values }, count);
+        if (mode == .canceled or mode == .expired or mode == .hash_canceled or mode == .estimate_canceled) {
+            try std.testing.expectError(if (mode == .expired) error.DeadlineExceeded else error.Canceled, result);
+            try std.testing.expectEqual(@as(u64, 0), group.rows_seen);
+            try std.testing.expectEqual(@as(usize, 0), group.groups.items.len);
+        } else {
+            try result;
+            const reference = try Groups.create(a, &specs, .{});
+            defer reference.deinit();
+            for (0..count) |_| try reference.add(&.{key}, &.{ value, value });
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const actual = try group.resultAt(arena.allocator(), 0);
+            const expected = try reference.resultAt(arena.allocator(), 0);
+            try std.testing.expectEqualDeep(expected.keys, actual.keys);
+            try std.testing.expectEqualDeep(expected.aggregates, actual.aggregates);
+            try std.testing.expectEqual(@as(u64, count), group.rows_seen);
+        }
+        try std.testing.expectEqual(mode == .hash_canceled or mode == .estimate_canceled, hash_check.triggered);
+        try std.testing.expectEqual(@as(usize, if (mode == .estimate_canceled) 0 else 1), node.attempts);
+        try std.testing.expectEqual(if (mode == .estimate_canceled) @as(usize, 0) else metadata + @as(usize, if (mode == .denied) 0 else scratch_bytes), node.peak);
+        try std.testing.expectEqual(mode != .denied and mode != .estimate_canceled, node.physical_retirement_checked);
+        try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+        try std.testing.expectEqual(@as(usize, 0), node.used);
+        try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 72), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(?u64, 100), execution.entry.?.options.deadline_ns);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    };
+}
+
 test "SQL pgwire native read cursor keeps transported JSON encoded through column pages and retires cache owners" {
     const Sources = @import("antfly_local_sources");
     const View = Sources.storage_relational_read_view.View;
@@ -4782,8 +6244,9 @@ test "SQL pgwire native read cursor keeps transported JSON encoded through colum
     const layout = try catalog.Row.TypedLayout.init(sa, &.{"j"});
     const encoded_page = try Payload.encodeVersion(sa, 1, &.{.{ .id = "key", .version = 1, .schema_version = 3, .value = .null, .typed_cells = .{ .layout = layout, .values = &.{Sources.sql_scalar.Datum.json(json)} } }}, null, .v2);
     var fixture: Fixture = .{ .bytes = encoded_page };
-    var adapter: Adapter = undefined;
-    adapter.context = .{};
+    // Page delivery still crosses the normal checkpoint and admission path.
+    // This fixture has no server/catalog work and no retained read fence.
+    var adapter: Adapter = .{ .server = undefined, .identity = undefined, .context = .{} };
     const table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 3, .columns = &.{.{ .name = "j", .path = "j", .type = .json }} };
     var projection = try Sources.sql_document_row.Projection.init(a, table, &.{"j"});
     defer projection.deinit(a);

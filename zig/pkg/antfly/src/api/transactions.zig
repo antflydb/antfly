@@ -1855,7 +1855,7 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
             return err;
         };
-        self.sessions.ensureUnusedCapacity(alloc, 1) catch |err| {
+        self.ensurePublicationCapacityLocked(alloc) catch |err| {
             self.mutex.unlock();
             return err;
         };
@@ -3283,10 +3283,11 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
             return;
         }
-        self.sessions.put(alloc, txn_id, candidate.*) catch |err| {
+        self.ensurePublicationCapacityLocked(alloc) catch |err| {
             self.mutex.unlock();
             return err;
         };
+        self.sessions.putAssumeCapacity(txn_id, candidate.*);
         candidate.* = undefined;
         self.mutex.unlock();
     }
@@ -3307,7 +3308,18 @@ pub const SessionRegistry = struct {
     fn ensureSessionCapacityLocked(self: *SessionRegistry) !void {
         const limit = self.max_sessions orelse return;
         const count = if (self.durable != null) self.known_durable_session_count orelse return error.SessionCapacityUnavailable else self.sessions.count();
-        if (count + self.reserved_session_count >= limit) return error.SessionLimitExceeded;
+        if (count >= limit or self.reserved_session_count >= limit - count) return error.SessionLimitExceeded;
+    }
+
+    /// Every new insertion preserves slots promised to BEGINs persisting
+    /// outside this mutex. ensureUnusedCapacity(1) alone does not reserve a
+    /// slot: another BEGIN, lazy load or adoption could consume the same one.
+    /// Reserve before persistence so BEGIN's final publication cannot allocate.
+    fn ensurePublicationCapacityLocked(self: *SessionRegistry, alloc: std.mem.Allocator) !void {
+        const pending = std.math.cast(u32, self.reserved_session_count) orelse return error.OutOfMemory;
+        const additional = std.math.add(u32, pending, 1) catch return error.OutOfMemory;
+        const total = std.math.add(u32, self.sessions.count(), additional) catch return error.OutOfMemory;
+        try self.sessions.ensureTotalCapacity(alloc, total);
     }
 
     fn initializeDurableSessionCount(self: *SessionRegistry) !void {
@@ -3348,7 +3360,8 @@ pub const SessionRegistry = struct {
             loaded_owned = false;
             return try session.clone(alloc);
         }
-        try self.sessions.put(alloc, txn_id, loaded);
+        try self.ensurePublicationCapacityLocked(alloc);
+        self.sessions.putAssumeCapacity(txn_id, loaded);
         loaded_owned = false;
         return try self.sessions.getPtr(txn_id).?.clone(alloc);
     }
@@ -6244,6 +6257,119 @@ test "terminal commit response preserves live debt ahead of repair" {
     );
 }
 
+// Inject a second public operation at the durable allocator boundary, after
+// BEGIN releases its mutex but before it can publish. This deterministically
+// exercises an allowed interleaving without concurrent backend transactions.
+const SessionPublicationInterleaving = struct {
+    registry: *SessionRegistry,
+    action: enum { begin, load, adopt },
+    durable_id: db_mod.types.TxnId,
+    armed: bool = false,
+    abort_outer: bool = true,
+    fired: bool = false,
+    preserved: bool = false,
+    failure: ?anyerror = null,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn interleave(self: *@This()) !void {
+        switch (self.action) {
+            .begin => {
+                _ = try self.registry.begin(std.testing.allocator, .{ .sync_level = .write }, 2);
+            },
+            .load => {
+                var details = (try self.registry.getDetails(std.testing.allocator, self.durable_id)) orelse return error.MissingSession;
+                defer details.deinit(std.testing.allocator);
+            },
+            .adopt => if (!(try self.registry.adopt(std.testing.allocator, self.durable_id, 3))) return error.MissingSession,
+        }
+    }
+
+    fn allocate(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.armed) {
+            self.armed = false;
+            self.fired = true;
+            self.interleave() catch |err| {
+                self.failure = err;
+                return null;
+            };
+            self.registry.mutex.lock();
+            self.preserved = self.registry.sessions.available >= self.registry.reserved_session_count;
+            self.registry.mutex.unlock();
+            // Stop before putAssumeCapacity on the unfixed implementation;
+            // observe the lost reservation instead of crashing the runner.
+            if (self.abort_outer) return null;
+        }
+        return std.testing.allocator.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+        return std.testing.allocator.rawResize(memory, alignment, len, ret_addr);
+    }
+    fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+        return std.testing.allocator.rawRemap(memory, alignment, len, ret_addr);
+    }
+    fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        std.testing.allocator.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+fn exerciseSessionPublicationInterleaving(action: @FieldType(SessionPublicationInterleaving, "action")) !void {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    var writer = SessionRegistry.init(&durable);
+    defer writer.deinit(alloc);
+    const uncached = try writer.begin(alloc, .{ .sync_level = .write }, 9);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(alloc);
+    // Leave exactly one publication slot, shared by the two overlapping calls.
+    while (registry.sessions.available != 1) {
+        _ = try registry.begin(alloc, .{ .sync_level = .write }, 1);
+    }
+    var hook: SessionPublicationInterleaving = .{ .registry = &registry, .action = action, .durable_id = uncached.txn_id };
+    durable.alloc = hook.allocator();
+    hook.armed = true;
+    try std.testing.expectError(error.OutOfMemory, registry.begin(alloc, .{ .sync_level = .write }, 1));
+    if (hook.failure) |err| return err;
+    try std.testing.expect(hook.fired);
+    try std.testing.expect(hook.preserved);
+    try std.testing.expectEqual(@as(usize, 0), registry.reserved_session_count);
+    try std.testing.expectEqual(try durable.sessionCount(), registry.known_durable_session_count.?);
+
+    // Exercise successful durable handoff too, including a fresh uncached ID.
+    const another = try writer.begin(alloc, .{ .sync_level = .write }, 9);
+    hook.durable_id = another.txn_id;
+    hook.abort_outer = false;
+    hook.armed = true;
+    hook.fired = false;
+    const outer = try registry.begin(alloc, .{ .sync_level = .write }, 1);
+    if (hook.failure) |err| return err;
+    try std.testing.expect(hook.fired and hook.preserved);
+    try std.testing.expect(registry.getInfo(outer.txn_id) != null);
+    var persisted = (try durable.load(outer.txn_id)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), registry.reserved_session_count);
+}
+
+test "durable session publication protects pending BEGIN slots from another BEGIN" {
+    try exerciseSessionPublicationInterleaving(.begin);
+}
+
+test "durable session publication protects pending BEGIN slots from lazy loading" {
+    try exerciseSessionPublicationInterleaving(.load);
+}
+
+test "durable session publication protects pending BEGIN slots from ownership adoption" {
+    try exerciseSessionPublicationInterleaving(.adopt);
+}
+
 test "durable session limits bound count and encoded record size" {
     var backend = mem_backend.Backend.init(std.testing.allocator, .{});
     defer backend.close();
@@ -6642,11 +6768,17 @@ test "transaction session registry renews and releases separate lease records" {
     const initial_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expect(initial_status.lease_expires_at > 0);
 
-    std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     _ = (try registry.createSavepoint(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
 
     const renewed_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
-    try std.testing.expect(renewed_status.lease_expires_at > initial_status.lease_expires_at);
+    // Savepoint renewal may occur within the same millisecond as BEGIN.
+    try std.testing.expect(renewed_status.lease_expires_at >= initial_status.lease_expires_at);
+    // The public maintenance path accepts an explicit time; prove advancement
+    // and exact persisted expiry without depending on scheduler sleep duration.
+    const renewal_time = renewed_status.lease_expires_at;
+    try std.testing.expectEqual(@as(usize, 1), try registry.renewOwnedLeases(15, renewal_time));
+    const advanced_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(renewal_time + 10 * std.time.ns_per_ms, advanced_status.lease_expires_at);
 
     try std.testing.expect(registry.remove(std.testing.allocator, session.txn_id));
     try std.testing.expect((try lease_store.load(std.testing.allocator, session.txn_id)) == null);

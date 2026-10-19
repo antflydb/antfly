@@ -456,6 +456,10 @@ pub const ColumnPage = struct {
     /// Declared NUMERIC reads fixed coefficients directly. Raw callers retain
     /// the established exact string contract for detected decimal columns.
     pub fn typedCell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8, numeric: bool) !Row.Cell {
+        return self.typedCellControlled(alloc, row, name, numeric, null);
+    }
+    pub fn typedCellControlled(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8, numeric: bool, control: ?@import("operator_work.zig").Control) !Row.Cell {
+        try @import("operator_work.zig").poll(control);
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         if (numeric and self.native == null) if (self.batch.findColumn(name)) |column| {
             const index = self.selection[row];
@@ -471,7 +475,7 @@ pub const ColumnPage = struct {
                 return @import("scalar.zig").Datum.typedNumeric(value);
             }
         };
-        return self.cell(alloc, row, name);
+        return self.cellControlled(alloc, row, name, control);
     }
     pub fn frozenJson(self: ColumnPage, row: usize, name: []const u8) !?@import("execution_batch.zig").FrozenJson {
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
@@ -488,12 +492,16 @@ pub const ColumnPage = struct {
         return null;
     }
     pub fn cell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8) !Row.Cell {
+        return self.cellControlled(alloc, row, name, null);
+    }
+    pub fn cellControlled(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8, control: ?@import("operator_work.zig").Control) !Row.Cell {
+        try @import("operator_work.zig").poll(control);
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         const index = self.selection[row];
         if (self.native) |native| {
             if (index >= native.values.len() or native.names.len != native.values.width()) return error.InvalidSqlBackendResponse;
             for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) {
-                const value = try native.values.cell(alloc, index, ordinal);
+                const value = try native.values.cellControlled(alloc, index, ordinal, control);
                 return value;
             };
             return .{ .value = .null, .sql_null = true };
@@ -511,7 +519,7 @@ pub const ColumnPage = struct {
             .bool => |values| .{ .bool = values[index] },
             .bytes => |values| .{ .string = values[index] },
             .dictionary_bytes => |values| .{ .string = values.at(index) },
-            .json => |values| try std.json.parseFromSliceLeaky(std.json.Value, alloc, values[index], .{ .allocate = .alloc_always, .parse_numbers = false }),
+            .json => |values| try @import("controlled_json_text.zig").parseLeaky(alloc, values[index], control),
             .decimal128 => |values| .{ .string = try values.text(alloc, index) },
             .vector_f32 => return error.UnsupportedSqlExecution,
         };
@@ -864,6 +872,9 @@ pub const Backend = struct {
     /// Independent scheduler children for pure kernels over immutable columns.
     /// This does not enable concurrent access to this backend's mutable state.
     cpu_scope: ?@import("parallel_scheduler.zig").ExecutionScope = null,
+    /// Inline coordinator kernels may checkpoint without allowing child tasks.
+    /// Keep serial/session-affine frontends independent of fan-out capability.
+    coordinator_scope: ?@import("parallel_scheduler.zig").CoordinatorScope = null,
     /// Serial spill I/O is independent of parallel compute ownership. A
     /// scheduled single-worker adapter can retain spilling without launching
     /// children that share its mutable execution capsule.

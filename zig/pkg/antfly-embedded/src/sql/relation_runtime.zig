@@ -723,6 +723,20 @@ fn Engine(comptime Context: type) type {
         outer_values: [32]?[]const Datum = @splat(null),
         outer_replays: [32]std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = @splat(.empty),
 
+        fn workControl(self: *Self) @import("operator_work.zig").Control {
+            return .{
+                .ptr = self,
+                .checkpoint = struct {
+                    fn check(raw: ?*anyopaque) !void {
+                        const engine: *Self = @ptrCast(@alignCast(raw.?));
+                        // Byte polls preserve the statement's CPU/cancellation
+                        // identity without counting each chunk as a logical row.
+                        try engine.context.checkpoint();
+                    }
+                }.check,
+            };
+        }
+
         pub fn checkpoint(self: *Self) !void {
             try self.context.checkpoint();
             self.work += 1;
@@ -2042,7 +2056,7 @@ fn Engine(comptime Context: type) type {
                 const native_values = if (batch == .columns) blk: {
                     const pointers = try a.alloc(*const scalar.Program, programs.len);
                     for (programs, pointers) |*program, *pointer| pointer.* = program;
-                    break :blk @import("vector_eval.zig").evaluateColumnsManyWithScope(a, pointers, batch.columns.page, batch.columns.definitions, self.engine.context.parameters, self.engine.context.backend.execution_io, self.engine.context.backend.cpu_scope) catch |err| {
+                    break :blk @import("vector_eval.zig").evaluateColumnsManyWithScopes(a, pointers, batch.columns.page, batch.columns.definitions, self.engine.context.parameters, self.engine.context.backend.execution_io, self.engine.context.backend.cpu_scope, self.engine.context.backend.coordinator_scope) catch |err| {
                         if (errors == null) return err;
                         break :blk null;
                     };
@@ -2434,7 +2448,7 @@ fn Engine(comptime Context: type) type {
                 };
                 if (self.partition_join != null) return;
                 if (self.hash_join == null) {
-                    self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes, .spill = self.engine.context.spill });
+                    self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes, .spill = self.engine.context.spill, .control = self.engine.workControl() });
                     if (!shared and kind != .left and kind != .full) try self.prepareScanFilter(if (self.flipped_join) join.right_keys else join.left_keys);
                     var scratch = std.heap.ArenaAllocator.init(self.engine.context.alloc);
                     defer scratch.deinit();
@@ -2576,7 +2590,7 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .cpu_scope = self.engine.context.backend.cpu_scope, .spill_io = self.engine.context.backend.spill_io, .spill_wait = self.engine.context.backend.spill_wait, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
+                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .cpu_scope = self.engine.context.backend.cpu_scope, .coordinator_scope = self.engine.context.backend.coordinator_scope, .spill_io = self.engine.context.backend.spill_io, .spill_wait = self.engine.context.backend.spill_wait, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
             }
             fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));

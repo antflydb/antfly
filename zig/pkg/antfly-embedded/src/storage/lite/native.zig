@@ -26,7 +26,7 @@ const Crc32 = @import("antfly_hash").Crc32;
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
+const OwnedIo = @import("../owned_io.zig").Owner;
 const resource_manager_mod = @import("../resource_manager.zig");
 const maintenance = @import("../maintenance.zig");
 pub const allocator_v4 = @import("allocator_v4.zig");
@@ -2470,14 +2470,16 @@ pub const OpenOptions = struct {
 };
 
 pub const PathWriterLock = struct {
-    io_impl: std.Io.Threaded,
+    io_impl: *std.Io.Threaded,
+    owned_io: ?*OwnedIo = null,
     borrowed_io: ?std.Io = null,
     file: std.Io.File,
 
     pub fn close(self: *PathWriterLock) void {
-        const io = self.borrowed_io orelse self.io_impl.io();
+        if (self.owned_io) |owner| owner.join();
+        const io = self.borrowed_io orelse std.Io.Threaded.global_single_threaded.io();
         self.file.close(io);
-        if (self.borrowed_io == null) self.io_impl.deinit();
+        if (self.owned_io) |owner| owner.destroy();
         self.* = undefined;
     }
 };
@@ -3324,7 +3326,9 @@ pub const NativeFile = struct {
     /// constructors leave it undefined and retain `borrowed_io` instead. This
     /// keeps the production convenience API while making the complete Lite
     /// file lifecycle executable by deterministic std.Io implementations.
-    io_impl: std.Io.Threaded,
+    io_impl: *std.Io.Threaded,
+    owned_io: ?*OwnedIo = null,
+    resource_lifetime: ?*resource_manager_mod.SharedResourceManager = null,
     borrowed_io: ?std.Io = null,
     path: []u8,
     file: std.Io.File,
@@ -3411,27 +3415,28 @@ pub const NativeFile = struct {
     }
 
     pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !NativeFile {
-        var io_impl = threaded_io_limits.initService(allocator);
-        errdefer io_impl.deinit();
-        return try openWithRuntime(allocator, path, opts, io_impl, null);
+        const owner = try OwnedIo.create(allocator, opts.resource_manager);
+        errdefer owner.destroy();
+        return try openWithRuntime(allocator, path, opts, owner, null);
     }
 
     /// Opens a Lite file using a caller-owned std.Io runtime. The runtime must
     /// outlive the returned file. No native thread or host-I/O escape is
     /// created by this path.
     pub fn openWithIo(allocator: Allocator, io: std.Io, path: []const u8, opts: OpenOptions) !NativeFile {
-        return try openWithRuntime(allocator, path, opts, undefined, io);
+        return try openWithRuntime(allocator, path, opts, null, io);
     }
 
     fn openWithRuntime(
         allocator: Allocator,
         path: []const u8,
         opts: OpenOptions,
-        io_impl: std.Io.Threaded,
+        owner: ?*OwnedIo,
         borrowed_io: ?std.Io,
     ) !NativeFile {
-        var owned_io_impl = io_impl;
-        const io = borrowed_io orelse owned_io_impl.io();
+        const resource_lifetime = if (borrowed_io != null) (if (opts.resource_manager) |manager| manager.retainLifetime() else null) else null;
+        errdefer if (resource_lifetime) |value| value.release();
+        const io = borrowed_io orelse owner.?.io();
 
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
@@ -3455,7 +3460,9 @@ pub const NativeFile = struct {
 
         var result = NativeFile{
             .allocator = allocator,
-            .io_impl = owned_io_impl,
+            .io_impl = if (owner) |value| &value.threaded else undefined,
+            .owned_io = owner,
+            .resource_lifetime = resource_lifetime,
             .borrowed_io = borrowed_io,
             .path = owned_path,
             .file = file,
@@ -3485,7 +3492,7 @@ pub const NativeFile = struct {
     /// Creates a Lite file using a caller-owned std.Io runtime. The runtime
     /// must outlive the returned file.
     pub fn createWithIo(allocator: Allocator, io: std.Io, path: []const u8, opts: CreateOptions) !NativeFile {
-        return try createWithRuntime(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, undefined, io, opts.indexed_reclamation);
+        return try createWithRuntime(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, null, io, opts.indexed_reclamation);
     }
 
     fn createWithMode(
@@ -3497,9 +3504,9 @@ pub const NativeFile = struct {
         writer_lock_marker: []const u8,
         indexed: bool,
     ) !NativeFile {
-        var io_impl = threaded_io_limits.initService(allocator);
-        errdefer io_impl.deinit();
-        return try createWithRuntime(allocator, path, exclusive, no_sync, resource_manager, writer_lock_marker, io_impl, null, indexed);
+        const owner = try OwnedIo.create(allocator, resource_manager);
+        errdefer owner.destroy();
+        return try createWithRuntime(allocator, path, exclusive, no_sync, resource_manager, writer_lock_marker, owner, null, indexed);
     }
 
     fn createWithRuntime(
@@ -3509,12 +3516,13 @@ pub const NativeFile = struct {
         no_sync: bool,
         resource_manager: ?*resource_manager_mod.ResourceManager,
         writer_lock_marker: []const u8,
-        io_impl: std.Io.Threaded,
+        owner: ?*OwnedIo,
         borrowed_io: ?std.Io,
         indexed: bool,
     ) !NativeFile {
-        var owned_io_impl = io_impl;
-        const io = borrowed_io orelse owned_io_impl.io();
+        const resource_lifetime = if (borrowed_io != null) (if (resource_manager) |manager| manager.retainLifetime() else null) else null;
+        errdefer if (resource_lifetime) |value| value.release();
+        const io = borrowed_io orelse owner.?.io();
 
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
@@ -3586,7 +3594,9 @@ pub const NativeFile = struct {
 
         var result = NativeFile{
             .allocator = allocator,
-            .io_impl = owned_io_impl,
+            .io_impl = if (owner) |value| &value.threaded else undefined,
+            .owned_io = owner,
+            .resource_lifetime = resource_lifetime,
             .borrowed_io = borrowed_io,
             .path = owned_path,
             .file = file,
@@ -3611,7 +3621,11 @@ pub const NativeFile = struct {
     pub fn close(self: *NativeFile) void {
         if (self.transaction_writes) |writes| writes.deinit(self.allocator);
         self.transaction_writes = null;
-        const io = self.runtimeIo();
+        // Native convenience IO is owned here; once joined, use the process
+        // synchronous authority only for final descriptor closes. Borrowed IO
+        // retains its caller's complete lifecycle, including deterministic IO.
+        if (self.owned_io) |owner| owner.join();
+        const io = if (self.owned_io != null) std.Io.Threaded.global_single_threaded.io() else self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.page_cache.deinit(self.allocator);
         self.invalidateLedger();
@@ -3620,7 +3634,8 @@ pub const NativeFile = struct {
         }
         self.file.close(io);
         self.allocator.free(self.path);
-        if (self.borrowed_io == null) self.io_impl.deinit();
+        if (self.owned_io) |owner| owner.destroy();
+        if (self.resource_lifetime) |value| value.release();
         self.* = undefined;
     }
 
@@ -9894,16 +9909,15 @@ pub fn create(io: std.Io, path: []const u8) !void {
 }
 
 pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
-    var io_impl = threaded_io_limits.initService(allocator);
-    errdefer io_impl.deinit();
+    return lockWriterPathWithResources(allocator, path, null);
+}
 
-    const file = (try acquireWriterLock(allocator, io_impl.io(), path)).file;
-    errdefer file.close(io_impl.io());
-
-    return .{
-        .io_impl = io_impl,
-        .file = file,
-    };
+/// Owned lock executor and its guarded stacks share the supplied memory budget.
+pub fn lockWriterPathWithResources(allocator: Allocator, path: []const u8, manager: ?*resource_manager_mod.ResourceManager) !PathWriterLock {
+    const owner = try OwnedIo.create(allocator, manager);
+    errdefer owner.destroy();
+    const file = (try acquireWriterLock(allocator, owner.io(), path)).file;
+    return .{ .io_impl = &owner.threaded, .owned_io = owner, .file = file };
 }
 
 /// Acquires the same cross-process writer lock through a caller-owned std.Io.

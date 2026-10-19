@@ -21,6 +21,8 @@ const serverless_http_types = @import("serverless/api/http_types.zig");
 
 const secrets = @import("antfly_local_sources").common_secrets;
 pub const ServerlessHttpServerConfig = struct {
+    /// Compatible allocator view sharing provenance with the server allocator.
+    control_allocator: ?std.mem.Allocator = null,
     secret_store: ?*secrets.FileStore = null,
     // Explicit credential required even on otherwise unauthenticated serverless
     // deployments. TLS terminates at the deployment's trusted ingress.
@@ -105,20 +107,21 @@ pub const ServerlessHttpServer = struct {
         };
 
         const path = if (std.mem.indexOfScalar(u8, req.uri, '?')) |query_index| req.uri[0..query_index] else req.uri;
-        var resp = try self.handler.handle(.{
+        const resp = try self.handler.handle(.{
             .method = method,
             .path = path,
             .body = req.body,
             .cancellation = if (req.cancellation) |value| value.token() else .none,
             .deadline_ns = if (req.cancellation) |value| value.execution_deadline_ns else null,
         });
-        defer resp.deinit(self.alloc);
-
-        var response = http_common.HttpResponse{
+        // Handler responses already own their buffers through the same stable
+        // allocator owner. Transfer them, including their original partition.
+        var response: http_common.HttpResponse = .{
             .status = resp.status,
             .owner_allocator = self.alloc,
-            .content_type = try self.alloc.dupe(u8, resp.content_type),
-            .body = try self.alloc.dupe(u8, resp.body),
+            .content_type = resp.content_type,
+            .body = resp.body,
+            .retirement = if (resp.retirement) |owner| .{ .ptr = owner.ptr, .release = owner.release } else null,
         };
         errdefer response.deinit(self.alloc);
         if (resp.retry_after_seconds) |seconds| {
@@ -219,6 +222,10 @@ pub const ServerlessHttpServer = struct {
         };
         const body = (try ctx.body()) orelse "";
         const context = try (@import("antfly_local_sources").api_operation.RequestContext{ .deadline_ns = ctx.application_deadline_ns, .deadline_io = if (ctx.application_deadline_io) |clock_io| @import("antfly_runtime_abi").io_abi.Borrow.init(&clock_io) else null }).platformDeadline();
+        if (ctx.isCancellationRequested()) return error.Canceled;
+        // Reserve transport metadata before the handler can accept a mutation.
+        // The response owns this bounded arena through physical teardown.
+        try ctx.response.reserveHeaderMemory(4 * 1024);
         var response = try self.handler.handle(.{
             .method = method,
             .path = ctx.request.uri.path,
@@ -243,7 +250,10 @@ pub const ServerlessHttpServer = struct {
             const value = try std.fmt.bufPrint(&retry_after_buf, "{d}", .{seconds});
             try ctx.setHeader("Retry-After", value);
         }
-        _ = ctx.response.body(response.body);
+        _ = ctx.response.ownedBody(response.body, self.alloc);
+        if (response.retirement) |owner| ctx.response.retirement = .{ .ptr = owner.ptr, .release = owner.release };
+        response.retirement = null;
+        response.body = &.{};
         return try ctx.response.build();
     }
 

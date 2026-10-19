@@ -4019,7 +4019,7 @@ func TestStandbyClientPathStyleAutoFallsBackToLegacyOnce(t *testing.T) {
 	}
 }
 
-func TestStandbyClientPathStyleAutoReplaysRequestBodyOnFallback(t *testing.T) {
+func TestStandbyClientPathStyleAutoDiscoversRouteBeforeSendingMutation(t *testing.T) {
 	t.Parallel()
 
 	counts := map[string]int{}
@@ -4038,8 +4038,9 @@ func TestStandbyClientPathStyleAutoReplaysRequestBodyOnFallback(t *testing.T) {
 	if resp.Slot.SlotName != "standby-a" {
 		t.Fatalf("SlotName = %q, want standby-a", resp.Slot.SlotName)
 	}
-	if counts[StandbyReplicationSlotsPath] != 1 || counts[HAReplicationSlotsPath] != 1 {
-		t.Fatalf("counts = %v, want one canonical probe and one legacy replay", counts)
+	if counts[StandbyPrimaryStatusPath] != 1 || counts[HAPrimaryStatusPath] != 1 ||
+		counts[StandbyReplicationSlotsPath] != 0 || counts[HAReplicationSlotsPath] != 1 {
+		t.Fatalf("counts = %v, want safe status discovery and exactly one legacy mutation", counts)
 	}
 }
 

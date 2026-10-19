@@ -50,6 +50,7 @@ const enrichment_config_validation = @import("config_validation.zig");
 const enrichment_neighbor_context = @import("neighbor_context.zig");
 const enrichment_artifact_codec = @import("artifact_codec.zig");
 const enrichment_worker = @import("enrichment_worker.zig");
+const ProgressMailbox = @import("progress_mailbox.zig").Mailbox(inference_request_context.Phase);
 const enrichment_lease = @import("enrichment_lease.zig");
 const enrichment_state = @import("enrichment_state.zig");
 const embedder_mod = @import("embedder.zig");
@@ -443,10 +444,25 @@ const default_sync_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
 const borrowed_cancellation_poll_min_ns: i64 = 25 * std.time.ns_per_ms;
 const borrowed_cancellation_poll_max_ns: i64 = 250 * std.time.ns_per_ms;
 
+// One synchronous catch-up owns this slot until every dispatched lane joins.
+// Concurrent guards preserve the first request rejection without touching the
+// durable provider retry identity or rechecking a one-shot callback.
+const ForegroundAuthorityRejection = struct {
+    code: std.atomic.Value(u32) = .init(0),
+    fn remember(self: *@This(), cause: anyerror) void {
+        _ = self.code.cmpxchgStrong(0, @intFromError(cause), .acq_rel, .acquire);
+    }
+    fn check(self: *const @This()) !void {
+        const code = self.code.load(.acquire);
+        if (code != 0) return @errorFromInt(@as(u16, @intCast(code)));
+    }
+};
+
 const ForegroundCatchUpGuard = struct {
     cancellation: CancellationToken = .none,
     deadline_ns: ?u64 = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
+    authority_rejection: ?*ForegroundAuthorityRejection = null,
 
     fn bounded(clock: platform_clock.Clock, config: Config, cancellation: CancellationToken) @This() {
         const timeout_ns = std.math.mul(
@@ -471,8 +487,19 @@ const ForegroundCatchUpGuard = struct {
     }
 
     fn check(self: @This()) !void {
-        if (self.cancellation.isCancelled())
-            return RuntimeError.EnrichmentWaitCanceled;
+        if (self.authority_rejection) |rejection|
+            rejection.check() catch return RuntimeError.EnrichmentWaitCanceled;
+        if (self.cancellation.check_fn != null) {
+            self.cancellation.check() catch |cause| {
+                if (self.authority_rejection) |rejection| {
+                    rejection.remember(cause);
+                    // Existing pipeline cancellation handling performs joined
+                    // unwind without durable worker/request failure accounting.
+                    return RuntimeError.EnrichmentWaitCanceled;
+                }
+                return cause;
+            };
+        } else if (self.cancellation.isCancelled()) return RuntimeError.EnrichmentWaitCanceled;
         if (self.deadline_ns) |deadline_ns| {
             if (self.clock.nowRealtimeNs() >= deadline_ns)
                 return RuntimeError.EnrichmentWaitTimeout;
@@ -1237,6 +1264,7 @@ fn updateIndexPublishing(runtime: *EnrichmentRuntime, index_names: []const []con
 }
 
 fn clearActiveInferenceAssumeLocked(runtime: *EnrichmentRuntime) void {
+    runtime.progress_mailbox.invalidate();
     runtime.active_inference_phase = .queued;
     runtime.active_model_len = 0;
     runtime.active_backend_len = 0;
@@ -1261,6 +1289,8 @@ fn updateActiveDeadlineAssumeLocked(
 }
 
 fn updatePublicationStateAssumeLocked(runtime: *EnrichmentRuntime, count: usize, started: bool) void {
+    consumeInferenceProgressAssumeLocked(runtime);
+    runtime.progress_mailbox.invalidate();
     if (count == 0) {
         if (!started and runtime.active_postprocess and runtime.active_publication_count == 0)
             clearActiveInferenceAssumeLocked(runtime);
@@ -1379,6 +1409,7 @@ fn noteEmbedBatchStartedFor(runtime: *EnrichmentRuntime, retry_fingerprint: u64,
         runtime.active_postprocess = false;
         runtime.active_postprocess_started_ns = 0;
         runtime.active_postprocess_started_ms = 0;
+        runtime.progress_mailbox.invalidate();
         runtime.active_inference_phase = .loading_model;
         runtime.active_model_len = 0;
         runtime.active_backend_len = 0;
@@ -1405,6 +1436,7 @@ fn noteEmbedBatchStartedFor(runtime: *EnrichmentRuntime, retry_fingerprint: u64,
         runtime.active_postprocess = false;
         runtime.active_postprocess_started_ns = 0;
         runtime.active_postprocess_started_ms = 0;
+        runtime.progress_mailbox.invalidate();
         runtime.active_inference_phase = .loading_model;
         runtime.active_model_len = 0;
         runtime.active_backend_len = 0;
@@ -1427,6 +1459,7 @@ fn noteEmbedBatchStartedFor(runtime: *EnrichmentRuntime, retry_fingerprint: u64,
         runtime.active_postprocess = false;
         runtime.active_postprocess_started_ns = 0;
         runtime.active_postprocess_started_ms = 0;
+        runtime.progress_mailbox.invalidate();
         runtime.active_inference_phase = .loading_model;
         runtime.active_model_len = 0;
         runtime.active_backend_len = 0;
@@ -1436,6 +1469,8 @@ fn noteEmbedBatchStartedFor(runtime: *EnrichmentRuntime, retry_fingerprint: u64,
 }
 
 fn finishActiveEmbedBatchAssumeLocked(runtime: *EnrichmentRuntime, success: bool) void {
+    consumeInferenceProgressAssumeLocked(runtime);
+    runtime.progress_mailbox.invalidate();
     runtime.active_embed_batch_items = 0;
     runtime.active_embed_batch_bytes = 0;
     runtime.active_embed_batch_max_bytes = 0;
@@ -1537,52 +1572,48 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
     runtime.notifyActivityHook();
 }
 
+// This callback may run while the native team is still computing. It must not
+// wait for the coordinator, invoke observer hooks or park that team's CPU loan.
 fn noteInferenceProgress(raw: ?*anyopaque, progress: inference_request_context.Progress) void {
     const runtime: *EnrichmentRuntime = @ptrCast(@alignCast(raw.?));
+    const generation = runtime.progress_mailbox.captureGeneration();
     const now_ns = runtime.deadline_clock.nowRealtimeNs();
-    // Provider progress uses the native inference clock. Sample the target
-    // first so returning to the runtime clock cannot extend the budget.
+    // Sample the target before the native source so progress cannot renew time.
     const deadline_ns = if (progress.deadline_ns) |deadline|
         now_ns +| (deadline -| platform_time.monotonicNs())
     else
         null;
-    const now_ms = runtime.clock.nowRealtimeMs();
-    if (comptime builtin.os.tag == .freestanding) {
-        runtime.active_inference_phase = progress.phase;
-        runtime.last_progress_ns = now_ns;
-        runtime.last_progress_ms = now_ms;
-        runtime.active_progress_completed = progress.completed;
-        runtime.active_progress_total = progress.total;
-        updateActiveDeadlineAssumeLocked(runtime, deadline_ns, now_ns, now_ms);
-        if (progress.model.len > 0) {
-            runtime.active_model_len = @min(progress.model.len, runtime.active_model_buf.len);
-            @memcpy(runtime.active_model_buf[0..runtime.active_model_len], progress.model[0..runtime.active_model_len]);
-        }
-        if (progress.backend.len > 0) {
-            runtime.active_backend_len = @min(progress.backend.len, runtime.active_backend_buf.len);
-            @memcpy(runtime.active_backend_buf[0..runtime.active_backend_len], progress.backend[0..runtime.active_backend_len]);
-        }
-        return;
+    _ = runtime.progress_mailbox.publishInGeneration(generation, .{
+        .phase = progress.phase,
+        .completed = progress.completed,
+        .total = progress.total,
+        .model = progress.model,
+        .backend = progress.backend,
+        .deadline_ns = deadline_ns,
+        .now_ns = now_ns,
+        .now_ms = runtime.clock.nowRealtimeMs(),
+    });
+}
+
+// Caller owns the coordinator mutex (or the single-threaded runtime). This
+// never waits for a publisher. Stats readers and ordinary lifecycle activity
+// boundaries consume samples; observer publication stays on those owning paths.
+fn consumeInferenceProgressAssumeLocked(runtime: *EnrichmentRuntime) void {
+    const sample = runtime.progress_mailbox.take() orelse return;
+    runtime.active_inference_phase = sample.phase;
+    runtime.last_progress_ns = @max(runtime.last_progress_ns, sample.now_ns);
+    runtime.last_progress_ms = @max(runtime.last_progress_ms, sample.now_ms);
+    runtime.active_progress_completed = sample.completed;
+    runtime.active_progress_total = sample.total;
+    updateActiveDeadlineAssumeLocked(runtime, sample.deadline_ns, sample.now_ns, sample.now_ms);
+    if (sample.model_len > 0) {
+        runtime.active_model_len = sample.model_len;
+        @memcpy(runtime.active_model_buf[0..sample.model_len], sample.model[0..sample.model_len]);
     }
-    const io_impl = runtime.io_impl orelse return;
-    const io = io_impl.io();
-    runtime.mutex.lockUncancelable(io);
-    runtime.active_inference_phase = progress.phase;
-    runtime.last_progress_ns = now_ns;
-    runtime.last_progress_ms = now_ms;
-    runtime.active_progress_completed = progress.completed;
-    runtime.active_progress_total = progress.total;
-    updateActiveDeadlineAssumeLocked(runtime, deadline_ns, now_ns, now_ms);
-    if (progress.model.len > 0) {
-        runtime.active_model_len = @min(progress.model.len, runtime.active_model_buf.len);
-        @memcpy(runtime.active_model_buf[0..runtime.active_model_len], progress.model[0..runtime.active_model_len]);
+    if (sample.backend_len > 0) {
+        runtime.active_backend_len = sample.backend_len;
+        @memcpy(runtime.active_backend_buf[0..sample.backend_len], sample.backend[0..sample.backend_len]);
     }
-    if (progress.backend.len > 0) {
-        runtime.active_backend_len = @min(progress.backend.len, runtime.active_backend_buf.len);
-        @memcpy(runtime.active_backend_buf[0..runtime.active_backend_len], progress.backend[0..runtime.active_backend_len]);
-    }
-    runtime.mutex.unlock(io);
-    runtime.notifyActivityHook();
 }
 
 fn statusPhaseName(active: bool, phase: inference_request_context.Phase) []const u8 {
@@ -2746,7 +2777,8 @@ fn isGraphRecoveryPending(err: anyerror) bool {
 }
 
 fn isEnrichmentControlError(err: anyerror) bool {
-    return err == error.EnrichmentRetryAborted or err == error.ArtifactPublicationPending or isGraphRecoveryPending(err);
+    return err == error.EnrichmentRetryAborted or err == error.ArtifactPublicationPending or
+        err == error.EnrichmentWaitCanceled or err == error.EnrichmentWaitTimeout or isGraphRecoveryPending(err);
 }
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
@@ -4950,6 +4982,7 @@ const UnsupportedEnrichmentRuntime = struct {
     active_publication_count: u64 = 0,
     active_publication_started_ms: u64 = 0,
     active_publication_started_ns: u64 = 0,
+    progress_mailbox: ProgressMailbox = .{},
     active_inference_phase: inference_request_context.Phase = .queued,
     active_model_buf: [256]u8 = undefined,
     active_model_len: usize = 0,
@@ -5085,7 +5118,7 @@ const UnsupportedEnrichmentRuntime = struct {
     }
 
     pub fn stop(self: *@This()) void {
-        _ = self;
+        self.progress_mailbox.invalidate();
     }
 
     pub fn isStarted(_: *const @This()) bool {
@@ -5097,6 +5130,7 @@ const UnsupportedEnrichmentRuntime = struct {
     }
 
     fn notifyActivityHook(self: *@This()) void {
+        consumeInferenceProgressAssumeLocked(self);
         if (self.status_hook) |hook| hook.notifyActivity();
     }
 
@@ -5172,12 +5206,19 @@ const UnsupportedEnrichmentRuntime = struct {
         try self.catchUpUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
     }
 
+    pub fn waitForAppliedWithExecutionWait(self: *@This(), sequence: u64, cancellation: CancellationToken, deadline_ns: ?u64, _: ?@import("../../../common/execution_wait.zig").Boundary) !void {
+        // This implementation executes the producer inline; it has no physical
+        // futex wait at which CPU can be lent.
+        return self.waitForAppliedWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+    }
+
     pub fn catchUpUntilWithVisibilityDeadline(
         self: *@This(),
         sequence: u64,
         cancellation: CancellationToken,
         deadline_ns: ?u64,
     ) !void {
+        if (cancellation.check_fn != null) try cancellation.check();
         if (sequence == 0) return;
         const wait_after_sequence = self.applied_sequence;
         // A completed or terminal prefix wins a racing transport
@@ -5189,14 +5230,19 @@ const UnsupportedEnrichmentRuntime = struct {
                 return RuntimeError.EnrichmentWorkerFailed;
             return;
         }
-        const guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
+        var rejection: ForegroundAuthorityRejection = .{};
+        var guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
+        guard.authority_rejection = &rejection;
         self.catchUpUntilGuarded(sequence, guard) catch |err| {
+            try rejection.check();
             const failure_envelope = terminalFailureEnvelopeSnapshot(self);
             if ((err == RuntimeError.EnrichmentWaitCanceled or err == RuntimeError.EnrichmentWaitTimeout) and
                 terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
                 return RuntimeError.EnrichmentWorkerFailed;
             return err;
         };
+        try rejection.check();
+        if (cancellation.check_fn != null) try cancellation.check();
         const failure_envelope = terminalFailureEnvelopeSnapshot(self);
         if (terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
             return RuntimeError.EnrichmentWorkerFailed;
@@ -5294,6 +5340,7 @@ const UnsupportedEnrichmentRuntime = struct {
     }
 
     pub fn stats(self: *@This()) types.EnrichmentStats {
+        consumeInferenceProgressAssumeLocked(self);
         const projection_status = runtimeProjectionStatus(self.retrying, self.worker_failed);
         const config_hash = enrichmentCatalogConfigHash(self.alloc, self.index_manager) catch 0;
         return .{
@@ -5473,6 +5520,7 @@ const PlatformEnrichmentRuntime = struct {
     active_publication_count: u64 = 0,
     active_publication_started_ms: u64 = 0,
     active_publication_started_ns: u64 = 0,
+    progress_mailbox: ProgressMailbox = .{},
     active_inference_phase: inference_request_context.Phase = .queued,
     active_model_buf: [256]u8 = undefined,
     active_model_len: usize = 0,
@@ -5606,6 +5654,7 @@ const PlatformEnrichmentRuntime = struct {
     pub fn reloadDurableState(self: *EnrichmentRuntime) !void {
         if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentReloadDurableState", .{self});
         if (self.future != null) return error.EnrichmentRuntimeStarted;
+        self.progress_mailbox.invalidate();
         self.applied_sequence = try enrichment_state.loadAppliedSequence(self.alloc, self.store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(self.alloc, self.store, scope_name);
         restoreThreadedRuntimeStatus(self, persisted_status);
@@ -5649,6 +5698,9 @@ const PlatformEnrichmentRuntime = struct {
             }
             self.mutex.unlock(io);
         }
+        // Every native/provider callback has joined. A queued advisory sample
+        // must not reappear in the stopped runtime or a later replay owner.
+        self.progress_mailbox.invalidate();
         self.future = null;
         self.shutdown = false;
         self.ownership.release();
@@ -5682,6 +5734,7 @@ const PlatformEnrichmentRuntime = struct {
 
     fn prepareExecution(self: *EnrichmentRuntime) !void {
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
+        self.progress_mailbox.invalidate();
         self.shutdown_event.reset();
         self.shutdown_requested.store(false, .release);
         const cancellation = CancellationToken.fromAtomic(&self.shutdown_requested);
@@ -5733,10 +5786,14 @@ const PlatformEnrichmentRuntime = struct {
 
     fn notifyActivityHook(self: *EnrichmentRuntime) void {
         const hook = blk: {
-            const io_impl = self.io_impl orelse break :blk self.status_hook;
+            const io_impl = self.io_impl orelse {
+                consumeInferenceProgressAssumeLocked(self);
+                break :blk self.status_hook;
+            };
             const io = io_impl.io();
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
+            consumeInferenceProgressAssumeLocked(self);
             break :blk self.status_hook;
         };
         if (hook) |value| value.notifyActivity();
@@ -5820,6 +5877,16 @@ const PlatformEnrichmentRuntime = struct {
         deadline_ns: ?u64,
     ) !void {
         if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentWaitForAppliedWithVisibilityDeadline", .{ self, sequence, cancellation, deadline_ns });
+        return self.waitForAppliedWithExecutionWait(sequence, cancellation, deadline_ns, null);
+    }
+
+    pub fn waitForAppliedWithExecutionWait(
+        self: *EnrichmentRuntime,
+        sequence: u64,
+        cancellation: CancellationToken,
+        deadline_ns: ?u64,
+        boundary: ?@import("../../../common/execution_wait.zig").Boundary,
+    ) !void {
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.mutex.lockUncancelable(io);
@@ -5840,6 +5907,13 @@ const PlatformEnrichmentRuntime = struct {
         var cancellation_poll_ns = borrowed_cancellation_poll_min_ns;
 
         while (true) {
+            // Scoped request authority must be checked outside the worker lock
+            // and before returning a ready result. Legacy transport cancellation
+            // still lets an already-applied prefix win the race below.
+            const request_cancelled = if (cancellation.check_fn != null) blk: {
+                try cancellation.check();
+                break :blk false;
+            } else cancellation.isCancelled();
             self.mutex.lockUncancelable(io);
             if (self.applied_sequence >= sequence) {
                 const failure_envelope = terminalFailureEnvelopeSnapshot(self);
@@ -5863,7 +5937,7 @@ const PlatformEnrichmentRuntime = struct {
                 self.mutex.unlock(io);
                 return RuntimeError.EnrichmentWaitCanceled;
             }
-            if (cancellation.isCancelled()) {
+            if (request_cancelled) {
                 self.mutex.unlock(io);
                 return RuntimeError.EnrichmentWaitCanceled;
             }
@@ -5896,6 +5970,11 @@ const PlatformEnrichmentRuntime = struct {
                 })
             else
                 deadline;
+            if (boundary) |original| original.beginWait() catch |err| {
+                const previous_waiters = self.sync_waiter_count.fetchSub(1, .release);
+                std.debug.assert(previous_waiters > 0);
+                return err;
+            };
             const wait_result = Io.futexWaitTimeout(
                 io,
                 u32,
@@ -5905,8 +5984,13 @@ const PlatformEnrichmentRuntime = struct {
             );
             const previous_waiters = self.sync_waiter_count.fetchSub(1, .release);
             std.debug.assert(previous_waiters > 0);
+            // Registration and physical wait have ended on every path. Reenter
+            // the same operation before consuming a wake, cancellation or the
+            // now-applied prefix; failure preserves its original retained owner.
+            if (boundary) |original| try original.endWait();
             wait_result catch |err| switch (err) {
                 error.Canceled => {
+                    if (cancellation.check_fn != null) try cancellation.check();
                     // Resolve a terminal transition racing cancellation before
                     // reporting an ambiguous post-commit wait outcome.
                     // Timed futex expiry is a successful (possibly spurious)
@@ -5971,13 +6055,17 @@ const PlatformEnrichmentRuntime = struct {
         deadline_ns: ?u64,
     ) !void {
         if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentCatchUpUntilWithVisibilityDeadline", .{ self, sequence, cancellation, deadline_ns });
+        if (cancellation.check_fn != null) try cancellation.check();
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.mutex.lockUncancelable(io);
         const wait_after_sequence = self.applied_sequence;
         self.mutex.unlock(io);
-        const guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
+        var rejection: ForegroundAuthorityRejection = .{};
+        var guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
+        guard.authority_rejection = &rejection;
         self.catchUpUntilGuarded(sequence, guard) catch |err| {
+            try rejection.check();
             self.mutex.lockUncancelable(io);
             const failure_envelope = terminalFailureEnvelopeSnapshot(self);
             self.mutex.unlock(io);
@@ -5986,6 +6074,8 @@ const PlatformEnrichmentRuntime = struct {
                 return RuntimeError.EnrichmentWorkerFailed;
             return err;
         };
+        try rejection.check();
+        if (cancellation.check_fn != null) try cancellation.check();
         self.mutex.lockUncancelable(io);
         const failure_envelope = terminalFailureEnvelopeSnapshot(self);
         self.mutex.unlock(io);
@@ -5999,6 +6089,7 @@ const PlatformEnrichmentRuntime = struct {
 
         self.notifySequence(sequence);
         while (true) {
+            if (guard.cancellation.check_fn != null) try guard.check();
             self.mutex.lockUncancelable(io);
             const applied = self.applied_sequence;
             const recovery_pending = self.graph_stage_recovery_pending;
@@ -6015,7 +6106,7 @@ const PlatformEnrichmentRuntime = struct {
                 .retry_in_progress => return RuntimeError.EnrichmentRetryInProgress,
                 .run_pass => {},
             }
-            try guard.check();
+            if (guard.cancellation.check_fn == null) try guard.check();
             runForegroundCatchUpPassGuarded(self, io, sequence, guard) catch |err| {
                 if (isGraphRecoveryPending(err)) continue;
                 return switch (err) {
@@ -6072,6 +6163,7 @@ const PlatformEnrichmentRuntime = struct {
         if (maybe_io) |io| self.mutex.lockUncancelable(io);
         defer if (maybe_io) |io| self.mutex.unlock(io);
 
+        consumeInferenceProgressAssumeLocked(self);
         const ownership_stats = self.ownership.stats();
         const projection_status = runtimeProjectionStatus(self.retrying, self.worker_failed);
         const config_hash = enrichmentCatalogConfigHash(self.alloc, self.index_manager) catch 0;
@@ -6562,6 +6654,103 @@ test "foreground enrichment catch-up treats cancellation as a waiter outcome" {
     try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
 }
 
+fn progressMailboxTestRuntime(clock: *platform_clock.ManualClock) EnrichmentRuntime {
+    return .{
+        .alloc = std.testing.allocator,
+        .io_impl = .{ .borrowed = std.testing.io },
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .sync_wait_timeout_ms = 1000 },
+        .ownership = undefined,
+        .deadline_clock = clock.clock(),
+    };
+}
+
+test "enrichment progress mailbox production callback never waits on the coordinator or invokes activity hooks" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const io = std.testing.io;
+    var clock: platform_clock.ManualClock = .{};
+    clock.setRealtimeNs(7 * std.time.ns_per_s);
+    var runtime = progressMailboxTestRuntime(&clock);
+    const Probe = struct {
+        runtime: *EnrichmentRuntime,
+        done: std.atomic.Value(bool) = .init(false),
+        activities: std.atomic.Value(usize) = .init(0),
+        fn activity(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.runtime.mutex.tryLock()) {
+                _ = self.activities.fetchAdd(100, .monotonic);
+                return;
+            }
+            self.runtime.mutex.unlock(std.testing.io);
+            _ = self.activities.fetchAdd(1, .monotonic);
+        }
+        fn changed(_: *anyopaque) void {}
+        fn run(self: *@This()) void {
+            noteInferenceProgress(self.runtime, .{ .phase = .executing, .completed = 7, .total = 9, .model = "model", .backend = "native" });
+            self.done.store(true, .release);
+        }
+    };
+    var probe: Probe = .{ .runtime = &runtime };
+    runtime.status_hook = .{ .ptr = &probe, .on_change = Probe.changed, .on_activity = Probe.activity };
+    runtime.mutex.lockUncancelable(io);
+    var locked = true;
+    defer if (locked) runtime.mutex.unlock(io);
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
+    const until = platform_time.monotonicNs() + 250 * std.time.ns_per_ms;
+    while (!probe.done.load(.acquire) and platform_time.monotonicNs() < until) io.sleep(.fromMilliseconds(1), .awake) catch {};
+    const completed_while_locked = probe.done.load(.acquire);
+    runtime.mutex.unlock(io);
+    locked = false;
+    thread.join();
+    try std.testing.expect(completed_while_locked);
+    try std.testing.expectEqual(@as(usize, 0), probe.activities.load(.acquire));
+    try std.testing.expectEqual(inference_request_context.Phase.queued, runtime.active_inference_phase);
+    // An ordinary owning boundary consumes the copied sample and invokes the
+    // activity hook after releasing the coordinator lock.
+    runtime.notifyActivityHook();
+    try std.testing.expectEqual(@as(usize, 1), probe.activities.load(.acquire));
+    try std.testing.expectEqual(inference_request_context.Phase.executing, runtime.active_inference_phase);
+    try std.testing.expectEqual(@as(u64, 7), runtime.active_progress_completed);
+    try std.testing.expectEqualStrings("model", runtime.active_model_buf[0..runtime.active_model_len]);
+}
+
+test "enrichment progress mailbox lifecycle consumption cannot revive execution after completion or publication" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var clock: platform_clock.ManualClock = .{};
+    clock.setRealtimeNs(7 * std.time.ns_per_s);
+    var runtime = progressMailboxTestRuntime(&clock);
+    noteInferenceProgress(&runtime, .{ .phase = .executing, .completed = 7, .total = 9 });
+    finishActiveEmbedBatchAssumeLocked(&runtime, true);
+    try std.testing.expectEqual(inference_request_context.Phase.serializing, runtime.active_inference_phase);
+    consumeInferenceProgressAssumeLocked(&runtime);
+    try std.testing.expectEqual(inference_request_context.Phase.serializing, runtime.active_inference_phase);
+    noteInferenceProgress(&runtime, .{ .phase = .executing });
+    updatePublicationStateAssumeLocked(&runtime, 1, true);
+    consumeInferenceProgressAssumeLocked(&runtime);
+    try std.testing.expectEqual(inference_request_context.Phase.publishing, runtime.active_inference_phase);
+    noteInferenceProgress(&runtime, .{ .phase = .executing, .model = "old" });
+    clearActiveInferenceAssumeLocked(&runtime);
+    consumeInferenceProgressAssumeLocked(&runtime);
+    try std.testing.expectEqual(inference_request_context.Phase.queued, runtime.active_inference_phase);
+    try std.testing.expectEqual(@as(usize, 0), runtime.active_model_len);
+    noteInferenceProgress(&runtime, .{ .phase = .executing, .model = "before-stop" });
+    // This fixture has no durable lease or live worker, but exercises the
+    // actual joined-stop boundary and its queued telemetry retirement.
+    runtime.ownership.lease_owned = false;
+    runtime.stop();
+    consumeInferenceProgressAssumeLocked(&runtime);
+    try std.testing.expectEqual(inference_request_context.Phase.queued, runtime.active_inference_phase);
+    try std.testing.expectEqual(@as(usize, 0), runtime.active_model_len);
+}
+
 test "enrichment provider deadlines and progress cross native clock boundaries" {
     if (comptime builtin.os.tag == .freestanding) return error.SkipZigTest;
     var clock: platform_clock.ManualClock = .{};
@@ -6610,13 +6799,16 @@ test "enrichment provider deadlines and progress cross native clock boundaries" 
         try std.testing.expect(remaining > 0 and remaining <= 1_000);
         // Provider progress returns its native deadline to the runtime epoch.
         try provider.update(.executing, 1, 2);
+        consumeInferenceProgressAssumeLocked(&runtime);
         try std.testing.expect(runtime.active_deadline_ns > epoch);
         try std.testing.expect(runtime.active_deadline_ns <= epoch + std.time.ns_per_s);
         try std.testing.expectEqual(@as(u64, 1), runtime.active_progress_completed);
         const saved = runtime.active_deadline_ns;
         noteInferenceProgress(&runtime, .{ .phase = .executing });
+        consumeInferenceProgressAssumeLocked(&runtime);
         try std.testing.expectEqual(saved, runtime.active_deadline_ns);
         noteInferenceProgress(&runtime, .{ .phase = .executing, .deadline_ns = 0 });
+        consumeInferenceProgressAssumeLocked(&runtime);
         try std.testing.expectEqual(epoch, runtime.active_deadline_ns);
         clock.advanceMs(1_000);
         try std.testing.expectError(error.Timeout, assetProviderRequestContext(&runtime).check());
@@ -15779,7 +15971,7 @@ const SharedPdfPngWindow = struct {
             }
             if (count == 0) return;
             var first_error: ?anyerror = null;
-            const stats = lane.executor().runBatch(contexts[0..count], EncodeJob.run, 1) catch |err| blk: {
+            const stats = lane.pageExecutor().runBatch(contexts[0..count], EncodeJob.run, 1) catch |err| blk: {
                 first_error = err;
                 break :blk null;
             };
@@ -35767,4 +35959,306 @@ test "model aware media fused reuse rejects a changed provider generation with t
     try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
     metadata.dimensions = 3;
     try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
+}
+
+test "controlled enrichment visibility checks original authority outside worker mutex before ready results" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = struct {
+        runtime: *EnrichmentRuntime,
+        io: Io,
+        cause: anyerror,
+        calls: usize = 0,
+        fail_call: usize,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (!self.runtime.mutex.tryLock()) return error.TestUnexpectedResult;
+            self.runtime.mutex.unlock(self.io);
+            // Reject only once: the original error cannot be recovered by
+            // calling a boolean adapter or checking authority a second time.
+            if (self.calls == self.fail_call) return self.cause;
+        }
+    };
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    for (0..3) |scenario| for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        var runtime = EnrichmentRuntime{
+            .alloc = std.testing.allocator,
+            .io_impl = .{ .borrowed = io },
+            .store = undefined,
+            .owns_store = false,
+            .change_journal = undefined,
+            .replay_source = undefined,
+            .index_manager = undefined,
+            .write_ctx = undefined,
+            .write_fn = undefined,
+            .notify_ctx = undefined,
+            .notify_fn = undefined,
+            .config = .{ .sync_wait_timeout_ms = 1_000 },
+            .ownership = undefined,
+            .applied_sequence = if (scenario == 1) 1 else 0,
+        };
+        var probe: Probe = .{ .runtime = &runtime, .io = io, .cause = cause, .fail_call = if (scenario == 2) 2 else 1 };
+        try std.testing.expectError(cause, runtime.waitForAppliedWithVisibilityDeadline(1, .{ .ptr = &probe, .check_fn = Probe.check }, null));
+        try std.testing.expectEqual(probe.fail_call, probe.calls);
+        try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+        try std.testing.expect(!runtime.worker_failed and !runtime.retrying);
+        try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+        try std.testing.expect(runtime.mutex.tryLock());
+        runtime.mutex.unlock(io);
+    };
+}
+
+test "controlled enrichment visibility inline catch-up restores original rejection after owned pass unwind" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = struct {
+        runtime: *EnrichmentRuntime,
+        io: Io,
+        cause: anyerror,
+        calls: usize = 0,
+        fail_call: usize,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (!self.runtime.mutex.tryLock()) return error.TestUnexpectedResult;
+            self.runtime.mutex.unlock(self.io);
+            // Reject only once: the original error cannot be recovered by
+            // calling a boolean adapter or checking authority a second time.
+            if (self.calls == self.fail_call) return self.cause;
+        }
+    };
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    for (0..4) |scenario| for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        var runtime = EnrichmentRuntime{
+            .alloc = std.testing.allocator,
+            .io_impl = .{ .borrowed = io },
+            .store = undefined,
+            .owns_store = false,
+            .change_journal = undefined,
+            .replay_source = undefined,
+            .index_manager = undefined,
+            .write_ctx = undefined,
+            .write_fn = undefined,
+            .notify_ctx = undefined,
+            .notify_fn = undefined,
+            .config = .{ .sync_wait_timeout_ms = 1_000 },
+            .ownership = undefined,
+            .applied_sequence = if (scenario == 1 or scenario == 2) 1 else 0,
+        };
+        var probe: Probe = .{ .runtime = &runtime, .io = io, .cause = cause, .fail_call = if (scenario == 3) 4 else if (scenario == 2) 2 else 1 };
+        try std.testing.expectError(cause, runtime.catchUpUntilWithVisibilityDeadline(1, .{ .ptr = &probe, .check_fn = Probe.check }, null));
+        try std.testing.expectEqual(probe.fail_call, probe.calls);
+        try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+        try std.testing.expect(!runtime.worker_failed and !runtime.retrying and !runtime.replay_pass_active);
+        try std.testing.expect(runtime.active_provider_guard.authority_rejection == null);
+        try std.testing.expectEqual(@as(u64, 0), runtime.error_count);
+        try std.testing.expect(runtime.mutex.tryLock());
+        runtime.mutex.unlock(io);
+    };
+}
+
+test "controlled enrichment visibility inline guard retains first cause across copied guards" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 1) return error.CatalogGenerationChanged;
+        }
+    };
+    var probe: Probe = .{};
+    var rejection: ForegroundAuthorityRejection = .{};
+    const guard: ForegroundCatchUpGuard = .{ .cancellation = .{ .ptr = &probe, .check_fn = Probe.check }, .authority_rejection = &rejection };
+    const copy = guard;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, guard.check());
+    try std.testing.expectError(error.EnrichmentWaitCanceled, copy.check());
+    rejection.remember(error.DeadlineExceeded);
+    try std.testing.expectError(error.CatalogGenerationChanged, rejection.check());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "controlled enrichment visibility waiter unwind bypasses durable provider retry classification" {
+    for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout }) |cause| {
+        try std.testing.expect(isEnrichmentControlError(cause));
+        // The early control decision must not read or charge a provider identity.
+        try std.testing.expect(shouldYieldRequestErrorFor(undefined, 123, cause));
+    }
+    try std.testing.expect(!isEnrichmentControlError(error.ExtractionTransientFailure));
+    try std.testing.expect(!isEnrichmentControlError(error.OutOfMemory));
+}
+
+test "controlled enrichment visibility futex wait lends CPU and preserves original owner on reentry refusal" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const native = @import("../../../common/runnable_scheduler.zig");
+    const Probe = struct {
+        runtime: *EnrichmentRuntime,
+        execution: *native.Execution,
+        scheduler: *native.Scheduler,
+        io: Io,
+        cause: ?anyerror,
+        refuse_begin: bool,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn fence(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cause) |cause| return cause;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            try std.testing.expect(self.runtime.mutex.tryLock());
+            self.runtime.mutex.unlock(self.io);
+            if (self.refuse_begin) return self.cause.?;
+            try self.execution.park(.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 23), self.scheduler.stats().retained_bytes);
+            var peer: native.Execution = .{};
+            try peer.start(self.scheduler, .{ .io = std.testing.io, .retained_bytes = 17, .allow_wait = false }, .background);
+            defer peer.finish();
+            var health: native.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .retained_bytes = 5, .allow_wait = false }, .control);
+            defer health.finish();
+            try std.testing.expectEqual(@as(usize, 2), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 45), self.scheduler.stats().retained_bytes);
+            // Model a concurrent worker's applied checkpoint and wake epoch.
+            // This fixture does not execute a physical provider or store write.
+            self.runtime.mutex.lockUncancelable(self.io);
+            self.runtime.applied_sequence = 1;
+            _ = self.runtime.sync_wait_epoch.fetchAdd(1, .release);
+            self.runtime.mutex.unlock(self.io);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            try std.testing.expectEqual(@as(u32, 0), self.runtime.sync_waiter_count.load(.acquire));
+            try std.testing.expect(self.runtime.mutex.tryLock());
+            self.runtime.mutex.unlock(self.io);
+            try self.execution.enterWithCheck(.query, .{ .context = self, .check = fence });
+        }
+    };
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    for ([_]bool{ false, true }) |refuse_begin| for ([_]?anyerror{ null, error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        if (refuse_begin and cause == null) continue;
+        var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: native.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+        defer execution.finish();
+        var runtime = EnrichmentRuntime{
+            .alloc = std.testing.allocator,
+            .io_impl = .{ .borrowed = io },
+            .store = undefined,
+            .owns_store = false,
+            .change_journal = undefined,
+            .replay_source = undefined,
+            .index_manager = undefined,
+            .write_ctx = undefined,
+            .write_fn = undefined,
+            .notify_ctx = undefined,
+            .notify_fn = undefined,
+            .config = .{ .sync_wait_timeout_ms = 1_000 },
+            .ownership = undefined,
+        };
+        var probe: Probe = .{ .runtime = &runtime, .execution = &execution, .scheduler = &scheduler, .io = io, .cause = cause, .refuse_begin = refuse_begin };
+        const result = runtime.waitForAppliedWithExecutionWait(1, .none, null, .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end });
+        if (cause) |err| try std.testing.expectError(err, result) else try result;
+        try std.testing.expectEqual(@as(usize, 1), probe.begins);
+        try std.testing.expectEqual(@as(usize, if (refuse_begin) 0 else 1), probe.ends);
+        try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+        try std.testing.expectEqual(@as(usize, if (!refuse_begin and cause != null) 0 else 1), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        try std.testing.expect(!runtime.worker_failed and !runtime.retrying);
+        try std.testing.expect(runtime.mutex.tryLock());
+        runtime.mutex.unlock(io);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+test "controlled enrichment visibility canceled future preserves reentry rejection after unregistering waiter" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const native = @import("../../../common/runnable_scheduler.zig");
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+    defer scheduler.close();
+    var execution: native.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+    defer execution.finish();
+    var runtime = EnrichmentRuntime{
+        .alloc = std.testing.allocator,
+        .io_impl = .{ .borrowed = io },
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .sync_wait_timeout_ms = 1_000 },
+        .ownership = undefined,
+    };
+    const Probe = struct {
+        runtime: *EnrichmentRuntime,
+        execution: *native.Execution,
+        io: Io,
+        entered: Io.Event = .unset,
+        ends: usize = 0,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.park(.resource_blocked);
+            self.entered.set(self.io);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            try std.testing.expectEqual(@as(u32, 0), self.runtime.sync_waiter_count.load(.acquire));
+            try self.execution.enter(.query);
+        }
+        fn run(self: *@This()) !void {
+            try self.runtime.waitForAppliedWithExecutionWait(1, .none, null, .{ .ptr = self, .begin = begin, .end = end });
+        }
+    };
+    var probe: Probe = .{ .runtime = &runtime, .execution = &execution, .io = io };
+    var future = try io.concurrent(Probe.run, .{&probe});
+    var joined = false;
+    defer if (!joined) {
+        _ = future.cancel(io) catch {};
+    };
+    probe.entered.waitUncancelable(io);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u32, 1), runtime.sync_waiter_count.load(.acquire));
+    var peer: native.Execution = .{};
+    try peer.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 17, .allow_wait = false }, .background);
+    defer peer.finish();
+    var health: native.Execution = .{};
+    try health.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 5, .allow_wait = false }, .control);
+    defer health.finish();
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 45), scheduler.stats().retained_bytes);
+    peer.finish();
+    health.finish();
+    const result = future.cancel(io);
+    joined = true;
+    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expectEqual(@as(usize, 1), probe.ends);
+    try std.testing.expectEqual(@as(u32, 0), runtime.sync_waiter_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(u64, 0), runtime.applied_sequence);
+    try std.testing.expectError(error.Canceled, execution.checkLifetime());
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }

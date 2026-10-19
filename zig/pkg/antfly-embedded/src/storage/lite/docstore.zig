@@ -1689,6 +1689,13 @@ pub const Store = struct {
         const io = self.file.runtime();
         self.read_mutex.lockUncancelable(io);
         defer self.read_mutex.unlock(io);
+        return self.initializeReadGenerationWithReadLock();
+    }
+
+    /// Both the owner mutex and read_mutex are held. This helper never waits
+    /// for another local coordination lock or invokes a yielding checkpoint.
+    fn initializeReadGenerationWithReadLock(self: *Store) !void {
+        const io = self.file.runtime();
         if (self.read_generation != null) return;
         const generation = try self.allocator.create(ReadGeneration);
         errdefer self.allocator.destroy(generation);
@@ -1719,6 +1726,9 @@ pub const Store = struct {
 
     // Called with read_mutex held. Pins are ordered by published sequence.
     fn pinInitializedReadGeneration(self: *Store, pin: *ReadPin) !*ReadGeneration {
+        return self.pinInitializedReadGenerationControlled(pin, null);
+    }
+    fn pinInitializedReadGenerationControlled(self: *Store, pin: *ReadPin, control: ?read_admission.Port) !*ReadGeneration {
         const generation = self.read_generation.?;
         // An idle connection must not fence reclamation. Only actual read
         // transactions hold the inode lock, including streams between calls.
@@ -1729,7 +1739,10 @@ pub const Store = struct {
                 // inode fence until exec/close, even after its parent closed
                 // the descriptor. Wait for that fence instead of failing an
                 // otherwise uncontended same-owner read.
-                try generation.file.file.lock(generation.file.runtime(), .shared);
+                if (control) |original| {
+                    try original.checkLifetime();
+                    if (!try generation.file.file.tryLock(generation.file.runtime(), .shared)) return error.Backpressured;
+                } else try generation.file.file.lock(generation.file.runtime(), .shared);
             }
             generation.kernel_readers += 1;
         }
@@ -3039,6 +3052,88 @@ pub const Txn = struct {
     }
 
     fn openReadControlled(store: *Store, prefix: []const u8, control: ?read_admission.Port) !Txn {
+        if (control) |original| return openReadAdmitted(store, prefix, original);
+        return openReadLegacy(store, prefix, control);
+    }
+
+    fn openReadAdmitted(store: *Store, prefix: []const u8, original: read_admission.Port) !Txn {
+        try validatePrefix(prefix);
+        try original.checkpoint();
+        if (store.read_only and !store.file.externally_locked) {
+            try original.checkLifetime();
+            return .{ .allocator = store.allocator, .store = store, .prefix = prefix, .checkpoint = store.file.activeCheckpoint() };
+        }
+        // Allocate before taking provider locks. The same pin belongs to this
+        // bounded attempt chain and is published exactly once on success.
+        const metadata = store.readMetadataAllocator();
+        const pin = try metadata.create(ReadPin);
+        var pin_owned = true;
+        errdefer if (pin_owned) metadata.destroy(pin);
+        while (true) {
+            try original.checkpoint();
+            const attempt = openReadAdmittedAttempt(store, prefix, pin, original) catch |cause| {
+                // Every acquired lock has retired before inspecting capability
+                // or invoking the original wait. Never retain a shared lock
+                // while another admitted holder needs CPU to unlock its peer.
+                try original.checkLifetime();
+                if (cause != error.Backpressured) return cause;
+                if (!try original.hasExecutionWait()) return error.Backpressured;
+                try original.waitForProgress();
+                continue;
+            };
+            // Capture has retired all coordination locks; late scope rejection
+            // discards its physical pin without publishing an owned snapshot.
+            var owned = attempt;
+            pin_owned = false;
+            original.checkpoint() catch |cause| {
+                owned.abort();
+                return cause;
+            };
+            return owned;
+        }
+    }
+
+    fn openReadAdmittedAttempt(store: *Store, prefix: []const u8, pin: *ReadPin, original: read_admission.Port) !Txn {
+        const io = store.file.runtime();
+        if (!store.generation_lock.tryLockShared(io)) return error.Backpressured;
+        defer store.generation_lock.unlockShared(io);
+        try original.checkLifetime();
+        var owner_held = false;
+        defer if (owner_held) store.mutex.unlock();
+        if (store.file.externally_locked) {
+            if (!store.mutex.tryLock()) return error.Backpressured;
+            owner_held = true;
+            try original.checkLifetime();
+        }
+        if (!store.read_mutex.tryLock()) return error.Backpressured;
+        var reader_held = true;
+        defer if (reader_held) store.read_mutex.unlock(io);
+        try original.checkLifetime();
+        if (store.read_generation == null) {
+            if (!owner_held) {
+                store.read_mutex.unlock(io);
+                reader_held = false;
+                if (!store.mutex.tryLock()) return error.Backpressured;
+                owner_held = true;
+                try original.checkLifetime();
+                if (!store.read_mutex.tryLock()) return error.Backpressured;
+                reader_held = true;
+                try original.checkLifetime();
+            }
+            try store.initializeReadGenerationWithReadLock();
+        }
+        if (store.read_outcome_unknown) return error.OutcomeUnknown;
+        if (!store.writer_mutex.tryLock()) return error.Backpressured;
+        const kernel_reader = !store.file.externally_locked or !store.writer_active;
+        store.writer_mutex.unlock(io);
+        try original.checkLifetime();
+        const checkpoint = store.read_generation.?.checkpoint;
+        pin.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(io), .kernel_reader = kernel_reader };
+        const generation = try store.pinInitializedReadGenerationControlled(pin, original);
+        return .{ .allocator = store.allocator, .store = store, .read_pin = pin, .prefix = prefix, .read_generation = generation, .checkpoint = checkpoint };
+    }
+
+    fn openReadLegacy(store: *Store, prefix: []const u8, control: ?read_admission.Port) !Txn {
         try validatePrefix(prefix);
         if (control) |budget| try budget.checkpoint();
         if (store.read_only and !store.file.externally_locked) return .{ .allocator = store.allocator, .store = store, .prefix = prefix, .checkpoint = store.file.activeCheckpoint() };
@@ -6574,6 +6669,11 @@ test "lite snapshot admission preserves original cancellation while the backend 
         pub fn checkpoint(self: *@This()) !void {
             if (self.cancel) return error.Canceled;
         }
+        pub const checkLifetime = checkpoint;
+        fn boundary(_: *anyopaque) !void {}
+        pub fn executionBoundary(self: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+            return .{ .ptr = self, .begin = boundary, .end = boundary };
+        }
         pub fn waitForProgress(self: *@This()) !void {
             self.waits += 1;
             if (self.release) self.store.mutex.unlock() else self.cancel = true;
@@ -7187,6 +7287,11 @@ test "lite snapshot admission preserves original cancellation while the backend 
                 .reader => self.store.read_mutex.unlock(self.io),
             }
             self.held = false;
+        }
+        pub const checkLifetime = checkpoint;
+        fn boundary(_: *anyopaque) !void {}
+        pub fn executionBoundary(self: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+            return .{ .ptr = self, .begin = boundary, .end = boundary };
         }
         pub fn waitForProgress(self: *@This()) !void {
             self.waits += 1;
@@ -11633,4 +11738,209 @@ test "lite typed score spans admit exact encoder after warmed graph scratch" {
     _ = try scope.readSortedScoreColumn("", nodes, &values);
     try std.testing.expectEqual(@as(f64, 1), values[0]);
     for (values[1..]) |value| try std.testing.expect(std.math.isNan(value));
+}
+
+pub fn qualifySnapshotCaptureDependencies() !void {
+    if (!@import("builtin").is_test) @compileError("qualification requires tests");
+    if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const native_scheduler = @import("../../common/runnable_scheduler.zig");
+    const Lock = enum { generation, owner, reader, writer, inode };
+    const Fixture = struct {
+        const Self = @This();
+        store: *Store,
+        scheduler: *native_scheduler.Scheduler,
+        io: std.Io,
+        coarse: bool,
+        failure: ?anyerror,
+        late: bool = false,
+        waiting: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
+        result: ?anyerror = null,
+        starts: usize = 0,
+        resumes: usize = 0,
+        stop: std.atomic.Value(bool) = .init(false),
+        const Scope = struct {
+            f: *Self,
+            execution: native_scheduler.Execution = .{},
+            rejected: ?anyerror = null,
+            pub fn checkLifetime(self: *@This()) !void {
+                if (self.rejected) |cause| return cause;
+                if (self.f.stop.load(.acquire)) return error.Canceled;
+                try self.execution.checkLifetime();
+            }
+            pub fn checkpoint(self: *@This()) !void {
+                try self.checkLifetime();
+                if (self.f.late) if (self.f.store.read_generation) |generation| {
+                    if (generation.references != 0) return self.f.failure.?;
+                };
+            }
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.checkLifetime();
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.execution.park(.resource_blocked);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.f.resumes += 1;
+                self.rejected = self.f.failure;
+                try self.execution.enterWithCheck(.query, .{ .context = self, .check = check });
+            }
+            pub fn executionBoundary(self: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+                return if (self.f.coarse) null else .{ .ptr = self, .begin = begin, .end = end };
+            }
+            pub fn waitForProgress(self: *@This()) !void {
+                if (self.f.coarse) return error.UnexpectedCoarseCaptureWait;
+                try begin(self);
+                self.f.waiting.set(self.f.io);
+                self.f.release.waitUncancelable(self.f.io);
+                try end(self);
+            }
+            fn run(self: *@This()) void {
+                self.execute() catch |cause| {
+                    self.f.result = cause;
+                };
+                self.f.done.set(self.f.io);
+            }
+            fn execute(self: *@This()) !void {
+                const now: u64 = @intCast(std.Io.Clock.now(.awake, self.f.io).nanoseconds);
+                try self.execution.start(self.f.scheduler, .{ .io = self.f.io, .allow_wait = true, .deadline_ns = now + 10 * std.time.ns_per_s, .retained_bytes = 23 }, .query);
+                self.f.starts += 1;
+                defer self.execution.finish();
+                var adapter: read_admission.Adapter(*@This()) = .{ .budget = self };
+                const payload = adapter.payload();
+                var read = try Txn.openReadWithAdmission(self.f.store, "", .init(&payload));
+                defer read.abort();
+                try std.testing.expectEqualStrings("value", try read.get("key"));
+            }
+        };
+    };
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "capture-dependencies.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = io, .no_sync = true, .externally_locked = true, .reclamation = .{ .enabled = false, .page_reuse = false } });
+    defer store.close();
+    {
+        var write = try store.beginWrite();
+        try write.put("key", "value");
+        try write.commit();
+        var read = try store.beginRead();
+        read.abort();
+    }
+    const blocker = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer blocker.close(io);
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+    inline for (std.enums.values(Lock)) |lock| {
+        for ([_]?anyerror{ null, error.Canceled, error.DeadlineExceeded, error.CatalogGenerationChanged }) |failure| {
+            for ([_]bool{ false, true }) |coarse| {
+                if (coarse and failure != null) continue;
+                var scheduler = try native_scheduler.Scheduler.init(.{ .slots = 2 });
+                defer scheduler.close();
+                var producer: native_scheduler.Execution = .{};
+                try producer.start(&scheduler, .{ .io = io, .allow_wait = true, .retained_bytes = 17 }, .background);
+                defer producer.finish();
+                switch (lock) {
+                    .generation => try std.testing.expect(store.generation_lock.tryLock(io)),
+                    .owner => try std.testing.expect(store.mutex.tryLock()),
+                    .reader => try std.testing.expect(store.read_mutex.tryLock()),
+                    .writer => try std.testing.expect(store.writer_mutex.tryLock()),
+                    .inode => try std.testing.expect(try blocker.tryLock(io, .exclusive)),
+                }
+                var held = true;
+                defer if (held) switch (lock) {
+                    .generation => store.generation_lock.unlock(io),
+                    .owner => store.mutex.unlock(),
+                    .reader => store.read_mutex.unlock(io),
+                    .writer => store.writer_mutex.unlock(io),
+                    .inode => blocker.unlock(io),
+                };
+                try producer.park(.resource_blocked);
+                var f: Fixture = .{ .store = &store, .scheduler = &scheduler, .io = io, .coarse = coarse, .failure = failure };
+                var reader: Fixture.Scope = .{ .f = &f };
+                const thread = try std.Thread.spawn(.{}, Fixture.Scope.run, .{&reader});
+                var joined = false;
+                defer if (!joined) {
+                    f.stop.store(true, .release);
+                    f.release.set(io);
+                    if (held) {
+                        switch (lock) {
+                            .generation => store.generation_lock.unlock(io),
+                            .owner => store.mutex.unlock(),
+                            .reader => store.read_mutex.unlock(io),
+                            .writer => store.writer_mutex.unlock(io),
+                            .inode => blocker.unlock(io),
+                        }
+                        held = false;
+                    }
+                    producer.finish();
+                    thread.join();
+                };
+                if (coarse) try f.done.waitTimeout(io, timeout) else {
+                    try f.waiting.waitTimeout(io, timeout);
+                    try std.testing.expectEqual(@as(u64, 40), scheduler.stats().retained_bytes);
+                }
+                // The waiting capture must retain none of the other locks.
+                if (lock != .generation) {
+                    try std.testing.expect(store.generation_lock.tryLock(io));
+                    store.generation_lock.unlock(io);
+                }
+                if (lock != .owner) {
+                    try std.testing.expect(store.mutex.tryLock());
+                    store.mutex.unlock();
+                }
+                if (lock != .reader) {
+                    try std.testing.expect(store.read_mutex.tryLock());
+                    store.read_mutex.unlock(io);
+                }
+                if (lock != .writer) {
+                    try std.testing.expect(store.writer_mutex.tryLock());
+                    store.writer_mutex.unlock(io);
+                }
+                var health: native_scheduler.Execution = .{};
+                try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+                health.finish();
+                try producer.enter(.background);
+                switch (lock) {
+                    .generation => store.generation_lock.unlock(io),
+                    .owner => store.mutex.unlock(),
+                    .reader => store.read_mutex.unlock(io),
+                    .writer => store.writer_mutex.unlock(io),
+                    .inode => blocker.unlock(io),
+                }
+                held = false;
+                producer.finish();
+                f.release.set(io);
+                try f.done.waitTimeout(io, timeout);
+                thread.join();
+                joined = true;
+                try std.testing.expectEqual(@as(?anyerror, if (coarse) error.Backpressured else failure), f.result);
+                try std.testing.expectEqual(@as(usize, 1), f.starts);
+                try std.testing.expectEqual(@as(usize, if (coarse) 0 else 1), f.resumes);
+                try std.testing.expectEqual(@as(usize, 0), store.read_generation.?.references);
+                try std.testing.expectEqual(@as(usize, 0), store.read_generation.?.kernel_readers);
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            }
+        }
+    }
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.CatalogGenerationChanged }) |failure| {
+        var scheduler = try native_scheduler.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var f: Fixture = .{ .store = &store, .scheduler = &scheduler, .io = io, .coarse = false, .failure = failure, .late = true };
+        var reader: Fixture.Scope = .{ .f = &f };
+        Fixture.Scope.run(&reader);
+        try std.testing.expectEqual(@as(?anyerror, failure), f.result);
+        try std.testing.expectEqual(@as(usize, 1), f.starts);
+        try std.testing.expectEqual(@as(usize, 0), f.resumes);
+        try std.testing.expectEqual(@as(usize, 0), store.read_generation.?.references);
+        try std.testing.expectEqual(@as(usize, 0), store.read_generation.?.kernel_readers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
 }

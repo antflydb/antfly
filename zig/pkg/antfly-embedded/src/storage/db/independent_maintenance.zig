@@ -278,7 +278,7 @@ test "independent maintenance shutdown fences every later stage and preserves cu
         owner: *Owner,
         stop_after: Owner.Work,
         fail_current: bool,
-        calls: [7]Owner.Work = undefined,
+        calls: [std.meta.tags(Owner.Work).len]Owner.Work = undefined,
         count: usize = 0,
         failed_count: usize = 0,
         fn ready(_: *anyopaque) bool {
@@ -307,7 +307,7 @@ test "independent maintenance shutdown fences every later stage and preserves cu
             @panic("shutdown must not start another activity observation");
         }
     };
-    const order = [_]Owner.Work{ .upload, .baseline, .producer, .footprint, .repair, .column, .index };
+    const order = [_]Owner.Work{ .upload, .authority, .baseline, .producer, .footprint, .repair, .column, .index };
     for (order, 0..) |work, index| {
         for ([_]bool{ false, true }) |fail_current| {
             if (fail_current and work != .baseline and work != .footprint) continue;

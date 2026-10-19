@@ -105,16 +105,31 @@ pub const kernel_error_identity = @import("kernel_error_identity");
 pub const kernel_wal_owner = antfly.kernel_wal_owner;
 
 pub const storageWalOpen = kernel_wal_owner.open;
+pub const storageWalOpenWithAllocator = kernel_wal_owner.openWithAllocator;
+pub const storageWalReadWithAllocator = kernel_wal_owner.readWithAllocator;
+pub const storageWalOwnedReadBegin = kernel_wal_owner.ownedReadBegin;
+pub const storageWalOwnedReadStep = kernel_wal_owner.ownedReadStep;
+pub const storageWalOwnedReadChunk = kernel_wal_owner.ownedReadChunk;
+pub const storageWalOwnedReadDestroy = kernel_wal_owner.ownedReadDestroy;
+
+pub const storageWalIterateWithAllocator = kernel_wal_owner.iterateWithAllocator;
 pub const storageWalClose = kernel_wal_owner.close;
 pub const storageWalAppend = kernel_wal_owner.append;
+pub const storageWalPrepareAppend = kernel_wal_owner.prepareAppend;
+pub const storageWalPreparedPublish = kernel_wal_owner.preparedPublish;
+pub const storageWalPreparedDestroy = kernel_wal_owner.preparedDestroy;
+pub const storageWalRecoveryPosition = kernel_wal_owner.recoveryPosition;
+pub const storageWalAppendIfRecoveryPosition = kernel_wal_owner.appendIfRecoveryPosition;
 pub const storageWalAppendIdempotent = kernel_wal_owner.appendIdempotent;
 pub const storageWalSync = kernel_wal_owner.sync;
 pub const storageWalTruncatePrefix = kernel_wal_owner.truncatePrefix;
 pub const storageWalTruncateSuffix = kernel_wal_owner.truncateSuffix;
 pub const storageWalIterate = kernel_wal_owner.iterate;
 pub const storageWalRead = kernel_wal_owner.read;
+pub const storageWalReadWithAdmission = kernel_wal_owner.readWithAdmission;
 pub const storageWalStatsSnapshot = kernel_wal_owner.statsSnapshot;
 pub const storageWalLastLsn = kernel_wal_owner.lastLsn;
+pub const storageWalLastLsnWithAdmission = kernel_wal_owner.lastLsnWithAdmission;
 
 pub const backend_types = antfly.storage_backend;
 pub const raft_mod = antfly.raft;
@@ -138,6 +153,10 @@ pub const kernel_runtime_services = antfly.kernel_runtime_services;
 pub const StorageOwnerContext = struct {
     native_queries: ?*@import("../api/native_query_repository.zig").Repository = null,
     allocator_bridge: ?kernel_runtime_services.memory.Allocator = null,
+    bootstrap_memory_parent: ?kernel_runtime_services.memory.Parent = null,
+    // Runtime retirement returns its own charges first. This additional scope
+    // keeps the node alive through the child manager and bootstrap header too.
+    execution_guard: ?@import("antfly_local_sources").storage_execution_services.Client = null,
     io_receiver: ?kernel_runtime_services.executor.Receiver = null,
     alloc: Allocator,
     resources: antfly.physical_resources.PhysicalStorageResources,
@@ -201,10 +220,13 @@ pub const StorageOwnerContext = struct {
         self.resources.deinit();
         // The standard allocator adapter points into this context. Copy its
         // table before poisoning/freeing the object that contains the adapter.
+        var execution_guard = self.execution_guard;
         const bridge = self.allocator_bridge;
+        const parent = self.bootstrap_memory_parent;
         const alloc = if (bridge) |*value| value.asStd() else self.alloc;
         self.* = undefined;
-        alloc.destroy(self);
+        kernel_runtime_services.BootstrapAllocation.destroy(StorageOwnerContext, alloc, parent, self);
+        if (execution_guard) |*guard| guard.close() catch @panic("storage execution guard retained");
         return true;
     }
 };
@@ -772,6 +794,15 @@ pub fn storageOwnerContextCreateWithRuntime(
 /// Keep fallible construction in an error union: errdefer does not run when
 /// an ABI function returns a scalar failure status.
 pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*StorageOwnerContext {
+    const parent = try services.readMemoryParent();
+    if (services.execution_services != null and services.io != null) return error.InvalidArgument;
+    var execution_guard = if (services.execution_services) |offer|
+        try @import("antfly_local_sources").storage_execution_services.Client.open(offer)
+    else
+        null;
+    // Registered before any storage allocation so rollback returns every
+    // parent charge before releasing the producer's lifetime retention.
+    errdefer if (execution_guard) |*guard| guard.close() catch @panic("storage execution rollback");
     const request = services.context;
     const runnable_owner = if (services.runnable_owner) |owner| try @import("antfly_runtime_abi").runnable_abi.Owner.read(owner) else null;
     const bridge = if (services.allocator) |value| blk: {
@@ -780,10 +811,12 @@ pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*St
     } else null;
     const receiver = if (services.io) |io| try io.receive() else null;
     const bootstrap_alloc = if (bridge) |*value| value.asStd() else std.heap.c_allocator;
-    const context = try bootstrap_alloc.create(StorageOwnerContext);
-    errdefer bootstrap_alloc.destroy(context);
+    const context = try kernel_runtime_services.BootstrapAllocation.allocate(StorageOwnerContext, bootstrap_alloc, parent);
+    errdefer kernel_runtime_services.BootstrapAllocation.destroy(StorageOwnerContext, bootstrap_alloc, parent, context);
     context.* = .{
         .allocator_bridge = bridge,
+        .bootstrap_memory_parent = parent,
+        .execution_guard = execution_guard,
         .io_receiver = receiver,
         .alloc = undefined,
         .resources = undefined,
@@ -793,18 +826,20 @@ pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*St
     context.alloc = alloc;
     const memory_budget = antfly.memory_budget;
     const memory_limit = std.math.cast(usize, services.memory_limit_bytes) orelse return error.InvalidArgument;
-    const budgets = if (services.io != null)
+    const budgets = if (services.io != null or services.execution_services != null)
         memory_budget.smartResourceBudgetsResolved(memory_limit, if (memory_limit == 0) .unavailable else .explicit)
     else
         memory_budget.smartResourceBudgets(memory_limit);
-    context.resources = try .initWithBudgets(alloc, budgets);
+    context.resources = try .initWithBudgetsAndParent(alloc, budgets, parent);
     errdefer context.resources.deinit();
     var runtime_config = db_mod.background_runtime.Config{};
     if (context.io_receiver) |*io| runtime_config = .{
         .backend = .manual,
         .borrowed_io = .{ .general = io.io() },
     };
+    runtime_config.execution_services = services.execution_services;
     runtime_config.runnable_owner = runnable_owner;
+    runtime_config.memory_parent = context.resources.resource_manager.memoryParentPort();
     context.backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, runtime_config);
     errdefer context.backend_runtime.deinit();
     context.resources.attachResourceManager();
@@ -816,7 +851,7 @@ pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*St
             context.lite_backend = try lite_backend.Handle.openOrCreate(alloc, path, .{
                 .no_sync = request.no_sync != 0,
                 .resource_manager = &context.resources.resource_manager,
-                .io = if (context.io_receiver) |*io| io.io() else null,
+                .io = context.backend_runtime.ptr().filesystemIo(),
             });
         },
     }
@@ -3915,8 +3950,33 @@ pub fn storageOwnerBatchJson(
     request: *const kernel_owner_abi.BatchJsonOperationRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
 ) callconv(.c) kernel_owner_abi.Status {
+    return storageOwnerBatchJsonImpl(owner, request, null, out_response);
+}
+
+test "controlled owner batch admission C entry rejects before resource access" {
+    const read_control = @import("antfly_local_sources").common_read_admission;
+    const Reject = struct {
+        fn check(_: *anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+    };
+    var marker: u8 = 0;
+    const payload: read_control.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Reject.check } };
+    const port = read_control.Port.init(&payload);
+    var output: kernel_owner_abi.OwnedBytes = .{};
+    try std.testing.expectEqual(kernel_owner_abi.Status.deadline_exceeded, storageOwnerBatchJsonWithAdmission(null, &.{}, &port, &output));
+    try std.testing.expect(output.ptr == null and output.len == 0);
+}
+
+pub fn storageOwnerBatchJsonWithAdmission(owner: ?*anyopaque, request: *const kernel_owner_abi.BatchJsonOperationRequest, admission_port: *const anyopaque, out_response: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    return storageOwnerBatchJsonImpl(owner, request, admission_port, out_response);
+}
+
+fn storageOwnerBatchJsonImpl(owner: ?*anyopaque, request: *const kernel_owner_abi.BatchJsonOperationRequest, admission_port: ?*const anyopaque, out_response: *kernel_owner_abi.OwnedBytes) kernel_owner_abi.Status {
     out_response.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    var admission: @import("antfly_local_sources").api_batch_execution_admission.Borrow = .{};
+    const original = if (admission_port) |port| admission.bind(port) catch |err| return storageOwnerStatusFromError(err) else null;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
     if ((request.document_child_range_dispatch_ctx == null) !=
@@ -3938,10 +3998,10 @@ pub fn storageOwnerBatchJson(
     else
         null;
     var response: capi.Buffer = .{};
-    const status = batchStorageKernelJson(handle, .{
+    const status = batchStorageKernelJsonWithAdmissionContext(handle, .{
         .ptr = request.request_json.ptr,
         .len = @intCast(request.request_json.len),
-    }, if (dispatch) |*value| value.dispatcher() else null, if (committed_effects) |*value| value.observer() else null, &response);
+    }, if (dispatch) |*value| value.dispatcher() else null, if (committed_effects) |*value| value.observer() else null, original, admission.roots, &response);
     if (status != .ok) return status;
     out_response.* = .{
         .ptr = response.ptr,
@@ -4845,6 +4905,15 @@ pub fn batchStorageKernelJson(
     committed_batch_effects_observer: ?db_mod.CommittedBatchEffectsObserver,
     out_buf: *capi.Buffer,
 ) kernel_owner_abi.Status {
+    return batchStorageKernelJsonWithAdmission(handle, request_json, document_child_range_dispatcher, committed_batch_effects_observer, null, out_buf);
+}
+
+pub fn batchStorageKernelJsonWithAdmission(handle: *Handle, request_json: capi.Slice, document_child_range_dispatcher: ?db_mod.DocumentArtifactChildRangeDispatcher, committed_batch_effects_observer: ?db_mod.CommittedBatchEffectsObserver, original: ?@import("antfly_local_sources").api_batch_execution_admission.Controls, out_buf: *capi.Buffer) kernel_owner_abi.Status {
+    return batchStorageKernelJsonWithAdmissionContext(handle, request_json, document_child_range_dispatcher, committed_batch_effects_observer, original, .{}, out_buf);
+}
+
+pub fn batchStorageKernelJsonWithAdmissionContext(handle: *Handle, request_json: capi.Slice, document_child_range_dispatcher: ?db_mod.DocumentArtifactChildRangeDispatcher, committed_batch_effects_observer: ?db_mod.CommittedBatchEffectsObserver, original: ?@import("antfly_local_sources").api_batch_execution_admission.Controls, roots: @import("antfly_local_sources").api_batch_execution_admission.RootContext, out_buf: *capi.Buffer) kernel_owner_abi.Status {
+    if (original) |controls| controls.lifetime.check() catch |err| return storageOwnerStatusFromError(err);
     // The group-local owner accepts the internal batch dialect so split
     // replication state and the caller's requested sync level survive the
     // compiled boundary. Public CAPI parsing remains intentionally narrower.
@@ -4854,7 +4923,9 @@ pub fn batchStorageKernelJson(
     if (owned.req.row_policy_publication != null) return .invalid_argument;
     if (owned.req.relational_index_maintenance) |command| if (command.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.PreparedGenerationChanged);
 
-    if (committed_batch_effects_observer) |observer|
+    if (original) |controls|
+        handle.db.batchWithAdmissionControlsAndRootContext(owned.req, controls, .none, roots, document_child_range_dispatcher, committed_batch_effects_observer) catch |err| return storageOwnerStatusFromError(err)
+    else if (committed_batch_effects_observer) |observer|
         handle.db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(
             owned.req,
             document_child_range_dispatcher,
@@ -5015,11 +5086,12 @@ pub fn storageOwnerRelationalReadProvider(
     const out: *provider.Provider = @ptrCast(@alignCast(output));
     // Provider callbacks resolve the registry id on every call. Returning the
     // raw Handle here would fail that check and could outlive its generation.
-    out.* = .{ .ptr = owner.?, .vtable = &.{ .open = StorageRelationalRead.open, .try_fence = StorageRelationalRead.tryFence } };
+    out.* = .{ .ptr = owner.?, .vtable = &.{ .open = StorageRelationalRead.open, .try_fence = StorageRelationalRead.tryFence, .try_fence_with_admission = StorageRelationalRead.tryFenceWithAdmission } };
     return .ok;
 }
 
 pub const StorageRelationalRead = struct {
+    const Admission = antfly.capi_dependencies.relational_read_provider.View.Admission;
     const View = antfly.capi_dependencies.relational_read_provider.View;
     const Fence = antfly.capi_dependencies.statement_read_fence.Fence;
     const Snapshot = antfly.capi_dependencies.statement_read_fence.Snapshot;
@@ -5030,12 +5102,19 @@ pub const StorageRelationalRead = struct {
         read: db_mod.DB.RelationalStatementSnapshot,
 
         pub fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
+            return openControlled(ptr, alloc, from, to, opts, null);
+        }
+        pub fn openWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, control: Admission) !View {
+            return openControlled(ptr, alloc, from, to, opts, control);
+        }
+        fn openControlled(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, control: ?Admission) !View {
+            if (control) |port| try port.checkpoint();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!opts.include_range_proofs) return error.SqlRangeTrackingRequired;
             const query = opts.relational_query orelse return error.SqlStatementSnapshotRequired;
             if (query.index != null or query.auto_index) return error.SqlStatementSnapshotRequired;
-            const session = try self.db.openRelationalReadSessionAtSnapshot(alloc, from, to, opts, &self.read);
-            return .{ .ptr = session, .vtable = &.{ .next = StorageRelationalRead.next, .close = StorageRelationalRead.close, .normalize = StorageRelationalRead.normalize, .range_proofs = StorageRelationalRead.rangeProofs } };
+            const session = try self.db.openRelationalReadSessionAtSnapshotWithAdmission(alloc, from, to, opts, &self.read, control);
+            return .{ .ptr = session, .vtable = &.{ .next = StorageRelationalRead.next, .next_with_admission = StorageRelationalRead.nextWithAdmission, .close = StorageRelationalRead.close, .normalize = StorageRelationalRead.normalize, .normalize_with_admission = StorageRelationalRead.normalizeWithAdmission, .range_proofs = StorageRelationalRead.rangeProofs, .range_proofs_with_admission = StorageRelationalRead.rangeProofsWithAdmission } };
         }
 
         pub fn release(ptr: *anyopaque) void {
@@ -5057,44 +5136,72 @@ pub const StorageRelationalRead = struct {
             if (self.cancellation) |token| try token.check();
             if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         }
+        pub fn validateWithAdmission(ptr: *anyopaque, control: Admission) !void {
+            try control.checkpoint();
+            try validate(ptr);
+            try control.checkpoint();
+        }
         pub fn release(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.fence.release();
             self.alloc.destroy(self);
         }
         pub fn open(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
+            return openControlled(ptr, alloc, from, to, opts, null);
+        }
+        pub fn openWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, control: Admission) !View {
+            return openControlled(ptr, alloc, from, to, opts, control);
+        }
+        fn openControlled(ptr: *anyopaque, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, control: ?Admission) !View {
+            if (control) |port| try port.checkpoint();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try validate(ptr);
-            const view = try StorageRelationalRead.openAny(self.db, alloc, from, to, opts);
+            const view = try StorageRelationalRead.openAnyControlled(self.db, alloc, from, to, opts, control);
             errdefer view.deinit();
             try validate(ptr);
             return view;
         }
 
         pub fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !Snapshot {
+            return captureSnapshotControlled(ptr, alloc, null);
+        }
+        pub fn captureSnapshotWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, control: Admission) !Snapshot {
+            return captureSnapshotControlled(ptr, alloc, control);
+        }
+        fn captureSnapshotControlled(ptr: *anyopaque, alloc: std.mem.Allocator, control: ?Admission) !Snapshot {
+            if (control) |port| try port.checkpoint();
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try validate(ptr);
             const pinned = try alloc.create(Pinned);
             errdefer alloc.destroy(pinned);
-            var read = try self.db.captureRelationalStatementSnapshot();
+            var read = try self.db.captureRelationalStatementSnapshotWithAdmission(control);
             errdefer read.deinit();
+            if (control) |port| try port.checkpoint();
             pinned.* = .{ .alloc = alloc, .db = self.db, .read = read };
             try validate(ptr);
-            return .{ .ptr = pinned, .vtable = &.{ .open = Pinned.open, .release = Pinned.release } };
+            return .{ .ptr = pinned, .vtable = &.{ .open = Pinned.open, .open_with_admission = Pinned.openWithAdmission, .release = Pinned.release } };
         }
     };
 
     pub fn tryFence(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, opts: db_mod.types.ScanOptions) !?Fence {
+        return tryFenceControlled(ptr, alloc, table, opts, null);
+    }
+    pub fn tryFenceWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, opts: db_mod.types.ScanOptions, control: Admission) !?Fence {
+        return tryFenceControlled(ptr, alloc, table, opts, control);
+    }
+    fn tryFenceControlled(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, opts: db_mod.types.ScanOptions, control: ?Admission) !?Fence {
+        if (control) |port| try port.checkpoint();
         const handle = asHandle(ptr) orelse return error.InvalidArgument;
         _ = storageOwnerTableName(handle, .fromSlice(table)) orelse return error.InvalidArgument;
         if (opts.cancellation) |token| try token.check();
-        var fence = (try handle.db.tryStatementReadFence()) orelse return null;
+        var fence = (try handle.db.tryStatementReadFenceWithAdmission(control)) orelse return null;
         errdefer fence.release();
         const capture = try alloc.create(Capture);
         errdefer alloc.destroy(capture);
         capture.* = .{ .alloc = alloc, .db = &handle.db, .fence = fence, .cancellation = opts.cancellation, .deadline_ns = opts.execution_deadline_ns };
         try Capture.validate(capture);
-        return .{ .ptr = capture, .vtable = &.{ .validate = Capture.validate, .open = Capture.open, .capture_snapshot = Capture.captureSnapshot, .release = Capture.release } };
+        if (control) |port| try port.checkpoint();
+        return .{ .ptr = capture, .vtable = &.{ .validate = Capture.validate, .validate_with_admission = Capture.validateWithAdmission, .open = Capture.open, .open_with_admission = Capture.openWithAdmission, .capture_snapshot = Capture.captureSnapshot, .capture_snapshot_with_admission = Capture.captureSnapshotWithAdmission, .release = Capture.release } };
     }
 
     pub fn open(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
@@ -5105,14 +5212,18 @@ pub const StorageRelationalRead = struct {
     }
 
     pub fn openAny(db: *db_mod.DB, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {
+        return openAnyControlled(db, alloc, from, to, opts, null);
+    }
+    fn openAnyControlled(db: *db_mod.DB, alloc: std.mem.Allocator, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, control: ?Admission) !View {
+        if (control) |port| try port.checkpoint();
         var schema = db.core.acquireSchemaView();
         defer if (schema) |*epoch| epoch.release();
         if (schema == null or schema.?.storageMode() == .document) {
-            const session = try db.openDocumentReadSession(alloc, from, to, opts);
-            return .{ .ptr = session, .vtable = &.{ .next = nextDocument, .close = closeDocument, .normalize = normalizeDocument, .range_proofs = documentRangeProofs } };
+            const session = try db.openDocumentReadSessionWithAdmission(alloc, from, to, opts, control);
+            return .{ .ptr = session, .vtable = &.{ .next = nextDocument, .next_with_admission = nextDocumentWithAdmission, .close = closeDocument, .normalize = normalizeDocument, .normalize_with_admission = normalizeDocumentWithAdmission, .range_proofs = documentRangeProofs, .range_proofs_with_admission = documentRangeProofsWithAdmission } };
         }
-        const session = try db.openRelationalReadSession(alloc, from, to, opts);
-        return .{ .ptr = session, .vtable = &.{ .next = next, .close = close, .normalize = normalize, .range_proofs = rangeProofs } };
+        const session = try db.openRelationalReadSessionAtSnapshotWithAdmission(alloc, from, to, opts, null, control);
+        return .{ .ptr = session, .vtable = &.{ .next = next, .next_with_admission = nextWithAdmission, .close = close, .normalize = normalize, .normalize_with_admission = normalizeWithAdmission, .range_proofs = rangeProofs, .range_proofs_with_admission = rangeProofsWithAdmission } };
     }
 
     pub fn documentRangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]antfly.capi_dependencies.storage_range_protection.Proof {
@@ -5130,6 +5241,11 @@ pub const StorageRelationalRead = struct {
         return session.next(alloc, limit);
     }
 
+    pub fn nextDocumentWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32, control: Admission) !View.Page {
+        const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
+        return session.nextWithAdmission(alloc, limit, control);
+    }
+
     pub fn closeDocument(ptr: *anyopaque) void {
         const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
         session.deinit();
@@ -5141,8 +5257,14 @@ pub const StorageRelationalRead = struct {
     }
 
     pub fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !View.Page {
+        return nextControlled(ptr, alloc, limit, null);
+    }
+    pub fn nextWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32, control: Admission) !View.Page {
+        return nextControlled(ptr, alloc, limit, control);
+    }
+    fn nextControlled(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32, control: ?Admission) !View.Page {
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
-        var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
+        var page = if (control) |port| try session.nextTypedPageWithAdmission(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true }, port) else try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024, .native_cells = true });
         errdefer page.deinit();
         const owned = page.arena.allocator();
         const rows = try owned.alloc(View.Row, page.rows.len);
@@ -5167,6 +5289,22 @@ pub const StorageRelationalRead = struct {
     pub fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_mod.types.BatchWrite) ![]db_mod.types.BatchWrite {
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
         return session.normalizeRows(alloc, writes);
+    }
+    pub fn normalizeWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_mod.types.BatchWrite, control: Admission) ![]db_mod.types.BatchWrite {
+        const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
+        return session.normalizeRowsWithAdmission(alloc, writes, control);
+    }
+    pub fn normalizeDocumentWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const db_mod.types.BatchWrite, control: Admission) ![]db_mod.types.BatchWrite {
+        const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
+        return session.normalizeRowsWithAdmission(alloc, writes, control);
+    }
+    pub fn rangeProofsWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, control: Admission) ![]antfly.capi_dependencies.storage_range_protection.Proof {
+        const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
+        return session.rangeProofsWithAdmission(alloc, control);
+    }
+    pub fn documentRangeProofsWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, control: Admission) ![]antfly.capi_dependencies.storage_range_protection.Proof {
+        const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
+        return session.rangeProofsWithAdmission(alloc, control);
     }
 };
 

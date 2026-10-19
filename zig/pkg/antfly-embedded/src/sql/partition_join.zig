@@ -129,6 +129,11 @@ pub const Join = struct {
     fn bindExecution(self: *Join, execution: ?*@import("../common/runnable_scheduler.zig").Execution) void {
         self.execution = execution;
         self.limits.execution = execution;
+        if (self.skew) |skew| {
+            skew.execution = execution;
+            if (skew.matches) |*file| file.execution = execution;
+        }
+
         for (&self.build, &self.probes) |*build, *probe| {
             if (build.*) |*file| file.file.execution = execution;
             if (probe.*) |*file| file.file.execution = execution;
@@ -577,7 +582,7 @@ pub const Join = struct {
         return true;
     }
     fn compactSkewInput(self: *Join, source: *spill.Sequential) !void {
-        var compact = try spill.Sequential.init(self.manager, @max(512, @min(32 * 1024, self.limits.bytes / 16)));
+        var compact = try spill.Sequential.initFor(self.manager, @max(512, @min(32 * 1024, self.limits.bytes / 16)), self.execution);
         errdefer compact.close();
         compact.buffer_bytes = @max(128, @min(4096, self.limits.bytes / 64));
         source.rewind();
@@ -664,7 +669,7 @@ pub const Join = struct {
                         if (!try self.split(all_hash_union ^ all_hash_intersection)) {
                             try self.compactSkewInput(file);
                             if (self.active.?.probes) |*probes| try self.compactSkewInput(probes);
-                            self.skew = try @import("skew_join.zig").Join.create(self.manager, self.outer_left, self.outer_right);
+                            self.skew = try @import("skew_join.zig").Join.createFor(self.manager, self.outer_left, self.outer_right, self.execution);
                             file.rewind();
                             break;
                         }
@@ -687,7 +692,7 @@ pub const Join = struct {
                     self.hash = null;
                     try self.compactSkewInput(file);
                     if (self.active.?.probes) |*probes| try self.compactSkewInput(probes);
-                    self.skew = try @import("skew_join.zig").Join.create(self.manager, self.outer_left, self.outer_right);
+                    self.skew = try @import("skew_join.zig").Join.createFor(self.manager, self.outer_left, self.outer_right, self.execution);
                     file.rewind();
                     break;
                 }
@@ -1681,6 +1686,7 @@ test "SQL scoped join preparation detaches recursive partitions and identical ke
             for (0..1000) |index| {
                 const key = Datum.json(.{ .integer = if (identical) 7 else @intCast(index) });
                 _ = try join.active.?.build.?.append(.{ .values = &.{key}, .keys = &.{key}, .ordinal = index }, spill.none);
+                join.active.?.hashes.add((try operators.HashJoin.keyHash(&.{key})).?);
             }
             try join.active.?.build.?.seal();
             join.active.?.probes = try join.partitionFile();
@@ -1701,7 +1707,9 @@ test "SQL scoped join preparation detaches recursive partitions and identical ke
             try std.testing.expect(try task.await(std.testing.io));
             try Fixture.detached(join);
             if (identical) {
-                try std.testing.expect(join.hash.?.disk != null);
+                try std.testing.expect(join.skew != null);
+                try std.testing.expect(join.skew.?.execution == null);
+                if (join.skew.?.matches) |file| try std.testing.expect(file.execution == null);
             } else {
                 try std.testing.expect(join.repartitions > 0 and join.pending_count > 0);
             }

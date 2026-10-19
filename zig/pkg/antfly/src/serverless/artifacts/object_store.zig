@@ -19,6 +19,8 @@ const artifact_store = @import("store.zig");
 const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
+const ReadContext = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
+const execution_wait = @import("antfly_local_sources").sql_execution_wait;
 
 pub const ObjectStore = struct {
     const verified_object_cache_limit: usize = 4096;
@@ -46,6 +48,8 @@ pub const ObjectStore = struct {
         }
     };
 
+    /// Borrowed only by this request-local store through synchronous upload.
+    upload_context: ReadContext = .{},
     alloc: std.mem.Allocator,
     client: objectstore.Client,
     fs_client: ?*objectstore.FilesystemClient = null,
@@ -197,13 +201,10 @@ pub const ObjectStore = struct {
 
     /// Borrow a configured client without widening its provisioning authority.
     /// Readers and require-existing writers must not create missing buckets.
-    pub fn initWithClientOptions(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8, options: struct { ensure_bucket: bool = false, read_only: bool = false, filesystem: ?*objectstore.FilesystemClient = null }) !ObjectStore {
+    pub fn initWithClientOptions(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8, options: struct { ensure_bucket: bool = false, read_only: bool = false, filesystem: ?*objectstore.FilesystemClient = null, context: ReadContext = .{} }) !ObjectStore {
         if (options.read_only and options.ensure_bucket) return error.InvalidArtifactStoreOptions;
         var owned_client = client;
-        if (!(try owned_client.bucketExists(bucket))) {
-            if (!options.ensure_bucket) return error.ArtifactBucketNotFound;
-            try owned_client.makeBucket(bucket);
-        }
+        try (object_store_support.OpenedObjectStore.OpenOptions{ .ensure_bucket = options.ensure_bucket, .context = options.context }).ensureClient(&owned_client, bucket, true);
         const owned_bucket = try alloc.dupe(u8, bucket);
         errdefer alloc.free(owned_bucket);
         const owned_prefix = try alloc.dupe(u8, prefix);
@@ -298,9 +299,12 @@ pub const ObjectStore = struct {
     }
 
     fn putInScope(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
-        try cancellation.check();
+        try self.upload_context.ensureActive();
+        const lifetime: UploadCancellation = .{ .context = self.upload_context, .parent = cancellation };
+        const token = lifetime.token();
+        try token.check();
         if (self.read_only) return error.ArtifactStoreReadOnly;
-        const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
+        const checksum = try sha256StringWithCancellationAlloc(alloc, contents, token);
         errdefer alloc.free(checksum);
         const artifact_id = if (scope) |value| scoped: {
             const id = try value.artifactId(checksum);
@@ -310,12 +314,13 @@ pub const ObjectStore = struct {
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
 
-        if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.registerScopedUpload(upload, checksum, cancellation);
+        if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.registerScopedUploadWithWait(upload, checksum, token, self.upload_context.wait);
+        try self.upload_context.ensureActive();
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, checksum) catch unreachable;
         var checksum_base64_buf: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
         const checksum_base64 = std.base64.standard.Encoder.encode(&checksum_base64_buf, &digest);
-        var result = self.client.putObject(self.bucket, key, contents, .{
+        const options: objectstore.PutOptions = .{
             .content_type = "application/octet-stream",
             .checksum_sha256_base64 = if (self.s3_client != null) checksum_base64 else null,
             // GCS exposes provider-computed CRC32C/MD5 metadata. A caller-owned
@@ -323,14 +328,16 @@ pub const ObjectStore = struct {
             // not be used to bypass content verification.
             .checksum_sha256_hex = null,
             .if_none_match = true,
-            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-        }) catch |err| switch (normalizeCancellationError(err, cancellation)) {
+            .cancellation = objectstore.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn),
+        };
+        var result = execution_wait.runOwned(self.upload_context.wait, objectstore.Client.putObject, .{ &self.client, self.bucket, key, contents, options }, discardProvider, .{self.client.allocator}) catch |err| switch (normalizeCancellationError(err, token)) {
             error.PreconditionFailed => {
                 // Content-addressed keys are immutable. Concurrent/idempotent
                 // writers may lose the create race, but the existing object is
                 // accepted only after authenticating it against the digest we
                 // computed from `contents`.
-                try self.verifyContent(alloc, artifact_id, contents.len, checksum, cancellation);
+                try self.upload_context.ensureActive();
+                try self.verifyContentWithContext(artifact_id, contents.len, checksum, token, null, self.upload_context);
                 var pin = try self.verifiedObjectPinAlloc(alloc, artifact_id, contents.len, null);
                 defer if (pin) |*value| value.deinit(alloc);
                 return .{
@@ -343,6 +350,7 @@ pub const ObjectStore = struct {
             else => |normalized| return normalized,
         };
         defer result.deinit(self.client.allocator);
+        try self.upload_context.ensureActive();
         try self.captureGeneration(artifact_id, contents.len, result.version_id, cancellation);
 
         return .{
@@ -351,6 +359,27 @@ pub const ObjectStore = struct {
             .byte_len = @intCast(contents.len),
             .checksum = checksum,
         };
+    }
+
+    const UploadCancellation = struct {
+        context: ReadContext,
+        parent: CancellationToken,
+        fn cancelled(raw: *const anyopaque) bool {
+            check(raw) catch return true;
+            return false;
+        }
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            try self.context.checkLifetime();
+            try self.parent.check();
+        }
+        fn token(self: *const @This()) CancellationToken {
+            return .{ .ptr = self, .is_cancelled_fn = cancelled, .check_fn = check };
+        }
+    };
+    fn discardProvider(value: anytype, alloc: std.mem.Allocator) void {
+        var result = value;
+        result.deinit(alloc);
     }
 
     pub fn getAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8) ![]u8 {
@@ -557,17 +586,24 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
         remaining: ?*u64,
     ) !void {
+        return self.verifyContentWithContext(artifact_id, expected_byte_len, expected_checksum, cancellation, remaining, .{});
+    }
+
+    fn verifyContentWithContext(self: *ObjectStore, artifact_id: []const u8, expected_byte_len: u64, expected_checksum: []const u8, cancellation: CancellationToken, remaining: ?*u64, context: ReadContext) !void {
+        try context.ensureActive();
         const selected_generation = try self.generation(artifact_id, cancellation);
         defer if (selected_generation) |selected| std.heap.page_allocator.free(selected);
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
-        var meta = self.client.statObjectWithOptions(self.bucket, key, .{
+        const stat_options: objectstore.StatOptions = .{
             .version_id = selected_generation,
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-        }) catch |err| return normalizeCancellationError(err, cancellation);
+        };
+        var meta = execution_wait.runOwned(context.wait, objectstore.Client.statObjectWithOptions, .{ &self.client, self.bucket, key, stat_options }, discardProvider, .{self.client.allocator}) catch |err| return normalizeCancellationError(err, cancellation);
         defer meta.deinit(self.client.allocator);
+        try context.ensureActive();
         if (meta.content_length != expected_byte_len) return error.ArtifactIntegrityMismatch;
         if (meta.checksum_scope == .object) {
             if (meta.checksum) |native| {
@@ -615,17 +651,20 @@ pub const ObjectStore = struct {
         const chunk_bytes: u64 = 8 * 1024 * 1024;
         var offset: u64 = 0;
         while (offset < expected_byte_len) {
+            try context.ensureActive();
             try cancellation.check();
             const len = @min(chunk_bytes, expected_byte_len - offset);
-            var part = self.client.getObject(self.bucket, key, .{
+            const get_options: objectstore.GetOptions = .{
                 .range = .{ .offset = offset, .length = len },
                 .version_id = meta.version_id,
                 .if_match_etag = meta.etag,
                 .skip_metadata_probe = true,
                 .max_response_bytes = @intCast(len),
                 .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-            }) catch |err| return normalizeCancellationError(err, cancellation);
+            };
+            var part = execution_wait.runOwned(context.wait, objectstore.Client.getObject, .{ &self.client, self.bucket, key, get_options }, discardProvider, .{self.client.allocator}) catch |err| return normalizeCancellationError(err, cancellation);
             defer part.deinit(self.client.allocator);
+            try context.ensureActive();
             if (part.body.len != len) return error.ArtifactIntegrityMismatch;
             hasher.update(part.body);
             offset += len;
@@ -1278,6 +1317,10 @@ test "serverless objectstore verification caches immutable provider identities" 
 
     const EtagOnlyClient = struct {
         inner: objectstore.Client,
+        running: ?*bool = null,
+        fn assertProvider(self: *@This()) !void {
+            if (self.running) |running| try std.testing.expect(!running.*);
+        }
 
         fn client(self: *@This()) objectstore.Client {
             return .{ .allocator = self.inner.allocator, .ptr = self, .vtable = &vtable };
@@ -1311,10 +1354,12 @@ test "serverless objectstore verification caches immutable provider identities" 
         }
 
         fn putObject(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8, body: []const u8, options: objectstore.PutOptions) !objectstore.PutResult {
+            try from(ptr).assertProvider();
             return try from(ptr).inner.putObject(bucket, key, body, options);
         }
 
         fn getObject(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8, options: objectstore.GetOptions) !objectstore.GetResult {
+            try from(ptr).assertProvider();
             return try from(ptr).inner.getObject(bucket, key, options);
         }
 
@@ -1336,6 +1381,7 @@ test "serverless objectstore verification caches immutable provider identities" 
 
         fn statObjectWithOptions(ptr: *anyopaque, _: std.mem.Allocator, bucket: []const u8, key: []const u8, options: objectstore.StatOptions) !objectstore.ObjectMetadata {
             const self = from(ptr);
+            try self.assertProvider();
             var metadata = try self.inner.statObjectWithOptions(bucket, key, options);
             etagOnly(&metadata, self.inner.allocator);
             return metadata;
@@ -1375,6 +1421,64 @@ test "serverless objectstore verification caches immutable provider identities" 
     // The authenticated provider pin makes reuse one GET, without another HEAD.
     try std.testing.expectEqual(@as(u64, 4), memory.operationCount());
     try std.testing.expectEqual(@as(u64, 0), warm_allowance);
+    const WaitProbe = struct {
+        running: bool = true,
+        reject: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.running);
+            self.running = false;
+            self.begins += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.running);
+            self.ends += 1;
+            if (self.reject) return error.SchedulerClosed;
+            self.running = true;
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            try std.testing.expect(@as(*@This(), @ptrCast(@alignCast(raw))).running);
+        }
+    };
+    const Expired = struct {
+        fn check(_: *anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+    };
+    var expired_marker: u8 = 0;
+    const original: ObjectStore.UploadCancellation = .{ .parent = .none, .context = .{ .authority = .{ .ptr = &expired_marker, .check = Expired.check } } };
+    try std.testing.expectError(error.DeadlineExceeded, original.token().check());
+    try std.testing.expectEqual(error.DeadlineExceeded, normalizeCancellationError(error.Cancelled, original.token()));
+    for ([_]bool{ false, true }) |reject| {
+        var probe: WaitProbe = .{ .reject = reject };
+        etag_only.running = &probe.running;
+        impl.upload_context = .{ .checkpoint = .{ .ptr = &probe, .check = WaitProbe.checkpoint }, .wait = .{ .ptr = &probe, .begin = WaitProbe.begin, .end = WaitProbe.end } };
+        defer {
+            impl.upload_context = .{};
+            etag_only.running = null;
+        }
+        const body = if (reject) "uploaded-before-resume-rejection" else "request-owned-upload";
+        const result = store.put(body);
+        if (reject) {
+            try std.testing.expectError(error.SchedulerClosed, result);
+            try std.testing.expectEqual(@as(usize, 1), probe.ends);
+            // The provider physically published. A resume rejection frees its
+            // response but must not delete or reinterpret that durable object.
+            probe.reject = false;
+            probe.running = true;
+        } else {
+            var uploaded = try result;
+            defer uploaded.deinit(alloc);
+        }
+        const before = probe.begins;
+        var duplicate = try store.put(body);
+        defer duplicate.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 3), probe.begins - before); // PUT conflict, HEAD, authenticated GET.
+        try std.testing.expectEqual(probe.begins, probe.ends);
+    }
 }
 
 test "serverless objectstore-backed artifact initialization cleans up every allocation failure" {

@@ -25,6 +25,9 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const read_admission = @import("../../common/read_admission.zig");
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 
+const RuntimeMemory = @import("../runtime_memory.zig");
+const MemoryParent = @import("antfly_runtime_abi").memory_abi.Parent;
+
 const Allocator = std.mem.Allocator;
 const CounterU64 = platform.atomic.Value(u64);
 const supports_native_storage = builtin.os.tag != .freestanding;
@@ -382,6 +385,8 @@ pub const NativePathLockFileOptions = struct {
 };
 
 pub const NativePathLockFile = struct {
+    memory: ?*RuntimeMemory.Owner = null,
+    pool: ?*NativeStoragePool = null,
     io_impl: if (supports_native_storage) std.Io.Threaded else void,
     file: std.Io.File,
     fd_cache: *FdCache,
@@ -428,6 +433,8 @@ pub const NativePathLockFile = struct {
             self.file.close(self.io_impl.io());
             self.fd_cache.releasePersistentDescriptors(self.io_impl.io(), 1);
             self.io_impl.deinit();
+            if (self.memory) |memory| memory.destroy();
+            if (self.pool) |pool| pool.releaseState();
             self.* = undefined;
         }
     }
@@ -485,12 +492,21 @@ pub fn openNativePathLockFileWithPool(
     options: NativePathLockFileOptions,
     pool: ?*NativeStoragePool,
 ) !NativePathLockFile {
-    return try openNativePathLockFileWithCache(
-        allocator,
+    if (pool) |owner| try owner.retainState();
+    errdefer if (pool) |owner| owner.releaseState();
+    const parent = if (pool) |owner| owner.memory_parent else null;
+    const memory = if (parent) |value| try RuntimeMemory.Owner.create(allocator, value) else null;
+    errdefer if (memory) |owner| owner.destroy();
+    var result = try openNativePathLockFileWithCache(
+        if (memory) |owner| owner.allocator() else allocator,
         path,
         options,
         if (pool) |configured| configured.fd_cache else processNativeFdCache(),
+        if (memory) |owner| owner.stackAllocator() else null,
     );
+    result.memory = memory;
+    result.pool = pool;
+    return result;
 }
 
 fn openNativePathLockFileWithCache(
@@ -498,11 +514,12 @@ fn openNativePathLockFileWithCache(
     path: []const u8,
     options: NativePathLockFileOptions,
     fd_cache: *FdCache,
+    stack_allocator: ?Allocator,
 ) !NativePathLockFile {
     if (comptime !supports_native_storage) {
         return error.UnsupportedPlatform;
     } else {
-        var io_impl = threaded_io_limits.initService(allocator);
+        var io_impl = threaded_io_limits.initOwnedService(allocator, stack_allocator);
         errdefer io_impl.deinit();
 
         const open_descriptor_count = createPathDescriptorCount(path);
@@ -706,6 +723,18 @@ pub const Storage = struct {
         } else try self.readFileRangeInto(allocator, path, offset, out);
         try control.checkpoint();
         return out;
+    }
+
+    /// Controlled into-buffer reads fail closed when the provider cannot carry
+    /// the original authority. The output belongs to the caller on every exit.
+    pub fn readFileRangeIntoWithAdmission(self: Storage, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
+        try control.checkpoint();
+        const read = self.vtable.read_file_range_into_with_admission orelse return error.ExecutionWaitUnsupported;
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        BoundaryAbi.call("read_file_range_into_with_admission", self.boundary_dispatch, read, .{ self.ptr, path, offset, out, borrowed }) catch |err| return relay.rejection orelse err;
+        if (relay.rejection) |err| return err;
+        try control.checkpoint();
     }
 
     pub fn readFileAllocWithAdmission(self: Storage, allocator: Allocator, path: []const u8, max_bytes: usize, control: read_admission.Port) ![]u8 {
@@ -2161,6 +2190,47 @@ fn processNativeFdCache() *FdCache {
 pub const NativeStoragePool = struct {
     fd_cache: *FdCache,
     owned_allocator: ?Allocator = null,
+    /// Borrowed through every retained native state/path lock and physical join.
+    memory_parent: ?MemoryParent = null,
+    state_mutex: std.Io.Mutex = .init,
+    states_drained: std.Io.Condition = .init,
+    state_count: usize = 0,
+    states_closing: bool = false,
+
+    fn retainState(self: *NativeStoragePool) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        if (self.states_closing) return error.StorageClosed;
+        if (self.state_count == std.math.maxInt(usize)) return error.StorageClosed;
+        self.state_count += 1;
+    }
+    fn releaseState(self: *NativeStoragePool) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        std.debug.assert(self.state_count != 0);
+        self.state_count -= 1;
+        if (self.state_count == 0) self.states_drained.broadcast(io);
+    }
+    pub fn closeAdmission(self: *NativeStoragePool) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        self.states_closing = true;
+    }
+    pub fn waitDrained(self: *NativeStoragePool) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        while (self.state_count != 0) self.states_drained.waitUncancelable(io, &self.state_mutex);
+    }
+    pub fn retainedStates(self: *NativeStoragePool) usize {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        return self.state_count;
+    }
 
     pub fn init(_: Allocator) NativeStoragePool {
         return .{ .fd_cache = processNativeFdCache() };
@@ -2173,6 +2243,8 @@ pub const NativeStoragePool = struct {
     }
 
     pub fn deinit(self: *NativeStoragePool) void {
+        self.closeAdmission();
+        self.waitDrained();
         if (self.owned_allocator) |allocator| {
             self.fd_cache.deinit();
             allocator.destroy(self.fd_cache);
@@ -2224,9 +2296,17 @@ const NativeStorageState = struct {
     threaded: std.Io.Threaded,
     fd_cache: *FdCache,
     cache_namespace: u64,
+    memory: ?*RuntimeMemory.Owner,
+    pool: ?*NativeStoragePool,
 
-    fn create(allocator: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !*NativeStorageState {
+    fn create(backing: Allocator, kind: RuntimeKind, pool: ?*NativeStoragePool) !*NativeStorageState {
         if (kind != .threaded) return error.UnsupportedEventedIoRuntime;
+        if (pool) |owner| try owner.retainState();
+        errdefer if (pool) |owner| owner.releaseState();
+        const parent = if (pool) |owner| owner.memory_parent else null;
+        const memory = if (parent) |value| try RuntimeMemory.Owner.create(backing, value) else null;
+        errdefer if (memory) |owner| owner.destroy();
+        const allocator = if (memory) |owner| owner.allocator() else backing;
         const state = try allocator.create(NativeStorageState);
         errdefer allocator.destroy(state);
         state.* = undefined;
@@ -2235,7 +2315,9 @@ const NativeStorageState = struct {
         state.closing = .init(false);
         // Native storage state may outlive its owning DB while range futures
         // drain. Prevent that retained runtime from growing without a bound.
-        state.threaded = threaded_io_limits.initService(allocator);
+        state.memory = memory;
+        state.pool = pool;
+        state.threaded = threaded_io_limits.initOwnedService(allocator, if (memory) |owner| owner.stackAllocator() else null);
         errdefer state.threaded.deinit();
         // NativeStorage.init is used by repository, recovery, and status
         // helpers as well as BackendRuntime-owned stores. All production
@@ -2329,7 +2411,11 @@ const NativeStorageState = struct {
         self.fd_cache.signalAdmissionChanged(self.threaded.io());
         self.threaded.deinit();
         const allocator = self.allocator;
+        const memory = self.memory;
+        const pool = self.pool;
         allocator.destroy(self);
+        if (memory) |owner| owner.destroy();
+        if (pool) |owner| owner.releaseState();
     }
 
     /// Mutation paths call invalidation before and after the filesystem
@@ -5603,6 +5689,7 @@ test "persistent path locks use reserved headroom under transient saturation" {
         path,
         .{ .create_if_missing = true },
         pool.fd_cache,
+        null,
     );
     defer lock_file.close();
     const stats = pool.snapshotStats();
@@ -5632,7 +5719,7 @@ test "persistent path lock exhaustion fails without waiting" {
 
     try std.testing.expectError(
         error.PersistentDescriptorAdmissionExhausted,
-        openNativePathLockFileWithCache(std.testing.allocator, path, .{ .create_if_missing = true }, pool.fd_cache),
+        openNativePathLockFileWithCache(std.testing.allocator, path, .{ .create_if_missing = true }, pool.fd_cache, null),
     );
     const stats = pool.snapshotStats();
     try std.testing.expectEqual(@as(usize, 0), stats.fd_admission_waiters);
@@ -6298,4 +6385,119 @@ test "storage file errors and returned writers use their owning dispatcher" {
     try std.testing.expectEqualStrings("hello", &bytes);
     try std.testing.expectError(error.EndOfStream, reader.readRangeInto(5, &bytes));
     try std.testing.expectEqual(@as(usize, 2), ReaderForeign.calls);
+}
+
+test "native executor memory path locks charge their parent and retire owned stacks" {
+    if (comptime !std.Thread.use_pthreads) return error.SkipZigTest;
+    const Manager = @import("../resource_manager.zig").ResourceManager;
+    var root = Manager.init(.{ .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+    defer root.deinit(std.testing.allocator);
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 8);
+    defer pool.deinit();
+    pool.memory_parent = root.memoryParentPort();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/private.lock", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    var file = try openNativePathLockFileWithPool(std.testing.allocator, path, .{ .create_if_missing = true }, &pool);
+    var live = true;
+    defer if (live) file.close();
+    try std.testing.expectEqual(@as(usize, 1), pool.retainedStates());
+    const Work = struct {
+        fn run() u32 {
+            return 42;
+        }
+    };
+    const io = file.io_impl.io();
+    var task = try io.concurrent(Work.run, .{});
+    try std.testing.expectEqual(@as(u32, 42), task.await(io));
+    try std.testing.expect(file.memory.?.stackStats().used > 0);
+    file.close();
+    live = false;
+    try std.testing.expectEqual(@as(usize, 0), pool.retainedStates());
+    try std.testing.expectEqual(@as(u64, 0), root.snapshot().memory.used_bytes);
+}
+
+test "native executor memory range futures and descriptor permits outlive the storage handle" {
+    const Manager = @import("../resource_manager.zig").ResourceManager;
+    var root = Manager.init(.{ .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+    defer root.deinit(std.testing.allocator);
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 8);
+    defer pool.deinit();
+    pool.memory_parent = root.memoryParentPort();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    var live = true;
+    defer if (live) native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/retained.bytes", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    try native.storage().writeFileAbsolute(path, "abcdefgh");
+    var future = try native.storage().beginReadFileRangeAlloc(std.testing.allocator, path, 2, 4);
+    var pending = true;
+    defer if (pending) future.cancel();
+    var permit = try native.acquireFdPermit();
+    defer permit.release();
+    native.deinit();
+    live = false;
+    pool.closeAdmission();
+    try std.testing.expectEqual(@as(usize, 1), pool.retainedStates());
+    try std.testing.expect(root.snapshot().memory.used_bytes > 0);
+    const bytes = try future.wait();
+    pending = false;
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("cdef", bytes);
+    try std.testing.expectEqual(@as(usize, 1), pool.retainedStates());
+    permit.release();
+    try std.testing.expectEqual(@as(usize, 0), pool.retainedStates());
+    try std.testing.expectEqual(@as(u64, 0), root.snapshot().memory.used_bytes);
+}
+
+test "LSM streaming block controlled into reads preserve original errors across checked callbacks" {
+    const Fixture = struct {
+        var dispatched: usize = 0;
+        var reads: usize = 0;
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            dispatched += 1;
+            return Storage.BoundaryAbi.local_dispatch(contract, callback, args, output);
+        }
+        fn read(_: *anyopaque, _: []const u8, _: u64, out: []u8, control: read_admission.Port) !void {
+            reads += 1;
+            // A provider that ignores rejection must not turn it into success.
+            control.checkpoint() catch {};
+            @memset(out, 0xab);
+        }
+    };
+    const Budget = struct {
+        checks: usize = 0,
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWindowWait;
+        }
+        pub fn checkpoint(self: *@This()) !void {
+            self.checks += 1;
+            if (self.checks >= 2) return error.TestOriginalIntoRejection;
+        }
+    };
+    for ([_]bool{ false, true }) |checked| {
+        var memory = MemoryStorage.init(std.testing.allocator);
+        defer memory.deinit();
+        var storage = memory.storage();
+        var table = storage.vtable.*;
+        table.read_file_range_into_with_admission = Fixture.read;
+        storage.vtable = &table;
+        if (checked) storage.boundary_dispatch = Fixture.dispatch;
+        Fixture.dispatched = 0;
+        Fixture.reads = 0;
+        var budget: Budget = .{};
+        var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        var out: [17]u8 = undefined;
+        try std.testing.expectError(error.TestOriginalIntoRejection, storage.readFileRangeIntoWithAdmission("immutable-run", 0, &out, .init(&payload)));
+        try std.testing.expectEqual(@as(usize, 1), Fixture.reads);
+        try std.testing.expectEqual(@as(usize, if (checked) 1 else 0), Fixture.dispatched);
+        table.read_file_range_into_with_admission = null;
+        budget.checks = 0;
+        try std.testing.expectError(error.ExecutionWaitUnsupported, storage.readFileRangeIntoWithAdmission("immutable-run", 0, &out, .init(&payload)));
+        try std.testing.expectEqual(@as(usize, 1), Fixture.reads);
+    }
 }

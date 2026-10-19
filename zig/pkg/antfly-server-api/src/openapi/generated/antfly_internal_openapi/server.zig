@@ -6,6 +6,49 @@ const httpx = @import("httpx");
 const types = @import("types.zig");
 
 /// --- Extractors (framework-agnostic) ---
+/// Parse the JSON request body for cancelRemoteAttempt.
+pub fn parseCancelRemoteAttemptBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(struct {}) {
+    return std.json.parseFromSlice(struct {}, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for fenceRemoteAttempts.
+pub fn parseFenceRemoteAttemptsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(struct {}) {
+    return std.json.parseFromSlice(struct {}, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for getRemoteAttemptStatus.
+pub fn parseGetRemoteAttemptStatusBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(struct {}) {
+    return std.json.parseFromSlice(struct {}, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a process-scoped owned read
+pub const ExecuteProcessOwnedGroupQueryPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+    /// Nonzero unsigned 128-bit root identity in decimal.
+    root_incarnation: []const u8,
+    reporter_incarnation: []const u8,
+};
+
+/// Parse the JSON request body for executeProcessOwnedGroupQuery.
+pub fn parseExecuteProcessOwnedGroupQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.ArrayHashMap(std.json.Value)) {
+    return std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Execute a process-scoped owned read
+pub const ExecuteProcessOwnedRetainedReadPathParams = struct {
+    group_id: []const u8,
+    table_name: []const u8,
+    /// Nonzero unsigned 128-bit root identity in decimal.
+    root_incarnation: []const u8,
+    reporter_incarnation: []const u8,
+};
+
+/// Parse the JSON request body for executeProcessOwnedRetainedRead.
+pub fn parseExecuteProcessOwnedRetainedReadBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.ArrayHashMap(std.json.Value)) {
+    return std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for createHAReplicationStreamingSlot.
 pub fn parseCreateHAReplicationStreamingSlotBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyCreateReplicationSlotRequest) {
     return std.json.parseFromSlice(types.StandbyCreateReplicationSlotRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -33,6 +76,12 @@ pub const Route = struct {
 };
 
 pub const routes = [_]Route{
+    .{ .method = "POST", .path = "/attempt/cancel", .operation_id = "cancelRemoteAttempt", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/attempt/capabilities", .operation_id = "getRemoteOwnedReadCapabilities", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/attempt/fence", .operation_id = "fenceRemoteAttempts", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/attempt/status", .operation_id = "getRemoteAttemptStatus", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/owned-query/{root_incarnation}/{reporter_incarnation}", .operation_id = "executeProcessOwnedGroupQuery", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/groups/{group_id}/tables/{table_name}/owned-retained-read/{root_incarnation}/{reporter_incarnation}", .operation_id = "executeProcessOwnedRetainedRead", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/standby/replication/identify", .operation_id = "identifyHAReplicationSystem", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/standby/replication/slots", .operation_id = "createHAReplicationStreamingSlot", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/standby/replication/start", .operation_id = "startHAReplication", .request_body = .buffered, .streaming_response = false },
@@ -50,6 +99,12 @@ pub const routes = [_]Route{
 ///   try router.register(&server);
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
+        if (!@hasDecl(Impl, "cancelRemoteAttempt")) @compileError("ServerRouter: Impl missing required method 'cancelRemoteAttempt'");
+        if (!@hasDecl(Impl, "getRemoteOwnedReadCapabilities")) @compileError("ServerRouter: Impl missing required method 'getRemoteOwnedReadCapabilities'");
+        if (!@hasDecl(Impl, "fenceRemoteAttempts")) @compileError("ServerRouter: Impl missing required method 'fenceRemoteAttempts'");
+        if (!@hasDecl(Impl, "getRemoteAttemptStatus")) @compileError("ServerRouter: Impl missing required method 'getRemoteAttemptStatus'");
+        if (!@hasDecl(Impl, "executeProcessOwnedGroupQuery")) @compileError("ServerRouter: Impl missing required method 'executeProcessOwnedGroupQuery'");
+        if (!@hasDecl(Impl, "executeProcessOwnedRetainedRead")) @compileError("ServerRouter: Impl missing required method 'executeProcessOwnedRetainedRead'");
         if (!@hasDecl(Impl, "identifyHAReplicationSystem")) @compileError("ServerRouter: Impl missing required method 'identifyHAReplicationSystem'");
         if (!@hasDecl(Impl, "createHAReplicationStreamingSlot")) @compileError("ServerRouter: Impl missing required method 'createHAReplicationStreamingSlot'");
         if (!@hasDecl(Impl, "startHAReplication")) @compileError("ServerRouter: Impl missing required method 'startHAReplication'");
@@ -65,10 +120,60 @@ pub fn ServerRouter(comptime Impl: type) type {
 
         /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
+            try server.post("/attempt/cancel", httpx.Handler.bind(self.impl, cancelRemoteAttempt));
+            try server.post("/attempt/capabilities", httpx.Handler.bind(self.impl, getRemoteOwnedReadCapabilities));
+            try server.post("/attempt/fence", httpx.Handler.bind(self.impl, fenceRemoteAttempts));
+            try server.post("/attempt/status", httpx.Handler.bind(self.impl, getRemoteAttemptStatus));
+            try server.post("/groups/:group_id/tables/:table_name/owned-query/:root_incarnation/:reporter_incarnation", httpx.Handler.bind(self.impl, executeProcessOwnedGroupQuery));
+            try server.post("/groups/:group_id/tables/:table_name/owned-retained-read/:root_incarnation/:reporter_incarnation", httpx.Handler.bind(self.impl, executeProcessOwnedRetainedRead));
             try server.get("/standby/replication/identify", httpx.Handler.bind(self.impl, identifyHAReplicationSystem));
             try server.post("/standby/replication/slots", httpx.Handler.bind(self.impl, createHAReplicationStreamingSlot));
             try server.post("/standby/replication/start", httpx.Handler.bind(self.impl, startHAReplication));
             try server.post("/standby/replication/status", httpx.Handler.bind(self.impl, updateHAStandbyStatus));
+        }
+
+        /// Cancel one remote attempt and suppress delayed dispatch
+        /// POST /attempt/cancel
+        fn cancelRemoteAttempt(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.cancelRemoteAttempt(ctx);
+        }
+
+        /// Probe signed owned-read support for an enrolled process
+        /// POST /attempt/capabilities
+        fn getRemoteOwnedReadCapabilities(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.getRemoteOwnedReadCapabilities(ctx);
+        }
+
+        /// Fence a coordinator generation after physical quiescence
+        /// POST /attempt/fence
+        fn fenceRemoteAttempts(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.fenceRemoteAttempts(ctx);
+        }
+
+        /// Read signed remote attempt status
+        /// POST /attempt/status
+        fn getRemoteAttemptStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.getRemoteAttemptStatus(ctx);
+        }
+
+        /// Execute a process-scoped owned read
+        /// POST /groups/{group_id}/tables/{table_name}/owned-query/{root_incarnation}/{reporter_incarnation}
+        fn executeProcessOwnedGroupQuery(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            const root_incarnation = ctx.param("root_incarnation") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: root_incarnation" });
+            const reporter_incarnation = ctx.param("reporter_incarnation") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: reporter_incarnation" });
+            return impl.executeProcessOwnedGroupQuery(ctx, group_id, table_name, root_incarnation, reporter_incarnation);
+        }
+
+        /// Execute a process-scoped owned read
+        /// POST /groups/{group_id}/tables/{table_name}/owned-retained-read/{root_incarnation}/{reporter_incarnation}
+        fn executeProcessOwnedRetainedRead(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const group_id = ctx.param("group_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: group_id" });
+            const table_name = ctx.param("table_name") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table_name" });
+            const root_incarnation = ctx.param("root_incarnation") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: root_incarnation" });
+            const reporter_incarnation = ctx.param("reporter_incarnation") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: reporter_incarnation" });
+            return impl.executeProcessOwnedRetainedRead(ctx, group_id, table_name, root_incarnation, reporter_incarnation);
         }
 
         /// Identify this primary replication system
@@ -99,6 +204,12 @@ pub fn ServerRouter(comptime Impl: type) type {
 
 // Handler interface. Implement these methods on your Impl struct:
 //
+//   fn cancelRemoteAttempt(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getRemoteOwnedReadCapabilities(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn fenceRemoteAttempts(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getRemoteAttemptStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn executeProcessOwnedGroupQuery(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8, root_incarnation: []const u8, reporter_incarnation: []const u8) !httpx.Response
+//   fn executeProcessOwnedRetainedRead(self: *Impl, ctx: *httpx.Context, group_id: []const u8, table_name: []const u8, root_incarnation: []const u8, reporter_incarnation: []const u8) !httpx.Response
 //   fn identifyHAReplicationSystem(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createHAReplicationStreamingSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn startHAReplication(self: *Impl, ctx: *httpx.Context) !httpx.Response

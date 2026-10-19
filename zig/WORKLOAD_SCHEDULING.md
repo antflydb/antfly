@@ -1,15 +1,28 @@
 # Workload Admission and Scheduling
 
-Status: fixed, opt-in admission, protected HTTP dispatch, a bounded dedicated
-SQL executor, reusable outbound clients with bounded waiting, and aggregate
-pgwire allocation and retained-state budgets are implemented. Pgwire also has
-an idle transaction deadline. Native row/session, H1/H2 dispatch, outbound reuse,
-and retained-state correctness checks are included. See [implementation scope and restrictions](WORKLOAD_POOLING_IMPLEMENTATION.md).
-The remaining deliveries and automatic query-admission defaults are not qualified.
+Status: bounded default query waiting, startup-resolved runnable capacity,
+protected HTTP dispatch, a bounded SQL executor, reusable outbound clients, and
+aggregate pgwire/session budgets are implemented. Python and TypeScript SDK
+clients and the root Go Antfly/inference SDK clients also have bounded local
+FIFO admission. Native session, H1/H2 dispatch, outbound reuse, and particular
+retained-state paths have focused checks. Owned remote-read families remain
+disabled by default; complete operator eligibility, distributed ownership,
+resource-progress and default-policy qualification remain open. See
+[implementation scope and restrictions](WORKLOAD_POOLING_IMPLEMENTATION.md).
 
-Source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on `origin/main`,
-verified against GitHub on 2026-10-05. Development branch:
-`design/default-workload-pooling`, in `.worktrees/default-workload-pooling`.
+Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
+`origin/main`, verified against GitHub on 2026-10-05. Active development uses one
+branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
+[PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
+implementation evidence are recorded in the implementation ledger.
+
+The full goal remains safe, bounded execution sharing across many connections
+by default, with fair scheduling and bounded waiting, preserving session
+semantics, query correctness, durability and control progress under overload.
+The delivery milestones below are stages of that goal within the same branch
+and PR. Full qualification is waived for this work; focused correctness and
+integration verification remain required. The waiver does not establish that
+automatic defaults or the full design are complete.
 
 This document carries forward the architecture from [PR #849](https://github.com/antflydb/antfly/pull/849),
 with a smaller first delivery and integration points checked against this baseline.
@@ -243,6 +256,13 @@ label cardinality. Report timing from original submission, including retries.
 
 ## Qualification and default-selection delivery
 
+For this implementation branch, the user waived full qualification. The complete
+resource/performance sweep below remains a reference for future full validation,
+not a pending builder or approval gate. Default activation still requires focused
+evidence for the supported production correctness and resource-bound contracts.
+See the current [completion audit](WORKLOAD_POOLING_IMPLEMENTATION.md#completion-audit-against-the-full-delivery-goal)
+for the remaining implementation and verification requirements.
+
 Correctness gates precede performance claims:
 
 | Scenario | Required assertion |
@@ -299,8 +319,10 @@ new default connection count or wait duration.
 2. Qualify runtime suspension and connection/session efficiency; add necessary
    transport capacity, reusable client lifetime, and aggregate state safeguards.
    Keep each change independently reviewable with fixed/fail-fast rollback.
-3. Run the declared qualification matrix, retain results, and ship measured
-   automatic sizing and bounded-wait defaults in a separate reviewed change.
+3. Retain focused correctness and integration evidence, then implement and
+   review automatic sizing and bounded-wait defaults within the same branch and
+   PR. The full qualification campaign is waived; default behavior still needs
+   evidence matching its safety, fairness and overload guarantees.
 
 Within the original broader design, helper/fan-out accounting, verified
 operator suspend/resume, weighted fairness, bounded backfill and large-request
@@ -323,6 +345,204 @@ admission. Neither client limits nor additional gateway replicas may substitute
 for node resource safety.
 
 ## Current resource integration
+
+### Transaction completion before the commit decision
+
+Status: durable effect storage, required-BEGIN commit gate, accepted-plan DB
+materialization, sealed-frame serving catalog leases and explicit local file
+eligibility implemented. Distributed prepare orchestration, peer/ordered-migration
+policy and completion reservations remain pending.
+The physical artifact inventory and
+transaction batch publication credit are implemented, but neither funds every
+future transaction replay effect. The following ordering is required before
+extending that credit to replay or claiming bounded mandatory completion.
+
+The current coordinator preserves the public sync level. In
+[`executeMultiTableCommitOnce`](pkg/antfly/src/api/distributed_txn.zig), it prepares
+all participants, resolves the first participant durably, disables abort, then
+resolves followers with the caller's sync level. Only `propose` is promoted to
+`write` for the coordinator. `TransactionIntentRequest` has no sync level;
+`PrepareFanoutTask` therefore cannot communicate the requested generated work.
+Participant resolution calls the ordinary mutation pipeline, where
+`generatedPrecomputeModeForSyncLevel` selects generated precomputation for
+`enrichments` and `full_index`. Consequently a follower can encounter producer
+failure or new resource admission after the coordinator's commit decision.
+These are source observations, not fault-injection qualification.
+
+Recovery reinforces the need for durable preparation: server
+`resolveParticipant` resolves at `write`, and embedded
+`resolveFinalizedTransactionIntentsForRecovery` resolves at `propose`. A durable
+effect plan must survive these weaker acknowledgement levels. Recovery must not
+reconstruct a different effect set from the retry's sync level or rerun a
+nondeterministic producer whose output was accepted before the decision.
+
+| Phase | Required ownership and behavior |
+| --- | --- |
+| Prepare request | Carry an explicit, versioned preparation contract independently of acknowledgement/visibility level. All participants receive the same requested producer semantics before any commit decision. |
+| Speculative preparation | On the proposal leader or embedded caller, use the original controlled preparation owner to compute eligible synchronous generated effects. Do this before Raft proposal/application and outside apply/catalog/storage writer fences. Reject producer failure, allocation failure and unavailable credit here. |
+| Durable prepare | Atomically persist intents, the preparation contract, immutable generated effects and remaining work descriptors, catalog identities, and completion reservations before voting prepared. Revalidate the observations used by speculative preparation under the existing apply fence. |
+| Coordinator decision | Require a compatible durable prepare from every participant before writing the first committed participant record. A stronger retry cannot silently upgrade a prepared contract. |
+| Participant commit | Consume the persisted effect plan and existing reservations. Choose visibility waits from the request, but choose mutation effects from durable preparation. Do not invoke a fresh mandatory producer or replay-credit grant. |
+| Recovery and acknowledgement | Restart, leadership change, lost replies and weaker recovery sync levels preserve the same effects. Keep each reservation until its actual durable dependency is retired; transaction resolution alone does not retire HA delivery debt. |
+| Abort | Atomically retire prepared effects and their reservations with intent cleanup. Retry remains idempotent, including uncertain physical commits. |
+
+The durable representation must cover the semantics of
+[`PrecomputedGeneratedBatch`](pkg/antfly-embedded/src/storage/db/execution_resources.zig):
+artifact writes/deletes, derived documents, dense/sparse embeddings, generated
+references and coverage outcomes. Persisting only artifact keys or an inference
+memo loses effects. Bind the representation to the intent revision, transaction
+identity and pinned catalog identities, validate checksums and checked lengths,
+and account its retained bytes, decoder scratch and eventual publication bytes.
+Repeated preparation must reuse the accepted revision or atomically replace its
+effects and grants while the transaction remains pending. It must not rerun a
+producer merely because a prepare response was lost.
+
+[`prepared_transaction_effects`](pkg/antfly-embedded/src/storage/db/prepared_transaction_effects.zig)
+provides the first part of this representation. Its checksummed `ATPE` v1 frame
+binds all seven effect families to the transaction ID, intent revision, intent
+digest, catalog digest, optional schema version and preparation mode. It omits
+request-local text JSON roots and their accounting, while retaining schema and
+write-plan generation fields. Encoding checks its exact size and decode-storage
+bound before allocating the frame. Decoding validates tags, lengths, checksum,
+identity and full consumption before allocating one independently owned backing
+buffer. Limits are 64 MiB encoded and 256 MiB decoded; copying and hashing check
+original controls every 4 KiB. A fixed wire fixture and allocation/control failure
+tests cover the format.
+
+The transaction manager can now seal a frame against an existing prepared intent
+revision. It derives the input digest from actual sorted intent keys and encoded
+values, transaction begin/creation identity and revision, and reads the schema
+binding from the durable lease. The DB owner supplies the catalog digest and
+mode under its apply fence; that digest must include table/shard identity as
+well as catalog generations before integration. A seal validates those bindings, charges its actual
+retained bytes to the DocStore durable backlog, and freezes further intent writes.
+Identical retries reuse the accepted frame and revision; conflicting generated
+results cannot replace it. A rejected grant leaves the prior prepare mutable.
+
+Loading a sealed plan owns its decoded slab independently of the input buffer.
+Plan-aware low-level resolution verifies the accepted frame fingerprint and
+revision, and retires the frame and its retention credit with intent resolution.
+The transaction manager accepts all effect mutations from its trusted materializer.
+The DB adapter loads accepted effects under apply ownership, clones all seven
+families into its preparation allocator, and supplies them to the ordinary
+artifact/replay/coverage pipeline without running a fresh mandatory producer.
+The decoded slab remains separately owned until the call finishes. The exact
+catalog bytes and physical table/shard/range identity are checked under apply
+before staging and at the atomic decision. A mismatch preserves the obligation;
+the sealed frame now retains these serving definitions through atomic completion.
+Legacy commit resolution refuses sealed plans. Abort can retire opaque or corrupt
+plans. Unexpected plans left beside already-resolved committed records remain
+fenced for repair rather than being silently garbage-collected. Terminal decision
+conflicts retain priority over plan errors. Native WAL reopen, quota, replacement,
+retry and ownership tests cover this storage lifecycle.
+
+An opt-in storage BEGIN atomically persists a checksummed preparation requirement
+and its immutable mode alongside the transaction record and ordered receipt.
+Required transactions cannot use legacy commit resolution even before their first
+intent or seal. Incremental intent writes remain legal until sealing. Existing
+legacy transactions cannot upgrade to this contract after BEGIN; identical retries
+reuse the requirement and its charge. The requirement shares the bounded durable
+publication pool and retires atomically on abort or accepted-plan consumption.
+Native ABI 31 also fences the accepted-plan owner added to transaction resolution;
+the ATPE effect format
+is unchanged.
+
+Generic transaction-manager recovery defers committed requirements and accepted
+plans. DB recovery first attempts accepted-plan materialization, including plans
+with no row intents. Unsealed, corrupt or unavailable-catalog obligations remain
+deferred while unrelated legacy recovery drains. Only atomic plan consumption
+proves completion; a terminal decision with no row intents is insufficient.
+Authoritative abort retires opaque preparation metadata through ordinary hooks.
+
+Normal HTTP/SQL/embedded PREPARE does not invoke sealing yet. This API therefore
+does not establish a new final vote, negotiated peer support, generated production
+before the decision, negotiated catalog-retention policy or mandatory completion grants.
+The durable pool charge funds the frame itself, not future replay/output or
+working memory. Raw-backend bypass and import/downgrade eligibility still require
+the protocol's migration fence before activation. Existing caller apply ownership
+and non-yielding retained controls are required around the storage transition.
+
+A sealed frame also serves as a durable lease on the current index, enrichment
+and resolver catalogs. Catalog publication and reconciliation reject changes
+while any frame remains; exact byte-identical publication is allowed. Presence
+checks use bounded keys-only metadata seeks, including malformed or orphan frames.
+They do not decode effect payloads or allocate a new lease record. The existing
+frame retention charge funds the lease. Commit and abort retire it in the same
+physical batch as the effects or intent cleanup. Schema and physical ownership
+checks also recognize frames whose ordinary schema sidecar is missing.
+
+Speculative producer work does not hold this lease. The DB-owned final seal
+rechecks the actual catalog/namespace digest under apply before publishing the
+frame; a stale attempt leaves no pin. Serving mutation paths reject an existing
+lease before pausing dependent workers and recheck before publication. Unchanged
+producer/resolver refreshes and exact ordered alignment continue to work.
+Native ABI 33 and storage owner ABI 101 cover explicit local activation through
+`DB.enablePreparedTransactionProtocol()`. It atomically publishes permanent reader
+floor and catalog-envelope version 5. DB-owned required BEGIN checks both and the
+permanent replacement baseline before creating a record. Older readers reject
+that format. Activation refuses unfenced preparation records and ordered catalog
+authority; it does not constitute a peer capability vote or coordinated migration.
+Commit/abort and later catalog changes retain the floor. Full peer negotiation,
+ordered/import migration and predecision completion reservations remain open.
+
+Existing producer eligibility remains authoritative:
+[`shouldPrecomputeGeneratedRequest`](pkg/antfly-embedded/src/storage/db/mutation_preparation.zig)
+defers committed-graph/neighbor-context work and PDF page images. Preserve those
+descriptors and their separately funded postcommit execution; do not mark their
+coverage complete during prepare. Extending the public precommit guarantee to
+those producers would require another semantic design, not moving them into the
+ordinary text precompute path. `propose`, `write` and `full_text` must not acquire
+synchronous inference obligations merely to simplify reservation accounting.
+
+Replay funding has two inputs: the prepared immutable effects and the exact
+current physical artifact inventory of each affected document. Derive the wire
+bound from the actual CJ2 field/list multiplicities and endpoint-hint encoding,
+using checked arithmetic; do not treat artifact count as a byte budget or
+assume the existing batch JSON expansion formula funds replay. Pinned catalogs
+must cover every catalog that can change those possible effects. Sealed frames
+now retain the serving index, enrichment and resolver definitions; replay growth
+still needs its own predecision reservation and atomic adjustment.
+
+Background changes to an intent-owned document can increase its later deletion
+or replacement replay. Such a mutation must update artifact inventory and the
+affected prepared transaction's replay reservation in the same backend batch,
+under the existing shared publication mutation gate. If growth cannot be funded,
+reject the background mutation before it changes physical state. Shrinking work
+releases only the amount no longer owed. Commit consumes the funded current view
+under apply ownership. Inventory updates, reservation RMW and aggregate debt
+staging need an explicit ordering that avoids recursive capture and cannot
+commit one without the others. Invalidated/unknown legacy inventory requires
+predecision reconciliation; it must never be interpreted as zero or become a
+new reason to refuse resolution of an already committed legacy transaction.
+
+Use a new envelope version that old peers reject rather than an optional JSON
+field they may ignore. Replicated application consumes already prepared data;
+followers must not perform independent inference. Legacy pending transactions
+retain their resolution policy and drain through an explicit migration fence.
+Import, restore, downgrade and raw-backend bypass need an eligibility rule for
+the new guarantee. A legacy prepare without this contract cannot be advertised
+as funded merely because it has the existing batch-credit sidecar.
+
+Implementation order and proof obligations:
+
+1. Add the durable preparation contract and canonical effect codec, strict wire
+   negotiation and idempotent revision rules through server, local and embedded
+   entry points. Verify round trips, malformed/truncated lengths, allocation
+   failure, old-peer rejection, restart and abort cleanup.
+2. Move eligible generated work to controlled speculative preparation, persist
+   the accepted effects with the vote, and consume them at resolution. Verify
+   follower producer failure occurs before the first commit decision, lost
+   prepare replies do not regenerate, and restart at `write`/`propose` preserves
+   the accepted result. Cover every generated effect family and deferred work.
+3. Fund derived replay from that plan plus current inventory and atomically
+   adjust credits on background growth. Verify saturation, replacement, shrinking,
+   concurrent namespace views, uncertain commit, restart/import/migration, graph
+   endpoint hints, and independent batch/replay HA acknowledgements.
+
+This protocol is only part of completion ownership. Backend working memory,
+CPU, I/O and dependencies still need a minimum executable recovery bundle, and
+the broader fairness, overload, transport and default-policy requirements of
+the original design remain open. Full Linux qualification remains waived.
 
 The [implementation ledger](WORKLOAD_POOLING_IMPLEMENTATION.md#resource-and-entry-point-integration)
 tracks the API request and persistent allocation envelopes, HTTP output lifetime accounting, shared

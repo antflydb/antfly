@@ -141,6 +141,8 @@ pub const RequestContext = struct {
     /// Trusted request-lifetime execution team. Local callbacks may borrow it
     /// only until their children join. Never reconstruct this from wire data.
     execution_team: ?*@import("antfly_runtime_abi").runnable_abi.Team = null,
+    /// Trusted local retained-parent dispatch. Borrow only through physical joins.
+    execution_remote_query: ?@import("../common/http/http_common.zig").RequestExecutor = null,
     /// Borrowed request identity used for correlation. An empty value means
     /// the caller did not supply one; adapters may generate one in middleware.
     request_id: []const u8 = "",
@@ -179,10 +181,27 @@ pub const RequestContext = struct {
         }
     }
 
+    /// Check a supplied execution owner's retained lifetime without yielding or
+    /// acquiring CPU. A missing callback cannot silently erase that authority.
+    pub fn ensureExecutionActive(self: RequestContext) !void {
+        var checked = self;
+        if (self.cancellation.check_fn != null) {
+            try self.cancellation.check();
+            // One authoritative scoped check. The legacy boolean adapter
+            // must not recheck or collapse a one-shot original rejection.
+            checked.cancellation = .none;
+        }
+        if (self.execution_team) |team| {
+            if (checked.cancellation.isCancelled()) return error.Canceled;
+            try team.borrow.checkLifetime();
+        }
+        try checked.ensureActive();
+    }
+
     /// Preserve remaining time when entering native owners or HTTP timeout
     /// APIs, whose absolute clock is platform monotonic rather than Io awake.
     pub fn platformDeadline(self: RequestContext) !RequestContext {
-        try self.ensureActive();
+        try self.ensureExecutionActive();
         const deadline = self.deadline_ns orelse return self;
         const borrow = self.deadline_io orelse return self;
         const platform_now = platform_time.monotonicNs();
@@ -300,4 +319,162 @@ test "serverless request diagnostics remain isolated across interleaved operatio
     try std.testing.expectEqualStrings("graph-b", second_rejection.graphIndexName());
     try std.testing.expectEqualStrings("degree", second_rejection.metricName());
     try std.testing.expectEqual(@as(u64, 22), second_rejection.materializer_fingerprint);
+}
+
+test "request context execution lifetime ingress preserves authority and never acquires CPU" {
+    const runtime = @import("antfly_runtime_abi");
+    const Scope = struct {
+        checks: usize = 0,
+        quantum: usize = 0,
+        phases: usize = 0,
+        failure: ?anyerror = null,
+        fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            return if (self.failure) |cause| runtime.error_abi.statusFromError(cause) else .ok;
+        }
+        fn checkpoint(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.quantum += 1;
+            return .ok;
+        }
+        fn phase(raw: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.phases += 1;
+            return .ok;
+        }
+    };
+    var scope: Scope = .{};
+    var team: runtime.runnable_abi.Team = .{ .borrow = .{ .context = &scope, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.query), .checkpoint = Scope.checkpoint, .park = Scope.phase, .enter = Scope.phase, .check_lifetime = Scope.lifetime }, .maximum_slots = 1, .allocator = std.testing.allocator };
+    const request: RequestContext = .{ .execution_team = &team, .request_id = "original" };
+    const normalized = try request.platformDeadline();
+    try std.testing.expect(normalized.execution_team == &team);
+    try std.testing.expectEqualStrings("original", normalized.request_id);
+    try std.testing.expectEqual(@as(usize, 1), scope.checks);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        scope.failure = cause;
+        try std.testing.expectError(cause, request.platformDeadline());
+    }
+    scope.failure = null;
+    const before = scope.checks;
+    var signal = std.atomic.Value(bool).init(true);
+    var canceled = request;
+    canceled.cancellation = .fromAtomic(&signal);
+    canceled.deadline_ns = 0;
+    try std.testing.expectError(error.Canceled, canceled.platformDeadline());
+    try std.testing.expectEqual(before, scope.checks);
+    team.borrow.check_lifetime = null;
+    try std.testing.expectError(error.UnsupportedOperation, request.platformDeadline());
+    team.borrow.check_lifetime = Scope.lifetime;
+    team.borrow.version +%= 1;
+    try std.testing.expectError(error.UnsupportedVersion, request.platformDeadline());
+    try std.testing.expectEqual(@as(usize, 0), scope.quantum);
+    try std.testing.expectEqual(@as(usize, 0), scope.phases);
+}
+
+test "request context execution lifetime observes real parked and retired scheduler owners" {
+    const runtime = @import("antfly_runtime_abi");
+    const scheduling = @import("../common/runnable_scheduler.zig");
+    const Clock = struct {
+        var now_ns: u64 = 10;
+        fn now() u64 {
+            return now_ns;
+        }
+    };
+    Clock.now_ns = 10;
+    var signal = std.atomic.Value(bool).init(false);
+    var scheduler = try scheduling.Scheduler.init(.{ .slots = 3, .max_operations = 4, .max_bytes = 128, .control_bytes = 32 });
+    defer scheduler.close();
+    var execution: scheduling.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100, .retained_bytes = 17, .cancellation = .{ .ptr = &signal, .requested = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    }.requested } }, .query);
+    const Bridge = struct {
+        fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const owner: *scheduling.Execution = @ptrCast(@alignCast(raw));
+            owner.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+            return .ok;
+        }
+        fn checkpoint(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.TestUnexpectedResult);
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.TestUnexpectedResult);
+        }
+    };
+    var team: runtime.runnable_abi.Team = .{ .borrow = .{ .context = &execution, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.query), .checkpoint = Bridge.checkpoint, .park = Bridge.phase, .enter = Bridge.phase, .check_lifetime = Bridge.lifetime }, .maximum_slots = 1, .allocator = std.testing.allocator };
+    const request: RequestContext = .{ .execution_team = &team };
+    _ = try request.platformDeadline();
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    try execution.park(.resource_blocked);
+    _ = try request.platformDeadline();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+    Clock.now_ns = 100;
+    try std.testing.expectError(error.DeadlineExceeded, request.platformDeadline());
+    signal.store(true, .release);
+    try std.testing.expectError(error.Canceled, request.platformDeadline());
+    signal.store(false, .release);
+    Clock.now_ns = 10;
+    scheduler.close();
+    try std.testing.expectError(error.SchedulerClosed, request.platformDeadline());
+    execution.finish();
+    try std.testing.expectError(error.InvalidRunnableTransition, request.platformDeadline());
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "request context execution lifetime preserves activated completion after foreground expiry and close" {
+    const runtime = @import("antfly_runtime_abi");
+    const scheduling = @import("../common/runnable_scheduler.zig");
+    const Clock = struct {
+        var now_ns: u64 = 10;
+        fn now() u64 {
+            return now_ns;
+        }
+    };
+    Clock.now_ns = 10;
+    var signal = std.atomic.Value(bool).init(false);
+    var scheduler = try scheduling.Scheduler.init(.{ .slots = 3, .control_slots = 1, .max_operations = 4, .max_bytes = 128, .control_bytes = 32 });
+    defer scheduler.close();
+    var execution: scheduling.Execution = .{};
+    defer execution.finish();
+    try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 50, .retained_bytes = 17, .cancellation = .{ .ptr = &signal, .requested = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    }.requested } }, .write);
+    try execution.reserveCompletion(.{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 200, .retained_bytes = 17 });
+    try execution.activateCompletion();
+    const Bridge = struct {
+        fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const owner: *scheduling.Execution = @ptrCast(@alignCast(raw));
+            owner.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+            return .ok;
+        }
+        fn checkpoint(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.TestUnexpectedResult);
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.TestUnexpectedResult);
+        }
+    };
+    var team: runtime.runnable_abi.Team = .{ .borrow = .{ .context = &execution, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .checkpoint = Bridge.checkpoint, .park = Bridge.phase, .enter = Bridge.phase, .check_lifetime = Bridge.lifetime }, .maximum_slots = 1, .allocator = std.testing.allocator };
+    const terminal: RequestContext = .{ .execution_team = &team };
+    Clock.now_ns = 60;
+    signal.store(true, .release);
+    scheduler.close();
+    _ = try terminal.platformDeadline();
+    try std.testing.expectEqual(@as(u64, 140), try execution.completionRemainingNs());
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+    Clock.now_ns = 200;
+    try std.testing.expectError(error.DeadlineExceeded, terminal.platformDeadline());
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }

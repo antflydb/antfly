@@ -22,6 +22,7 @@ pub const storage_runtime = @import("storage_runtime.zig");
 pub const linalg = @import("linalg.zig");
 pub const compaction = @import("compaction.zig");
 pub const turboquant = @import("turboquant.zig");
+pub const device_memory = @import("device_memory.zig");
 pub const prompt_cache = @import("prompt_cache.zig");
 
 test {

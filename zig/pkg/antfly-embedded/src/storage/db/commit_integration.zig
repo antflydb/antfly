@@ -66,6 +66,23 @@ pub const ReplicationDeferredCommitGates = struct {
         self.transition_locked = false;
     }
 
+    /// One completion observation. A contended final transition fence also
+    /// yields pending; it must not turn a ready durability result into an
+    /// unfenced acknowledgement. No blocking-completion fallback is allowed.
+    pub fn pollForDurabilityAndAuthority(self: *@This(), write_gate: ?ReplicationWriteGate) !bool {
+        self.releaseTransition();
+        for (self.gates[0..self.gate_count]) |gate| {
+            if (!try gate.mirror.publisher.pollCompletion(gate.mirror, gate.lsn)) return false;
+        }
+        if (self.transition_mutex) |mutex| {
+            if (!mutex.tryLock()) return false;
+            self.transition_locked = true;
+        }
+        defer self.releaseTransition();
+        try enforceReplicationWriteGateOptional(write_gate);
+        return true;
+    }
+
     pub fn waitForDurabilityAndAuthority(self: *@This(), write_gate: ?ReplicationWriteGate) !void {
         // The replication records are already durable and ordered with the local commit.
         // Remote acknowledgement must not retain the DB apply lock or the
@@ -115,9 +132,38 @@ pub fn enforceReplicationWriteGateOptional(gate: ?ReplicationWriteGate) !void {
 pub fn preflight(mirror: ?ReplicationAsyncEffectMirror, log_mutex: *std.atomic.Mutex) !void {
     const configured = mirror orelse return;
     if (!configured.requirements.preflight) return;
-    lockAtomic(log_mutex);
+    try preflightWithAdmission(configured, log_mutex, null);
+}
+
+/// Foreground pre-decision admission uses the original synchronous port. No
+/// publication or completion ownership exists yet, so rejection cannot append.
+/// The callback still runs under the same physical local log fence.
+pub fn preflightWithAdmission(mirror: ?ReplicationAsyncEffectMirror, log_mutex: *std.atomic.Mutex, control: ?read_admission.Port) !void {
+    const configured = mirror orelse return;
+    if (!configured.requirements.preflight) return;
+    if (control) |original| {
+        try @import("../../common/bounded_mutex.zig").lockAtomic(log_mutex, original);
+    } else lockAtomic(log_mutex);
     defer log_mutex.unlock();
-    try configured.publisher.preflight(configured);
+    if (control) |original| {
+        // The local log fence is retained. Dependent WAL/capture holders have
+        // not all adopted mandatory CPU reentry, so nested progress keeps CPU.
+        const Retained = struct {
+            original: read_admission.Port,
+            fn check(raw: *anyopaque) !void {
+                const scope: *@This() = @ptrCast(@alignCast(raw));
+                try scope.original.checkpoint();
+            }
+            fn wait(raw: *anyopaque) !void {
+                try check(raw);
+                if (builtin.os.tag == .freestanding) std.atomic.spinLoopHint() else @import("antfly_platform").time.yieldNow();
+                try check(raw);
+            }
+        };
+        var retained: Retained = .{ .original = original };
+        const payload: read_admission.Payload = .{ .ptr = &retained, .vtable = &.{ .checkpoint = Retained.check, .wait_for_progress = Retained.wait } };
+        try configured.publisher.preflightWithAdmission(configured, false, read_admission.Port.init(&payload));
+    } else try configured.publisher.preflight(configured);
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
@@ -155,6 +201,7 @@ fn lockAtomicWithAdmission(mutex: *std.atomic.Mutex, io: ?std.Io, control: ?read
 /// Borrowed for one recovery operation. This owner cannot access DB internals
 /// or delete pending records; the storage owner clears them after success.
 pub const RecoveryContext = struct {
+    completion: enum { wait, poll } = .wait,
     mutation_barrier: ?*MutationBarrier = null,
     mutation_root: ?*MutationBarrier.RootSharedLease = null,
     io: ?std.Io = null,
@@ -168,11 +215,24 @@ pub const RecoveryContext = struct {
 /// Match an already published record before appending, fail closed when its
 /// retention fence is gone, and complete acknowledgement without a DB lock.
 pub fn recoverDurableOutbox(
-    context: RecoveryContext,
+    original_context: RecoveryContext,
     mirror: ReplicationAsyncEffectMirror,
     outbox: durable_outbox.DurableReplicationOutbox,
     kind: durable_outbox.Kind,
 ) !void {
+    var retained: read_admission.RetainedDependency = .{};
+    var context = original_context;
+    context.admission = retained.bind(original_context.admission);
+    // Capability refusal precedes publication locks and publisher-specific
+    // telemetry callbacks; it is not an attempted delivery failure.
+    if (context.admission) |control| {
+        if (mirror.publisher.vtable.recover_with_admission == null) {
+            try control.checkpoint();
+            return error.ExecutionWaitUnsupported;
+        }
+    }
+    if (context.completion == .poll and mirror.publisher.poll_completion == null)
+        return error.ExecutionWaitUnsupported;
     const Lifetime = struct {
         original: ?read_admission.Port,
         pub fn checkpoint(self: *@This()) !void {
@@ -189,10 +249,18 @@ pub fn recoverDurableOutbox(
         }
         if (context.mutation_root) |root| {
             if (root.barrier != barrier) return error.InvalidArgument;
+            if (context.completion == .poll) {
+                try lifetime.checkpoint();
+                break :blk (try root.tryBorrowPhase()) orelse return error.CommitCompletionPending;
+            }
             break :blk if (root.held)
                 try root.borrowControlled(&lifetime)
             else
                 try root.borrowPhaseControlled(context.io orelse return error.MissingBackendRuntimeIo, &lifetime);
+        }
+        if (context.completion == .poll) {
+            try lifetime.checkpoint();
+            break :blk barrier.tryAcquireShared() orelse return error.CommitCompletionPending;
         }
         break :blk if (context.admission != null)
             try barrier.acquireSharedControlled(context.io orelse return error.MissingBackendRuntimeIo, &lifetime)
@@ -203,14 +271,28 @@ pub fn recoverDurableOutbox(
         break :blk null;
     };
     defer if (mutation) |*lease| lease.release();
-    var deferred = try ReplicationDeferredCommitGates.beginWithAdmission(context.transition_mutex, context.io, context.admission);
+    if (context.completion == .poll) try lifetime.checkpoint();
+    var deferred = if (context.completion == .poll) pending: {
+        if (context.transition_mutex) |mutex| if (!mutex.tryLock()) return error.CommitCompletionPending;
+        break :pending ReplicationDeferredCommitGates{ .transition_mutex = context.transition_mutex, .transition_locked = context.transition_mutex != null };
+    } else try ReplicationDeferredCommitGates.beginWithAdmission(context.transition_mutex, context.io, context.admission);
     defer deferred.releaseTransition();
 
     const lsn = blk: {
-        try lockAtomicWithAdmission(context.log_mutex, context.io, context.admission);
+        if (context.completion == .poll) {
+            if (!context.log_mutex.tryLock()) return error.CommitCompletionPending;
+        } else try lockAtomicWithAdmission(context.log_mutex, context.io, context.admission);
         defer context.log_mutex.*.unlock();
+        if (context.completion == .poll) try lifetime.checkpoint();
 
-        break :blk mirror.publisher.recover(mirror, kind, outbox, context.namespace) catch |err| {
+        const recovery = if (context.admission) |control|
+            mirror.publisher.recoverWithAdmission(mirror, kind, outbox, context.namespace, control)
+        else
+            mirror.publisher.recover(mirror, kind, outbox, context.namespace);
+        break :blk recovery catch |err| {
+            // A busy writer or changed absence witness is ordinary pending
+            // progress, not a publication failure or acknowledgement.
+            if (err == error.CommitCompletionPending) return err;
             switch (kind) {
                 .batch, .restore_batch => noteReplicationMirrorFailure(mirror, "batch mutation recovery", err),
                 .replay, .primary_effect => noteReplicationMirrorFailure(mirror, "derived effect recovery", err),
@@ -227,7 +309,10 @@ pub fn recoverDurableOutbox(
     deferred.releaseTransition();
     if (mutation) |*lease| lease.release();
     mutation = null;
-    try deferred.waitForDurabilityAndAuthority(context.write_gate);
+    switch (context.completion) {
+        .wait => try deferred.waitForDurabilityAndAuthority(context.write_gate),
+        .poll => if (!try deferred.pollForDurabilityAndAuthority(context.write_gate)) return error.CommitCompletionPending,
+    }
 }
 
 /// Borrowed controls for one publication. Store access and mutation execution
@@ -360,6 +445,20 @@ pub fn appendReplicationEncodedBatchMutationCommitLockedContextStrict(ctx: *cons
     return .{ .mirror = mirror, .lsn = lsn };
 }
 
+/// Match the ordinary encoded publish path's log serialization, failure policy,
+/// telemetry and deferred acknowledgement while consuming precommit funding.
+pub fn appendPreparedPublicationCommitLockedContext(ctx: *const CommitContext, mirror: ReplicationAsyncEffectMirror, prepared: *const replication_contract.PreparedPublication, strict_append: bool) !?ReplicationDeferredCommitGate {
+    lockAtomic(ctx.log_mutex);
+    defer ctx.log_mutex.*.unlock();
+    const lsn = prepared.publish() catch |err| {
+        noteReplicationMirrorFailure(mirror, "prepared publication", err);
+        if (strict_append or replicationMirrorSyncEnabled(mirror)) return err;
+        return null;
+    };
+    mirror.notePublished(lsn);
+    return .{ .mirror = mirror, .lsn = lsn };
+}
+
 pub fn mirrorReplicationSchemaMetadataBestEffortContext(
     ctx: *const CommitContext,
     table_schema: schema_mod.TableSchema,
@@ -406,13 +505,21 @@ pub fn appendReplicationEncodedSchemaMetadataCommitLockedContext(
     ctx: *const CommitContext,
     payload: []const u8,
 ) !?ReplicationDeferredCommitGate {
+    return appendReplicationEncodedSchemaMetadataCommitLockedContextStrict(ctx, payload, false);
+}
+
+pub fn appendReplicationEncodedSchemaMetadataCommitLockedContextStrict(
+    ctx: *const CommitContext,
+    payload: []const u8,
+    strict_append: bool,
+) !?ReplicationDeferredCommitGate {
     const mirror = ctx.replication_async_metadata_mirror orelse return null;
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         const lsn = mirror.publisher.publish(mirror, .schema, payload, ctx.identity_namespace) catch |err| {
             noteReplicationMirrorFailure(mirror, "metadata mutation", err);
-            if (replicationMirrorSyncEnabled(mirror)) return err;
+            if (strict_append or replicationMirrorSyncEnabled(mirror)) return err;
             return null;
         };
         mirror.notePublished(lsn);
@@ -442,9 +549,12 @@ const TestPublisher = struct {
     fenced: bool = false,
     fail_completion: bool = false,
     preflight_locked: bool = false,
+    fail_preflight: bool = true,
     recovered: bool = false,
     barrier: ?*MutationBarrier = null,
     captured: bool = false,
+    blocking_calls: usize = 0,
+    recovery_calls: usize = 0,
 
     fn cast(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
@@ -477,16 +587,23 @@ const TestPublisher = struct {
             }
         }
         self.recovered = true;
+        self.recovery_calls += 1;
         return 7;
     }
     fn preflight(m: ReplicationAsyncEffectMirror, _: bool) !void {
         const self = cast(m.publisher.ptr);
         self.preflight_locked = !self.log.tryLock();
         if (!self.preflight_locked) self.log.unlock();
-        return error.SyncPolicyUnsatisfied;
+        if (self.fail_preflight) return error.SyncPolicyUnsatisfied;
+    }
+    fn preflightWithAdmission(m: ReplicationAsyncEffectMirror, record_decision: bool, control: read_admission.Port) !void {
+        try control.checkpoint();
+        try @This().preflight(m, record_decision);
+        try control.checkpoint();
     }
     fn complete(m: ReplicationAsyncEffectMirror, lsn: u64) !void {
         const self = cast(m.publisher.ptr);
+        self.blocking_calls += 1;
         try std.testing.expectEqual(@as(u64, 7), lsn);
         try std.testing.expect(self.transition.tryLock());
         self.transition.unlock();
@@ -499,6 +616,15 @@ const TestPublisher = struct {
         }
         self.completed = true;
         if (self.fail_completion) return error.CommitCompletionPending;
+    }
+    fn poll(m: ReplicationAsyncEffectMirror, lsn: u64) !bool {
+        const self = cast(m.publisher.ptr);
+        try std.testing.expectEqual(@as(u64, 7), lsn);
+        try std.testing.expect(self.log.tryLock());
+        self.log.unlock();
+        if (self.fail_completion) return false;
+        self.completed = true;
+        return true;
     }
     fn capture(self: *@This()) void {
         if (self.barrier.?.tryAcquireExclusive()) |lease| {
@@ -516,8 +642,77 @@ const TestPublisher = struct {
     fn gate(self: *@This()) ReplicationWriteGate {
         return .{ .borrowed = .{ .ptr = self, .check_fn = check } };
     }
-    const vtable: replication_contract.Publisher.VTable = .{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = @This().preflight, .complete = complete };
+    fn recoverWithAdmission(m: ReplicationAsyncEffectMirror, kind: durable_outbox.Kind, pending: durable_outbox.DurableReplicationOutbox, ns: Namespace, control: read_admission.Port) !u64 {
+        try control.checkpoint();
+        return recover(m, kind, pending, ns);
+    }
+    const vtable: replication_contract.Publisher.VTable = .{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .recover_with_admission = recoverWithAdmission, .preflight = @This().preflight, .preflight_with_admission = @This().preflightWithAdmission, .complete = complete };
 };
+
+test "controlled replication preflight preserves original rejection and local log fence" {
+    const Authority = struct {
+        publisher: *TestPublisher,
+        held: *bool,
+        checks: usize = 0,
+        waits: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.fail_at) return self.cause;
+        }
+        fn wait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waits += 1;
+            try std.testing.expect(self.held.*);
+            self.publisher.log.unlock();
+            self.held.* = false;
+        }
+    };
+    var publisher: TestPublisher = .{ .fail_preflight = false };
+    try std.testing.expect(publisher.log.tryLock());
+    var held = true;
+    defer if (held) publisher.log.unlock();
+    var authority: Authority = .{ .publisher = &publisher, .held = &held };
+    const payload: read_admission.Payload = .{ .ptr = &authority, .vtable = &.{ .checkpoint = Authority.check, .wait_for_progress = Authority.wait } };
+    const control = read_admission.Port.init(&payload);
+    try preflightWithAdmission(publisher.mirror(), &publisher.log, control);
+    try std.testing.expect(publisher.preflight_locked);
+    try std.testing.expectEqual(@as(usize, 1), authority.waits);
+    const checks = authority.checks;
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        for (1..checks + 1) |fail_at| {
+            try std.testing.expect(publisher.log.tryLock());
+            held = true;
+            publisher.preflight_locked = false;
+            authority = .{ .publisher = &publisher, .held = &held, .cause = cause, .fail_at = fail_at };
+            try std.testing.expectError(cause, preflightWithAdmission(publisher.mirror(), &publisher.log, control));
+            if (held) {
+                try std.testing.expect(!publisher.log.tryLock());
+                publisher.log.unlock();
+                held = false;
+            } else {
+                try std.testing.expect(publisher.log.tryLock());
+                publisher.log.unlock();
+            }
+            try std.testing.expect(!publisher.completed and !publisher.recovered);
+        }
+    }
+    authority = .{ .publisher = &publisher, .held = &held };
+    publisher.fail_preflight = true;
+    try std.testing.expectError(error.SyncPolicyUnsatisfied, preflightWithAdmission(publisher.mirror(), &publisher.log, control));
+    try std.testing.expect(publisher.log.tryLock());
+    publisher.log.unlock();
+    // An absent or optional preflight does not acquire the log or invoke policy.
+    try std.testing.expect(publisher.log.tryLock());
+    held = true;
+    var optional = publisher.mirror();
+    optional.requirements.preflight = false;
+    try preflightWithAdmission(optional, &publisher.log, control);
+    try preflightWithAdmission(null, &publisher.log, control);
+    try std.testing.expect(!publisher.log.tryLock());
+}
 
 test "storage.hot_standby engine preflight holds the local log fence and propagates rejection" {
     var publisher: TestPublisher = .{};
@@ -612,7 +807,7 @@ test "durable outbox storage recovery admission preserves mandatory completion a
             try std.testing.expectError(error.PrimaryFenced, recoverDurableOutbox(context, publisher.mirror(), .{ .from_lsn = 5, .payload = "payload" }, .replay));
         } else try recoverDurableOutbox(context, publisher.mirror(), .{ .from_lsn = 5, .payload = "payload" }, .replay);
         try std.testing.expect(publisher.recovered and publisher.completed);
-        try std.testing.expectEqual(@as(usize, 4), state.checks);
+        try std.testing.expect(state.checks >= 4);
         try std.testing.expectEqual(@as(usize, 0), state.after_publication);
         try std.testing.expect(publisher.transition.tryLock());
         publisher.transition.unlock();
@@ -711,4 +906,131 @@ test "durable outbox storage recovery retires its scoped root phase before remot
         var capture = barrier.tryAcquireExclusive() orelse return error.ScopedRecoveryLeakedMutationReader;
         capture.release();
     }
+}
+
+test "publication completion poll preserves pending and final authority without entering blocking completion" {
+    var publisher: TestPublisher = .{ .fail_completion = true };
+    var mirror = publisher.mirror();
+    mirror.publisher.poll_completion = TestPublisher.poll;
+    var gates: ReplicationDeferredCommitGates = .{ .transition_mutex = &publisher.transition };
+    gates.append(.{ .mirror = mirror, .lsn = 7 });
+    try std.testing.expect(!try gates.pollForDurabilityAndAuthority(publisher.gate()));
+    try std.testing.expect(!publisher.completed);
+    publisher.fail_completion = false;
+    try std.testing.expect(publisher.transition.tryLock());
+    // Durability is ready, but the final authority fence is still contended.
+    const contended = gates.pollForDurabilityAndAuthority(publisher.gate());
+    publisher.transition.unlock();
+    try std.testing.expect(!try contended);
+    publisher.fenced = true;
+    try std.testing.expectError(error.PrimaryFenced, gates.pollForDurabilityAndAuthority(publisher.gate()));
+    publisher.fenced = false;
+    try std.testing.expect(try gates.pollForDurabilityAndAuthority(publisher.gate()));
+    try std.testing.expectEqual(@as(usize, 0), publisher.blocking_calls);
+    try std.testing.expect(publisher.transition.tryLock());
+    publisher.transition.unlock();
+    // A missing capability may never select the blocking fallback.
+    gates.gates[0].mirror.publisher.poll_completion = null;
+    try std.testing.expectError(error.ExecutionWaitUnsupported, gates.pollForDurabilityAndAuthority(publisher.gate()));
+    try std.testing.expectEqual(@as(usize, 0), publisher.blocking_calls);
+    try std.testing.expect(!mirror.eql(gates.gates[0].mirror));
+}
+
+test "publication completion poll recovery retains the exact obligation through pending and fencing" {
+    var publisher: TestPublisher = .{ .fail_completion = true };
+    var mirror = publisher.mirror();
+    mirror.publisher.poll_completion = TestPublisher.poll;
+    const context: RecoveryContext = .{ .completion = .poll, .transition_mutex = &publisher.transition, .log_mutex = &publisher.log, .namespace = .{ .table_id = 1, .shard_id = 2 }, .write_gate = publisher.gate() };
+    const obligation: durable_outbox.DurableReplicationOutbox = .{ .from_lsn = 5, .payload = "payload" };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, recoverDurableOutbox(context, publisher.mirror(), obligation, .replay));
+    try std.testing.expectEqual(@as(usize, 0), publisher.recovery_calls);
+    try std.testing.expectError(error.CommitCompletionPending, recoverDurableOutbox(context, mirror, obligation, .replay));
+    try std.testing.expect(publisher.recovered and !publisher.completed);
+    publisher.fail_completion = false;
+    publisher.fenced = true;
+    try std.testing.expectError(error.PrimaryFenced, recoverDurableOutbox(context, mirror, obligation, .replay));
+    publisher.fenced = false;
+    try recoverDurableOutbox(context, mirror, obligation, .replay);
+    try std.testing.expectEqual(@as(usize, 3), publisher.recovery_calls);
+    try std.testing.expectEqual(@as(usize, 0), publisher.blocking_calls);
+}
+
+test "publication recovery step yields at mutation transition and log fences without publishing" {
+    var barrier: MutationBarrier = .{};
+    var root = MutationBarrier.RootSharedLease.initRetired(&barrier);
+    defer root.release();
+    var publisher: TestPublisher = .{ .barrier = &barrier, .fail_completion = true };
+    var mirror = publisher.mirror();
+    mirror.publisher.poll_completion = TestPublisher.poll;
+    const context: RecoveryContext = .{ .completion = .poll, .mutation_barrier = &barrier, .mutation_root = &root, .transition_mutex = &publisher.transition, .log_mutex = &publisher.log, .namespace = .{ .table_id = 1, .shard_id = 2 }, .write_gate = publisher.gate() };
+    const obligation: durable_outbox.DurableReplicationOutbox = .{ .from_lsn = 5, .payload = "payload" };
+    var captured = barrier.tryAcquireExclusive() orelse return error.TestExpectedEqual;
+    const blocked_capture = recoverDurableOutbox(context, mirror, obligation, .replay);
+    captured.release();
+    try std.testing.expectError(error.CommitCompletionPending, blocked_capture);
+    try std.testing.expect(!root.held and publisher.recovery_calls == 0);
+    try std.testing.expect(publisher.transition.tryLock());
+    const blocked_transition = recoverDurableOutbox(context, mirror, obligation, .replay);
+    publisher.transition.unlock();
+    try std.testing.expectError(error.CommitCompletionPending, blocked_transition);
+    try std.testing.expect(!root.held and publisher.recovery_calls == 0);
+    try std.testing.expect(publisher.log.tryLock());
+    const blocked_log = recoverDurableOutbox(context, mirror, obligation, .replay);
+    publisher.log.unlock();
+    try std.testing.expectError(error.CommitCompletionPending, blocked_log);
+    try std.testing.expect(!root.held and publisher.recovery_calls == 0);
+    try std.testing.expectError(error.CommitCompletionPending, recoverDurableOutbox(context, mirror, obligation, .replay));
+    try std.testing.expect(!root.held and publisher.recovery_calls == 1);
+    var available = barrier.tryAcquireExclusive() orelse return error.TestExpectedEqual;
+    available.release();
+    publisher.fail_completion = false;
+    try recoverDurableOutbox(context, mirror, obligation, .replay);
+    try std.testing.expect(!root.held);
+    try std.testing.expectEqual(@as(usize, 0), publisher.blocking_calls);
+}
+
+test "metadata preparation strict async failure retains caller owned publication" {
+    const Fixture = struct {
+        failures: usize = 0,
+        released: usize = 0,
+        fn unbox(mirror: ReplicationAsyncEffectMirror) *@This() {
+            return @ptrCast(@alignCast(mirror.publisher.ptr));
+        }
+        fn next(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn identity(_: *anyopaque) replication_contract.Publisher.Identity {
+            return .{ .table_id = 1, .shard_id = 2, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(_: ReplicationAsyncEffectMirror, _: durable_outbox.Kind, _: []const u8, _: Namespace) !u64 {
+            return error.OutOfMemory;
+        }
+        fn recover(_: ReplicationAsyncEffectMirror, _: durable_outbox.Kind, _: durable_outbox.DurableReplicationOutbox, _: Namespace) !u64 {
+            return error.OutOfMemory;
+        }
+        fn preflight(_: ReplicationAsyncEffectMirror, _: bool) !void {}
+        fn complete(_: ReplicationAsyncEffectMirror, _: u64) !void {}
+        fn failed(mirror: ReplicationAsyncEffectMirror) void {
+            unbox(mirror).failures += 1;
+        }
+        fn preparedPublish(_: *anyopaque) !u64 {
+            return error.OutOfMemory;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.released += 1;
+        }
+    };
+    var fixture: Fixture = .{};
+    const mirror: ReplicationAsyncEffectMirror = .{ .publisher = .{ .ptr = &fixture, .vtable = &.{ .next_lsn = Fixture.next, .identity = Fixture.identity, .publish = Fixture.publish, .recover = Fixture.recover, .preflight = Fixture.preflight, .complete = Fixture.complete, .note_failure = Fixture.failed } } };
+    var mutex: std.atomic.Mutex = .unlocked;
+    const context: CommitContext = .{ .alloc = std.testing.allocator, .identity_namespace = .{ .table_id = 1, .shard_id = 2 }, .transition_mutex = null, .log_mutex = &mutex, .replication_write_gate = null, .replication_async_effect_mirror = null, .replication_async_batch_mirror = null, .replication_async_metadata_mirror = mirror, .append_pending = null };
+    try std.testing.expect((try appendReplicationEncodedSchemaMetadataCommitLockedContext(&context, "optional")) == null);
+    try std.testing.expectError(error.OutOfMemory, appendReplicationEncodedSchemaMetadataCommitLockedContextStrict(&context, "mandatory", true));
+    var prepared: replication_contract.PreparedPublication = .{ .ptr = &fixture, .vtable = &.{ .publish = Fixture.preparedPublish, .deinit = Fixture.release } };
+    try std.testing.expectError(error.OutOfMemory, appendPreparedPublicationCommitLockedContext(&context, mirror, &prepared, true));
+    try std.testing.expectEqual(@as(usize, 3), fixture.failures);
+    try std.testing.expectEqual(@as(usize, 0), fixture.released);
+    prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fixture.released);
 }

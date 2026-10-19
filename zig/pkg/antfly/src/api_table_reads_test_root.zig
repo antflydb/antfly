@@ -21,11 +21,14 @@ const http_client = @import("api/http_client.zig");
 const storage_db = @import("antfly_source_root").antfly_sources.selected_db;
 
 test {
+    _ = @import("api/internal_query_owner.zig");
     _ = @import("api/retained_read_owner.zig");
     _ = @import("api/retained_read_rpc.zig");
+    _ = @import("api/owned_retained_read.zig");
     _ = @import("api/retained_read_client.zig");
     _ = table_reads;
     _ = table_router;
+    _ = @import("api/table_catalog.zig").consumer_tests;
     _ = internal_query_operations;
     _ = internal_group_operations;
     _ = http_client;

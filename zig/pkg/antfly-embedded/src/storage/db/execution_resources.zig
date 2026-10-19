@@ -1011,13 +1011,22 @@ pub const BatchExecutionOptions = struct {
     /// Resolver-owned reader, borrowed until the batch orders its local tails.
     /// The batch retires its nested reader first and nulls this slot before waits.
     enclosing_mutation_retirement: ?*?MutationBarrier.SharedLease = null,
+    /// Separate from pre-decision controls; checked against retired holders at
+    /// the committed visibility wait, never used for apply or mutation admission.
+    committed_visibility_wait: ?@import("../../common/execution_wait.zig").Boundary = null,
     /// Borrowed at a stable address; all nested work joins before root release.
     mutation_root: ?*MutationBarrier.RootSharedLease = null,
     /// Borrowed only during pre-decision snapshot/apply acquisition. This
     /// authority never cancels mandatory retirement after primary durability.
     admission_controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition = null,
+    /// Set only by the foreground admission entrypoint, before this write has
+    /// a decision. Mandatory replay/resolution keeps the default wait policy.
+    avoid_admission_capacity_cycle: bool = false,
     row_policy_principal: ?*const row_policy_authority_mod.Payload = null,
     row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease = null,
+    /// The DB wrapper explicitly transfers retirement of its own write lease
+    /// after local effects/tails are ordered. Borrowed leases remain caller-owned.
+    row_policy_retirement: ?*row_policy_gate_mod.Gate.Lease = null,
     restore_staging: ?@import("restore_staging.zig").BatchAdmission = null,
     restore_artifacts: []const @import("restore_staging.zig").Artifact = &.{},
     restore_timestamps: ?*const std.StringHashMapUnmanaged(u64) = null,
@@ -1056,12 +1065,15 @@ pub const BatchExecutionOptions = struct {
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
 
 pub const TransactionResolution = struct {
+    /// Borrowed decoded owner, retained through cloning and the atomic decision.
+    accepted_effects: ?*const transactions_mod.PreparedEffects = null,
     txn_id: transactions_mod.TxnId,
     status: transactions_mod.TxnStatus,
     commit_version: u64,
     expected_intent_revision: u64,
     intent_keys: []const []const u8,
     resolved_participant: ?[]const u8 = null,
+    defer_retained_coordinator_acknowledgement: bool = false,
     schema_binding: ?transactions_mod.SchemaBinding = null,
     schema_namespace_generation: ?u64 = null,
 };
@@ -1142,6 +1154,10 @@ pub const LocalExecutionState = struct {
     /// startup barrier also serves as this transient publication barrier.
     row_policy_replication_outbox_pending: std.atomic.Value(bool) = .init(false),
     durable_replication_flush_mutex: std.Io.Mutex = .init,
+    /// Shared by DB, prepared mutations and recovery executions. Accepted jobs
+    /// join before this DB-owned state retires; publishers borrow it synchronously.
+    replication_recovery_cursor: @import("durable_outbox.zig").RecoveryCursor = .{},
+    replication_intent_capture: @import("durable_outbox_store.zig").IntentCapture = .{},
     /// Crash-left records must be replayed before this process publishes its
     /// first hot-standby mutation. Once crossed, foreground commits append under the
     /// apply/log ordering fences and may await independent LSNs concurrently.
@@ -1614,16 +1630,7 @@ pub const ChunkEmbeddingSource = materialized_sources.ChunkEmbeddingSource;
 
 pub const clearChunkEmbeddingSourceList = materialized_sources.clearChunkEmbeddingSourceList;
 
-pub const PrecomputedCoverageOutcome = struct {
-    index_name: []u8,
-    doc_key: []u8,
-    outcome: DerivedCoverageOutcome,
-
-    pub fn deinit(self: @This(), alloc: Allocator) void {
-        alloc.free(self.index_name);
-        alloc.free(self.doc_key);
-    }
-};
+pub const PrecomputedCoverageOutcome = @import("prepared_effect_types.zig").PrecomputedCoverageOutcome;
 
 pub const PrecomputedCoverageCandidate = struct {
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -1760,36 +1767,7 @@ pub const GeneratedPrecomputeMode = enum {
     all,
 };
 
-pub const PrecomputedGeneratedBatch = struct {
-    artifact_writes: []types.BatchWrite = &.{},
-    artifact_delete_keys: []const []const u8 = &.{},
-    documents: []const derived_types.DerivedDocument = &.{},
-    dense_embeddings: []const derived_types.DerivedDenseEmbeddingWrite = &.{},
-    sparse_embeddings: []const derived_types.DerivedSparseEmbeddingWrite = &.{},
-    generated_enrichment_refs: []const enrichment_types.GeneratedEnrichmentRef = &.{},
-    coverage_outcomes: []PrecomputedCoverageOutcome = &.{},
-
-    pub fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
-        for (self.artifact_writes) |write| {
-            alloc.free(@constCast(write.key));
-            alloc.free(@constCast(write.value));
-        }
-        if (self.artifact_writes.len > 0) alloc.free(self.artifact_writes);
-        for (self.artifact_delete_keys) |key| alloc.free(key);
-        if (self.artifact_delete_keys.len > 0) alloc.free(self.artifact_delete_keys);
-
-        var derived_batch = derived_types.DerivedBatch{
-            .documents = self.documents,
-            .dense_embeddings = self.dense_embeddings,
-            .sparse_embeddings = self.sparse_embeddings,
-            .generated_enrichment_refs = self.generated_enrichment_refs,
-        };
-        derived_types.deinitDerivedBatch(alloc, &derived_batch);
-        for (self.coverage_outcomes) |outcome| outcome.deinit(alloc);
-        if (self.coverage_outcomes.len > 0) alloc.free(self.coverage_outcomes);
-        self.* = undefined;
-    }
-};
+pub const PrecomputedGeneratedBatch = @import("prepared_effect_types.zig").PrecomputedGeneratedBatch;
 
 pub const GraphArtifactRefView = struct {
     name: []const u8,
@@ -2124,7 +2102,7 @@ pub fn appendEnrichmentTerminalFailureMarkerDeletePageForIssue(
     return state.entries_examined;
 }
 
-pub const DerivedCoverageOutcome = enum { produced, skipped, terminal_failed };
+pub const DerivedCoverageOutcome = @import("prepared_effect_types.zig").DerivedCoverageOutcome;
 
 pub const DerivedCoverageDocOutcome = struct {
     doc_key: []const u8,

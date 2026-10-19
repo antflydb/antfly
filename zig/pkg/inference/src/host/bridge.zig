@@ -21,13 +21,18 @@ const std = @import("std");
 const error_abi = @import("antfly_runtime_abi").error_abi;
 const http_abi = @import("antfly_runtime_abi").http_abi;
 const native_abi = @import("antfly_runtime_abi").native_abi;
+pub const MemoryParent = @import("antfly_runtime_abi").memory_abi.Parent;
 pub const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const antfly_image = @import("antfly_image");
 
 // Includes runnable execution control, CUDA preload precision, raster embedding,
 // host-owned execution placement, and memory-admission diagnostics.
 // Mixed runtime versions fail closed.
-pub const abi_version: u32 = 36;
+// Version 42 adds runtime-owned Metal KV buffer credits, including graph aliases.
+// Version 41 introduced CUDA cache credits surviving cache/host teardown.
+// Version 40 introduced the parented/supervised host cache allocator contract.
+// Worker Create.bridge_version also fences older executables before startup.
+pub const abi_version: u32 = 43;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -119,6 +124,9 @@ pub const CreateContext = extern struct {
     executor: native_abi.IoBorrow,
     out_handle: *?*anyopaque,
     execution_host: ExecutionHost = .server,
+    /// Process-local bootstrap accounting, borrowed through Client destruction
+    /// and any retained result. Never serialized into child launch settings.
+    bootstrap_memory_parent: ?*const MemoryParent = null,
 };
 
 pub const ConfigureContext = extern struct {
@@ -151,8 +159,15 @@ pub const ResourceBudget = extern struct {
     reserve_admission: *const fn (*anyopaque, *const AdmissionAmounts, *usize) callconv(.c) Status,
     retain_admission: *const fn (*anyopaque, usize, *const AdmissionAmounts) callconv(.c) Status,
     release_admission: *const fn (*anyopaque, usize) callconv(.c) void,
+    /// Both tokens must already be registered. Failure preserves both owners;
+    /// success moves existing credit without changing aggregate usage.
+    transfer_admission: ?*const fn (*anyopaque, usize, usize, *const AdmissionAmounts) callconv(.c) Status = null,
     observe_prompt_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
     observe_tokenizer_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
+    /// Admit aggregate live parent-side transport/result bytes. Identity is
+    /// process-local, stable for one Client budget, and never crosses IPC.
+    /// Growth must precede allocation; validated shrink must always succeed.
+    adjust_transient_host: ?*const fn (*anyopaque, usize, u64, u64) callconv(.c) u8 = null,
 };
 
 /// Stable operation identifiers for the embedded inference service. Requests
@@ -518,4 +533,10 @@ test "linked inference ABI rejects mismatched context and function-table prefixe
     table.struct_size = requiredFunctionTableSize(Capability.provider).?;
     try std.testing.expect(validFunctionTable(&table, Capability.provider));
     try std.testing.expect(!validFunctionTable(&table, 1 << 63));
+}
+
+test "inference worker create context requires the bootstrap memory parent ABI tail" {
+    try std.testing.expect(validContext(CreateContext, abi_version, @sizeOf(CreateContext)));
+    try std.testing.expect(!validContext(CreateContext, abi_version - 1, @sizeOf(CreateContext)));
+    try std.testing.expect(!validContext(CreateContext, abi_version, @offsetOf(CreateContext, "bootstrap_memory_parent")));
 }

@@ -61,7 +61,9 @@ const std = @import("std");
 /// and adopts every native namespace writer in the same durable transaction.
 /// Version 33 decodes name-sensitive table replacements carrying an exact
 /// relation-owner, logical-binding and metadata-incarnation mutation fence.
-pub const current_version: u16 = 33;
+/// Version 34 persists permanent, root-signed remote journal initialization.
+pub const current_version: u16 = 34;
+pub const remote_attempt_initialization_version: u16 = 34;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;

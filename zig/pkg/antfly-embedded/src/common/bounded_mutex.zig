@@ -1,8 +1,31 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Cooperative mutex admission using the original caller's wait authority.
 const std = @import("std");
+// The acquired mutex may protect a dependency another admitted task needs.
+// Lifetime checks must not yield CPU; cooperative checkpoints belong before
+// acquisition or after the caller has released the protected dependency.
+fn checkAcquired(budget: anytype) !void {
+    const T = switch (@typeInfo(@TypeOf(budget))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(budget),
+    };
+    if (@hasDecl(T, "checkLifetime")) try budget.checkLifetime() else try budget.checkpoint();
+}
+
 pub fn lock(mutex: *std.Io.Mutex, unlock_io: std.Io, budget: anytype) !void {
     while (true) {
         try budget.checkpoint();
@@ -10,7 +33,7 @@ pub fn lock(mutex: *std.Io.Mutex, unlock_io: std.Io, budget: anytype) !void {
             // Cancellation racing successful acquisition must release the
             // lock before returning; the caller receives ownership only here.
             errdefer mutex.unlock(unlock_io);
-            try budget.checkpoint();
+            try checkAcquired(budget);
             return;
         }
         try budget.waitForProgress();
@@ -75,13 +98,14 @@ test "transaction routing control port wait releases a newly acquired lock on ad
     mutex.unlock(std.testing.io);
 }
 
-/// Atomic backend mutexes use the same original progress capability.
-pub fn lockAtomic(mutex: *std.atomic.Mutex, budget: anytype) !void {
+/// Atomic backend and publication mutexes use the same original progress
+/// capability. A failed tryLock must leave no ticket or ownership behind.
+pub fn lockAtomic(mutex: anytype, budget: anytype) !void {
     while (true) {
         try budget.checkpoint();
         if (mutex.tryLock()) {
             errdefer mutex.unlock();
-            try budget.checkpoint();
+            try checkAcquired(budget);
             return;
         }
         try budget.waitForProgress();
@@ -152,7 +176,7 @@ pub fn lockShared(mutex: *std.Io.RwLock, unlock_io: std.Io, budget: anytype) !vo
         try budget.checkpoint();
         if (mutex.tryLockShared(unlock_io)) {
             errdefer mutex.unlockShared(unlock_io);
-            try budget.checkpoint();
+            try checkAcquired(budget);
             return;
         }
         try budget.waitForProgress();

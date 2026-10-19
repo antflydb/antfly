@@ -96,6 +96,7 @@ fn releaseState(allocator: Allocator, rc: *RcState) void {
 
 pub const Backend = struct {
     serialized_write_mutex: std.atomic.Mutex = .unlocked,
+    publication_backlog_mutex: std.atomic.Mutex = .unlocked,
     allocator: Allocator,
     open_options: backend_types.OpenOptions,
     state: ?*RcState = null,
@@ -115,6 +116,11 @@ pub const Backend = struct {
         backend: *Backend,
         namespace: backend_types.Namespace,
 
+        pub fn publicationGate(self: *@This()) ?*std.atomic.Mutex {
+            if (@hasField(Backend, "publication_backlog_mutex")) return &self.backend.publication_backlog_mutex;
+            return null;
+        }
+
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{
                 .ordered_ranges = true,
@@ -133,6 +139,16 @@ pub const Backend = struct {
 
         pub fn beginReadWithAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !BoundTxn {
             _ = admission; // Persistent memory snapshots have no block cache.
+            return BoundTxn.openReadWithAdmission(self.backend, self.namespace, control);
+        }
+
+        pub fn beginProbeWithAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !BoundTxn {
+            // A memory probe borrows the current persistent snapshot just as
+            // the legacy erased probe does; no mutable memtable is cloned.
+            return self.beginReadWithAdmission(admission, control);
+        }
+
+        pub fn beginCurrentScanWithAdmission(self: *@This(), control: read_admission.Port) !BoundTxn {
             return BoundTxn.openReadWithAdmission(self.backend, self.namespace, control);
         }
 
@@ -324,7 +340,7 @@ pub const Backend = struct {
             const rc = try backend.ensureStateLocked();
             retainState(rc);
             errdefer releaseState(backend.allocator, rc);
-            try control.checkpoint();
+            try control.checkLifetime();
             return .{ .allocator = backend.allocator, .backend = backend, .namespace = namespace, .read_only = true, .rc = rc };
         }
 

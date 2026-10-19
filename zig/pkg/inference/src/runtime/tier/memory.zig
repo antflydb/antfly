@@ -680,6 +680,9 @@ pub const AdmissionResourceBudget = struct {
     try_reserve: *const fn (*anyopaque, AdmissionAmounts) AdmissionResourceError!usize,
     retain: *const fn (*anyopaque, usize, AdmissionAmounts) AdmissionResourceError!void,
     release: *const fn (*anyopaque, usize) void,
+    /// Move credit between already-registered tokens. Failure must leave both
+    /// owners unchanged; success cannot require further metadata allocation.
+    transfer: ?*const fn (*anyopaque, usize, usize, AdmissionAmounts) AdmissionResourceError!void = null,
 
     pub fn hasValidLifetimeHooks(self: @This()) bool {
         return (self.retain_context == null) == (self.release_context == null);
@@ -786,15 +789,62 @@ pub const AdmissionLease = struct {
             return error.InvalidAdmissionLeaseReduction;
         const retained_live_bytes = liveHostBytes(retained) catch
             return error.InvalidAdmissionLeaseReduction;
+        const previous_live_bytes = liveHostBytes(self.amounts) catch
+            return error.InvalidAdmissionLeaseReduction;
+        const committed_live_bytes = std.math.sub(usize, previous_live_bytes, self.live_reserved_bytes) catch
+            return error.InvalidAdmissionLeaseReduction;
         try controller.retainExternalLease(self.external_lease, retained);
         controller.releaseSingle(backend_class, released);
         controller.settleLiveReservation(
             self.live_reserved_bytes,
-            retained_live_bytes,
+            // A transfer can combine pending credit with residency already
+            // charged to this epoch (or included in its physical sample).
+            // Retain committed residency first; commit only retained pending
+            // credit, never the same physical pressure a second time.
+            retained_live_bytes -| committed_live_bytes,
         );
         self.amounts = retained;
         self.amounts_by_backend[backendClassIndex(backend_class)] = retained;
         self.live_reserved_bytes = 0;
+    }
+
+    /// Partition ownership without changing this controller's aggregate policy
+    /// or live-pressure ledgers. Both independently acquired destinations and
+    /// sources must belong to the same controller and backend policy bucket.
+    /// Caller owns both mutable leases exclusively throughout the operation.
+    pub fn transferCreditTo(self: *AdmissionLease, destination: *AdmissionLease, amounts: AdmissionAmounts) !void {
+        const controller = self.controller orelse return error.AdmissionLeaseReleased;
+        if (destination.controller == null) return error.AdmissionLeaseReleased;
+        const backend = self.retain_backend_class orelse return error.InvalidAdmissionLeaseTransfer;
+        if (self == destination or destination.controller != controller or
+            destination.retain_backend_class != backend)
+            return error.InvalidAdmissionLeaseTransfer;
+        const source_amounts = subtractAdmissionAmounts(self.amounts, amounts) orelse
+            return error.InvalidAdmissionLeaseTransfer;
+        const destination_amounts = addAdmissionAmounts(destination.amounts, amounts) orelse
+            return error.InvalidAdmissionLeaseTransfer;
+        const moved_live = @min(self.live_reserved_bytes, try liveHostBytes(amounts));
+        const destination_live = std.math.add(usize, destination.live_reserved_bytes, moved_live) catch
+            return error.InvalidAdmissionLeaseTransfer;
+
+        if (self.external_lease) |source_token| {
+            const destination_token = destination.external_lease orelse return error.InvalidAdmissionLeaseTransfer;
+            if (source_token == destination_token) return error.InvalidAdmissionLeaseTransfer;
+            // The independent active lease count fences owner replacement even
+            // for two zero-byte tokens. No controller mutex spans the callback.
+            const budget = controller.resource_budget orelse return error.InvalidAdmissionLeaseTransfer;
+            const transfer = budget.transfer orelse return error.AdmissionLeaseTransferUnsupported;
+            try transfer(budget.context, source_token, destination_token, amounts);
+        } else if (destination.external_lease != null) return error.InvalidAdmissionLeaseTransfer;
+
+        // No fallible work after the external owner commits. Aggregate policy
+        // usage, pending live pressure and active lease count remain unchanged.
+        self.amounts = source_amounts;
+        destination.amounts = destination_amounts;
+        self.amounts_by_backend[backendClassIndex(backend)] = source_amounts;
+        destination.amounts_by_backend[backendClassIndex(backend)] = destination_amounts;
+        self.live_reserved_bytes -= moved_live;
+        destination.live_reserved_bytes = destination_live;
     }
 
     pub fn release(self: *AdmissionLease) void {
@@ -835,6 +885,10 @@ pub const AdmissionController = struct {
     process_memory_limit_bytes: usize = 0,
     process_memory_limit_provenance: ProcessMemoryLimitProvenance = .automatic,
     resource_budget: ?AdmissionResourceBudget = null,
+    /// Byte totals can reach zero before an external token retires. Count
+    /// provisional acquisitions and live leases independently so their owner
+    /// cannot be replaced during reserve, retain-to-zero or release callbacks.
+    active_leases: usize = 0,
     /// Opt-in fault injection for live server regression tests. Production
     /// callers leave this at zero, so normal admission behavior is unchanged.
     forced_run_denials_for_testing: std.atomic.Value(usize) = .init(0),
@@ -872,7 +926,7 @@ pub const AdmissionController = struct {
     ) void {
         spinLockAdmission(&self.mutex);
         defer self.mutex.unlock();
-        std.debug.assert(std.meta.eql(self.admitted, AdmissionAmounts{}));
+        std.debug.assert(self.active_leases == 0 and std.meta.eql(self.admitted, AdmissionAmounts{}));
         self.shared_limits = shared_limits;
     }
 
@@ -883,7 +937,7 @@ pub const AdmissionController = struct {
     ) void {
         spinLockAdmission(&self.mutex);
         defer self.mutex.unlock();
-        std.debug.assert(std.meta.eql(self.admitted, AdmissionAmounts{}));
+        std.debug.assert(self.active_leases == 0 and std.meta.eql(self.admitted, AdmissionAmounts{}));
         self.process_memory_limit_bytes = limit_bytes;
         self.process_memory_limit_provenance = provenance;
     }
@@ -914,7 +968,7 @@ pub const AdmissionController = struct {
         }
         errdefer if (resource_budget) |budget| budget.releaseContext();
         spinLockAdmission(&self.mutex);
-        if (!std.meta.eql(self.admitted, AdmissionAmounts{})) {
+        if (self.active_leases != 0 or !std.meta.eql(self.admitted, AdmissionAmounts{})) {
             self.mutex.unlock();
             return error.ResourceBudgetInUse;
         }
@@ -1118,6 +1172,8 @@ pub const AdmissionController = struct {
                 );
                 next_by_backend[index] = domain_next;
             }
+            self.active_leases = std.math.add(usize, self.active_leases, 1) catch
+                return error.ResourceLimitExceeded;
             self.admitted = next;
             self.admitted_by_backend = next_by_backend;
         }
@@ -1193,9 +1249,12 @@ pub const AdmissionController = struct {
         backend_class: BackendClass,
         amounts: AdmissionAmounts,
     ) void {
-        var amounts_by_backend = emptyAdmissionAmountsByBackend();
-        amounts_by_backend[backendClassIndex(backend_class)] = amounts;
-        self.releaseLocal(amounts_by_backend, amounts);
+        // A retain changes quantities, not lease ownership. In particular,
+        // reducing to zero must leave configuration fenced until release.
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        subtractAdmissionAmountsInPlace(&self.admitted, amounts);
+        subtractAdmissionAmountsInPlace(&self.admitted_by_backend[backendClassIndex(backend_class)], amounts);
     }
 
     fn release(
@@ -1205,9 +1264,9 @@ pub const AdmissionController = struct {
         external_lease: ?usize,
     ) void {
         if (external_lease) |token| {
-            // Keep the local reservation published until the external owner has
+            // Keep the local lease and reservation published until the external owner has
             // consumed its exactly-once token. configureResourceBudget() uses
-            // that reservation as its exclusion condition, so releasing local
+            // the independent lease count as its exclusion condition, so releasing local
             // accounting first would let a concurrent reconfiguration detach
             // the old context and route this token to a different capability.
             const resource_budget = self.resource_budget orelse
@@ -1235,6 +1294,8 @@ pub const AdmissionController = struct {
     ) void {
         spinLockAdmission(&self.mutex);
         defer self.mutex.unlock();
+        std.debug.assert(self.active_leases != 0);
+        self.active_leases -= 1;
         subtractAdmissionAmountsInPlace(&self.admitted, amounts);
         for (0..backend_class_count) |index|
             subtractAdmissionAmountsInPlace(
@@ -3764,6 +3825,121 @@ test "admission lease releases transient construction bytes while retaining resi
     );
 }
 
+const ZeroLeaseOwnerProbe = struct {
+    controller: *AdmissionController,
+    token: usize,
+    references: usize = 1,
+    releases: usize = 0,
+    reserve_failure: ?AdmissionResourceError = null,
+    return_zero_token: bool = false,
+    check_reserve_fence: bool = false,
+    reserve_fenced: bool = false,
+    release_fenced: bool = false,
+
+    fn port(self: *@This()) AdmissionResourceBudget {
+        return .{ .context = self, .retain_context = retainContext, .release_context = releaseContext, .try_reserve = reserve, .retain = retain, .release = release };
+    }
+    fn retainContext(raw: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.references += 1;
+        return true;
+    }
+    fn releaseContext(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.references > 1);
+        self.references -= 1;
+    }
+    fn configurationFenced(self: *@This()) bool {
+        self.controller.configureResourceBudget(null) catch |err| return err == error.ResourceBudgetInUse;
+        // Restore the original owner before reporting a regression. This keeps
+        // the failing test's cleanup from dispatching an old token elsewhere.
+        self.controller.configureResourceBudget(self.port()) catch unreachable;
+        return false;
+    }
+    fn reserve(raw: *anyopaque, _: AdmissionAmounts) AdmissionResourceError!usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.check_reserve_fence) self.reserve_fenced = self.configurationFenced();
+        if (self.reserve_failure) |cause| return cause;
+        return if (self.return_zero_token) 0 else self.token;
+    }
+    fn retain(raw: *anyopaque, token: usize, _: AdmissionAmounts) AdmissionResourceError!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (token != self.token) return error.ResourceLimitExceeded;
+    }
+    fn release(raw: *anyopaque, token: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(token == self.token);
+        self.release_fenced = self.configurationFenced();
+        self.releases += 1;
+    }
+};
+
+test "admission resource budget zero byte leases retain their owner through physical retirement" {
+    for ([_]usize{ 0, 64 }) |initial_bytes| {
+        var controller: AdmissionController = .{};
+        var original: ZeroLeaseOwnerProbe = .{ .controller = &controller, .token = 17 };
+        var replacement: ZeroLeaseOwnerProbe = .{ .controller = &controller, .token = 29 };
+        try controller.configureResourceBudget(original.port());
+        defer controller.deinit();
+        var lease = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = initial_bytes }, false);
+        defer lease.release();
+        if (initial_bytes != 0) try lease.retain(.{});
+        try std.testing.expectEqual(AdmissionAmounts{}, controller.snapshot());
+        const changed = controller.configureResourceBudget(replacement.port());
+        if (changed) |_| try controller.configureResourceBudget(original.port()) else |_| {}
+        try std.testing.expectError(error.ResourceBudgetInUse, changed);
+        try std.testing.expectEqual(@as(usize, 2), original.references);
+        try std.testing.expectEqual(@as(usize, 1), replacement.references);
+        lease.release();
+        try std.testing.expect(original.release_fenced);
+        try std.testing.expectEqual(@as(usize, 1), original.releases);
+        try std.testing.expectEqual(@as(usize, 0), replacement.releases);
+        // Idempotent retirement must not affect a successor owner's capacity.
+        lease.release();
+        try controller.configureResourceBudget(replacement.port());
+        try std.testing.expectEqual(@as(usize, 1), original.references);
+        try std.testing.expectEqual(@as(usize, 2), replacement.references);
+    }
+}
+
+test "admission resource budget zero local leases fence later owner installation" {
+    var controller: AdmissionController = .{};
+    var owner: ZeroLeaseOwnerProbe = .{ .controller = &controller, .token = 17 };
+    defer controller.deinit();
+    var lease = try controller.tryAcquireRequests(&.{}, false);
+    defer lease.release();
+    const installed = controller.configureResourceBudget(owner.port());
+    if (installed) |_| try controller.configureResourceBudget(null) else |_| {}
+    try std.testing.expectError(error.ResourceBudgetInUse, installed);
+    lease.release();
+    try controller.configureResourceBudget(owner.port());
+    try std.testing.expectEqual(@as(usize, 2), owner.references);
+}
+
+test "admission resource budget zero provisional reservations fence callbacks and unwind refusals" {
+    for (0..3) |scenario| {
+        var controller: AdmissionController = .{};
+        var original: ZeroLeaseOwnerProbe = .{ .controller = &controller, .token = 17, .check_reserve_fence = true };
+        var replacement: ZeroLeaseOwnerProbe = .{ .controller = &controller, .token = 29 };
+        try controller.configureResourceBudget(original.port());
+        defer controller.deinit();
+        if (scenario == 1) original.reserve_failure = error.ResourceTemporarilyUnavailable;
+        if (scenario == 2) original.return_zero_token = true;
+        const result = controller.tryAcquireRequests(&.{ .{ .backend_class = .cpu, .limits = .{}, .amounts = .{} }, .{ .backend_class = .gpu, .limits = .{}, .amounts = .{} } }, false);
+        if (result) |value| {
+            var lease = value;
+            defer lease.release();
+            try std.testing.expect(original.reserve_fenced);
+        } else |cause| {
+            try std.testing.expectEqual(if (scenario == 1) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, cause);
+            try std.testing.expect(original.reserve_fenced);
+        }
+        try std.testing.expectEqual(AdmissionAmounts{}, controller.snapshot());
+        try controller.configureResourceBudget(replacement.port());
+        try std.testing.expectEqual(@as(usize, 1), original.references);
+    }
+}
+
 test "admission resource budget mirrors acquire retain and release" {
     const Recorder = struct {
         current: AdmissionAmounts = .{},
@@ -4339,4 +4515,158 @@ test "derive gpu limits keeps combined cap sane" {
     try std.testing.expect(limits.combined_limit_bytes >= gib(6));
     try std.testing.expect(limits.combined_limit_bytes <= gib(12));
     try std.testing.expect(limits.backend_limit_bytes <= limits.combined_limit_bytes);
+}
+
+test "admission credit transfer preserves policy capacity and live-pressure ownership" {
+    var controller: AdmissionController = .{};
+    defer controller.deinit();
+    const limits: Limits = .{ .host_limit_bytes = 100 };
+    var source = try controller.tryAcquire(.cpu, limits, .{ .host_kv_bytes = 60, .host_scratch_bytes = 40 }, false);
+    defer source.release();
+    var destination = try controller.tryAcquire(.cpu, limits, .{}, false);
+    defer destination.release();
+    source.live_reserved_bytes = try controller.tryReserveLiveCapacityWithInfo(100, .{ .total_bytes = gib(64), .available_bytes = gib(20) });
+    const capacity = controller.live_capacity_bytes;
+    const before = controller.snapshot();
+    try source.transferCreditTo(&destination, .{ .host_kv_bytes = 30, .host_scratch_bytes = 10 });
+    try std.testing.expectEqualDeep(before, controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 2), controller.active_leases);
+    try std.testing.expectEqual(@as(usize, 100), controller.live_pending_bytes);
+    try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
+    try std.testing.expectEqual(@as(usize, 60), source.live_reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 40), destination.live_reserved_bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.cpu, limits, .{ .host_kv_bytes = 1 }, false));
+    source.release();
+    try std.testing.expectEqual(@as(usize, 40), controller.live_pending_bytes);
+    try std.testing.expectEqual(@as(usize, 40), controller.snapshot().hostTotalBytes());
+    destination.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.active_leases);
+    try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.live_capacity_bytes);
+    destination.release();
+}
+
+const TransferBudgetProbe = struct {
+    controller: *AdmissionController,
+    tokens: [2]?AdmissionAmounts = @splat(null),
+    next: usize = 0,
+    deny: bool = false,
+    transfers: usize = 0,
+    fn reserve(raw: *anyopaque, amounts: AdmissionAmounts) AdmissionResourceError!usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.next == self.tokens.len) return error.ResourceTemporarilyUnavailable;
+        self.tokens[self.next] = amounts;
+        self.next += 1;
+        return self.next;
+    }
+    fn retain(_: *anyopaque, _: usize, _: AdmissionAmounts) AdmissionResourceError!void {
+        return error.ResourceLimitExceeded;
+    }
+    fn release(raw: *anyopaque, token: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.tokens[token - 1] != null);
+        self.tokens[token - 1] = null;
+    }
+    fn transfer(raw: *anyopaque, source: usize, destination: usize, amounts: AdmissionAmounts) AdmissionResourceError!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        // Snapshot takes the controller mutex: no callback may hold it.
+        std.debug.assert(self.controller.snapshot().hostTotalBytes() == 100);
+        if (self.controller.configureResourceBudget(null)) |_| unreachable else |err| std.debug.assert(err == error.ResourceBudgetInUse);
+        self.transfers += 1;
+        if (self.deny) return error.ResourceTemporarilyUnavailable;
+        const from = subtractAdmissionAmounts(self.tokens[source - 1].?, amounts) orelse return error.ResourceLimitExceeded;
+        const to = addAdmissionAmounts(self.tokens[destination - 1].?, amounts) orelse return error.ResourceLimitExceeded;
+        self.tokens[source - 1] = from;
+        self.tokens[destination - 1] = to;
+    }
+    fn port(self: *@This(), supported: bool) AdmissionResourceBudget {
+        return .{ .context = self, .try_reserve = reserve, .retain = retain, .release = release, .transfer = if (supported) transfer else null };
+    }
+};
+
+test "admission credit transfer commits external ownership before infallible local partition" {
+    for ([_]bool{ false, true }) |supported| {
+        var controller: AdmissionController = .{};
+        var probe: TransferBudgetProbe = .{ .controller = &controller };
+        try controller.configureResourceBudget(probe.port(supported));
+        defer controller.deinit();
+        var source = try controller.tryAcquire(.cpu, .{}, .{ .host_kv_bytes = 60, .host_scratch_bytes = 40 }, false);
+        defer source.release();
+        var destination = try controller.tryAcquire(.cpu, .{}, .{}, false);
+        defer destination.release();
+        const moved: AdmissionAmounts = .{ .host_kv_bytes = 30, .host_scratch_bytes = 10 };
+        const source_before = source;
+        const destination_before = destination;
+        probe.deny = true;
+        if (supported) {
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, source.transferCreditTo(&destination, moved));
+        } else {
+            try std.testing.expectError(error.AdmissionLeaseTransferUnsupported, source.transferCreditTo(&destination, moved));
+        }
+        try std.testing.expectEqualDeep(source_before, source);
+        try std.testing.expectEqualDeep(destination_before, destination);
+        try std.testing.expectEqualDeep(source.amounts, probe.tokens[0].?);
+        try std.testing.expectEqualDeep(destination.amounts, probe.tokens[1].?);
+        if (supported) {
+            probe.deny = false;
+            try source.transferCreditTo(&destination, moved);
+            try std.testing.expectEqual(@as(usize, 2), probe.transfers);
+            try std.testing.expectEqualDeep(source.amounts, probe.tokens[0].?);
+            try std.testing.expectEqualDeep(destination.amounts, probe.tokens[1].?);
+            try std.testing.expectEqual(@as(usize, 100), controller.snapshot().hostTotalBytes());
+            source.release();
+            try std.testing.expectEqual(@as(usize, 40), controller.snapshot().hostTotalBytes());
+            destination.release();
+            try std.testing.expect(probe.tokens[0] == null and probe.tokens[1] == null);
+        }
+    }
+}
+
+test "admission credit transfer refuses incompatible leases before invoking external owner" {
+    var controller: AdmissionController = .{};
+    defer controller.deinit();
+    var source = try controller.tryAcquire(.cpu, .{}, .{ .host_kv_bytes = 10 }, false);
+    defer source.release();
+    var destination = try controller.tryAcquire(.cpu, .{}, .{}, false);
+    defer destination.release();
+    const before = source;
+    try std.testing.expectError(error.InvalidAdmissionLeaseTransfer, source.transferCreditTo(&source, .{}));
+    try std.testing.expectError(error.InvalidAdmissionLeaseTransfer, source.transferCreditTo(&destination, .{ .host_kv_bytes = 11 }));
+    var other_controller: AdmissionController = .{};
+    defer other_controller.deinit();
+    var foreign = try other_controller.tryAcquire(.cpu, .{}, .{}, false);
+    defer foreign.release();
+    try std.testing.expectError(error.InvalidAdmissionLeaseTransfer, source.transferCreditTo(&foreign, .{}));
+    var gpu = try controller.tryAcquire(.gpu, .{}, .{}, false);
+    defer gpu.release();
+    try std.testing.expectError(error.InvalidAdmissionLeaseTransfer, source.transferCreditTo(&gpu, .{}));
+    destination.release();
+    try std.testing.expectError(error.AdmissionLeaseReleased, source.transferCreditTo(&destination, .{}));
+    try std.testing.expectError(error.AdmissionLeaseReleased, destination.transferCreditTo(&source, .{}));
+    try std.testing.expectEqualDeep(before, source);
+    try std.testing.expectEqual(@as(usize, 10), controller.snapshot().hostTotalBytes());
+}
+
+test "admission credit transfer mixed settled and pending retain never recommits old residency" {
+    var controller: AdmissionController = .{};
+    defer controller.deinit();
+    var source = try controller.tryAcquire(.cpu, .{}, .{ .host_kv_bytes = 100 }, false);
+    defer source.release();
+    var destination = try controller.tryAcquire(.cpu, .{}, .{ .host_kv_bytes = 50 }, false);
+    defer destination.release();
+    source.live_reserved_bytes = try controller.tryReserveLiveCapacityWithInfo(100, .{ .total_bytes = gib(64), .available_bytes = gib(20) });
+    const capacity = controller.live_capacity_bytes;
+    try source.transferCreditTo(&destination, .{ .host_kv_bytes = 40 });
+    try std.testing.expectEqual(@as(usize, 40), destination.live_reserved_bytes);
+    // Of 90 bytes, 50 were already settled. Retaining 75 commits only 25 of
+    // the 40 pending bytes; it neither recommits 50 nor requires 75 pending.
+    try destination.retain(.{ .host_kv_bytes = 75 });
+    try std.testing.expectEqual(capacity - 25, controller.live_capacity_bytes);
+    try std.testing.expectEqual(@as(usize, 60), controller.live_pending_bytes);
+    try std.testing.expectEqual(@as(usize, 0), destination.live_reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 135), controller.snapshot().hostTotalBytes());
+    source.release();
+    try std.testing.expectEqual(@as(usize, 0), controller.live_pending_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.live_capacity_bytes);
+    try std.testing.expectEqual(@as(usize, 75), controller.snapshot().hostTotalBytes());
 }

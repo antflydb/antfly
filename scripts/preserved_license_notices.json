@@ -637,5 +637,8 @@
     "required": [
       "Maintained Antfly Zig port; see PORTING.md and SOURCE_NOTICES.md."
     ]
+  },
+  "zig/pkg/antfly-embedded/src/sql/float_parse/LICENSE": {
+    "file": "LICENSES/third-party/Zig-SHA256-MIT.txt"
   }
 }

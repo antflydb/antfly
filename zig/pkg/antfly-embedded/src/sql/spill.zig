@@ -77,6 +77,7 @@ pub const Manager = struct {
     peak_files: usize = 0,
     mutex: std.atomic.Mutex = .unlocked,
     allocation_mutex: std.atomic.Mutex = .unlocked,
+    directory_mutex: std.atomic.Mutex = .unlocked,
     /// Legacy unscoped spill children pass through this gate. Serial spill I/O must
     /// never imply permission to share a parent's runnable execution capsule.
     pub fn submit(self: *Manager, bytes: usize, comptime function: anytype, args: anytype) ?@import("parallel_scheduler.zig").Task(@TypeOf(@call(.auto, function, args))) {
@@ -99,11 +100,15 @@ pub const Manager = struct {
         return self.performOwned(operation, args, discard, discard_args);
     }
     fn lockFor(self: *Manager, execution: ?*Runnable.Execution) !void {
-        if (execution == null and self.cpu_scope == null) return self.lock();
+        return self.lockMutexFor(&self.mutex, execution);
+    }
+    fn lockMutexFor(self: *Manager, mutex: *std.atomic.Mutex, execution: ?*Runnable.Execution) !void {
+        if (execution == null and self.cpu_scope == null) {
+            while (!mutex.tryLock()) std.atomic.spinLoopHint();
+            return;
+        }
         const boundary = if (execution) |child| childWait(child) else self.cpu_scope.?.wait;
-        // Directory creation holds this lock across physical I/O. A contending
-        // task must release CPU so the lock owner can reacquire its grant.
-        while (!self.mutex.tryLock()) {
+        while (!mutex.tryLock()) {
             try self.checkFor(execution);
             try @import("execution_wait.zig").run(boundary, std.Io.sleep, .{ self.io, std.Io.Duration.fromMilliseconds(1), .awake });
         }
@@ -210,9 +215,13 @@ pub const Manager = struct {
         if (execution) |child| return child.checkpoint();
         return self.check();
     }
-    fn open(self: *Manager, execution: ?*Runnable.Execution) !void {
+    fn open(self: *Manager, execution: ?*Runnable.Execution) !std.Io.Dir {
+        // Initialization may suspend for filesystem work. Its mutex is separate
+        // from accounting, so peers can retire/read/reserve while it resumes.
+        try self.lockMutexFor(&self.directory_mutex, execution);
+        defer self.directory_mutex.unlock();
         if (comptime !native_spill_supported) return error.SqlProgramLimitExceeded;
-        if (self.dir != null) return;
+        if (self.dir) |dir| return dir;
         try self.checkFor(execution);
         var random: [16]u8 = undefined;
         try self.io.randomSecure(&random);
@@ -220,6 +229,7 @@ pub const Manager = struct {
         const opened = try self.performOwnedFor(execution, openPrivateDirectory, .{ self.io, self.root, &self.directory_name }, PrivateDirectory.discard, .{ self.io, &self.directory_name });
         self.dir = opened.dir;
         self.parent = opened.parent;
+        return opened.dir;
     }
     const PrivateDirectory = struct {
         parent: std.Io.Dir,
@@ -270,21 +280,25 @@ pub const Manager = struct {
         return self.createFor(null);
     }
     pub fn createFor(self: *Manager, execution: ?*Runnable.Execution) !File {
-        // Freestanding builds have no native spill directory. Keep bounded
-        // in-memory SQL available and report its existing limit on overflow.
         if (comptime !native_spill_supported) return error.SqlProgramLimitExceeded;
-        try self.lockFor(execution);
-        defer self.mutex.unlock();
-        if (self.max_bytes == 0) return error.SqlProgramLimitExceeded;
-        try self.open(execution);
-        if (self.files >= 64) return error.SqlProgramLimitExceeded;
-        self.sequence += 1;
+        const id = reserve: {
+            try self.lockFor(execution);
+            defer self.mutex.unlock();
+            if (self.max_bytes == 0 or self.files >= 64) return error.SqlProgramLimitExceeded;
+            self.sequence += 1;
+            self.files += 1;
+            self.peak_files = @max(self.peak_files, self.files);
+            break :reserve self.sequence;
+        };
+        // The descriptor is funded before publication; failure returns its
+        // reservation after all acquired handles have been discarded. Never
+        // hold the accounting mutex across an I/O or scheduler boundary.
+        errdefer self.closeFile(0);
+        const dir = try self.open(execution);
         var name: [24]u8 = undefined;
-        const text = try std.fmt.bufPrint(&name, "{d}", .{self.sequence});
-        const file = try self.performOwnedFor(execution, createPrivateFile, .{ self.dir.?, self.io, text }, discardPrivateFile, .{self.io});
-        self.files += 1;
-        self.peak_files = @max(self.peak_files, self.files);
-        return .{ .manager = self, .file = file, .id = self.sequence, .execution = execution };
+        const text = try std.fmt.bufPrint(&name, "{d}", .{id});
+        const file = try self.performOwnedFor(execution, createPrivateFile, .{ dir, self.io, text }, discardPrivateFile, .{self.io});
+        return .{ .manager = self, .file = file, .id = id, .execution = execution };
     }
     pub fn deinit(self: *Manager) void {
         // Memory-only callers need no cancellation-capable Io. No resources
@@ -812,12 +826,67 @@ fn jsonNumber(bytes: []const u8) bool {
 }
 const JsonOwner = struct {
     arena: std.heap.ArenaAllocator,
+    backing: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
-    // Only consumers crossing a scalar/text boundary allocate cache records.
-    // Keys borrow validated, immutable ranges owned by the enclosing block.
+    allocation_mutex: std.atomic.Mutex = .unlocked,
+    live_bytes: usize = 0,
+    // Cache metadata and published payloads belong to the immutable block.
     cached: std.AutoHashMapUnmanaged(usize, *FrozenJson) = .empty,
+    fn init(self: *JsonOwner, backing: Allocator) void {
+        self.* = .{ .arena = undefined, .backing = @import("memory_budget.zig").reclaimingAllocator(backing) };
+        self.arena = .init(self.allocator());
+    }
+    fn allocator(self: *JsonOwner) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn allocationLock(self: *JsonOwner) void {
+        while (!self.allocation_mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    fn allocate(raw: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *JsonOwner = @ptrCast(@alignCast(raw));
+        self.allocationLock();
+        defer self.allocation_mutex.unlock();
+        const result = self.backing.rawAlloc(n, alignment, ra) orelse return null;
+        self.live_bytes += n;
+        return result;
+    }
+    fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *JsonOwner = @ptrCast(@alignCast(raw));
+        self.allocationLock();
+        defer self.allocation_mutex.unlock();
+        if (!self.backing.rawResize(bytes, alignment, n, ra)) return false;
+        self.live_bytes = self.live_bytes - bytes.len + n;
+        return true;
+    }
+    fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *JsonOwner = @ptrCast(@alignCast(raw));
+        self.allocationLock();
+        defer self.allocation_mutex.unlock();
+        const result = self.backing.rawRemap(bytes, alignment, n, ra) orelse return null;
+        self.live_bytes = self.live_bytes - bytes.len + n;
+        return result;
+    }
+    fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *JsonOwner = @ptrCast(@alignCast(raw));
+        self.allocationLock();
+        defer self.allocation_mutex.unlock();
+        self.backing.rawFree(bytes, alignment, ra);
+        self.live_bytes -= bytes.len;
+    }
+    fn retainedBytes(self: *JsonOwner) usize {
+        self.allocationLock();
+        defer self.allocation_mutex.unlock();
+        return self.live_bytes;
+    }
+    fn lock(self: *JsonOwner, control: ?@import("operator_work.zig").Control) !void {
+        while (!self.mutex.tryLock()) try @import("operator_work.zig").poll(control);
+    }
     fn get(self: *JsonOwner, bytes: []const u8, lossless: bool) !*FrozenJson {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        return self.getControlled(bytes, lossless, null);
+    }
+    fn getControlled(self: *JsonOwner, bytes: []const u8, lossless: bool, control: ?@import("operator_work.zig").Control) !*FrozenJson {
+        try @import("operator_work.zig").poll(control);
+        try self.lock(control);
         defer self.mutex.unlock();
         if (self.cached.get(@intFromPtr(bytes.ptr))) |entry| return entry;
         const a = self.arena.allocator();
@@ -827,7 +896,28 @@ const JsonOwner = struct {
         return entry;
     }
     fn deinit(self: *JsonOwner) void {
+        var entries = self.cached.valueIterator();
+        while (entries.next()) |entry| {
+            if (entry.*.decoded) |payload| payload.deinit();
+            if (entry.*.encoded_text) |payload| payload.deinit();
+        }
         self.arena.deinit();
+    }
+};
+// Each speculative fill has an independent, stable arena. A cancelled or
+// losing fill releases its allocations without touching a published value.
+const JsonCachePayload = struct {
+    owner: *JsonOwner,
+    arena: std.heap.ArenaAllocator,
+    fn create(owner: *JsonOwner) !*JsonCachePayload {
+        const self = try owner.allocator().create(JsonCachePayload);
+        self.* = .{ .owner = owner, .arena = .init(owner.allocator()) };
+        return self;
+    }
+    fn deinit(self: *JsonCachePayload) void {
+        const a = self.owner.allocator();
+        self.arena.deinit();
+        a.destroy(self);
     }
 };
 // Offsets are relative to the immutable block wire, never producer pointers.
@@ -845,39 +935,67 @@ const FrozenJson = struct {
     lossless: bool,
     value: ?std.json.Value = null,
     text: ?[]const u8 = null,
-    fn lock(self: *FrozenJson) void {
-        while (!self.owner.mutex.tryLock()) std.atomic.spinLoopHint();
-    }
+    decoded: ?*JsonCachePayload = null,
+    encoded_text: ?*JsonCachePayload = null,
     fn materialize(self: *FrozenJson) !Datum {
-        self.lock();
+        return self.materializeControlled(null);
+    }
+    fn materializeControlled(self: *FrozenJson, control: ?@import("operator_work.zig").Control) !Datum {
+        const Work = @import("operator_work.zig");
+        try Work.poll(control);
+        try self.owner.lock(control);
+        const ready = self.value;
+        self.owner.mutex.unlock();
+        if (ready) |value| return Datum.json(value);
+        const payload = try JsonCachePayload.create(self.owner);
+        var published = false;
+        defer if (!published) payload.deinit();
+        var decoder: Decoder = .{ .validated_json = true, .a = payload.arena.allocator(), .bytes = self.bytes, .control = control };
+        const value = try decoder.json(0);
+        try Work.poll(control);
+        try self.owner.lock(control);
         defer self.owner.mutex.unlock();
         if (self.value == null) {
-            var decoder: Decoder = .{ .validated_json = true, .a = self.owner.arena.allocator(), .bytes = self.bytes };
-            self.value = try decoder.json(0);
+            self.value = value;
+            self.decoded = payload;
+            published = true;
         }
         return Datum.json(self.value.?);
     }
     fn encoded(self: *FrozenJson) !?[]const u8 {
-        // Integer/float DOM tags must survive scalar access and frozen replay.
-        // Canonical text cannot distinguish them from number-string tags.
         if (!self.lossless) return null;
-        self.lock();
+        try self.owner.lock(null);
+        const ready = self.text;
+        self.owner.mutex.unlock();
+        if (ready) |text| return text;
+        const payload = try JsonCachePayload.create(self.owner);
+        var published = false;
+        defer if (!published) payload.deinit();
+        // The growing encoder buffer is temporary; only the final text
+        // belongs to the published cache arena.
+        const work = self.owner.allocator();
+        var output: std.Io.Writer.Allocating = .init(work);
+        defer output.deinit();
+        var json: std.json.Stringify = .{ .writer = &output.writer };
+        var decoder: Decoder = .{ .a = work, .bytes = self.bytes };
+        _ = decoder.walkJson(0, &json) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+        const text = try payload.arena.allocator().dupe(u8, output.written());
+        try self.owner.lock(null);
         defer self.owner.mutex.unlock();
         if (self.text == null) {
-            const work = @import("memory_budget.zig").reclaimingAllocator(self.owner.arena.allocator());
-            var output: std.Io.Writer.Allocating = .init(work);
-            defer output.deinit();
-            var json: std.json.Stringify = .{ .writer = &output.writer };
-            var decoder: Decoder = .{ .a = work, .bytes = self.bytes };
-            _ = decoder.walkJson(0, &json) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
-            self.text = try self.owner.arena.allocator().dupe(u8, output.written());
+            self.text = text;
+            self.encoded_text = payload;
+            published = true;
         }
         return self.text;
     }
 };
 /// The handle is issued only after recursive validation by the block decoder.
 pub fn materializeFrozenJson(a: Allocator, value: @import("execution_batch.zig").FrozenJson) !Datum {
-    var decoder: Decoder = .{ .validated_json = true, .a = a, .bytes = value.bytes };
+    return materializeFrozenJsonControlled(a, value, null);
+}
+pub fn materializeFrozenJsonControlled(a: Allocator, value: @import("execution_batch.zig").FrozenJson, control: ?@import("operator_work.zig").Control) !Datum {
+    var decoder: Decoder = .{ .validated_json = true, .a = a, .bytes = value.bytes, .control = control };
     const result = try decoder.json(0);
     if (decoder.position != value.bytes.len) return error.InvalidSqlSpill;
     return Datum.json(result);
@@ -885,22 +1003,31 @@ pub fn materializeFrozenJson(a: Allocator, value: @import("execution_batch.zig")
 /// Write an already validated frozen value without a DOM or text buffer.
 /// Writer failures remain writer failures; callers own quota/error mapping.
 pub fn writeFrozenJson(writer: *std.Io.Writer, value: @import("execution_batch.zig").FrozenJson) !void {
+    return writeFrozenJsonControlled(writer, value, null);
+}
+pub fn writeFrozenJsonControlled(writer: *std.Io.Writer, value: @import("execution_batch.zig").FrozenJson, control: ?@import("operator_work.zig").Control) !void {
+    try @import("operator_work.zig").poll(control);
     var scratch = std.heap.FixedBufferAllocator.init(&.{});
     var json: std.json.Stringify = .{ .writer = writer };
-    var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.bytes };
+    var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.bytes, .control = control };
     _ = try decoder.walkJson(0, &json);
     if (decoder.position != value.bytes.len) return error.InvalidSqlSpill;
 }
 pub fn frozenJsonText(a: Allocator, value: @import("execution_batch.zig").FrozenJson) ![]const u8 {
+    return frozenJsonTextControlled(a, value, null);
+}
+pub fn frozenJsonTextControlled(a: Allocator, value: @import("execution_batch.zig").FrozenJson, control: ?@import("operator_work.zig").Control) ![]const u8 {
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
-    writeFrozenJson(&output.writer, value) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+    writeFrozenJsonControlled(&output.writer, value, control) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
     return output.toOwnedSlice();
 }
 /// Scalar consumers can construct incompatible native tags during validation.
 /// Forwarding consumers retain every validated compound as frozen bytes.
 pub const JsonConsumption = enum { scalar, forwarding };
 const Decoder = struct {
+    // This authority belongs only to the current synchronous decoder.
+    control: ?@import("operator_work.zig").Control = null,
     json_consumption: JsonConsumption = .scalar,
     validated_json: bool = false,
     eager_nontext: bool = false,
@@ -929,7 +1056,7 @@ const Decoder = struct {
         return @intCast(len);
     }
     fn text(self: *Decoder) ![]u8 {
-        return self.a.dupe(u8, try self.take(try self.count()));
+        return @import("operator_work.zig").dupe(u8, self.a, try self.take(try self.count()), self.control);
     }
     fn byte(self: *Decoder) !u8 {
         return (try self.take(1))[0];
@@ -1015,6 +1142,7 @@ const Decoder = struct {
     /// Validate every frozen token and duplicate key before publishing the
     /// block. Nested payloads remain ranges; no JSON Value tree is built.
     fn walkJson(self: *Decoder, depth: usize, output: ?*std.json.Stringify) anyerror!bool {
+        try @import("operator_work.zig").poll(self.control);
         if (depth > 64) return error.InvalidSqlSpill;
         switch (try self.byte()) {
             0 => {
@@ -1042,7 +1170,13 @@ const Decoder = struct {
             4, 5 => |tag_| {
                 const bytes = try self.take(try self.count());
                 if (output) |writer_| {
-                    if (tag_ == 4) try writer_.write(std.json.Value{ .number_string = bytes }) else try writer_.write(bytes);
+                    if (self.control == null) {
+                        if (tag_ == 4) try writer_.write(std.json.Value{ .number_string = bytes }) else try writer_.write(bytes);
+                    } else {
+                        try writer_.beginWriteRaw();
+                        try self.emitText(writer_.writer, bytes, tag_ == 5);
+                        writer_.endWriteRaw();
+                    }
                 }
                 if (output != null) return true;
                 const lossless = if (tag_ == 5) std.unicode.utf8ValidateSlice(bytes) else jsonNumber(bytes);
@@ -1071,7 +1205,15 @@ const Decoder = struct {
                             if (self.eager_nontext and !valid) return error.ScalarJsonRequired;
                             lossless = valid and lossless;
                         }
-                        if (output) |writer_| try writer_.objectField(key);
+                        if (output) |writer_| {
+                            if (self.control == null) {
+                                try writer_.objectField(key);
+                            } else {
+                                try writer_.beginObjectFieldRaw();
+                                try self.emitText(writer_.writer, key, true);
+                                writer_.endObjectFieldRaw();
+                            }
+                        }
                     }
                     const child = try self.walkJson(depth + 1, output);
                     lossless = child and lossless;
@@ -1084,7 +1226,25 @@ const Decoder = struct {
             else => return error.InvalidSqlSpill,
         }
     }
+    // All frozen emitters use the default JSON options (Unicode bytes pass
+    // through). Splitting even within a UTF-8 sequence therefore preserves the
+    // exact encoded stream while bounding escape scanning and output copying.
+    fn emitText(self: *Decoder, writer: *std.Io.Writer, bytes: []const u8, quoted: bool) !void {
+        const Work = @import("operator_work.zig");
+        try Work.poll(self.control);
+        if (quoted) try writer.writeByte('"');
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            try Work.poll(self.control);
+            const end = offset + @min(@as(usize, 4096), bytes.len - offset);
+            if (quoted) try std.json.Stringify.encodeJsonStringChars(bytes[offset..end], .{}, writer) else try writer.writeAll(bytes[offset..end]);
+            offset = end;
+        }
+        if (quoted) try writer.writeByte('"');
+        try Work.poll(self.control);
+    }
     fn json(self: *Decoder, depth: usize) anyerror!std.json.Value {
+        try @import("operator_work.zig").poll(self.control);
         if (depth > 64) return error.InvalidSqlSpill;
         return switch (try self.byte()) {
             0 => .null,
@@ -1144,8 +1304,12 @@ pub const ColumnarBlock = struct {
         return self.ordinals.len;
     }
     pub fn cell(self: ColumnarBlock, row: usize, column: usize) !Datum {
+        return self.cellControlled(row, column, null);
+    }
+    pub fn cellControlled(self: ColumnarBlock, row: usize, column: usize, control: ?@import("operator_work.zig").Control) !Datum {
+        try @import("operator_work.zig").poll(control);
         if (row >= self.count() or column >= self.values.len) return error.InvalidSqlSpill;
-        return self.values[column].cell(row);
+        return self.values[column].cellControlled(row, control);
     }
     pub fn frozenJson(self: ColumnarBlock, row: usize, column: usize, keys: bool) !?@import("execution_batch.zig").FrozenJson {
         const columns = if (keys) self.keys else self.values;
@@ -1790,6 +1954,11 @@ pub const JoinPayloads = struct {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 return if (self_.bound(row, column)) Datum{} else self_.source.cell(alloc, row, column);
             }
+            fn cellControlled(raw: *anyopaque, alloc: Allocator, row: usize, column: usize, control: ?@import("operator_work.zig").Control) anyerror!Datum {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                try @import("operator_work.zig").poll(control);
+                return if (self_.bound(row, column)) Datum{} else self_.source.cellControlled(alloc, row, column, control);
+            }
             fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 return if (self_.bound(row, column)) null else self_.source.frozenJson(row, column);
@@ -1802,7 +1971,7 @@ pub const JoinPayloads = struct {
         var view: View = .{ .source = &values, .bindings = bindings.items };
         var base: std.ArrayList(u8) = .empty;
         const ordinals: [page_rows]u64 = @splat(0);
-        try appendColumnarBatchVersionMode(a, a, &base, .{ .reader = .{ .ptr = &view, .read = View.cell, .read_frozen = View.frozen, .read_json = View.json, .count = values.len(), .width = values.width() } }, ordinals[0..values.len()], self.file.manager.max_record_bytes, .v2, self.file.manager);
+        try appendColumnarBatchVersionMode(a, a, &base, .{ .reader = .{ .ptr = &view, .read = View.cell, .read_controlled = View.cellControlled, .read_frozen = View.frozen, .read_json = View.json, .count = values.len(), .width = values.width() } }, ordinals[0..values.len()], self.file.manager.max_record_bytes, .v2, self.file.manager);
         var output: std.ArrayList(u8) = .empty;
         var encoder: Encoder = .{ .a = a, .bytes = &output, .limit = self.file.manager.max_record_bytes };
         try encoder.append(references_magic);
@@ -1826,6 +1995,10 @@ pub const JoinPayloads = struct {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 return self_.source.cell(alloc, self_.row, self_.column);
             }
+            fn cellControlled(raw: *anyopaque, alloc: Allocator, _: usize, _: usize, control: ?@import("operator_work.zig").Control) anyerror!Datum {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                return self_.source.cellControlled(alloc, self_.row, self_.column, control);
+            }
             fn getFrozen(raw: *anyopaque, _: usize, _: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 return self_.source.frozenJson(self_.row, self_.column);
@@ -1837,7 +2010,7 @@ pub const JoinPayloads = struct {
         };
         var one: One = .{ .source = &values, .row = row, .column = column };
 
-        return (try self.lookupNativeBody(key)) orelse try self.appendInlineBatch(.{ .reader = .{ .ptr = &one, .read = One.cell, .read_frozen = One.getFrozen, .read_json = One.json, .count = 1, .width = 1 } }, .body, key);
+        return (try self.lookupNativeBody(key)) orelse try self.appendInlineBatch(.{ .reader = .{ .ptr = &one, .read = One.cell, .read_controlled = One.cellControlled, .read_frozen = One.getFrozen, .read_json = One.json, .count = 1, .width = 1 } }, .body, key);
     }
     /// One immutable producer cohort, with one bounded content memo shared by
     /// packing and every physical append. Count distinct bodies per page so a
@@ -2898,10 +3071,14 @@ pub const Sequential = struct {
             return json.encoded();
         }
         fn cell(self: EncodedColumn, index: usize) anyerror!Datum {
+            return self.cellControlled(index, null);
+        }
+        fn cellControlled(self: EncodedColumn, index: usize, control: ?@import("operator_work.zig").Control) anyerror!Datum {
+            try @import("operator_work.zig").poll(control);
             if (self.values == .shared) {
                 const shared = self.values.shared;
-                if (shared.bodies[index]) |body| return body.cell(0, 0);
-                return shared.base.cell(index);
+                if (shared.bodies[index]) |body| return body.cellControlled(0, 0, control);
+                return shared.base.cellControlled(index, control);
             }
             if (self.values == .dynamic) {
                 const dynamic = self.values.dynamic;
@@ -2909,7 +3086,10 @@ pub const Sequential = struct {
                     const range = dynamic.ranges[index];
                     if (range.length == 0 and range.begin >= JsonRange.json_null) return .{ .sql_null = range.begin == JsonRange.sql_null };
                 }
-                if (try self.jsonAt(index)) |json| return json.materialize();
+                if (self.frozen(index)) |payload| {
+                    const json = try dynamic.owner.?.getControlled(payload.bytes, payload.lossless_text, control);
+                    return json.materializeControlled(control);
+                }
                 return self.values.dynamic.cells[index];
             }
             const flag = (self.flags[index / 4] >> @as(u3, @intCast(index % 4 * 2))) & 3;
@@ -2956,7 +3136,7 @@ pub const Sequential = struct {
                         decoder.eager_nontext = false;
                         if (decoder.json_owner == null) {
                             const owner = try decoder.a.create(JsonOwner);
-                            owner.* = .{ .arena = .init(decoder.cache_backing.?) };
+                            owner.init(decoder.cache_backing.?);
                             decoder.json_owner = owner;
                         }
                         if (ranges.len == 0) {
@@ -3057,9 +3237,7 @@ pub const Sequential = struct {
         fn ownRetainedBytes(self: *const OwnedBlock) usize {
             var bytes = @sizeOf(OwnedBlock) +| self.arena.queryCapacity();
             if (self.encoded) |encoded| if (encoded.json_owner) |owner| {
-                while (!owner.mutex.tryLock()) std.atomic.spinLoopHint();
-                defer owner.mutex.unlock();
-                bytes +|= owner.arena.queryCapacity();
+                bytes +|= owner.retainedBytes();
             };
             return bytes +| self.dependencies.capacity *| @sizeOf(*OwnedBlock);
         }
@@ -3075,8 +3253,12 @@ pub const Sequential = struct {
             return if (self.encoded) |v| v.values.len else self.rows[0].values.len;
         }
         pub fn cell(self: *const OwnedBlock, index: usize, column: usize) !Datum {
+            return self.cellControlled(index, column, null);
+        }
+        pub fn cellControlled(self: *const OwnedBlock, index: usize, column: usize, control: ?@import("operator_work.zig").Control) !Datum {
+            try @import("operator_work.zig").poll(control);
             if (index >= self.count() or column >= self.width()) return error.InvalidSqlSpill;
-            return if (self.encoded) |v| v.values[column].cell(index) else self.rows[index].values[column];
+            return if (self.encoded) |v| v.values[column].cellControlled(index, control) else self.rows[index].values[column];
         }
         pub fn keyWidth(self: *const OwnedBlock) usize {
             return if (self.encoded) |v| v.keys.len else self.rows[0].keys.len;
@@ -3085,8 +3267,12 @@ pub const Sequential = struct {
             return if (self.encoded) |v| v.ordinals[index] else self.rows[index].ordinal;
         }
         pub fn keyCell(self: *const OwnedBlock, index: usize, column: usize) !Datum {
+            return self.keyCellControlled(index, column, null);
+        }
+        pub fn keyCellControlled(self: *const OwnedBlock, index: usize, column: usize, control: ?@import("operator_work.zig").Control) !Datum {
+            try @import("operator_work.zig").poll(control);
             if (index >= self.count() or column >= self.keyWidth()) return error.InvalidSqlSpill;
-            return if (self.encoded) |v| v.keys[column].cell(index) else self.rows[index].keys[column];
+            return if (self.encoded) |v| v.keys[column].cellControlled(index, control) else self.rows[index].keys[column];
         }
         pub fn batch(self: *OwnedBlock, a: Allocator, keys: bool) !@import("execution_batch.zig").Batch {
             const View = struct {
@@ -3095,6 +3281,10 @@ pub const Sequential = struct {
                 fn cell(raw: *anyopaque, _: Allocator, row_index: usize, column: usize) anyerror!Datum {
                     const view: *@This() = @ptrCast(@alignCast(raw));
                     return if (view.keys) view.block.keyCell(row_index, column) else view.block.cell(row_index, column);
+                }
+                fn cellControlled(raw: *anyopaque, _: Allocator, row_index: usize, column: usize, control: ?@import("operator_work.zig").Control) anyerror!Datum {
+                    const view: *@This() = @ptrCast(@alignCast(raw));
+                    return if (view.keys) view.block.keyCellControlled(row_index, column, control) else view.block.cellControlled(row_index, column, control);
                 }
                 fn json(raw: *anyopaque, row_index: usize, column: usize) anyerror!?[]const u8 {
                     const view: *@This() = @ptrCast(@alignCast(raw));
@@ -3158,7 +3348,7 @@ pub const Sequential = struct {
             };
             const view = try a.create(View);
             view.* = .{ .block = self, .keys = keys };
-            return .{ .reader = .{ .ptr = view, .read = View.cell, .read_physical = View.physical, .read_decimal_selected = View.decimal, .read_identity = View.identity, .read_json = if (keys) null else View.json, .read_frozen = if (keys) null else View.frozen, .read_dictionary = View.dictionary, .count = self.count(), .width = if (keys) self.keyWidth() else self.width() } };
+            return .{ .reader = .{ .ptr = view, .read = View.cell, .read_controlled = View.cellControlled, .read_physical = View.physical, .read_decimal_selected = View.decimal, .read_identity = View.identity, .read_json = if (keys) null else View.json, .read_frozen = if (keys) null else View.frozen, .read_dictionary = View.dictionary, .count = self.count(), .width = if (keys) self.keyWidth() else self.width() } };
         }
         pub fn decimalColumn(self: *const OwnedBlock, a: Allocator, column: usize, selected: ?[]const usize) !?@import("execution_batch.zig").DecimalColumn {
             const count_rows = if (selected) |indices| indices.len else self.count();
@@ -3837,7 +4027,7 @@ pub const PayloadReader = struct {
         errdefer stable.free(payloads);
         const view = try stable.create(PageView);
         view.* = .{ .payloads = payloads };
-        return .{ .values = .{ .reader = .{ .ptr = view, .read = PageView.cell, .read_frozen = PageView.frozen, .read_json = PageView.json, .read_identity = PageView.identity, .read_dictionary = PageView.dictionary, .count = payloads.len, .width = width } }, .payloads = payloads, .a = stable };
+        return .{ .values = .{ .reader = .{ .ptr = view, .read = PageView.cell, .read_controlled = PageView.cellControlled, .read_frozen = PageView.frozen, .read_json = PageView.json, .read_identity = PageView.identity, .read_dictionary = PageView.dictionary, .count = payloads.len, .width = width } }, .payloads = payloads, .a = stable };
     }
     const PageView = struct {
         payloads: []const Payload,
@@ -3866,6 +4056,11 @@ pub const PayloadReader = struct {
             const self_: *@This() = @ptrCast(@alignCast(raw));
             const payload = self_.payloads[row];
             return payload.block.cell(payload.index, column);
+        }
+        fn cellControlled(raw: *anyopaque, _: Allocator, row: usize, column: usize, control: ?@import("operator_work.zig").Control) anyerror!Datum {
+            const self_: *@This() = @ptrCast(@alignCast(raw));
+            const payload = self_.payloads[row];
+            return payload.block.cellControlled(payload.index, column, control);
         }
         fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
             const self_: *@This() = @ptrCast(@alignCast(raw));
@@ -4836,6 +5031,11 @@ pub const Sort = struct {
             const location = self.locations[row];
             return if (self.keys) location.block.keyCell(location.row, column) else location.block.cell(location.row, column);
         }
+        fn cellControlled(raw: *anyopaque, _: Allocator, row: usize, column: usize, control: ?@import("operator_work.zig").Control) anyerror!Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const location = self.locations[row];
+            return if (self.keys) location.block.keyCellControlled(location.row, column, control) else location.block.cellControlled(location.row, column, control);
+        }
         fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const location = self.locations[row];
@@ -4848,7 +5048,7 @@ pub const Sort = struct {
         }
         fn batch(self: *@This()) @import("execution_batch.zig").Batch {
             const block = self.locations[0].block;
-            return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .width = if (self.keys) block.keyWidth() else block.width(), .count = self.locations.len } };
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_controlled = cellControlled, .read_frozen = frozen, .read_json = json, .width = if (self.keys) block.keyWidth() else block.width(), .count = self.locations.len } };
         }
         fn write(locations: []const Location, ordinals: []const u64, output: *Sequential) !void {
             if (locations.len == 0) return;
@@ -5095,6 +5295,10 @@ pub const Sort = struct {
         pub fn cell(self: RowLease, column: usize) !Datum {
             return if (self.block) |block| block.cell(self.index, column) else if (self.values) |values| values.cell(values.a, self.index, column) else self.row.values[column];
         }
+        pub fn cellControlled(self: RowLease, a: Allocator, column: usize, control: ?@import("operator_work.zig").Control) !Datum {
+            try @import("operator_work.zig").poll(control);
+            return if (self.block) |block| block.cellControlled(self.index, column, control) else if (self.values) |values| values.cellControlled(a, self.index, column, control) else self.row.values[column];
+        }
         /// Merge consumers can inspect typed keys without reconstructing an
         /// entire row or duplicating keys in the stored payload columns.
         pub fn keyCell(self: RowLease, column: usize) !Datum {
@@ -5148,6 +5352,10 @@ pub const Sort = struct {
             const view: *@This() = @ptrCast(@alignCast(raw));
             return view.sort.values.cell(a, view.position(row), column);
         }
+        fn cellControlled(raw: *anyopaque, a: Allocator, row: usize, column: usize, control: ?@import("operator_work.zig").Control) anyerror!Datum {
+            const view: *@This() = @ptrCast(@alignCast(raw));
+            return view.sort.values.cellControlled(a, view.position(row), column, control);
+        }
         fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
             const view: *@This() = @ptrCast(@alignCast(raw));
             return view.sort.values.frozenJson(view.position(row), column);
@@ -5170,7 +5378,7 @@ pub const Sort = struct {
             return (try source.select(a, positions)).dictionaryColumn(a, column);
         }
         fn batch(self: *@This()) @import("execution_batch.zig").Batch {
-            return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .read_identity = identity, .read_dictionary = dictionary, .count = self.count, .width = self.sort.values.columns.len } };
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_controlled = cellControlled, .read_frozen = frozen, .read_json = json, .read_identity = identity, .read_dictionary = dictionary, .count = self.count, .width = self.sort.values.columns.len } };
         }
     };
     pub fn nextValuesPage(self: *Sort, maximum: usize, byte_limit: usize) anyerror!ValuesPage {
@@ -5306,7 +5514,7 @@ pub const Sort = struct {
             key.* = null;
         }
         view.* = .{ .rows = output };
-        return .{ .rows = output, .a = stable, .values = .{ .reader = .{ .ptr = view, .read = PageView.cell, .read_frozen = PageView.frozen, .read_json = PageView.json, .read_identity = PageView.identity, .read_dictionary = PageView.dictionary, .count = output.len, .width = if (output.len == 0) 0 else output[0].block.?.width() } } };
+        return .{ .rows = output, .a = stable, .values = .{ .reader = .{ .ptr = view, .read = PageView.cell, .read_controlled = PageView.cellControlled, .read_frozen = PageView.frozen, .read_json = PageView.json, .read_identity = PageView.identity, .read_dictionary = PageView.dictionary, .count = output.len, .width = if (output.len == 0) 0 else output[0].block.?.width() } } };
     }
     const PageView = struct {
         rows: []const RowLease,
@@ -5318,6 +5526,10 @@ pub const Sort = struct {
         fn cell(raw: *anyopaque, _: Allocator, row: usize, column: usize) anyerror!Datum {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return self.rows[row].cell(column);
+        }
+        fn cellControlled(raw: *anyopaque, a: Allocator, row: usize, column: usize, control: ?@import("operator_work.zig").Control) anyerror!Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.rows[row].cellControlled(a, column, control);
         }
         fn frozen(raw: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -9563,4 +9775,270 @@ test "SQL native spill decimal views retain selected coefficients display scales
     try std.testing.expectEqualSlices(i128, &.{ -45, 0, 12300, -45 }, view.physical.vector.values.decimal128.values);
     try std.testing.expectEqualSlices(u16, &.{ 1, 0, 4, 1 }, view.scales);
     try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, view.physical.vector.nulls.bytes);
+}
+
+test "SQL consumer spill cancellation retires unpublished cache and retries with current control" {
+    const Fixture = struct {
+        fn run(backing: Allocator) !void {
+            var source = std.heap.ArenaAllocator.init(backing);
+            defer source.deinit();
+            const a = source.allocator();
+            const text = try a.alloc(u8, 32768);
+            @memset(text, 'x');
+            const items = try a.alloc(std.json.Value, 2);
+            items[0] = .{ .string = text };
+            items[1] = .{ .integer = 9007199254740993 };
+            const value: std.json.Value = .{ .array = .fromOwnedSlice(a, items) };
+            const rows = [_]Row{.{ .values = &.{Datum.json(value)}, .keys = &.{Datum.json(value)}, .ordinal = 7 }};
+            const bytes = try encodeColumnarBlockVersionAlloc(a, &rows, 1 << 20, .v2);
+            var metadata = std.heap.ArenaAllocator.init(backing);
+            defer metadata.deinit();
+            var budget: @import("memory_budget.zig") = .{ .backing = backing, .limit = 1 << 24 };
+            {
+                const block = try decodeColumnarBlockForForwarding(metadata.allocator(), budget.allocator(), bytes, 1 << 20);
+                defer block.deinit();
+                var owned: Sequential.OwnedBlock = .{ .a = backing, .arena = .init(backing), .encoded = block };
+                defer owned.arena.deinit();
+                const Counter = struct {
+                    calls: usize = 0,
+                    stop: usize = std.math.maxInt(usize),
+                    fn checkpoint(raw: ?*anyopaque) !void {
+                        const self: *@This() = @ptrCast(@alignCast(raw.?));
+                        self.calls += 1;
+                        if (self.calls == self.stop) return error.Cancelled;
+                    }
+                    fn control(self: *@This()) @import("operator_work.zig").Control {
+                        return .{ .ptr = self, .checkpoint = checkpoint };
+                    }
+                };
+                for ([_]bool{ false, true }) |keys| {
+                    const frozen = (try (if (keys) block.keys[0] else block.values[0]).jsonAt(0)).?;
+                    const baseline = budget.live;
+                    const batch = try owned.batch(a, keys);
+                    var stopped: Counter = .{ .stop = 8 };
+                    if (batch.cellControlled(a, 0, 0, stopped.control())) |_| {
+                        return error.TestUnexpectedResult;
+                    } else |err| {
+                        if (err == error.OutOfMemory) return err;
+                        try std.testing.expectEqual(error.Cancelled, err);
+                    }
+                    try std.testing.expectEqual(@as(usize, 8), stopped.calls);
+                    try std.testing.expect(frozen.value == null and frozen.decoded == null);
+                    try std.testing.expectEqual(baseline, budget.live);
+                    var current: Counter = .{};
+                    const decoded = try batch.cellControlled(a, 0, 0, current.control());
+                    try std.testing.expect(current.calls >= 8);
+                    try std.testing.expectEqualStrings(text, decoded.value.array.items[0].string);
+                    try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.array.items[1].integer);
+                    try std.testing.expect(frozen.decoded != null);
+                    try std.testing.expectEqual(budget.live, block.json_owner.?.retainedBytes());
+                    const retained = budget.live;
+                    var next: Counter = .{};
+                    const cached = try batch.cellControlled(a, 0, 0, next.control());
+                    try std.testing.expect(next.calls != 0);
+                    try std.testing.expectEqual(decoded.value.array.items.ptr, cached.value.array.items.ptr);
+                    try std.testing.expectEqual(retained, budget.live);
+                    try std.testing.expectError(error.InvalidSqlSpill, owned.cellControlled(1, 0, next.control()));
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL consumer spill suspended decode permits legacy publication without holding cache mutex" {
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    const scratch = source.allocator();
+    const text = try scratch.alloc(u8, 32768);
+    @memset(text, 'y');
+    const items = try scratch.alloc(std.json.Value, 1);
+    items[0] = .{ .string = text };
+    const value: std.json.Value = .{ .array = .fromOwnedSlice(scratch, items) };
+    const rows = [_]Row{.{ .values = &.{Datum.json(value)}, .keys = &.{}, .ordinal = 9 }};
+    const bytes = try encodeColumnarBlockVersionAlloc(scratch, &rows, 1 << 20, .v2);
+    var metadata = std.heap.ArenaAllocator.init(a);
+    defer metadata.deinit();
+    const block = try decodeColumnarBlockForForwarding(metadata.allocator(), a, bytes, 1 << 20);
+    defer block.deinit();
+    const frozen = (try block.values[0].jsonAt(0)).?;
+    const Reentrant = struct {
+        frozen: *FrozenJson,
+        calls: usize = 0,
+        published: ?Datum = null,
+        fn checkpoint(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls != 6) return;
+            try std.testing.expect(self.frozen.owner.mutex.tryLock());
+            self.frozen.owner.mutex.unlock();
+            self.published = try self.frozen.materialize();
+            try std.testing.expect((try self.frozen.encoded()) != null);
+        }
+    };
+    var first: Reentrant = .{ .frozen = frozen };
+    const decoded = try block.cellControlled(0, 0, .{ .ptr = &first, .checkpoint = Reentrant.checkpoint });
+    try std.testing.expect(first.published != null);
+    try std.testing.expectEqual(first.published.?.value.array.items.ptr, decoded.value.array.items.ptr);
+    try std.testing.expectEqualStrings(text, decoded.value.array.items[0].string);
+    try std.testing.expect(frozen.decoded != null and frozen.encoded_text != null);
+}
+
+test "SQL consumer spill cache lock wait cancels without releasing another owner" {
+    var owner: JsonOwner = undefined;
+    owner.init(std.testing.allocator);
+    defer owner.deinit();
+    var frozen: FrozenJson = .{ .owner = &owner, .bytes = &.{}, .lossless = false };
+    const Counter = struct {
+        calls: usize = 0,
+        fn checkpoint(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 3) return error.Cancelled;
+        }
+    };
+    var counter: Counter = .{};
+    try std.testing.expect(owner.mutex.tryLock());
+    defer owner.mutex.unlock();
+    try std.testing.expectError(error.Cancelled, frozen.materializeControlled(.{ .ptr = &counter, .checkpoint = Counter.checkpoint }));
+    try std.testing.expectEqual(@as(usize, 3), counter.calls);
+    try std.testing.expect(!owner.mutex.tryLock());
+    try std.testing.expectEqual(@as(usize, 0), owner.retainedBytes());
+}
+
+test "SQL consumer frozen encoding bounds large keys strings and numeric lexemes with exact legacy bytes" {
+    const Fixture = struct {
+        fn run(backing: Allocator) !void {
+            var source = std.heap.ArenaAllocator.init(backing);
+            defer source.deinit();
+            const a = source.allocator();
+            const key = try a.alloc(u8, 16384);
+            @memset(key, 'k');
+            @memcpy(key[4095..4097], "é");
+            key[8191] = '\n';
+            key[8192] = '"';
+            const text = try a.dupe(u8, key);
+            text[12287] = '\\';
+            const number = try a.alloc(u8, 16384);
+            @memset(number, '1');
+            var object: std.json.ObjectMap = .empty;
+            try object.put(a, key, .{ .string = text });
+            try object.put(a, "number", .{ .number_string = number });
+            try object.put(a, "native", .{ .integer = 9007199254740993 });
+            const rows = [_]Row{.{ .values = &.{Datum.json(.{ .object = object })}, .keys = &.{}, .ordinal = 2 }};
+            const bytes = try encodeColumnarBlockVersionAlloc(a, &rows, 1 << 20, .v2);
+            var metadata = std.heap.ArenaAllocator.init(backing);
+            defer metadata.deinit();
+            const block = try decodeColumnarBlockForForwarding(metadata.allocator(), backing, bytes, 1 << 20);
+            defer block.deinit();
+            const frozen = (try block.frozenJson(0, 0, false)).?;
+            const expected = try frozenJsonText(a, frozen);
+            const Counter = struct {
+                calls: usize = 0,
+                stop: usize = std.math.maxInt(usize),
+                fn checkpoint(raw: ?*anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    self.calls += 1;
+                    if (self.calls == self.stop) return error.Cancelled;
+                }
+                fn control(self: *@This()) @import("operator_work.zig").Control {
+                    return .{ .ptr = self, .checkpoint = checkpoint };
+                }
+            };
+            var output: std.Io.Writer.Allocating = .init(a);
+            defer output.deinit();
+            var stopped: Counter = .{ .stop = 6 };
+            if (writeFrozenJsonControlled(&output.writer, frozen, stopped.control())) |_| {
+                return error.TestUnexpectedResult;
+            } else |err| {
+                if (err == error.OutOfMemory or err == error.WriteFailed) return error.OutOfMemory;
+                try std.testing.expectEqual(error.Cancelled, err);
+            }
+            try std.testing.expectEqual(@as(usize, 6), stopped.calls);
+            try std.testing.expect(output.written().len <= 8196);
+            var current: Counter = .{};
+            const actual = try frozenJsonTextControlled(a, frozen, current.control());
+            try std.testing.expectEqualSlices(u8, expected, actual);
+            try std.testing.expect(current.calls > 12);
+            var storage: [8]u8 = undefined;
+            var denied: std.Io.Writer = .fixed(&storage);
+            try std.testing.expectError(error.WriteFailed, writeFrozenJsonControlled(&denied, frozen, current.control()));
+            try std.testing.expect((try block.values[0].jsonAt(0)).?.value == null);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL scoped spill creation permits accounting and control progress during directory and file IO" {
+    const Fixture = struct {
+        io: std.Io,
+        parent: *Runnable.Execution,
+        owner: *Runnable.Scheduler,
+        manager: *Manager = undefined,
+        done: std.Io.Event = .unset,
+        peer: ?std.Io.Future(anyerror!usize) = null,
+        begins: usize = 0,
+        controls: usize = 0,
+        fn metadata(self: *@This()) anyerror!usize {
+            var execution: Runnable.Execution = .{};
+            try execution.start(self.owner, .{ .io = self.io }, .query);
+            defer execution.finish();
+            const available = self.manager.fileHeadroom();
+            self.done.set(self.io);
+            return available;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.parent.checkpoint();
+            try self.parent.park(.resource_blocked);
+            self.begins += 1;
+            if (self.peer == null) self.peer = try self.io.concurrent(metadata, .{self});
+            var control: Runnable.Execution = .{};
+            try control.start(self.owner, .{ .io = self.io }, .control);
+            defer control.finish();
+            try control.checkpoint();
+            self.controls += 1;
+            self.done.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } }) catch return error.TestSpillAccountingBlockedByIO;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.parent.enter(.query);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.parent.checkpoint();
+        }
+    };
+    for ([_]bool{ false, true }) |warm| {
+        var owner = try Runnable.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+        var parent: Runnable.Execution = .{};
+        try parent.start(&owner, .{ .io = std.testing.io }, .query);
+        defer parent.finish();
+        var fixture: Fixture = .{ .io = std.testing.io, .parent = &parent, .owner = &owner };
+        var manager: Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &fixture, .checkpoint = Fixture.check };
+        defer manager.deinit();
+        fixture.manager = &manager;
+        if (warm) {
+            var initial = try manager.create();
+            initial.close();
+        }
+        manager.wait = .{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end };
+        defer if (fixture.peer) |*task| {
+            _ = task.await(std.testing.io) catch {};
+        };
+        const created = manager.create();
+        const headroom = try fixture.peer.?.await(std.testing.io);
+        fixture.peer = null;
+        var file = try created;
+        file.close();
+        try std.testing.expectEqual(@as(usize, 63), headroom);
+        try std.testing.expect(fixture.begins >= (if (warm) @as(usize, 1) else 2));
+        try std.testing.expectEqual(fixture.begins, fixture.controls);
+        try std.testing.expectEqual(@as(usize, 0), manager.files);
+        try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+    }
 }

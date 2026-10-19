@@ -412,3 +412,18 @@ test "storage.hot_standby effects rejects non-binary encoded change records befo
 test {
     _ = codecs;
 }
+
+/// Recovery variants consume a completed absence witness under WAL append
+/// serialization. Payload codecs and validation match ordinary publication.
+pub fn appendEncodedBatchMutationRequestIfPosition(primary: *primary_mod.Primary, position: primary_mod.RecoveryPosition, payload: []const u8, options: AppendBatchMutationOptions, control: @import("antfly_local_sources").common_read_admission.Port) !primary_mod.RecoveryAppendResult {
+    return primary.appendIfRecoveryPosition(position, .{ .kind = .batch_mutation, .payload_codec = .json, .shard_id = options.shard_id, .table_id = options.table_id, .commit_timestamp_ns = options.commit_timestamp_ns, .payload = payload }, control);
+}
+
+pub fn appendEncodedSchemaMetadataMutationIfPosition(primary: *primary_mod.Primary, position: primary_mod.RecoveryPosition, payload: []const u8, options: AppendMetadataMutationOptions, control: @import("antfly_local_sources").common_read_admission.Port) !primary_mod.RecoveryAppendResult {
+    return primary.appendIfRecoveryPosition(position, .{ .kind = .metadata_mutation, .payload_codec = .json, .shard_id = options.shard_id, .table_id = options.table_id, .commit_timestamp_ns = options.commit_timestamp_ns, .payload = payload }, control);
+}
+
+pub fn appendEncodedDerivedChangeRecordIfPosition(primary: *primary_mod.Primary, position: primary_mod.RecoveryPosition, payload: []const u8, options: AppendDerivedEffectOptions, control: @import("antfly_local_sources").common_read_admission.Port) !primary_mod.RecoveryAppendResult {
+    if (!change_journal.looksLikeBinaryRecord(payload) and !primary_effect.isPrimaryEffect(payload)) return error.UnsupportedDerivedEffectPayload;
+    return primary.appendIfRecoveryPosition(position, .{ .kind = .derived_effect, .payload_codec = .binary, .shard_id = options.shard_id, .table_id = options.table_id, .commit_timestamp_ns = options.commit_timestamp_ns, .payload = payload }, control);
+}

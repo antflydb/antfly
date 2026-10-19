@@ -46,6 +46,9 @@ pub const Grouped = struct {
             for (&self.child.partitions) |*file| {
                 if (file.*) |*open| open.file.execution = execution;
             }
+            for (&self.child.partition_inputs) |*inputs| for (inputs.items) |*input| {
+                input.file.file.execution = execution;
+            };
             self.output.?.producer_execution = execution;
             defer self.output.?.producer_execution = null;
             // run closes every exclusive child file before this scope retires.
@@ -247,7 +250,7 @@ pub const Grouped = struct {
                 }
                 if (count == 0) continue;
                 if (self.partitions[partition] == null) {
-                    self.partitions[partition] = try spill.Sequential.init(self.sort.manager, @min(4096, self.bytes / 128));
+                    self.partitions[partition] = try spill.Sequential.initFor(self.sort.manager, @min(4096, self.bytes / 128), self.sort.execution);
                     self.partitions[partition].?.buffer_bytes = 512;
                 }
                 try self.partitions[partition].?.appendBatch(try values.select(a, positions[0..count]), try key_batch.select(a, positions[0..count]), chosen_ordinals[0..count]);
@@ -259,7 +262,7 @@ pub const Grouped = struct {
         if (!self.partitioned) return self.sort.add(row);
         const index = self.partitionFor(try keyHash(row.keys));
         if (self.partitions[index] == null) {
-            self.partitions[index] = try spill.Sequential.init(self.sort.manager, @min(4096, self.bytes / 128));
+            self.partitions[index] = try spill.Sequential.initFor(self.sort.manager, @min(4096, self.bytes / 128), self.sort.execution);
             self.partitions[index].?.buffer_bytes = 512;
         }
         _ = try self.partitions[index].?.append(row, spill.none);
@@ -543,6 +546,8 @@ pub const Grouped = struct {
                     fallback.* = try Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, self.bytes);
                     const shift = if (partial_state or self.nativeInputs(row.values[1..])) try self.repartitionShift(row.keys) else null;
                     fallback.partitioned = shift != null;
+                    fallback.parallel = self.parallel;
+                    fallback.sort.execution = self.sort.execution;
                     if (shift) |bit| {
                         fallback.hash_shift = bit;
                         fallback.repartition_depth = self.repartition_depth + 1;
@@ -552,7 +557,7 @@ pub const Grouped = struct {
                         fallback.parallel = false;
                         self.repartitions += 1;
                     }
-                    fallback.sort.parallel_runs = self.parallel;
+                    fallback.sort.parallel_runs = fallback.parallel;
                     // Logical sorted runs share reusable extents in one
                     // anonymous file, preserving descriptor headroom for
                     // other live partitions and their merge outputs.
@@ -666,6 +671,8 @@ pub const Grouped = struct {
         const pattern_sets = try a.alloc(?*@import("pattern_spill.zig").Set, states.len);
         for (self.specs, pattern_sets) |spec, *set| set.* = if (spec.kind == .pattern_set) try @import("pattern_spill.zig").Set.create(self.sort.manager) else null;
         var distinct = spill.Sort.init(self.a, self.sort.manager, &.{ .{}, .{} }, self.sort.memory_bytes);
+        distinct.execution = self.sort.execution;
+        distinct.parallel_runs = self.parallel;
         defer distinct.deinit();
         distinct.execution = self.sort.execution;
         if (self.sort.execution != null) distinct.parallel_runs = false;

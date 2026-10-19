@@ -26,6 +26,11 @@ const Allocator = std.mem.Allocator;
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
 const read_control = @import("../common/read_admission.zig");
+
+/// Remember original rejection across missing-record recovery branches. The
+/// adapter stays at its bound address for the synchronous mutation call only.
+pub const BeginAdmissionTrace = MutationAdmissionTrace;
+pub const MutationAdmissionTrace = read_control.RejectionTrace;
 const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const internal_keys = @import("internal_keys.zig");
@@ -84,12 +89,14 @@ pub const max_read_guards_per_transaction = 65_536;
 // mutation; resolution retires both. Historical immutable schemas remain
 // usable after a new active epoch is published and after participant restart.
 const schema_leases_prefix = "\x00\x00__txn_schema_leases__:";
-const records_prefix = "\x00\x00__txn_records__:";
+pub const records_prefix = "\x00\x00__txn_records__:";
 const participants_prefix = "\x00\x00__txn_participants__:";
 const participant_index_prefix = "\x00\x00__txn_participant_index_v1__:";
 const resolved_index_prefix = "\x00\x00__txn_resolved_index_v1__:";
 const resolved_participants_prefix = "\x00\x00__txn_resolved_participants__:";
-const hot_standby_batch_outbox_prefix = "\x00\x00__txn_ha_batch_outbox__:";
+const publication_backlog = @import("publication_backlog.zig");
+const prepared_effects = @import("db/prepared_transaction_effects.zig");
+const hot_standby_batch_outbox_prefix = publication_backlog.transaction_batch_prefix;
 const hot_standby_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
 
 // ============================================================================
@@ -97,6 +104,14 @@ const hot_standby_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
 // ============================================================================
 
 pub const TxnId = [16]u8;
+
+pub fn makePreparedEffectsKey(txn_id: TxnId) [publication_backlog.prepared_effects_prefix.len + 16]u8 {
+    return publication_backlog.prepared_effects_prefix.* ++ txn_id;
+}
+
+pub fn makePreparationRequirementKey(txn_id: TxnId) [publication_backlog.preparation_requirement_prefix.len + 16]u8 {
+    return publication_backlog.preparation_requirement_prefix.* ++ txn_id;
+}
 
 pub const TxnStatus = enum(u8) {
     pending = 0,
@@ -144,9 +159,19 @@ pub const IntentValue = struct {
 /// the preparation allocator, rather than multiplying payload bytes by a DOM
 /// worst case. Limits apply across prepares; replacing a key releases credits.
 pub fn intentAdmissionBytes(intent: WriteIntent) !u64 {
+    return intentAdmissionBytesWithAdmission(intent, null);
+}
+
+pub fn intentAdmissionBytesWithAdmission(intent: WriteIntent, control: ?read_control.Port) !u64 {
+    if (control) |owner| try owner.checkpoint();
     var payload: u64 = (if (intent.value) |value| value.len else 0) +
         (if (intent.prepared_row) |row| row.len else 0);
-    for (intent.json_null_fields) |field| payload = std.math.add(u64, payload, field.len + @sizeOf([]const u8)) catch return error.TransactionTooLarge;
+    for (intent.json_null_fields, 0..) |field, index| {
+        if (index % 64 == 0) if (control) |owner| try owner.checkpoint();
+        const field_bytes = std.math.add(u64, field.len, @sizeOf([]const u8)) catch return error.TransactionTooLarge;
+        payload = std.math.add(u64, payload, field_bytes) catch return error.TransactionTooLarge;
+    }
+    if (control) |owner| try owner.checkpoint();
     const bytes = payload;
     const keys = std.math.mul(u64, intent.key.len, 16) catch return error.TransactionTooLarge;
     return std.math.add(u64, bytes, std.math.add(u64, keys, 4096) catch return error.TransactionTooLarge) catch error.TransactionTooLarge;
@@ -175,6 +200,11 @@ fn isRawMetadataPredicateKey(key: []const u8) bool {
 }
 
 fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
+    return retainedIntentBytesWithAdmission(alloc, intent, null);
+}
+
+pub fn retainedIntentBytesWithAdmission(alloc: Allocator, intent: WriteIntent, control: ?read_control.Port) !u64 {
+    if (control) |owner| try owner.checkpoint();
     if (@import("db/relational_integrity_contract.zig").isKey(intent.key)) {
         _ = try @import("db/relational_integrity_contract.zig").parseKey(intent.key);
         return std.math.add(u64, 16 + intent.key.len, if (intent.value) |value| value.len else 0) catch error.TransactionTooLarge;
@@ -182,26 +212,10 @@ fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
     if (isRawMetadataIntentKey(intent.key)) return 0;
     var payload: u64 = if (intent.prepared_row) |row| row.len else if (intent.value) |value| value.len else 0;
     if (intent.prepared_row == null) if (intent.value) |value| {
-        // No escaped property name and no special spelling means the mapper
-        // borrows original bytes; do not parse or allocate on that common path.
-        if (std.mem.indexOf(u8, value, "_edges") != null or std.mem.indexOf(u8, value, "_embeddings") != null or std.mem.indexOfScalar(u8, value, '\\') != null) {
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{ .parse_numbers = false }) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidTxnRecord,
-            };
-            defer parsed.deinit();
-            if (parsed.value == .object) {
-                var buffer: [1024]u8 = undefined;
-                var counter = std.Io.Writer.Discarding.init(&buffer);
-                try std.json.Stringify.value(parsed.value, .{}, &counter.writer);
-                // Native DB removes special/vector fields, while the generic
-                // transaction manager can preserve raw document bytes. Cover
-                // both authorities; removing fields never grows this encoding.
-                payload = @max(payload, counter.fullCount());
-            }
-        }
+        payload = try @import("transaction_intent_admission.zig").payloadBytes(alloc, value, control);
     };
-    const primary = std.math.add(u64, 16 + 2 + internal_keys.encodedComponentLen(intent.key), payload) catch return error.TransactionTooLarge;
+    if (control) |owner| try owner.checkpoint();
+    const primary = std.math.add(u64, 16 + 2 + try @import("transaction_intent_admission.zig").encodedComponentBytes(intent.key, control), payload) catch return error.TransactionTooLarge;
     return std.math.add(u64, primary, intent.retained_artifact_bytes) catch error.TransactionTooLarge;
 }
 
@@ -246,6 +260,11 @@ fn validReadMember(bytes: []const u8) bool {
 }
 
 fn readPredicateIdentity(predicate: VersionPredicate, out: *[33]u8) []const u8 {
+    return readPredicateIdentityWithAdmission(predicate, out, null) catch unreachable;
+}
+
+fn readPredicateIdentityWithAdmission(predicate: VersionPredicate, out: *[33]u8, control: ?read_control.Port) ![]const u8 {
+    if (control) |owner| try owner.checkpoint();
     switch (predicate.comparison) {
         .document_version => {
             if (predicate.expected_content_digest) |digest| {
@@ -263,7 +282,17 @@ fn readPredicateIdentity(predicate: VersionPredicate, out: *[33]u8) []const u8 {
         },
         .exact_value => {
             out[0] = if (predicate.expected_value != null) 3 else 2;
-            std.crypto.hash.Blake3.hash(predicate.expected_value orelse "", out[1..33], .{});
+            var hash = std.crypto.hash.Blake3.init(.{});
+            const bytes = predicate.expected_value orelse "";
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                if (control) |owner| try owner.checkpoint();
+                const end = offset + @min(bytes.len - offset, 4096);
+                hash.update(bytes[offset..end]);
+                offset = end;
+            }
+            hash.final(out[1..33]);
+            if (control) |owner| try owner.checkpoint();
             return out;
         },
     }
@@ -342,6 +371,8 @@ pub const ResolutionExtraBatch = struct {
     completion_writes: []const docstore.KVPair = &.{},
     completion_deletes: []const []const u8 = &.{},
     resolved_participant: ?[]const u8 = null,
+    /// Local coordinator self-ack waits for its durable session response.
+    defer_retained_coordinator_acknowledgement: bool = false,
     replay: ?ReplayAppend = null,
     expected_intent_revision: ?u64 = null,
     /// Exact user keys captured from a validated intent snapshot. Ordinary
@@ -391,6 +422,17 @@ pub const ReplicationOutbox = struct {
     pub fn deinit(self: *ReplicationOutbox, alloc: Allocator) void {
         if (self.batch_payload) |payload| alloc.free(payload);
         if (self.replay_payload) |payload| alloc.free(payload);
+        self.* = undefined;
+    }
+};
+
+/// Owns the decoded slab through effect materialization and atomic resolution.
+/// Existing per-field PrecomputedGeneratedBatch.deinit must not free its slices.
+pub const PreparedEffects = struct {
+    decoded: prepared_effects.Decoded,
+    fingerprint: [32]u8,
+    pub fn deinit(self: *@This()) void {
+        self.decoded.deinit();
         self.* = undefined;
     }
 };
@@ -608,7 +650,83 @@ pub const TxnManager = struct {
         );
     }
 
-    pub fn initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
+    pub fn initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(self: *TxnManager, txn_id: TxnId, timestamp: u64, created_at: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, extra_batch: MutationExtraBatch) !void {
+        return self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, extra_batch, null);
+    }
+
+    pub fn initTransactionWithParticipantsCreatedAtRoleAndRetentionWithAdmission(self: *TxnManager, txn_id: TxnId, timestamp: u64, created_at: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, control: ?read_control.Port) !void {
+        return self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, .{}, control);
+    }
+
+    /// Opt-in BEGIN contract. Caller retains the DB apply fence and passes
+    /// retained controls while holding dependencies. A legacy in-flight record
+    /// cannot be upgraded after its coordinator may already have decided.
+    pub fn initTransactionRequiringPreparedEffects(self: *TxnManager, txn_id: TxnId, timestamp: u64, created_at: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: prepared_effects.Requirement, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
+        var trace: BeginAdmissionTrace = .{};
+        self.initRequiredPreparationInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, requirement, extra_batch, trace.bind(original)) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| return cause;
+    }
+
+    fn initRequiredPreparationInner(self: *TxnManager, txn_id: TxnId, timestamp: u64, created_at: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: prepared_effects.Requirement, extra_batch: MutationExtraBatch, control: ?read_control.Port) !void {
+        if (control) |owner| try owner.checkpoint();
+        const existing = self.loadTransactionRecordWithAdmission(txn_id, control) catch |err| blk: {
+            if (err != TxnError.TxnNotFound) return err;
+            if (control) |owner| try owner.checkpoint();
+            break :blk null;
+        };
+        if (existing) |record| if (record.status != .pending) return TxnError.DecisionConflict;
+        const previous = try self.loadPreparationRequirementInner(txn_id, control);
+        const key = makePreparationRequirementKey(txn_id);
+        const effect_key = makePreparedEffectsKey(txn_id);
+        for (extra_batch.writes) |write| {
+            if (control) |owner| try owner.checkpoint();
+            if (std.mem.eql(u8, write.key, &key) or std.mem.eql(u8, write.key, &effect_key)) return error.InvalidPreparationRequirement;
+        }
+        for (extra_batch.deletes) |deleted| {
+            if (control) |owner| try owner.checkpoint();
+            if (std.mem.eql(u8, deleted, &key) or std.mem.eql(u8, deleted, &effect_key)) return error.InvalidPreparationRequirement;
+        }
+        if (existing != null) {
+            const accepted = previous orelse return error.PreparationContractConflict;
+            if (accepted.mode != requirement.mode) return error.PreparationContractConflict;
+            // Retry never rewrites the requirement or reacquires its credit.
+            return self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, extra_batch, control);
+        }
+        if (previous != null or try self.hasPreparedEffects(txn_id)) return error.InvalidTxnRecord;
+        const encoded = requirement.encode();
+        var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
+        defer writes.deinit(self.alloc);
+        try writes.append(self.alloc, .{ .key = &key, .value = &encoded });
+        try writes.appendSlice(self.alloc, extra_batch.writes);
+        var batch = extra_batch;
+        batch.writes = writes.items;
+        try self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, batch, control);
+    }
+
+    pub fn loadPreparationRequirement(self: *TxnManager, txn_id: TxnId, original: ?read_control.Port) !?prepared_effects.Requirement {
+        var trace: MutationAdmissionTrace = .{};
+        const result = self.loadPreparationRequirementInner(txn_id, trace.bind(original)) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| return cause;
+        return result;
+    }
+
+    fn loadPreparationRequirementInner(self: *TxnManager, txn_id: TxnId, control: ?read_control.Port) !?prepared_effects.Requirement {
+        const key = makePreparationRequirementKey(txn_id);
+        const raw = self.getAllocWithAdmission(self.alloc, &key, control) catch |err| {
+            if (err != error.NotFound) return err;
+            if (control) |owner| try owner.checkpoint();
+            return null;
+        };
+        defer self.alloc.free(raw);
+        return try prepared_effects.Requirement.decode(raw);
+    }
+
+    pub fn hasPreparationRequirement(self: *TxnManager, txn_id: TxnId) !bool {
+        const key = makePreparationRequirementKey(txn_id);
+        return self.keyExists(&key);
+    }
+
+    fn initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(
         self: *TxnManager,
         txn_id: TxnId,
         timestamp: u64,
@@ -617,19 +735,28 @@ pub const TxnManager = struct {
         coordinator: bool,
         retain_terminal: bool,
         extra_batch: MutationExtraBatch,
+        original_control: ?read_control.Port,
     ) !void {
+        var trace: BeginAdmissionTrace = .{};
+        const control = trace.bind(original_control);
+        if (control) |owner| try owner.checkpoint();
         const key = makeRecordKey(txn_id);
-        const existing = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
-            TxnError.TxnNotFound => null,
-            else => return err,
+        const existing = self.loadTransactionRecordWithAdmission(txn_id, control) catch |err| blk: {
+            // A caller rejection may share the store's missing-record name.
+            // It must never authorize creating a new transaction instead.
+            if (trace.failure) |cause| return cause;
+            break :blk switch (err) {
+                TxnError.TxnNotFound => null,
+                else => return err,
+            };
         };
         if (existing) |record| {
             if (record.status != .pending or record.begin_timestamp != timestamp) return TxnError.DecisionConflict;
             if (record.coordinator_known and record.coordinator != coordinator) return TxnError.DecisionConflict;
             if (record.retain_terminal_known and record.retain_terminal != retain_terminal) return TxnError.DecisionConflict;
-            const persisted = try self.getParticipants(self.alloc, txn_id);
+            const persisted = self.loadParticipantSetWithAdmission(self.alloc, participants_prefix, txn_id, control) catch |err| return trace.failure orelse err;
             defer freeParticipantList(self.alloc, persisted);
-            if (!participantListsEqual(persisted, participants)) return TxnError.DecisionConflict;
+            if (!try participantListsEqualWithAdmission(persisted, participants, control)) return TxnError.DecisionConflict;
             // An idempotent begin from a new binary is the authoritative point
             // where a legacy record can safely learn its coordinator role.
             // Persist the upgrade before prepare can rewrite the record as v4.
@@ -645,9 +772,11 @@ pub const TxnManager = struct {
                 defer writes.deinit(self.alloc);
                 try writes.append(self.alloc, .{ .key = &key, .value = upgraded_value });
                 try writes.appendSlice(self.alloc, extra_batch.writes);
-                try self.applyBatch(writes.items, extra_batch.deletes, null);
+                if (control) |owner| try owner.checkpoint();
+                try self.applyBatchWithAdmission(writes.items, extra_batch.deletes, null, control);
             } else {
-                try self.applyMutationExtraBatch(extra_batch);
+                if (control) |owner| try owner.checkpoint();
+                try self.applyMutationExtraBatchWithAdmission(extra_batch, control);
             }
             return;
         }
@@ -664,7 +793,7 @@ pub const TxnManager = struct {
         defer self.alloc.free(record_value);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
-        const participant_value = if (participants.len > 0) try encodeParticipantList(self.alloc, participants) else null;
+        const participant_value = if (participants.len > 0) try encodeParticipantListWithAdmission(self.alloc, participants, control) else null;
         defer if (participant_value) |value| self.alloc.free(value);
         var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
         defer writes.deinit(self.alloc);
@@ -681,7 +810,8 @@ pub const TxnManager = struct {
             try deletes.appendSlice(self.alloc, &.{ &participant_key, &resolved_key });
         }
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
-        try self.applyBatch(writes.items, deletes.items, null);
+        if (control) |owner| try owner.checkpoint();
+        try self.applyBatchWithAdmission(writes.items, deletes.items, null, control);
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
                 .name = "InitTransaction",
@@ -709,10 +839,31 @@ pub const TxnManager = struct {
         predicates: []const VersionPredicate,
         extra_batch: MutationExtraBatch,
     ) !void {
+        return self.writeIntentsExtraBatchInner(txn_id, intents, predicates, extra_batch, null);
+    }
+
+    pub fn writeIntentsExtraBatchWithAdmission(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, predicates: []const VersionPredicate, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
+        var trace: MutationAdmissionTrace = .{};
+        return self.writeIntentsExtraBatchInner(txn_id, intents, predicates, extra_batch, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+
+    fn writeIntentsExtraBatchInner(
+        self: *TxnManager,
+        txn_id: TxnId,
+        intents: []const WriteIntent,
+        predicates: []const VersionPredicate,
+        extra_batch: MutationExtraBatch,
+        control: ?read_control.Port,
+    ) !void {
+        if (control) |owner| try owner.checkpoint();
         if (extra_batch.index_span_digests.len > max_read_guards_per_transaction) return error.TransactionTooLarge;
-        for (intents) |intent| if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
-        var record = try self.loadTransactionRecord(txn_id);
+        for (intents) |intent| {
+            if (control) |owner| try owner.checkpoint();
+            if (intent.json_null_fields.len != 0 and intent.prepared_row == null) return error.PreparedIntentRequiresMaterialization;
+        }
+        var record = try self.loadTransactionRecordWithAdmission(txn_id, control);
         if (record.status != .pending) return TxnError.DecisionConflict;
+        if (try self.hasPreparedEffects(txn_id)) return error.PreparedEffectsSealed;
 
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var schema_lease_value: [5]u8 = @splat(0);
@@ -720,7 +871,7 @@ pub const TxnManager = struct {
         schema_lease_value[0] = @intFromBool(binding.version != null);
         if (binding.version) |version|
             std.mem.writeInt(u32, schema_lease_value[1..5], version, .little);
-        const previous_lease = self.getAlloc(self.alloc, &schema_lease_key) catch |err| switch (err) {
+        const previous_lease = self.getAllocWithAdmission(self.alloc, &schema_lease_key, control) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
@@ -738,17 +889,21 @@ pub const TxnManager = struct {
             });
         }
 
-        self.checkVersionPredicates(predicates, txn_id) catch |err| {
+        if (control) |owner| try owner.checkpoint();
+        self.checkVersionPredicatesWithAdmission(predicates, txn_id, control) catch |err| {
             self.traceWriteIntentFails(txn_id, intents, "VersionConflict");
             return err;
         };
-        self.checkIntentConflicts(intents, txn_id) catch |err| {
+        if (control) |owner| try owner.checkpoint();
+        self.checkIntentConflictsWithAdmission(intents, txn_id, control) catch |err| {
             self.traceWriteIntentFails(txn_id, intents, "IntentConflict");
             return err;
         };
-        try self.checkIndexSpanGuardConflicts(extra_batch.index_span_digests, txn_id);
+        if (control) |owner| try owner.checkpoint();
+        try self.checkIndexSpanGuardConflictsWithAdmission(extra_batch.index_span_digests, txn_id, control);
 
-        const previous_admission = try self.loadIntentAdmission(self.alloc, txn_id);
+        if (control) |owner| try owner.checkpoint();
+        const previous_admission = try self.loadIntentAdmissionWithAdmission(self.alloc, txn_id, control);
         var admission = previous_admission orelse IntentAdmission{};
         var pending_costs = std.StringHashMapUnmanaged(IntentCost).empty;
         defer pending_costs.deinit(self.alloc);
@@ -774,20 +929,21 @@ pub const TxnManager = struct {
         // or rewrite a growing list of keys.
         if ((previous_admission == null or !previous_admission.?.retention_tracked) and record.intent_revision != 0) {
             admission = .{};
-            var previous = try self.collectIntentBatch(self.alloc, txn_id);
+            var previous = try self.collectIntentBatchWithAdmission(self.alloc, txn_id, control);
             defer previous.deinit(self.alloc);
             for (previous.owned_entries.?) |entry| {
+                if (control) |owner| try owner.checkpoint();
                 const key = entry.key[intents_prefix.len + 17 ..];
                 const decoded = try IntentValue.decode(entry.value);
                 const previous_intent: WriteIntent = .{ .key = key, .value = decoded.value, .prepared_row = decoded.prepared_row };
-                const cost = try intentAdmissionBytes(previous_intent);
-                const retained = try retainedIntentBytes(self.alloc, previous_intent);
+                const cost = try intentAdmissionBytesWithAdmission(previous_intent, control);
+                const retained = try retainedIntentBytesWithAdmission(self.alloc, previous_intent, control);
                 admission.count += 1;
                 admission.bytes = std.math.add(u64, admission.bytes, cost) catch return error.TransactionTooLarge;
                 admission.retained_bytes = std.math.add(u64, admission.retained_bytes, retained) catch return error.TransactionTooLarge;
                 admission.retained_keys += @intFromBool(retained != 0);
                 try pending_costs.put(self.alloc, key, .{ .bytes = cost, .retained = retained, .retained_keys = @intFromBool(retained != 0) });
-                const member_key = try makeIntentMemberKey(self.alloc, txn_id, key);
+                const member_key = try makeIntentMemberKeyWithAdmission(self.alloc, txn_id, key, control);
                 try appendOwnedBytes(self.alloc, &write_keys, member_key);
                 const member_value = try self.alloc.alloc(u8, 16);
                 try appendOwnedBytes(self.alloc, &write_vals, member_value);
@@ -803,10 +959,11 @@ pub const TxnManager = struct {
         // Compute the final replacement-aware ledger before allocating any
         // payload envelopes. Repeated keys retain only their final mutation.
         for (intents, 0..) |intent, index| {
-            const member_key = try makeIntentMemberKey(self.alloc, txn_id, intent.key);
+            if (control) |owner| try owner.checkpoint();
+            const member_key = try makeIntentMemberKeyWithAdmission(self.alloc, txn_id, intent.key, control);
             defer self.alloc.free(member_key);
             const prior = if (pending_costs.get(intent.key)) |cost| cost else blk: {
-                const raw = self.getAlloc(self.alloc, member_key) catch |err| switch (err) {
+                const raw = self.getAllocWithAdmission(self.alloc, member_key, control) catch |err| switch (err) {
                     error.NotFound => break :blk null,
                     else => return err,
                 };
@@ -814,8 +971,8 @@ pub const TxnManager = struct {
                 if (raw.len != 16 and raw.len != 24) return error.InvalidTxnRecord;
                 break :blk IntentCost{ .bytes = std.mem.readInt(u64, raw[0..8], .little), .retained = std.mem.readInt(u64, raw[8..16], .little), .retained_keys = if (raw.len == 24) std.mem.readInt(u64, raw[16..24], .little) else @intFromBool(std.mem.readInt(u64, raw[8..16], .little) != 0) };
             };
-            const cost = try intentAdmissionBytes(intent);
-            const retained = try retainedIntentBytes(self.alloc, intent);
+            const cost = try intentAdmissionBytesWithAdmission(intent, control);
+            const retained = try retainedIntentBytesWithAdmission(self.alloc, intent, control);
             const retained_keys = try retainedIntentKeys(intent, retained);
             if (prior) |old| {
                 admission.bytes = std.math.sub(u64, admission.bytes, old.bytes) catch return error.InvalidTxnRecord;
@@ -830,6 +987,15 @@ pub const TxnManager = struct {
             try pending_costs.put(self.alloc, intent.key, .{ .bytes = cost, .retained = retained, .retained_keys = retained_keys });
             try last_intents.put(self.alloc, intent.key, index);
         }
+        const publication_credit_key = publication_backlog.transactionCreditKey(txn_id);
+        var publication_credit: [8]u8 = undefined;
+        if (admission.count != 0) {
+            std.mem.writeInt(u64, &publication_credit, try publication_backlog.transactionBatchBudget(admission.bytes), .little);
+            // Append before any new intent or vote, without moving the whole
+            // mutation array after preparing it. Legacy conversion above only
+            // stages member sidecars; its old intents still fence migration.
+            try writes.append(self.alloc, .{ .key = &publication_credit_key, .value = &publication_credit });
+        }
         var range_reservations = std.ArrayListUnmanaged(VersionPredicate).empty;
         defer range_reservations.deinit(self.alloc);
         try range_reservations.appendSlice(self.alloc, predicates);
@@ -838,12 +1004,13 @@ pub const TxnManager = struct {
         const index_writer_keys = try self.alloc.alloc([range_protection.index_writer_prefix.len + range_protection.index_span_digest_bytes]u8, extra_batch.index_span_digests.len);
         defer self.alloc.free(index_writer_keys);
         {
-            var probe = try self.store.beginProbe();
+            var probe = if (control) |owner| try self.store.beginProbeWithAdmission(.retain, owner) else try self.store.beginProbe();
             defer probe.abort();
             const tracking_active = try range_protection.isActive(&probe);
             if (!tracking_active and extra_batch.index_span_digests.len != 0) return error.SqlRangeTrackingRequired;
             if (tracking_active) {
                 for (intents) |intent| {
+                    if (control) |owner| try owner.checkpoint();
                     if (std.mem.startsWith(u8, intent.key, "\x00\x00")) continue;
                     const id = range_protection.bucket(intent.key);
                     if (writer_buckets.isSet(id)) continue;
@@ -852,12 +1019,14 @@ pub const TxnManager = struct {
                     try range_reservations.append(self.alloc, .{ .key = &writer_keys[id], .expected_version = 0, .comparison = .exact_value, .expected_value = null });
                 }
                 for (extra_batch.index_span_digests, 0..) |digest, i| {
+                    if (control) |owner| try owner.checkpoint();
                     index_writer_keys[i] = range_protection.indexWriterKey(digest);
                     try range_reservations.append(self.alloc, .{ .key = &index_writer_keys[i], .expected_version = 0, .comparison = .exact_value, .expected_value = null });
                 }
             }
         }
-        const read_admission = try self.stageReadGuards(txn_id, range_reservations.items, &last_intents, &write_keys, &write_vals, &writes);
+        if (control) |owner| try owner.checkpoint();
+        const read_admission = try self.stageReadGuards(txn_id, range_reservations.items, &last_intents, &write_keys, &write_vals, &writes, control);
         const total_bytes = std.math.add(u64, admission.bytes, read_admission.next.bytes) catch return error.TransactionTooLarge;
         const previous_bytes = std.math.add(u64, if (previous_admission) |previous| previous.bytes else 0, read_admission.previous.bytes) catch return error.InvalidTxnRecord;
         if (extra_batch.max_intent_admission_bytes != 0 and total_bytes > extra_batch.max_intent_admission_bytes and
@@ -865,8 +1034,9 @@ pub const TxnManager = struct {
             return error.TransactionTooLarge;
 
         for (intents, 0..) |intent, index| {
+            if (control) |owner| try owner.checkpoint();
             if (last_intents.get(intent.key).? != index) continue;
-            const member_key = try makeIntentMemberKey(self.alloc, txn_id, intent.key);
+            const member_key = try makeIntentMemberKeyWithAdmission(self.alloc, txn_id, intent.key, control);
             try appendOwnedBytes(self.alloc, &write_keys, member_key);
             const member_value = try self.alloc.alloc(u8, 24);
             std.mem.writeInt(u64, member_value[0..8], pending_costs.get(intent.key).?.bytes, .little);
@@ -874,33 +1044,15 @@ pub const TxnManager = struct {
             std.mem.writeInt(u64, member_value[16..24], pending_costs.get(intent.key).?.retained_keys, .little);
             try appendOwnedBytes(self.alloc, &write_vals, member_value);
             try writes.append(self.alloc, .{ .key = member_key, .value = member_value });
-            const intent_key = try self.makeIntentKey(txn_id, intent.key);
+            const intent_key = try self.makeIntentKeyWithAdmission(txn_id, intent.key, control);
             try appendOwnedBytes(self.alloc, &write_keys, intent_key);
 
-            // Intent value: [is_delete:u8][value_bytes]
-            var val: []u8 = undefined;
-            if (intent.value) |v| {
-                if (intent.prepared_row) |row| {
-                    const json_len = std.math.cast(u32, v.len) orelse return error.TransactionTooLarge;
-                    val = try self.alloc.alloc(u8, 5 + v.len + row.len);
-                    val[0] = 2;
-                    std.mem.writeInt(u32, val[1..5], json_len, .little);
-                    @memcpy(val[5..][0..v.len], v);
-                    @memcpy(val[5 + v.len ..], row);
-                } else {
-                    val = try self.alloc.alloc(u8, 1 + v.len);
-                    val[0] = 0;
-                    @memcpy(val[1..], v);
-                }
-            } else {
-                val = try self.alloc.alloc(u8, 1);
-                val[0] = 1; // is a delete
-            }
+            const val = try @import("transaction_intent_admission.zig").encode(self.alloc, intent, control);
             try appendOwnedBytes(self.alloc, &write_vals, val);
 
             try writes.append(self.alloc, .{ .key = intent_key, .value = val });
 
-            const lock_key = try self.makeIntentLockKey(intent.key);
+            const lock_key = try self.makeIntentLockKeyWithAdmission(intent.key, control);
             try appendOwnedBytes(self.alloc, &write_keys, lock_key);
             const owner = try self.alloc.dupe(u8, &txn_id);
             try appendOwnedBytes(self.alloc, &write_vals, owner);
@@ -929,7 +1081,7 @@ pub const TxnManager = struct {
 
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
-        try self.applyBatchWithReservation(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() });
+        try self.applyBatchWithParticipantAndAdmission(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() }, null, control);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
     }
@@ -949,40 +1101,90 @@ pub const TxnManager = struct {
         timestamp: u64,
         extra_batch: ResolutionExtraBatch,
     ) !ResolutionOutcome {
+        return self.resolveIntentsWithPreparedEffects(txn_id, status, timestamp, extra_batch, null, null);
+    }
+
+    /// The trusted materializer supplies this owner only after staging all its
+    /// effects in extra_batch. No producer is invoked by this method.
+    pub fn resolvePreparedIntents(self: *TxnManager, txn_id: TxnId, timestamp: u64, plan: *const PreparedEffects, extra_batch: ResolutionExtraBatch, original: ?read_control.Port) !ResolutionOutcome {
+        const contract = plan.decoded.plan.contract;
+        if (!std.mem.eql(u8, &contract.txn_id, &txn_id)) return error.PreparedEffectsMismatch;
+        var batch = extra_batch;
+        if (batch.expected_intent_revision) |revision| if (revision != contract.intent_revision) return error.IntentSnapshotChanged;
+        batch.expected_intent_revision = contract.intent_revision;
+        var trace: MutationAdmissionTrace = .{};
+        return self.resolveIntentsWithPreparedEffects(txn_id, .committed, timestamp, batch, &plan.fingerprint, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+
+    fn resolveIntentsWithPreparedEffects(self: *TxnManager, txn_id: TxnId, status: TxnStatus, timestamp: u64, extra_batch: ResolutionExtraBatch, consumed: ?*const [32]u8, control: ?read_control.Port) !ResolutionOutcome {
+        if (control) |owner| try owner.checkpoint();
         const rec_key = makeRecordKey(txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var record = try self.loadTransactionRecord(txn_id);
+        if (record.status != .pending and record.status != status) {
+            self.traceResolveDecisionConflict(txn_id, record.status, status, timestamp);
+            return TxnError.DecisionConflict;
+        }
+        const prepared_key = makePreparedEffectsKey(txn_id);
+        const requirement_key = makePreparationRequirementKey(txn_id);
+        // Abort can retire opaque/corrupt prepared bytes. Commit must never
+        // silently fall back to legacy reconstruction when a sealed plan exists.
+        if (status == .committed) {
+            const requirement = try self.loadPreparationRequirementInner(txn_id, control);
+            if (requirement != null and record.intents_resolved_known and record.intents_resolved) return error.InvalidTxnRecord;
+            if (try self.hasPreparedEffects(txn_id)) {
+                if (record.intents_resolved_known and record.intents_resolved) return error.InvalidTxnRecord;
+                const accepted = consumed orelse return error.PreparedEffectsRequired;
+                const raw = try self.getAllocWithAdmission(self.alloc, &prepared_key, control);
+                defer self.alloc.free(raw);
+                const inspection = try prepared_effects.inspect(raw, control);
+                if (requirement) |required| if (required.mode != inspection.contract.mode) return error.PreparationContractConflict;
+                if (inspection.contract.intent_revision != record.intent_revision or
+                    !std.mem.eql(u8, &inspection.contract.txn_id, &txn_id) or
+                    !std.mem.eql(u8, &inspection.fingerprint, accepted)) return error.PreparedEffectsMismatch;
+            } else if (requirement != null or (consumed != null and !(record.status == .committed and record.intents_resolved_known and record.intents_resolved))) return error.PreparedEffectsRequired;
+        }
         var resolved_participant_key: [resolved_participants_prefix.len + 16]u8 = undefined;
         var resolved_participant_value: ?[]u8 = null;
         defer if (resolved_participant_value) |value| self.alloc.free(value);
-        if (extra_batch.resolved_participant) |participant| {
-            const participants = try self.getParticipants(self.alloc, txn_id);
-            defer freeParticipantList(self.alloc, participants);
-            var enlisted = false;
-            for (participants) |existing| {
-                if (std.mem.eql(u8, existing, participant)) {
-                    enlisted = true;
-                    break;
+        var indexed_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer indexed_arena.deinit();
+        var indexed_writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
+        var indexed_deletes: std.ArrayListUnmanaged([]const u8) = .empty;
+        const defer_ack = extra_batch.defer_retained_coordinator_acknowledgement and status == .committed and record.coordinator and record.retain_terminal;
+        if (if (defer_ack) null else extra_batch.resolved_participant) |participant| {
+            const index_key = makeSidecarKey(participant_index_prefix, txn_id);
+            if (try self.keyExists(&index_key)) {
+                try self.stageParticipantResolutions(txn_id, &.{participant}, indexed_arena.allocator(), &indexed_writes, &indexed_deletes);
+            } else {
+                const participants = try self.getParticipants(self.alloc, txn_id);
+                defer freeParticipantList(self.alloc, participants);
+                var enlisted = false;
+                for (participants) |existing| {
+                    if (std.mem.eql(u8, existing, participant)) {
+                        enlisted = true;
+                        break;
+                    }
                 }
-            }
-            if (!enlisted) return error.InvalidParticipant;
+                if (!enlisted) return error.InvalidParticipant;
 
-            const resolved = try self.getResolvedParticipants(self.alloc, txn_id);
-            defer freeParticipantList(self.alloc, resolved);
-            var already_resolved = false;
-            for (resolved) |existing| {
-                if (std.mem.eql(u8, existing, participant)) {
-                    already_resolved = true;
-                    break;
+                const resolved = try self.getResolvedParticipants(self.alloc, txn_id);
+                defer freeParticipantList(self.alloc, resolved);
+                var already_resolved = false;
+                for (resolved) |existing| {
+                    if (std.mem.eql(u8, existing, participant)) {
+                        already_resolved = true;
+                        break;
+                    }
                 }
-            }
-            if (!already_resolved) {
-                const next = try self.alloc.alloc([]const u8, resolved.len + 1);
-                defer self.alloc.free(next);
-                for (resolved, 0..) |existing, i| next[i] = existing;
-                next[resolved.len] = participant;
-                resolved_participant_key = makeSidecarKey(resolved_participants_prefix, txn_id);
-                resolved_participant_value = try encodeParticipantList(self.alloc, next);
+                if (!already_resolved) {
+                    const next = try self.alloc.alloc([]const u8, resolved.len + 1);
+                    defer self.alloc.free(next);
+                    for (resolved, 0..) |existing, i| next[i] = existing;
+                    next[resolved.len] = participant;
+                    resolved_participant_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+                    resolved_participant_value = try encodeParticipantList(self.alloc, next);
+                }
             }
         }
         if (extra_batch.expected_intent_revision) |expected| {
@@ -991,15 +1193,7 @@ pub const TxnManager = struct {
         const was_terminal = record.status != .pending;
         applyResolveDecision(&record, status, timestamp) catch |err| {
             if (err == TxnError.DecisionConflict) {
-                if (self.trace_writer) |tw| {
-                    tw.traceEvent(&.{
-                        .name = "ResolveDecisionConflict",
-                        .txn_id = txn_id,
-                        .shard_id = self.shard_id,
-                        .timestamp = timestamp,
-                        .reason = resolveDecisionConflictReason(record.status, status),
-                    });
-                }
+                self.traceResolveDecisionConflict(txn_id, record.status, status, timestamp);
             }
             return err;
         };
@@ -1010,8 +1204,15 @@ pub const TxnManager = struct {
             if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             }
-            if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0) {
-                try self.applyBatch(completion_writes.items, extra_batch.completion_deletes, null);
+            try completion_writes.appendSlice(self.alloc, indexed_writes.items);
+            var completion_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer completion_deletes.deinit(self.alloc);
+            try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
+            try completion_deletes.appendSlice(self.alloc, indexed_deletes.items);
+            if (status == .aborted and try self.hasPreparedEffects(txn_id)) try completion_deletes.append(self.alloc, &prepared_key);
+            if (status == .aborted and try self.hasPreparationRequirement(txn_id)) try completion_deletes.append(self.alloc, &requirement_key);
+            if (completion_writes.items.len != 0 or completion_deletes.items.len != 0) {
+                try self.applyBatchWithAdmission(completion_writes.items, completion_deletes.items, null, control);
             }
             return .{
                 .applied = false,
@@ -1048,7 +1249,9 @@ pub const TxnManager = struct {
         // durable must not apply the caller's derived batch again. In
         // particular, doing so could overwrite a newer user write with the
         // transaction's old value.
-        if (was_terminal and intent_entries.len == 0 and read_entries.len == 0) {
+        // An accepted effect plan can owe output without any row intents.
+        // Only the atomic plan-consuming batch proves that work completed.
+        if (was_terminal and consumed == null and intent_entries.len == 0 and read_entries.len == 0) {
             record.intents_resolved = true;
             record.intents_resolved_known = true;
             const marker_value = try self.encodeRecord(record);
@@ -1062,14 +1265,18 @@ pub const TxnManager = struct {
             if (resolved_participant_value) |value| {
                 try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
             }
+            try completion_writes.appendSlice(self.alloc, indexed_writes.items);
             var completion_deletes = std.ArrayListUnmanaged([]const u8).empty;
             defer completion_deletes.deinit(self.alloc);
             try completion_deletes.append(self.alloc, &stale_manifest_key);
             try completion_deletes.append(self.alloc, &stale_admission_key);
             try completion_deletes.append(self.alloc, &schema_lease_key);
+            try completion_deletes.append(self.alloc, &prepared_key);
+            try completion_deletes.append(self.alloc, &requirement_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
+            try completion_deletes.appendSlice(self.alloc, indexed_deletes.items);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyBatchWithReservation(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
+            try self.applyBatchWithParticipantAndAdmission(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, control);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -1122,10 +1329,10 @@ pub const TxnManager = struct {
             try deletes.append(self.alloc, entry.key);
             const user_key = entry.key[intents_prefix.len + 17 ..];
             const member_key = try makeIntentMemberKey(self.alloc, txn_id, user_key);
-            try owned_apply_keys.append(self.alloc, member_key);
+            try appendOwnedBytes(self.alloc, &owned_apply_keys, member_key);
             try deletes.append(self.alloc, member_key);
             const lock_key = try self.makeIntentLockKey(user_key);
-            try owned_apply_keys.append(self.alloc, lock_key);
+            try appendOwnedBytes(self.alloc, &owned_apply_keys, lock_key);
             try deletes.append(self.alloc, lock_key);
         }
         const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
@@ -1133,6 +1340,18 @@ pub const TxnManager = struct {
         try deletes.append(self.alloc, &admission_key);
         try deletes.append(self.alloc, &intent_keys_key);
         try deletes.append(self.alloc, &schema_lease_key);
+        try deletes.append(self.alloc, &prepared_key);
+        try deletes.append(self.alloc, &requirement_key);
+        const publication_credit_key = publication_backlog.transactionCreditKey(txn_id);
+        const publication_batch_key = makeTransactionReplicationBatchOutboxKey(txn_id);
+        // Outbox creation and intents_resolved commit atomically. An already
+        // resolved retry returned above and keeps its grant for HA delivery;
+        // this transition only needs to inspect its own new writes.
+        var keeps_publication_credit = false;
+        if (status == .committed) for (extra_batch.writes) |write| {
+            if (std.mem.eql(u8, write.key, &publication_batch_key)) keeps_publication_credit = true;
+        };
+        if (!keeps_publication_credit) try deletes.append(self.alloc, &publication_credit_key);
         if (status == .committed) {
             // Apply intents to real keys
             for (intent_entries) |entry| {
@@ -1155,22 +1374,22 @@ pub const TxnManager = struct {
                 if (intent.value == null) {
                     // Delete — also remove the timestamp entry
                     const store_key = try internal_keys.documentKeyAlloc(self.alloc, user_key);
-                    try owned_apply_keys.append(self.alloc, store_key);
+                    try appendOwnedBytes(self.alloc, &owned_apply_keys, store_key);
                     try deletes.append(self.alloc, store_key);
 
                     const ts_key = try internal_keys.ttlKeyAlloc(self.alloc, user_key);
-                    try owned_apply_keys.append(self.alloc, ts_key);
+                    try appendOwnedBytes(self.alloc, &owned_apply_keys, ts_key);
                     try deletes.append(self.alloc, ts_key);
                 } else {
                     // Put
                     const val = intent.value.?;
                     const store_key = try internal_keys.documentKeyAlloc(self.alloc, user_key);
-                    try owned_apply_keys.append(self.alloc, store_key);
+                    try appendOwnedBytes(self.alloc, &owned_apply_keys, store_key);
                     try writes.append(self.alloc, .{ .key = store_key, .value = val });
 
                     // Write timestamp for the key
                     const ts_key = try internal_keys.ttlKeyAlloc(self.alloc, user_key);
-                    try owned_apply_keys.append(self.alloc, ts_key);
+                    try appendOwnedBytes(self.alloc, &owned_apply_keys, ts_key);
                     var ts_val: [8]u8 = undefined;
                     std.mem.writeInt(u64, &ts_val, timestamp, .little);
                     try writes.append(self.alloc, .{ .key = ts_key, .value = &ts_val });
@@ -1191,11 +1410,13 @@ pub const TxnManager = struct {
         if (resolved_participant_value) |value| {
             try writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
         }
+        try writes.appendSlice(self.alloc, indexed_writes.items);
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
+        try deletes.appendSlice(self.alloc, indexed_deletes.items);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyBatchWithParticipant(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null);
+        try self.applyBatchWithParticipantAndAdmission(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -1215,6 +1436,161 @@ pub const TxnManager = struct {
             .applied = true,
             .replay_sequence = record.replay_sequence,
         };
+    }
+
+    /// Metadata probes intentionally have no iterator. Use the backend's
+    /// short current-scan lease for this bounded, keys-only presence check.
+    pub fn hasPreparedCatalogLease(self: *TxnManager) !bool {
+        var scan = try self.store.beginCurrentScan();
+        defer scan.abort();
+        return try @import("db/artifact_inventory.zig").hasPreparedCatalogLease(&scan);
+    }
+
+    /// Activation must not retroactively authorize unfenced required records,
+    /// including opaque/orphan metadata. Bounded seeks never decode payloads.
+    pub fn hasPreparationMetadata(self: *TxnManager) !bool {
+        var scan = try self.store.beginCurrentScan();
+        defer scan.abort();
+        var cursor = try scan.openCursor();
+        defer cursor.close();
+        cursor.setKeysOnly();
+        for ([_][]const u8{ publication_backlog.prepared_effects_prefix, publication_backlog.preparation_requirement_prefix }) |prefix| {
+            if (try cursor.seekAtOrAfter(prefix)) |entry|
+                if (std.mem.startsWith(u8, entry.key, prefix)) return true;
+        }
+        return false;
+    }
+
+    pub fn hasPreparedEffects(self: *TxnManager, txn_id: TxnId) !bool {
+        const key = makePreparedEffectsKey(txn_id);
+        return self.keyExists(&key);
+    }
+
+    fn hashPreparedInput(hash: *std.crypto.hash.Blake3, bytes: []const u8, control: ?read_control.Port) !void {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, bytes.len, .little);
+        hash.update(&length);
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            if (control) |owner| try owner.checkpoint();
+            const end = offset + @min(@as(usize, 4096), bytes.len - offset);
+            hash.update(bytes[offset..end]);
+            offset = end;
+        }
+    }
+
+    /// Capture outside producer execution, then revalidate at seal under the
+    /// same external DB apply fence used by every TxnManager mutation. Digests
+    /// of catalogs are authored/leased by the DB catalog owner, not this layer.
+    pub fn preparedEffectsContract(self: *TxnManager, txn_id: TxnId, catalog_digest: [32]u8, mode: prepared_effects.Mode, original: ?read_control.Port) !prepared_effects.Contract {
+        var trace: MutationAdmissionTrace = .{};
+        return self.preparedEffectsContractInner(txn_id, catalog_digest, mode, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+
+    fn preparedEffectsContractInner(self: *TxnManager, txn_id: TxnId, catalog_digest: [32]u8, mode: prepared_effects.Mode, control: ?read_control.Port) !prepared_effects.Contract {
+        const record = try self.loadTransactionRecordWithAdmission(txn_id, control);
+        if (!record.prepared or record.intent_revision == 0 or record.status == .aborted) return error.PreparedEffectsRequired;
+        var batch = try self.collectIntentBatchWithAdmission(self.alloc, txn_id, control);
+        defer batch.deinit(self.alloc);
+        if (batch.revision != record.intent_revision) return error.IntentSnapshotChanged;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly-prepared-intents-v1");
+        hash.update(&txn_id);
+        var identity: [24]u8 = undefined;
+        std.mem.writeInt(u64, identity[0..8], record.begin_timestamp, .little);
+        std.mem.writeInt(u64, identity[8..16], record.created_at, .little);
+        std.mem.writeInt(u64, identity[16..24], batch.revision, .little);
+        hash.update(&identity);
+        // Collection returns physical keys in sorted order, for both legacy
+        // manifests and the current member index. Length framing distinguishes
+        // boundaries, deletes and prepared-row envelopes without re-parsing JSON.
+        for (batch.owned_entries.?) |entry| {
+            if (control) |owner| try owner.checkpoint();
+            try hashPreparedInput(&hash, entry.key, control);
+            try hashPreparedInput(&hash, entry.value, control);
+        }
+        const after = try self.loadTransactionRecordWithAdmission(txn_id, control);
+        if (after.intent_revision != batch.revision or after.status != record.status or
+            after.begin_timestamp != record.begin_timestamp or after.created_at != record.created_at or
+            !after.prepared) return error.IntentSnapshotChanged;
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return .{
+            .txn_id = txn_id,
+            .intent_revision = batch.revision,
+            .intent_digest = digest,
+            .catalog_digest = catalog_digest,
+            .schema_version = if (batch.schema_binding) |binding| binding.version else null,
+            .mode = mode,
+        };
+    }
+
+    /// Final predecision seal. The external apply fence must span validation
+    /// and publication. Normal HTTP/SQL prepare does not call this API yet.
+    /// Its immutable frame shares durable backlog admission and the backend
+    /// transaction with its size/aggregate accounting. Failed admission leaves
+    /// the existing revision mutable; accepted seals freeze subsequent writes.
+    pub fn sealPreparedEffects(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, original: ?read_control.Port) !void {
+        var trace: MutationAdmissionTrace = .{};
+        return self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+
+    fn sealPreparedEffectsInner(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, control: ?read_control.Port) !void {
+        const record = try self.loadTransactionRecordWithAdmission(txn_id, control);
+        if (record.status != .pending) return TxnError.DecisionConflict;
+        if (try self.loadPreparationRequirementInner(txn_id, control)) |required| if (required.mode != mode) return error.PreparationContractConflict;
+        const inspection = try prepared_effects.inspect(frame, control);
+        const expected = try self.preparedEffectsContractInner(txn_id, catalog_digest, mode, control);
+        if (!std.meta.eql(expected, inspection.contract)) return error.PreparedEffectsMismatch;
+        const key = makePreparedEffectsKey(txn_id);
+        const previous = self.getAllocWithAdmission(self.alloc, &key, control) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (previous) |bytes| self.alloc.free(bytes);
+        if (previous) |bytes| {
+            // Lost response retry: preserve the first accepted immutable result,
+            // revision and grant. A regenerated/different result cannot replace it.
+            if (bytes.len != frame.len) return error.PreparedEffectsConflict;
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                if (control) |owner| try owner.checkpoint();
+                const end = offset + @min(@as(usize, 4096), bytes.len - offset);
+                if (!std.mem.eql(u8, bytes[offset..end], frame[offset..end])) return error.PreparedEffectsConflict;
+                offset = end;
+            }
+            return;
+        }
+        try self.applyBatchWithAdmission(&.{.{ .key = &key, .value = frame }}, &.{}, null, control);
+    }
+
+    /// Reopen/recovery owns both this decoded slab and any separately staged
+    /// materialization scratch. This load does not invoke a producer or infer
+    /// its mode from the retry's acknowledgement level.
+    pub fn loadPreparedEffects(self: *TxnManager, alloc: Allocator, txn_id: TxnId, original: ?read_control.Port) !?PreparedEffects {
+        var trace: MutationAdmissionTrace = .{};
+        const result = self.loadPreparedEffectsInner(alloc, txn_id, trace.bind(original)) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| {
+            if (result) |value| {
+                var owned = value;
+                owned.deinit();
+            }
+            return cause;
+        }
+        return result;
+    }
+
+    fn loadPreparedEffectsInner(self: *TxnManager, alloc: Allocator, txn_id: TxnId, control: ?read_control.Port) !?PreparedEffects {
+        const key = makePreparedEffectsKey(txn_id);
+        const raw = self.getAllocWithAdmission(alloc, &key, control) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        const inspection = try prepared_effects.inspect(raw, control);
+        if (try self.loadPreparationRequirementInner(txn_id, control)) |required| if (required.mode != inspection.contract.mode) return error.PreparationContractConflict;
+        const expected = try self.preparedEffectsContractInner(txn_id, inspection.contract.catalog_digest, inspection.contract.mode, control);
+        return .{ .decoded = try prepared_effects.decode(alloc, raw, expected, control), .fingerprint = inspection.fingerprint };
     }
 
     pub fn collectIntentBatch(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !IntentBatch {
@@ -1287,8 +1663,13 @@ pub const TxnManager = struct {
         defer scan.abort();
         var cursor = try scan.openCursor();
         defer cursor.close();
-        if (try cursor.seekAtOrAfter(schema_leases_prefix)) |entry|
-            if (std.mem.startsWith(u8, entry.key, schema_leases_prefix)) return true;
+        cursor.setKeysOnly();
+        // The frame also pins physical ownership/schema if an orphan or old
+        // compatibility record lost its ordinary schema sidecar.
+        for ([_][]const u8{ schema_leases_prefix, publication_backlog.prepared_effects_prefix }) |prefix| {
+            if (try cursor.seekAtOrAfter(prefix)) |entry|
+                if (std.mem.startsWith(u8, entry.key, prefix)) return true;
+        }
         // Existing document databases may have unresolved intents predating
         // relational epoch binding. They also fence a storage-mode switch.
         const entry = (try cursor.seekAtOrAfter(intents_prefix)) orelse return false;
@@ -1352,7 +1733,8 @@ pub const TxnManager = struct {
         switch (kind) {
             .batch => {
                 const key = makeTransactionReplicationBatchOutboxKey(txn_id);
-                try self.applyBatch(&.{}, &.{&key}, null);
+                const credit_key = publication_backlog.transactionCreditKey(txn_id);
+                try self.applyBatch(&.{}, &.{ &key, &credit_key }, null);
             },
             .replay => {
                 const key = makeTransactionReplicationReplayOutboxKey(txn_id);
@@ -1423,6 +1805,15 @@ pub const TxnManager = struct {
     /// Get the status of a transaction.
     pub fn getTransactionStatus(self: *TxnManager, txn_id: TxnId) !TxnStatus {
         return (try self.loadTransactionRecord(txn_id)).status;
+    }
+
+    /// Preserve the original admission error even when it shares the store's
+    /// missing-record name and loadTransactionRecord translates that name.
+    pub fn getTransactionStatusWithAdmission(self: *TxnManager, txn_id: TxnId, original: ?read_control.Port) !TxnStatus {
+        var trace: MutationAdmissionTrace = .{};
+        const record = self.loadTransactionRecordWithAdmission(txn_id, trace.bind(original)) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| return cause;
+        return record.status;
     }
 
     pub fn getCommitVersion(self: *TxnManager, txn_id: TxnId) !u64 {
@@ -1521,6 +1912,23 @@ pub const TxnManager = struct {
     /// this result. A prepared participant may otherwise resolve immediately
     /// after the check, yielding different sides of one distributed commit.
     pub fn hasUnresolvedWriteIntents(self: *TxnManager) !bool {
+        return self.hasUnresolvedWriteIntentsWithAdmission(null);
+    }
+    pub fn hasUnresolvedWriteIntentsWithAdmission(self: *TxnManager, original: ?@import("../common/read_admission.zig").Port) !bool {
+        var retained: @import("../common/read_admission.zig").RetainedDependency = .{};
+        if (retained.bind(original)) |port| {
+            try port.checkpoint();
+            // Both primary and replay fences remain owned. Busy providers
+            // unwind to the coordinator; they cannot lend CPU to a producer
+            // that may itself need either fence.
+            var read = try self.store.beginReadWithAdmission(.transient, port);
+            defer read.abort();
+            var cursor = try read.openCursorWithAdmission(port);
+            defer cursor.close();
+            const entry = try cursor.seekAtOrAfterWithAdmission(intents_prefix, port);
+            try port.checkpoint();
+            return if (entry) |value| std.mem.startsWith(u8, value.key, intents_prefix) else false;
+        }
         var read = try self.store.beginRead();
         defer read.abort();
         return readHasPrefix(&read, intents_prefix);
@@ -1640,19 +2048,28 @@ pub const TxnManager = struct {
     }
 
     pub fn markParticipantsResolvedExtraBatch(self: *TxnManager, txn_id: TxnId, acknowledgements: []const []const u8, extra_batch: MutationExtraBatch) !void {
-        if (acknowledgements.len == 0 or acknowledgements.len > 64) return error.InvalidParticipant;
-        _ = try self.loadTransactionRecord(txn_id);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
+        var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
+        var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
+        try self.stageParticipantResolutions(txn_id, acknowledgements, scratch, &writes, &deletes);
+        try writes.appendSlice(scratch, extra_batch.writes);
+        try deletes.appendSlice(scratch, extra_batch.deletes);
+        try self.applyBatch(writes.items, deletes.items, null);
+    }
+
+    /// Stage indexed acknowledgements into the caller's atomic mutation batch.
+    /// Every key/value added here lives in scratch until that batch finishes.
+    fn stageParticipantResolutions(self: *TxnManager, txn_id: TxnId, acknowledgements: []const []const u8, scratch: Allocator, writes: *std.ArrayListUnmanaged(docstore.KVPair), deletes: *std.ArrayListUnmanaged([]const u8)) !void {
+        if (acknowledgements.len == 0 or acknowledgements.len > 64) return error.InvalidParticipant;
+        _ = try self.loadTransactionRecord(txn_id);
         const index_key = makeSidecarKey(participant_index_prefix, txn_id);
         const raw = self.getAlloc(scratch, &index_key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
         var indexed = if (raw) |bytes| try ParticipantIndex.decode(bytes) else ParticipantIndex{};
-        var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
-        var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
         var enlisted: std.StringHashMapUnmanaged(void) = .empty;
         if (raw == null) {
             const participants = try self.getParticipants(scratch, txn_id);
@@ -1714,13 +2131,8 @@ pub const TxnManager = struct {
         if (indexed.resolved > indexed.enlisted) return error.InvalidTxnRecord;
         var encoded: [17]u8 = undefined;
         indexed.encode(&encoded);
-        try writes.append(scratch, .{ .key = &index_key, .value = &encoded });
-        try writes.appendSlice(scratch, extra_batch.writes);
-        try deletes.append(scratch, &legacy_key);
-        try deletes.appendSlice(scratch, extra_batch.deletes);
-        // Membership migration, resolution entries, count proof and the Raft
-        // replay marker publish in one storage batch. No growing list rewrite.
-        try self.applyBatch(writes.items, deletes.items, null);
+        try writes.append(scratch, .{ .key = try scratch.dupe(u8, &index_key), .value = try scratch.dupe(u8, &encoded) });
+        try deletes.append(scratch, try scratch.dupe(u8, &legacy_key));
     }
 
     pub fn getParticipants(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![][]u8 {
@@ -1847,6 +2259,32 @@ pub const TxnManager = struct {
                 continue;
             }
 
+            if (try self.hasPreparedEffects(txn_id) or try self.hasPreparationRequirement(txn_id)) {
+                if (summary.status == .committed) {
+                    // Empty row intents do not prove accepted effects were
+                    // consumed. Generic legacy recovery must leave these to
+                    // the plan-aware owner and continue draining other records.
+                    stats.deferred_unresolved += 1;
+                    continue;
+                }
+                // Authoritative abort can retire even an opaque/corrupt plan
+                // or requirement. Preserve ordinary completion hooks, but do
+                // not interpret stale summary flags again after this mutation.
+                const resolve_ts = if (summary.finalized_at > 0) summary.finalized_at else resolution_timestamp;
+                var cleanup_batch: ResolutionExtraBatch = .{};
+                var initialized = false;
+                defer if (initialized) {
+                    if (extra_hooks.cleanup) |cleanup| cleanup(extra_hooks.ctx, cleanup_batch);
+                };
+                if (extra_hooks.build) |build| {
+                    cleanup_batch = try build(extra_hooks.ctx, self, txn_id, .aborted, resolve_ts);
+                    initialized = true;
+                }
+                _ = try self.resolveIntentsWithExtraBatch(txn_id, .aborted, resolve_ts, cleanup_batch);
+                stats.resolved_finalized += 1;
+                continue;
+            }
+
             if (!(summary.intents_resolved_known and summary.intents_resolved) and try self.hasAnyIntents(txn_id)) {
                 const resolve_ts = switch (summary.status) {
                     .committed => if (summary.commit_version > 0) summary.commit_version else summary.begin_timestamp,
@@ -1920,12 +2358,28 @@ pub const TxnManager = struct {
         predicates: []const VersionPredicate,
         exclude_txn: ?TxnId,
     ) !void {
+        return self.checkVersionPredicatesInner(predicates, exclude_txn, null);
+    }
+
+    pub fn checkVersionPredicatesWithAdmission(self: *TxnManager, predicates: []const VersionPredicate, exclude_txn: ?TxnId, original: ?read_control.Port) !void {
+        var trace: MutationAdmissionTrace = .{};
+        return self.checkVersionPredicatesInner(predicates, exclude_txn, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+
+    fn checkVersionPredicatesInner(
+        self: *TxnManager,
+        predicates: []const VersionPredicate,
+        exclude_txn: ?TxnId,
+        control: ?read_control.Port,
+    ) !void {
+        if (control) |owner| try owner.checkpoint();
         var relational_primary: ?bool = null;
         for (predicates) |pred| {
+            if (control) |owner| try owner.checkpoint();
             if (pred.unique_absence and (pred.comparison != .document_version or pred.expected_version != 0)) return error.InvalidArgument;
             switch (pred.comparison) {
                 .document_version => {
-                    const current_ts = try self.readTimestamp(pred.key);
+                    const current_ts = try self.readTimestampWithAdmission(pred.key, control);
                     if (pred.expected_version == 0) {
                         if (current_ts != null) return if (pred.unique_absence) error.UniqueConstraintViolation else TxnError.VersionConflict;
                     } else {
@@ -1936,7 +2390,7 @@ pub const TxnManager = struct {
                         if (pred.expected_version == 0) return error.InvalidArgument;
                         if (relational_primary == null) {
                             const table_catalog = @import("db/table_catalog.zig");
-                            const catalog_bytes = self.getAlloc(self.alloc, table_catalog.key) catch |err| switch (err) {
+                            const catalog_bytes = self.getAllocWithAdmission(self.alloc, table_catalog.key, control) catch |err| switch (err) {
                                 error.NotFound => null,
                                 else => return err,
                             };
@@ -1946,65 +2400,67 @@ pub const TxnManager = struct {
                                 relational_primary = catalog.mode_initialized and catalog.storage_mode == .relational;
                             } else {
                                 // Legacy document stores predate the fixed catalog.
+                                if (control) |owner| try owner.checkpoint();
                                 const schema = try @import("schema.zig").loadSchema(self.store, self.alloc);
                                 defer if (schema) |value| @import("schema.zig").freeSchema(self.alloc, value);
+                                if (control) |owner| try owner.checkpoint();
                                 relational_primary = schema != null and schema.?.storage_mode == .relational;
                             }
                         }
                         const primary_key = if (relational_primary.?)
-                            try internal_keys.relationalRowKeyAlloc(self.alloc, pred.key)
+                            try @import("transaction_intent_admission.zig").userKey(self.alloc, pred.key, internal_keys.relational_row_kind, control)
                         else
-                            try internal_keys.documentKeyAlloc(self.alloc, pred.key);
+                            try @import("transaction_intent_admission.zig").userKey(self.alloc, pred.key, internal_keys.primary_kind, control);
                         defer self.alloc.free(primary_key);
-                        const current = self.getAlloc(self.alloc, primary_key) catch |err| switch (err) {
+                        const current = self.getAllocWithAdmission(self.alloc, primary_key, control) catch |err| switch (err) {
                             error.NotFound => return TxnError.VersionConflict,
                             else => return err,
                         };
                         defer self.alloc.free(current);
-                        var digest: [32]u8 = undefined;
-                        std.crypto.hash.sha2.Sha256.hash(current, &digest, .{});
+                        const digest = try @import("transaction_intent_admission.zig").sha256(current, control);
                         if (!std.mem.eql(u8, &digest, &expected)) return TxnError.VersionConflict;
                     }
                 },
                 .exact_value => {
                     if (!isRawMetadataPredicateKey(pred.key)) return error.InvalidArgument;
                     if (range_protection.counterBucket(pred.key)) |id| {
-                        var probe = try self.store.beginProbe();
+                        var probe = if (control) |owner| try self.store.beginProbeWithAdmission(.retain, owner) else try self.store.beginProbe();
                         defer probe.abort();
                         if (!try range_protection.isActive(&probe)) return error.SqlRangeTrackingRequired;
-                        var read = try self.store.beginCurrentScan();
+                        var read = if (control) |owner| try self.store.beginCurrentScanWithAdmission(owner) else try self.store.beginCurrentScan();
                         defer read.abort();
-                        var cursor = try read.openCursor();
+                        var cursor = if (control) |owner| try read.openCursorWithAdmission(owner) else try read.openCursor();
                         defer cursor.close();
                         const writer_key = range_protection.writerKey(id);
-                        try self.checkReadGuardCursor(&cursor, &writer_key, exclude_txn);
+                        try self.checkReadGuardCursorWithAdmission(&cursor, &writer_key, exclude_txn, control);
                     }
                     if (range_protection.indexCounterDigest(pred.key)) |digest| {
-                        var probe = try self.store.beginProbe();
+                        var probe = if (control) |owner| try self.store.beginProbeWithAdmission(.retain, owner) else try self.store.beginProbe();
                         defer probe.abort();
                         if (!try range_protection.isActive(&probe)) return error.SqlRangeTrackingRequired;
-                        var read = try self.store.beginCurrentScan();
+                        var read = if (control) |owner| try self.store.beginCurrentScanWithAdmission(owner) else try self.store.beginCurrentScan();
                         defer read.abort();
-                        var cursor = try read.openCursor();
+                        var cursor = if (control) |owner| try read.openCursorWithAdmission(owner) else try read.openCursor();
                         defer cursor.close();
                         const writer_key = range_protection.indexWriterKey(digest);
-                        try self.checkReadGuardCursor(&cursor, &writer_key, exclude_txn);
+                        try self.checkReadGuardCursorWithAdmission(&cursor, &writer_key, exclude_txn, control);
                     }
-                    const current = self.getAlloc(self.alloc, pred.key) catch |err| switch (err) {
+                    const current = self.getAllocWithAdmission(self.alloc, pred.key, control) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,
                     };
                     defer if (current) |bytes| self.alloc.free(bytes);
                     if (pred.expected_value) |expected| {
-                        if (!std.mem.eql(u8, current orelse return TxnError.VersionConflict, expected)) return TxnError.VersionConflict;
+                        if (!try @import("transaction_intent_admission.zig").equalBytes(current orelse return TxnError.VersionConflict, expected, control)) return TxnError.VersionConflict;
                     } else if (current != null) return TxnError.VersionConflict;
                 },
             }
 
-            if (try self.hasPendingIntentForKey(pred.key, exclude_txn)) {
+            if (try self.hasPendingIntentForKeyWithAdmission(pred.key, exclude_txn, control)) {
                 return TxnError.IntentConflict;
             }
         }
+        if (control) |owner| try owner.checkpoint();
     }
 
     pub fn checkIntentConflicts(
@@ -2012,34 +2468,56 @@ pub const TxnManager = struct {
         intents: []const WriteIntent,
         exclude_txn: ?TxnId,
     ) !void {
+        return self.checkIntentConflictsInner(intents, exclude_txn, null);
+    }
+
+    pub fn checkIntentConflictsWithAdmission(self: *TxnManager, intents: []const WriteIntent, exclude_txn: ?TxnId, original: ?read_control.Port) !void {
+        var trace: MutationAdmissionTrace = .{};
+        return self.checkIntentConflictsInner(intents, exclude_txn, trace.bind(original)) catch |err| return trace.failure orelse err;
+    }
+
+    fn checkIntentConflictsInner(
+        self: *TxnManager,
+        intents: []const WriteIntent,
+        exclude_txn: ?TxnId,
+        control: ?read_control.Port,
+    ) !void {
+        if (control) |owner| try owner.checkpoint();
         for (intents) |intent| {
-            if (try self.hasPendingIntentForKey(intent.key, exclude_txn)) {
+            if (control) |owner| try owner.checkpoint();
+            if (try self.hasPendingIntentForKeyWithAdmission(intent.key, exclude_txn, control)) {
                 return TxnError.IntentConflict;
             }
         }
-        if (try self.readGuardCount() != 0) {
-            var scan = try self.store.beginCurrentScan();
+        if (try self.readGuardCountWithAdmission(control) != 0) {
+            var scan = if (control) |owner| try self.store.beginCurrentScanWithAdmission(owner) else try self.store.beginCurrentScan();
             defer scan.abort();
-            var cursor = try scan.openCursor();
+            var cursor = if (control) |owner| try scan.openCursorWithAdmission(owner) else try scan.openCursor();
             defer cursor.close();
             var buckets: std.StaticBitSet(range_protection.bucket_count) = .empty;
             for (intents) |intent| {
-                try self.checkReadGuardCursor(&cursor, intent.key, exclude_txn);
+                if (control) |owner| try owner.checkpoint();
+                try self.checkReadGuardCursorWithAdmission(&cursor, intent.key, exclude_txn, control);
                 if (std.mem.startsWith(u8, intent.key, "\x00\x00")) continue;
                 const id = range_protection.bucket(intent.key);
                 if (buckets.isSet(id)) continue;
                 buckets.set(id);
                 const counter = range_protection.counterKey(id);
-                try self.checkReadGuardCursor(&cursor, &counter, exclude_txn);
+                try self.checkReadGuardCursorWithAdmission(&cursor, &counter, exclude_txn, control);
             }
         }
+        if (control) |owner| try owner.checkpoint();
     }
 
     /// Check if any other pending transaction has an intent on this key.
     fn hasPendingIntentForKey(self: *TxnManager, user_key: []const u8, exclude_txn: ?TxnId) !bool {
-        const lock_key = try self.makeIntentLockKey(user_key);
+        return self.hasPendingIntentForKeyWithAdmission(user_key, exclude_txn, null);
+    }
+
+    fn hasPendingIntentForKeyWithAdmission(self: *TxnManager, user_key: []const u8, exclude_txn: ?TxnId, control: ?read_control.Port) !bool {
+        const lock_key = try self.makeIntentLockKeyWithAdmission(user_key, control);
         defer self.alloc.free(lock_key);
-        const owner = self.getAlloc(self.alloc, lock_key) catch |err| switch (err) {
+        const owner = self.getAllocWithAdmission(self.alloc, lock_key, control) catch |err| switch (err) {
             error.NotFound => return false,
             else => return err,
         };
@@ -2142,19 +2620,46 @@ pub const TxnManager = struct {
         digests: []const [range_protection.index_span_digest_bytes]u8,
         exclude_txn: ?TxnId,
     ) !void {
-        if (digests.len == 0 or try self.readGuardCount() == 0) return;
-        var scan = try self.store.beginCurrentScan();
+        return self.checkIndexSpanGuardConflictsWithAdmission(digests, exclude_txn, null);
+    }
+
+    pub fn checkIndexSpanGuardConflictsWithAdmission(
+        self: *TxnManager,
+        digests: []const [range_protection.index_span_digest_bytes]u8,
+        exclude_txn: ?TxnId,
+        control: ?read_control.Port,
+    ) !void {
+        var trace: MutationAdmissionTrace = .{};
+        const original = trace.bind(control);
+        self.checkIndexSpanGuardConflictsInner(digests, exclude_txn, original) catch |err| return trace.failure orelse err;
+        if (original) |owner| try owner.checkpoint();
+    }
+
+    fn checkIndexSpanGuardConflictsInner(
+        self: *TxnManager,
+        digests: []const [range_protection.index_span_digest_bytes]u8,
+        exclude_txn: ?TxnId,
+        control: ?read_control.Port,
+    ) !void {
+        if (control) |owner| try owner.checkpoint();
+        if (digests.len == 0 or try self.readGuardCountWithAdmission(control) == 0) return;
+        var scan = if (control) |owner| try self.store.beginCurrentScanWithAdmission(owner) else try self.store.beginCurrentScan();
         defer scan.abort();
-        var cursor = try scan.openCursor();
+        var cursor = if (control) |owner| try scan.openCursorWithAdmission(owner) else try scan.openCursor();
         defer cursor.close();
         for (digests) |digest| {
+            if (control) |owner| try owner.checkpoint();
             const counter = range_protection.indexCounterKey(digest);
-            try self.checkReadGuardCursor(&cursor, &counter, exclude_txn);
+            try self.checkReadGuardCursorWithAdmission(&cursor, &counter, exclude_txn, control);
         }
     }
 
     fn readGuardCount(self: *TxnManager) !u64 {
-        const raw = self.getAlloc(self.alloc, read_guard_count_key) catch |err| switch (err) {
+        return self.readGuardCountWithAdmission(null);
+    }
+
+    fn readGuardCountWithAdmission(self: *TxnManager, control: ?read_control.Port) !u64 {
+        const raw = self.getAllocWithAdmission(self.alloc, read_guard_count_key, control) catch |err| switch (err) {
             error.NotFound => return 0,
             else => return err,
         };
@@ -2166,8 +2671,12 @@ pub const TxnManager = struct {
     }
 
     fn loadReadAdmission(self: *TxnManager, txn_id: TxnId) !IntentAdmission {
+        return self.loadReadAdmissionWithAdmission(txn_id, null);
+    }
+
+    fn loadReadAdmissionWithAdmission(self: *TxnManager, txn_id: TxnId, control: ?read_control.Port) !IntentAdmission {
         const key = makeSidecarKey(read_admission_prefix, txn_id);
-        const raw = self.getAlloc(self.alloc, &key) catch |err| switch (err) {
+        const raw = self.getAllocWithAdmission(self.alloc, &key, control) catch |err| switch (err) {
             error.NotFound => return .{},
             else => return err,
         };
@@ -2179,24 +2688,28 @@ pub const TxnManager = struct {
     }
 
     fn makeReadGuardKey(alloc: Allocator, user_key: []const u8, txn_id: ?TxnId) ![]u8 {
+        return makeReadGuardKeyWithAdmission(alloc, user_key, txn_id, null);
+    }
+
+    fn makeReadGuardKeyWithAdmission(alloc: Allocator, user_key: []const u8, txn_id: ?TxnId, control: ?read_control.Port) ![]u8 {
         const length = std.math.cast(u32, user_key.len) orelse return error.TransactionTooLarge;
-        const prefix_length = read_guards_prefix.len + 4 + user_key.len;
-        const key = try alloc.alloc(u8, prefix_length + @as(usize, if (txn_id != null) 16 else 0));
-        @memcpy(key[0..read_guards_prefix.len], read_guards_prefix);
-        std.mem.writeInt(u32, key[read_guards_prefix.len..][0..4], length, .big);
-        @memcpy(key[read_guards_prefix.len + 4 ..][0..user_key.len], user_key);
-        if (txn_id) |id| @memcpy(key[prefix_length..], &id);
-        return key;
+        var length_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length_bytes, length, .big);
+        return @import("transaction_intent_admission.zig").concatKey(alloc, &.{ read_guards_prefix, &length_bytes, user_key, if (txn_id) |*id| id else "" }, control);
     }
 
     /// At most two entries: our own shared guard and the first other reader.
     /// Exact length framing prevents a guard for "a" locking "a\x00" or "ab".
     fn checkReadGuardCursor(self: *TxnManager, cursor: anytype, key: []const u8, exclude_txn: ?TxnId) !void {
-        const prefix = try makeReadGuardKey(self.alloc, key, null);
+        return self.checkReadGuardCursorWithAdmission(cursor, key, exclude_txn, null);
+    }
+
+    fn checkReadGuardCursorWithAdmission(self: *TxnManager, cursor: anytype, key: []const u8, exclude_txn: ?TxnId, control: ?read_control.Port) !void {
+        const prefix = try makeReadGuardKeyWithAdmission(self.alloc, key, null, control);
         defer self.alloc.free(prefix);
-        var entry = try cursor.seekAtOrAfter(prefix);
-        while (entry) |item| : (entry = try cursor.next()) {
-            if (!std.mem.startsWith(u8, item.key, prefix)) break;
+        var entry = if (control) |owner| try cursor.seekAtOrAfterWithAdmission(prefix, owner) else try cursor.seekAtOrAfter(prefix);
+        while (entry) |item| : (entry = if (control) |owner| try cursor.nextWithAdmission(owner) else try cursor.next()) {
+            if (!try @import("transaction_intent_admission.zig").hasPrefix(item.key, prefix, control)) break;
             if (item.key.len != prefix.len + 16 or item.value.len != 0) return error.InvalidTxnRecord;
             if (exclude_txn) |id| if (std.mem.eql(u8, item.key[prefix.len..], &id)) continue;
             return error.IntentConflict;
@@ -2228,24 +2741,27 @@ pub const TxnManager = struct {
         owned_keys: *std.ArrayListUnmanaged([]u8),
         owned_values: *std.ArrayListUnmanaged([]u8),
         writes: *std.ArrayListUnmanaged(docstore.KVPair),
+        control: ?read_control.Port,
     ) !ReadAdmissionChange {
+        if (control) |owner| try owner.checkpoint();
         if (predicates.len > max_read_guards_per_transaction) return error.TransactionTooLarge;
-        const previous = try self.loadReadAdmission(txn_id);
+        const previous = try self.loadReadAdmissionWithAdmission(txn_id, control);
         var next = previous;
         var seen = std.StringHashMapUnmanaged(void).empty;
         defer seen.deinit(self.alloc);
         const member_prefix = makeSidecarKey(read_members_prefix, txn_id);
         for (predicates) |predicate| {
+            if (control) |owner| try owner.checkpoint();
             if (write_set.contains(predicate.key) or (try seen.getOrPut(self.alloc, predicate.key)).found_existing) continue;
-            const member = try std.mem.concat(self.alloc, u8, &.{ &member_prefix, predicate.key });
+            const member = try @import("transaction_intent_admission.zig").concatKey(self.alloc, &.{ &member_prefix, predicate.key }, control);
             try appendOwnedBytes(self.alloc, owned_keys, member);
-            const old = self.getAlloc(self.alloc, member) catch |err| switch (err) {
+            const old = self.getAllocWithAdmission(self.alloc, member, control) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             defer if (old) |bytes| self.alloc.free(bytes);
             var identity_buf: [33]u8 = undefined;
-            const identity = readPredicateIdentity(predicate, &identity_buf);
+            const identity = try readPredicateIdentityWithAdmission(predicate, &identity_buf, control);
             if (old) |bytes| {
                 if (!validReadMember(bytes)) return error.InvalidTxnRecord;
                 if (!std.mem.eql(u8, bytes, identity)) return error.VersionConflict;
@@ -2253,11 +2769,11 @@ pub const TxnManager = struct {
             }
             next.count = std.math.add(u64, next.count, 1) catch return error.TransactionTooLarge;
             if (next.count > max_read_guards_per_transaction) return error.TransactionTooLarge;
-            next.bytes = std.math.add(u64, next.bytes, try intentAdmissionBytes(.{ .key = predicate.key, .value = null })) catch return error.TransactionTooLarge;
+            next.bytes = std.math.add(u64, next.bytes, try intentAdmissionBytesWithAdmission(.{ .key = predicate.key, .value = null }, control)) catch return error.TransactionTooLarge;
             const version = try self.alloc.dupe(u8, identity);
             try appendOwnedBytes(self.alloc, owned_values, version);
             try writes.append(self.alloc, .{ .key = member, .value = version });
-            const guard = try makeReadGuardKey(self.alloc, predicate.key, txn_id);
+            const guard = try makeReadGuardKeyWithAdmission(self.alloc, predicate.key, txn_id, control);
             try appendOwnedBytes(self.alloc, owned_keys, guard);
             try writes.append(self.alloc, .{ .key = guard, .value = "" });
         }
@@ -2269,36 +2785,40 @@ pub const TxnManager = struct {
             std.mem.writeInt(u64, admission_value[0..8], next.count, .little);
             std.mem.writeInt(u64, admission_value[8..16], next.bytes, .little);
             try writes.append(self.alloc, .{ .key = admission_key, .value = admission_value });
-            const count = std.math.add(u64, try self.readGuardCount(), next.count - previous.count) catch return error.TransactionTooLarge;
+            const count = std.math.add(u64, try self.readGuardCountWithAdmission(control), next.count - previous.count) catch return error.TransactionTooLarge;
             const count_value = try self.alloc.alloc(u8, 8);
             try appendOwnedBytes(self.alloc, owned_values, count_value);
             std.mem.writeInt(u64, count_value[0..8], count, .little);
             try writes.append(self.alloc, .{ .key = read_guard_count_key, .value = count_value });
         }
+        if (control) |owner| try owner.checkpoint();
         return .{ .previous = previous, .next = next };
     }
 
     /// Build an intent key: intents_prefix + txn_id + ':' + user_key
     fn makeIntentKey(self: *TxnManager, txn_id: TxnId, user_key: []const u8) ![]u8 {
-        const total = intents_prefix.len + 16 + 1 + user_key.len;
-        const key = try self.alloc.alloc(u8, total);
-        @memcpy(key[0..intents_prefix.len], intents_prefix);
-        @memcpy(key[intents_prefix.len..][0..16], &txn_id);
-        key[intents_prefix.len + 16] = ':';
-        @memcpy(key[intents_prefix.len + 17 ..], user_key);
-        return key;
+        return self.makeIntentKeyWithAdmission(txn_id, user_key, null);
+    }
+
+    fn makeIntentKeyWithAdmission(self: *TxnManager, txn_id: TxnId, user_key: []const u8, control: ?read_control.Port) ![]u8 {
+        return @import("transaction_intent_admission.zig").concatKey(self.alloc, &.{ intents_prefix, &txn_id, ":", user_key }, control);
     }
 
     fn makeIntentLockKey(self: *TxnManager, user_key: []const u8) ![]u8 {
-        const key = try self.alloc.alloc(u8, intent_locks_prefix.len + user_key.len);
-        @memcpy(key[0..intent_locks_prefix.len], intent_locks_prefix);
-        @memcpy(key[intent_locks_prefix.len..], user_key);
-        return key;
+        return self.makeIntentLockKeyWithAdmission(user_key, null);
+    }
+
+    fn makeIntentLockKeyWithAdmission(self: *TxnManager, user_key: []const u8, control: ?read_control.Port) ![]u8 {
+        return @import("transaction_intent_admission.zig").concatKey(self.alloc, &.{ intent_locks_prefix, user_key }, control);
     }
 
     fn loadTransactionRecord(self: *TxnManager, txn_id: TxnId) !TxnRecord {
+        return self.loadTransactionRecordWithAdmission(txn_id, null);
+    }
+
+    fn loadTransactionRecordWithAdmission(self: *TxnManager, txn_id: TxnId, control: ?read_control.Port) !TxnRecord {
         const key = makeRecordKey(txn_id);
-        const val = self.getAlloc(self.alloc, &key) catch |err| switch (err) {
+        const val = self.getAllocWithAdmission(self.alloc, &key, control) catch |err| switch (err) {
             error.NotFound => return TxnError.TxnNotFound,
             else => return err,
         };
@@ -2362,7 +2882,7 @@ pub const TxnManager = struct {
             false
         else
             try self.hasAnyIntents(txn_id);
-        if (record.status == .pending or has_intents or try self.hasReplicationOutbox(txn_id)) {
+        if (record.status == .pending or has_intents or try self.hasReplicationOutbox(txn_id) or try self.hasPreparedEffects(txn_id) or try self.hasPreparationRequirement(txn_id)) {
             try self.applyMutationExtraBatch(extra_batch);
             return false;
         }
@@ -2427,8 +2947,12 @@ pub const TxnManager = struct {
     }
 
     fn loadIntentAdmission(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?IntentAdmission {
+        return self.loadIntentAdmissionWithAdmission(alloc, txn_id, null);
+    }
+
+    fn loadIntentAdmissionWithAdmission(self: *TxnManager, alloc: Allocator, txn_id: TxnId, control: ?read_control.Port) !?IntentAdmission {
         const key = makeSidecarKey(intent_admission_prefix, txn_id);
-        const raw = self.getAlloc(alloc, &key) catch |err| switch (err) {
+        const raw = self.getAllocWithAdmission(alloc, &key, control) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
@@ -2438,7 +2962,11 @@ pub const TxnManager = struct {
     }
 
     fn makeIntentMemberKey(alloc: Allocator, txn_id: TxnId, key: []const u8) ![]u8 {
-        return try std.mem.concat(alloc, u8, &.{ intent_members_prefix, &txn_id, ":", key });
+        return makeIntentMemberKeyWithAdmission(alloc, txn_id, key, null);
+    }
+
+    fn makeIntentMemberKeyWithAdmission(alloc: Allocator, txn_id: TxnId, key: []const u8, control: ?read_control.Port) ![]u8 {
+        return @import("transaction_intent_admission.zig").concatKey(alloc, &.{ intent_members_prefix, &txn_id, ":", key }, control);
     }
 
     fn loadIntentEntries(
@@ -2600,13 +3128,16 @@ pub const TxnManager = struct {
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
         const hot_standby_batch_key = makeTransactionReplicationBatchOutboxKey(txn_id);
         const hot_standby_replay_key = makeTransactionReplicationReplayOutboxKey(txn_id);
+        const publication_credit_key = publication_backlog.transactionCreditKey(txn_id);
+        const prepared_key = makePreparedEffectsKey(txn_id);
+        const requirement_key = makePreparationRequirementKey(txn_id);
         const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(self.alloc);
         const admission_key = makeSidecarKey(intent_admission_prefix, txn_id);
         try deletes.append(self.alloc, &admission_key);
-        try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &hot_standby_batch_key, &hot_standby_replay_key, &intent_keys_key, &schema_lease_key });
+        try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &hot_standby_batch_key, &hot_standby_replay_key, &publication_credit_key, &intent_keys_key, &schema_lease_key, &prepared_key, &requirement_key });
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         const member_prefix = makeSidecarKey(participant_index_prefix, txn_id);
         const resolution_prefix = makeSidecarKey(resolved_index_prefix, txn_id);
@@ -2643,25 +3174,33 @@ pub const TxnManager = struct {
     }
 
     fn loadParticipantSet(self: *TxnManager, alloc: Allocator, comptime prefix: []const u8, txn_id: TxnId) ![][]u8 {
+        return self.loadParticipantSetWithAdmission(alloc, prefix, txn_id, null);
+    }
+
+    fn loadParticipantSetWithAdmission(self: *TxnManager, alloc: Allocator, comptime prefix: []const u8, txn_id: TxnId, control: ?read_control.Port) ![][]u8 {
         const key = makeSidecarKey(prefix, txn_id);
-        const raw = self.getAlloc(alloc, &key) catch |err| switch (err) {
+        const raw = self.getAllocWithAdmission(alloc, &key, control) catch |err| switch (err) {
             error.NotFound => return alloc.alloc([]u8, 0),
             else => return err,
         };
         defer alloc.free(raw);
-        return try decodeParticipantList(alloc, raw);
+        return try decodeParticipantListWithAdmission(alloc, raw, control);
     }
 
     pub fn getAlloc(self: *TxnManager, alloc: Allocator, key: []const u8) ![]u8 {
+        return self.getAllocWithAdmission(alloc, key, null);
+    }
+
+    fn getAllocWithAdmission(self: *TxnManager, alloc: Allocator, key: []const u8, control: ?read_control.Port) ![]u8 {
         // These helpers copy one value and release it immediately; none of
         // their callers retain a multi-operation snapshot. On the runtime LSM
         // a bound read clones the mutable memtable, while a probe reads the
         // current tip under the backend lock. In particular, ordinary batch
         // admission calls this for every transaction-intent lock key.
-        var txn = try self.store.beginProbe();
+        var txn = if (control) |owner| try self.store.beginProbeWithAdmission(.retain, owner) else try self.store.beginProbe();
         defer txn.abort();
         const value = try txn.get(key);
-        return try alloc.dupe(u8, value);
+        return try backend_scan.dupeWithAdmission(alloc, value, control);
     }
 
     fn keyExists(self: *TxnManager, key: []const u8) !bool {
@@ -2682,12 +3221,21 @@ pub const TxnManager = struct {
     }
 
     fn applyMutationExtraBatch(self: *TxnManager, extra_batch: MutationExtraBatch) !void {
+        return self.applyMutationExtraBatchWithAdmission(extra_batch, null);
+    }
+
+    fn applyMutationExtraBatchWithAdmission(self: *TxnManager, extra_batch: MutationExtraBatch, control: ?read_control.Port) !void {
+        if (control) |owner| try owner.checkpoint();
         if (extra_batch.writes.len == 0 and extra_batch.deletes.len == 0) return;
-        try self.applyBatch(extra_batch.writes, extra_batch.deletes, null);
+        try self.applyBatchWithAdmission(extra_batch.writes, extra_batch.deletes, null, control);
     }
 
     fn applyBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {
-        return self.applyBatchWithReservation(writes, deletes, replay, null);
+        return self.applyBatchWithAdmission(writes, deletes, replay, null);
+    }
+
+    fn applyBatchWithAdmission(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, control: ?read_control.Port) !void {
+        return self.applyBatchWithParticipantAndAdmission(writes, deletes, replay, null, null, control);
     }
 
     const ReservationChange = struct { previous: u64, next: u64 };
@@ -2696,21 +3244,26 @@ pub const TxnManager = struct {
     }
 
     fn applyBatchWithParticipant(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant) !void {
+        return self.applyBatchWithParticipantAndAdmission(writes, deletes, replay, reservation, participant, null);
+    }
+
+    fn applyBatchWithParticipantAndAdmission(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port) !void {
+        if (control) |owner| try owner.checkpoint();
         var batch = try self.store.beginBatch();
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
-        for (deletes) |key| {
-            batch.delete(key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
-        }
-        for (writes) |kv| {
-            try batch.put(kv.key, kv.value);
-        }
-        if (replay) |entry| try batch.setReplayOpaque(entry.sequence, entry.payload);
-        try batch.commit();
+        try @import("transaction_batch_admission.zig").apply(&batch, writes, deletes, replay, control);
+    }
+
+    fn traceResolveDecisionConflict(self: *TxnManager, txn_id: TxnId, previous: TxnStatus, requested: TxnStatus, timestamp: u64) void {
+        if (self.trace_writer) |tw| tw.traceEvent(&.{
+            .name = "ResolveDecisionConflict",
+            .txn_id = txn_id,
+            .shard_id = self.shard_id,
+            .timestamp = timestamp,
+            .reason = resolveDecisionConflictReason(previous, requested),
+        });
     }
 
     fn traceWriteIntentSuccess(self: *TxnManager, txn_id: TxnId, intents: []const WriteIntent, predicates: []const VersionPredicate) void {
@@ -2724,9 +3277,13 @@ pub const TxnManager = struct {
     }
 
     fn readTimestamp(self: *TxnManager, key: []const u8) !?u64 {
-        const ts_key = try internal_keys.ttlKeyAlloc(self.alloc, key);
+        return self.readTimestampWithAdmission(key, null);
+    }
+
+    fn readTimestampWithAdmission(self: *TxnManager, key: []const u8, control: ?read_control.Port) !?u64 {
+        const ts_key = try @import("transaction_intent_admission.zig").userKey(self.alloc, key, internal_keys.ttl_kind, control);
         defer self.alloc.free(ts_key);
-        const val = self.getAlloc(self.alloc, ts_key) catch |err| switch (err) {
+        const val = self.getAllocWithAdmission(self.alloc, ts_key, control) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
@@ -3148,29 +3705,59 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
 }
 
 fn participantListsEqual(a: []const []const u8, b: []const []const u8) bool {
+    return participantListsEqualWithAdmission(a, b, null) catch unreachable;
+}
+
+pub fn participantListsEqualWithAdmission(a: []const []const u8, b: []const []const u8, control: ?read_control.Port) !bool {
+    if (control) |owner| try owner.checkpoint();
     if (a.len != b.len) return false;
     for (a, b) |left, right| {
-        if (!std.mem.eql(u8, left, right)) return false;
+        if (control) |owner| try owner.checkpoint();
+        if (left.len != right.len) return false;
+        var offset: usize = 0;
+        while (offset < left.len) {
+            if (control) |owner| try owner.checkpoint();
+            const end = offset + @min(left.len - offset, 4096);
+            if (!std.mem.eql(u8, left[offset..end], right[offset..end])) return false;
+            offset = end;
+        }
     }
+    if (control) |owner| try owner.checkpoint();
     return true;
 }
 
 fn encodeParticipantList(alloc: Allocator, participants: []const []const u8) ![]u8 {
+    return encodeParticipantListWithAdmission(alloc, participants, null);
+}
+
+pub fn encodeParticipantListWithAdmission(alloc: Allocator, participants: []const []const u8, control: ?read_control.Port) ![]u8 {
+    if (control) |owner| try owner.checkpoint();
+    if (participants.len > std.math.maxInt(u32)) return TxnError.InvalidTxnRecord;
     var total: usize = 4;
-    for (participants) |participant| total += 4 + participant.len;
+    for (participants) |participant| {
+        if (control) |owner| try owner.checkpoint();
+        if (participant.len > std.math.maxInt(u32)) return TxnError.InvalidTxnRecord;
+        total = std.math.add(usize, total, 4) catch return error.OutOfMemory;
+        total = std.math.add(usize, total, participant.len) catch return error.OutOfMemory;
+    }
     const buf = try alloc.alloc(u8, total);
-    var count_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &count_buf, @intCast(participants.len), .little);
-    @memcpy(buf[0..4], &count_buf);
+    errdefer alloc.free(buf);
+    std.mem.writeInt(u32, buf[0..4], @intCast(participants.len), .little);
     var offset: usize = 4;
     for (participants) |participant| {
-        var len_buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &len_buf, @intCast(participant.len), .little);
-        @memcpy(buf[offset .. offset + 4], &len_buf);
+        if (control) |owner| try owner.checkpoint();
+        std.mem.writeInt(u32, buf[offset..][0..4], @intCast(participant.len), .little);
         offset += 4;
-        @memcpy(buf[offset .. offset + participant.len], participant);
+        var copied: usize = 0;
+        while (copied < participant.len) {
+            if (control) |owner| try owner.checkpoint();
+            const end = copied + @min(participant.len - copied, 4096);
+            @memcpy(buf[offset + copied .. offset + end], participant[copied..end]);
+            copied = end;
+        }
         offset += participant.len;
     }
+    if (control) |owner| try owner.checkpoint();
     return buf;
 }
 
@@ -3178,7 +3765,7 @@ fn decodeParticipantList(alloc: Allocator, raw: []const u8) ![][]u8 {
     return decodeParticipantListWithAdmission(alloc, raw, null);
 }
 
-fn decodeParticipantListWithAdmission(alloc: Allocator, raw: []const u8, control: ?read_control.Port) ![][]u8 {
+pub fn decodeParticipantListWithAdmission(alloc: Allocator, raw: []const u8, control: ?read_control.Port) ![][]u8 {
     if (control) |owner| try owner.checkpoint();
     if (raw.len < 4) return TxnError.InvalidTxnRecord;
     var count_buf: [4]u8 = undefined;
@@ -3268,6 +3855,605 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "prepared transaction effects required begin survives restart before and after sealing" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "required-prepare-reopen");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(0xb1);
+    const catalogs: [32]u8 = @splat(55);
+    const receipt_key = "\x00\x00__metadata__:required-begin-receipt";
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.initTransactionRequiringPreparedEffects(id, 10, 11, &.{}, false, false, .{ .mode = .synchronous }, .{ .writes = &.{.{ .key = receipt_key, .value = "same-batch" }} }, null);
+        try std.testing.expectError(error.PreparedEffectsRequired, manager.resolveIntents(id, .committed, 100));
+        try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(id));
+        try manager.initTransaction(id, 10);
+        try std.testing.expectEqual(prepared_effects.Mode.synchronous, (try manager.loadPreparationRequirement(id, null)).?.mode);
+        try manager.initTransactionRequiringPreparedEffects(id, 10, 11, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+        try std.testing.expectError(error.PreparationContractConflict, manager.initTransactionRequiringPreparedEffects(id, 10, 11, &.{}, false, false, .{ .mode = .deferred }, .{}, null));
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = "first" }}, &.{});
+        try manager.writeIntents(id, &.{.{ .key = "other", .value = null }}, &.{});
+        const receipt = try store.get(a, receipt_key);
+        defer a.free(receipt);
+        try std.testing.expectEqualStrings("same-batch", receipt);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 2), (try publication_backlog.load(&read)).?.records);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try std.testing.expectError(error.PreparedEffectsRequired, manager.resolveIntents(id, .committed, 100));
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = "second" }}, &.{});
+        const contract = try manager.preparedEffectsContract(id, catalogs, .synchronous, null);
+        const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+        defer a.free(frame);
+        try std.testing.expectError(error.PreparationContractConflict, manager.sealPreparedEffects(id, frame, catalogs, .deferred, null));
+        try manager.sealPreparedEffects(id, frame, catalogs, .synchronous, null);
+        try manager.initTransactionRequiringPreparedEffects(id, 10, 11, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 3), (try publication_backlog.load(&read)).?.records);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try std.testing.expectEqual(prepared_effects.Mode.synchronous, (try manager.loadPreparationRequirement(id, null)).?.mode);
+        var plan = (try manager.loadPreparedEffects(a, id, null)).?;
+        defer plan.deinit();
+        _ = try manager.resolvePreparedIntents(id, 100, &plan, .{}, null);
+        try std.testing.expect(!try manager.hasPreparationRequirement(id));
+        try std.testing.expect(!try manager.hasPreparedEffects(id));
+        const row = try getVisibleDocRuntime(&manager.store, a, "row");
+        defer a.free(row);
+        try std.testing.expectEqualStrings("second", row);
+        try std.testing.expectError(TxnError.DecisionConflict, manager.initTransactionRequiringPreparedEffects(id, 10, 11, &.{}, false, false, .{ .mode = .synchronous }, .{}, null));
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 0), (try publication_backlog.load(&read)).?.records);
+        const key = makePreparationRequirementKey(id);
+        try std.testing.expect(!@import("portable_backup.zig").isPortableMetadataKey(&key));
+    }
+}
+
+test "prepared transaction effects required begin refuses legacy upgrades and corrupt modes" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const legacy: TxnId = @splat(0xb2);
+    const required: TxnId = @splat(0xb3);
+    const orphan: TxnId = @splat(0xb4);
+    const reserved_key = makePreparationRequirementKey(required);
+    const reserved_frame = makePreparedEffectsKey(required);
+    const forged = (prepared_effects.Requirement{ .mode = .deferred }).encode();
+    try std.testing.expectError(error.InvalidPreparationRequirement, manager.initTransactionRequiringPreparedEffects(required, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{ .writes = &.{.{ .key = &reserved_key, .value = &forged }} }, null));
+    try std.testing.expectError(error.InvalidPreparationRequirement, manager.initTransactionRequiringPreparedEffects(required, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{ .deletes = &.{&reserved_key} }, null));
+    try std.testing.expectError(error.InvalidPreparationRequirement, manager.initTransactionRequiringPreparedEffects(required, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{ .writes = &.{.{ .key = &reserved_frame, .value = "forged" }} }, null));
+    try std.testing.expectError(TxnError.TxnNotFound, manager.getTransactionStatus(required));
+    try manager.initTransaction(legacy, 1);
+    try std.testing.expectError(error.PreparationContractConflict, manager.initTransactionRequiringPreparedEffects(legacy, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null));
+    try manager.writeIntents(legacy, &.{.{ .key = "legacy", .value = "unchanged" }}, &.{});
+    try manager.resolveIntents(legacy, .committed, 10);
+    const legacy_requirement = makePreparationRequirementKey(legacy);
+    try manager.applyBatch(&.{.{ .key = &legacy_requirement, .value = &forged }}, &.{}, null);
+    try std.testing.expectError(error.InvalidTxnRecord, manager.resolveIntents(legacy, .committed, 10));
+    try std.testing.expectError(TxnError.DecisionConflict, manager.resolveIntents(legacy, .aborted, 10));
+    try std.testing.expect(!try manager.cleanupTransactionMetadataIfEligibleExtraBatch(legacy, 100, 100, .{}));
+    try std.testing.expect(try manager.hasPreparationRequirement(legacy));
+    try manager.initTransactionRequiringPreparedEffects(required, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+    const catalogs: [32]u8 = @splat(56);
+    try manager.writeIntents(required, &.{.{ .key = "required", .value = "uncommitted" }}, &.{});
+    const contract = try manager.preparedEffectsContract(required, catalogs, .synchronous, null);
+    const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(frame);
+    try manager.sealPreparedEffects(required, frame, catalogs, .synchronous, null);
+    var plan = (try manager.loadPreparedEffects(a, required, null)).?;
+    defer plan.deinit();
+    const key = makePreparationRequirementKey(required);
+    var raw = (prepared_effects.Requirement{ .mode = .deferred }).encode();
+    try manager.applyBatch(&.{.{ .key = &key, .value = &raw }}, &.{}, null);
+    try std.testing.expectError(error.PreparationContractConflict, manager.loadPreparedEffects(a, required, null));
+    try std.testing.expectError(error.PreparationContractConflict, manager.resolvePreparedIntents(required, 10, &plan, .{}, null));
+    raw[39] ^= 1;
+    try manager.applyBatch(&.{.{ .key = &key, .value = &raw }}, &.{}, null);
+    try std.testing.expectError(error.InvalidPreparationRequirement, manager.resolveIntents(required, .committed, 10));
+    try manager.resolveIntents(required, .aborted, 10);
+    try std.testing.expect(!try manager.hasPreparationRequirement(required));
+    try std.testing.expect(!try manager.hasPreparedEffects(required));
+    // An aborted terminal record can retire an opaque leftover requirement.
+    try manager.applyBatch(&.{.{ .key = &key, .value = &raw }}, &.{}, null);
+    try manager.resolveIntents(required, .aborted, 10);
+    try std.testing.expect(!try manager.hasPreparationRequirement(required));
+    const orphan_key = makePreparationRequirementKey(orphan);
+    const valid = (prepared_effects.Requirement{ .mode = .deferred }).encode();
+    try manager.applyBatch(&.{.{ .key = &orphan_key, .value = &valid }}, &.{}, null);
+    try std.testing.expectError(error.InvalidTxnRecord, manager.initTransactionRequiringPreparedEffects(orphan, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null));
+    try std.testing.expectError(TxnError.TxnNotFound, manager.getTransactionStatus(orphan));
+}
+
+test "prepared transaction effects required begin reserves before publication and retries at capacity" {
+    const a = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(a, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    const id: TxnId = @splat(0xb5);
+    const refused: TxnId = @splat(0xb6);
+    try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+    const prefix = @import("db/durable_outbox.zig").replication_outbox_v2_prefix;
+    var filler: [prefix.len + 8]u8 = undefined;
+    @memcpy(filler[0..prefix.len], prefix);
+    var fill = try store.beginWriteBatch();
+    errdefer fill.abort();
+    for (0..publication_backlog.default_max_records - 1) |i| {
+        std.mem.writeInt(u64, filler[prefix.len..][0..8], i, .big);
+        try fill.put(&filler, "x");
+    }
+    try fill.commit();
+    try std.testing.expectError(error.Backpressured, manager.initTransactionRequiringPreparedEffects(refused, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{ .writes = &.{.{ .key = "receipt-refused", .value = "absent" }} }, null));
+    try std.testing.expectError(TxnError.TxnNotFound, manager.getTransactionStatus(refused));
+    try std.testing.expect(!try manager.hasPreparationRequirement(refused));
+    try std.testing.expectError(error.NotFound, store.get(a, "receipt-refused"));
+    try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+    try std.testing.expectError(error.Backpressured, manager.writeIntents(id, &.{.{ .key = "row", .value = "first" }}, &.{}));
+    try std.testing.expect(!(try manager.loadTransactionRecord(id)).prepared);
+    try store.delete(&filler);
+    try manager.writeIntents(id, &.{.{ .key = "row", .value = "first" }}, &.{});
+    const catalogs: [32]u8 = @splat(57);
+    var contract = try manager.preparedEffectsContract(id, catalogs, .deferred, null);
+    const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(frame);
+    try std.testing.expectError(error.Backpressured, manager.sealPreparedEffects(id, frame, catalogs, .deferred, null));
+    try manager.writeIntents(id, &.{.{ .key = "row", .value = "second" }}, &.{});
+    std.mem.writeInt(u64, filler[prefix.len..][0..8], 0, .big);
+    try store.delete(&filler);
+    contract = try manager.preparedEffectsContract(id, catalogs, .deferred, null);
+    const updated = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(updated);
+    try manager.sealPreparedEffects(id, updated, catalogs, .deferred, null);
+    try manager.resolveIntents(id, .aborted, 10);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(publication_backlog.default_max_records - 3, (try publication_backlog.load(&read)).?.records);
+}
+
+test "prepared transaction effects required begin releases every failed allocation atomically" {
+    const Case = struct {
+        fn run(failing: Allocator) !void {
+            const a = std.testing.allocator;
+            var backend = mem_backend.Backend.init(a, .{});
+            defer backend.close();
+            var runtime = try backend.runtimeStore(a, .{});
+            defer runtime.deinit();
+            var manager = try TxnManager.init(a, &runtime);
+            defer manager.deinit();
+            const id: TxnId = @splat(0xb7);
+            manager.alloc = failing;
+            const result = manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{ "one", "two" }, true, true, .{ .mode = .synchronous }, .{ .writes = &.{.{ .key = "required-receipt", .value = "atomic" }} }, null);
+            manager.alloc = a;
+            if (result) |_| {
+                try std.testing.expect(try manager.hasPreparationRequirement(id));
+                try manager.resolveIntents(id, .aborted, 10);
+            } else |err| {
+                try std.testing.expectError(TxnError.TxnNotFound, manager.getTransactionStatus(id));
+                try std.testing.expect(!try manager.hasPreparationRequirement(id));
+                try std.testing.expectError(error.NotFound, manager.getAlloc(a, "required-receipt"));
+                return err;
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "prepared transaction effects required begin original rejections never create a legacy record" {
+    const Control = struct {
+        checks: usize = 0,
+        reject: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.reject) return self.cause;
+        }
+    };
+    const Case = struct {
+        fn run(c: *Control) !void {
+            const a = std.testing.allocator;
+            var backend = mem_backend.Backend.init(a, .{});
+            defer backend.close();
+            var runtime = try backend.runtimeStore(a, .{});
+            defer runtime.deinit();
+            var manager = try TxnManager.init(a, &runtime);
+            defer manager.deinit();
+            const id: TxnId = @splat(0xb8);
+            const payload: read_control.Payload = .{ .ptr = c, .vtable = &.{ .checkpoint = Control.check } };
+            const port = read_control.Port.init(&payload);
+            const result = manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, port);
+            if (result) |_| {
+                try manager.resolveIntents(id, .aborted, 10);
+            } else |err| {
+                try std.testing.expectError(TxnError.TxnNotFound, manager.getTransactionStatus(id));
+                try std.testing.expect(!try manager.hasPreparationRequirement(id));
+                return err;
+            }
+        }
+    };
+    var baseline: Control = .{};
+    try Case.run(&baseline);
+    try std.testing.expect(baseline.checks > 8);
+    for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.MemoryLimitExceeded }) |cause| {
+        for (1..baseline.checks + 1) |reject| {
+            var stopped: Control = .{ .reject = reject, .cause = cause };
+            try std.testing.expectError(cause, Case.run(&stopped));
+            try std.testing.expectEqual(reject, stopped.checks);
+        }
+    }
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    var stopped: Control = .{ .reject = 1 };
+    const payload: read_control.Payload = .{ .ptr = &stopped, .vtable = &.{ .checkpoint = Control.check } };
+    try std.testing.expectError(error.NotFound, manager.loadPreparationRequirement(@splat(0xb9), read_control.Port.init(&payload)));
+}
+
+test "prepared transaction effects seal survives native reopen and consumes once" {
+    const a = std.testing.allocator;
+    const path = try tempTestPath(a, "prepared-effects-seal");
+    defer a.free(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(91);
+    const catalogs: [32]u8 = @splat(17);
+    const effect_key = "\x00\x00__metadata__:prepared-test-effect";
+    var revision: u64 = 0;
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        try manager.initTransaction(id, 10);
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = "first" }}, &.{});
+        try manager.writeIntents(id, &.{ .{ .key = "row", .value = "second" }, .{ .key = "deleted", .value = null } }, &.{});
+        const contract = try manager.preparedEffectsContract(id, catalogs, .synchronous, null);
+        revision = contract.intent_revision;
+        const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{ .artifact_writes = @constCast(&[_]@import("db/types.zig").BatchWrite{.{ .key = effect_key, .value = "accepted" }}) } }, null);
+        defer a.free(frame);
+        var before_probe = try store.beginReadTxn();
+        const before = (try publication_backlog.load(&before_probe)).?;
+        before_probe.abort();
+        try manager.sealPreparedEffects(id, frame, catalogs, .synchronous, null);
+        var after_probe = try store.beginReadTxn();
+        const after = (try publication_backlog.load(&after_probe)).?;
+        after_probe.abort();
+        try std.testing.expectEqual(before.records + 1, after.records);
+        try std.testing.expectEqual(before.bytes + makePreparedEffectsKey(id).len + frame.len, after.bytes);
+        try manager.sealPreparedEffects(id, frame, catalogs, .synchronous, null);
+        try std.testing.expectEqual(revision, (try manager.loadTransactionRecord(id)).intent_revision);
+        try std.testing.expectError(error.PreparedEffectsSealed, manager.writeIntents(id, &.{.{ .key = "row", .value = "changed" }}, &.{}));
+        try std.testing.expectError(error.PreparedEffectsRequired, manager.resolveIntents(id, .committed, 100));
+        const different = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+        defer a.free(different);
+        try std.testing.expectError(error.PreparedEffectsConflict, manager.sealPreparedEffects(id, different, catalogs, .synchronous, null));
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(after, (try publication_backlog.load(&read)).?);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(a, &store);
+        defer manager.deinit();
+        var plan = (try manager.loadPreparedEffects(a, id, null)).?;
+        defer plan.deinit();
+        try std.testing.expectEqual(revision, plan.decoded.plan.contract.intent_revision);
+        try std.testing.expectEqual(prepared_effects.Mode.synchronous, plan.decoded.plan.contract.mode);
+        try std.testing.expectError(error.PreparedEffectsRequired, manager.resolveIntents(id, .committed, 100));
+        const effect = plan.decoded.plan.effects.artifact_writes[0];
+        const batch: ResolutionExtraBatch = .{ .writes = &.{.{ .key = effect.key, .value = effect.value }} };
+        try std.testing.expect((try manager.resolvePreparedIntents(id, 100, &plan, batch, null)).applied);
+        try std.testing.expect(!try manager.hasPreparedEffects(id));
+        try std.testing.expect((try manager.loadPreparedEffects(a, id, null)) == null);
+        const visible = try getVisibleDocRuntime(&manager.store, a, "row");
+        defer a.free(visible);
+        try std.testing.expectEqualStrings("second", visible);
+        const output = try store.get(a, effect_key);
+        defer a.free(output);
+        try std.testing.expectEqualStrings("accepted", output);
+        try store.put(effect_key, "newer");
+        try std.testing.expect(!(try manager.resolvePreparedIntents(id, 100, &plan, batch, null)).applied);
+        const newer = try store.get(a, effect_key);
+        defer a.free(newer);
+        try std.testing.expectEqualStrings("newer", newer);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 0), (try publication_backlog.load(&read)).?.records);
+    }
+}
+
+test "prepared transaction effects refuse stale inputs mode schema and missing seals" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(92);
+    const catalogs: [32]u8 = @splat(18);
+    try manager.initTransaction(id, 10);
+    try manager.writeIntentsExtraBatch(id, &.{.{ .key = "row", .value = "{}", .prepared_row = "first-row" }}, &.{}, .{ .schema_binding = .{ .version = 19 } });
+    const contract = try manager.preparedEffectsContract(id, catalogs, .deferred, null);
+    const old = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(old);
+    try manager.writeIntentsExtraBatch(id, &.{.{ .key = "row", .value = "{}", .prepared_row = "second-row" }}, &.{}, .{ .schema_binding = .{ .version = 19 } });
+    try std.testing.expectError(error.PreparedEffectsMismatch, manager.sealPreparedEffects(id, old, catalogs, .deferred, null));
+    const current = try manager.preparedEffectsContract(id, catalogs, .deferred, null);
+    try std.testing.expect(!std.mem.eql(u8, &contract.intent_digest, &current.intent_digest));
+    var wrong = current;
+    wrong.schema_version = 20;
+    const wrong_frame = try prepared_effects.encode(a, .{ .contract = wrong, .effects = .{} }, null);
+    defer a.free(wrong_frame);
+    try std.testing.expectError(error.PreparedEffectsMismatch, manager.sealPreparedEffects(id, wrong_frame, catalogs, .deferred, null));
+    const frame = try prepared_effects.encode(a, .{ .contract = current, .effects = .{} }, null);
+    defer a.free(frame);
+    try std.testing.expectError(error.PreparedEffectsMismatch, manager.sealPreparedEffects(id, frame, catalogs, .synchronous, null));
+    try std.testing.expectError(error.PreparedEffectsMismatch, manager.sealPreparedEffects(id, frame, @splat(99), .deferred, null));
+    try std.testing.expect(!try manager.hasPreparedEffects(id));
+    try manager.sealPreparedEffects(id, frame, catalogs, .deferred, null);
+    var plan = (try manager.loadPreparedEffects(a, id, null)).?;
+    defer plan.deinit();
+    const key = makePreparedEffectsKey(id);
+    try manager.applyBatch(&.{}, &.{&key}, null);
+    try std.testing.expectError(error.PreparedEffectsRequired, manager.resolvePreparedIntents(id, 100, &plan, .{}, null));
+    try manager.sealPreparedEffects(id, frame, catalogs, .deferred, null);
+    // Abort retires opaque bytes; corrupt plans cannot make abort depend on a
+    // successful decoder or synchronous producer.
+    const bad = try a.dupe(u8, frame);
+    defer a.free(bad);
+    bad[bad.len - 1] ^= 1;
+    try manager.applyBatch(&.{.{ .key = &key, .value = bad }}, &.{}, null);
+    try std.testing.expectError(error.InvalidPreparedEffects, manager.loadPreparedEffects(a, id, null));
+    try manager.resolveIntents(id, .aborted, 100);
+    try std.testing.expect(!try manager.hasPreparedEffects(id));
+}
+
+test "prepared transaction effects admission refuses sealing before durable growth" {
+    const a = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(a, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(a, &store);
+    defer manager.deinit();
+    const id: TxnId = @splat(93);
+    const catalogs: [32]u8 = @splat(19);
+    try manager.initTransaction(id, 1);
+    try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+    var contract = try manager.preparedEffectsContract(id, catalogs, .deferred, null);
+    const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(frame);
+    const prefix = @import("db/durable_outbox.zig").replication_outbox_v2_prefix;
+    var filler: [prefix.len + 8]u8 = undefined;
+    @memcpy(filler[0..prefix.len], prefix);
+    var fill = try store.beginWriteBatch();
+    errdefer fill.abort();
+    for (0..publication_backlog.default_max_records - 1) |i| {
+        std.mem.writeInt(u64, filler[prefix.len..][0..8], i, .big);
+        try fill.put(&filler, "x");
+    }
+    try fill.commit();
+    try std.testing.expectError(error.Backpressured, manager.sealPreparedEffects(id, frame, catalogs, .deferred, null));
+    try std.testing.expect(!try manager.hasPreparedEffects(id));
+    try std.testing.expectEqual(contract.intent_revision, (try manager.loadTransactionRecord(id)).intent_revision);
+    // Refusal did not freeze the existing prepare or consume a record credit.
+    try manager.writeIntents(id, &.{.{ .key = "row", .value = "updated" }}, &.{});
+    try store.delete(&filler);
+    contract = try manager.preparedEffectsContract(id, catalogs, .deferred, null);
+    const updated = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(updated);
+    try manager.sealPreparedEffects(id, updated, catalogs, .deferred, null);
+    try manager.sealPreparedEffects(id, updated, catalogs, .deferred, null);
+    try manager.resolveIntents(id, .aborted, 10);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(publication_backlog.default_max_records - 2, (try publication_backlog.load(&read)).?.records);
+}
+
+test "prepared transaction effects seal and load release every allocation failure" {
+    const Case = struct {
+        fn run(failing: Allocator) !void {
+            const a = std.testing.allocator;
+            var backend = mem_backend.Backend.init(a, .{});
+            defer backend.close();
+            var runtime = try backend.runtimeStore(a, .{});
+            defer runtime.deinit();
+            var manager = try TxnManager.init(a, &runtime);
+            defer manager.deinit();
+            const id: TxnId = @splat(94);
+            const catalogs: [32]u8 = @splat(20);
+            try manager.initTransaction(id, 1);
+            try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+            const contract = try manager.preparedEffectsContract(id, catalogs, .synchronous, null);
+            const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{ .artifact_delete_keys = &.{"old-artifact"} } }, null);
+            defer a.free(frame);
+            manager.alloc = failing;
+            const sealed = manager.sealPreparedEffects(id, frame, catalogs, .synchronous, null);
+            manager.alloc = a;
+            if (sealed) |_| {} else |err| {
+                try std.testing.expect(!try manager.hasPreparedEffects(id));
+                try std.testing.expectEqual(contract.intent_revision, (try manager.loadTransactionRecord(id)).intent_revision);
+                return err;
+            }
+            manager.alloc = failing;
+            const loaded = manager.loadPreparedEffects(failing, id, null);
+            manager.alloc = a;
+            if (loaded) |value| {
+                var owned = value.?;
+                owned.deinit();
+            } else |err| {
+                try std.testing.expect(try manager.hasPreparedEffects(id));
+                try manager.resolveIntents(id, .aborted, 10);
+                return err;
+            }
+            try manager.resolveIntents(id, .aborted, 10);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "transaction batch publication reserves before vote and delivers at quota across restart" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-publication-credit");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    const id: TxnId = @splat(81);
+    const refused_id: TxnId = @splat(82);
+    const credit_key = publication_backlog.transactionCreditKey(id);
+    const batch_key = makeTransactionReplicationBatchOutboxKey(id);
+    const effects = @import("db/replication_effects.zig");
+    const payload = try effects.encodeBatchMutationRequestAlloc(alloc, .{ .writes = &.{.{ .key = "row", .value = "{}" }}, .timestamp_ns = 10 });
+    defer alloc.free(payload);
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.initTransaction(id, 1);
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+        const credit = try store.get(alloc, &credit_key);
+        defer alloc.free(credit);
+        try std.testing.expect(payload.len <= std.mem.readInt(u64, credit[0..8], .little));
+        var fill = try store.beginWriteBatch();
+        var fill_open = true;
+        defer if (fill_open) fill.abort();
+        const prefix = @import("db/durable_outbox.zig").replication_outbox_v2_prefix;
+        var filler: [prefix.len + 8]u8 = undefined;
+        @memcpy(filler[0..prefix.len], prefix);
+        for (0..publication_backlog.default_max_records - 1) |i| {
+            std.mem.writeInt(u64, filler[prefix.len..][0..8], i, .big);
+            try fill.put(&filler, "x");
+        }
+        try fill.commit();
+        fill_open = false;
+        try manager.initTransaction(refused_id, 2);
+        try std.testing.expectError(error.Backpressured, manager.writeIntents(refused_id, &.{.{ .key = "refused", .value = "{}" }}, &.{}));
+        try std.testing.expect(!(try manager.loadTransactionRecord(refused_id)).prepared);
+        try std.testing.expect(!(try manager.hasIntents(refused_id)));
+        // Replacing an existing prepare reuses its record credit at capacity.
+        try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+        _ = try manager.resolveIntentsWithExtraBatch(id, .committed, 10, .{ .writes = &.{.{ .key = &batch_key, .value = payload }} });
+        try std.testing.expect(!(try manager.hasIntents(id)));
+        const held = try store.get(alloc, &credit_key);
+        defer alloc.free(held);
+        try std.testing.expectEqualSlices(u8, credit, held);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        var pending = try manager.loadReplicationOutbox(alloc, id);
+        defer pending.deinit(alloc);
+        try std.testing.expectEqualSlices(u8, payload, pending.batch_payload.?);
+        try std.testing.expectError(error.Backpressured, manager.writeIntents(refused_id, &.{.{ .key = "refused", .value = "{}" }}, &.{}));
+        try manager.clearReplicationOutbox(id, .batch);
+        try manager.clearReplicationOutbox(id, .batch);
+        try std.testing.expectError(error.NotFound, store.get(alloc, &credit_key));
+        try manager.writeIntents(refused_id, &.{.{ .key = "refused", .value = "{}" }}, &.{});
+        try manager.resolveIntents(refused_id, .aborted, 11);
+        const aborted_credit = publication_backlog.transactionCreditKey(refused_id);
+        try std.testing.expectError(error.NotFound, store.get(alloc, &aborted_credit));
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(publication_backlog.default_max_records - 1, (try publication_backlog.load(&read)).?.records);
+    }
+}
+
+test "transaction batch publication fences legacy prepares without blocking their committed outbox" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const legacy: TxnId = @splat(83);
+    const next: TxnId = @splat(84);
+    try manager.initTransaction(legacy, 1);
+    try manager.initTransaction(next, 2);
+    var record = try manager.loadTransactionRecord(legacy);
+    record.prepared = true;
+    record.intent_revision = 1;
+    const raw_record = try manager.encodeRecord(record);
+    defer alloc.free(raw_record);
+    const record_key = makeRecordKey(legacy);
+    try store.put(&record_key, raw_record);
+    const intent_key = try manager.makeIntentKey(legacy, "legacy");
+    defer alloc.free(intent_key);
+    try store.put(intent_key, "\x00{}");
+    try std.testing.expectError(error.Backpressured, manager.writeIntents(next, &.{.{ .key = "new", .value = "{}" }}, &.{}));
+    const outbox_key = makeTransactionReplicationBatchOutboxKey(legacy);
+    _ = try manager.resolveIntentsWithExtraBatch(legacy, .committed, 3, .{ .writes = &.{.{ .key = &outbox_key, .value = "legacy HA payload" }} });
+    try std.testing.expectError(error.Backpressured, manager.writeIntents(next, &.{.{ .key = "new", .value = "{}" }}, &.{}));
+    try manager.clearReplicationOutbox(legacy, .batch);
+    try manager.writeIntents(next, &.{.{ .key = "new", .value = "{}" }}, &.{});
+    try manager.resolveIntents(next, .aborted, 4);
+}
+
+test "transaction batch publication budget covers actual escaped and binary request envelopes" {
+    const alloc = std.testing.allocator;
+    const effects = @import("db/replication_effects.zig");
+    const fixed = try std.json.Stringify.valueAlloc(alloc, effects.BatchMutationPayload{
+        .schema_version = 21,
+        .ordinary_raft_entry = .{ .term = std.math.maxInt(u64), .index = std.math.maxInt(u64) },
+        .request = .{ .timestamp_ns = std.math.maxInt(u64), .restore_staging_scope = @splat(255), .sync_level = .full_index },
+    }, .{});
+    defer alloc.free(fixed);
+    try std.testing.expect(fixed.len < 64 * 1024);
+    const pattern = [_]u8{ 0, 1, 8, 9, 10, 13, 31, '"', '\\' };
+    var bytes: [576]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = pattern[i % pattern.len];
+    for ([_][]const u8{ "row:\x00\"\\\n", "\x00\x00__metadata__:binary\xff\x00" }) |key| {
+        const intent: WriteIntent = .{ .key = key, .value = &bytes };
+        const payload = try effects.encodeBatchMutationRequestAlloc(alloc, .{ .writes = &.{.{ .key = key, .value = &bytes }}, .deletes = &.{key}, .timestamp_ns = std.math.maxInt(u64) });
+        defer alloc.free(payload);
+        const cost = try intentAdmissionBytes(intent);
+        try std.testing.expect(payload.len <= try publication_backlog.transactionBatchBudget(cost * 2));
+    }
+    try std.testing.expectError(error.TransactionTooLarge, publication_backlog.transactionBatchBudget(std.math.maxInt(u64)));
+}
 
 test "retained transaction reservations survive LSM reopen and guarantee committed resolution at quota" {
     const alloc = std.testing.allocator;
@@ -3471,6 +4657,9 @@ test "workload accepted transactions recover durable decisions after pressured s
         try std.testing.expectEqual(TxnStatus.committed, try manager.getTransactionStatus(committed));
         try std.testing.expectEqual(TxnStatus.aborted, try manager.getTransactionStatus(aborted));
         try std.testing.expect(!(try manager.loadTransactionRecord(committed)).intents_resolved);
+        // Shutdown still has no resource grant for finalization. Its one
+        // deferred-finalization error is intentional; additional errors fail.
+        @import("antfly_test_error_logs").expectErrorLogs(1);
     }
     {
         var backend = try lsm_backend.Backend.open(alloc, path, .{ .resource_manager = &resources });
@@ -5523,12 +6712,11 @@ test "transaction intent collection original admission lazy layout builder wait 
         _ = version.references.fetchAdd(1, .monotonic);
         defer version.release(&backend);
         const captured_count = version.directory.?.count();
-        const locked = if (with_io) version.build_mu.tryLock() else version.build_fallback_mu.tryLock();
-        try std.testing.expect(locked);
+        try std.testing.expect(!version.preparing);
+        version.preparing = true;
         const State = struct {
             backend: *lsm_backend.Backend,
             version: *runtime.ReadVersion,
-            with_io: bool,
             expire: bool,
             expired: bool = false,
             waits: usize = 0,
@@ -5537,8 +6725,9 @@ test "transaction intent collection original admission lazy layout builder wait 
                 if (self.expired) return error.DeadlineExceeded;
             }
             fn unlock(self: *@This()) void {
-                if (self.with_io) self.version.build_mu.unlock(std.testing.io) else self.version.build_fallback_mu.unlock();
+                self.version.preparing = false;
             }
+            fn transfer(_: *anyopaque) !void {}
             fn wait(raw: *anyopaque) !void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 self.waits += 1;
@@ -5553,12 +6742,14 @@ test "transaction intent collection original admission lazy layout builder wait 
                     try write.put(.{}, "after", "new");
                     try write.commit();
                     try self.backend.flushBufferedWritesWithOptions(.{ .compact = false });
+                    try std.testing.expect(self.backend.mu.tryLock());
                     self.unlock();
+                    self.backend.mu.unlock();
                 }
             }
         };
-        var state: State = .{ .backend = &backend, .version = version, .with_io = with_io, .expire = expire };
-        const source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .wait_for_progress = State.wait } };
+        var state: State = .{ .backend = &backend, .version = version, .expire = expire };
+        const source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .check_lifetime = State.check, .wait_for_progress = State.wait }, .execution_wait = .{ .ptr = &state, .begin = State.transfer, .end = State.transfer } };
         if (expire) {
             try std.testing.expectError(error.DeadlineExceeded, backend.prepareReadVersionWithAdmission(version, read_control.Port.init(&source)));
             try std.testing.expect(!version.prepared);
@@ -5635,4 +6826,274 @@ test "transaction intent collection original admission lazy projection rejects e
     state.checks = 0;
     source.ptr = &state;
     try std.testing.checkAllAllocationFailures(alloc, Allocation.run, .{ directory, read_control.Port.init(&source) });
+}
+
+test "prepared transaction effects original rejection cannot become absent state" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(95);
+    const catalogs: [32]u8 = @splat(21);
+    try manager.initTransaction(id, 1);
+    try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+    const contract = try manager.preparedEffectsContract(id, catalogs, .deferred, null);
+    const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(frame);
+    const Control = struct {
+        checks: usize = 0,
+        reject: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.reject) return error.NotFound;
+        }
+    };
+    var c: Control = .{ .reject = 1 };
+    const source: read_control.Payload = .{ .ptr = &c, .vtable = &.{ .checkpoint = Control.check } };
+    const port = read_control.Port.init(&source);
+    try std.testing.expectError(error.NotFound, manager.loadPreparedEffects(a, id, port));
+    c = .{};
+    try manager.sealPreparedEffects(id, frame, catalogs, .deferred, port);
+    const seal_checks = c.checks;
+    const key = makePreparedEffectsKey(id);
+    try manager.applyBatch(&.{}, &.{&key}, null);
+    for (1..seal_checks + 1) |reject| {
+        c = .{ .reject = reject };
+        try std.testing.expectError(error.NotFound, manager.sealPreparedEffects(id, frame, catalogs, .deferred, port));
+        try std.testing.expect(!try manager.hasPreparedEffects(id));
+    }
+    try manager.sealPreparedEffects(id, frame, catalogs, .deferred, null);
+    c = .{};
+    var loaded = (try manager.loadPreparedEffects(a, id, port)).?;
+    const load_checks = c.checks;
+    loaded.deinit();
+    for (1..load_checks + 1) |reject| {
+        c = .{ .reject = reject };
+        try std.testing.expectError(error.NotFound, manager.loadPreparedEffects(a, id, port));
+        try std.testing.expect(try manager.hasPreparedEffects(id));
+    }
+    try manager.resolveIntents(id, .aborted, 100);
+}
+
+test "prepared transaction effects terminal decisions retain priority and orphan plans stay fenced" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const catalogs: [32]u8 = @splat(22);
+    for ([_]TxnStatus{ .aborted, .committed }, 0..) |status, i| {
+        const id: TxnId = @splat(@as(u8, @intCast(96 + i)));
+        try manager.initTransaction(id, 1);
+        try manager.writeIntents(id, &.{.{ .key = if (i == 0) "aborted" else "committed", .value = "{}" }}, &.{});
+        const contract = try manager.preparedEffectsContract(id, catalogs, .deferred, null);
+        const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+        defer a.free(frame);
+        try manager.sealPreparedEffects(id, frame, catalogs, .deferred, null);
+        if (status == .aborted) {
+            var record = try manager.loadTransactionRecord(id);
+            record.status = .aborted;
+            record.finalized_at = 10;
+            try manager.saveTransactionRecord(makeRecordKey(id), record);
+            try std.testing.expectError(TxnError.DecisionConflict, manager.resolveIntents(id, .committed, 10));
+            try manager.resolveIntents(id, .aborted, 10);
+        } else {
+            var plan = (try manager.loadPreparedEffects(a, id, null)).?;
+            defer plan.deinit();
+            _ = try manager.resolvePreparedIntents(id, 10, &plan, .{}, null);
+        }
+        // Simulate an old writer leaving an opaque sidecar after terminal
+        // resolution. An abort can retire it; a committed record cannot prove
+        // the plan was consumed and must remain fenced for repair.
+        const key = makePreparedEffectsKey(id);
+        try manager.applyBatch(&.{.{ .key = &key, .value = frame }}, &.{}, null);
+        if (status == .aborted) {
+            try manager.resolveIntents(id, .aborted, 10);
+            try std.testing.expect(!try manager.hasPreparedEffects(id));
+        } else {
+            try std.testing.expectError(TxnError.DecisionConflict, manager.resolveIntents(id, .aborted, 10));
+            try std.testing.expectError(error.InvalidTxnRecord, manager.resolveIntents(id, .committed, 10));
+            try std.testing.expect(!try manager.cleanupTransactionMetadataIfEligibleExtraBatch(id, 100, 100, .{}));
+            try std.testing.expect(try manager.hasPreparedEffects(id));
+        }
+        try std.testing.expect(!@import("portable_backup.zig").isPortableMetadataKey(&key));
+    }
+}
+
+test "prepared transaction effects recovery retains committed obligations and drains legacy" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const required: TxnId = @splat(0xd1);
+    const framed: TxnId = @splat(0xd2);
+    const aborted: TxnId = @splat(0xd3);
+    const legacy: TxnId = @splat(0xd4);
+    try manager.initTransactionRequiringPreparedEffects(required, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+    try manager.writeIntents(required, &.{}, &.{});
+    var record = try manager.loadTransactionRecord(required);
+    try applyResolveDecision(&record, .committed, 10);
+    try manager.saveTransactionRecord(makeRecordKey(required), record);
+    try manager.initTransaction(framed, 1);
+    try manager.writeIntents(framed, &.{}, &.{});
+    const contract = try manager.preparedEffectsContract(framed, @splat(72), .deferred, null);
+    const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(frame);
+    try manager.sealPreparedEffects(framed, frame, @splat(72), .deferred, null);
+    record = try manager.loadTransactionRecord(framed);
+    try applyResolveDecision(&record, .committed, 10);
+    record.intents_resolved = true;
+    record.intents_resolved_known = true;
+    try manager.saveTransactionRecord(makeRecordKey(framed), record);
+    try manager.initTransactionRequiringPreparedEffects(aborted, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+    record = try manager.loadTransactionRecord(aborted);
+    try applyResolveDecision(&record, .aborted, 10);
+    record.intents_resolved = true;
+    record.intents_resolved_known = true;
+    try manager.saveTransactionRecord(makeRecordKey(aborted), record);
+    var corrupt = (prepared_effects.Requirement{ .mode = .synchronous }).encode();
+    corrupt[39] ^= 1;
+    const aborted_requirement = makePreparationRequirementKey(aborted);
+    try manager.applyBatch(&.{.{ .key = &aborted_requirement, .value = &corrupt }}, &.{}, null);
+    try manager.initTransaction(legacy, 1);
+    try manager.writeIntents(legacy, &.{.{ .key = "legacy-visible", .value = "committed" }}, &.{});
+    try manager.resolveIntents(legacy, .committed, 10);
+    const stats = try manager.recoverTransactions(100, 101);
+    try std.testing.expectEqual(@as(u64, 2), stats.deferred_unresolved);
+    try std.testing.expectEqual(@as(u64, 1), stats.resolved_finalized);
+    try std.testing.expectEqual(@as(u64, 1), stats.cleaned_records);
+    try std.testing.expect(try manager.hasPreparationRequirement(required));
+    try std.testing.expect(!(try manager.loadTransactionRecord(required)).intents_resolved);
+    try std.testing.expect(try manager.hasPreparedEffects(framed));
+    try std.testing.expect(!try manager.hasPreparationRequirement(aborted));
+    const visible = try getVisibleDocRuntime(&manager.store, a, "legacy-visible");
+    defer a.free(visible);
+    try std.testing.expectEqualStrings("committed", visible);
+    const next = try manager.recoverTransactions(100, 102);
+    try std.testing.expectEqual(@as(u64, 2), next.deferred_unresolved);
+    try std.testing.expectEqual(@as(u64, 1), next.cleaned_records);
+}
+
+test "prepared transaction effects terminal empty intents still consume accepted materialization once" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(0xd5);
+    try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+    try manager.writeIntents(id, &.{}, &.{});
+    const contract = try manager.preparedEffectsContract(id, @splat(73), .synchronous, null);
+    const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(frame);
+    try manager.sealPreparedEffects(id, frame, @splat(73), .synchronous, null);
+    var record = try manager.loadTransactionRecord(id);
+    try applyResolveDecision(&record, .committed, 2);
+    try manager.saveTransactionRecord(makeRecordKey(id), record);
+    var plan = (try manager.loadPreparedEffects(a, id, null)).?;
+    defer plan.deinit();
+    const batch: ResolutionExtraBatch = .{ .writes = &.{.{ .key = "accepted-artifact", .value = "accepted" }} };
+    try std.testing.expect((try manager.resolvePreparedIntents(id, 2, &plan, batch, null)).applied);
+    const value = try manager.getAllocWithAdmission(a, "accepted-artifact", null);
+    defer a.free(value);
+    try std.testing.expectEqualStrings("accepted", value);
+    try std.testing.expect(!try manager.hasPreparedEffects(id));
+    try std.testing.expect(!try manager.hasPreparationRequirement(id));
+    try manager.applyBatch(&.{.{ .key = "accepted-artifact", .value = "newer" }}, &.{}, null);
+    try std.testing.expect(!(try manager.resolvePreparedIntents(id, 999, &plan, batch, null)).applied);
+    const newer = try manager.getAllocWithAdmission(a, "accepted-artifact", null);
+    defer a.free(newer);
+    try std.testing.expectEqualStrings("newer", newer);
+}
+
+test "prepared transaction effects resolution status preserves original admission errors" {
+    const Control = struct {
+        count: usize = 0,
+        reject: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            if (self.count == self.reject) return self.cause;
+        }
+    };
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(0xd6);
+    try manager.initTransaction(id, 1);
+    var c: Control = .{};
+    const payload: read_control.Payload = .{ .ptr = &c, .vtable = &.{ .checkpoint = Control.check } };
+    const port = read_control.Port.init(&payload);
+    for ([_]TxnId{ id, @splat(0xd7) }) |lookup| {
+        c = .{};
+        const baseline = manager.getTransactionStatusWithAdmission(lookup, port);
+        if (std.mem.eql(u8, &lookup, &id)) {
+            try std.testing.expectEqual(TxnStatus.pending, try baseline);
+        } else try std.testing.expectError(TxnError.TxnNotFound, baseline);
+        const count = c.count;
+        try std.testing.expect(count > 0);
+        for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.MemoryLimitExceeded }) |cause| {
+            for (1..count + 1) |reject| {
+                c = .{ .reject = reject, .cause = cause };
+                try std.testing.expectError(cause, manager.getTransactionStatusWithAdmission(lookup, port));
+                try std.testing.expectEqual(reject, c.count);
+            }
+        }
+    }
+}
+
+test "prepared transaction effects catalog lease fences changes and permits identical publication" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const inventory = @import("db/artifact_inventory.zig");
+    const topology = @import("db/relational_integrity_topology.zig");
+    const key = makePreparedEffectsKey(@splat(0xe1));
+    try manager.applyBatch(&.{.{ .key = inventory.index_key, .value = "original" }}, &.{}, null);
+    {
+        var writer = try manager.store.beginWrite();
+        errdefer writer.abort();
+        try inventory.requirePreparedCatalogUnchanged(&writer, inventory.index_key, "before-seal");
+        // Even a malformed/orphan frame pins the catalog and namespace. No
+        // frame payload is decoded to establish the lease.
+        try writer.put(&key, "opaque-orphan");
+        try std.testing.expect(try inventory.hasPreparedCatalogLease(&writer));
+        try std.testing.expectError(error.SchemaInUse, inventory.requirePreparedCatalogUnchanged(&writer, inventory.index_key, "changed"));
+        try inventory.requirePreparedCatalogUnchanged(&writer, inventory.index_key, "original");
+        try std.testing.expectError(error.SchemaInUse, topology.requireUnfencedOrUnchanged(&writer, inventory.enrichment_key, "new"));
+        try inventory.requirePreparedCatalogUnchanged(&writer, @import("db/catalog/resolver_catalog.zig").merge_catalog_key, "must-drain");
+        try writer.commit();
+    }
+    try std.testing.expect(try manager.hasSchemaLeases());
+    {
+        var writer = try manager.store.beginWrite();
+        errdefer writer.abort();
+        try std.testing.expectError(error.SchemaInUse, inventory.requirePreparedCatalogUnchanged(&writer, inventory.resolver_key, "new"));
+        try writer.delete(&key);
+        try std.testing.expect(!try inventory.hasPreparedCatalogLease(&writer));
+        try inventory.requirePreparedCatalogUnchanged(&writer, inventory.index_key, "after-retirement");
+        try writer.put(inventory.index_key, "after-retirement");
+        try writer.commit();
+    }
+    try std.testing.expect(!try manager.hasSchemaLeases());
 }

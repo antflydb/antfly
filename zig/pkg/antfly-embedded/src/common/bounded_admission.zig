@@ -91,6 +91,7 @@ pub const Controller = struct {
     mutex: std.atomic.Mutex = .unlocked,
     active: usize = 0,
     peak: usize = 0,
+    granted: u64 = 0,
     rejected: u64 = 0,
     queued: usize = 0,
     queued_bytes: u64 = 0,
@@ -143,6 +144,7 @@ pub const Controller = struct {
     fn grant(self: *Controller) void {
         self.active += 1;
         self.peak = @max(self.peak, self.active);
+        self.granted +|= 1;
     }
 
     pub fn tryAcquire(self: *Controller) bool {
@@ -395,6 +397,10 @@ pub const Controller = struct {
         in_flight: usize,
         peak_in_flight: usize,
         rejected_total: u64,
+        /// Operation admission grants, including leases without timing clocks.
+        /// Grant/cancel races count admission, not application execution.
+        /// Null means a projected/legacy snapshot has no authoritative count.
+        granted_total: ?u64 = null,
         queued: usize = 0,
         queued_bytes: u64 = 0,
         waited_total: u64 = 0,
@@ -429,6 +435,7 @@ pub const Controller = struct {
             .in_flight = self.active,
             .peak_in_flight = self.peak,
             .rejected_total = self.rejected,
+            .granted_total = self.granted,
             .queued = self.queued,
             .queued_bytes = self.queued_bytes,
             .waited_total = self.waited,
@@ -469,6 +476,7 @@ test "bounded admission contextual leases measure ownership once under both poli
         Clock.value = 500;
         lease.release();
         const stats = gate.stats();
+        try std.testing.expectEqual(@as(u64, 1), stats.granted_total.?);
         try std.testing.expectEqual(@as(u64, 1), stats.lease_completed_total);
         try std.testing.expectEqual(@as(u64, 150), stats.lease_hold_ns_total);
         try std.testing.expectEqual(@as(u64, 150), stats.lease_hold_ns_max);
@@ -485,13 +493,16 @@ test "bounded admission FIFO grant cancellation and close transfer one owner" {
     try gate.enqueue(&a);
     try gate.enqueue(&b);
     try std.testing.expect(!gate.tryAcquire());
+    try std.testing.expectEqual(@as(u64, 1), gate.stats().granted_total.?);
     active.release();
+    try std.testing.expectEqual(@as(u64, 2), gate.stats().granted_total.?);
     try std.testing.expect(a.state == .granted and b.state == .queued);
     try std.testing.expectError(error.Canceled, gate.retire(&a, error.Canceled));
     try std.testing.expect(b.state == .granted);
     var granted = try gate.retire(&b, null);
     granted.release();
     granted.release();
+    try std.testing.expectEqual(@as(u64, 3), gate.stats().granted_total.?);
     try std.testing.expectEqual(@as(usize, 0), gate.stats().in_flight);
     try std.testing.expectEqual(@as(u64, 0), gate.stats().queued_bytes);
     active = gate.tryAcquireLease().?;
@@ -501,6 +512,7 @@ test "bounded admission FIFO grant cancellation and close transfer one owner" {
     try std.testing.expectError(error.AdmissionClosed, gate.retire(&a, null));
     active.release();
     try std.testing.expect(!gate.tryAcquire());
+    try std.testing.expectEqual(@as(u64, 4), gate.stats().granted_total.?);
 }
 
 test "bounded admission rejects count bytes oversized and invalid policies" {

@@ -36,6 +36,8 @@ const SharedBodyBudget = @import("body_budget.zig").SharedBodyBudget;
 pub const Frame = struct {
     header: Http2FrameHeader,
     payload: []u8,
+    /// Local ingress metadata; never serialized as part of a wire frame.
+    request_deadline_ms: i64 = 0,
 
     pub fn deinit(self: *Frame, allocator: Allocator) void {
         allocator.free(self.payload);
@@ -70,6 +72,9 @@ pub const H2Connection = struct {
     /// Signaled when send window increases (WINDOW_UPDATE received), allowing
     /// writeDataBlocking to wake up and send more data.
     send_window_event: Io.Event = .unset,
+    // A generation allows concurrent credit waiters without resetting an Event
+    // while another writer still waits on it.
+    send_window_generation: std.atomic.Value(u32) = .init(0),
 
     /// Maximum bytes of DATA payload allowed per stream. 0 = unlimited.
     /// Set from ServerConfig.max_body_size or ClientConfig.max_response_size.
@@ -233,6 +238,12 @@ pub const H2Connection = struct {
     /// Reads one HTTP/2 frame. Handles CONTINUATION reassembly.
     /// Returns the complete frame; caller owns the payload memory.
     pub fn readFrame(self: *Self, reader: anytype) !Frame {
+        const Reader = switch (@typeInfo(@TypeOf(reader))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(reader),
+        };
+        errdefer self.resetContinuation();
+        if (comptime @hasDecl(Reader, "beginFrameRead")) try reader.beginFrameRead();
         while (true) {
             var hdr_buf: [9]u8 = undefined;
             try readExact(reader, &hdr_buf);
@@ -277,6 +288,7 @@ pub const H2Connection = struct {
                             .stream_id = stream_id,
                         },
                         .payload = assembled,
+                        .request_deadline_ms = frameRequestDeadline(reader),
                     };
                 }
                 continue;
@@ -295,8 +307,16 @@ pub const H2Connection = struct {
                 continue;
             }
 
-            return .{ .header = hdr, .payload = payload };
+            return .{ .header = hdr, .payload = payload, .request_deadline_ms = frameRequestDeadline(reader) };
         }
+    }
+
+    fn frameRequestDeadline(reader: anytype) i64 {
+        const Reader = switch (@typeInfo(@TypeOf(reader))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(reader),
+        };
+        return if (comptime @hasDecl(Reader, "frameRequestDeadlineMs")) reader.frameRequestDeadlineMs() else 0;
     }
 
     /// Writes a single frame (header + payload).
@@ -404,8 +424,8 @@ pub const H2Connection = struct {
             beginConnectionWrite(writer);
             const result = self.writeControlledDataFrame(writer, stream_id, data, end_stream, control, &offset);
             try finishConnectionWrite(writer);
-            const stalled = try result;
-            if (!stalled) {
+            const generation = try result;
+            if (generation == null) {
                 stall_deadline = null;
                 continue;
             }
@@ -417,7 +437,7 @@ pub const H2Connection = struct {
                 ms = @min(ms, @as(u64, @intCast(@divTrunc(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms))));
             }
             ms = (try control.timeout(ms)).?;
-            try control.withWait(waitForCreditTick, .{ &self.send_window_event, self.io, ms });
+            try control.withWait(waitForCreditTick, .{ &self.send_window_generation.raw, self.io, generation.?, ms });
         }
     }
 
@@ -436,7 +456,7 @@ pub const H2Connection = struct {
         if (@hasDecl(Writer, "finishConnectionWrite")) try writer.finishConnectionWrite();
     }
 
-    fn writeControlledDataFrame(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, control: WriteControl, offset: *usize) !bool {
+    fn writeControlledDataFrame(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool, control: WriteControl, offset: *usize) !?u32 {
         try control.lock(&self.write_mutex, self.io);
         defer self.write_mutex.unlock(self.io);
         const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
@@ -446,14 +466,13 @@ pub const H2Connection = struct {
                 try self.writeFrame(writer, .data, FLAG_END_STREAM, stream_id, &.{});
                 stream.sendEndStream();
             }
-            return false;
+            return null;
         }
         const sw: usize = if (stream.send_window > 0) @intCast(stream.send_window) else 0;
         const cw: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
         const count = @min(data.len - offset.*, @min(@min(sw, cw), self.peer_settings.max_frame_size));
         if (count == 0) {
-            self.send_window_event.reset();
-            return true;
+            return self.send_window_generation.load(.acquire);
         }
         const amount: i32 = @intCast(count);
         try stream.updateSendWindow(-amount);
@@ -466,7 +485,7 @@ pub const H2Connection = struct {
         };
         offset.* += count;
         if (last and end_stream) stream.sendEndStream();
-        return false;
+        return null;
     }
 
     pub fn sendHeadersControlled(self: *Self, writer: anytype, stream_id: u31, headers: []const hpack.HeaderEntry, end_stream: bool, control: WriteControl) !void {
@@ -481,19 +500,23 @@ pub const H2Connection = struct {
         try self.sendHeaders(writer, stream_id, headers, end_stream);
     }
 
-    fn waitForCreditTick(event: *Io.Event, io: Io, ms: u64) !void {
-        event.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(ms)), .clock = .awake } }) catch |err| switch (err) {
-            // Only the IO polling tick is transient. A timeout returned by
-            // weighted reentry must escape without attempting another wait.
-            error.Timeout => {},
-            else => return err,
-        };
+    fn waitForCreditTick(generation: *const u32, io: Io, observed: u32, ms: u64) !void {
+        // A wake or polling timeout only authorizes another state check. The
+        // controlled caller owns the absolute deadline and checked reentry.
+        try io.futexWaitTimeout(u32, generation, observed, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(ms)), .clock = .awake } });
+    }
+
+    pub fn notifySendCredit(self: *Self, io: Io) void {
+        _ = self.send_window_generation.fetchAdd(1, .release);
+        io.futexWake(u32, &self.send_window_generation.raw, std.math.maxInt(u32));
+        self.send_window_event.set(io);
     }
 
     pub fn writeDataBlocking(self: *Self, writer: anytype, stream_id: u31, data: []const u8, end_stream: bool) !void {
         const max_size = self.peer_settings.max_frame_size;
 
         var offset: usize = 0;
+        var stall_deadline: ?Io.Timeout = null;
         while (offset < data.len) {
             const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
             if (stream.responseWriteError(self.is_server)) |err| return err;
@@ -507,25 +530,21 @@ pub const H2Connection = struct {
             const chunk_size = @min(remaining, @min(window, max_size));
 
             if (chunk_size == 0) {
-                // Window exhausted — release mutex, wait for WINDOW_UPDATE, reacquire.
-                {
-                    self.write_mutex.unlock(self.io);
-                    defer self.write_mutex.lockUncancelable(self.io);
-                    self.send_window_event.reset();
-                    // Re-check after reset (receive loop may have updated between our check and reset).
-                    const s2 = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-                    if (s2.responseWriteError(self.is_server)) |err| return err;
-                    const sw2: usize = if (s2.send_window > 0) @intCast(s2.send_window) else 0;
-                    const cw2: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
-                    if (sw2 == 0 or cw2 == 0) {
-                        self.send_window_event.waitTimeout(self.io, self.send_window_timeout) catch |err| switch (err) {
-                            error.Timeout => return error.Timeout,
-                            error.Canceled => return error.Canceled,
-                        };
-                    }
+                if (stall_deadline == null) stall_deadline = self.send_window_timeout.toDeadline(self.io);
+                if (stall_deadline.?.toDurationFromNow(self.io)) |duration| {
+                    if (duration.raw.toNanoseconds() <= 0) return error.Timeout;
                 }
+                const generation = self.send_window_generation.load(.acquire);
+                self.write_mutex.unlock(self.io);
+                {
+                    defer self.write_mutex.lockUncancelable(self.io);
+                    try self.io.futexWaitTimeout(u32, &self.send_window_generation.raw, generation, stall_deadline.?);
+                }
+                // Spurious wakes and competing streams cannot replace the
+                // original stall deadline. State is rechecked under the lock.
                 continue;
             }
+            stall_deadline = null;
 
             const chunk_i32: i32 = @intCast(chunk_size);
             try stream.updateSendWindow(-chunk_i32);
@@ -626,7 +645,7 @@ pub const H2Connection = struct {
             };
         }
         // Wake any fiber blocked in writeDataBlocking waiting for window space.
-        self.send_window_event.set(self.io);
+        self.notifySendCredit(self.io);
     }
 
     /// Handles a received GOAWAY frame. Signals streams above the peer's
@@ -979,6 +998,8 @@ pub const H2Connection = struct {
 
         switch (frame.header.frame_type) {
             .headers => {
+                if (!stream.got_headers and stream.request_deadline_ms == 0)
+                    stream.request_deadline_ms = frame.request_deadline_ms;
                 // Decode HPACK immediately in the receive loop. This is the
                 // only safe place since hpack_decode_ctx is connection-scoped
                 // and stateful — concurrent decodes corrupt the dynamic table.
@@ -1199,6 +1220,9 @@ pub const H2Connection = struct {
                 stream.reset();
                 stream.completion_event.set(self.io);
                 if (stream.data_event) |ev| ev.set(self.io);
+                // Credit-blocked response writers must observe the reset too.
+                // Publish cancellation/state before waking them to recheck.
+                self.notifySendCredit(self.io);
             },
             else => {},
         }
@@ -1214,7 +1238,7 @@ pub const H2Connection = struct {
 
         const maybe = try self.dispatchFrame(&frame, writer);
         if (maybe) |sf| {
-            self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
+            self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload, .request_deadline_ms = sf.request_deadline_ms }) catch |err| switch (err) {
                 // RFC 7540 §5.1: late frame for a closed stream — send
                 // RST_STREAM(STREAM_CLOSED) but keep the connection alive.
                 // Discarded DATA still consumes connection credit; refund
@@ -1289,7 +1313,7 @@ pub const H2Connection = struct {
             if (maybe) |sf| {
                 // deliverToMailbox decodes HPACK + copies payload under lock,
                 // ensuring the shared hpack_decode_ctx is not accessed concurrently.
-                self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
+                self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload, .request_deadline_ms = sf.request_deadline_ms }) catch |err| switch (err) {
                     error.ClosedStream => {
                         if (sf.header.frame_type == .data and sf.payload.len > 0)
                             try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
@@ -1380,13 +1404,16 @@ pub const H2Connection = struct {
         while (it.next()) |entry| {
             const s = entry.value_ptr.*;
             s.cancellation.store(true, .release);
-            if (!s.completed) {
+            // `completed` also marks the incoming request body. A half-closed
+            // request may still own a credit-blocked response writer.
+            if (s.state != .closed) {
                 s.stream_error = err;
                 s.completed = true;
                 if (s.data_event) |ev| ev.set(self.io);
                 s.completion_event.set(self.io);
             }
         }
+        self.notifySendCredit(self.io);
     }
 
     // ---------------------------------------------------------------
@@ -3836,7 +3863,7 @@ test "H2 controlled credit waits release CPU and restore it before frame seriali
     try state.waiting.wait(io);
     connection.write_mutex.lockUncancelable(io);
     stream.send_window = 100;
-    connection.send_window_event.set(io);
+    connection.notifySendCredit(io);
     connection.write_mutex.unlock(io);
     try task.await(io);
     try std.testing.expect(state.begins > 0);

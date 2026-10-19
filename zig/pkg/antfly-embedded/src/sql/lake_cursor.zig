@@ -2286,13 +2286,16 @@ test "lake SQL scoped ordered cursors park physical object reads and retire inde
             try std.testing.expect(reader.request_store.?.context.execution == execution);
             try std.testing.expect(reader.base.wait == null);
             try std.testing.expect(child.partition_source.?.scanner.object_reader.client.ptr == reader.base.client.ptr);
-            const file = child.partition_source.?.fileAt(child.stream.files[0]);
+            // Ordered lanes share the immutable file list. Warm the first
+            // file assigned to this lane; earlier lanes may have cached theirs.
+            const first_file = (child.stream.partition_index * child.stream.files.len + child.stream.partition_count - 1) / child.stream.partition_count;
+            const file = child.partition_source.?.fileAt(child.stream.files[first_file]);
             const ranges = @import("../serverless/query/lake_range_io.zig");
             try reader.prefetch(&.{try ranges.planParquetFooterRead(try ranges.objectRefForExternalFileUri(file), 64 * 1024)});
             // Join the actual nested scope directly: speculative drain would
             // otherwise hide an invalid borrowed receiver's failure.
-            if (reader.pending[0]) |*task| try task.await(std.testing.io) else return error.TestUnexpectedResult;
-            reader.pending[0] = null;
+            if (reader.pending[0] == null) return error.TestUnexpectedResult;
+            try reader.joinPrefetch();
             var count: usize = 0;
             while (true) {
                 const page = try cursor.next(cursor.ptr, std.testing.allocator, 2);

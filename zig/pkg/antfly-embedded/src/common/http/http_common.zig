@@ -111,6 +111,15 @@ test "RequestCancellation safely ignores incomplete semantic tokens" {
     try std.testing.expect(!cancellation.isCancelled());
 }
 
+/// A synchronous borrowed permit. The owning API kernel validates its owner,
+/// type contract and live token before use. It grants no remote capability or
+/// retirement evidence, and must never outlive the issuing control pass.
+pub const BorrowedControlPermit = extern struct {
+    contract: @import("antfly_runtime_abi").native_abi.TypeContract,
+    owner: *const anyopaque,
+    generation: u64,
+};
+
 pub const HttpRequest = struct {
     method: Method,
     uri: []const u8,
@@ -129,6 +138,9 @@ pub const HttpRequest = struct {
     /// Borrowed through physical transport joining. Executors may park only
     /// actual IO waits; authentication, encoding and decoding keep CPU.
     execution_wait: ?@import("../execution_wait.zig").Boundary = null,
+    /// Trusted local dispatch authority, consumed only after route resolution.
+    /// Never serialized. A plain transport must not silently send it as legacy.
+    execution_remote_query: ?RequestExecutor = null,
 
     pub fn header(self: HttpRequest, name: []const u8) ?[]const u8 {
         for (self.headers) |entry| {
@@ -192,6 +204,8 @@ pub const Header = struct {
 
 pub const HttpResponse = struct {
     status: u16,
+    /// Move-only operation owner, released after response buffers retire.
+    retirement: ?struct { ptr: *anyopaque, release: *const fn (*anyopaque) void } = null,
     /// Allocator that owns all response allocations. Executors that allocate
     /// independently of the allocator supplied by the caller must set this.
     owner_allocator: ?std.mem.Allocator = null,
@@ -212,6 +226,7 @@ pub const HttpResponse = struct {
         for (self.headers) |*entry| entry.deinit(alloc);
         if (self.headers.len > 0) alloc.free(self.headers);
         if (self.body.len > 0) alloc.free(self.body);
+        if (self.retirement) |owner| owner.release(owner.ptr);
         self.* = undefined;
     }
 };
@@ -258,12 +273,15 @@ pub const StreamingRequestExecutor = struct {
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn execute(self: StreamingRequestExecutor, alloc: std.mem.Allocator, req: HttpRequest, writer: StreamWriter) !bool {
+        if (req.execution_remote_query != null) return error.ExecutionWaitUnsupported;
         if (req.delivery_tracker) |tracker| tracker.markUnknown();
         return BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, alloc, req, writer }) catch |err| return canonicalTransportError(err);
     }
 };
 
 pub const RequestExecutor = struct {
+    /// Set only by the native wrapper which resolves the signed catalog fence.
+    routes_owned_queries: bool = false,
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
@@ -287,6 +305,7 @@ pub const RequestExecutor = struct {
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn execute(self: RequestExecutor, alloc: std.mem.Allocator, req: HttpRequest) !HttpResponse {
+        if (req.execution_remote_query != null and !self.routes_owned_queries) return error.ExecutionWaitUnsupported;
         // Caller-side request construction may establish `not_sent`, but that
         // proof ends when control crosses an arbitrary executor boundary. A
         // tracking-aware executor can restore `not_sent` during its own local
@@ -318,6 +337,7 @@ pub const RequestExecutor = struct {
         req: HttpRequest,
         writer: StreamWriter,
     ) !?bool {
+        if (req.execution_remote_query != null) return error.ExecutionWaitUnsupported;
         const execute_stream = self.vtable.execute_stream orelse return null;
         if (req.delivery_tracker) |tracker| tracker.markUnknown();
         return BoundaryAbi.call("execute_stream", self.boundary_dispatch, execute_stream, .{ self.ptr, alloc, req, writer }) catch |err| return canonicalTransportError(err);

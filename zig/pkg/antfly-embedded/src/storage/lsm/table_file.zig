@@ -2121,6 +2121,191 @@ fn decodePrefixCompressedBlockAllocWithAdmission(
     return out.toOwnedSliceAssert();
 }
 
+/// Movable prefix-block expansion. Every call reads or writes at most quantum
+/// bytes and advances at most one fixed metadata/copy phase. All input/output
+/// spans are caller-owned, immutable/stable for this operation, and borrowed
+/// only during step. Restart offsets and preceding keys are scalar positions.
+pub const PrefixDecodeCursor = struct {
+    pub const Status = enum { pending, needs_output, done };
+    pub const Progress = struct { status: Status, input_bytes: usize = 0, output_bytes: usize = 0 };
+    const Phase = enum { header, output, restart, entry, raw_header, namespace, shared, suffix, value, finish, done, failed };
+    input_len: usize,
+    output_len: usize,
+    phase: Phase = .header,
+    failure: ?anyerror = null,
+    header: [24]u8 = undefined,
+    entry: [17]u8 = undefined,
+    raw_header: [13]u8 = undefined,
+    restart: [4]u8 = undefined,
+    partial: usize = 0,
+    input_offset: usize = 24,
+    output_offset: usize = 0,
+    entries_end: usize = 0,
+    entry_count: usize = 0,
+    restart_interval: usize = 1,
+    entry_index: usize = 0,
+    namespace_len: usize = 0,
+    shared_len: usize = 0,
+    suffix_len: usize = 0,
+    value_len: usize = 0,
+    previous_key_offset: usize = 0,
+    previous_key_len: usize = 0,
+    key_offset: usize = 0,
+
+    pub fn init(input_len: usize, output_len: usize) @This() {
+        return .{ .input_len = input_len, .output_len = output_len };
+    }
+    pub fn step(self: *@This(), input: []const u8, output: ?[]u8, quantum: usize) !Progress {
+        if (quantum == 0 or quantum > 64 * 1024 or input.len != self.input_len) return error.InvalidArgument;
+        if (output) |bytes| if (bytes.len != self.output_len) return error.InvalidArgument;
+        return self.advance(input, output, quantum) catch |err| {
+            self.failure = err;
+            self.phase = .failed;
+            return err;
+        };
+    }
+    fn advance(self: *@This(), input: []const u8, output: ?[]u8, quantum: usize) !Progress {
+        switch (self.phase) {
+            .failed => return self.failure.?,
+            .done => return .{ .status = .done },
+            .header => {
+                if (input.len < self.header.len) return error.InvalidTableFile;
+                const take = @min(quantum, self.header.len - self.partial);
+                @memcpy(self.header[self.partial..][0..take], input[self.partial..][0..take]);
+                self.partial += take;
+                if (self.partial == self.header.len) {
+                    if (!std.mem.eql(u8, self.header[0..8], prefix_block_magic)) return error.InvalidTableFile;
+                    self.entry_count = std.mem.readInt(u32, self.header[8..12], .little);
+                    self.restart_interval = std.mem.readInt(u32, self.header[12..16], .little);
+                    if (self.restart_interval == 0) return error.InvalidTableFile;
+                    const restarts: usize = std.mem.readInt(u32, self.header[16..20], .little);
+                    const entries_len: usize = std.mem.readInt(u32, self.header[20..24], .little);
+                    const expected_restarts = if (self.entry_count == 0) 0 else 1 + (self.entry_count - 1) / self.restart_interval;
+                    if (restarts != expected_restarts) return error.InvalidTableFile;
+                    self.entries_end = std.math.add(usize, self.header.len, entries_len) catch return error.InvalidTableFile;
+                    const restart_bytes = std.math.mul(usize, restarts, 4) catch return error.InvalidTableFile;
+                    const total = std.math.add(usize, self.entries_end, restart_bytes) catch return error.InvalidTableFile;
+                    if (total != input.len) return error.InvalidTableFile;
+                    self.partial = 0;
+                    self.phase = .output;
+                }
+                return .{ .status = if (self.phase == .output and output == null) .needs_output else .pending, .input_bytes = take };
+            },
+            .output => {
+                if (output == null) return .{ .status = .needs_output };
+                self.phase = if (self.entry_count == 0) .finish else .restart;
+                return .{ .status = .pending };
+            },
+            .restart => {
+                const base = self.entries_end + (self.entry_index / self.restart_interval) * 4;
+                const take = @min(quantum, self.restart.len - self.partial);
+                @memcpy(self.restart[self.partial..][0..take], input[base + self.partial ..][0..take]);
+                self.partial += take;
+                if (self.partial == self.restart.len) {
+                    if (std.mem.readInt(u32, &self.restart, .little) != self.input_offset - self.header.len) return error.InvalidTableFile;
+                    self.partial = 0;
+                    self.phase = .entry;
+                }
+                return .{ .status = .pending, .input_bytes = take };
+            },
+            .entry => {
+                if (self.entry.len > self.entries_end -| self.input_offset) return error.InvalidTableFile;
+                const take = @min(quantum, self.entry.len - self.partial);
+                @memcpy(self.entry[self.partial..][0..take], input[self.input_offset + self.partial ..][0..take]);
+                self.partial += take;
+                if (self.partial == self.entry.len) {
+                    if (self.entry[0] > 1) return error.InvalidTableFile;
+                    self.namespace_len = std.mem.readInt(u32, self.entry[1..5], .little);
+                    self.shared_len = std.mem.readInt(u32, self.entry[5..9], .little);
+                    self.suffix_len = std.mem.readInt(u32, self.entry[9..13], .little);
+                    self.value_len = std.mem.readInt(u32, self.entry[13..17], .little);
+                    if (self.shared_len > self.previous_key_len or (self.entry_index % self.restart_interval == 0 and self.shared_len != 0)) return error.InvalidTableFile;
+                    const key_len = std.math.add(usize, self.shared_len, self.suffix_len) catch return error.InvalidTableFile;
+                    if (key_len > std.math.maxInt(u32)) return error.InvalidTableFile;
+                    var encoded_len = std.math.add(usize, self.namespace_len, self.suffix_len) catch return error.InvalidTableFile;
+                    encoded_len = std.math.add(usize, encoded_len, self.value_len) catch return error.InvalidTableFile;
+                    self.input_offset += self.entry.len;
+                    if (encoded_len > self.entries_end -| self.input_offset) return error.InvalidTableFile;
+                    var raw_len = std.math.add(usize, self.raw_header.len, self.namespace_len) catch return error.InvalidTableFile;
+                    raw_len = std.math.add(usize, raw_len, key_len) catch return error.InvalidTableFile;
+                    raw_len = std.math.add(usize, raw_len, self.value_len) catch return error.InvalidTableFile;
+                    if (raw_len > self.output_len -| self.output_offset) return error.InvalidTableFile;
+                    self.raw_header[0] = self.entry[0];
+                    std.mem.writeInt(u32, self.raw_header[1..5], @intCast(self.namespace_len), .little);
+                    std.mem.writeInt(u32, self.raw_header[5..9], @intCast(key_len), .little);
+                    std.mem.writeInt(u32, self.raw_header[9..13], @intCast(self.value_len), .little);
+                    self.partial = 0;
+                    self.phase = .raw_header;
+                }
+                return .{ .status = .pending, .input_bytes = take };
+            },
+            .raw_header => {
+                const out = output orelse return .{ .status = .needs_output };
+                const take = @min(quantum, self.raw_header.len - self.partial);
+                @memcpy(out[self.output_offset..][0..take], self.raw_header[self.partial..][0..take]);
+                self.output_offset += take;
+                self.partial += take;
+                if (self.partial == self.raw_header.len) {
+                    self.partial = 0;
+                    self.phase = .namespace;
+                }
+                return .{ .status = .pending, .output_bytes = take };
+            },
+            .namespace, .suffix, .value => {
+                const out = output orelse return .{ .status = .needs_output };
+                const len = switch (self.phase) {
+                    .namespace => self.namespace_len,
+                    .suffix => self.suffix_len,
+                    .value => self.value_len,
+                    else => unreachable,
+                };
+                const take = @min(quantum, len - self.partial);
+                @memcpy(out[self.output_offset..][0..take], input[self.input_offset..][0..take]);
+                self.input_offset += take;
+                self.output_offset += take;
+                self.partial += take;
+                if (self.partial == len) {
+                    self.partial = 0;
+                    switch (self.phase) {
+                        .namespace => {
+                            self.key_offset = self.output_offset;
+                            self.phase = .shared;
+                        },
+                        .suffix => {
+                            self.previous_key_offset = self.key_offset;
+                            self.previous_key_len = self.shared_len + self.suffix_len;
+                            self.phase = .value;
+                        },
+                        .value => {
+                            self.entry_index += 1;
+                            self.phase = if (self.entry_index == self.entry_count) .finish else if (self.entry_index % self.restart_interval == 0) .restart else .entry;
+                        },
+                        else => unreachable,
+                    }
+                }
+                return .{ .status = .pending, .input_bytes = take, .output_bytes = take };
+            },
+            .shared => {
+                const out = output orelse return .{ .status = .needs_output };
+                const take = @min(quantum, self.shared_len - self.partial);
+                @memcpy(out[self.output_offset..][0..take], out[self.previous_key_offset + self.partial ..][0..take]);
+                self.output_offset += take;
+                self.partial += take;
+                if (self.partial == self.shared_len) {
+                    self.partial = 0;
+                    self.phase = .suffix;
+                }
+                return .{ .status = .pending, .output_bytes = take };
+            },
+            .finish => {
+                if (self.input_offset != self.entries_end or self.output_offset != self.output_len) return error.InvalidTableFile;
+                self.phase = .done;
+                return .{ .status = .done };
+            },
+        }
+    }
+};
+
 const PrefixBlockView = struct {
     entry_count: usize,
     restart_interval: usize,
@@ -2440,6 +2625,134 @@ pub fn decodeBlockPayloadAllocWithAdmission(
     return decodeBlockPayloadWithScratchAllocWithAdmission(allocator, allocator, compression, payload, expected_len, expected_checksum, control);
 }
 
+/// Scalar continuation for raw or Snappy block verification/materialization.
+/// Input stays immutable; output (once supplied) preserves its decoded prefix.
+/// Both buffers and controls remain caller-owned. The checksum and Snappy
+/// preamble are verified before needs_output authorizes output allocation.
+/// Prefix block reconstruction still uses its existing decoder separately.
+pub const BlockDecodeCursor = struct {
+    pub const Status = enum { pending, needs_output, done };
+    pub const Progress = struct { status: Status, checksum_bytes: usize = 0, input_bytes: usize = 0, output_bytes: usize = 0, tags: usize = 0 };
+    const Phase = enum { checksum, header, output, done, failed };
+    compression: BlockCompression,
+    input_len: usize,
+    output_len: usize,
+    expected_checksum: u32,
+    checksum_offset: usize = 0,
+    output_offset: usize = 0,
+    crc: Crc32 = .init(),
+    decoder: snappy.DecodeCursor,
+    phase: Phase = .checksum,
+    failure: ?anyerror = null,
+
+    pub fn init(compression: BlockCompression, input_len: usize, output_len: usize, expected_checksum: u32) !BlockDecodeCursor {
+        if (compression != .none and compression != .snappy) return error.InvalidArgument;
+        return .{ .compression = compression, .input_len = input_len, .output_len = output_len, .expected_checksum = expected_checksum, .decoder = snappy.DecodeCursor.init(input_len, output_len) };
+    }
+
+    pub fn step(self: *BlockDecodeCursor, src: []const u8, dst: ?[]u8, quantum: usize) !Progress {
+        if (quantum == 0 or src.len != self.input_len) return error.InvalidArgument;
+        if (dst) |out| if (out.len != self.output_len) return error.InvalidArgument;
+        return self.stepFromReader(SliceReader{ .bytes = src, .length = src.len }, dst, quantum);
+    }
+
+    const SliceReader = struct {
+        bytes: []const u8,
+        length: usize,
+        pub fn window(self: @This(), offset: usize, max_len: usize) ![]const u8 {
+            return self.bytes[offset..][0..@min(max_len, self.bytes.len - offset)];
+        }
+        pub fn readInto(self: @This(), offset: u64, out: []u8) !void {
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+    };
+
+    /// The reader owns immutable source binding and funded input windows.
+    /// A failed read terminates this operation; discard unpublished output.
+    pub fn stepFromReader(self: *BlockDecodeCursor, reader: anytype, dst: ?[]u8, quantum: usize) !Progress {
+        if (quantum == 0 or reader.length != self.input_len) return error.InvalidArgument;
+        if (dst) |out| if (out.len != self.output_len) return error.InvalidArgument;
+        return self.advance(reader, dst, quantum) catch |err| {
+            self.phase = .failed;
+            self.failure = err;
+            return err;
+        };
+    }
+
+    fn advance(self: *BlockDecodeCursor, reader: anytype, dst: ?[]u8, quantum: usize) !Progress {
+        switch (self.phase) {
+            .failed => return self.failure.?,
+            .done => return .{ .status = .done },
+            .checksum => {
+                const take = @min(quantum, self.input_len - self.checksum_offset);
+                const bytes = try reader.window(self.checksum_offset, take);
+                if (bytes.len > take or (bytes.len == 0 and take != 0)) return error.CorruptInput;
+                self.crc.update(bytes);
+                self.checksum_offset += bytes.len;
+                if (self.checksum_offset == self.input_len) {
+                    if (self.crc.final() != self.expected_checksum) return error.TableBlockChecksumMismatch;
+                    self.phase = .header;
+                }
+                // A separate phase prevents checksum plus decode from spending
+                // two input quanta in one invocation.
+                return .{ .status = .pending, .checksum_bytes = bytes.len };
+            },
+            .header => {
+                if (self.compression == .none) {
+                    if (self.input_len != self.output_len) return error.InvalidTableFile;
+                    self.phase = .output;
+                    return .{ .status = if (dst == null) .needs_output else .pending };
+                }
+                if (self.input_len == 0 and self.output_len != 0) return error.InvalidTableFile;
+                const progress = self.decoder.stepFromReader(reader, null, quantum) catch |err| {
+                    if (self.decoder.declared_length) |length| if (length != self.output_len) return error.InvalidTableFile;
+                    return err;
+                };
+                if (progress.needs_output or progress.done) self.phase = .output;
+                return .{ .status = if (self.phase == .output and dst == null) .needs_output else .pending, .input_bytes = progress.input_bytes, .tags = progress.tags };
+            },
+            .output => {
+                const out = dst orelse return .{ .status = .needs_output };
+                if (self.compression == .none) {
+                    const take = @min(quantum, out.len - self.output_offset);
+                    try reader.readInto(@intCast(self.output_offset), out[self.output_offset..][0..take]);
+                    self.output_offset += take;
+                    if (self.output_offset == out.len) self.phase = .done;
+                    return .{ .status = if (self.phase == .done) .done else .pending, .input_bytes = take, .output_bytes = take };
+                }
+                const progress = try self.decoder.stepFromReader(reader, out, quantum);
+                self.output_offset = self.decoder.output_offset;
+                if (progress.done) self.phase = .done;
+                return .{ .status = if (progress.done) .done else .pending, .input_bytes = progress.input_bytes, .output_bytes = progress.output_bytes, .tags = progress.tags };
+            },
+        }
+    }
+};
+
+fn decodeRawOrSnappyBlockAlloc(allocator: std.mem.Allocator, compression: BlockCompression, payload: []const u8, expected_len: usize, expected_checksum: u32, control: ?read_admission.Port) ![]u8 {
+    var cursor = try BlockDecodeCursor.init(compression, payload.len, expected_len, expected_checksum);
+    var output: ?[]u8 = null;
+    errdefer if (output) |bytes| allocator.free(bytes);
+    while (true) {
+        if (control) |port| try port.checkpoint();
+        const progress = cursor.step(payload, output, 64 * 1024) catch |err| {
+            // The final original lifetime check precedes reporting corruption,
+            // just as it did in the synchronous checksum/decoder path.
+            if (control) |port| try port.checkpoint();
+            return err;
+        };
+        if (control) |port| try port.checkpoint();
+        switch (progress.status) {
+            .pending => {},
+            .needs_output => {
+                std.debug.assert(output == null);
+                output = try allocator.alloc(u8, expected_len);
+            },
+            .done => return output.?,
+        }
+    }
+}
+
 pub fn decodeBlockPayloadWithScratchAllocWithAdmission(
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
@@ -2449,22 +2762,11 @@ pub fn decodeBlockPayloadWithScratchAllocWithAdmission(
     expected_checksum: u32,
     control: ?read_admission.Port,
 ) ![]u8 {
+    if (compression == .none or compression == .snappy)
+        return decodeRawOrSnappyBlockAlloc(allocator, compression, payload, expected_len, expected_checksum, control);
     if (try checksumWithAdmission(payload, control) != expected_checksum) return error.TableBlockChecksumMismatch;
     const decoded = switch (compression) {
-        .none => blk: {
-            if (payload.len != expected_len) return error.InvalidTableFile;
-            const bytes = try allocator.alloc(u8, payload.len);
-            errdefer allocator.free(bytes);
-            try copyWithAdmission(bytes, payload, control);
-            break :blk bytes;
-        },
-        .snappy => blk: {
-            if (try snappy.decodedLen(payload) != expected_len) return error.InvalidTableFile;
-            const bytes = try snappy.decodeWithAdmission(allocator, payload, control);
-            errdefer allocator.free(bytes);
-            if (bytes.len != expected_len) return error.InvalidTableFile;
-            break :blk bytes;
-        },
+        .none, .snappy => unreachable,
         .prefix => try decodePrefixCompressedBlockAllocWithAdmission(allocator, scratch, payload, expected_len, control),
         .prefix_snappy => blk: {
             try validatePrefixDecodedSize(payload, expected_len);
@@ -2639,6 +2941,296 @@ pub fn decodeFooterBytes(raw: []const u8) !Footer {
         .metadata_checksum = metadata_checksum,
     };
 }
+
+/// A read-only index whose variable spans belong to one retained metadata
+/// allocation. Use view() for access and deinit() for retirement; TableIndex's
+/// ordinary deinit must not free the interior borrowed spans.
+pub const RetainedIndex = struct {
+    allocator: std.mem.Allocator,
+    metadata: []u8,
+    value: TableIndex,
+
+    pub fn view(self: *const @This()) *const TableIndex {
+        return &self.value;
+    }
+    pub fn deinit(self: *@This()) void {
+        self.allocator.free(self.value.entry_offsets);
+        self.allocator.free(self.value.block_entry_offsets);
+        self.allocator.free(self.value.blocks);
+        self.allocator.free(self.metadata);
+        self.* = undefined;
+    }
+};
+
+/// Takes ownership of metadata immediately. No step retains a control borrow.
+/// CRC and offset validation use finite quanta; other phases visit one scalar
+/// record. Variable strings and filters borrow the owned buffer without copies.
+pub const IndexDecodeCursor = struct {
+    pub const Status = enum { pending, ready };
+    const Phase = enum { checksum, offsets_allocate, offsets, filter, blocks_allocate, blocks, filter_count, block_filters, hash_count, hashes, physical_count, physical, smallest_count, smallest, compare_namespace, compare_key, prefix, prefix_count, block_prefix, validate_offsets, ready, taken, closed, failed };
+    allocator: std.mem.Allocator,
+    metadata: ?[]u8,
+    footer: Footer,
+    phase: Phase = .checksum,
+    failure: ?anyerror = null,
+    crc: Crc32 = .init(),
+    position: usize = 0,
+    cursor: usize = 0,
+    offsets: []u16 = &.{},
+    blocks: []TableIndex.BlockMeta = &.{},
+    filter: ?bloom.OwnedFilter = null,
+    prefix_filter: ?bloom.OwnedFilter = null,
+    prefix_extractor: PrefixExtractor = .none,
+    row: usize = 0,
+    block: usize = 0,
+    expected_entry: usize = 0,
+    expected_logical: usize = 0,
+    expected_physical: usize = 0,
+    previous_local: u16 = 0,
+    compare_offset: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, footer: Footer, metadata: []u8) @This() {
+        return .{ .allocator = allocator, .footer = footer, .metadata = metadata };
+    }
+    pub fn step(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+        if (quantum == 0 or quantum > 65536) return error.InvalidArgument;
+        if (self.failure) |err| return err;
+        if (self.phase == .closed or self.phase == .taken) return error.TransactionClosed;
+        return self.advance(quantum, control) catch |err| {
+            const cause = if (control) |port| blk: {
+                port.checkpoint() catch |original| break :blk original;
+                break :blk err;
+            } else err;
+            self.deinit();
+            self.failure = cause;
+            self.phase = .failed;
+            return cause;
+        };
+    }
+    fn count(self: *@This(), bytes: []const u8, next: Phase) !void {
+        if (try readU32(bytes, &self.cursor) != self.blocks.len) return error.InvalidTableFile;
+        self.block = 0;
+        self.phase = next;
+    }
+    fn borrowFilter(self: *@This(), bytes: []const u8, optional: bool) !?bloom.OwnedFilter {
+        const len = try readU32(bytes, &self.cursor);
+        if (optional and len == 0) return null;
+        const filter = try bloom.BorrowedFilter.decode(try readSlice(bytes, &self.cursor, len));
+        return .{ .bytes = @constCast(filter.bytes), .bit_count = filter.bit_count, .hash_count = filter.hash_count };
+    }
+    fn span(self: *@This(), bytes: []const u8, len: usize) ![]u8 {
+        return @constCast(try readSlice(bytes, &self.cursor, len));
+    }
+    fn compare(self: *@This(), lhs: []const u8, rhs: []const u8, quantum: usize) ?std.math.Order {
+        const common = @min(lhs.len, rhs.len);
+        const end = self.compare_offset + @min(quantum, common - self.compare_offset);
+        const order = std.mem.order(u8, lhs[self.compare_offset..end], rhs[self.compare_offset..end]);
+        self.compare_offset = end;
+        if (order != .eq) return order;
+        if (end == common) return std.math.order(lhs.len, rhs.len);
+        return null;
+    }
+    fn compared(self: *@This(), order: std.math.Order, namespace: bool) !void {
+        if (order == .gt) return error.InvalidTableFile;
+        self.compare_offset = 0;
+        if (namespace and order == .eq) self.phase = .compare_key else {
+            self.block += 1;
+            self.phase = .smallest;
+        }
+    }
+    fn advance(self: *@This(), quantum: usize, control: ?read_admission.Port) !Status {
+        if (control) |port| try port.checkpoint();
+        const bytes = self.metadata.?;
+        switch (self.phase) {
+            .ready => return .ready,
+            .checksum => {
+                if (bytes.len != self.footer.metadata_len or self.footer.metadata_offset < header_len) return error.InvalidTableFile;
+                const end = self.position + @min(quantum, bytes.len - self.position);
+                self.crc.update(bytes[self.position..end]);
+                self.position = end;
+                if (end == bytes.len) {
+                    if (self.crc.final() != self.footer.metadata_checksum) return error.InvalidTableFile;
+                    try consumePackedOffsetsMarker(bytes, &self.cursor);
+                    if (self.footer.entry_count > (bytes.len - self.cursor) / 2) return error.InvalidTableFile;
+                    self.phase = .offsets_allocate;
+                }
+            },
+            .offsets_allocate => {
+                self.offsets = try self.allocator.alloc(u16, self.footer.entry_count);
+                self.row = 0;
+                self.phase = .offsets;
+            },
+            .offsets => {
+                const end = self.row + @min(@max(1, quantum / 2), self.offsets.len - self.row);
+                while (self.row < end) : (self.row += 1) self.offsets[self.row] = try readU16(bytes, &self.cursor);
+                if (self.row == self.offsets.len) self.phase = .filter;
+            },
+            .filter => {
+                self.filter = (try self.borrowFilter(bytes, false)).?;
+                self.phase = .blocks_allocate;
+            },
+            .blocks_allocate => {
+                const n = try readU32(bytes, &self.cursor);
+                if (n > self.footer.entry_count or n > (bytes.len - self.cursor) / 24) return error.InvalidTableFile;
+                self.blocks = try self.allocator.alloc(TableIndex.BlockMeta, n);
+                self.block = 0;
+                self.phase = .blocks;
+            },
+            .blocks => {
+                if (self.block == self.blocks.len) {
+                    if (self.expected_entry != self.footer.entry_count) return error.InvalidTableFile;
+                    self.phase = .filter_count;
+                } else {
+                    const offset = try readU32(bytes, &self.cursor);
+                    const len = try readU32(bytes, &self.cursor);
+                    const first = try readU32(bytes, &self.cursor);
+                    const n = try readU32(bytes, &self.cursor);
+                    const ns_len = try readU32(bytes, &self.cursor);
+                    const key_len = try readU32(bytes, &self.cursor);
+                    const ns = if (ns_len == std.math.maxInt(u32)) null else try self.span(bytes, ns_len);
+                    const key = try self.span(bytes, key_len);
+                    if (n == 0 or first != self.expected_entry or offset != self.expected_logical or
+                        @as(usize, first) + n > self.footer.entry_count or @as(usize, offset) + len > self.footer.entry_data_len or
+                        (self.block + 1 == self.blocks.len and @as(usize, offset) + len != self.footer.entry_data_len)) return error.InvalidTableFile;
+                    self.blocks[self.block] = .{ .relative_offset = offset, .len = len, .physical_relative_offset = offset, .physical_len = len, .first_entry_index = first, .entry_count = n, .largest_namespace_name = ns, .largest_key = key };
+                    self.expected_entry += n;
+                    self.expected_logical += len;
+                    self.block += 1;
+                }
+            },
+            .filter_count => try self.count(bytes, .block_filters),
+            .block_filters => {
+                if (self.block == self.blocks.len) self.phase = .hash_count else {
+                    self.blocks[self.block].filter = try self.borrowFilter(bytes, false);
+                    self.block += 1;
+                }
+            },
+            .hash_count => try self.count(bytes, .hashes),
+            .hashes => {
+                if (self.block == self.blocks.len) self.phase = .physical_count else {
+                    const n = try readU32(bytes, &self.cursor);
+                    if (n > (bytes.len - self.cursor) / 4) return error.InvalidTableFile;
+                    _ = try readSlice(bytes, &self.cursor, @as(usize, n) * 4);
+                    self.block += 1;
+                }
+            },
+            .physical_count => try self.count(bytes, .physical),
+            .physical => {
+                if (self.block == self.blocks.len) {
+                    if (self.expected_physical != self.footer.metadata_offset - header_len) return error.InvalidTableFile;
+                    self.phase = .smallest_count;
+                } else {
+                    const offset = try readU32(bytes, &self.cursor);
+                    const len = try readU32(bytes, &self.cursor);
+                    const compression: BlockCompression = switch (try readU32(bytes, &self.cursor)) {
+                        0 => .none,
+                        1 => .snappy,
+                        2 => .prefix,
+                        3 => .prefix_snappy,
+                        else => return error.InvalidTableFile,
+                    };
+                    const checksum = try readU32(bytes, &self.cursor);
+                    if (len == 0 or offset != self.expected_physical) return error.InvalidTableFile;
+                    const block = &self.blocks[self.block];
+                    block.physical_relative_offset = offset;
+                    block.physical_len = len;
+                    block.compression = compression;
+                    block.checksum = checksum;
+                    self.expected_physical += len;
+                    self.block += 1;
+                }
+            },
+            .smallest_count => try self.count(bytes, .smallest),
+            .smallest => {
+                if (self.block == self.blocks.len) self.phase = .prefix else {
+                    const ns_len = try readU32(bytes, &self.cursor);
+                    const key_len = try readU32(bytes, &self.cursor);
+                    const block = &self.blocks[self.block];
+                    block.smallest_namespace_name = if (ns_len == std.math.maxInt(u32)) null else try self.span(bytes, ns_len);
+                    block.smallest_key = try self.span(bytes, key_len);
+                    self.compare_offset = 0;
+                    self.phase = .compare_namespace;
+                }
+            },
+            .compare_namespace => {
+                const block = self.blocks[self.block];
+                const lhs = block.smallest_namespace_name;
+                const rhs = block.largest_namespace_name;
+                if (lhs == null or rhs == null) try self.compared(if (lhs == null and rhs == null) .eq else if (lhs == null) .lt else .gt, true) else if (self.compare(lhs.?, rhs.?, quantum)) |order| try self.compared(order, true);
+            },
+            .compare_key => {
+                const block = self.blocks[self.block];
+                if (self.compare(block.smallest_key.?, block.largest_key, quantum)) |order| try self.compared(order, false);
+            },
+            .prefix => {
+                self.prefix_extractor = try decodePrefixExtractor(try readU32(bytes, &self.cursor));
+                self.prefix_filter = try self.borrowFilter(bytes, true);
+                self.phase = .prefix_count;
+            },
+            .prefix_count => try self.count(bytes, .block_prefix),
+            .block_prefix => {
+                if (self.block == self.blocks.len) {
+                    if (self.cursor != bytes.len) return error.InvalidTableFile;
+                    if (self.offsets.len == 0) {
+                        if (self.blocks.len != 0 or self.footer.entry_data_len != 0) return error.InvalidTableFile;
+                        self.phase = .ready;
+                    } else {
+                        if (self.blocks.len == 0) return error.InvalidTableFile;
+                        self.block = 0;
+                        self.row = 0;
+                        self.previous_local = 0;
+                        self.phase = .validate_offsets;
+                    }
+                } else {
+                    self.blocks[self.block].prefix_filter = try self.borrowFilter(bytes, true);
+                    self.block += 1;
+                }
+            },
+            .validate_offsets => {
+                const block = self.blocks[self.block];
+                const block_end = @as(usize, block.first_entry_index) + block.entry_count;
+                const end = self.row + @min(@max(1, quantum / 2), block_end - self.row);
+                while (self.row < end) : (self.row += 1) {
+                    const local = self.offsets[self.row];
+                    if ((self.row == block.first_entry_index and local != 0) or (self.row > block.first_entry_index and local <= self.previous_local) or local >= block.len) return error.InvalidTableFile;
+                    self.previous_local = local;
+                }
+                if (self.row == block_end) {
+                    self.block += 1;
+                    self.previous_local = 0;
+                    if (self.block == self.blocks.len) {
+                        if (@as(usize, block.relative_offset) + self.offsets[self.offsets.len - 1] >= self.footer.entry_data_len) return error.InvalidTableFile;
+                        self.phase = .ready;
+                    }
+                }
+            },
+            else => unreachable,
+        }
+        if (control) |port| try port.checkpoint();
+        return if (self.phase == .ready) .ready else .pending;
+    }
+    pub fn takeOutput(self: *@This()) !RetainedIndex {
+        if (self.failure) |err| return err;
+        if (self.phase != .ready) return error.InvalidArgument;
+        const result: RetainedIndex = .{ .allocator = self.allocator, .metadata = self.metadata.?, .value = .{ .block_entry_offsets = self.offsets, .entry_data_start = header_len, .entry_data_len = self.footer.entry_data_len, .filter = self.filter.?, .prefix_extractor = self.prefix_extractor, .prefix_filter = self.prefix_filter, .blocks = self.blocks } };
+        self.metadata = null;
+        self.offsets = &.{};
+        self.blocks = &.{};
+        self.phase = .taken;
+        return result;
+    }
+    pub fn deinit(self: *@This()) void {
+        // Every variable span is inside metadata, even on partial parse. No
+        // per-block cleanup loop or access to uninitialized block slots.
+        self.allocator.free(self.blocks);
+        self.blocks = &.{};
+        self.allocator.free(self.offsets);
+        self.offsets = &.{};
+        if (self.metadata) |bytes| self.allocator.free(bytes);
+        self.metadata = null;
+        self.phase = .closed;
+    }
+};
 
 pub fn decodeIndexFromFooterAlloc(allocator: std.mem.Allocator, footer: Footer, metadata: []const u8) !TableIndex {
     return decodeIndexFromFooterAllocWithAdmission(allocator, footer, metadata, null);
@@ -4565,4 +5157,296 @@ pub fn qualifyControlledPrefixPointReader(control: read_admission.Port) !void {
     try std.testing.expect(try reader.findWithAdmission(a, "aaa", "shared-key:0001", control) == null);
     try std.testing.expect(try reader.findWithAdmission(a, "zzz", "shared-key:0001", control) == null);
     try std.testing.expect(try reader.findWithAdmission(a, "docs", "shared-key:0005~", control) == null);
+}
+
+test "table block decode continuation bounds checksum and output without replaying prefixes" {
+    const a = std.testing.allocator;
+    const expected = try a.alloc(u8, 128 * 1024 + 31);
+    defer a.free(expected);
+    for (expected, 0..) |*byte, i| byte.* = @truncate(i *% 7);
+    for ([_]BlockCompression{ .none, .snappy }) |compression| {
+        const payload = if (compression == .snappy) try snappy.encode(a, expected) else expected;
+        defer if (compression == .snappy) a.free(payload);
+        var cursor = try BlockDecodeCursor.init(compression, payload.len, expected.len, Crc32.hash(payload));
+        var output: ?[]u8 = null;
+        defer if (output) |bytes| a.free(bytes);
+        var checksum_bytes: usize = 0;
+        var input_bytes: usize = 0;
+        var output_bytes: usize = 0;
+        var allocations: usize = 0;
+        var steps: usize = 0;
+        while (true) {
+            const progress = try cursor.step(payload, output, 257);
+            try std.testing.expect(progress.checksum_bytes + progress.input_bytes <= 257);
+            try std.testing.expect(progress.output_bytes <= 257 and progress.tags <= 256);
+            checksum_bytes += progress.checksum_bytes;
+            input_bytes += progress.input_bytes;
+            output_bytes += progress.output_bytes;
+            steps += 1;
+            try std.testing.expect(steps < expected.len + payload.len + 8);
+            switch (progress.status) {
+                .pending => {},
+                .needs_output => {
+                    try std.testing.expect(output == null);
+                    try std.testing.expectEqual(payload.len, checksum_bytes);
+                    output = try a.alloc(u8, expected.len);
+                    allocations += 1;
+                },
+                .done => break,
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), allocations);
+        try std.testing.expectEqual(payload.len, checksum_bytes);
+        try std.testing.expectEqual(payload.len, input_bytes);
+        try std.testing.expectEqual(expected.len, output_bytes);
+        try std.testing.expectEqualSlices(u8, expected, output.?);
+        try std.testing.expect(@sizeOf(BlockDecodeCursor) <= 256);
+    }
+}
+
+test "table block decode continuation verifies checksum and declared size before output allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const payload = [_]u8{ 17, 0 };
+    try std.testing.expectError(error.TableBlockChecksumMismatch, decodeBlockPayloadAlloc(failing.allocator(), .snappy, &payload, 4, Crc32.hash(&payload) ^ 1));
+    try std.testing.expectError(error.InvalidTableFile, decodeBlockPayloadAlloc(failing.allocator(), .snappy, &payload, 4, Crc32.hash(&payload)));
+    try std.testing.expectError(error.InvalidTableFile, decodeBlockPayloadAlloc(failing.allocator(), .snappy, "", 4, Crc32.hash("")));
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
+    var cursor = try BlockDecodeCursor.init(.none, payload.len, payload.len, Crc32.hash(&payload) ^ 1);
+    try std.testing.expectError(error.TableBlockChecksumMismatch, cursor.step(&payload, null, 4));
+    try std.testing.expectError(error.TableBlockChecksumMismatch, cursor.step(&payload, null, 4));
+}
+
+test "table block decode continuation preserves original rejection and retires partial output" {
+    const a = std.testing.allocator;
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.OriginalBlockDeadline;
+        }
+    };
+    const bytes = try a.alloc(u8, 128 * 1024 + 17);
+    defer a.free(bytes);
+    @memset(bytes, 51);
+    for ([_]BlockCompression{ .none, .snappy }) |compression| {
+        const payload = if (compression == .snappy) try snappy.encode(a, bytes) else bytes;
+        defer if (compression == .snappy) a.free(payload);
+        var state: Control = .{};
+        const owned: read_admission.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check } };
+        const control = read_admission.Port.init(&owned);
+        var tracking = std.testing.FailingAllocator.init(a, .{});
+        const result = try decodeBlockPayloadAllocWithAdmission(tracking.allocator(), compression, payload, bytes.len, Crc32.hash(payload), control);
+        tracking.allocator().free(result);
+        const checks = state.calls;
+        try std.testing.expect(checks > 6);
+        for (1..checks + 1) |index| {
+            state = .{ .fail_at = index };
+            try std.testing.expectError(error.OriginalBlockDeadline, decodeBlockPayloadAllocWithAdmission(tracking.allocator(), compression, payload, bytes.len, Crc32.hash(payload), control));
+            try std.testing.expectEqual(index, state.calls);
+            try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+        }
+        state = .{ .fail_at = 2 };
+        try std.testing.expectError(error.OriginalBlockDeadline, decodeBlockPayloadAllocWithAdmission(tracking.allocator(), compression, payload[0..1], bytes.len, 0, control));
+        try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+    }
+}
+
+test "table file prefix continuation bounds shared keys headers and restart validation" {
+    const a = std.testing.allocator;
+    var raw = std.ArrayListUnmanaged(u8).empty;
+    defer raw.deinit(a);
+    const key = try a.alloc(u8, 8192);
+    defer a.free(key);
+    @memset(key, 'k');
+    for (0..40) |i| {
+        key[key.len - 1] = @intCast(i);
+        try appendEntryBytesToList(a, &raw, .{ .namespace_name = if (i % 2 == 0) "docs" else null, .key = key, .value = if (i % 3 == 0) "" else "value", .tombstone = i % 3 == 0 });
+    }
+    const encoded = try encodePrefixCompressedBlockAlloc(a, raw.items);
+    defer a.free(encoded);
+    for ([_]usize{ 1, 97, 4093 }) |quantum| {
+        var cursor = PrefixDecodeCursor.init(encoded.len, raw.items.len);
+        var output: ?[]u8 = null;
+        defer if (output) |bytes| a.free(bytes);
+        var steps: usize = 0;
+        while (true) {
+            const progress = try cursor.step(encoded, output, quantum);
+            try std.testing.expect(progress.input_bytes <= quantum and progress.output_bytes <= quantum);
+            steps += 1;
+            try std.testing.expect(steps < 1000000);
+            switch (progress.status) {
+                .pending => {},
+                .needs_output => {
+                    try std.testing.expect(output == null);
+                    output = try a.alloc(u8, raw.items.len);
+                },
+                .done => break,
+            }
+        }
+        try std.testing.expectEqualSlices(u8, raw.items, output.?);
+    }
+    for (0..4) |variant| {
+        const corrupt = try a.dupe(u8, encoded);
+        defer a.free(corrupt);
+        switch (variant) {
+            0 => corrupt[0] ^= 1,
+            1 => std.mem.writeInt(u32, corrupt[12..16], 0, .little),
+            2 => std.mem.writeInt(u32, corrupt[29..33], 1, .little), // shared prefix on first restart
+            3 => corrupt[corrupt.len - 4] ^= 1,
+            else => unreachable,
+        }
+        var cursor = PrefixDecodeCursor.init(corrupt.len, raw.items.len);
+        const output = try a.alloc(u8, raw.items.len);
+        defer a.free(output);
+        var failed = false;
+        for (0..10000) |_| {
+            const result = cursor.step(corrupt, output, 4093) catch |err| {
+                try std.testing.expectEqual(error.InvalidTableFile, err);
+                try std.testing.expectError(err, cursor.step(encoded, output, 4093));
+                failed = true;
+                break;
+            };
+            if (result.status == .done) break;
+        }
+        try std.testing.expect(failed);
+    }
+}
+
+fn expectRetainedIndexForTest(expected: *const TableIndex, actual: *const TableIndex) !void {
+    try std.testing.expectEqual(expected.entry_data_start, actual.entry_data_start);
+    try std.testing.expectEqual(expected.entry_data_len, actual.entry_data_len);
+    try std.testing.expectEqualSlices(u16, expected.block_entry_offsets, actual.block_entry_offsets);
+    try std.testing.expectEqualDeep(expected.filter, actual.filter);
+    try std.testing.expectEqualDeep(expected.prefix_filter, actual.prefix_filter);
+    try std.testing.expectEqual(expected.prefix_extractor, actual.prefix_extractor);
+    try std.testing.expectEqual(expected.blocks.len, actual.blocks.len);
+    for (expected.blocks, actual.blocks) |lhs, rhs| try std.testing.expectEqualDeep(lhs, rhs);
+}
+
+fn finishIndexCursorForTest(cursor: *IndexDecodeCursor, quantum: usize) !RetainedIndex {
+    var polls: usize = 0;
+    while (try cursor.step(quantum, null) != .ready) : (polls += 1) try std.testing.expect(polls < 100000);
+    return cursor.takeOutput();
+}
+
+test "table file retained index continuation matches allocating decoder across large metadata and movable ownership" {
+    const a = std.testing.allocator;
+    const keys = try a.alloc(u8, 32 * 4096);
+    defer a.free(keys);
+    const namespace = try a.alloc(u8, 1024);
+    defer a.free(namespace);
+    @memset(namespace, 'n');
+    const value: [default_block_size]u8 = @splat('v');
+    var entries: [32]Entry = undefined;
+    for (&entries, 0..) |*entry, i| {
+        const key = keys[i * 4096 ..][0..4096];
+        @memset(key, 'k');
+        key[key.len - 1] = @intCast(i);
+        entry.* = .{ .namespace_name = namespace, .key = key, .value = &value };
+    }
+    const encoded = try encodeAlloc(a, &entries);
+    defer a.free(encoded);
+    const footer = try decodeFooter(encoded);
+    const metadata = encoded[footer.metadata_offset..][0..footer.metadata_len];
+    try std.testing.expect(metadata.len > 65536);
+    var baseline = try decodeIndexFromFooterAlloc(a, footer, metadata);
+    defer baseline.deinit(a);
+    for ([_]usize{ 127, 4093, 65536 }) |quantum| {
+        var decoder = IndexDecodeCursor.init(a, footer, try a.dupe(u8, metadata));
+        defer decoder.deinit();
+        _ = try decoder.step(quantum, null);
+        var moved = decoder;
+        decoder = .{ .allocator = a, .footer = footer, .metadata = null, .phase = .closed };
+        defer moved.deinit();
+        var index = try finishIndexCursorForTest(&moved, quantum);
+        defer index.deinit();
+        try expectRetainedIndexForTest(&baseline, index.view());
+        for (index.view().blocks) |block| {
+            try std.testing.expect(@intFromPtr(block.largest_key.ptr) >= @intFromPtr(index.metadata.ptr));
+            try std.testing.expect(@intFromPtr(block.largest_key.ptr) + block.largest_key.len <= @intFromPtr(index.metadata.ptr) + index.metadata.len);
+        }
+        try std.testing.expectError(error.TransactionClosed, moved.step(1, null));
+    }
+}
+
+test "table file retained index continuation retires every allocation failure and original rejection phase" {
+    const a = std.testing.allocator;
+    const entries = [_]Entry{ .{ .namespace_name = "docs", .key = "key0", .value = "payload" }, .{ .namespace_name = "docs", .key = "key1", .value = "payload" } };
+    const encoded = try encodeAlloc(a, &entries);
+    defer a.free(encoded);
+    const footer = try decodeFooter(encoded);
+    const metadata = encoded[footer.metadata_offset..][0..footer.metadata_len];
+    const Probe = struct {
+        fn run(root: std.mem.Allocator, f: Footer, raw: []const u8) !void {
+            var decoder = IndexDecodeCursor.init(root, f, try root.dupe(u8, raw));
+            defer decoder.deinit();
+            var index = try finishIndexCursorForTest(&decoder, 17);
+            defer index.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{ footer, metadata });
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {
+            return error.TestIndexOriginalRefusal;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedIndexWait;
+        }
+    };
+    var budget: Budget = .{};
+    var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    inline for (@typeInfo(IndexDecodeCursor.Phase).@"enum".field_values) |field_value| {
+        const phase: IndexDecodeCursor.Phase = @fromBackingInt(field_value);
+        if (phase == .taken or phase == .closed or phase == .failed) continue;
+        var decoder = IndexDecodeCursor.init(a, footer, try a.dupe(u8, metadata));
+        defer decoder.deinit();
+        var polls: usize = 0;
+        while (decoder.phase != phase and decoder.phase != .ready) : (polls += 1) {
+            try std.testing.expect(polls < 10000);
+            _ = try decoder.step(17, null);
+        }
+        try std.testing.expectEqual(phase, decoder.phase);
+        try std.testing.expectError(error.TestIndexOriginalRefusal, decoder.step(17, .init(&payload)));
+        try std.testing.expect(decoder.metadata == null);
+        try std.testing.expectEqual(@as(usize, 0), decoder.blocks.len);
+        try std.testing.expectEqual(@as(usize, 0), decoder.offsets.len);
+        try std.testing.expectError(error.TestIndexOriginalRefusal, decoder.step(17, null));
+    }
+}
+
+test "table file retained index continuation preserves malformed metadata validation" {
+    const a = std.testing.allocator;
+    const entries = [_]Entry{ .{ .namespace_name = "docs", .key = "key0", .value = "payload" }, .{ .namespace_name = "docs", .key = "key1", .value = "payload" } };
+    const encoded = try encodeAlloc(a, &entries);
+    defer a.free(encoded);
+    var footer = try decodeFooter(encoded);
+    const metadata = encoded[footer.metadata_offset..][0..footer.metadata_len];
+    var rejected: usize = 0;
+    var accepted: usize = 0;
+    for (0..metadata.len) |position| {
+        const changed = try a.dupe(u8, metadata);
+        defer a.free(changed);
+        changed[position] ^= 0x80;
+        footer.metadata_checksum = Crc32.hash(changed);
+        const expected = decodeIndexFromFooterAlloc(a, footer, changed);
+        var cursor = IndexDecodeCursor.init(a, footer, try a.dupe(u8, changed));
+        defer cursor.deinit();
+        const actual = finishIndexCursorForTest(&cursor, 17);
+        if (expected) |value| {
+            var baseline = value;
+            defer baseline.deinit(a);
+            var index = try actual;
+            defer index.deinit();
+            try expectRetainedIndexForTest(&baseline, index.view());
+            accepted += 1;
+        } else |err| {
+            try std.testing.expectError(err, actual);
+            rejected += 1;
+        }
+    }
+    try std.testing.expect(rejected > 0 and accepted > 0);
 }

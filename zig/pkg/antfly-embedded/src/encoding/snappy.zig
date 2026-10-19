@@ -47,24 +47,6 @@ fn checkpoint(control: anytype) !void {
     }
 }
 
-fn copyLiteralWithAdmission(dst: []u8, src: []const u8, control: anytype) !void {
-    if (comptime @TypeOf(control) == @TypeOf(null)) {
-        @memcpy(dst, src);
-        return;
-    }
-    if (control == null) {
-        @memcpy(dst, src);
-        return;
-    }
-    var cursor: usize = 0;
-    while (cursor < src.len) {
-        try checkpoint(control);
-        const end = cursor + @min(src.len - cursor, 64 * 1024);
-        @memcpy(dst[cursor..end], src[cursor..end]);
-        cursor = end;
-    }
-}
-
 pub fn decodeWithAdmission(alloc: Allocator, src: []const u8, control: anytype) ![]u8 {
     try checkpoint(control);
     if (src.len == 0) {
@@ -102,88 +84,189 @@ pub fn decodeIntoWithAdmission(src: []const u8, dst: []u8, control: anytype) !vo
     try decodePayload(src, pos, dst, control);
 }
 
-fn decodePayload(src: []const u8, start: usize, dst: []u8, control: anytype) !void {
-    var pos = start;
-    const uncompressed_len = dst.len;
-    var d: usize = 0; // destination offset
-    var checked_destination: usize = 0;
-    var tags_since_check: usize = 0;
-    try checkpoint(control);
+/// Explicit raw-block decode progress. Owns only scalar offsets and pending
+/// tag metadata; input, output, reader and controls are borrowed per step.
+/// Callers keep one immutable input and its decoded prefix alive across steps.
+/// No output may be published before done. A failed provider read can be
+/// retried: only successfully read input and written output advance progress.
+pub const DecodeCursor = struct {
+    pub const Phase = enum { preamble, tag, literal_header, copy_header, literal, copy, done, failed };
+    pub const Progress = struct { done: bool, needs_output: bool, input_bytes: usize, output_bytes: usize, tags: usize };
+    input_len: usize,
+    output_len: usize,
+    input_offset: usize = 0,
+    output_offset: usize = 0,
+    phase: Phase = .preamble,
+    header_value: usize = 0,
+    header_shift: std.math.Log2Int(usize) = 0,
+    header_left: usize = 0,
+    remaining: usize = 0,
+    copy_offset: usize = 0,
+    declared_length: ?usize = null,
 
-    while (pos < src.len) {
-        if (comptime @TypeOf(control) != @TypeOf(null)) {
-            if (tags_since_check >= 256 or d - checked_destination >= 64 * 1024) {
-                try checkpoint(control);
-                checked_destination = d;
-                tags_since_check = 0;
-            }
-            tags_since_check += 1;
-        }
-        const tag = src[pos];
-        pos += 1;
-        const element_type: u2 = @truncate(tag);
-
-        switch (element_type) {
-            tag_literal => {
-                var length: usize = @as(usize, tag >> 2) + 1;
-                if (length <= 60) {
-                    // Length is inline in tag
-                } else {
-                    // Length follows in 1-4 bytes
-                    const extra_bytes = length - 60;
-                    if (pos + extra_bytes > src.len) return error.CorruptInput;
-                    length = 1;
-                    for (0..extra_bytes) |i| {
-                        length += @as(usize, src[pos + i]) << @intCast(i * 8);
-                    }
-                    pos += extra_bytes;
-                }
-                if (pos + length > src.len) return error.CorruptInput;
-                if (d + length > dst.len) return error.CorruptInput;
-                try copyLiteralWithAdmission(dst[d..][0..length], src[pos..][0..length], control);
-                d += length;
-                pos += length;
-            },
-            tag_copy1 => {
-                // 2-byte element: tag + 1 offset byte
-                if (pos >= src.len) return error.CorruptInput;
-                const length: usize = @as(usize, (tag >> 2) & 0x07) + 4;
-                const offset: usize = (@as(usize, tag & 0xe0) << 3) | @as(usize, src[pos]);
-                pos += 1;
-                if (offset == 0 or offset > d) return error.CorruptInput;
-                if (d + length > dst.len) return error.CorruptInput;
-                copyOverlapping(dst, d, offset, length);
-                d += length;
-            },
-            tag_copy2 => {
-                // 3-byte element: tag + 2 offset bytes
-                if (pos + 2 > src.len) return error.CorruptInput;
-                const length: usize = @as(usize, tag >> 2) + 1;
-                const offset: usize = @as(usize, src[pos]) | (@as(usize, src[pos + 1]) << 8);
-                pos += 2;
-                if (offset == 0 or offset > d) return error.CorruptInput;
-                if (d + length > dst.len) return error.CorruptInput;
-                copyOverlapping(dst, d, offset, length);
-                d += length;
-            },
-            tag_copy4 => {
-                // 5-byte element: tag + 4 offset bytes
-                if (pos + 4 > src.len) return error.CorruptInput;
-                const length: usize = @as(usize, tag >> 2) + 1;
-                const offset: usize = @as(usize, src[pos]) |
-                    (@as(usize, src[pos + 1]) << 8) |
-                    (@as(usize, src[pos + 2]) << 16) |
-                    (@as(usize, src[pos + 3]) << 24);
-                pos += 4;
-                if (offset == 0 or offset > d) return error.CorruptInput;
-                if (d + length > dst.len) return error.CorruptInput;
-                copyOverlapping(dst, d, offset, length);
-                d += length;
-            },
-        }
+    pub fn init(input_len: usize, output_len: usize) DecodeCursor {
+        return .{ .input_len = input_len, .output_len = output_len, .phase = if (input_len == 0 and output_len == 0) .done else .preamble };
     }
 
-    if (d != uncompressed_len) return error.CorruptInput;
+    const SliceReader = struct {
+        bytes: []const u8,
+        length: usize,
+        fn readInto(self: @This(), offset: u64, out: []u8) !void {
+            const start = std.math.cast(usize, offset) orelse return error.CorruptInput;
+            if (start > self.bytes.len or out.len > self.bytes.len - start) return error.CorruptInput;
+            @memcpy(out, self.bytes[start..][0..out.len]);
+        }
+    };
+
+    /// Each call requests at most quantum input bytes, writes at most quantum
+    /// output bytes and parses at most 256 tags. Zero quantum is invalid.
+    pub fn step(self: *DecodeCursor, src: []const u8, dst: ?[]u8, quantum: usize) !Progress {
+        return self.stepFromReader(SliceReader{ .bytes = src, .length = src.len }, dst, quantum);
+    }
+
+    /// A reader supplies length and readInto(offset, out). It must honor its
+    /// own physical admission/window bounds. Neither reader nor output escapes.
+    pub fn stepFromReader(self: *DecodeCursor, reader: anytype, dst: ?[]u8, quantum: usize) !Progress {
+        if (quantum == 0 or reader.length != self.input_len) return error.InvalidArgument;
+        if (dst) |out| if (out.len != self.output_len) return error.InvalidArgument;
+        return self.advance(reader, dst, quantum) catch |err| {
+            if (err == error.CorruptInput) self.phase = .failed;
+            return err;
+        };
+    }
+
+    fn byte(self: *DecodeCursor, reader: anytype) !u8 {
+        if (self.input_offset >= self.input_len) return error.CorruptInput;
+        var out: [1]u8 = undefined;
+        try reader.readInto(@intCast(self.input_offset), &out);
+        self.input_offset += 1;
+        return out[0];
+    }
+
+    fn literalReady(self: *DecodeCursor) !void {
+        if (self.remaining > self.output_len - self.output_offset or self.remaining > self.input_len - self.input_offset) return error.CorruptInput;
+        self.phase = .literal;
+    }
+
+    fn copyReady(self: *DecodeCursor) !void {
+        if (self.copy_offset == 0 or self.copy_offset > self.output_offset or self.remaining > self.output_len - self.output_offset) return error.CorruptInput;
+        self.phase = .copy;
+    }
+
+    fn advance(self: *DecodeCursor, reader: anytype, dst: ?[]u8, quantum: usize) !Progress {
+        const input_start = self.input_offset;
+        const output_start = self.output_offset;
+        var input_left = quantum;
+        var output_left = quantum;
+        var tags: usize = 0;
+        while (true) {
+            if (dst == null and self.phase != .preamble and self.phase != .done and self.phase != .failed) break;
+            switch (self.phase) {
+                .failed => return error.CorruptInput,
+                .done => break,
+                .preamble => {
+                    if (input_left == 0) break;
+                    const value = try self.byte(reader);
+                    input_left -= 1;
+                    const bits: usize = value & 127;
+                    if (bits > @as(usize, std.math.maxInt(usize)) >> self.header_shift) return error.CorruptInput;
+                    self.header_value |= bits << self.header_shift;
+                    if (value & 128 == 0) {
+                        self.declared_length = self.header_value;
+                        if (self.header_value != self.output_len) return error.CorruptInput;
+                        self.phase = .tag;
+                    } else {
+                        if (self.header_shift > @bitSizeOf(usize) - 1 - 7) return error.CorruptInput;
+                        self.header_shift += 7;
+                    }
+                },
+                .tag => {
+                    if (self.input_offset == self.input_len) {
+                        if (self.output_offset != self.output_len) return error.CorruptInput;
+                        self.phase = .done;
+                        break;
+                    }
+                    if (input_left == 0 or tags == 256) break;
+                    const tag = try self.byte(reader);
+                    input_left -= 1;
+                    tags += 1;
+                    const kind: u2 = @truncate(tag);
+                    self.header_shift = 0;
+                    self.header_value = 0;
+                    self.remaining = @as(usize, tag >> 2) + 1;
+                    if (kind == tag_literal) {
+                        if (self.remaining <= 60) {
+                            try self.literalReady();
+                        } else {
+                            self.header_left = self.remaining - 60;
+                            self.phase = .literal_header;
+                        }
+                    } else {
+                        self.header_left = switch (kind) {
+                            tag_copy1 => 1,
+                            tag_copy2 => 2,
+                            tag_copy4 => 4,
+                            else => unreachable,
+                        };
+                        if (kind == tag_copy1) {
+                            self.remaining = @as(usize, (tag >> 2) & 7) + 4;
+                            self.header_value = @as(usize, tag & 0xe0) << 3;
+                        }
+                        self.phase = .copy_header;
+                    }
+                },
+                .literal_header, .copy_header => {
+                    if (input_left == 0) break;
+                    const value = try self.byte(reader);
+                    input_left -= 1;
+                    self.header_value |= @as(usize, value) << self.header_shift;
+                    self.header_left -= 1;
+                    if (self.header_left == 0) {
+                        if (self.phase == .literal_header) {
+                            self.remaining = std.math.add(usize, self.header_value, 1) catch return error.CorruptInput;
+                            try self.literalReady();
+                        } else {
+                            self.copy_offset = self.header_value;
+                            try self.copyReady();
+                        }
+                    } else self.header_shift += 8;
+                },
+                .literal => {
+                    if (input_left == 0 or output_left == 0) break;
+                    const take = @min(self.remaining, @min(input_left, output_left));
+                    // A provider may write a partial range then fail. Its bytes
+                    // are unpublished; retry overwrites that uncommitted range.
+                    try reader.readInto(@intCast(self.input_offset), dst.?[self.output_offset..][0..take]);
+                    self.input_offset += take;
+                    self.output_offset += take;
+                    self.remaining -= take;
+                    input_left -= take;
+                    output_left -= take;
+                    if (self.remaining == 0) self.phase = .tag;
+                },
+                .copy => {
+                    if (output_left == 0) break;
+                    const take = @min(self.remaining, output_left);
+                    copyOverlapping(dst.?, self.output_offset, self.copy_offset, take);
+                    self.output_offset += take;
+                    self.remaining -= take;
+                    output_left -= take;
+                    if (self.remaining == 0) self.phase = .tag;
+                },
+            }
+        }
+        return .{ .done = self.phase == .done, .needs_output = dst == null and self.phase != .preamble and self.phase != .done, .input_bytes = self.input_offset - input_start, .output_bytes = self.output_offset - output_start, .tags = tags };
+    }
+};
+
+fn decodePayload(src: []const u8, start: usize, dst: []u8, control: anytype) !void {
+    var cursor = DecodeCursor.init(src.len, dst.len);
+    cursor.input_offset = start;
+    cursor.phase = .tag;
+    while (true) {
+        try checkpoint(control);
+        if ((try cursor.step(src, dst, 64 * 1024)).done) break;
+    }
     try checkpoint(control);
 }
 
@@ -203,8 +286,21 @@ pub fn decodeFromView(alloc: Allocator, view: @import("../segment_source.zig").V
     if (size > max_output_bytes) return error.SegmentReadBudgetExceeded;
     const dst = try alloc.alloc(u8, size);
     errdefer alloc.free(dst);
-    try decodeRangePayload(&input, dst, dst.len, true);
+    try decodeRangeFully(&input, dst);
     return dst;
+}
+
+fn decodeRangeFully(input: anytype, dst: []u8) !void {
+    const Reader = struct {
+        input: @TypeOf(input),
+        length: u64,
+        pub fn readInto(self: @This(), offset: u64, out: []u8) !void {
+            return self.input.readInto(offset, out);
+        }
+    };
+    var cursor = DecodeCursor.init(@intCast(input.view.length), dst.len);
+    const reader: Reader = .{ .input = input, .length = input.view.length };
+    while (!(try cursor.stepFromReader(reader, dst, 64 * 1024)).done) {}
 }
 
 const RangeInput = RangeReader(@import("../segment_source.zig").View);
@@ -216,6 +312,11 @@ fn RangeReader(comptime View: type) type {
         valid: usize = 0,
         window_bytes: usize = 8192,
         bytes: [8192]u8 = undefined,
+        pub fn readInto(self: *@This(), offset: u64, out: []u8) !void {
+            if (offset > self.view.length or out.len > self.view.length - offset) return error.CorruptInput;
+            self.pos = offset;
+            try self.literal(out);
+        }
         fn decodedSize(self: *@This()) !usize {
             if (self.view.length == 0) return 0;
             var prefix: [5]u8 = undefined;
@@ -230,7 +331,7 @@ fn RangeReader(comptime View: type) type {
         }
         fn byte(self: *@This()) !u8 {
             if (self.pos >= self.view.length) return error.CorruptInput;
-            if (self.valid == 0 or self.pos - self.start >= self.valid) {
+            if (self.valid == 0 or self.pos < self.start or self.pos - self.start >= self.valid) {
                 self.start = self.pos;
                 self.valid = @intCast(@min(self.window_bytes, self.view.length - self.pos));
                 try self.view.readInto(self.pos, self.bytes[0..self.valid]);
@@ -269,7 +370,7 @@ pub fn decodeFromViewInto(view: @import("../segment_source.zig").View, dst: []u8
     }
     var input = RangeInput{ .view = view };
     if (try input.decodedSize() != dst.len) return error.CorruptInput;
-    try decodeRangePayload(&input, dst, dst.len, true);
+    try decodeRangeFully(&input, dst);
 }
 
 /// Compare a compressed block with borrowed expected spans. The already
@@ -768,4 +869,186 @@ test "SQL bounded native delivery Snappy exact span comparison validates literal
     try std.testing.expectError(error.CorruptInput, equalsFromReader(Input{ .bytes = &corrupt, .length = corrupt.len }, &.{"abcd"}));
     const trailing = [_]u8{ 1, 0, 'a', 0, 'b' };
     try std.testing.expectError(error.CorruptInput, equalsFromReader(Input{ .bytes = &trailing, .length = trailing.len }, &.{"a"}));
+}
+
+test "Snappy continuation byte quanta resume all tag widths with fresh input and output borrows" {
+    const a = std.testing.allocator;
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    defer encoded.deinit(a);
+    const expected = "abcdefghabcdefgh" ++ "efgh" ++ "efghefgh" ++ "c";
+    try writeVarint(a, &encoded, expected.len);
+    try emitLiteral(a, &encoded, "abcdefgh");
+    // COPY_1: eight bytes at offset eight; COPY_2: four at offset four;
+    // COPY_4: eight at offset four, including overlapping history.
+    try encoded.appendSlice(a, &.{ 0x11, 8, 0x0e, 4, 0, 0x1f, 4, 0, 0, 0 });
+    // Final single literal supplies the last byte independently.
+    try emitLiteral(a, &encoded, "c");
+    const length = try decodedLen(encoded.items);
+    for ([_]usize{ 1, 2, 3, 7, 64 }) |quantum| {
+        const first_input = try a.dupe(u8, encoded.items);
+        defer a.free(first_input);
+        const second_input = try a.dupe(u8, encoded.items);
+        defer a.free(second_input);
+        const first_output = try a.alloc(u8, length);
+        defer a.free(first_output);
+        const second_output = try a.alloc(u8, length);
+        defer a.free(second_output);
+        var cursor = DecodeCursor.init(encoded.items.len, length);
+        var steps: usize = 0;
+        var input_bytes: usize = 0;
+        var output_bytes: usize = 0;
+        var prior = first_output;
+        while (true) {
+            const src = if (steps % 2 == 0) first_input else second_input;
+            const dst = if (steps % 2 == 0) second_output else first_output;
+            @memcpy(src, encoded.items);
+            @memcpy(dst[0..cursor.output_offset], prior[0..cursor.output_offset]);
+            const progress = try cursor.step(src, dst, quantum);
+            @memset(src, 0xFF);
+            try std.testing.expect(progress.input_bytes <= quantum and progress.output_bytes <= quantum and progress.tags <= 256);
+            input_bytes += progress.input_bytes;
+            output_bytes += progress.output_bytes;
+            steps += 1;
+            try std.testing.expect(steps <= encoded.items.len + length + 2);
+            if (progress.done) {
+                try std.testing.expectEqualStrings(expected, dst);
+                break;
+            }
+            try std.testing.expect(progress.input_bytes + progress.output_bytes > 0);
+            prior = dst;
+        }
+        try std.testing.expectEqual(encoded.items.len, input_bytes);
+        try std.testing.expectEqual(length, output_bytes);
+    }
+}
+
+test "Snappy continuation long literals and copies stay within byte and tag quanta" {
+    const a = std.testing.allocator;
+    const count = 128 * 1024 + 17;
+    const data = try a.alloc(u8, count);
+    defer a.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i);
+    for ([_]bool{ false, true }) |copies| {
+        var encoded: std.ArrayListUnmanaged(u8) = .empty;
+        defer encoded.deinit(a);
+        try writeVarint(a, &encoded, count);
+        if (copies) {
+            try emitLiteral(a, &encoded, "a");
+            try emitCopy(a, &encoded, 1, count - 1);
+        } else try emitLiteral(a, &encoded, data);
+        const out = try a.alloc(u8, count);
+        defer a.free(out);
+        var cursor = DecodeCursor.init(encoded.items.len, count);
+        var total_input: usize = 0;
+        var total_output: usize = 0;
+        var steps: usize = 0;
+        while (true) {
+            const progress = try cursor.step(encoded.items, out, 1021);
+            try std.testing.expect(progress.input_bytes <= 1021 and progress.output_bytes <= 1021 and progress.tags <= 256);
+            total_input += progress.input_bytes;
+            total_output += progress.output_bytes;
+            steps += 1;
+            try std.testing.expect(steps < count);
+            if (progress.done) break;
+        }
+        try std.testing.expect(steps > 100);
+        try std.testing.expectEqual(encoded.items.len, total_input);
+        try std.testing.expectEqual(count, total_output);
+        if (copies) {
+            for (out) |b| try std.testing.expectEqual(@as(u8, 'a'), b);
+        } else try std.testing.expectEqualSlices(u8, data, out);
+    }
+}
+
+test "Snappy continuation reader failure preserves committed progress and borrows no reader" {
+    const a = std.testing.allocator;
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    defer encoded.deinit(a);
+    try writeVarint(a, &encoded, 200);
+    var data: [200]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i);
+    try emitLiteral(a, &encoded, &data);
+    const Reader = struct {
+        bytes: []const u8,
+        length: usize,
+        fail: bool = true,
+        pub fn readInto(self: *@This(), offset: u64, out: []u8) !void {
+            if (self.fail and out.len > 1) {
+                out[0] = 0xDD;
+                return error.TransientInputFault;
+            }
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+    };
+    var cursor = DecodeCursor.init(encoded.items.len, data.len);
+    var output: [200]u8 = @splat(0xCC);
+    {
+        var reader: Reader = .{ .bytes = encoded.items, .length = encoded.items.len };
+        try std.testing.expectError(error.TransientInputFault, cursor.stepFromReader(&reader, &output, 31));
+    }
+    try std.testing.expect(cursor.phase == .literal and cursor.output_offset == 0);
+    const committed_input = cursor.input_offset;
+    try std.testing.expect(committed_input > 0 and committed_input < encoded.items.len);
+    var resumed: Reader = .{ .bytes = encoded.items, .length = encoded.items.len, .fail = false };
+    var resumed_input: usize = 0;
+    while (true) {
+        const progress = try cursor.stepFromReader(&resumed, &output, 31);
+        resumed_input += progress.input_bytes;
+        if (progress.done) break;
+    }
+    try std.testing.expectEqual(encoded.items.len - committed_input, resumed_input);
+    try std.testing.expectEqualSlices(u8, &data, &output);
+    try std.testing.expect(@sizeOf(DecodeCursor) <= 128);
+}
+
+test "Snappy continuation corruption remains terminal across tag and preamble boundaries" {
+    const cases = [_]struct { bytes: []const u8, len: usize }{
+        .{ .bytes = &.{128}, .len = 1 },
+        .{ .bytes = &.{ 1, 0 }, .len = 1 },
+        .{ .bytes = &.{ 2, 0, 'a', 2, 0, 0 }, .len = 2 },
+        .{ .bytes = &.{ 2, 0, 'a', 2, 2, 0 }, .len = 2 },
+        .{ .bytes = &.{ 1, 4, 'a', 'b' }, .len = 1 },
+        .{ .bytes = &.{ 0, 0, 'a' }, .len = 0 },
+        .{ .bytes = &.{ 1, 240 }, .len = 1 },
+        .{ .bytes = &.{ 1, 252, 255, 255, 255, 255 }, .len = 1 },
+    };
+    for (cases) |case| {
+        var cursor = DecodeCursor.init(case.bytes.len, case.len);
+        var output: [2]u8 = undefined;
+        var caught = false;
+        for (0..32) |_| {
+            const progress = cursor.step(case.bytes, output[0..case.len], 1) catch |err| {
+                try std.testing.expectEqual(error.CorruptInput, err);
+                caught = true;
+                break;
+            };
+            try std.testing.expect(!progress.done);
+        }
+        try std.testing.expect(caught);
+        try std.testing.expectError(error.CorruptInput, cursor.step(case.bytes, output[0..case.len], 1));
+    }
+    var cursor = DecodeCursor.init(2, 1);
+    var output: [1]u8 = undefined;
+    try std.testing.expectError(error.InvalidArgument, cursor.step(&.{ 1, 0 }, &output, 0));
+}
+
+test "Snappy continuation preserves high COPY offsets across partial headers" {
+    const a = std.testing.allocator;
+    const count = 65543;
+    const literal = try a.alloc(u8, count);
+    defer a.free(literal);
+    for (literal, 0..) |*byte, i| byte.* = @truncate((i *% 0x9e3779b1) ^ (i >> 16));
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    defer encoded.deinit(a);
+    try writeVarint(a, &encoded, count + 4 + 64);
+    try emitLiteral(a, &encoded, literal);
+    // COPY_1 count four, offset 300; COPY_4 count 64, offset 65536.
+    try encoded.appendSlice(a, &.{ 0x21, 44, 0xff, 0, 0, 1, 0 });
+    const output = try a.alloc(u8, count + 4 + 64);
+    defer a.free(output);
+    var cursor = DecodeCursor.init(encoded.items.len, output.len);
+    while (!(try cursor.step(encoded.items, output, 13)).done) {}
+    try std.testing.expectEqualSlices(u8, literal, output[0..count]);
+    try std.testing.expectEqualSlices(u8, literal[count - 300 ..][0..4], output[count..][0..4]);
+    try std.testing.expectEqualSlices(u8, literal[count + 4 - 65536 ..][0..64], output[count + 4 ..]);
 }

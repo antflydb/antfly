@@ -138,7 +138,40 @@ pub const OpenedObjectStore = struct {
 
     pub const OpenOptions = struct {
         ensure_bucket: bool = true,
+        context: @import("query/lake_read_context.zig").Context = .{},
+
+        pub fn ensureClient(self: OpenOptions, client: *object_storage.ObjectStorage, bucket: []const u8, require_existing: bool) !void {
+            try self.context.ensureActive();
+            if (!self.ensure_bucket and !require_existing) return;
+            const lifetime: OpenCancellation = .{ .context = self.context };
+            const options: @import("objectstore").BucketOptions = .{ .cancellation = .{ .ptr = &lifetime, .is_cancelled_fn = OpenCancellation.cancelled } };
+            const exists = @import("../sql/execution_wait.zig").run(self.context.wait, object_storage.ObjectStorage.bucketExistsWithOptions, .{ client, bucket, options }) catch |err| {
+                try self.context.checkLifetime();
+                return err;
+            };
+            try self.context.ensureActive();
+            if (!exists) {
+                if (!self.ensure_bucket) return error.ArtifactBucketNotFound;
+                @import("../sql/execution_wait.zig").run(self.context.wait, object_storage.ObjectStorage.makeBucketWithOptions, .{ client, bucket, options }) catch |err| {
+                    try self.context.checkLifetime();
+                    return err;
+                };
+                try self.context.ensureActive();
+            }
+        }
     };
+    const OpenCancellation = struct {
+        context: @import("query/lake_read_context.zig").Context,
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            self.context.checkLifetime() catch return true;
+            return false;
+        }
+    };
+    fn discardFilesystem(value: object_storage.FilesystemObjectStorage) void {
+        var owned = value;
+        owned.deinit();
+    }
 
     pub fn initRemoteUri(alloc: Allocator, uri: []const u8, file_bucket: []const u8) !OpenedObjectStore {
         return try initRemoteUriWithS3AndOpenOptions(alloc, uri, file_bucket, null, .{});
@@ -211,11 +244,12 @@ pub const OpenedObjectStore = struct {
         const fs = try alloc.create(object_storage.FilesystemObjectStorage);
         errdefer alloc.destroy(fs);
         const manifest = std.mem.endsWith(u8, path, ".parquet-manifest.json");
-        fs.* = try object_storage.FilesystemObjectStorage.init(alloc, if (manifest) std.fs.path.dirname(path) orelse "." else path);
+        try options.context.ensureActive();
+        fs.* = try @import("../sql/execution_wait.zig").runOwned(options.context.wait, object_storage.FilesystemObjectStorage.init, .{ alloc, if (manifest) std.fs.path.dirname(path) orelse "." else path }, discardFilesystem, .{});
 
         var owned_client = fs.client();
         errdefer owned_client.deinit();
-        if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        try options.ensureClient(&owned_client, bucket, false);
         const owned_bucket = try alloc.dupe(u8, bucket);
         errdefer alloc.free(owned_bucket);
         return .{
@@ -260,7 +294,7 @@ pub const OpenedObjectStore = struct {
 
         var owned_client = gcs.client();
         errdefer owned_client.deinit();
-        if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        try options.ensureClient(&owned_client, bucket, false);
         const owned_bucket = try alloc.dupe(u8, bucket);
         errdefer alloc.free(owned_bucket);
         return .{
@@ -380,7 +414,7 @@ pub const OpenedObjectStore = struct {
         cfg_owned = false;
         var owned_client = s3.client();
         errdefer owned_client.deinit();
-        if (open_options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        try open_options.ensureClient(&owned_client, bucket, false);
         const owned_bucket = try alloc.dupe(u8, bucket);
         errdefer alloc.free(owned_bucket);
         return .{
@@ -406,7 +440,7 @@ pub const OpenedObjectStore = struct {
         options: OpenOptions,
     ) !OpenedObjectStore {
         var owned_client = client;
-        if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        try options.ensureClient(&owned_client, bucket, false);
         const owned_bucket = try alloc.dupe(u8, bucket);
         errdefer alloc.free(owned_bucket);
         return .{
@@ -518,4 +552,57 @@ test "lake store opening frees partial names without destroying borrowed client"
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.open, .{client});
     // A rejected opening must neither destroy nor replace its producer.
     try std.testing.expect(try client.bucketExists("existing"));
+}
+
+test "lake store opening parks the original execution and preserves provisioned buckets on rejected resume" {
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Wait = struct {
+        scheduler: *Runnable.Scheduler,
+        execution: *Runnable.Execution,
+        reject: bool,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.checkpoint();
+            try self.execution.park(.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            var control: Runnable.Execution = .{};
+            try control.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            defer control.finish();
+            try control.checkpoint();
+            self.begins += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            if (self.reject and self.ends == 2) self.scheduler.close();
+            try self.execution.enter(try self.execution.retainedClass());
+        }
+    };
+    for ([_]bool{ false, true }) |reject| {
+        var memory = @import("objectstore").MemoryClient.init(std.testing.allocator);
+        defer memory.deinit();
+        var client = memory.client();
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 1024 * 1024 });
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query);
+        defer execution.finish();
+        var wait: Wait = .{ .scheduler = &scheduler, .execution = &execution, .reject = reject };
+        var context: @import("query/lake_read_context.zig").Context = .{};
+        context = context.withExecution(&execution);
+        context.wait = .{ .ptr = &wait, .begin = Wait.begin, .end = Wait.end };
+        const result = (OpenedObjectStore.OpenOptions{ .context = context }).ensureClient(&client, "new-bucket", false);
+        if (reject) {
+            try std.testing.expectError(error.SchedulerClosed, result);
+        } else {
+            try result;
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+        }
+        try std.testing.expectEqual(@as(usize, 2), wait.begins);
+        try std.testing.expectEqual(wait.begins, wait.ends);
+        try std.testing.expect(try client.bucketExists("new-bucket"));
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    }
 }

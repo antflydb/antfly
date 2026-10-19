@@ -33,6 +33,7 @@ const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
 const retained_effects = @import("retained_effects.zig");
+const artifact_replay_inventory = @import("artifact_replay_inventory.zig");
 const artifact_payload = @import("artifact_payload.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
@@ -456,6 +457,9 @@ pub const DocStore = struct {
     payload_capture_inline: bool = false,
     payload_migration_allowance: ?u64 = null,
     payload_policy_mutex: std.Io.Mutex = .init,
+    // Never wrap: an A -> B -> A policy change must invalidate an in-flight
+    // primary capture even when its policy values compare equal again.
+    payload_policy_generation: u64 = 0,
     payload_recovery_required: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     /// Process-local wake hint, published only after successful row/schema
@@ -468,6 +472,7 @@ pub const DocStore = struct {
     // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
     // this before its commit; an aborted admission merely leaves a safe probe.
     retained_effects_cache: std.atomic.Value(u8) = .init(0),
+    publication_backlog_mutex: std.atomic.Mutex = .unlocked,
     runtime_store: backend_erased.Store,
     owns_runtime_store: bool,
     owned_lsm_backend: ?lsm_backend.BackendHandle,
@@ -490,6 +495,7 @@ pub const DocStore = struct {
     // transactions. Packing both into one atomic makes reader admission versus
     // publication closure a single indivisible transition.
     portable_import_reader_state: std.atomic.Value(usize) = .init(0),
+    portable_import_revision: std.atomic.Value(u64) = .init(0),
 
     const replay_index_unknown: u8 = 0;
     const replay_index_missing: u8 = 1;
@@ -514,7 +520,9 @@ pub const DocStore = struct {
         retained: retained_effects.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
+        publication_backlog: @import("publication_backlog.zig").Capture = .{},
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
+        artifact_inventory: artifact_replay_inventory.Capture = .{},
         mutation_capture: ?*@import("txn_mutation_capture.zig").Capture = null,
         payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
@@ -578,6 +586,7 @@ pub const DocStore = struct {
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
+            self.artifact_inventory.deinit(self.alloc);
             const reader_owner = self.portable_import_reader_owner;
             const payload_session = self.payload_session;
             defer if (payload_session) |session| session.release();
@@ -591,6 +600,7 @@ pub const DocStore = struct {
             } else if (self.read) |*read| {
                 read.abort();
             }
+            self.publication_backlog.release();
             self.* = undefined;
             if (reader_owner) |owner| owner.releasePortableImportReader();
         }
@@ -609,11 +619,13 @@ pub const DocStore = struct {
                 try self.artifact_inputs.stage(self, self.retained.staged);
                 try self.artifact_footprint.stage(self);
                 try self.document_revisions.stage(self);
+                try self.artifact_inventory.stage(self, if (self.columnar_owner) |owner| &owner.runtime_store else null);
             }
             const reader_owner = self.portable_import_reader_owner;
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const payload_session = self.payload_session;
             if (payload_session) |session| try session.stageReferenceEpoch(self);
+            try self.publication_backlog.stage(self);
             if (payload_session) |session| try session.prepareCommit();
             if (payload_session) |session| session.primary_commit_attempted = true;
             if (self.write) |*write| {
@@ -628,6 +640,8 @@ pub const DocStore = struct {
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
+            self.artifact_inventory.deinit(self.alloc);
+            self.publication_backlog.release();
             self.* = undefined;
             if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
             if (reader_owner) |owner| owner.releasePortableImportReader();
@@ -761,7 +775,7 @@ pub const DocStore = struct {
             const admission = @import("../common/read_admission.zig");
             var adapter = admission.Adapter(@TypeOf(budget)){ .budget = budget };
             const payload = adapter.payload();
-            try self.read.?.getManySortedWithAdmission(keys, values, admission.Port.init(&payload));
+            try self.read.?.getManySortedWithAdmission(keys, values, admission.portForBudget(budget, &payload));
             try budget.checkpoint();
         }
 
@@ -802,6 +816,13 @@ pub const DocStore = struct {
         }
 
         pub fn put(self: *Txn, key: []const u8, value: []const u8) anyerror!void {
+            errdefer if (artifact_replay_inventory.isTrackedKey(key)) {
+                self.artifact_inventory.poisoned = true;
+            };
+            errdefer if (@import("publication_backlog.zig").isObligation(key)) {
+                self.publication_backlog.poisoned = true;
+            };
+            try self.publication_backlog.touch(self, if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null, key, value);
             try updateGraphOwningTable(self, key, value);
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
             if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked) {
@@ -814,6 +835,7 @@ pub const DocStore = struct {
             try requireGraphEndpointWritable(self, self.alloc, key, value);
             if (try graphRelationshipRetiredCached(self, self.alloc, key, &self.graph_retirements_maybe)) return;
 
+            try self.trackArtifactInventory(key, true);
             try maintainGraphIncoming(self, self.alloc, key, value, false, false);
             try self.document_revisions.touchValue(self.alloc, key, value);
             try self.artifact_footprint.touch(key, value);
@@ -830,6 +852,18 @@ pub const DocStore = struct {
         }
 
         pub fn delete(self: *Txn, key: []const u8) anyerror!void {
+            self.deleteInventoryTracked(key) catch |cause| {
+                if (cause != error.NotFound and artifact_replay_inventory.isTrackedKey(key)) self.artifact_inventory.poisoned = true;
+                return cause;
+            };
+        }
+
+        fn deleteInventoryTracked(self: *Txn, key: []const u8) anyerror!void {
+            try self.trackArtifactInventory(key, false);
+            errdefer if (@import("publication_backlog.zig").isObligation(key)) {
+                self.publication_backlog.poisoned = true;
+            };
+            try self.publication_backlog.touch(self, if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null, key, null);
             try updateGraphEndpointCleanupAdmission(self, self.alloc, key, null);
             try removeGraphRetirementReference(self, self.alloc, key, &self.graph_retirements_maybe);
             if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
@@ -848,11 +882,17 @@ pub const DocStore = struct {
             try self.markColumnarDirty(key, null);
             try self.invalidateColumns(key);
 
-            try self.write.?.delete(key);
+            self.write.?.delete(key) catch |err| {
+                if (err != error.NotFound or !@import("publication_backlog.zig").isObligation(key)) return err;
+            };
             if (self.payload_session) |session| {
                 if (artifact_payload.isEmbeddingKey(key)) session.reference_mutated = true;
                 try session.recordOwnership(&self.write.?, key, null);
             }
+        }
+
+        fn trackArtifactInventory(self: *Txn, key: []const u8, present: bool) !void {
+            try self.artifact_inventory.touch(self.alloc, self, &self.publication_backlog, if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null, key, present);
         }
 
         fn markColumnarDirty(self: *Txn, key: []const u8, value: ?[]const u8) anyerror!void {
@@ -880,10 +920,18 @@ pub const DocStore = struct {
             const admission = @import("../common/read_admission.zig");
             var adapter = admission.Adapter(@TypeOf(budget)){ .budget = budget };
             const payload = adapter.payload();
-            return self.openCursorWithAdmission(admission.Port.init(&payload));
+            return self.openCursorWithAdmission(admission.portForBudget(budget, &payload));
         }
 
         pub fn openCursorWithAdmission(self: *Txn, control: @import("../common/read_admission.zig").Port) !CursorAdapter {
+            var physical = try self.openPhysicalCursorWithAdmission(control);
+            errdefer physical.close();
+            return try wrapPayloadCursor(self.alloc, physical, self.payload_session, self.current_scan != null);
+        }
+
+        /// Metadata/presence consumers inspect encoded keys and values without
+        /// resolving or copying external payloads. Admission stays per call.
+        pub fn openPhysicalCursorWithAdmission(self: *Txn, control: @import("../common/read_admission.zig").Port) !CursorAdapter {
             try control.checkpoint();
             if (self.write != null or self.probe != null) return error.ExecutionWaitUnsupported;
             var physical = if (self.current_scan) |*current|
@@ -892,7 +940,7 @@ pub const DocStore = struct {
                 try self.read.?.openCursorWithAdmission(control);
             errdefer physical.close();
             try control.checkpoint();
-            return try wrapPayloadCursor(self.alloc, physical, self.payload_session, self.current_scan != null);
+            return physical;
         }
 
         fn openCursorAdapter(self: *Txn) !CursorAdapter {
@@ -936,7 +984,9 @@ pub const DocStore = struct {
         retained: retained_effects.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
+        publication_backlog: @import("publication_backlog.zig").Capture = .{},
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
+        artifact_inventory: artifact_replay_inventory.Capture = .{},
         columnar_owner: ?*DocStore = null,
         payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
@@ -956,7 +1006,10 @@ pub const DocStore = struct {
             retained: *retained_effects.Capture,
             artifact_inputs: *@import("artifact_input_capture.zig").Capture,
             artifact_footprint: *@import("artifact_footprint.zig").Capture,
+            publication_backlog: *@import("publication_backlog.zig").Capture,
+            publication_gate: ?*std.atomic.Mutex,
             document_revisions: *@import("document_mutation_revision.zig").Capture,
+            artifact_inventory: *artifact_replay_inventory.Capture,
             retained_cache: ?*std.atomic.Value(u8) = null,
             payload_session: ?*artifact_payload.Session = null,
             alloc: Allocator,
@@ -1003,6 +1056,13 @@ pub const DocStore = struct {
             }
 
             pub fn put(self: @This(), key: []const u8, value: []const u8) anyerror!void {
+                errdefer if (artifact_replay_inventory.isTrackedKey(key)) {
+                    self.artifact_inventory.poisoned = true;
+                };
+                errdefer if (@import("publication_backlog.zig").isObligation(key)) {
+                    self.publication_backlog.poisoned = true;
+                };
+                try self.publication_backlog.touch(self, self.publication_gate, key, value);
                 try updateGraphOwningTable(self, key, value);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
                 if (internal_keys.isInternalUserKey(key) and !self.graph_directory_checked.*) {
@@ -1015,6 +1075,7 @@ pub const DocStore = struct {
                 try requireGraphEndpointWritable(self, self.alloc, key, value);
                 if (try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
+                try self.trackArtifactInventory(key, true);
                 try maintainGraphIncoming(self, self.alloc, key, value, false, false);
                 try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
@@ -1034,6 +1095,14 @@ pub const DocStore = struct {
             }
 
             fn appendPutChecked(self: @This(), key: []const u8, value: []const u8, retirement_checked: bool) anyerror!void {
+                self.appendPutInventoryTracked(key, value, retirement_checked) catch |cause| {
+                    if (cause != error.Unsupported and artifact_replay_inventory.isTrackedKey(key)) self.artifact_inventory.poisoned = true;
+                    return cause;
+                };
+            }
+
+            fn appendPutInventoryTracked(self: @This(), key: []const u8, value: []const u8, retirement_checked: bool) anyerror!void {
+                if (@import("publication_backlog.zig").isObligation(key)) return self.put(key, value);
                 if (std.mem.startsWith(u8, key, internal_keys.graph_endpoint_cleanup_prefix) and self.unordered_bulk_append_puts) return error.Unsupported;
                 try updateGraphOwningTable(self, key, value);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, value);
@@ -1052,6 +1121,7 @@ pub const DocStore = struct {
                 try requireGraphEndpointWritable(self, self.alloc, key, value);
                 if (!retirement_checked and try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
+                try self.trackArtifactInventory(key, true);
                 try maintainGraphIncoming(self, self.alloc, key, value, true, retirement_checked);
                 try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
@@ -1080,6 +1150,18 @@ pub const DocStore = struct {
             }
 
             pub fn delete(self: @This(), key: []const u8) anyerror!void {
+                self.deleteInventoryTracked(key) catch |cause| {
+                    if (cause != error.NotFound and artifact_replay_inventory.isTrackedKey(key)) self.artifact_inventory.poisoned = true;
+                    return cause;
+                };
+            }
+
+            fn deleteInventoryTracked(self: @This(), key: []const u8) anyerror!void {
+                try self.trackArtifactInventory(key, false);
+                errdefer if (@import("publication_backlog.zig").isObligation(key)) {
+                    self.publication_backlog.poisoned = true;
+                };
+                try self.publication_backlog.touch(self, self.publication_gate, key, null);
                 try updateGraphEndpointCleanupAdmission(self, self.alloc, key, null);
                 try removeGraphRetirementReference(self, self.alloc, key, self.graph_retirements_maybe);
                 if (try internal_keys.graphIncomingKeyAlloc(self.alloc, key)) |incoming| {
@@ -1097,11 +1179,24 @@ pub const DocStore = struct {
                 try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
 
-                try self.runtime.?.delete(key);
+                self.runtime.?.delete(key) catch |err| {
+                    if (err != error.NotFound or !@import("publication_backlog.zig").isObligation(key)) return err;
+                };
                 if (self.payload_session) |session| {
                     if (artifact_payload.isEmbeddingKey(key)) session.reference_mutated = true;
                     try session.recordOwnership(self.runtime.?, key, null);
                 }
+            }
+
+            /// Physical staged membership; never hydrate artifact payloads.
+            pub fn contains(self: @This(), key: []const u8) !bool {
+                var present: [1]bool = undefined;
+                try self.runtime.?.containsManySorted(&.{key}, &present);
+                return present[0];
+            }
+
+            fn trackArtifactInventory(self: @This(), key: []const u8, present: bool) !void {
+                try self.artifact_inventory.touch(self.alloc, self, self.publication_backlog, self.publication_gate, key, present);
             }
 
             fn markColumnarDirty(self: @This(), key: []const u8, value: ?[]const u8) anyerror!void {
@@ -1155,12 +1250,14 @@ pub const DocStore = struct {
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
+            self.artifact_inventory.deinit(self.alloc);
             const payload_session = self.payload_session;
             defer if (payload_session) |session| session.release();
 
             if (self.runtime) |*runtime| {
                 runtime.abort();
             }
+            self.publication_backlog.release();
             self.* = undefined;
         }
 
@@ -1175,10 +1272,12 @@ pub const DocStore = struct {
                 try self.artifact_inputs.stage(self.asTxn(), self.retained.staged);
                 try self.artifact_footprint.stage(self.asTxn());
                 try self.document_revisions.stage(self.asTxn());
+                try self.artifact_inventory.stage(self.asTxn(), if (self.columnar_owner) |owner| &owner.runtime_store else null);
             }
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const payload_session = self.payload_session;
             if (payload_session) |session| try session.stageReferenceEpoch(self);
+            try self.publication_backlog.stage(self.asTxn());
             if (payload_session) |session| try session.prepareCommit();
             if (payload_session) |session| session.primary_commit_attempted = true;
             if (self.runtime) |*runtime| {
@@ -1191,6 +1290,8 @@ pub const DocStore = struct {
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
+            self.artifact_inventory.deinit(self.alloc);
+            self.publication_backlog.release();
             self.* = undefined;
             if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
         }
@@ -1201,7 +1302,10 @@ pub const DocStore = struct {
                 .retained = &self.retained,
                 .artifact_inputs = &self.artifact_inputs,
                 .artifact_footprint = &self.artifact_footprint,
+                .publication_backlog = &self.publication_backlog,
+                .publication_gate = if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null,
                 .document_revisions = &self.document_revisions,
+                .artifact_inventory = &self.artifact_inventory,
                 .retained_cache = if (self.columnar_owner) |owner| &owner.retained_effects_cache else null,
                 .payload_session = self.payload_session,
                 .alloc = self.alloc,
@@ -1386,6 +1490,7 @@ pub const DocStore = struct {
     pub fn configurePayloadPolicy(self: *DocStore, store: ?artifact_payload.Store, capture_inline: bool, migration_allowance: ?u64) void {
         self.lockPayloadPolicy();
         defer self.unlockPayloadPolicy();
+        self.payload_policy_generation +|= 1;
         self.payload_store = store;
         self.payload_capture_inline = capture_inline;
         self.payload_migration_allowance = migration_allowance;
@@ -1430,16 +1535,151 @@ pub const DocStore = struct {
         return txn;
     }
 
-    /// These scopes retain payload policy ownership while admitting the
-    /// backend. CPU release requires the complete capture dependency graph.
-    fn checkRetainedReadAdmission(control: @import("../common/read_admission.zig").Port) !void {
+    /// Validate the original borrow before acquiring retained capture ownership.
+    /// Providers retire coordination locks before waiting; import publishers
+    /// either reject contention or retire apply/policy before lending CPU.
+    fn checkReadCaptureAdmission(control: @import("../common/read_admission.zig").Port) !void {
+        try control.checkLifetime();
         try control.checkpoint();
-        if (try control.executionWait() != null) return error.ExecutionWaitUnsupported;
     }
 
+    /// A snapshot cursor for primary metadata keys. Retire or transfer it before
+    /// DocStore close. The import reader spans all seeks and value handoff.
+    pub fn beginOwnedInternalKeyCursor(self: *DocStore, allocator: Allocator, control: @import("../common/read_admission.zig").Port) !OwnedInternalKeyCursor {
+        try control.checkpoint();
+        try self.acquirePortableImportReaderWithAdmission(control);
+        errdefer self.releasePortableImportReader();
+        const revision = try self.portableImportRevision();
+        const query_revision = self.query_generation_revision.load(.acquire);
+        var cursor = try self.runtime_store.beginOwnedKeyCursor(allocator, control);
+        errdefer cursor.deinit();
+        try control.checkpoint();
+        return .{ .cursor = cursor, .source = self, .revision = revision, .query_revision = query_revision };
+    }
+
+    pub const OwnedInternalKeyCursor = struct {
+        cursor: ?backend_erased.OwnedKeyCursor,
+        source: ?*DocStore,
+        revision: u64,
+        query_revision: u64,
+        failure: ?anyerror = null,
+        fn fail(self: *@This(), err: anyerror) anyerror {
+            self.deinit();
+            self.failure = err;
+            return err;
+        }
+        pub fn seek(self: *@This(), lower: []const u8, upper: ?[]const u8, exclusive: bool, control: @import("../common/read_admission.zig").Port) !void {
+            if (self.failure) |err| return err;
+            const cursor = if (self.cursor) |*cursor| cursor else return error.TransactionClosed;
+            if (!std.mem.startsWith(u8, lower, "\x00\x00__metadata__:")) return self.fail(error.InvalidArgument);
+            cursor.seek(lower, upper, exclusive, control) catch |err| return self.fail(err);
+        }
+        pub fn step(self: *@This(), quantum: usize, control: @import("../common/read_admission.zig").Port) !backend_erased.OwnedKeyCursor.Status {
+            if (quantum == 0 or quantum > 65536) return error.InvalidArgument;
+            if (self.failure) |err| return err;
+            const cursor = if (self.cursor) |*cursor| cursor else return error.TransactionClosed;
+            return cursor.step(quantum, control) catch |err| return self.fail(err);
+        }
+        pub fn key(self: *@This(), control: @import("../common/read_admission.zig").Port) !?[]const u8 {
+            if (self.failure) |err| return err;
+            const cursor = if (self.cursor) |*cursor| cursor else return error.TransactionClosed;
+            const found = cursor.key(control) catch |err| return self.fail(err);
+            if (found) |name| if (!std.mem.startsWith(u8, name, "\x00\x00__metadata__:")) return null;
+            return found;
+        }
+        pub fn intoValueRead(self: *@This(), control: @import("../common/read_admission.zig").Port) !OwnedInternalValueRead {
+            const selected = (try self.key(control)) orelse return self.fail(error.NotFound);
+            if (artifact_payload.isEmbeddingKey(selected)) return self.fail(error.InvalidArgument);
+            var read = self.cursor.?.intoValueRead(control) catch |err| return self.fail(err);
+            errdefer read.deinit();
+            const source = self.source orelse return error.TransactionClosed;
+            self.cursor = null;
+            self.source = null;
+            return .{ .lookup = read, .import_owner = source };
+        }
+        pub fn deinit(self: *@This()) void {
+            if (self.cursor) |*cursor| cursor.deinit();
+            self.cursor = null;
+            const source = self.source;
+            self.source = null;
+            if (source) |store| store.releasePortableImportReader();
+        }
+    };
+
+    /// Owned primary-only metadata lookup. This excludes embedding keys, whose
+    /// values require a payload-policy/session capture. Retire a pending owner
+    /// before closing this DocStore, as with its ordinary read transactions.
+    pub fn beginOwnedInternalValueRead(self: *DocStore, allocator: Allocator, key: []const u8, control: @import("../common/read_admission.zig").Port) !OwnedInternalValueRead {
+        try control.checkpoint();
+        if (!std.mem.startsWith(u8, key, "\x00\x00__metadata__:") or artifact_payload.isEmbeddingKey(key)) return error.InvalidArgument;
+        try self.acquirePortableImportReaderWithAdmission(control);
+        errdefer self.releasePortableImportReader();
+        var lookup = try self.runtime_store.beginOwnedValueRead(allocator, key, control);
+        errdefer lookup.deinit();
+        try control.checkpoint();
+        return .{ .lookup = lookup, .import_owner = self };
+    }
+
+    pub const OwnedInternalValueRead = struct {
+        pub const Status = enum { pending, ready };
+        lookup: ?backend_erased.OwnedValueRead,
+        import_owner: ?*DocStore,
+        value: ?backend_erased.OwnedValue = null,
+        failure: ?anyerror = null,
+        closed: bool = false,
+
+        pub fn step(self: *@This(), quantum: usize, control: @import("../common/read_admission.zig").Port) !Status {
+            if (quantum == 0 or quantum > 64 * 1024) return error.InvalidArgument;
+            if (self.failure) |err| return err;
+            if (self.closed) return error.TransactionClosed;
+            return self.advance(quantum, control) catch |err| {
+                const cause = blk: {
+                    control.checkpoint() catch |original| break :blk original;
+                    break :blk err;
+                };
+                self.deinit();
+                self.failure = cause;
+                return cause;
+            };
+        }
+        fn advance(self: *@This(), quantum: usize, control: @import("../common/read_admission.zig").Port) !Status {
+            try control.checkpoint();
+            if (self.lookup) |*lookup| {
+                if (try lookup.step(quantum, control) != .ready) return .pending;
+                self.value = try lookup.takeOutput();
+                self.lookup = null;
+                self.releaseImport();
+            }
+            try control.checkpoint();
+            return .ready;
+        }
+        fn releaseImport(self: *@This()) void {
+            const owner = self.import_owner;
+            self.import_owner = null;
+            if (owner) |store| store.releasePortableImportReader();
+        }
+        pub fn takeOutput(self: *@This()) !backend_erased.OwnedValue {
+            if (self.failure) |err| return err;
+            if (self.closed or self.lookup != null) return error.InvalidArgument;
+            const value = self.value orelse return error.InvalidArgument;
+            self.value = null;
+            self.closed = true;
+            return value;
+        }
+        /// Grant-free and idempotent. No caller control/payload is retained.
+        pub fn deinit(self: *@This()) void {
+            if (self.lookup) |*lookup| lookup.deinit();
+            self.lookup = null;
+            self.releaseImport();
+            if (self.value) |*value| value.deinit();
+            self.value = null;
+            self.closed = true;
+        }
+    };
+
     pub fn beginReadTxnWithAdmission(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port) !Txn {
-        try checkRetainedReadAdmission(control);
-        return self.beginReadTxnWithBudget(admission, control);
+        try checkReadCaptureAdmission(control);
+        return self.beginReadCapture(admission, control, .snapshot);
     }
 
     pub fn beginProbeTxnWithAdmission(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port) !Txn {
@@ -1450,46 +1690,80 @@ pub const DocStore = struct {
         return self.beginLiveReadTxnWithAdmission(.retain, control, true);
     }
 
-    fn beginLiveReadTxnWithAdmission(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port, current: bool) !Txn {
-        try checkRetainedReadAdmission(control);
-        try self.acquirePortableImportReader();
-        errdefer self.releasePortableImportReader();
-        try @import("../common/bounded_mutex.zig").lock(&self.payload_policy_mutex, payloadPolicyIo(), control);
+    const ReadCaptureKind = enum { snapshot, probe, current };
+    const PayloadPolicyCapture = struct {
+        generation: u64,
+        session: ?*artifact_payload.Session,
+    };
+
+    fn capturePayloadPolicy(self: *DocStore, budget: anytype) !PayloadPolicyCapture {
+        try @import("../common/bounded_mutex.zig").lock(&self.payload_policy_mutex, payloadPolicyIo(), budget);
         defer self.unlockPayloadPolicy();
-        const payload_session = try self.createPayloadSession();
-        var session_transferred = false;
-        errdefer if (!session_transferred) {
-            if (payload_session) |session| session.release();
-        };
-        var txn: Txn = .{ .payload_session = payload_session, .alloc = self.alloc };
-        if (current) {
-            txn.current_scan = try self.runtime_store.beginCurrentScanWithAdmission(control);
-        } else txn.probe = try self.runtime_store.beginProbeWithAdmission(admission, control);
-        session_transferred = true;
+        if (self.payload_policy_generation == std.math.maxInt(u64)) return error.PayloadPolicyGenerationExhausted;
+        return .{ .generation = self.payload_policy_generation, .session = try self.createPayloadSession() };
+    }
+
+    fn payloadPolicyStillCurrent(self: *DocStore, generation: u64, budget: anytype) !bool {
+        try @import("../common/bounded_mutex.zig").lock(&self.payload_policy_mutex, payloadPolicyIo(), budget);
+        defer self.unlockPayloadPolicy();
+        return generation == self.payload_policy_generation;
+    }
+
+    fn beginReadCaptureAttempt(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, budget: anytype, kind: ReadCaptureKind) !Txn {
+        const policy = try self.capturePayloadPolicy(budget);
+        errdefer if (policy.session) |session| session.release();
+        // The retained session pins the payload store while its mutex is free.
+        // Import exclusion still spans the complete primary capture and its
+        // returned transaction. It is not a substitute for policy validation.
+        const admission_mod = @import("../common/read_admission.zig");
+        var adapter = admission_mod.Adapter(@TypeOf(budget)){ .budget = budget };
+        const payload = adapter.payload();
+        const control = admission_mod.portForBudget(budget, &payload);
+        try self.acquirePortableImportReaderWithAdmission(control);
+        errdefer self.releasePortableImportReader();
+        try budget.checkpoint();
+        var txn: Txn = .{ .alloc = self.alloc };
+        switch (kind) {
+            .snapshot => txn.read = try self.runtime_store.beginReadWithAdmission(admission, control),
+            .probe => txn.probe = try self.runtime_store.beginProbeWithAdmission(admission, control),
+            .current => txn.current_scan = try self.runtime_store.beginCurrentScanWithAdmission(control),
+        }
         errdefer txn.abort();
-        try control.checkpoint();
+        if (!try self.payloadPolicyStillCurrent(policy.generation, budget)) return error.PayloadPolicyCaptureChanged;
+        try budget.checkpoint();
+        txn.payload_session = policy.session;
         txn.portable_import_reader_owner = self;
         return txn;
     }
 
-    /// Retain the original admission authority while acquiring the payload
-    /// policy and backend snapshot locks. Cursor and file I/O need separate support.
+    fn beginReadCapture(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, budget: anytype, kind: ReadCaptureKind) !Txn {
+        while (true) {
+            try budget.checkpoint();
+            return self.beginReadCaptureAttempt(admission, budget, kind) catch |err| {
+                if (err != error.PayloadPolicyCaptureChanged) return err;
+                // The failed attempt has retired its backend view, session and
+                // import-reader ownership before any retry wait or checkpoint.
+                try budget.waitForProgress();
+                continue;
+            };
+        }
+    }
+
+    fn beginLiveReadTxnWithAdmission(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port, current: bool) !Txn {
+        try checkReadCaptureAdmission(control);
+        return self.beginReadCapture(admission, control, if (current) .current else .probe);
+    }
+
+    /// Policy capture and backend acquisition never hold each other's mutex.
+    /// A monotonically checked generation prevents publishing a mixed capture.
+    /// Waits borrow original execution only after provider locks retire.
     pub fn beginReadTxnWithBudget(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, budget: anytype) !Txn {
-        try budget.checkpoint();
-        try self.acquirePortableImportReader();
-        errdefer self.releasePortableImportReader();
-        try @import("../common/bounded_mutex.zig").lock(&self.payload_policy_mutex, payloadPolicyIo(), budget);
-        defer self.unlockPayloadPolicy();
-        const payload_session = try self.createPayloadSession();
-        errdefer if (payload_session) |session| session.release();
-        try budget.checkpoint();
         const admission_mod = @import("../common/read_admission.zig");
         var adapter = admission_mod.Adapter(@TypeOf(budget)){ .budget = budget };
         const payload = adapter.payload();
-        var read = try self.runtime_store.beginReadWithAdmission(admission, admission_mod.Port.init(&payload));
-        errdefer read.abort();
-        try budget.checkpoint();
-        return .{ .payload_session = payload_session, .alloc = self.alloc, .read = read, .portable_import_reader_owner = self };
+        // Validate incomplete lending budgets before a policy mutex can call
+        // their checkpoint under acquired ownership. Existing ports remain exact.
+        return self.beginReadTxnWithAdmission(admission, admission_mod.portForBudget(budget, &payload));
     }
 
     fn beginReadTxnUnchecked(self: *DocStore) !Txn {
@@ -2213,17 +2487,24 @@ pub const DocStore = struct {
     }
 
     fn acquirePortableImportReader(self: *DocStore) !void {
+        return self.acquirePortableImportReaderControlled(null);
+    }
+    fn acquirePortableImportReaderWithAdmission(self: *DocStore, control: @import("../common/read_admission.zig").Port) !void {
+        return self.acquirePortableImportReaderControlled(control);
+    }
+    fn acquirePortableImportReaderControlled(self: *DocStore, control: ?@import("../common/read_admission.zig").Port) !void {
+        if (control) |original| try original.checkLifetime();
         try self.ensurePortableImportOperational();
         var state = self.portable_import_reader_state.load(.acquire);
         while (true) {
+            if (control) |original| try original.checkLifetime();
             if (state & portable_import_publication_bit != 0) return error.PortableImportPublicationInProgress;
             if (state == portable_import_reader_count_mask) return error.PortableImportReaderLimitReached;
             state = self.portable_import_reader_state.cmpxchgWeak(state, state + 1, .acquire, .monotonic) orelse break;
         }
-        if (self.portable_import_recovery_required.load(.acquire)) {
-            self.releasePortableImportReader();
-            return error.PortableImportRecoveryRequired;
-        }
+        errdefer self.releasePortableImportReader();
+        try self.ensurePortableImportOperational();
+        if (control) |original| try original.checkLifetime();
     }
 
     fn releasePortableImportReader(self: *DocStore) void {
@@ -2234,11 +2515,32 @@ pub const DocStore = struct {
     /// Enter the short reader-visible publication fence. DB's exclusive apply
     /// lock serializes publishers and ordinary writers; this atomic closes the
     /// remaining lock-free read path without penalizing reads with a mutex.
+    pub const PublicationAdmission = @import("db/apply_rw_lock.zig").ApplyRwLock.Acquisition;
+
     pub fn beginPortableImportPublication(self: *DocStore, io: std.Io) !void {
+        return self.beginPortableImportPublicationWithAdmission(io, null);
+    }
+
+    /// Pre-publication only: failure withdraws this publisher's exclusion bit
+    /// without retiring any live reader. A successful return owns the fence.
+    pub fn beginPortableImportPublicationWithAdmission(self: *DocStore, io: std.Io, controls: ?PublicationAdmission) !void {
+        try self.claimPortableImportPublicationWithAdmission(controls);
+        errdefer self.cancelPortableImportPublication();
+        try self.awaitPortableImportPublicationReadersWithAdmission(io, controls);
+    }
+
+    /// Claim reader exclusion without waiting. The successful caller owns the
+    /// bit until finish/cancel, including while older readers are still live.
+    pub fn claimPortableImportPublicationWithAdmission(self: *DocStore, controls: ?PublicationAdmission) !void {
+        if (controls) |original| try original.lifetime.check();
         try self.ensurePortableImportOperational();
+        if (self.portable_import_revision.load(.acquire) == std.math.maxInt(u64)) return error.PortableImportRecoveryRequired;
         var state = self.portable_import_reader_state.load(.acquire);
         while (true) {
             if (state & portable_import_publication_bit != 0) return error.PortableImportPublicationInProgress;
+            // Reader churn may invalidate the CAS repeatedly. Keep even this
+            // pre-claim contention bounded by the original lifetime.
+            if (controls) |original| try original.lifetime.check();
             state = self.portable_import_reader_state.cmpxchgWeak(
                 state,
                 state | portable_import_publication_bit,
@@ -2246,18 +2548,57 @@ pub const DocStore = struct {
                 .acquire,
             ) orelse break;
         }
+        errdefer self.cancelPortableImportPublication();
+        if (controls) |original| try original.lifetime.check();
+    }
+
+    pub fn portableImportHasReaders(self: *const DocStore) bool {
+        return self.portable_import_reader_state.load(.acquire) & portable_import_reader_count_mask != 0;
+    }
+
+    /// Withdraw only the caller-owned exclusion bit. Never retire live readers.
+    pub fn cancelPortableImportPublication(self: *DocStore) void {
+        const prior = self.portable_import_reader_state.fetchAnd(portable_import_reader_count_mask, .acq_rel);
+        std.debug.assert(prior & portable_import_publication_bit != 0);
+    }
+
+    /// The caller already owns exclusion. It must cancel on failure; this
+    /// split permits DB to retire apply/policy before lending execution.
+    pub fn awaitPortableImportPublicationReadersWithAdmission(self: *DocStore, io: std.Io, controls: ?PublicationAdmission) !void {
+        std.debug.assert(self.portableImportPublicationInProgress());
         while (self.portable_import_reader_state.load(.acquire) & portable_import_reader_count_mask != 0) {
-            // Publication is rare, but an admitted reader may be an std.Io
-            // fiber. Yield through that same scheduler rather than blocking an
-            // executor thread while the reader drains.
-            io.sleep(.fromNanoseconds(1), .awake) catch {};
+            try self.ensurePortableImportOperational();
+            if (controls) |original| {
+                try original.lifetime.check();
+                const wait = original.execution_wait orelse return error.Backpressured;
+                try wait.beginWait();
+                // Keep the backend owner's clock. Lifetime checks retain the
+                // original caller's deadline without translating clock domains.
+                const result = io.sleep(.fromMilliseconds(1), .awake);
+                try wait.endWait();
+                try original.lifetime.check();
+                try result;
+            } else {
+                // A caller without an explicit lending borrow may own the CPU
+                // a retained reader needs. This is still pre-publication.
+                return error.Backpressured;
+            }
         }
+        try self.ensurePortableImportOperational();
+        if (controls) |original| try original.lifetime.check();
     }
 
     pub fn finishPortableImportPublication(self: *DocStore) void {
         self.retained_effects_cache.store(0, .release);
         std.debug.assert(self.portable_import_reader_state.load(.monotonic) == portable_import_publication_bit);
+        const revision = self.portable_import_revision.load(.monotonic);
+        if (revision == std.math.maxInt(u64)) self.requirePortableImportRecovery() else self.portable_import_revision.store(revision + 1, .release);
         self.portable_import_reader_state.store(0, .release);
+    }
+
+    pub fn portableImportRevision(self: *const DocStore) !u64 {
+        try self.ensurePortableImportOperational();
+        return self.portable_import_revision.load(.acquire);
     }
 
     pub fn portableImportPublicationInProgress(self: *const DocStore) bool {
@@ -3298,7 +3639,7 @@ pub const DocStore = struct {
         checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
         callback: ScanWithContextCallback,
     ) !void {
-        return self.scanRowKindReadTxnWithContext(txn, lower, upper, internal_keys.relational_row_kind, ctx, checkpoint, callback);
+        return self.scanRowKindReadTxnWithContext(txn, lower, upper, internal_keys.relational_row_kind, ctx, checkpoint, callback, null);
     }
 
     pub fn scanDocumentRowsReadTxnWithContext(
@@ -3310,7 +3651,22 @@ pub const DocStore = struct {
         checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
         callback: ScanWithContextCallback,
     ) !void {
-        return self.scanRowKindReadTxnWithContext(txn, lower, upper, internal_keys.primary_kind, ctx, checkpoint, callback);
+        return self.scanRowKindReadTxnWithContext(txn, lower, upper, internal_keys.primary_kind, ctx, checkpoint, callback, null);
+    }
+
+    /// The admission port is borrowed only until traversal and cursor cleanup
+    /// join. Callbacks execute with CPU admission restored after physical I/O.
+    pub fn scanDocumentRowsReadTxnWithAdmission(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        ctx: ?*anyopaque,
+        checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
+        callback: ScanWithContextCallback,
+        control: @import("../common/read_admission.zig").Port,
+    ) !void {
+        return self.scanRowKindReadTxnWithContext(txn, lower, upper, internal_keys.primary_kind, ctx, checkpoint, callback, control);
     }
 
     fn scanRowKindReadTxnWithContext(
@@ -3322,8 +3678,10 @@ pub const DocStore = struct {
         ctx: ?*anyopaque,
         checkpoint: *const fn (?*anyopaque, []const u8) anyerror!ScanAction,
         callback: ScanWithContextCallback,
+        control: ?@import("../common/read_admission.zig").Port,
     ) !void {
-        var cursor = try txn.openCursor();
+        if (control) |port| try port.checkpoint();
+        var cursor = if (control) |port| try txn.openCursorWithAdmission(port) else try txn.openCursor();
         defer cursor.close();
         const end = if (upper.len != 0) upper else &[_]u8{internal_keys.user_namespace + 1};
         cursor.setUpperBound(end);
@@ -3332,8 +3690,9 @@ pub const DocStore = struct {
         if (std.mem.order(u8, start, end) != .lt) return;
         var candidate = std.ArrayListUnmanaged(u8).empty;
         defer candidate.deinit(self.alloc);
-        var entry = try cursor.seekAtOrAfter(start);
+        var entry = if (control) |port| try cursor.seekAtOrAfterWithAdmission(start, port) else try cursor.seekAtOrAfter(start);
         while (entry) |item| {
+            if (control) |port| try port.checkpoint();
             if (std.mem.order(u8, item.key, end) != .lt or !internal_keys.isInternalUserKey(item.key)) return;
             const term = internal_keys.findComponentTerminator(item.key, 1) orelse return error.InvalidInternalUserKey;
             candidate.clearRetainingCapacity();
@@ -3342,7 +3701,7 @@ pub const DocStore = struct {
             if (try checkpoint(ctx, candidate.items) == .stop) return;
             var current = item;
             if (std.mem.order(u8, current.key, candidate.items) == .lt) {
-                current = (try cursor.seekAtOrAfter(candidate.items)) orelse return;
+                current = (if (control) |port| try cursor.seekAtOrAfterWithAdmission(candidate.items, port) else try cursor.seekAtOrAfter(candidate.items)) orelse return;
                 if (!std.mem.startsWith(u8, current.key, candidate.items[0 .. term + 2])) {
                     entry = current;
                     continue;
@@ -3356,7 +3715,7 @@ pub const DocStore = struct {
             candidate.items.len = term + 2;
             candidate.items[term + 1] = 1;
             if (std.mem.order(u8, candidate.items, end) != .lt) return;
-            entry = try cursor.seekAtOrAfter(candidate.items);
+            entry = if (control) |port| try cursor.seekAtOrAfterWithAdmission(candidate.items, port) else try cursor.seekAtOrAfter(candidate.items);
         }
     }
 
@@ -6552,5 +6911,781 @@ test "public graph metric borrowed wire content authority shares txn batch appen
             try std.testing.expect((try revision.loadContent(&deleted, key)) == null);
             try std.testing.expectError(error.NotFound, deleted.get(key));
         }
+    }
+}
+
+pub fn qualifyPayloadPolicyCapture() !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const native = @import("../common/runnable_scheduler.zig");
+    const Admission = @import("../common/read_admission.zig");
+    const Mode = enum { unchanged, changed, aba, backend_failure, late_failure, retry_canceled, exhausted, recovery };
+    const Payload = struct {
+        refs: usize = 0,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.refs > 0);
+            self.refs -= 1;
+        }
+        fn prepare(_: *anyopaque, _: []const artifact_payload.Prepared) !void {
+            return error.TestUnexpectedPayloadWrite;
+        }
+        fn resolve(_: *anyopaque, _: Allocator, _: []const u8, _: artifact_payload.Reference) ![]u8 {
+            return error.TestUnexpectedPayloadRead;
+        }
+        fn interface(self: *@This()) artifact_payload.Store {
+            return .{ .ptr = self, .vtable = &.{ .retain = retain, .release = release, .prepare = prepare, .resolve = resolve } };
+        }
+    };
+    const Intercept = struct {
+        store: *DocStore,
+        original: backend_erased.Store,
+        first: *Payload,
+        second: *Payload,
+        mode: Mode,
+        captures: usize = 0,
+        captured: bool = false,
+        fn afterCapture(self: *@This()) !void {
+            self.captures += 1;
+            self.captured = true;
+            try std.testing.expect(self.store.payload_policy_mutex.tryLock());
+            self.store.unlockPayloadPolicy();
+            try std.testing.expectEqual(@as(usize, 1), self.store.portable_import_reader_state.load(.acquire));
+            if (self.mode == .backend_failure) return error.TestBackendCaptureFailure;
+            if (self.captures == 1 and (self.mode == .changed or self.mode == .aba or self.mode == .retry_canceled)) {
+                self.store.configurePayloadPolicy(self.second.interface(), false, 2);
+                if (self.mode == .aba) self.store.configurePayloadPolicy(self.first.interface(), true, 1);
+                var writer = try self.original.beginWrite();
+                errdefer writer.abort();
+                try writer.put("key", "new");
+                try writer.commit();
+            }
+        }
+        fn read(_: Allocator, raw: *anyopaque, cache: backend_types.Namespace.BlockCacheAdmission, port: Admission.Port) !backend_erased.ReadTxn {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var txn = try self.original.beginReadWithAdmission(cache, port);
+            errdefer txn.abort();
+            try self.afterCapture();
+            return txn;
+        }
+        fn probe(_: Allocator, raw: *anyopaque, cache: backend_types.Namespace.BlockCacheAdmission, port: Admission.Port) !backend_erased.ProbeTxn {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var txn = try self.original.beginProbeWithAdmission(cache, port);
+            errdefer txn.abort();
+            try self.afterCapture();
+            return txn;
+        }
+        fn current(_: Allocator, raw: *anyopaque, port: Admission.Port) !backend_erased.CurrentScanTxn {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var txn = try self.original.beginCurrentScanWithAdmission(port);
+            errdefer txn.abort();
+            try self.afterCapture();
+            return txn;
+        }
+    };
+    const Budget = struct {
+        execution: *native.Execution,
+        scheduler: *native.Scheduler,
+        intercept: *Intercept,
+        waits: usize = 0,
+        pub fn checkLifetime(self: *@This()) !void {
+            if (self.intercept.mode == .late_failure and self.intercept.captured) return error.CatalogGenerationChanged;
+            try self.execution.checkLifetime();
+        }
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.intercept.mode == .late_failure and self.intercept.captured) return error.CatalogGenerationChanged;
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            const owner = self.intercept.store;
+            try std.testing.expectEqual(@as(usize, 0), owner.portable_import_reader_state.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), self.intercept.first.refs + self.intercept.second.refs);
+            try std.testing.expect(owner.payload_policy_mutex.tryLock());
+            owner.unlockPayloadPolicy();
+            self.waits += 1;
+            try self.execution.park(.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 17), self.scheduler.stats().retained_bytes);
+            var health: native.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+            if (self.intercept.mode == .retry_canceled) return error.Canceled;
+            try self.execution.enter(.query);
+        }
+    };
+    const alloc = std.testing.allocator;
+    inline for (.{ DocStore.ReadCaptureKind.snapshot, .probe, .current }) |kind| {
+        for ([_]Mode{ .unchanged, .changed, .aba, .backend_failure, .late_failure, .retry_canceled, .exhausted, .recovery }) |mode| {
+            var backend = mem_backend.Backend.init(alloc, .{});
+            defer backend.close();
+            var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+            defer store.close();
+            try store.put("key", "old");
+            var first: Payload = .{};
+            var second: Payload = .{};
+            store.configurePayloadPolicy(first.interface(), true, 1);
+            if (mode == .exhausted) store.payload_policy_generation = std.math.maxInt(u64);
+            if (mode == .recovery) store.requirePortableImportRecovery();
+            const original = store.runtime_store;
+            var intercept: Intercept = .{ .store = &store, .original = original, .first = &first, .second = &second, .mode = mode };
+            var vtable = original.vtable.*;
+            vtable.begin_read_with_admission = Intercept.read;
+            vtable.begin_probe_with_admission = Intercept.probe;
+            vtable.begin_current_scan_with_admission = Intercept.current;
+            store.runtime_store.ptr = &intercept;
+            store.runtime_store.vtable = &vtable;
+            defer store.runtime_store = original;
+            var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+            var execution: native.Execution = .{};
+            try execution.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+            defer execution.finish();
+            var budget: Budget = .{ .execution = &execution, .scheduler = &scheduler, .intercept = &intercept };
+            const result = store.beginReadCapture(.retain, &budget, kind);
+            switch (mode) {
+                .backend_failure => try std.testing.expectError(error.TestBackendCaptureFailure, result),
+                .late_failure => try std.testing.expectError(error.CatalogGenerationChanged, result),
+                .retry_canceled => try std.testing.expectError(error.Canceled, result),
+                .exhausted => try std.testing.expectError(error.PayloadPolicyGenerationExhausted, result),
+                .recovery => try std.testing.expectError(error.PortableImportRecoveryRequired, result),
+                .unchanged, .changed, .aba => {
+                    var txn = try result;
+                    defer txn.abort();
+                    try std.testing.expectEqual(mode != .changed, txn.payload_session.?.capture_inline);
+                    try std.testing.expectEqual(@as(?u64, if (mode == .changed) 2 else 1), txn.payload_session.?.migration_allowance);
+                    if (kind == .snapshot) {
+                        const value = try txn.get("key");
+                        try std.testing.expectEqualStrings(if (mode == .unchanged) "old" else "new", value);
+                    }
+                    try std.testing.expectEqual(@as(usize, 1), first.refs + second.refs);
+                    try std.testing.expectEqual(@as(usize, 1), store.portable_import_reader_state.load(.acquire));
+                },
+            }
+            try std.testing.expectEqual(@as(usize, if (mode == .changed or mode == .aba or mode == .retry_canceled) 1 else 0), budget.waits);
+            try std.testing.expectEqual(@as(usize, 0), first.refs + second.refs);
+            try std.testing.expectEqual(@as(usize, 0), store.portable_import_reader_state.load(.acquire));
+            try std.testing.expect(store.payload_policy_mutex.tryLock());
+            store.unlockPayloadPolicy();
+            execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
+    }
+}
+
+pub fn qualifyPortablePublicationAdmission() !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const Txn = DocStore.Txn;
+    const native = @import("../common/runnable_scheduler.zig");
+    const Mode = enum { success, initial_rejected, canceled, expired, shutdown, io_canceled, begin_rejected, late_rejected, claimed_rejected, coarse };
+    const Fixture = struct {
+        store: *DocStore,
+        execution: *native.Execution,
+        scheduler: *native.Scheduler,
+        readers: *[2]Txn,
+        open: bool = true,
+        mode: Mode,
+        waits: usize = 0,
+        failure: ?anyerror = null,
+        fn retireReaders(self: *@This()) void {
+            if (!self.open) return;
+            for (self.readers) |*reader| reader.abort();
+            self.open = false;
+        }
+        fn lifetime(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.mode == .claimed_rejected and self.store.portableImportPublicationInProgress()) return error.Canceled;
+            if (self.failure) |cause| return cause;
+            try self.execution.checkLifetime();
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waits += 1;
+            try std.testing.expect(self.store.portableImportPublicationInProgress());
+            try std.testing.expectError(error.PortableImportPublicationInProgress, self.store.beginProbeTxn());
+            // A rejected competing publisher must not clear this owner's bit.
+            try std.testing.expectError(error.PortableImportPublicationInProgress, self.store.beginPortableImportPublication(std.testing.io));
+            try std.testing.expect(self.store.portableImportPublicationInProgress());
+            try self.execution.park(.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 17), self.scheduler.stats().retained_bytes);
+            var health: native.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+            if (self.mode == .begin_rejected) return error.Canceled;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (self.mode) {
+                .success, .late_rejected => self.retireReaders(),
+                .canceled => self.failure = error.Canceled,
+                .expired => self.failure = error.DeadlineExceeded,
+                .shutdown => self.scheduler.close(),
+                .io_canceled => {},
+                .initial_rejected, .begin_rejected, .claimed_rejected, .coarse => return error.TestUnexpectedResume,
+            }
+            if (self.mode != .late_rejected) try lifetime(self);
+            try self.execution.enter(.query);
+            if (self.mode == .late_rejected) self.failure = error.Canceled;
+        }
+        fn cancelSleep(_: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]Mode{ .success, .initial_rejected, .canceled, .expired, .shutdown, .io_canceled, .begin_rejected, .late_rejected, .claimed_rejected, .coarse }) |mode| {
+        var backend = mem_backend.Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put("key", "old");
+        var readers: [2]Txn = .{ try store.beginReadTxn(), try store.beginReadTxn() };
+        var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+        var execution: native.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+        defer execution.finish();
+        var fixture: Fixture = .{ .store = &store, .execution = &execution, .scheduler = &scheduler, .readers = &readers, .mode = mode };
+        defer fixture.retireReaders();
+        if (mode == .initial_rejected) fixture.failure = error.Canceled;
+        const controls: DocStore.PublicationAdmission = .{ .lifetime = .{ .context = &fixture, .check_fn = Fixture.lifetime }, .execution_wait = if (mode == .coarse) null else .{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end } };
+        var io_table = std.testing.io.vtable.*;
+        io_table.sleep = Fixture.cancelSleep;
+        const io: std.Io = if (mode == .io_canceled) .{ .userdata = std.testing.io.userdata, .vtable = &io_table } else std.testing.io;
+        const result = store.beginPortableImportPublicationWithAdmission(io, controls);
+        if (mode == .success) {
+            try result;
+            try std.testing.expect(!fixture.open);
+            try std.testing.expect(store.portableImportPublicationInProgress());
+            store.finishPortableImportPublication();
+        } else {
+            try std.testing.expectError(switch (mode) {
+                .expired => error.DeadlineExceeded,
+                .shutdown => error.SchedulerClosed,
+                .coarse => error.Backpressured,
+                else => error.Canceled,
+            }, result);
+            try std.testing.expect(!store.portableImportPublicationInProgress());
+            const remaining: usize = if (fixture.open) 2 else 0;
+            try std.testing.expectEqual(remaining, store.portable_import_reader_state.load(.acquire));
+            // Withdrawing the bit preserves both old reader ownership and new
+            // reader admission; a failed publisher never published any data.
+            if (fixture.open) try std.testing.expectEqualStrings("old", try readers[0].get("key"));
+            var probe = try store.beginProbeTxn();
+            probe.abort();
+            try std.testing.expectEqual(remaining, store.portable_import_reader_state.load(.acquire));
+        }
+        fixture.retireReaders();
+        try std.testing.expectEqual(@as(usize, 0), store.portable_import_reader_state.load(.acquire));
+        try std.testing.expectEqual(@as(usize, if (mode == .initial_rejected or mode == .claimed_rejected or mode == .coarse) 0 else 1), fixture.waits);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        // A later unscheduled publication can reuse the fully retired fence.
+        try store.beginPortableImportPublication(std.testing.io);
+        store.finishPortableImportPublication();
+    }
+}
+
+test "docstore publication backlog count bounds atomically refuse source writes and reuse credit" {
+    const backlog = @import("publication_backlog.zig");
+    const outbox = @import("db/durable_outbox.zig");
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var batch = try store.beginWriteBatch();
+    var batch_open = true;
+    defer if (batch_open) batch.abort();
+    var key: [outbox.replication_outbox_v2_prefix.len + 8]u8 = undefined;
+    @memcpy(key[0..outbox.replication_outbox_v2_prefix.len], outbox.replication_outbox_v2_prefix);
+    for (0..backlog.default_max_records) |i| {
+        std.mem.writeInt(u64, key[outbox.replication_outbox_v2_prefix.len..][0..8], i, .big);
+        try batch.put(&key, "x");
+    }
+    try batch.commit();
+    batch_open = false;
+    var read = try store.beginReadTxn();
+    const full = (try backlog.load(&read)).?;
+    read.abort();
+    try std.testing.expectEqual(backlog.default_max_records, full.records);
+    try std.testing.expectEqual(backlog.default_max_records * (key.len + 1), full.bytes);
+    {
+        var refused = try store.beginWriteBatch();
+        defer refused.abort();
+        try refused.put("source-must-not-commit", "value");
+        try refused.put(outbox.replication_batch_outbox_key, "new obligation");
+        try std.testing.expectError(error.Backpressured, refused.commit());
+    }
+    try std.testing.expectError(error.NotFound, store.get(alloc, "source-must-not-commit"));
+    try std.testing.expectError(error.NotFound, store.get(alloc, outbox.replication_batch_outbox_key));
+    // The final view, not the mutation order, determines admission. Repeated
+    // replacements and deletion of an already absent key cannot invent credit.
+    var replacement = try store.beginWriteBatch();
+    var replacement_open = true;
+    defer if (replacement_open) replacement.abort();
+    try replacement.put(outbox.replication_batch_outbox_key, "first");
+    try replacement.put(outbox.replication_batch_outbox_key, "last");
+    try replacement.delete(&key);
+    replacement.delete(&key) catch |err| if (err != error.NotFound) return err;
+    try replacement.commit();
+    replacement_open = false;
+    read = try store.beginReadTxn();
+    defer read.abort();
+    const next = (try backlog.load(&read)).?;
+    try std.testing.expectEqual(full.records, next.records);
+    try std.testing.expectEqual(full.bytes - key.len - 1 + outbox.replication_batch_outbox_key.len + 4, next.bytes);
+}
+
+test "docstore publication backlog byte bounds corruption and arithmetic fail closed" {
+    const backlog = @import("publication_backlog.zig");
+    const full: backlog.State = .{ .records = backlog.default_max_records, .bytes = backlog.default_max_bytes };
+    try std.testing.expectError(error.Backpressured, full.admit(0, 1));
+    try std.testing.expectError(error.Backpressured, full.admit(1, 0));
+    try std.testing.expectEqual(full, try full.admit(0, 0));
+    try std.testing.expectEqual(backlog.State{ .records = full.records - 1, .bytes = full.bytes - 10 }, try full.admit(-1, -10));
+    try std.testing.expectError(error.InvalidHAOutbox, (backlog.State{}).admit(-1, 0));
+    try std.testing.expectError(error.InvalidHAOutbox, full.admit(@as(i128, std.math.maxInt(i128)) - @as(i128, full.records), 0));
+    const oversized: backlog.State = .{ .records = full.records + 1, .bytes = full.bytes + 1 };
+    try std.testing.expectEqual(full, try oversized.admit(-1, -1));
+    var raw = full.encode();
+    raw[12] ^= 1;
+    try std.testing.expectError(error.InvalidHAOutbox, backlog.State.decode(&raw));
+}
+
+test "docstore publication backlog legacy roots drain before new obligations and ignore portable metadata" {
+    const backlog = @import("publication_backlog.zig");
+    const outbox = @import("db/durable_outbox.zig");
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    // Simulate an old database, bypassing the new DocStore hooks.
+    var old = try store.runtime_store.beginWrite();
+    var old_open = true;
+    defer if (old_open) old.abort();
+    try old.put(outbox.replication_batch_outbox_key, "old");
+    try old.put(outbox.replication_schema_outbox_key, "old schema");
+    try old.commit();
+    old_open = false;
+    try std.testing.expectError(error.Backpressured, store.put(outbox.replication_replay_outbox_key, "new"));
+    try store.delete(outbox.replication_batch_outbox_key);
+    try std.testing.expectError(error.Backpressured, store.put(outbox.replication_replay_outbox_key, "new"));
+    try store.delete(outbox.replication_schema_outbox_key);
+    try store.put(outbox.replication_replay_outbox_key, "new");
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const state = (try backlog.load(&read)).?;
+    try std.testing.expectEqual(@as(u64, 1), state.records);
+    try std.testing.expectEqual(@as(u64, outbox.replication_replay_outbox_key.len + 3), state.bytes);
+    try std.testing.expect(!@import("portable_backup.zig").isPortableMetadataKey(backlog.state_key));
+    try std.testing.expect(!@import("portable_backup.zig").isPortableMetadataKey(&backlog.sizeKey(outbox.replication_replay_outbox_key)));
+    try std.testing.expect(!@import("portable_backup.zig").isPortableMetadataKey(outbox.replication_replay_outbox_key));
+}
+
+test "docstore publication backlog survives abort and native reopen with exact replacement accounting" {
+    const backlog = @import("publication_backlog.zig");
+    const outbox = @import("db/durable_outbox.zig");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 4096 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        try store.put(outbox.replication_batch_outbox_key, "retained");
+        var aborted = try store.beginWriteBatch();
+        try aborted.put(outbox.replication_replay_outbox_key, "never committed");
+        try aborted.delete(outbox.replication_batch_outbox_key);
+        aborted.abort();
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = 4096 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var read = try store.beginReadTxn();
+        const state = (try backlog.load(&read)).?;
+        read.abort();
+        try std.testing.expectEqual(@as(u64, 1), state.records);
+        try std.testing.expectEqual(@as(u64, outbox.replication_batch_outbox_key.len + 8), state.bytes);
+        try store.put(outbox.replication_batch_outbox_key, "x");
+        try store.delete(outbox.replication_batch_outbox_key);
+        read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(backlog.State{}, (try backlog.load(&read)).?);
+    }
+}
+
+test "docstore publication backlog shares native gate across views and releases on abort" {
+    const outbox = @import("db/durable_outbox.zig");
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var first = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer first.close();
+    var second = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer second.close();
+    var pending = try first.beginWriteBatch();
+    var pending_open = true;
+    defer if (pending_open) pending.abort();
+    try pending.put(outbox.replication_batch_outbox_key, "pending");
+    // Same-thread contention is a deterministic overlap: no worker may park
+    // while holding another write transaction or the DB apply fence.
+    try std.testing.expectError(error.Backpressured, second.put(outbox.replication_replay_outbox_key, "peer"));
+    try second.put("unrelated", "continues");
+    pending.abort();
+    pending_open = false;
+    try second.put(outbox.replication_replay_outbox_key, "peer");
+    try first.delete(outbox.replication_replay_outbox_key);
+}
+
+test "docstore publication backlog uncertain backend outcomes retain exactly committed debt" {
+    const backlog = @import("publication_backlog.zig");
+    const outbox = @import("db/durable_outbox.zig");
+    const Fixture = struct {
+        inner: ?backend_erased.WriteTxn,
+        commit_first: bool,
+        fn unbox(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn abort(_: Allocator, ptr: *anyopaque) void {
+            const self = unbox(ptr);
+            if (self.inner) |*inner| inner.abort();
+            self.inner = null;
+        }
+        fn commit(_: Allocator, ptr: *anyopaque) !void {
+            const self = unbox(ptr);
+            if (self.commit_first) {
+                try self.inner.?.commit();
+                self.inner = null;
+            }
+            return error.TestUncertainCommit;
+        }
+        fn get(ptr: *anyopaque, key: []const u8) ![]const u8 {
+            // Accounting must not synchronously materialize an outbox value,
+            // even on the real backend's commit/cleanup path.
+            if (@import("publication_backlog.zig").isObligation(key)) return error.TestOutboxValueReadForbidden;
+            return unbox(ptr).inner.?.get(key);
+        }
+        fn put(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
+            return unbox(ptr).inner.?.put(key, value);
+        }
+        fn delete(ptr: *anyopaque, key: []const u8) !void {
+            return unbox(ptr).inner.?.delete(key);
+        }
+        fn openCursor(_: Allocator, ptr: *anyopaque) !backend_erased.Cursor {
+            return unbox(ptr).inner.?.openCursor();
+        }
+    };
+    for ([_]bool{ false, true }) |commit_first| {
+        const alloc = std.testing.allocator;
+        var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var txn = try store.beginWriteTxn();
+        var fixture: Fixture = .{ .inner = txn.write.?, .commit_first = commit_first };
+        txn.write = .{ .allocator = alloc, .ptr = &fixture, .vtable = &.{ .abort = Fixture.abort, .commit = Fixture.commit, .get = Fixture.get, .put = Fixture.put, .delete = Fixture.delete, .open_cursor = Fixture.openCursor } };
+        var txn_open = true;
+        defer if (txn_open) txn.abort();
+        try txn.put(outbox.replication_batch_outbox_key, "uncertain");
+        try txn.put("source", "same decision");
+        try std.testing.expectError(error.TestUncertainCommit, txn.commit());
+        txn.abort();
+        txn_open = false;
+        var read = try store.beginReadTxn();
+        const state = try backlog.load(&read);
+        if (commit_first) {
+            try std.testing.expectEqual(@as(u64, 1), state.?.records);
+            try std.testing.expectEqual(@as(u64, outbox.replication_batch_outbox_key.len + 9), state.?.bytes);
+            try std.testing.expectEqualStrings("same decision", try read.get("source"));
+        } else {
+            try std.testing.expect(state == null);
+            try std.testing.expectError(error.NotFound, read.get("source"));
+            try std.testing.expectError(error.NotFound, read.get(outbox.replication_batch_outbox_key));
+        }
+        read.abort();
+        // Even an uncertain deletion updates aggregate and sidecar with the
+        // same decision, without requesting the primary outbox value.
+        var cleanup = try store.beginWriteTxn();
+        var cleanup_fixture: Fixture = .{ .inner = cleanup.write.?, .commit_first = true };
+        cleanup.write = .{ .allocator = alloc, .ptr = &cleanup_fixture, .vtable = &.{ .abort = Fixture.abort, .commit = Fixture.commit, .get = Fixture.get, .put = Fixture.put, .delete = Fixture.delete, .open_cursor = Fixture.openCursor } };
+        var cleanup_open = true;
+        defer if (cleanup_open) cleanup.abort();
+        try cleanup.delete(outbox.replication_batch_outbox_key);
+        try std.testing.expectError(error.TestUncertainCommit, cleanup.commit());
+        cleanup.abort();
+        cleanup_open = false;
+        read = try store.beginReadTxn();
+        const empty = (try backlog.load(&read)).?;
+        try std.testing.expectEqual(backlog.State{}, empty);
+        try std.testing.expectError(error.NotFound, read.get(&backlog.sizeKey(outbox.replication_batch_outbox_key)));
+        read.abort();
+        // Ambiguous completion did not leak the precommit gate.
+        try store.put(outbox.replication_replay_outbox_key, "next");
+    }
+}
+
+test "docstore artifact replay inventory coalesces writer forms and releases aborted ownership" {
+    const a = std.testing.allocator;
+    var native = lsm_backend.Backend.init(a, .{});
+    defer native.close();
+    var store = try DocStore.openRuntime(a, try native.runtimeStore(a, .{}));
+    defer store.close();
+    try @import("artifact_footprint.zig").initializeEmpty(&store);
+    try artifact_replay_inventory.initialize(&store);
+    const first = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner\x00binary", "first");
+    defer a.free(first);
+    const second = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner\x00binary", "second");
+    defer a.free(second);
+    const third = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner\x00binary", "third");
+    defer a.free(third);
+    const payload: [8193]u8 = @splat(29);
+    try store.put(first, &payload);
+    {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(first, "replacement");
+        try batch.delete(first);
+        try batch.asTxn().appendPut(first, "last");
+        try batch.asTxn().appendPut(second, "first");
+        try batch.asTxn().appendPut(second, "last");
+        try batch.commit();
+    }
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const state = (try artifact_replay_inventory.loadDocument(&read, first)).?;
+        try std.testing.expectEqual(@as(u64, 2), state.count);
+        try std.testing.expectEqual(@as(u64, first.len + second.len), state.key_bytes);
+    }
+    {
+        var abandoned = try store.beginWriteTxn();
+        defer abandoned.abort();
+        try abandoned.put(third, "abandoned");
+    }
+    try std.testing.expectError(error.NotFound, store.get(a, third));
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try write.delete(first);
+        write.delete(first) catch |cause| if (cause != error.NotFound) return cause;
+        try write.delete(second);
+        try write.commit();
+    }
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualDeep(artifact_replay_inventory.State{}, (try artifact_replay_inventory.loadDocument(&read, first)).?);
+}
+
+test "docstore artifact replay inventory reconciles legacy pages and restarts only changed documents" {
+    const a = std.testing.allocator;
+    var native = lsm_backend.Backend.init(a, .{});
+    defer native.close();
+    var store = try DocStore.openRuntime(a, try native.runtimeStore(a, .{}));
+    defer store.close();
+    var expected_bytes: u64 = 0;
+    {
+        var legacy = try store.beginWriteBatch();
+        errdefer legacy.abort();
+        for (0..300) |i| {
+            var name_buf: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "vector-{d}", .{i});
+            const physical = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "legacy", name);
+            defer a.free(physical);
+            expected_bytes += physical.len;
+            try legacy.put(physical, "legacy payload is not copied by reconciliation");
+        }
+        try legacy.commit();
+    }
+    try artifact_replay_inventory.initialize(&store);
+    const doc = try internal_keys.documentKeyAlloc(a, "legacy");
+    defer a.free(doc);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try artifact_replay_inventory.loadDocument(&read, doc) == null);
+    }
+    try std.testing.expect(!try artifact_replay_inventory.reconcileDocumentPage(a, &store, doc, null));
+    const added = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "legacy", "added-after-page");
+    defer a.free(added);
+    try store.put(added, "change invalidates old page");
+    expected_bytes += added.len;
+    const other = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "other", "vector");
+    defer a.free(other);
+    try store.put(other, "unrelated mutation");
+    while (!try artifact_replay_inventory.reconcileDocumentPage(a, &store, other, null)) {}
+    var calls: usize = 0;
+    while (!try artifact_replay_inventory.reconcileDocumentPage(a, &store, doc, null)) {
+        calls += 1;
+        try std.testing.expect(calls < 1024);
+    }
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const state = (try artifact_replay_inventory.loadDocument(&read, doc)).?;
+    try std.testing.expectEqual(@as(u64, 301), state.count);
+    try std.testing.expectEqual(expected_bytes, state.key_bytes);
+    try std.testing.expectEqual(@as(u64, 1), (try artifact_replay_inventory.loadDocument(&read, other)).?.count);
+}
+
+test "docstore artifact replay inventory shared gate and ignored allocation failure cannot publish false totals" {
+    const a = std.testing.allocator;
+    var native = lsm_backend.Backend.init(a, .{});
+    defer native.close();
+    var first = try DocStore.openRuntime(a, try native.runtimeStore(a, .{}));
+    defer first.close();
+    var second = try DocStore.openRuntime(a, try native.runtimeStore(a, .{}));
+    defer second.close();
+    try @import("artifact_footprint.zig").initializeEmpty(&first);
+    try artifact_replay_inventory.initialize(&first);
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "first");
+    defer a.free(artifact);
+    const other = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "second");
+    defer a.free(other);
+    {
+        var accepted = try first.beginWriteBatch();
+        errdefer accepted.abort();
+        try accepted.put(artifact, "accepted");
+        {
+            var refused = try second.beginWriteBatch();
+            defer refused.abort();
+            try std.testing.expectError(error.Backpressured, refused.put(other, "refused"));
+            try std.testing.expectError(error.InvalidArtifactReplayInventory, refused.commit());
+        }
+        try accepted.commit();
+    }
+    {
+        var refused = try second.beginWriteTxn();
+        defer refused.abort();
+        var deny = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        refused.alloc = deny.allocator();
+        const result = refused.put(other, "must not publish");
+        refused.alloc = a;
+        try std.testing.expectError(error.OutOfMemory, result);
+        try std.testing.expectError(error.InvalidArtifactReplayInventory, refused.commit());
+    }
+    try std.testing.expectError(error.NotFound, first.get(a, other));
+    try second.put(other, "retry after retirement");
+    var read = try first.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(@as(u64, 2), (try artifact_replay_inventory.loadDocument(&read, artifact)).?.count);
+}
+
+test "docstore artifact replay inventory epochs reject legacy writes and import invalidation across reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/inventory", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "first");
+    defer a.free(artifact);
+    const other = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "legacy");
+    defer a.free(other);
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        try @import("artifact_footprint.zig").initializeEmpty(&store);
+        try artifact_replay_inventory.initialize(&store);
+        try store.put(artifact, "durable");
+    }
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 1), (try artifact_replay_inventory.loadDocument(&read, artifact)).?.count);
+        }
+        // Emulate an older DocStore: revisions/footprints still advance, but
+        // the inventory observer is absent. Old counters must become unknown.
+        {
+            var old_writer = try store.beginWriteTxn();
+            errdefer old_writer.abort();
+            old_writer.artifact_inventory.staging = true;
+            try old_writer.put(other, "older writer");
+            try old_writer.commit();
+        }
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect(try artifact_replay_inventory.loadDocument(&read, artifact) == null);
+        }
+        while (!try artifact_replay_inventory.reconcileDocumentPage(a, &store, artifact, null)) {}
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 2), (try artifact_replay_inventory.loadDocument(&read, artifact)).?.count);
+        }
+        try @import("artifact_footprint.zig").invalidate(&store);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try artifact_replay_inventory.loadDocument(&read, artifact) == null);
+    }
+    {
+        var store = try DocStore.open(a, path, .{});
+        defer store.close();
+        while (!try artifact_replay_inventory.reconcileDocumentPage(a, &store, artifact, null)) {}
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            const state = (try artifact_replay_inventory.loadDocument(&read, artifact)).?;
+            try std.testing.expectEqual(@as(u64, 2), state.count);
+            try std.testing.expectEqual(@as(u64, artifact.len + other.len), state.key_bytes);
+        }
+        // Clear retains the local generation fence, retires old counter keys,
+        // and cannot resurrect the pre-clear counts when the root is reused.
+        try @import("db/core.zig").clearAllKeysFromStore(a, &store);
+        try std.testing.expectError(error.NotFound, store.get(a, artifact));
+        while (!try artifact_replay_inventory.reconcileDocumentPage(a, &store, artifact, null)) {}
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(artifact_replay_inventory.State{}, (try artifact_replay_inventory.loadDocument(&read, artifact)).?);
+        try std.testing.expect(!@import("portable_backup.zig").isPortableMetadataKey(artifact_replay_inventory.marker_key));
+    }
+}
+
+test "docstore artifact replay inventory counts actual staged presence after late append rejection and fallback" {
+    const a = std.testing.allocator;
+    var native = lsm_backend.Backend.init(a, .{});
+    defer native.close();
+    var store = try DocStore.openRuntime(a, try native.runtimeStore(a, .{}));
+    defer store.close();
+    try @import("artifact_footprint.zig").initializeEmpty(&store);
+    try artifact_replay_inventory.initialize(&store);
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "late-unsupported");
+    defer a.free(artifact);
+    const Reject = struct {
+        fn append(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+            return error.Unsupported;
+        }
+    };
+    for ([_]bool{ false, true }) |fallback| {
+        {
+            var batch = try store.beginWriteBatch();
+            errdefer batch.abort();
+            var callbacks = batch.runtime.?.vtable.*;
+            const supported = callbacks.append_put;
+            callbacks.append_put = Reject.append;
+            batch.runtime.?.vtable = &callbacks;
+            try std.testing.expectError(error.Unsupported, batch.asTxn().appendPut(artifact, "not staged"));
+            callbacks.append_put = supported;
+            if (fallback) try batch.put(artifact, "fallback staged");
+            try batch.commit();
+        }
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const state = (try artifact_replay_inventory.loadDocument(&read, artifact)).?;
+        try std.testing.expectEqual(@as(u64, @intFromBool(fallback)), state.count);
+        try std.testing.expectEqual(@as(u64, if (fallback) artifact.len else 0), state.key_bytes);
+        try std.testing.expectEqual(fallback, try read.contains(artifact));
     }
 }

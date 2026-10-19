@@ -192,6 +192,7 @@ pub const Store = struct {
     /// cache hints may be changing concurrently and belong to the new record.
     pub fn revision(source: *const Run, metadata: Run) Run {
         var run = metadata;
+        run.read_identity = source.read_identity;
         run.owner = source.owner;
         run.path = source.path;
         run.smallest_namespace_name = source.smallest_namespace_name;
@@ -308,6 +309,7 @@ pub const Store = struct {
     fn stageInternal(self: *Store, allocator: std.mem.Allocator, run: Run, overwrite: bool) !void {
         var probe = run;
         if (!overwrite and Tree.find(self.tree.root, .{ .run = &probe }) != null) return error.DuplicateRun;
+        try probe.ensureReadIdentity();
         try self.tree.prepare(allocator);
         const payload = try allocator.create(Payload);
         const bytes = @sizeOf(Payload) + if (run.owner != null) @as(usize, 0) else run.smallest_key.len + run.largest_key.len +
@@ -317,7 +319,7 @@ pub const Store = struct {
             (if (run.state) |present| present.estimatedMemoryBytes() else 0);
         self.tree.account.?.charge(bytes);
         const parent = if (run.owner) |owner| owner.raw.owner.?.retain() else null;
-        payload.* = .{ .owner = .{ .raw = if (parent) |owner| owner.raw else &payload.run, .destroy = Payload.destroy }, .parent = parent, .run = run, .destroy_run = self.destroy_run, .account = self.tree.account.?, .bytes = bytes };
+        payload.* = .{ .owner = .{ .raw = if (parent) |owner| owner.raw else &payload.run, .destroy = Payload.destroy }, .parent = parent, .run = probe, .destroy_run = self.destroy_run, .account = self.tree.account.?, .bytes = bytes };
         payload.run.owner = &payload.owner;
         if (parent != null) {
             payload.run.bloom_filter = null;
@@ -415,4 +417,45 @@ test "writer owner narrow publication scaling benchmark" {
         }
         std.debug.print("writer-owner runs={d} changed=5 array_mean_ns={d} tree_mean_ns={d} retained_bytes={d}\n", .{ count_runs, array_ns / 31, tree_ns / 31, live.memoryBytes(@import("memory_account.zig").nextPass()) });
     }
+}
+
+test "lsm local decoder admission immutable identity survives revisions and snapshots" {
+    const a = std.testing.allocator;
+    var run: Run = .{ .id = 1, .level = 0, .size_bytes = 64, .path = try a.dupe(u8, "same-path"), .smallest_namespace_name = null, .smallest_key = &.{}, .largest_namespace_name = null, .largest_key = &.{}, .entry_count = 1, .bloom_filter = null, .state = null };
+    var adopted = false;
+    defer if (!adopted) run.deinit(a);
+    var store: Store = .{};
+    defer store.deinit(a);
+    try store.append(a, run);
+    adopted = true;
+    const identity = store.at(0).read_identity;
+    try std.testing.expect(identity.valid());
+    var snapshot = try @import("repository.zig").cloneRunSnapshot(a, store.at(0).*);
+    defer snapshot.deinit(a);
+    var compact = try @import("repository.zig").cloneRunCompactionSnapshot(a, store.at(0).*);
+    defer compact.deinit(a);
+    try std.testing.expect(std.meta.eql(identity, snapshot.read_identity));
+    try std.testing.expect(std.meta.eql(identity, compact.read_identity));
+    var metadata = store.at(0).*;
+    metadata.level = 1;
+    metadata.gc_requested = true;
+    // A stale logical plan cannot replace the pinned physical source's identity.
+    metadata.read_identity = try @import("read_generation.zig").allocate();
+    const revised = Store.revision(store.at(0), metadata);
+    try std.testing.expect(std.meta.eql(identity, revised.read_identity));
+    var candidate = store.fork();
+    defer candidate.deinit(a);
+    try candidate.remove(a, store.at(0));
+    try candidate.stageRevision(a, revised);
+    candidate.adopt(&revised);
+    try std.testing.expect(std.meta.eql(identity, candidate.at(0).read_identity));
+    var replacement = try @import("repository.zig").cloneRunCompactionSnapshot(a, revised);
+    replacement.read_identity = .{};
+    var replacement_owned = true;
+    defer if (replacement_owned) replacement.deinit(a);
+    var fresh: Store = .{};
+    defer fresh.deinit(a);
+    try fresh.append(a, replacement);
+    replacement_owned = false;
+    try std.testing.expect(!std.meta.eql(identity, fresh.at(0).read_identity));
 }

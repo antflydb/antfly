@@ -1319,7 +1319,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (io == null and !builtin.is_test and comptime false) {
             const provider_impl = try std.heap.c_allocator.create(MetalNativeProvider);
             errdefer std.heap.c_allocator.destroy(provider_impl);
-            provider_impl.* = try MetalNativeProvider.createWithKernelJitOptions(kernel_jit_options);
+            provider_impl.* = try MetalNativeProvider.createWithKernelJitOptionsAndDeviceBudget(kernel_jit_options, data.device_memory_budget);
+            errdefer provider_impl.deinitOwned();
+            if (data.device_memory_budget) |budget|
+                try provider_impl.configureDeviceMemoryBudget(budget);
             self.* = .{
                 .allocator = allocator,
                 .data = data,
@@ -1336,12 +1339,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const provider_impl = data.shared_metal_native_provider orelse blk: {
             const created = try std.heap.c_allocator.create(MetalNativeProvider);
             errdefer std.heap.c_allocator.destroy(created);
-            created.* = try MetalNativeProvider.createWithKernelJitOptions(kernel_jit_options);
+            created.* = try MetalNativeProvider.createWithKernelJitOptionsAndDeviceBudget(kernel_jit_options, data.device_memory_budget);
             data.shared_metal_native_provider = created;
             break :blk created;
         };
         if (provider_impl.jit_mode != kernel_jit_options.config.mode or
             !provider_impl.jit_scope.eql(kernel_jit_options.scope)) return error.MetalKernelJitConfigConflict;
+        if (data.device_memory_budget) |budget|
+            try provider_impl.configureDeviceMemoryBudget(budget);
         self.* = .{
             .allocator = allocator,
             .data = data,
@@ -1371,6 +1376,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const provider_impl = data.shared_metal_native_provider orelse return error.SharedProviderUnavailable;
         if (provider_impl.jit_mode != kernel_jit_options.config.mode or
             !provider_impl.jit_scope.eql(kernel_jit_options.scope)) return error.MetalKernelJitConfigConflict;
+        if (data.device_memory_budget) |budget|
+            try provider_impl.configureDeviceMemoryBudget(budget);
         var compute: MetalCompute = .{
             .allocator = allocator,
             .data = data,
@@ -4518,6 +4525,40 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     }
 
+    fn configureDeviceMemoryBudgetLocked(data: *WeightStore, provider: ?*MetalNativeProvider, budget: runtime_root.kv.device_memory.Budget) !void {
+        if (budget.family != .kv) return error.MetalDeviceBudgetOwnershipConflict;
+        if (data.device_memory_budget) |existing| {
+            if (!existing.sameOwner(budget)) return error.MetalDeviceBudgetOwnershipConflict;
+        }
+        // Acquire the store capability before installing the provider's own
+        // capability so a failed clone cannot leave a partially bound store.
+        const owned = if (data.device_memory_budget == null) try budget.clone() else null;
+        errdefer if (owned) |capability| capability.deinit();
+        if (provider) |active|
+            try active.configureDeviceMemoryBudget(budget);
+        if (owned) |capability| data.device_memory_budget = capability;
+    }
+
+    /// Metadata-only configuration before model publication/prewarm. Never wait
+    /// behind a request's GPU work and never create a device or provider here.
+    pub fn configureSharedDeviceMemoryBudget(data: *WeightStore, io: ?std.Io, budget: runtime_root.kv.device_memory.Budget) !void {
+        const lock_io = try lockSharedMetalData(data, io);
+        defer unlockSharedMetalData(data, lock_io);
+        try configureDeviceMemoryBudgetLocked(data, data.shared_metal_native_provider, budget);
+    }
+
+    pub fn cloneSharedDeviceMemoryBudget(data: *WeightStore, io: ?std.Io) !?runtime_root.kv.device_memory.Budget {
+        const lock_io = try lockSharedMetalData(data, io);
+        defer unlockSharedMetalData(data, lock_io);
+        return if (data.device_memory_budget) |budget| try budget.clone() else null;
+    }
+
+    fn configureDeviceMemoryBudgetOp(ctx: *anyopaque, budget: runtime_root.kv.device_memory.Budget) !void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        // Compute contexts already own or borrow this provider's execution lease.
+        try configureDeviceMemoryBudgetLocked(self.data, self.provider_impl, budget);
+    }
+
     fn provisionKvDeviceWriteHookOp(
         ctx: *anyopaque,
         storage: *runtime_root.kv.storage_runtime.KvStorageRuntime,
@@ -4529,7 +4570,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const config = storage.storage.config;
         const metal_kv_storage = @import("../backends/metal_kv_storage.zig");
         const metal_storage = metal_kv_storage.MetalKvStorage.create(
-            self.allocator,
+            storage.allocator,
             runtime,
             config.dtype,
             config.num_kv_heads,
@@ -33359,6 +33400,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.runAttentionResidual = runAttentionResidualOp;
         vt.runAttentionOutputResidual = runAttentionOutputResidualOp;
         vt.provisionKvDeviceWriteHook = provisionKvDeviceWriteHookOp;
+        vt.configureDeviceMemoryBudget = configureDeviceMemoryBudgetOp;
         vt.runDenseFfnResidual = runDenseFfnResidualOp;
         vt.runDenseDecoderBlock = runDenseDecoderBlockOp;
         vt.runGatedFfnResidual = runGatedFfnResidualOp;

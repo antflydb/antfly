@@ -39,6 +39,76 @@ fn callbackStatusAfterIo(context: *const httpx.Context, err: anyerror) abi.Callb
     return callbackStatusFromError(err);
 }
 
+const WriteControl = httpx.socket.WriteControl;
+
+/// Each adapter is owned by one synchronous callback. Its view is never saved
+/// in Outbound or a stream writer, so joined monitors cannot outlive the borrow.
+const CallControl = struct {
+    base: WriteControl,
+    incoming: ?*const abi.RequestControl,
+
+    fn result(status: abi.CallbackStatus) WriteControl.Error!void {
+        return switch (status) {
+            .ok => {},
+            .timeout => error.Timeout,
+            else => error.Canceled,
+        };
+    }
+    fn check(raw: ?*anyopaque) WriteControl.Error!void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try self.base.check();
+        if (self.incoming) |incoming| {
+            const call = incoming.check orelse return error.Canceled;
+            try result(call(incoming.context));
+        }
+    }
+    fn remaining(raw: ?*anyopaque) WriteControl.Error!?u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        var limit = try self.base.timeout(null);
+        if (self.incoming) |incoming| {
+            const call = incoming.remaining orelse return error.Canceled;
+            var timeout: abi.OptionalTimeout = .{};
+            try result(call(incoming.context, &timeout));
+            if (timeout.present > 1) return error.Canceled;
+            if (timeout.present == 1) {
+                if (timeout.milliseconds == 0) return error.Timeout;
+                limit = @min(limit orelse timeout.milliseconds, timeout.milliseconds);
+            }
+        }
+        return limit;
+    }
+    fn begin(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try self.base.wait_begin_fn.?(self.base.ptr);
+    }
+    fn end(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        try self.base.wait_end_fn.?(self.base.ptr);
+    }
+    fn view(self: *@This()) WriteControl {
+        if (self.incoming == null) return self.base;
+        return .{ .ptr = self, .check_fn = check, .remaining_ms_fn = remaining, .wait_begin_fn = if (self.base.wait_begin_fn != null) begin else null, .wait_end_fn = if (self.base.wait_end_fn != null) end else null };
+    }
+};
+
+const ExportControl = struct {
+    control: WriteControl,
+    fn check(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.control.check() catch |err| return callbackStatusFromError(err);
+        return .ok;
+    }
+    fn remaining(raw: ?*anyopaque, out: *abi.OptionalTimeout) callconv(.c) abi.CallbackStatus {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        const ms = self.control.timeout(null) catch |err| return callbackStatusFromError(err);
+        out.* = if (ms) |value| .{ .milliseconds = value, .present = 1 } else .{};
+        return .ok;
+    }
+    fn view(self: *@This()) abi.RequestControl {
+        return .{ .context = self, .check = check, .remaining = remaining };
+    }
+};
+
 pub const Outbound = struct {
     context: *httpx.Context,
     writer: ?httpx.Context.StreamWriter = null,
@@ -57,6 +127,7 @@ pub const Outbound = struct {
         return .{
             .context = self,
             .read_all = readAllBody,
+            .read_all_controlled = readAllBodyControlled,
             .streaming = @intFromBool(self.context.hasStreamingRequestBody()),
         };
     }
@@ -68,6 +139,9 @@ pub const Outbound = struct {
             .write = write,
             .close = close,
             .set_execution_wait = setExecutionWait,
+            .start_controlled = startControlled,
+            .write_controlled = writeControlled,
+            .close_controlled = closeControlled,
         };
     }
 
@@ -90,8 +164,7 @@ pub const Outbound = struct {
     }
     fn remainingOutput(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
         const self: *Outbound = @ptrCast(@alignCast(raw.?));
-        if (self.write_control.remaining_ms_fn) |remaining| return remaining(self.write_control.ptr);
-        return null;
+        return self.write_control.timeout(null);
     }
     fn beginOutputWait(raw: ?*anyopaque) !void {
         const self: *Outbound = @ptrCast(@alignCast(raw.?));
@@ -102,8 +175,8 @@ pub const Outbound = struct {
         try callbackResult(self.execution_wait.end.?(self.execution_wait.context));
     }
     fn outputControl(self: *Outbound) httpx.socket.WriteControl {
-        if (self.execution_wait.begin == null) return self.write_control;
-        return .{ .ptr = self, .check_fn = checkOutput, .remaining_ms_fn = remainingOutput, .wait_begin_fn = beginOutputWait, .wait_end_fn = endOutputWait };
+        if (self.execution_wait.begin == null) return self.context.requestWriteControl(self.write_control);
+        return self.context.requestWriteControl(.{ .ptr = self, .check_fn = checkOutput, .remaining_ms_fn = remainingOutput, .wait_begin_fn = beginOutputWait, .wait_end_fn = endOutputWait });
     }
 
     fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
@@ -112,14 +185,27 @@ pub const Outbound = struct {
     }
 
     fn readAllBody(raw: ?*anyopaque, out: *abi.OptionalBytes) callconv(.c) abi.CallbackStatus {
+        return readAllBodyWithControl(raw, out, null);
+    }
+    fn readAllBodyControlled(raw: ?*anyopaque, out: *abi.OptionalBytes, incoming: *const abi.RequestControl) callconv(.c) abi.CallbackStatus {
+        return readAllBodyWithControl(raw, out, incoming);
+    }
+    fn readAllBodyWithControl(raw: ?*anyopaque, out: *abi.OptionalBytes, incoming: ?*const abi.RequestControl) abi.CallbackStatus {
         const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
         if (self.context.isCancellationRequested()) return .canceled;
-        const body = self.context.body() catch |err| return callbackStatusAfterIo(self.context, err);
+        var control: CallControl = .{ .base = self.outputControl(), .incoming = incoming };
+        const body = self.context.bodyControlled(control.view()) catch |err| return callbackStatusAfterIo(self.context, err);
         out.* = abi.OptionalBytes.init(body);
         return .ok;
     }
 
     fn start(raw: ?*anyopaque, status: u16, content_type: abi.Bytes, headers: abi.HeaderList) callconv(.c) abi.CallbackStatus {
+        return startWithControl(raw, status, content_type, headers, null);
+    }
+    fn startControlled(raw: ?*anyopaque, status: u16, content_type: abi.Bytes, headers: abi.HeaderList, incoming: *const abi.RequestControl) callconv(.c) abi.CallbackStatus {
+        return startWithControl(raw, status, content_type, headers, incoming);
+    }
+    fn startWithControl(raw: ?*anyopaque, status: u16, content_type: abi.Bytes, headers: abi.HeaderList, incoming: ?*const abi.RequestControl) abi.CallbackStatus {
         const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
         if (self.context.isCancellationRequested()) return .canceled;
         if (self.started) return .failed;
@@ -131,23 +217,55 @@ pub const Outbound = struct {
         for (headers.slice()) |header| {
             self.context.response.headers.append(header.name.slice(), header.value.slice()) catch |err| return callbackStatusAfterIo(self.context, err);
         }
-        self.writer = self.context.streamResponseWithContentTypeControlled(status, content_type.slice(), self.outputControl()) catch |err| return callbackStatusAfterIo(self.context, err);
+        var control: CallControl = .{ .base = self.outputControl(), .incoming = incoming };
+        var writer = self.context.streamResponseWithContentTypeControlled(status, content_type.slice(), control.view()) catch |err| return callbackStatusAfterIo(self.context, err);
+        // streamResponse copies its control. Drop the callback-local view before
+        // publishing the persistent writer, including its nested H2 writer.
+        writer.control = self.outputControl();
+        if (writer.h2_writer) |*h2_writer| h2_writer.control = writer.control;
+        self.writer = writer;
         self.started = true;
         return .ok;
     }
 
     fn write(raw: ?*anyopaque, bytes: abi.Bytes) callconv(.c) abi.CallbackStatus {
+        return writeWithControl(raw, bytes, null);
+    }
+    fn writeControlled(raw: ?*anyopaque, bytes: abi.Bytes, incoming: *const abi.RequestControl) callconv(.c) abi.CallbackStatus {
+        return writeWithControl(raw, bytes, incoming);
+    }
+    fn writeWithControl(raw: ?*anyopaque, bytes: abi.Bytes, incoming: ?*const abi.RequestControl) abi.CallbackStatus {
         const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
         if (self.context.isCancellationRequested()) return .canceled;
-        const writer = &(self.writer orelse return .failed);
+        const writer = if (self.writer) |*writer| writer else return .failed;
+        var control: CallControl = .{ .base = self.outputControl(), .incoming = incoming };
+        writer.control = control.view();
+        if (writer.h2_writer) |*h2_writer| h2_writer.control = writer.control;
+        defer {
+            writer.control = self.outputControl();
+            if (writer.h2_writer) |*h2_writer| h2_writer.control = writer.control;
+        }
         writer.write(bytes.slice()) catch |err| return callbackStatusAfterIo(self.context, err);
         return .ok;
     }
 
     fn close(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
+        return closeWithControl(raw, null);
+    }
+    fn closeControlled(raw: ?*anyopaque, incoming: *const abi.RequestControl) callconv(.c) abi.CallbackStatus {
+        return closeWithControl(raw, incoming);
+    }
+    fn closeWithControl(raw: ?*anyopaque, incoming: ?*const abi.RequestControl) abi.CallbackStatus {
         const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
         if (self.context.isCancellationRequested()) return .canceled;
-        const writer = &(self.writer orelse return .failed);
+        const writer = if (self.writer) |*writer| writer else return .failed;
+        var control: CallControl = .{ .base = self.outputControl(), .incoming = incoming };
+        writer.control = control.view();
+        if (writer.h2_writer) |*h2_writer| h2_writer.control = writer.control;
+        defer {
+            writer.control = self.outputControl();
+            if (writer.h2_writer) |*h2_writer| h2_writer.control = writer.control;
+        }
         writer.close() catch |err| return callbackStatusAfterIo(self.context, err);
         return .ok;
     }
@@ -170,6 +288,7 @@ pub fn installInbound(
         context.body_delegate = .{
             .ptr = @constCast(body_source),
             .read_all = inboundReadAllBody,
+            .read_all_controlled = inboundReadAllBodyControlled,
             .streaming = body_source.streaming != 0,
         };
     }
@@ -179,6 +298,9 @@ pub fn installInbound(
             .start = inboundStart,
             .write = inboundWrite,
             .close = inboundClose,
+            .start_controlled = inboundStartControlled,
+            .write_controlled = inboundWriteControlled,
+            .close_controlled = inboundCloseControlled,
         };
     }
 }
@@ -195,6 +317,20 @@ fn inboundReadAllBody(raw: ?*anyopaque) !?[]const u8 {
         .body_capacity_exceeded => return error.BodyCapacityExceeded,
         .end_of_stream => return error.EndOfStream,
     }
+    return bytes.slice();
+}
+
+fn inboundReadAllBodyControlled(raw: ?*anyopaque, control: WriteControl) !?[]const u8 {
+    if (!control.active()) return inboundReadAllBody(raw);
+    const source: *const abi.RequestBodySource = @ptrCast(@alignCast(raw orelse return error.BodySourceUnavailable));
+    const call = source.read_all_controlled orelse return error.RequestControlUnavailable;
+    var adapter: ExportControl = .{ .control = control };
+    const view = adapter.view();
+    var bytes: abi.OptionalBytes = .{};
+    const status = call(source.context, &bytes, &view);
+    if (status == .failed) return error.BodyReadFailed;
+    try callbackResult(status);
+    try control.check();
     return bytes.slice();
 }
 
@@ -220,6 +356,41 @@ fn inboundWrite(raw: ?*anyopaque, bytes: []const u8) !void {
 fn inboundClose(raw: ?*anyopaque) !void {
     const stream: *const abi.StreamSink = @ptrCast(@alignCast(raw orelse return error.StreamUnavailable));
     try callbackResult(stream.close.?(stream.context));
+}
+
+fn inboundStartControlled(raw: ?*anyopaque, status: u16, content_type: []const u8, headers: *const httpx.Headers, control: WriteControl) !void {
+    if (!control.active()) return inboundStart(raw, status, content_type, headers);
+    const stream: *const abi.StreamSink = @ptrCast(@alignCast(raw orelse return error.StreamUnavailable));
+    if (stream.write_controlled == null or stream.close_controlled == null) return error.RequestControlUnavailable;
+    const call = stream.start_controlled orelse return error.RequestControlUnavailable;
+    var local: [16]abi.HeaderView = undefined;
+    const views = if (headers.count() <= local.len) local[0..headers.count()] else try headers.allocator.alloc(abi.HeaderView, headers.count());
+    defer if (views.len > local.len) headers.allocator.free(views);
+    for (headers.iterator(), views) |header, *view| view.* = .{ .name = .init(header.name), .value = .init(header.value) };
+    var adapter: ExportControl = .{ .control = control };
+    const view = adapter.view();
+    try callbackResult(call(stream.context, status, .init(content_type), .{ .ptr = views.ptr, .len = views.len }, &view));
+    try control.check();
+}
+
+fn inboundWriteControlled(raw: ?*anyopaque, bytes: []const u8, control: WriteControl) !void {
+    if (!control.active()) return inboundWrite(raw, bytes);
+    const stream: *const abi.StreamSink = @ptrCast(@alignCast(raw orelse return error.StreamUnavailable));
+    const call = stream.write_controlled orelse return error.RequestControlUnavailable;
+    var adapter: ExportControl = .{ .control = control };
+    const view = adapter.view();
+    try callbackResult(call(stream.context, .init(bytes), &view));
+    try control.check();
+}
+
+fn inboundCloseControlled(raw: ?*anyopaque, control: WriteControl) !void {
+    if (!control.active()) return inboundClose(raw);
+    const stream: *const abi.StreamSink = @ptrCast(@alignCast(raw orelse return error.StreamUnavailable));
+    const call = stream.close_controlled orelse return error.RequestControlUnavailable;
+    var adapter: ExportControl = .{ .control = control };
+    const view = adapter.view();
+    try callbackResult(call(stream.context, &view));
+    try control.check();
 }
 
 fn callbackResult(status: abi.CallbackStatus) !void {
@@ -306,6 +477,18 @@ test "outbound original output fences survive linked stream callbacks" {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             if (self.failure) |err| return err;
         }
+        fn startControlled(raw: ?*anyopaque, status: u16, content_type: []const u8, headers: *const httpx.Headers, control: WriteControl) !void {
+            try control.check();
+            return start(raw, status, content_type, headers);
+        }
+        fn writeControlled(raw: ?*anyopaque, bytes: []const u8, control: WriteControl) !void {
+            try control.check();
+            return write(raw, bytes);
+        }
+        fn closeControlled(raw: ?*anyopaque, control: WriteControl) !void {
+            try control.check();
+            return close(raw);
+        }
         fn start(raw: ?*anyopaque, _: u16, _: []const u8, _: *const httpx.Headers) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.starts += 1;
@@ -324,7 +507,7 @@ test "outbound original output fences survive linked stream callbacks" {
     var outer = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
     defer outer.deinit();
     var state = State{ .failure = error.Timeout };
-    outer.stream_delegate = .{ .ptr = &state, .start = State.start, .write = State.write, .close = State.close };
+    outer.stream_delegate = .{ .ptr = &state, .start = State.start, .write = State.write, .close = State.close, .start_controlled = State.startControlled, .write_controlled = State.writeControlled, .close_controlled = State.closeControlled };
     var outbound = Outbound{ .context = &outer, .write_control = .{ .ptr = &state, .check_fn = State.check } };
     var sink = outbound.stream();
     try std.testing.expectEqual(.timeout, sink.start.?(sink.context, 200, abi.Bytes.init("application/x-ndjson"), .{}));
@@ -650,4 +833,343 @@ test "outbound checked execution wait installation preserves fences and clears b
     try std.testing.expectEqual(.ok, sink.set_execution_wait.?(sink.context, null));
     try std.testing.expect(outbound.outputControl().wait_begin_fn == null);
     try std.testing.expectError(error.Canceled, outbound.outputControl().check());
+}
+
+test "opaque HTTP controls interrupt physical lazy H1 reads and release the callback borrow" {
+    const std = @import("std");
+    const Body = struct {
+        fn legacy(raw: ?*anyopaque) !?[]const u8 {
+            const reader: *httpx.Context.H1StreamReader = @ptrCast(@alignCast(raw.?));
+            return reader.readAllControlled(.{});
+        }
+        fn controlled(raw: ?*anyopaque, control: WriteControl) !?[]const u8 {
+            const reader: *httpx.Context.H1StreamReader = @ptrCast(@alignCast(raw.?));
+            return reader.readAllControlled(control);
+        }
+    };
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |native| {
+        var listener = try httpx.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var socket = try httpx.Socket.connect(listener.getLocalAddress(), io);
+        defer socket.close();
+        if (native) socket.enableNativeTimeouts();
+        try socket.setRecvTimeout(2000);
+        var peer = try listener.accept();
+        defer peer.socket.close();
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "/upload");
+        defer request.deinit();
+        var outer = httpx.Context.init(std.testing.allocator, io, &request);
+        defer outer.deinit();
+        const started = std.Io.Clock.awake.now(io).nanoseconds;
+        outer.application_deadline_ns = @intCast(started + 2000 * std.time.ns_per_ms);
+        outer.application_deadline_io = io;
+        var buffer: [8192]u8 = undefined;
+        var leftover: usize = 0;
+        var reader: httpx.Context.H1StreamReader = .{ .allocator = std.testing.allocator, .io = io, .sock = &socket, .buffer = &buffer, .leftover = &leftover, .remaining = 1, .deadline_ms = @intCast(@divTrunc(started, std.time.ns_per_ms) + 2000) };
+        defer reader.deinit();
+        outer.body_delegate = .{ .ptr = &reader, .read_all = Body.legacy, .read_all_controlled = Body.controlled, .streaming = true };
+        var outbound: Outbound = .{ .context = &outer };
+        const source = outbound.bodySource();
+        var inner = httpx.Context.init(std.testing.allocator, io, &request);
+        defer inner.deinit();
+        installInbound(&inner, &.{}, &source, &.{});
+        inner.application_deadline_ns = @intCast(started + 100 * std.time.ns_per_ms);
+        inner.application_deadline_io = io;
+        try std.testing.expectError(error.Timeout, inner.body());
+        const elapsed = std.Io.Clock.awake.now(io).nanoseconds - started;
+        try std.testing.expect(elapsed < 1000 * std.time.ns_per_ms);
+        try std.testing.expect(!reader.control.active());
+        try std.testing.expect(reader.owned_body == null);
+        try std.testing.expectEqual(@as(u64, 1), reader.remaining);
+    }
+}
+
+test "opaque HTTP controls bound H2 DATA credit waits without retaining per-call views" {
+    const std = @import("std");
+    const Waits = struct {
+        parked: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.parked) return .failed;
+            self.parked = true;
+            self.begins += 1;
+            return .ok;
+        }
+        fn end(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!self.parked) return .failed;
+            self.parked = false;
+            self.ends += 1;
+            return .ok;
+        }
+    };
+    const io = std.testing.io;
+    var listener = try httpx.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var socket = try httpx.Socket.connect(listener.getLocalAddress(), io);
+    defer socket.close();
+    socket.enableNativeTimeouts();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    var h2 = httpx.H2Connection.initServer(std.testing.allocator, io);
+    defer h2.deinit();
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    stream.send_window = 0;
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "/stream");
+    defer request.deinit();
+    var outer = httpx.Context.init(std.testing.allocator, io, &request);
+    defer outer.deinit();
+    outer.h2 = &h2;
+    outer.h2_sock = &socket;
+    outer.h2_stream_id = 1;
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    outer.application_deadline_ns = @intCast(started + 2000 * std.time.ns_per_ms);
+    outer.application_deadline_io = io;
+    var outbound: Outbound = .{ .context = &outer };
+    const sink = outbound.stream();
+    var waits: Waits = .{};
+    try std.testing.expectEqual(.ok, sink.set_execution_wait.?(sink.context, &.{ .context = &waits, .begin = Waits.begin, .end = Waits.end }));
+    var inner = httpx.Context.init(std.testing.allocator, io, &request);
+    defer inner.deinit();
+    installInbound(&inner, &.{}, &.{}, &sink);
+    inner.application_deadline_ns = @intCast(started + 100 * std.time.ns_per_ms);
+    inner.application_deadline_io = io;
+    var writer = try inner.streamResponseWithContentType(200, "application/octet-stream");
+    try std.testing.expect(outbound.writer.?.control.ptr == @as(?*anyopaque, @ptrCast(&outbound)));
+    try std.testing.expect(outbound.writer.?.h2_writer.?.control.ptr == @as(?*anyopaque, @ptrCast(&outbound)));
+    try std.testing.expectError(error.Timeout, writer.write("blocked"));
+    try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - started < 1000 * std.time.ns_per_ms);
+    try std.testing.expect(outbound.writer.?.control.ptr == @as(?*anyopaque, @ptrCast(&outbound)));
+    try std.testing.expect(outbound.writer.?.h2_writer.?.control.ptr == @as(?*anyopaque, @ptrCast(&outbound)));
+    try std.testing.expect(waits.begins > 0 and waits.begins == waits.ends);
+    try std.testing.expect(!waits.parked);
+    try std.testing.expectEqual(.ok, sink.set_execution_wait.?(sink.context, null));
+    try std.testing.expect(outbound.writer.?.control.ptr == null);
+    try std.testing.expect(outbound.writer.?.h2_writer.?.control.ptr == null);
+    // Retirement of the borrow must not turn a stream-local budget into a
+    // socket deadline inherited by the next stream.
+    try std.testing.expect(socket.request_deadline_ms == null);
+    const next = try h2.stream_manager.getOrCreateStream(3);
+    next.state = .open;
+    outer.h2_stream_id = 3;
+    var healthy = try outer.streamResponseWithContentType(200, "text/plain");
+    try healthy.write("healthy");
+    try healthy.close();
+}
+
+test "opaque HTTP controls reject a peer missing physical control callbacks before publication" {
+    const std = @import("std");
+    const State = struct {
+        calls: usize = 0,
+        fn start(raw: ?*anyopaque, _: u16, _: abi.Bytes, _: abi.HeaderList) callconv(.c) abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return .ok;
+        }
+        fn startControlled(raw: ?*anyopaque, status: u16, content_type: abi.Bytes, headers: abi.HeaderList, _: *const abi.RequestControl) callconv(.c) abi.CallbackStatus {
+            return start(raw, status, content_type, headers);
+        }
+        fn write(_: ?*anyopaque, _: abi.Bytes) callconv(.c) abi.CallbackStatus {
+            return .ok;
+        }
+        fn close(_: ?*anyopaque) callconv(.c) abi.CallbackStatus {
+            return .ok;
+        }
+        fn body(raw: ?*anyopaque, _: *abi.OptionalBytes) callconv(.c) abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return .ok;
+        }
+    };
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "/");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    var state: State = .{};
+    const source: abi.RequestBodySource = .{ .context = &state, .read_all = State.body };
+    const sink: abi.StreamSink = .{ .context = &state, .start = State.start, .write = State.write, .close = State.close };
+    installInbound(&context, &.{}, &source, &sink);
+    context.application_deadline_io = std.testing.io;
+    context.application_deadline_ns = @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds + std.time.ns_per_s);
+    try std.testing.expectError(error.RequestControlUnavailable, context.body());
+    try std.testing.expectError(error.RequestControlUnavailable, context.streamResponse(200));
+    try std.testing.expectEqual(@as(usize, 0), state.calls);
+    // A partial capability must not commit headers and discover the missing
+    // controlled write/close only after the response is already visible.
+    var partial_sink = sink;
+    partial_sink.start_controlled = State.startControlled;
+    installInbound(&context, &.{}, &source, &partial_sink);
+    try std.testing.expectError(error.RequestControlUnavailable, context.streamResponse(200));
+    try std.testing.expectEqual(@as(usize, 0), state.calls);
+}
+
+test "opaque HTTP controls interrupt check-only cancellation during native and Io body reads" {
+    const std = @import("std");
+    const State = struct {
+        canceled: std.atomic.Value(bool) = .init(false),
+        parked: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.parked) return .failed;
+            self.parked = true;
+            self.begins += 1;
+            return .ok;
+        }
+        fn end(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!self.parked) return .failed;
+            self.parked = false;
+            self.ends += 1;
+            return .ok;
+        }
+        fn check(raw: ?*anyopaque) WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.canceled.load(.acquire)) return error.Canceled;
+        }
+        fn cancel(io: std.Io, self: *@This()) void {
+            io.sleep(.fromMilliseconds(100), .awake) catch return;
+            self.canceled.store(true, .release);
+        }
+        fn legacy(raw: ?*anyopaque) !?[]const u8 {
+            const reader: *httpx.Context.H1StreamReader = @ptrCast(@alignCast(raw.?));
+            return reader.readAllControlled(.{});
+        }
+        fn body(raw: ?*anyopaque, control: WriteControl) !?[]const u8 {
+            const reader: *httpx.Context.H1StreamReader = @ptrCast(@alignCast(raw.?));
+            return reader.readAllControlled(control);
+        }
+    };
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |native| {
+        var listener = try httpx.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var socket = try httpx.Socket.connect(listener.getLocalAddress(), io);
+        defer socket.close();
+        if (native) socket.enableNativeTimeouts();
+        try socket.setRecvTimeout(2000);
+        var peer = try listener.accept();
+        defer peer.socket.close();
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "/upload");
+        defer request.deinit();
+        var outer = httpx.Context.init(std.testing.allocator, io, &request);
+        defer outer.deinit();
+        var buffer: [8192]u8 = undefined;
+        var leftover: usize = 0;
+        const started = std.Io.Clock.awake.now(io).nanoseconds;
+        var reader: httpx.Context.H1StreamReader = .{ .allocator = std.testing.allocator, .io = io, .sock = &socket, .buffer = &buffer, .leftover = &leftover, .remaining = 1, .deadline_ms = @intCast(@divTrunc(started, std.time.ns_per_ms) + 2000) };
+        defer reader.deinit();
+        outer.body_delegate = .{ .ptr = &reader, .read_all = State.legacy, .read_all_controlled = State.body, .streaming = true };
+        var outbound: Outbound = .{ .context = &outer };
+        const source = outbound.bodySource();
+        var inner = httpx.Context.init(std.testing.allocator, io, &request);
+        defer inner.deinit();
+        installInbound(&inner, &.{}, &source, &.{});
+        var state: State = .{};
+        const sink = outbound.stream();
+        try std.testing.expectEqual(.ok, sink.set_execution_wait.?(sink.context, &.{ .context = &state, .begin = State.begin, .end = State.end }));
+        var cancel = try io.concurrent(State.cancel, .{ io, &state });
+        defer cancel.await(io);
+        try std.testing.expectError(error.Canceled, inner.bodyControlled(.{ .ptr = &state, .check_fn = State.check }));
+        try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - started < 1000 * std.time.ns_per_ms);
+        try std.testing.expect(!reader.control.active());
+        try std.testing.expect(reader.owned_body == null);
+        try std.testing.expect(!state.parked);
+        try std.testing.expect(state.begins > 0 and state.begins == state.ends);
+        try std.testing.expectEqual(.ok, sink.set_execution_wait.?(sink.context, null));
+    }
+}
+
+test "opaque HTTP controls bound physical H1 backpressure and keep close state in the owning writer" {
+    const std = @import("std");
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |native| {
+        var listener = try httpx.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var socket = try httpx.Socket.connect(listener.getLocalAddress(), io);
+        defer socket.close();
+        if (native) socket.enableNativeTimeouts();
+        try socket.setSendTimeout(2000);
+        const small_buffer: c_int = 4096;
+        try std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&small_buffer));
+        var peer = try listener.accept();
+        defer peer.socket.close();
+        try std.posix.setsockopt(peer.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&small_buffer));
+        var request = try httpx.Request.init(std.testing.allocator, .GET, "/stream");
+        defer request.deinit();
+        var outer = httpx.Context.init(std.testing.allocator, io, &request);
+        defer outer.deinit();
+        outer.h1_sock = &socket;
+        const started = std.Io.Clock.awake.now(io).nanoseconds;
+        outer.application_deadline_ns = @intCast(started + 2000 * std.time.ns_per_ms);
+        outer.application_deadline_io = io;
+        var outbound: Outbound = .{ .context = &outer };
+        const sink = outbound.stream();
+        var inner = httpx.Context.init(std.testing.allocator, io, &request);
+        defer inner.deinit();
+        installInbound(&inner, &.{}, &.{}, &sink);
+        inner.application_deadline_ns = @intCast(started + 100 * std.time.ns_per_ms);
+        inner.application_deadline_io = io;
+        var writer = try inner.streamResponseWithContentType(200, "application/octet-stream");
+        const payload = try std.testing.allocator.alloc(u8, 1024 * 1024);
+        defer std.testing.allocator.free(payload);
+        @memset(payload, 'x');
+        try std.testing.expectError(error.Timeout, writer.write(payload));
+        try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - started < 1000 * std.time.ns_per_ms);
+        try std.testing.expect(outbound.writer.?.control.ptr == null);
+    }
+    // A successful close updates the stored writer rather than an optional
+    // payload temporary, so callbacks cannot write after the terminal frame.
+    var listener = try httpx.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var socket = try httpx.Socket.connect(listener.getLocalAddress(), io);
+    defer socket.close();
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "/stream");
+    defer request.deinit();
+    var outer = httpx.Context.init(std.testing.allocator, io, &request);
+    defer outer.deinit();
+    outer.h1_sock = &socket;
+    var outbound: Outbound = .{ .context = &outer };
+    const sink = outbound.stream();
+    try std.testing.expectEqual(.ok, sink.start.?(sink.context, 200, .init("text/plain"), .{}));
+    try std.testing.expectEqual(.ok, sink.close.?(sink.context));
+    try std.testing.expect(outbound.writer.?.closed);
+    try std.testing.expectEqual(.failed, sink.write.?(sink.context, .init("late")));
+}
+
+test "opaque HTTP controls bound lazy H2 mailbox waits before returning borrowed data" {
+    const std = @import("std");
+    const io = std.testing.io;
+    var h2 = httpx.H2Connection.initServer(std.testing.allocator, io);
+    defer h2.deinit();
+    const stream = try h2.stream_manager.getOrCreateStream(1);
+    stream.state = .open;
+    var ready: std.Io.Event = .unset;
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    var reader: httpx.Context.H2StreamReader = .{ .h2_stream = stream, .io = io, .data_event = &ready, .deadline_ms = @intCast(@divTrunc(started, std.time.ns_per_ms) + 2000) };
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/upload");
+    defer request.deinit();
+    var outer = httpx.Context.init(std.testing.allocator, io, &request);
+    defer outer.deinit();
+    outer.h2_body_reader = &reader;
+    outer.application_deadline_ns = @intCast(started + 2000 * std.time.ns_per_ms);
+    outer.application_deadline_io = io;
+    var outbound: Outbound = .{ .context = &outer };
+    const source = outbound.bodySource();
+    var inner = httpx.Context.init(std.testing.allocator, io, &request);
+    defer inner.deinit();
+    installInbound(&inner, &.{}, &source, &.{});
+    inner.application_deadline_ns = @intCast(started + 100 * std.time.ns_per_ms);
+    inner.application_deadline_io = io;
+    try std.testing.expectError(error.Timeout, inner.body());
+    try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - started < 1000 * std.time.ns_per_ms);
+    try std.testing.expect(!reader.control.active());
+    try std.testing.expect(request.body == null);
 }

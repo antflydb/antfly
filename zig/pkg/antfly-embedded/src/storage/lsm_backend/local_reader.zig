@@ -19,6 +19,8 @@ const resources = @import("../resource_manager.zig");
 const read_admission = @import("../../common/read_admission.zig");
 const bounded_mutex = @import("../../common/bounded_mutex.zig");
 const RecyclingWorkspace = @import("recycling_workspace.zig").RecyclingWorkspace;
+const table_file = @import("../lsm/table_file.zig");
+const read_generation = @import("read_generation.zig");
 const SharedBytes = @import("shared_bytes.zig").SharedBytes;
 
 /// A fixed number of decoder workspaces and flight records. Workspace storage
@@ -27,6 +29,17 @@ pub const Pool = struct {
     pub const workspace_count = 4;
     pub const flight_count = 16;
     pub const retained_bytes_per_workspace = 64 * 1024;
+
+    /// Streaming block readers make two arena allocations: path and input
+    /// window. With the pinned arena's 1.5x node growth, retaining R bytes and
+    /// failing in-place resize can require up to 4.75R + 3.75P + 1.5W, plus
+    /// node headers. Fund backing capacity, including retained nodes, before
+    /// decoding; a logical P+W grant alone can falsely refuse a valid read.
+    pub fn streamingScratchBound(path_bytes: usize, window_bytes: usize) !usize {
+        const input = std.math.add(usize, path_bytes, window_bytes) catch return error.InvalidTableFile;
+        const total = std.math.add(usize, input, retained_bytes_per_workspace + 128) catch return error.InvalidTableFile;
+        return std.math.mul(usize, total, 5) catch error.InvalidTableFile;
+    }
     const Waiter = struct {
         next: ?*Waiter = null,
         io: ?std.Io,
@@ -78,18 +91,31 @@ pub const Pool = struct {
         budget: ?resources.BudgetedAllocator = null,
         cap: Capped = .{},
     };
+    pub const Key = struct {
+        path: []const u8,
+        generation: read_generation.Identity,
+        run_id: u64,
+        offset: u64,
+        physical_len: u32,
+        logical_len: u32,
+        compression: table_file.BlockCompression,
+        checksum: u32,
+        admit: bool,
+        fn matches(self: Key, other: Key) bool {
+            return std.meta.eql(self.generation, other.generation) and self.run_id == other.run_id and
+                self.offset == other.offset and self.physical_len == other.physical_len and
+                self.logical_len == other.logical_len and self.compression == other.compression and
+                self.checksum == other.checksum and self.admit == other.admit and std.mem.eql(u8, self.path, other.path);
+        }
+    };
     pub const Flight = struct {
         refs: usize = 0,
-        path: []u8 = &.{},
-        run_id: u64 = 0,
-        offset: u64 = 0,
-        len: u32 = 0,
-        admit: bool = false,
+        constructing: bool = false,
+        key: Key = undefined,
+        backing: std.mem.Allocator = undefined,
         completed: bool = false,
-        io: ?std.Io = null,
-        done: std.Io.Event = .unset,
         result: ?*SharedBytes = null,
-        failure: ?anyerror = null,
+        failed: bool = false,
     };
     mutex: std.atomic.Mutex = .unlocked,
     slots: [workspace_count]Slot = @splat(.{}),
@@ -99,7 +125,6 @@ pub const Pool = struct {
     active: usize = 0,
     peak_active_bytes: usize = 0,
     joined: usize = 0,
-    allocator: ?std.mem.Allocator = null,
 
     fn notifyLocked(self: *Pool) void {
         var next = self.waiters;
@@ -155,8 +180,10 @@ pub const Pool = struct {
 
     /// Ordinary operations share the byte ceiling. One operation larger than
     /// the ceiling runs alone, preserving support for legitimate large rows.
+    /// This compatibility entry requires no runnable ownership. Production reads
+    /// use the fallible admission entry, including callers without a port.
     pub fn acquire(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, output_bytes: usize) Workspace {
-        return self.acquireMode(backing, manager, io, bytes, limit, output_bytes, false, null) catch unreachable;
+        return self.acquireMode(backing, manager, io, bytes, limit, output_bytes, false, null, true) catch unreachable;
     }
 
     fn lockWithAdmission(self: *Pool, control: ?read_admission.Port) !void {
@@ -173,18 +200,18 @@ pub const Pool = struct {
     }
 
     pub fn acquireWithAdmission(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, output_bytes: usize, control: ?read_admission.Port) !Workspace {
-        return self.acquireMode(backing, manager, io, bytes, limit, output_bytes, false, control);
+        return self.acquireMode(backing, manager, io, bytes, limit, output_bytes, false, control, try canWait(control));
     }
 
     pub fn acquireRecycled(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize) Workspace {
-        return self.acquireRecycledWithAdmission(backing, manager, io, bytes, limit, null) catch unreachable;
+        return self.acquireMode(backing, manager, io, bytes, limit, 0, true, null, true) catch unreachable;
     }
 
     pub fn acquireRecycledWithAdmission(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, control: ?read_admission.Port) !Workspace {
-        return self.acquireMode(backing, manager, io, bytes, limit, 0, true, control);
+        return self.acquireMode(backing, manager, io, bytes, limit, 0, true, control, try canWait(control));
     }
 
-    fn acquireMode(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, output_bytes: usize, recycled_mode: bool, control: ?read_admission.Port) !Workspace {
+    fn acquireMode(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, output_bytes: usize, recycled_mode: bool, control: ?read_admission.Port, allow_wait: bool) !Workspace {
         while (true) {
             try self.lockWithAdmission(control);
             if (self.active == 0 or bytes <= limit -| self.active_bytes) {
@@ -193,7 +220,6 @@ pub const Pool = struct {
                     self.active += 1;
                     self.active_bytes += bytes;
                     self.peak_active_bytes = @max(self.peak_active_bytes, self.active_bytes);
-                    if (self.allocator == null) self.allocator = backing;
                     self.mutex.unlock();
                     // The busy slot is exclusively owned. Release retained
                     // credit before rebinding, outside the coordination lock.
@@ -222,22 +248,30 @@ pub const Pool = struct {
                     return .{ .pool = self, .slot = slot, .bytes = bytes };
                 };
             }
+            if (!allow_wait) {
+                self.mutex.unlock();
+                if (control) |budget| try budget.checkLifetime();
+                return error.Backpressured;
+            }
             try self.waitLockedWithAdmission(io, control);
         }
     }
 
-    pub const Ticket = struct { flight: *Flight, leader: bool };
-    /// Called without the writer mutex. Flight exhaustion waits for a bounded
-    /// record instead of allocating an unbounded coordination structure.
-    pub fn begin(self: *Pool, backing: std.mem.Allocator, io: ?std.Io, path: []const u8, run_id: u64, offset: u64, len: u32, admit: bool) !Ticket {
-        return self.beginWithAdmission(backing, io, path, run_id, offset, len, admit, null);
+    fn canWait(control: ?read_admission.Port) !bool {
+        const budget = control orelse return false;
+        try budget.checkLifetime();
+        return budget.hasExecutionWait();
     }
 
-    pub fn beginWithAdmission(self: *Pool, backing: std.mem.Allocator, io: ?std.Io, path: []const u8, run_id: u64, offset: u64, len: u32, admit: bool, control: ?read_admission.Port) !Ticket {
+    pub const Ticket = struct { flight: *Flight, leader: bool };
+    /// Only explicitly lendable callers may share a flight. Null/coarse callers
+    /// decode independently and try the same bounded workspace pool.
+    pub fn beginWithAdmission(self: *Pool, backing: std.mem.Allocator, io: ?std.Io, key: Key, control: ?read_admission.Port) !?Ticket {
+        if (!try canWait(control) or !key.generation.valid()) return null;
         while (true) {
             try self.lockWithAdmission(control);
             for (&self.flights) |*flight| {
-                if (flight.refs != 0 and flight.run_id == run_id and flight.offset == offset and flight.len == len and flight.admit == admit and std.mem.eql(u8, flight.path, path)) {
+                if (flight.refs != 0 and !flight.constructing and flight.key.matches(key)) {
                     flight.refs += 1;
                     self.joined += 1;
                     self.mutex.unlock();
@@ -245,27 +279,30 @@ pub const Pool = struct {
                 }
             }
             for (&self.flights) |*flight| if (flight.refs == 0) {
-                const owned = backing.dupe(u8, path) catch |err| {
-                    self.mutex.unlock();
-                    return err;
-                };
-                if (self.allocator == null) self.allocator = backing;
-                flight.* = .{ .refs = 1, .path = owned, .run_id = run_id, .offset = offset, .len = len, .admit = admit, .io = io };
+                // Reserve a finite record first; allocation and its destructor
+                // run outside the coordination mutex. Unpublished keys cannot join.
+                flight.* = .{ .refs = 1, .constructing = true, .key = key, .backing = backing };
+                flight.key.path = &.{};
+                self.mutex.unlock();
+                errdefer self.releaseFlight(flight);
+                const path = try backing.dupe(u8, key.path);
+                errdefer backing.free(path);
+                try self.lockWithAdmission(control);
+                flight.key.path = path;
+                flight.constructing = false;
                 self.mutex.unlock();
                 return .{ .flight = flight, .leader = true };
             };
             try self.waitLockedWithAdmission(io, control);
         }
     }
-    pub fn join(self: *Pool, path: []const u8, run_id: u64, offset: u64, len: u32, admit: bool) ?*Flight {
-        return self.joinWithAdmission(path, run_id, offset, len, admit, null) catch unreachable;
-    }
 
-    pub fn joinWithAdmission(self: *Pool, path: []const u8, run_id: u64, offset: u64, len: u32, admit: bool, control: ?read_admission.Port) !?*Flight {
+    pub fn joinWithAdmission(self: *Pool, key: Key, control: ?read_admission.Port) !?*Flight {
+        if (!try canWait(control) or !key.generation.valid()) return null;
         try self.lockWithAdmission(control);
         defer self.mutex.unlock();
         for (&self.flights) |*flight| {
-            if (flight.refs != 0 and flight.run_id == run_id and flight.offset == offset and flight.len == len and flight.admit == admit and std.mem.eql(u8, flight.path, path)) {
+            if (flight.refs != 0 and !flight.constructing and flight.key.matches(key)) {
                 flight.refs += 1;
                 self.joined += 1;
                 return flight;
@@ -275,56 +312,43 @@ pub const Pool = struct {
     }
     pub fn finish(self: *Pool, flight: *Flight, result: anyerror!*SharedBytes) void {
         platform.sync.lockYielding(&self.mutex);
-        if (result) |payload| flight.result = payload.retain() else |err| flight.failure = err;
+        if (result) |payload| flight.result = payload.retain() else |_| flight.failed = true;
         flight.completed = true;
-        if (flight.io) |io| flight.done.set(io);
         self.mutex.unlock();
     }
+    /// Peer failure is not the borrower's authority. The caller may perform one
+    /// independent decode, under its original lifetime and workspace admission.
     pub fn waitWithAdmission(self: *Pool, flight: *Flight, control: ?read_admission.Port) !*SharedBytes {
-        const budget = control orelse return self.wait(flight);
+        const lendable = try canWait(control);
         while (true) {
-            try self.lockWithAdmission(budget);
+            try self.lockWithAdmission(control);
             if (flight.completed) {
                 defer self.mutex.unlock();
-                if (flight.failure) |err| return err;
-                // The caller's flight reference keeps the result alive. No
-                // admission borrow escapes with the returned payload.
+                if (flight.failed) return error.LocalDecodeProducerFailed;
                 return flight.result.?.retain();
             }
             self.mutex.unlock();
-            try budget.waitForProgress();
+            if (!lendable) return error.Backpressured;
+            try control.?.waitForProgress();
         }
-    }
-
-    pub fn wait(self: *Pool, flight: *Flight) !*SharedBytes {
-        if (flight.io) |io| flight.done.waitUncancelable(io) else {
-            while (true) {
-                platform.sync.lockYielding(&self.mutex);
-                const completed = flight.completed;
-                self.mutex.unlock();
-                if (completed) break;
-                platform.time.yieldBriefly();
-            }
-        }
-        if (flight.failure) |err| return err;
-        return flight.result.?.retain();
     }
     pub fn releaseFlight(self: *Pool, flight: *Flight) void {
         platform.sync.lockYielding(&self.mutex);
+        std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
         if (flight.refs != 0) {
             self.mutex.unlock();
             return;
         }
         const result = flight.result;
-        const path = flight.path;
+        const path = flight.key.path;
+        const backing = flight.backing;
         flight.result = null;
-        flight.path = &.{};
+        flight.key = undefined;
         self.notifyLocked();
         self.mutex.unlock();
-        // Final result/free callbacks never run under the coordination lock.
         if (result) |payload| payload.release();
-        self.allocator.?.free(path);
+        backing.free(path);
     }
     pub fn deinit(self: *Pool) void {
         std.debug.assert(self.active == 0 and self.waiters == null);
@@ -366,6 +390,38 @@ test "lsm local decoder scratch reuse is bounded charged and failure-safe" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "lsm local decoder streaming scratch funds retained arena backing without in-place growth" {
+    const allocators = @import("../lite/test_allocator.zig");
+    const Fixture = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var no_resize: allocators.NoResizeAllocator = .{ .backing = backing };
+            var manager = resources.ResourceManager.init(.{});
+            defer manager.deinit(std.testing.allocator);
+            var pool: Pool = .{};
+            defer pool.deinit();
+            {
+                var warm = pool.acquire(no_resize.allocator(), &manager, std.testing.io, 256 * 1024, 1024 * 1024, 0);
+                defer warm.release();
+                _ = try warm.allocator().alloc(u8, 64 * 1024);
+            }
+            const bound = try Pool.streamingScratchBound(64, 64 * 1024);
+            {
+                var work = pool.acquire(no_resize.allocator(), &manager, std.testing.io, bound, 1024 * 1024, 0);
+                defer work.release();
+                const path = try work.allocator().alloc(u8, 64);
+                @memset(path, 'p');
+                const input = try work.allocator().alloc(u8, 64 * 1024);
+                @memset(input, 'x');
+                try std.testing.expectEqual(@as(u8, 'p'), path[0]);
+                try std.testing.expect(pool.slots[0].cap.live <= bound);
+            }
+            try std.testing.expectEqual(@as(u64, pool.slots[0].cap.live), manager.sliceStats(.lsm_read_working_set).used_bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try std.testing.expectError(error.InvalidTableFile, Pool.streamingScratchBound(std.math.maxInt(usize), 1));
 }
 
 test "lsm local decoder byte gate admits oversized work alone and wakes waiters" {
@@ -449,28 +505,47 @@ test "lsm local waiter keeps stack alive until notifier unlocks with and without
     }
 }
 
+fn testBoundary(raw: *anyopaque) @import("../../common/execution_wait.zig").Boundary {
+    const Noop = struct {
+        fn run(_: *anyopaque) !void {}
+    };
+    return .{ .ptr = raw, .begin = Noop.run, .end = Noop.run };
+}
+fn testKey() !Pool.Key {
+    return .{ .path = "block", .generation = try read_generation.allocate(), .run_id = 1, .offset = 0, .physical_len = 64, .logical_len = 64, .compression = .none, .checksum = 0, .admit = true };
+}
+
 test "lsm local decoder admission cancellation preserves producer and healthy follower" {
     var pool: Pool = .{};
     defer pool.deinit();
-    const leader = try pool.begin(std.testing.allocator, null, "block", 1, 0, 64, true);
-    defer pool.releaseFlight(leader.flight);
-    const follower = try pool.begin(std.testing.allocator, null, "block", 1, 0, 64, true);
-    var follower_held = true;
-    defer if (follower_held) pool.releaseFlight(follower.flight);
-    const healthy = try pool.begin(std.testing.allocator, null, "block", 1, 0, 64, true);
-    defer pool.releaseFlight(healthy.flight);
     const Budget = struct {
         waits: usize = 0,
         canceled: bool = false,
         pub fn checkpoint(self: *@This()) !void {
             if (self.canceled) return error.Canceled;
         }
+        pub const checkLifetime = checkpoint;
+        pub fn executionBoundary(self: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+            return testBoundary(self);
+        }
         pub fn waitForProgress(self: *@This()) !void {
             self.waits += 1;
             self.canceled = true;
         }
     };
-    var budget = Budget{};
+    var healthy_budget: Budget = .{};
+    var healthy_adapter = read_admission.Adapter(*Budget){ .budget = &healthy_budget };
+    const healthy_payload = healthy_adapter.payload();
+    const port: read_admission.Port = .init(&healthy_payload);
+    const key = try testKey();
+    const leader = (try pool.beginWithAdmission(std.testing.allocator, null, key, port)).?;
+    defer pool.releaseFlight(leader.flight);
+    const follower = (try pool.beginWithAdmission(std.testing.allocator, null, key, port)).?;
+    var follower_held = true;
+    defer if (follower_held) pool.releaseFlight(follower.flight);
+    const healthy = (try pool.beginWithAdmission(std.testing.allocator, null, key, port)).?;
+    defer pool.releaseFlight(healthy.flight);
+    var budget: Budget = .{};
     var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
     const payload = adapter.payload();
     try std.testing.expectError(error.Canceled, pool.waitWithAdmission(follower.flight, .init(&payload)));
@@ -482,7 +557,7 @@ test "lsm local decoder admission cancellation preserves producer and healthy fo
     const result = try SharedBytes.create(std.testing.allocator, try std.testing.allocator.dupe(u8, "decoded"));
     defer result.release();
     pool.finish(leader.flight, result);
-    const retained = try pool.wait(healthy.flight);
+    const retained = try pool.waitWithAdmission(healthy.flight, port);
     defer retained.release();
     try std.testing.expectEqualStrings("decoded", retained.bytes);
 }
@@ -498,6 +573,10 @@ test "lsm local decoder admission progress releases workspace before retry" {
         held_live: *bool,
         waits: usize = 0,
         pub fn checkpoint(_: *@This()) !void {}
+        pub const checkLifetime = checkpoint;
+        pub fn executionBoundary(self: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+            return testBoundary(self);
+        }
         pub fn waitForProgress(self: *@This()) !void {
             self.waits += 1;
             self.held.release();
@@ -533,4 +612,289 @@ test "lsm local decoder frees oversized scratch when reset allocation fails" {
     _ = try work.allocator().alloc(u8, 4096);
     work.release();
     try std.testing.expect(pool.slots[0].cap.live <= Pool.retained_bytes_per_workspace + 128);
+}
+
+const TestBudget = struct {
+    fail_at: usize = 0,
+    checks: usize = 0,
+    waits: usize = 0,
+    lendable: bool = true,
+    pub fn checkpoint(self: *@This()) !void {
+        self.checks += 1;
+        if (self.fail_at != 0 and self.checks >= self.fail_at) return error.CatalogGenerationChanged;
+    }
+    pub const checkLifetime = checkpoint;
+    pub fn executionBoundary(self: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+        return if (self.lendable) testBoundary(self) else null;
+    }
+    pub fn waitForProgress(self: *@This()) !void {
+        self.waits += 1;
+        return error.UnexpectedDecoderWait;
+    }
+};
+
+test "lsm local decoder admission shares only exact immutable decode contracts" {
+    var pool: Pool = .{};
+    defer pool.deinit();
+    var budget: TestBudget = .{};
+    var adapter: read_admission.Adapter(*TestBudget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    const port: read_admission.Port = .init(&payload);
+    const key = try testKey();
+    const leader = (try pool.beginWithAdmission(std.testing.allocator, null, key, port)).?;
+    defer pool.releaseFlight(leader.flight);
+    for (0..11) |field| {
+        var changed = key;
+        switch (field) {
+            0 => changed.path = "other",
+            1 => changed.generation.issuer += 1,
+            2 => changed.generation.sequence += 1,
+            3 => changed.run_id += 1,
+            4 => changed.offset += 1,
+            5 => changed.physical_len += 1,
+            6 => changed.logical_len += 1,
+            7 => changed.compression = .snappy,
+            8 => changed.checksum += 1,
+            9 => changed.admit = false,
+            10 => changed.generation = .{},
+            else => unreachable,
+        }
+        try std.testing.expect(try pool.joinWithAdmission(changed, port) == null);
+        if (try pool.beginWithAdmission(std.testing.allocator, null, changed, port)) |independent| {
+            try std.testing.expect(independent.leader and independent.flight != leader.flight);
+            pool.finish(independent.flight, error.TestIndependentDecode);
+            pool.releaseFlight(independent.flight);
+        } else try std.testing.expect(field == 10);
+    }
+    try std.testing.expect(try pool.beginWithAdmission(std.testing.allocator, null, key, null) == null);
+    try std.testing.expect(try pool.joinWithAdmission(key, null) == null);
+    budget.lendable = false;
+    const coarse_payload = adapter.payload();
+    const coarse: read_admission.Port = .init(&coarse_payload);
+    try std.testing.expect(try pool.beginWithAdmission(std.testing.allocator, null, key, coarse) == null);
+    try std.testing.expect(try pool.joinWithAdmission(key, coarse) == null);
+    try std.testing.expectError(error.Backpressured, pool.waitWithAdmission(leader.flight, coarse));
+    budget.lendable = true;
+    const joined = (try pool.joinWithAdmission(key, port)).?;
+    defer pool.releaseFlight(joined);
+    pool.finish(leader.flight, error.Canceled);
+    try std.testing.expectError(error.LocalDecodeProducerFailed, pool.waitWithAdmission(joined, port));
+    try std.testing.expectEqual(@as(usize, 0), budget.waits);
+}
+
+test "lsm local decoder admission rejected flight construction retires all bounded state" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator, fail_at: usize) !void {
+            var pool: Pool = .{};
+            defer pool.deinit();
+            var budget: TestBudget = .{ .fail_at = fail_at };
+            var adapter: read_admission.Adapter(*TestBudget) = .{ .budget = &budget };
+            const payload = adapter.payload();
+            const result = pool.beginWithAdmission(a, null, try testKey(), .init(&payload));
+            if (result) |ticket| {
+                if (ticket) |owned| {
+                    pool.finish(owned.flight, error.TestEnd);
+                    pool.releaseFlight(owned.flight);
+                }
+                try std.testing.expect(fail_at == 0 or budget.checks < fail_at);
+            } else |cause| {
+                if (cause == error.OutOfMemory) return cause;
+                try std.testing.expectEqual(error.CatalogGenerationChanged, cause);
+            }
+            for (&pool.flights) |*flight| try std.testing.expectEqual(@as(usize, 0), flight.refs);
+            try std.testing.expect(pool.mutex.tryLock());
+            pool.mutex.unlock();
+        }
+        fn allocations(a: std.mem.Allocator) !void {
+            try run(a, 0);
+        }
+    };
+    for (1..7) |fail_at| try Fixture.run(std.testing.allocator, fail_at);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.allocations, .{});
+}
+
+test "lsm local decoder admission native sole ordinary slot preserves producer and control progress" {
+    if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const native = @import("../../common/runnable_scheduler.zig");
+    const Mode = enum { legacy, coarse, legacy_workspace_full, coarse_workspace_full, coalesced, peer_canceled, producer_canceled, different_generation, flight_full, workspace_wait };
+    const Fixture = struct {
+        const Self = @This();
+        mode: Mode,
+        pool: Pool = .{},
+        scheduler: *native.Scheduler,
+        key: Pool.Key,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        peer_waiting: std.Io.Event = .unset,
+        stop: std.atomic.Value(bool) = .init(false),
+        fn independent(self: *@This()) bool {
+            return switch (self.mode) {
+                .legacy, .coarse, .legacy_workspace_full, .coarse_workspace_full, .different_generation, .flight_full => true,
+                else => false,
+            };
+        }
+        const Scope = struct {
+            f: *Self,
+            producer: bool,
+            execution: native.Execution = .{},
+            failure: ?anyerror = null,
+            reject: ?anyerror = null,
+            done: std.Io.Event = .unset,
+            pub fn checkLifetime(self: *@This()) !void {
+                if (self.reject) |cause| return cause;
+                if (self.f.stop.load(.acquire)) return error.Canceled;
+                try self.execution.checkLifetime();
+            }
+            pub const checkpoint = checkLifetime;
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.execution.park(.resource_blocked);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.execution.enter(if (self.producer) .background else .write);
+                if (self.producer and self.f.mode == .producer_canceled) self.reject = error.Canceled;
+                try self.checkLifetime();
+            }
+            pub fn executionBoundary(self: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+                if (!self.producer and (self.f.mode == .coarse or self.f.mode == .coarse_workspace_full)) return null;
+                return .{ .ptr = self, .begin = begin, .end = end };
+            }
+            pub fn waitForProgress(self: *@This()) !void {
+                if (self.producer) return error.UnexpectedDecoderWait;
+                if (self.f.independent()) return error.UnexpectedCoarseDecoderWait;
+                try begin(self);
+                self.f.peer_waiting.set(std.testing.io);
+                const result = std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                try end(self);
+                if (self.f.mode == .peer_canceled) {
+                    self.reject = error.Canceled;
+                    return error.Canceled;
+                }
+                try result;
+            }
+            fn run(self: *@This()) void {
+                self.execute() catch |cause| {
+                    self.failure = cause;
+                };
+                self.done.set(std.testing.io);
+            }
+            fn execute(self: *@This()) !void {
+                const now: u64 = @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds);
+                try self.execution.start(self.f.scheduler, .{ .io = std.testing.io, .allow_wait = true, .deadline_ns = now + 10 * std.time.ns_per_s, .retained_bytes = if (self.producer) 17 else 23 }, if (self.producer) .background else .write);
+                defer self.execution.finish();
+                var adapter: read_admission.Adapter(*@This()) = .{ .budget = self };
+                const payload = adapter.payload();
+                const port: ?read_admission.Port = if (!self.producer and (self.f.mode == .legacy or self.f.mode == .legacy_workspace_full or self.f.mode == .flight_full)) null else .init(&payload);
+                var key = self.f.key;
+                if (!self.producer and (self.f.mode == .different_generation or self.f.mode == .workspace_wait)) key.generation = try read_generation.allocate();
+                if (self.producer) {
+                    var tickets: [Pool.flight_count]Pool.Ticket = undefined;
+                    var ticket_count: usize = 0;
+                    defer for (tickets[0..ticket_count]) |ticket| self.f.pool.releaseFlight(ticket.flight);
+                    const n: usize = if (self.f.mode == .flight_full) Pool.flight_count else 1;
+                    for (0..n) |i| {
+                        var own_key = key;
+                        own_key.offset += i;
+                        tickets[i] = (try self.f.pool.beginWithAdmission(std.testing.allocator, std.testing.io, own_key, port)).?;
+                        ticket_count += 1;
+                    }
+                    const result = self.produce(port);
+                    for (tickets[0..ticket_count]) |ticket| self.f.pool.finish(ticket.flight, result);
+                    const value = try result;
+                    value.release();
+                } else {
+                    const ticket = try self.f.pool.beginWithAdmission(std.testing.allocator, std.testing.io, key, port);
+                    if (ticket) |owned| {
+                        defer self.f.pool.releaseFlight(owned.flight);
+                        if (!owned.leader) {
+                            const value = try self.f.pool.waitWithAdmission(owned.flight, port);
+                            defer value.release();
+                            try std.testing.expectEqualStrings("decoded", value.bytes);
+                            return;
+                        }
+                        const result = self.peerDecode(port);
+                        self.f.pool.finish(owned.flight, result);
+                        const value = try result;
+                        value.release();
+                    } else {
+                        const value = try self.peerDecode(port);
+                        value.release();
+                    }
+                }
+            }
+            fn produce(self: *@This(), port: ?read_admission.Port) !*SharedBytes {
+                var work: [Pool.workspace_count]Pool.Workspace = undefined;
+                var count: usize = 0;
+                defer for (work[0..count]) |*held| held.release();
+                const n: usize = switch (self.f.mode) {
+                    .legacy_workspace_full, .coarse_workspace_full, .workspace_wait => Pool.workspace_count,
+                    else => 1,
+                };
+                for (work[0..n]) |*held| {
+                    held.* = try self.f.pool.acquireWithAdmission(std.testing.allocator, null, std.testing.io, 64, 1024, 0, port);
+                    count += 1;
+                }
+                try begin(self);
+                self.f.entered.set(std.testing.io);
+                self.f.release.waitUncancelable(std.testing.io);
+                try end(self);
+                return SharedBytes.create(std.testing.allocator, try std.testing.allocator.dupe(u8, "decoded"));
+            }
+            fn peerDecode(self: *@This(), port: ?read_admission.Port) !*SharedBytes {
+                var work = try self.f.pool.acquireWithAdmission(std.testing.allocator, null, std.testing.io, 64, 1024, 0, port);
+                defer work.release();
+                return SharedBytes.create(std.testing.allocator, try std.testing.allocator.dupe(u8, "decoded"));
+            }
+        };
+    };
+    const io = std.testing.io;
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+    for (std.enums.values(Mode)) |mode| {
+        var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var f: Fixture = .{ .mode = mode, .scheduler = &scheduler, .key = try testKey() };
+        defer f.pool.deinit();
+        var producer: Fixture.Scope = .{ .f = &f, .producer = true };
+        var peer: Fixture.Scope = .{ .f = &f, .producer = false };
+        const producer_thread = try std.Thread.spawn(.{}, Fixture.Scope.run, .{&producer});
+        var peer_thread: ?std.Thread = null;
+        var joined = false;
+        defer if (!joined) {
+            f.stop.store(true, .release);
+            f.release.set(io);
+            producer_thread.join();
+            if (peer_thread) |thread| thread.join();
+        };
+        try f.entered.waitTimeout(io, timeout);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        peer_thread = try std.Thread.spawn(.{}, Fixture.Scope.run, .{&peer});
+        if (f.independent()) {
+            try peer.done.waitTimeout(io, timeout);
+        } else {
+            try f.peer_waiting.waitTimeout(io, timeout);
+            if (mode == .peer_canceled) try peer.done.waitTimeout(io, timeout) else try std.testing.expectEqual(@as(u64, 40), scheduler.stats().retained_bytes);
+        }
+        var health: native.Execution = .{};
+        try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        health.finish();
+        f.release.set(io);
+        try producer.done.waitTimeout(io, timeout);
+        try peer.done.waitTimeout(io, timeout);
+        producer_thread.join();
+        peer_thread.?.join();
+        joined = true;
+        try std.testing.expectEqual(@as(?anyerror, if (mode == .producer_canceled) error.Canceled else null), producer.failure);
+        const expected: ?anyerror = switch (mode) {
+            .legacy_workspace_full, .coarse_workspace_full => error.Backpressured,
+            .producer_canceled => error.LocalDecodeProducerFailed,
+            .peer_canceled => error.Canceled,
+            else => null,
+        };
+        try std.testing.expectEqual(expected, peer.failure);
+        try std.testing.expectEqual(@as(usize, 0), f.pool.active);
+        for (&f.pool.flights) |*flight| try std.testing.expectEqual(@as(usize, 0), flight.refs);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
 }

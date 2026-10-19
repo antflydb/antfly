@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Process-local execution ownership across independently compiled archives.
 //! Tokens are single-worker capsules. I/O, cancellation and clock inputs remain
@@ -9,7 +21,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 13;
+pub const abi_version: u32 = 15;
 /// Synchronous, non-yielding restriction on the original CPU-return wait.
 /// Borrowed only until enterChecked returns; never retained by the owner.
 /// Rejection stops that execution and does not retire physical ownership.
@@ -25,6 +37,27 @@ pub const Reentry = extern struct {
         try self.validate();
         const status = self.check(self.context);
         if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+};
+
+/// Borrowed trusted resource accounting, copied by value before queuing. The
+/// context and its physical resources outlive owning finish and every join.
+/// Callbacks hold no partial bundle on refusal and never wait, allocate,
+/// reclaim, perform IO or reenter the executor. Probe retains no capacity.
+/// Integer results are checked at the scheduler boundary before interpretation.
+pub const ResourceBundle = extern struct {
+    pub const version_number: u32 = 1;
+    pub const Probe = enum(c_int) { ready, wait, unknown, too_large, unsupported, mismatch };
+    pub const Acquire = enum(c_int) { acquired, wait, too_large, unsupported, mismatch };
+    version: u32 = version_number,
+    struct_size: u32 = @sizeOf(@This()),
+    context: *anyopaque,
+    probe: *const fn (*anyopaque) callconv(.c) c_int,
+    acquire: *const fn (*anyopaque) callconv(.c) c_int,
+
+    pub fn read(raw: *const ResourceBundle) !ResourceBundle {
+        if (raw.version != version_number or raw.struct_size != @sizeOf(ResourceBundle)) return error.UnsupportedVersion;
+        return raw.*;
     }
 };
 
@@ -49,6 +82,7 @@ pub const Start = extern struct {
     slots: usize = 1,
     retained_bytes: u64 = 0,
     out_handle: *?*anyopaque,
+    resources: ?*const ResourceBundle = null,
 
     pub fn validate(self: *const Start) !void {
         if (self.version != abi_version or self.struct_size != @sizeOf(Start)) return error.UnsupportedVersion;
@@ -56,6 +90,10 @@ pub const Start = extern struct {
         if (self.native_deadline != 0 and self.clock_io != null) return error.InvalidArgument;
         _ = std.enums.fromInt(Class, self.class) orelse return error.InvalidArgument;
         if (self.slots == 0) return error.InvalidRunnableDemand;
+        if (self.resources) |resource| {
+            if (self.class == @backingInt(Class.control) or self.cleanup != 0) return error.InvalidArgument;
+            _ = try ResourceBundle.read(resource);
+        }
         if (self.cleanup != 0 and (self.class != @backingInt(Class.control) or self.slots != 1 or self.allow_wait != 0 or
             self.has_deadline == 0 or self.cancellation.context != null or self.cancellation.is_cancelled != null)) return error.InvalidArgument;
     }
@@ -119,6 +157,22 @@ pub const ChildStart = extern struct {
     }
 };
 
+/// Trusted prepared-stage CPU eligibility. This carries no fresh clock,
+/// cancellation, memory or durable authority. Disable uses a zero work bound.
+pub const CpuBorrow = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    enabled: u8,
+    reserved: [7]u8 = @splat(0),
+    max_non_yield_ns: u64 = 0,
+    pub fn validate(self: *const CpuBorrow) !void {
+        if (self.version != abi_version or self.struct_size != @sizeOf(CpuBorrow)) return error.UnsupportedVersion;
+        if (self.enabled > 1 or !std.mem.allEqual(u8, &self.reserved, 0) or
+            (self.enabled == 0 and self.max_non_yield_ns != 0) or
+            (self.enabled == 1 and self.max_non_yield_ns == 0)) return error.InvalidArgument;
+    }
+};
+
 pub const Owner = extern struct {
     version: u32 = abi_version,
     struct_size: u32 = @sizeOf(@This()),
@@ -149,6 +203,36 @@ pub const Owner = extern struct {
     /// parent class in a borrow remains the authority for returning a transfer.
     current_class: ?*const fn (*anyopaque, *c_int) callconv(.c) errors.Status = null,
     enter_checked: ?*const fn (*anyopaque, c_int, *const Reentry) callconv(.c) errors.Status = null,
+    cpu_borrow: ?*const fn (*anyopaque, *const CpuBorrow) callconv(.c) errors.Status = null,
+    request_resources: ?*const fn (*anyopaque, *const ResourceBundle) callconv(.c) errors.Status = null,
+
+    /// Resource-capable owners advertise both initial and parked grants through
+    /// request_resources. Require that capability before invoking start, so an
+    /// owner that only supports CPU cannot silently ignore the resource field.
+    pub fn startWithResources(self: Owner, options: *const Start) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        try options.validate();
+        if (options.resources == null) return error.InvalidArgument;
+        if (self.request_resources == null) return error.UnsupportedOperation;
+        const status = self.start(self.context, options);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn requestResources(self: Owner, handle: *anyopaque, resources: *const ResourceBundle) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        const value = try ResourceBundle.read(resources);
+        const callback = self.request_resources orelse return error.UnsupportedOperation;
+        const status = callback(handle, &value);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn setCpuBorrow(self: Owner, handle: *anyopaque, options: *const CpuBorrow) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        try options.validate();
+        const callback = self.cpu_borrow orelse return error.UnsupportedOperation;
+        const status = callback(handle, options);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
 
     pub fn checkLifetime(self: Owner, handle: *anyopaque) !void {
         if (!self.valid()) return error.UnsupportedVersion;
@@ -286,6 +370,24 @@ pub const Borrowed = extern struct {
     check_lifetime: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
     current_class: ?*const fn (*anyopaque, *c_int) callconv(.c) errors.Status = null,
     enter_checked: ?*const fn (*anyopaque, c_int, *const Reentry) callconv(.c) errors.Status = null,
+    cpu_borrow: ?*const fn (*anyopaque, *const CpuBorrow) callconv(.c) errors.Status = null,
+    request_resources: ?*const fn (*anyopaque, *const ResourceBundle) callconv(.c) errors.Status = null,
+
+    pub fn requestResources(self: Borrowed, resources: *const ResourceBundle) !void {
+        try self.validate();
+        const value = try ResourceBundle.read(resources);
+        const callback = self.request_resources orelse return error.UnsupportedOperation;
+        const status = callback(self.context, &value);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn setCpuBorrow(self: Borrowed, options: *const CpuBorrow) !void {
+        try self.validate();
+        try options.validate();
+        const callback = self.cpu_borrow orelse return error.UnsupportedOperation;
+        const status = callback(self.context, options);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
 
     pub fn enterChecked(self: Borrowed, class: Class, restriction: *const Reentry) !void {
         try self.validate();
@@ -415,6 +517,8 @@ pub const Borrowed = extern struct {
             .check_lifetime = owner.check_lifetime,
             .current_class = owner.current_class,
             .enter_checked = owner.enter_checked,
+            .cpu_borrow = owner.cpu_borrow,
+            .request_resources = owner.request_resources,
         };
         try borrow.validate();
         return borrow;
@@ -948,4 +1052,55 @@ test "runnable lifetime ABI cleanup transfer updates demand only on checked succ
     borrow.activate_cleanup = null;
     try std.testing.expectError(error.UnsupportedOperation, borrow.activateCleanup());
     try std.testing.expectEqual(@as(usize, 6), fake.calls);
+}
+
+test "runnable CPU borrow ABI rejects malformed prefixes before calling capability" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn set(raw: *anyopaque, options: *const CpuBorrow) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            options.validate() catch |err| return errors.statusFromError(err);
+            return errors.statusFromError(error.ResourceTemporarilyUnavailable);
+        }
+        fn check(_: *anyopaque) callconv(.c) errors.Status {
+            return .ok;
+        }
+        fn enter(_: *anyopaque, _: c_int) callconv(.c) errors.Status {
+            return .ok;
+        }
+    };
+    var fake: Fake = .{};
+    var borrow: Borrowed = .{ .context = &fake, .cpu_slots = 1, .parent_class = @backingInt(Class.query), .checkpoint = Fake.check, .park = Fake.enter, .enter = Fake.enter, .cpu_borrow = Fake.set };
+    const enabled: CpuBorrow = .{ .enabled = 1, .max_non_yield_ns = 1000 };
+    var bad = enabled;
+    bad.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrow.setCpuBorrow(&bad));
+    bad = enabled;
+    bad.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrow.setCpuBorrow(&bad));
+    bad = enabled;
+    bad.reserved[0] = 1;
+    try std.testing.expectError(error.InvalidArgument, borrow.setCpuBorrow(&bad));
+    bad = enabled;
+    bad.max_non_yield_ns = 0;
+    try std.testing.expectError(error.InvalidArgument, borrow.setCpuBorrow(&bad));
+    bad = enabled;
+    bad.enabled = 2;
+    try std.testing.expectError(error.InvalidArgument, borrow.setCpuBorrow(&bad));
+    bad = enabled;
+    bad.enabled = 0;
+    try std.testing.expectError(error.InvalidArgument, borrow.setCpuBorrow(&bad));
+    borrow.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrow.setCpuBorrow(&enabled));
+    borrow.version = abi_version;
+    borrow.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrow.setCpuBorrow(&enabled));
+    borrow.struct_size = @sizeOf(Borrowed);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, borrow.setCpuBorrow(&enabled));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, borrow.setCpuBorrow(&.{ .enabled = 0 }));
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    borrow.cpu_borrow = null;
+    try std.testing.expectError(error.UnsupportedOperation, borrow.setCpuBorrow(&enabled));
 }

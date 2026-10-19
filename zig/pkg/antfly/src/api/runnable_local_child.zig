@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 const std = @import("std");
 const runtime = @import("antfly_runtime_abi");
 const scheduler = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
@@ -11,11 +24,14 @@ const abi = runtime.runnable_abi;
 /// No callback touches a mutable SQL Adapter or its read-fence cache. SQL worker
 /// adapters must supply their own policy fences before enabling operator fanout.
 pub fn reserve(parent: *scheduler.Execution, allocator: std.mem.Allocator, options: *const abi.ChildStart) !void {
+    return reserveValidated(parent, allocator, options, null);
+}
+pub fn reserveValidated(parent: *scheduler.Execution, allocator: std.mem.Allocator, options: *const abi.ChildStart, validation: ?@import("runnable_read_validation.zig").Hook) !void {
     try options.validate();
     const bytes = std.math.add(u64, options.retained_bytes, @sizeOf(Receiver)) catch return error.InvalidRunnableDemand;
     const receiver = try allocator.create(Receiver);
     errdefer allocator.destroy(receiver);
-    receiver.* = .{ .allocator = allocator, .io = try options.io.receive() };
+    receiver.* = .{ .allocator = allocator, .io = try options.io.receive(), .validation = if (validation) |hook| if (hook.active) null else hook.fresh() else null };
     errdefer receiver.execution.finish();
     try receiver.execution.reserveChild(parent, receiver.io.io(), bytes);
     options.out_child.* = .{ .borrow = receiver.borrowed(), .finish = Receiver.finish };
@@ -25,6 +41,14 @@ const Receiver = struct {
     allocator: std.mem.Allocator,
     io: runtime.io_abi.Receiver,
     execution: scheduler.Execution = .{},
+    validation: ?@import("runnable_read_validation.zig").Hook = null,
+
+    fn precheck(self: *Receiver) !void {
+        if (self.validation) |*hook| try hook.precheck();
+    }
+    fn validateCurrent(self: *Receiver) !void {
+        if (self.validation) |*hook| try hook.ensure(&self.execution, self.borrowed());
+    }
 
     fn from(raw: *anyopaque) *Receiver {
         return @ptrCast(@alignCast(raw));
@@ -43,10 +67,20 @@ const Receiver = struct {
             .check_lifetime = lifetime,
             .current_class = currentClass,
             .completion_remaining_ns = remaining,
+            .request_resources = requestResources,
         };
     }
+    fn requestResources(raw: *anyopaque, resources: *const abi.ResourceBundle) callconv(.c) runtime.error_abi.Status {
+        const participant = @import("runnable_resource_bridge.zig").receive(resources) catch |err| return runtime.error_abi.statusFromError(err);
+        const self = from(raw);
+        self.precheck() catch |err| return runtime.error_abi.statusFromError(err);
+        self.execution.requestResources(participant) catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
     fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
-        from(raw).execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+        const self = from(raw);
+        self.precheck() catch |err| return runtime.error_abi.statusFromError(err);
+        self.execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
     fn remaining(raw: *anyopaque, out: *u64) callconv(.c) runtime.error_abi.Status {
@@ -58,11 +92,17 @@ const Receiver = struct {
         return .ok;
     }
     fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
-        from(raw).execution.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+        const self = from(raw);
+        self.precheck() catch |err| return runtime.error_abi.statusFromError(err);
+        self.execution.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+        self.validateCurrent() catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
     fn activate(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
-        from(raw).execution.activateChild() catch |err| return runtime.error_abi.statusFromError(err);
+        const self = from(raw);
+        self.precheck() catch |err| return runtime.error_abi.statusFromError(err);
+        self.execution.activateChild() catch |err| return runtime.error_abi.statusFromError(err);
+        self.validateCurrent() catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
     fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
@@ -72,17 +112,33 @@ const Receiver = struct {
     }
     fn enter(raw: *anyopaque, next: c_int) callconv(.c) runtime.error_abi.Status {
         const class = std.enums.fromInt(scheduler.Class, next) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
-        from(raw).execution.enter(class) catch |err| return runtime.error_abi.statusFromError(err);
+        const self = from(raw);
+        self.precheck() catch |err| return runtime.error_abi.statusFromError(err);
+        self.execution.enter(class) catch |err| return runtime.error_abi.statusFromError(err);
+        self.validateCurrent() catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
     fn enterChecked(raw: *anyopaque, next: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
         const class = std.enums.fromInt(scheduler.Class, next) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
-        @import("runnable_reentry.zig").enter(&from(raw).execution, class, restriction) catch |err| return runtime.error_abi.statusFromError(err);
+        const self = from(raw);
+        self.precheck() catch |err| return runtime.error_abi.statusFromError(err);
+        @import("runnable_reentry.zig").enter(&self.execution, class, restriction) catch |err| return runtime.error_abi.statusFromError(err);
+        const generation = self.execution.resume_generation;
+        const validation_needed = if (self.validation) |hook| !hook.active and hook.last_generation != generation else false;
+        self.validateCurrent() catch |err| return runtime.error_abi.statusFromError(err);
+        // Full policy validation can outlive the caller's restriction even
+        // without a scheduling yield or a change in resume generation.
+        if (validation_needed or generation != self.execution.resume_generation) restriction.checkpoint() catch |err| {
+            if (self.validation) |*hook| hook.reject(&self.execution, err);
+            return runtime.error_abi.statusFromError(err);
+        };
         return .ok;
     }
     fn reserveNested(raw: *anyopaque, options: *const abi.ChildStart) callconv(.c) runtime.error_abi.Status {
         const self = from(raw);
-        reserve(&self.execution, self.allocator, options) catch |err| return runtime.error_abi.statusFromError(err);
+        self.precheck() catch |err| return runtime.error_abi.statusFromError(err);
+        self.validateCurrent() catch |err| return runtime.error_abi.statusFromError(err);
+        reserveValidated(&self.execution, self.allocator, options, self.validation) catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
     fn finish(raw: *anyopaque) callconv(.c) void {

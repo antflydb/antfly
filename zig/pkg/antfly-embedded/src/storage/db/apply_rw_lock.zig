@@ -319,6 +319,16 @@ pub const ApplyRwLock = struct {
         if (previous == writer_bit + 1) self.signal();
     }
 
+    /// Count a real non-waiting admission attempt without joining the writer
+    /// queue. Unlike a speculative try-lock probe, this is an operation's
+    /// actual acquisition/rejection and must remain visible in lock metrics.
+    pub fn tryLockExclusiveForAdmission(self: *@This()) bool {
+        _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
+        const acquired = self.tryLockExclusive();
+        if (!acquired) _ = self.exclusive_contended_calls.fetchAdd(1, .monotonic);
+        return acquired;
+    }
+
     pub fn tryLockExclusive(self: *@This()) bool {
         if (self.exclusive_waiters.load(.acquire) != 0 or self.priority_shared_waiters.load(.acquire) != 0) return false;
         if (!self.writer_gate.tryLock()) return false;

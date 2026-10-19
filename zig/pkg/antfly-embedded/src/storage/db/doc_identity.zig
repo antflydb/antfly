@@ -1228,6 +1228,69 @@ pub fn visibilitySummaryFromWrites(writes: []const docstore_mod.KVPair) !?Visibi
     return null;
 }
 
+/// The caller holds apply admission. Capture at most five small metadata roots;
+/// any mapping, state, chunk or unknown identity key is non-pristine. Reuse the
+/// existing validator/statistics on this bounded projection rather than cloning
+/// and traversing the source's entire mutable or historical generation.
+pub fn pristinePortableIdentityFromRead(alloc: Allocator, read: *docstore_mod.DocStore.Txn, control: ?@import("../../common/read_admission.zig").Port) !bool {
+    const keys = [_][]const u8{ &internal_keys.identity_namespace_key, &internal_keys.identity_next_ordinal_key, &internal_keys.identity_visibility_summary_key, &internal_keys.identity_visibility_manifest_key, &internal_keys.identity_live_directory_manifest_key };
+    var values: [keys.len][40]u8 = undefined;
+    var lengths: [keys.len]?usize = @splat(null);
+    var copied: usize = 0;
+    var cursor = if (control) |port| try read.openPhysicalCursorWithAdmission(port) else try read.openPhysicalCursorAdapter();
+    defer cursor.close();
+    const prefix = [_]u8{internal_keys.identity_namespace};
+    var entry = if (control) |port| try cursor.seekAtOrAfterWithAdmission(&prefix, port) else try cursor.seekAtOrAfter(&prefix);
+    while (entry) |row| {
+        if (control) |port| try port.checkpoint();
+        if (!std.mem.startsWith(u8, row.key, &prefix)) break;
+        if (copied == keys.len) return false;
+        var slot: ?usize = null;
+        for (keys, 0..) |key, i| if (std.mem.eql(u8, key, row.key)) {
+            slot = i;
+            break;
+        };
+        const i = slot orelse return false;
+        if (lengths[i] != null) return error.InvalidDocIdentity;
+        // Oversized roots are not a pristine supported identity image. Never
+        // copy an unbounded/corrupt value into the validation projection.
+        if (row.value.len > values[i].len) return false;
+        @memcpy(values[i][0..row.value.len], row.value);
+        lengths[i] = row.value.len;
+        copied += 1;
+        entry = if (control) |port| try cursor.nextWithAdmission(port) else try cursor.next();
+    }
+    if (control) |port| try port.checkpoint();
+    if (copied == 0) return true;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var projection = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer projection.close();
+    // This private image must preserve even malformed source bytes for the
+    // identity validator. Normal DocStore writes also maintain retained-effect
+    // metadata and may reject a damaged namespace before validation can run.
+    {
+        var write = try projection.runtime_store.beginWrite();
+        errdefer write.abort();
+        for (keys, lengths, 0..) |key, length, i| if (length) |len| {
+            if (control) |port| try port.checkpoint();
+            try write.put(key, values[i][0..len]);
+        };
+        try write.commit();
+    }
+    validateStoreAlloc(alloc, &projection) catch |err| switch (err) {
+        error.InvalidDocIdentity => return false,
+        else => return err,
+    };
+    if (control) |port| try port.checkpoint();
+    const stats = try fullStatsFromStore(&projection);
+    if (control) |port| try port.checkpoint();
+    return stats.next_ordinal == 1 and stats.allocated_ordinals == 0 and
+        stats.state_rows == 0 and stats.live_ordinals == 0 and stats.tombstone_ordinals == 0 and
+        stats.visibility_chunks == 0 and stats.visibility_deleted_ordinals == 0 and
+        stats.visibility_mask_bytes == 0 and stats.visibility_repair_count == 0;
+}
+
 pub fn fullStatsFromStore(store: *docstore_mod.DocStore) !Stats {
     var stats = try fastStatsFromStore(store);
     stats.state_rows = 0;

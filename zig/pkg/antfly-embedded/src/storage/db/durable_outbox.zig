@@ -45,9 +45,94 @@ pub const replication_outbox_checksum_len: usize = 4;
 
 pub const replication_outbox_recovery_batch_size: usize = 16;
 
+pub const RecoveryIdentity = [replication_outbox_id_len]u8;
+
+/// One DB-owned recovery cursor. Scalar identity/history survives attempts;
+/// an optional provider continuation owns its funded read and working storage.
+/// Join callers and reset before retiring the allocator or DB storage. Neither
+/// expected payload nor per-attempt execution control may be retained.
+pub const RecoveryCursor = struct {
+    pub const Position = struct { origin: u64 = 0, owner: u64 = 0, revision: u64 = 0, next_lsn: u64 = 0 };
+    pub const State = struct {
+        active: bool = false,
+        identity: RecoveryIdentity = @splat(0),
+        from_lsn: u64 = 0,
+        next_lsn: u64 = 0,
+        matched_lsn: u64 = 0,
+        kind: @import("replication_record.zig").RecordKind = .batch_mutation,
+        payload_len: usize = 0,
+        shard_id: u64 = 0,
+        table_id: u64 = 0,
+        cluster_id: u64 = 0,
+        timeline_id: u64 = 0,
+        epoch: u64 = 0,
+        position: Position = .{},
+    };
+    pub const Continuation = struct {
+        ptr: *anyopaque,
+        // Grant-free destruction executes in the unit owning the allocation.
+        destroy: *const fn (*anyopaque) callconv(.c) void,
+    };
+    allocator: ?Allocator = null,
+    mutex: std.atomic.Mutex = .unlocked,
+    state: State = .{},
+    pending: ?Continuation = null,
+    progress_generation: std.atomic.Value(u64) = .init(0),
+    runnable: bool = false,
+    pub const Progress = struct { generation: u64, runnable: bool = false };
+
+    /// Observation only: no grant or publication authority. A contended probe
+    /// preserves generation while refusing readiness, without waiting.
+    pub fn progress(self: *RecoveryCursor) Progress {
+        const generation = self.progress_generation.load(.acquire);
+        if (!self.mutex.tryLock()) return .{ .generation = generation };
+        defer self.mutex.unlock();
+        return .{ .generation = self.progress_generation.load(.acquire), .runnable = self.runnable };
+    }
+
+    pub fn retireIdentity(self: *RecoveryCursor, identity: RecoveryIdentity) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.state.active and std.mem.eql(u8, &self.state.identity, &identity)) {
+            self.retireRead();
+            self.state = .{};
+        }
+    }
+    pub fn init(allocator: Allocator) RecoveryCursor {
+        return .{ .allocator = allocator };
+    }
+    /// Caller holds mutex, or has joined every caller during teardown.
+    pub fn retireRead(self: *RecoveryCursor) void {
+        self.runnable = false;
+        const pending = self.pending;
+        self.pending = null;
+        if (pending) |owner| owner.destroy(owner.ptr);
+    }
+    /// Grant-free retirement joins any synchronous use. The atomic mutex
+    /// itself is never copied, and the allocator remains available for reuse.
+    pub fn reset(self: *RecoveryCursor) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.retireRead();
+        self.state = .{};
+    }
+};
+
 pub const DurableReplicationOutbox = struct {
     from_lsn: u64,
     payload: []const u8,
+    /// Copied from an immutable persisted v2 intent key, never a payload borrow.
+    /// Legacy singleton keys have no reusable identity and remain null.
+    recovery_identity: ?RecoveryIdentity = null,
+    /// Borrowed only during publisher recovery; never retained by that publisher.
+    recovery_cursor: ?*RecoveryCursor = null,
+
+    pub fn withRecoveryKey(self: @This(), key: []const u8) !@This() {
+        _ = try durableReplicationOutboxKindFromKey(key);
+        var result = self;
+        result.recovery_identity = key[key.len - replication_outbox_id_len ..][0..replication_outbox_id_len].*;
+        return result;
+    }
 };
 
 pub fn durableReplicationOutboxKeyAlloc(
@@ -115,30 +200,89 @@ pub fn decodeDurableReplicationOutbox(raw: []const u8) !DurableReplicationOutbox
 /// Recovery still holds service leases. Inspect the retained original lifetime
 /// between bounded CRC updates without transferring CPU or authorizing delivery.
 pub fn decodeDurableReplicationOutboxWithAdmission(raw: []const u8, control: ?@import("../../common/read_admission.zig").Port) !DurableReplicationOutbox {
-    if (control) |port| try port.checkpoint();
-    if (raw.len < replication_outbox_header_len + replication_outbox_checksum_len or !std.mem.eql(u8, raw[0..4], replication_outbox_magic))
-        return error.InvalidHAOutbox;
-    const payload_len: usize = @intCast(std.mem.readInt(u32, raw[12..16], .little));
-    if (payload_len != raw.len - replication_outbox_header_len - replication_outbox_checksum_len) return error.InvalidHAOutbox;
-    const checksum = std.mem.readInt(u32, raw[raw.len - replication_outbox_checksum_len ..][0..replication_outbox_checksum_len], .little);
-    const checked_bytes = raw[0 .. raw.len - replication_outbox_checksum_len];
-    const actual = if (control) |port| blk: {
-        var crc = @import("antfly_hash").Crc32.init();
-        var offset: usize = 0;
-        while (offset < checked_bytes.len) {
-            try port.checkpoint();
-            const end = offset + @min(64 * 1024, checked_bytes.len - offset);
-            crc.update(checked_bytes[offset..end]);
-            offset = end;
-        }
-        try port.checkpoint();
-        break :blk crc.final();
-    } else @import("antfly_hash").Crc32.hash(checked_bytes);
-    if (actual != checksum) return error.InvalidHAOutbox;
-    const from_lsn = std.mem.readInt(u64, raw[4..12], .little);
-    if (from_lsn == 0) return error.InvalidHAOutbox;
-    return .{ .from_lsn = from_lsn, .payload = raw[replication_outbox_header_len .. raw.len - replication_outbox_checksum_len] };
+    var cursor: DecodeCursor = .{};
+    while (try cursor.step(raw, 64 * 1024, control) != .ready) {}
+    return cursor.view(raw);
 }
+
+/// Incremental AHO1 validation over an immutable owned value. No input/control
+/// span is retained. A ready view borrows the same owner's bytes and grants no
+/// authority to publish or delete a durable intent.
+pub const DecodeCursor = struct {
+    pub const Status = enum { pending, ready };
+    const Phase = enum { header, checksum, trailer, ready, failed };
+    phase: Phase = .header,
+    raw_len: ?usize = null,
+    header: [replication_outbox_header_len]u8 = undefined,
+    trailer: [replication_outbox_checksum_len]u8 = undefined,
+    partial: usize = 0,
+    checksum_offset: usize = 0,
+    crc: @import("antfly_hash").Crc32 = .init(),
+    from_lsn: u64 = 0,
+    failure: ?anyerror = null,
+
+    pub fn step(self: *@This(), raw: []const u8, quantum: usize, control: ?@import("../../common/read_admission.zig").Port) !Status {
+        if (quantum == 0 or quantum > 64 * 1024) return error.InvalidArgument;
+        if (self.failure) |err| return err;
+        return self.advance(raw, quantum, control) catch |err| {
+            const cause = if (control) |port| blk: {
+                port.checkpoint() catch |original| break :blk original;
+                break :blk err;
+            } else err;
+            self.phase = .failed;
+            self.failure = cause;
+            return cause;
+        };
+    }
+    fn advance(self: *@This(), raw: []const u8, quantum: usize, control: ?@import("../../common/read_admission.zig").Port) !Status {
+        if (control) |port| try port.checkpoint();
+        if (raw.len < replication_outbox_header_len + replication_outbox_checksum_len) return error.InvalidHAOutbox;
+        if (self.raw_len) |len| {
+            if (len != raw.len) return error.InvalidHAOutbox;
+        } else self.raw_len = raw.len;
+        switch (self.phase) {
+            .header => {
+                const take = @min(quantum, self.header.len - self.partial);
+                @memcpy(self.header[self.partial..][0..take], raw[self.partial..][0..take]);
+                self.partial += take;
+                if (self.partial == self.header.len) {
+                    if (!std.mem.eql(u8, self.header[0..4], replication_outbox_magic)) return error.InvalidHAOutbox;
+                    const len: usize = std.mem.readInt(u32, self.header[12..16], .little);
+                    if (len != raw.len - self.header.len - self.trailer.len) return error.InvalidHAOutbox;
+                    self.partial = 0;
+                    self.phase = .checksum;
+                }
+            },
+            .checksum => {
+                const end = raw.len - self.trailer.len;
+                const take = @min(quantum, end - self.checksum_offset);
+                self.crc.update(raw[self.checksum_offset..][0..take]);
+                self.checksum_offset += take;
+                if (self.checksum_offset == end) self.phase = .trailer;
+            },
+            .trailer => {
+                const take = @min(quantum, self.trailer.len - self.partial);
+                @memcpy(self.trailer[self.partial..][0..take], raw[raw.len - self.trailer.len + self.partial ..][0..take]);
+                self.partial += take;
+                if (self.partial == self.trailer.len) {
+                    if (self.crc.final() != std.mem.readInt(u32, &self.trailer, .little)) return error.InvalidHAOutbox;
+                    self.from_lsn = std.mem.readInt(u64, self.header[4..12], .little);
+                    if (self.from_lsn == 0) return error.InvalidHAOutbox;
+                    self.phase = .ready;
+                }
+            },
+            .ready => {},
+            .failed => return self.failure.?,
+        }
+        if (control) |port| try port.checkpoint();
+        return if (self.phase == .ready) .ready else .pending;
+    }
+    pub fn view(self: *const @This(), raw: []const u8) !DurableReplicationOutbox {
+        if (self.failure) |err| return err;
+        if (self.phase != .ready or raw.len != self.raw_len.?) return error.InvalidArgument;
+        return .{ .from_lsn = self.from_lsn, .payload = raw[replication_outbox_header_len .. raw.len - replication_outbox_checksum_len] };
+    }
+};
 
 test "storage.hot_standby durable outbox codec preserves pre-extraction persisted bytes" {
     // Independent fixture: AHO1, little-endian LSN and length, payload, IEEE CRC32.
@@ -223,13 +367,15 @@ test "durable outbox storage admitted checksum retains original errors at every 
     const result = try decodeDurableReplicationOutboxWithAdmission(raw, control);
     try std.testing.expectEqual(@as(u64, 37), result.from_lsn);
     try std.testing.expectEqualSlices(u8, payload, result.payload);
-    // Entry, three <=64 KiB updates, and the final lifetime inspection.
-    try std.testing.expectEqual(@as(usize, 5), state.checks);
+    // Separate bounded header, three CRC updates and trailer, each with
+    // original authority checked before and after its work.
+    const successful_checks = state.checks;
+    try std.testing.expectEqual(@as(usize, 10), successful_checks);
     for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |rejection| {
-        for (1..6) |at| {
+        for (1..successful_checks + 1) |at| {
             state = .{ .reject_at = at, .rejection = rejection };
             try std.testing.expectError(rejection, decodeDurableReplicationOutboxWithAdmission(raw, control));
-            try std.testing.expectEqual(at, state.checks);
+            try std.testing.expect(state.checks >= at and state.checks <= at + 1);
             try std.testing.expectEqualSlices(u8, saved, raw);
         }
     }
@@ -246,4 +392,55 @@ test "durable outbox storage admitted checksum retains original errors at every 
         raw[at] ^= 1;
     }
     try std.testing.expectEqualSlices(u8, saved, raw);
+}
+
+test "durable outbox recovery identity copies only immutable persisted v2 keys" {
+    const a = std.testing.allocator;
+    const key = try durableReplicationOutboxKeyAlloc(a, .batch, 7, 3, "payload");
+    defer a.free(key);
+    const raw = try encodeDurableReplicationOutboxAlloc(a, 7, "payload");
+    defer a.free(raw);
+    const decoded = try decodeDurableReplicationOutbox(raw);
+    try std.testing.expect(decoded.recovery_identity == null);
+    const bound = try decoded.withRecoveryKey(key);
+    const saved = bound.recovery_identity.?;
+    key[key.len - 1] ^= 1;
+    try std.testing.expectEqualDeep(saved, bound.recovery_identity.?);
+    const changed = (try decoded.withRecoveryKey(key)).recovery_identity.?;
+    try std.testing.expect(!std.mem.eql(u8, &saved, &changed));
+    try std.testing.expectEqual(@as(u64, 7), bound.from_lsn);
+    try std.testing.expectEqualStrings("payload", bound.payload);
+    try std.testing.expectError(error.InvalidHAOutbox, decoded.withRecoveryKey(replication_batch_outbox_key));
+    try std.testing.expectError(error.InvalidHAOutbox, decoded.withRecoveryKey(key[0 .. key.len - 1]));
+    key[replication_outbox_v2_prefix.len] = 255;
+    try std.testing.expectError(error.InvalidHAOutbox, decoded.withRecoveryKey(key));
+}
+
+test "durable outbox owned decoder validates independent persisted fixture one byte per step" {
+    const fixture = [_]u8{ 0x41, 0x48, 0x4f, 0x31, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x03, 0x00, 0x00, 0x00, 0x61, 0x62, 0x63, 0x7e, 0x55, 0xb7, 0xf9 };
+    var cursor: DecodeCursor = .{};
+    try std.testing.expectError(error.InvalidArgument, cursor.view(&fixture));
+    try std.testing.expectError(error.InvalidArgument, cursor.step(&fixture, 0, null));
+    try std.testing.expectError(error.InvalidArgument, cursor.step(&fixture, 65537, null));
+    var calls: usize = 0;
+    while (true) {
+        const before = cursor.checksum_offset;
+        const status = try cursor.step(&fixture, 1, null);
+        try std.testing.expect(cursor.checksum_offset - before <= 1);
+        calls += 1;
+        if (status == .ready) break;
+        try std.testing.expectError(error.InvalidArgument, cursor.view(&fixture));
+        try std.testing.expect(calls < 100);
+    }
+    try std.testing.expectEqual(@as(usize, 16 + 19 + 4), calls);
+    const decoded = try cursor.view(&fixture);
+    try std.testing.expectEqual(@as(u64, 0x0102030405060708), decoded.from_lsn);
+    try std.testing.expectEqualStrings("abc", decoded.payload);
+    try std.testing.expectError(error.InvalidArgument, cursor.view(fixture[0..22]));
+    try std.testing.expectEqual(DecodeCursor.Status.ready, try cursor.step(&fixture, 1, null));
+    // A truncated capture permanently rejects; later bytes cannot revive it.
+    var truncated: DecodeCursor = .{};
+    try std.testing.expectError(error.InvalidHAOutbox, truncated.step(fixture[0..19], 1, null));
+    try std.testing.expectError(error.InvalidHAOutbox, truncated.step(&fixture, 1, null));
+    try std.testing.expectError(error.InvalidHAOutbox, truncated.view(&fixture));
 }

@@ -2083,6 +2083,11 @@ pub const MetadataHttpServer = struct {
         // transport closed until store-bound principal verification exists.
         if (parsed.value == .fk_initial_retirement_page)
             return ctx.status(501).text("store-bound initial FK retirement reads are not active");
+        // First-use authority always needs the host-verified service token,
+        // including when legacy internal routes permit tokenless migration.
+        if (parsed.value == .remote_attempt_initialization and
+            ctx.header(@import("../api/internal_service_auth.zig").header_name) == null)
+            return ctx.status(403).text("remote initialization requires an authenticated service");
         // This transport authenticates the calling service, not a setting
         // administrator. Never infer an admin grant from request JSON.
         const authority = @import("../system_catalog/setting_authority.zig");
@@ -8349,4 +8354,86 @@ test "metadata node protocol readiness is unavailable without whole-request retr
     // Registration may already have persisted its node before store admission
     // needs a newer profile. Do not claim the whole request was unadmitted.
     try std.testing.expect(response.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
+}
+
+test "remote initialization HTTP handler requires service authentication and preserves outcomes" {
+    const wire = @import("remote_attempt_initialization.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn identity(_: *anyopaque) !metadata_api.CatalogIdentity {
+            return .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".* };
+        }
+        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            try std.testing.expect(!context.setting_admin);
+            try std.testing.expect(input == .remote_attempt_initialization);
+            try input.remote_attempt_initialization.validate();
+            self.calls += 1;
+            if (self.failure) |failure| return failure;
+            return alloc.dupe(u8, "{}");
+        }
+    };
+    const alloc = std.testing.allocator;
+    var fixture: Fixture = .{};
+    var server = MetadataHttpServer.init(alloc, .{}, .{ .ptr = &fixture, .vtable = &.{
+        .status = Fixture.status,
+        .admin_snapshot = Fixture.snapshot,
+        .free_admin_snapshot = Fixture.freeSnapshot,
+        .system_catalog = Fixture.catalog,
+        .catalog_identity = Fixture.identity,
+    } });
+    const seed: [32]u8 = @splat(7);
+    const identity: wire.Identity = .{ .metadata_incarnation = "11111111111111111111111111111111".*, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed)).public_key.toBytes() };
+    for ([_]wire.Action{ .prepare, .activate, .status }) |action| {
+        const signed = try wire.Request.sign(identity, 4, action, @splat(1), seed);
+        const body = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .remote_attempt_initialization = signed }, .{});
+        defer alloc.free(body);
+        var request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+        defer request.deinit();
+        try request.setBody(body);
+        try request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+        try request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+        try request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+        const before = fixture.calls;
+        {
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try server.metadataSystemCatalog(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 403), response.status.code);
+            try std.testing.expectEqual(before, fixture.calls);
+        }
+        // Host middleware verifies this credential before invoking the handler.
+        try request.headers.append(@import("../api/internal_service_auth.zig").header_name, "host-verified-service-token");
+        for ([_]?anyerror{ null, error.InvalidStoreRootEnrollment, error.StoreRootEnrollmentChanged, error.MetadataMutationOutcomeUnknown }) |failure| {
+            fixture.failure = failure;
+            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try server.metadataSystemCatalog(&ctx);
+            defer response.deinit();
+            const expected: u16 = if (failure) |err| switch (err) {
+                error.InvalidStoreRootEnrollment => 400,
+                error.StoreRootEnrollmentChanged => 409,
+                error.MetadataMutationOutcomeUnknown => 503,
+                else => unreachable,
+            } else 200;
+            try std.testing.expectEqual(expected, response.status.code);
+            try std.testing.expectEqualStrings(if (expected == 503)
+                routes.Routes.raft_mutation_outcome_unknown
+            else if (failure == null)
+                routes.Routes.raft_mutation_outcome_committed
+            else
+                routes.Routes.raft_mutation_outcome_not_proposed, response.headers.get(routes.Routes.raft_mutation_outcome_header).?);
+        }
+        try std.testing.expectEqual(before + 4, fixture.calls);
+    }
 }

@@ -364,7 +364,7 @@ pub const Enforcer = struct {
         }
         for (self.policies.items) |rule| {
             if (!std.mem.eql(u8, rule.ptype, "p")) continue;
-            if (!try self.subjectMatches(username, rule.fields[0])) continue;
+            if (!try self.subjectMatchesAlloc(alloc, username, rule.fields[0])) continue;
             var owned = try rule.clone(alloc);
             errdefer owned.deinit(alloc);
             try out.append(alloc, owned);
@@ -401,18 +401,26 @@ pub const Enforcer = struct {
     }
 
     fn subjectMatches(self: *const Enforcer, subject: []const u8, policy_subject: []const u8) !bool {
+        return self.subjectMatchesAlloc(self.alloc, subject, policy_subject);
+    }
+
+    fn subjectMatchesAlloc(self: *const Enforcer, alloc: Allocator, subject: []const u8, policy_subject: []const u8) !bool {
         if (std.mem.eql(u8, subject, policy_subject)) return true;
         var queue = std.ArrayList([]const u8).empty;
-        defer queue.deinit(self.alloc);
+        defer queue.deinit(alloc);
         var visited = std.StringHashMapUnmanaged(void){};
         defer {
             var it = visited.iterator();
-            while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
-            visited.deinit(self.alloc);
+            while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+            visited.deinit(alloc);
         }
 
-        try queue.append(self.alloc, subject);
-        try visited.put(self.alloc, try self.alloc.dupe(u8, subject), {});
+        try queue.append(alloc, subject);
+        const owned_subject = try alloc.dupe(u8, subject);
+        visited.put(alloc, owned_subject, {}) catch |err| {
+            alloc.free(owned_subject);
+            return err;
+        };
         var index: usize = 0;
         while (index < queue.items.len) : (index += 1) {
             const current = queue.items[index];
@@ -422,9 +430,12 @@ pub const Enforcer = struct {
                 if (!std.mem.eql(u8, current, rule.fields[0])) continue;
                 if (std.mem.eql(u8, rule.fields[1], policy_subject)) return true;
                 if (visited.contains(rule.fields[1])) continue;
-                const owned = try self.alloc.dupe(u8, rule.fields[1]);
-                try visited.put(self.alloc, owned, {});
-                try queue.append(self.alloc, rule.fields[1]);
+                const owned = try alloc.dupe(u8, rule.fields[1]);
+                visited.put(alloc, owned, {}) catch |err| {
+                    alloc.free(owned);
+                    return err;
+                };
+                try queue.append(alloc, rule.fields[1]);
             }
         }
         return false;

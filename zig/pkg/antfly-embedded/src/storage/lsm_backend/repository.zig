@@ -104,6 +104,8 @@ pub const Run = struct {
         self.state = null;
         return true;
     }
+    /// Immutable physical generation, preserved by revisions and read projections.
+    read_identity: @import("read_generation.zig").Identity = .{},
     owner: ?*RunOwner = null,
     output_ticket: ?*@import("output_cleanup.zig").Ticket = null,
     id: u64,
@@ -136,6 +138,10 @@ pub const Run = struct {
     shared_read_version: bool = false,
     state: ?state_mod.State,
     shared_memory: ?*SharedMemory = null,
+
+    pub fn ensureReadIdentity(self: *Run) !void {
+        if (!self.read_identity.valid()) self.read_identity = try @import("read_generation.zig").allocate();
+    }
 
     pub fn deinit(self: *Run, allocator: Allocator) void {
         if (self.owner) |owner| {
@@ -269,6 +275,7 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
 
     var out = Run{
         .id = source.id,
+        .read_identity = source.read_identity,
         .level = source.level,
         .size_bytes = source.size_bytes,
         .compression_stats = source.compression_stats,
@@ -313,6 +320,7 @@ pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
 
     var out = Run{
         .id = source.id,
+        .read_identity = source.read_identity,
         .level = source.level,
         .size_bytes = source.size_bytes,
         .compression_stats = source.compression_stats,

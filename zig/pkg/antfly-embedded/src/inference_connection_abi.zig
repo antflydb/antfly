@@ -23,7 +23,7 @@ const error_abi = @import("antfly_runtime_abi").error_abi;
 const http_abi = @import("antfly_runtime_abi").http_abi;
 const memory_abi = @import("runtime_memory_abi");
 
-pub const abi_version: u32 = 3;
+pub const abi_version: u32 = 4;
 pub const Status = error_abi.Status;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
@@ -114,6 +114,8 @@ pub const Target = extern struct {
 };
 
 pub fn validInvokeContext(context: *const InvokeContext) bool {
+    // Reject older/truncated layouts before reading the expanded stream tail.
+    if (context.abi_version != abi_version or context.struct_size < @sizeOf(InvokeContext)) return false;
     const stream_callbacks = @as(u2, @intFromBool(context.stream.start != null)) +
         @as(u2, @intFromBool(context.stream.write != null)) +
         @as(u2, @intFromBool(context.stream.close != null));
@@ -162,4 +164,14 @@ test "local inference response validation contains malformed ownership" {
     invalid_reserved.content_type._reserved[0] = 1;
     try std.testing.expect(!invalid_reserved.valid());
     invalid_reserved.deinit(&abi_alloc);
+}
+
+test "local inference connection ABI rejects old and truncated layouts before stream access" {
+    const Header = extern struct { version: u32, size: u32 };
+    var header: Header align(@alignOf(InvokeContext)) = .{ .version = abi_version - 1, .size = @sizeOf(InvokeContext) };
+    const context: *const InvokeContext = @ptrCast(&header);
+    try std.testing.expect(!validInvokeContext(context));
+    header.version = abi_version;
+    header.size = @sizeOf(Header);
+    try std.testing.expect(!validInvokeContext(context));
 }

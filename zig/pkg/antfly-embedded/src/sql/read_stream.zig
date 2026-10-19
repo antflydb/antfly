@@ -453,6 +453,10 @@ const PendingColumns = struct {
     fn cell(self: *const PendingColumns, a: std.mem.Allocator, row: usize, column: usize) !@import("scalar.zig").Datum {
         return self.values.cell(a, self.begin + row, column);
     }
+    fn cellControlled(self: *const PendingColumns, a: std.mem.Allocator, row: usize, column: usize, control: ?@import("operator_work.zig").Control) !@import("scalar.zig").Datum {
+        return self.values.cellControlled(a, self.begin + row, column, control);
+    }
+
     fn reserveRecords(self: *PendingColumns, count: usize) !void {
         const a = self.owner.arena.allocator();
         try self.owner.positions.ensureUnusedCapacity(a, count);
@@ -559,7 +563,11 @@ const ParallelScan = struct {
         fn run(self: *Worker) anyerror!void {
             // Nested expression jobs must not consume admission intended for
             // sibling scan workers while the parent is still starting them.
-            try self.pipeline.ready.wait(self.pipeline.io);
+            try @import("execution_wait.zig").run(
+                if (self.execution) |execution| @import("spill.zig").childWait(execution) else null,
+                std.Io.Event.wait,
+                .{ &self.pipeline.ready, self.pipeline.io },
+            );
             var index = self.index;
             while (index < self.pipeline.lanes.len) : (index += self.pipeline.worker_count) {
                 const lane = &self.pipeline.lanes[index];
@@ -1167,7 +1175,7 @@ pub const Stream = struct {
             var end = begin;
             var bytes: usize = 0;
             while (end < pending.len() and end - begin < max_rows) {
-                for (0..self.context.binding.columns.len) |column| bytes +|= try pending.values.cellBytes(arena.allocator(), pending.begin + end, column);
+                for (0..self.context.binding.columns.len) |column| bytes +|= try pending.values.cellBytesControlled(arena.allocator(), pending.begin + end, column, self.context.workControl());
                 end += 1;
                 if (bytes >= self.context.limits.page_bytes) break;
             }
@@ -1217,7 +1225,7 @@ pub const Stream = struct {
             for (values, 0..) |*value, index| value.* = try encoded.cell(a, index, 0);
             return values;
         }
-        if (try @import("vector_eval.zig").evaluateColumnsWithScope(a, program, page, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io, self.context.backend.cpu_scope)) |values| return values;
+        if (try @import("vector_eval.zig").evaluateColumnsWithScopes(a, program, page, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io, self.context.backend.cpu_scope, self.context.backend.coordinator_scope)) |values| return values;
         const values = try a.alloc(@import("scalar.zig").Datum, page.selection.len);
         var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
         defer scratch.deinit();
@@ -1353,7 +1361,7 @@ pub const Stream = struct {
             try programs.append(a, program);
             try slots.append(a, index);
         };
-        const evaluated = try @import("vector_eval.zig").evaluateColumnsEncodedManyWithScope(a, programs.items, selected, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io, self.context.backend.cpu_scope);
+        const evaluated = try @import("vector_eval.zig").evaluateColumnsEncodedManyWithScopes(a, programs.items, selected, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io, self.context.backend.cpu_scope, self.context.backend.coordinator_scope);
         for (evaluated, programs.items, slots.items) |values, program, index| {
             if (values) |batch| {
                 projections[index] = batch;
@@ -1407,9 +1415,12 @@ pub const Stream = struct {
                 return projection_.page.encodedJson(index, projection_.stream.fields[ordinal]);
             }
             fn cell(raw: *anyopaque, alloc: std.mem.Allocator, index: usize, ordinal: usize) anyerror!@import("scalar.zig").Datum {
+                return cellControlled(raw, alloc, index, ordinal, null);
+            }
+            fn cellControlled(raw: *anyopaque, alloc: std.mem.Allocator, index: usize, ordinal: usize, control: ?@import("operator_work.zig").Control) anyerror!@import("scalar.zig").Datum {
                 const projection_: *@This() = @ptrCast(@alignCast(raw));
-                const cell_ = if (projection_.projections[ordinal]) |values| try values.cell(alloc, index, 0) else blk: {
-                    const raw_ = try projection_.page.typedCell(alloc, index, projection_.stream.fields[ordinal], projection_.stream.context.binding.columns[ordinal].element_type == .numeric);
+                const cell_ = if (projection_.projections[ordinal]) |values| try values.cellControlled(alloc, index, 0, control) else blk: {
+                    const raw_ = try projection_.page.cellControlled(alloc, index, projection_.stream.fields[ordinal], control);
                     break :blk raw_;
                 };
                 const column = projection_.stream.context.binding.columns[ordinal];
@@ -1425,7 +1436,9 @@ pub const Stream = struct {
         // complete batch is published only after all typed columns succeed.
         if (self.one_scan_page) try pending.reserveRecords(selection.items.len);
         const before = pending.len();
-        try pending.values.appendBatch(.{ .reader = .{ .ptr = &projection, .read = Projection.cell, .read_dictionary = Projection.dictionary, .read_json = Projection.json, .read_frozen = Projection.frozen, .count = selection.items.len, .width = self.fields.len } });
+        var payload_lease = @import("typed_store.zig").Store.JsonLease.initControlled(a, self.context.workControl());
+        defer payload_lease.deinit();
+        try pending.values.appendBatchLeased(.{ .reader = .{ .ptr = &projection, .read = Projection.cell, .read_controlled = Projection.cellControlled, .read_dictionary = Projection.dictionary, .read_json = Projection.json, .read_frozen = Projection.frozen, .count = selection.items.len, .width = self.fields.len } }, &payload_lease);
         if (self.one_scan_page) for (positions.items, failures) |position, failure| pending.record(position, failure);
         for (before..pending.len()) |row| for (0..self.fields.len) |column| {
             output_bytes +|= try pending.values.cellBytes(a, row, column);
@@ -1530,7 +1543,7 @@ pub const Stream = struct {
                 const row = try a.alloc(Json, self.context.binding.columns.len);
                 const nulls = try a.alloc(bool, self.context.binding.columns.len);
                 for (row, nulls, 0..) |*out, *sql_null, column| {
-                    const datum = try pending.cell(a, index, column);
+                    const datum = try pending.cellControlled(a, index, column, self.context.workControl());
                     sql_null.* = datum.sql_null;
                     var output_context = self.context;
                     output_context.arena = a;
@@ -2835,6 +2848,70 @@ test "SQL pull stream reuses proven provider order and stops before scanning a l
     try std.testing.expectEqual(@as(usize, 1), fixture.closed);
 }
 
+test "SQL scan startup wait releases runnable capacity and preserves original authority" {
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Mode = enum { resumed, canceled, expired, closed };
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return now_ns.load(.acquire);
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const io = std.testing.io;
+    for (std.enums.values(Mode)) |mode| {
+        Clock.now_ns.store(0, .release);
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{
+            .io = io,
+            .native_now_ns = Clock.now,
+            .deadline_ns = 100,
+            .cancellation = .{ .ptr = &canceled, .requested = Clock.requested },
+        }, .query);
+        defer execution.finish();
+        var pipeline: ParallelScan = .{ .a = std.testing.allocator, .io = io, .lanes = &.{} };
+        var worker: ParallelScan.Worker = .{ .pipeline = &pipeline, .index = 0, .credit = undefined, .execution = &execution };
+        var future = try io.concurrent(ParallelScan.Worker.run, .{&worker});
+        defer _ = future.cancel(io) catch {};
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+        while (scheduler.stats().resource_blocked != 1) {
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.ScanStartupDidNotPark;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        // An ordinary peer and protected control can progress before startup.
+        var peer: Runnable.Execution = .{};
+        try peer.start(&scheduler, .{ .io = io, .allow_wait = false }, .query);
+        peer.finish();
+        var control: Runnable.Execution = .{};
+        try control.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+        control.finish();
+        switch (mode) {
+            .resumed => {},
+            .canceled => canceled.store(true, .release),
+            .expired => Clock.now_ns.store(100, .release),
+            .closed => scheduler.close(),
+        }
+        pipeline.ready.set(io);
+        switch (mode) {
+            .resumed => try future.await(io),
+            .canceled => try std.testing.expectError(error.Canceled, future.await(io)),
+            .expired => try std.testing.expectError(error.DeadlineExceeded, future.await(io)),
+            .closed => try std.testing.expectError(error.SchedulerClosed, future.await(io)),
+        }
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
 test "SQL scoped ordered scans own cursor callbacks preserve ordered quotas and join original failures" {
     const Runnable = @import("../common/runnable_scheduler.zig");
     const Mode = enum { success, filtered, limit, expression, early_close, canceled, deadline, revoked, registry_full };
@@ -2913,7 +2990,7 @@ test "SQL scoped ordered scans own cursor callbacks preserve ordered quotas and 
         }
     };
     const a = std.testing.allocator;
-    for (std.enums.values(Mode)) |mode| {
+    for ([_]bool{ false, true }) |coordinator_only| for (std.enums.values(Mode)) |mode| {
         Clock.now_ns.store(0, .release);
         var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024, .checkpoint_budget = 1, .max_operations = if (mode == .registry_full) 2 else 32 });
         var cancel: std.atomic.Value(bool) = .init(false);
@@ -2928,7 +3005,9 @@ test "SQL scoped ordered scans own cursor callbacks preserve ordered quotas and 
         vtable.open_scan = Owner.open;
         backend.ptr = &owner;
         backend.vtable = &vtable;
-        backend.cpu_scope = .{ .execution = &execution, .allocator = a, .io = std.testing.io, .wait = boundary };
+        const scope = @import("parallel_scheduler.zig").ExecutionScope{ .execution = &execution, .allocator = a, .io = std.testing.io, .wait = boundary, .checkpoint = Owner.check };
+        backend.coordinator_scope = scope.coordinator();
+        if (!coordinator_only) backend.cpu_scope = scope;
         const sql = switch (mode) {
             .filtered => "SELECT n + 1 FROM docs WHERE n % 2 = 0",
             .limit => "SELECT n + 1 FROM docs LIMIT 8192 OFFSET 7",
@@ -2941,7 +3020,7 @@ test "SQL scoped ordered scans own cursor callbacks preserve ordered quotas and 
             const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .retained_bytes = 32 * 1024 * 1024 })).?;
             defer stream.close();
             var first = try stream.nextBatch(137);
-            try std.testing.expect((stream.parallel != null) == (mode != .registry_full));
+            try std.testing.expect((stream.parallel != null) == (!coordinator_only and mode != .registry_full));
             var first_owned = true;
             defer if (first_owned) first.deinit();
             try std.testing.expectEqual(@as(usize, 137), first.values.len());
@@ -2951,8 +3030,10 @@ test "SQL scoped ordered scans own cursor callbacks preserve ordered quotas and 
             health.finish();
             switch (mode) {
                 .early_close => {
-                    stream.parallel.?.close();
-                    stream.parallel = null;
+                    if (stream.parallel) |parallel| {
+                        parallel.close();
+                        stream.parallel = null;
+                    }
                     try std.testing.expectEqual(@as(i64, 1), (try first.values.cell(a, 0, 0)).value.integer);
                     try execution.checkpoint();
                 },
@@ -2998,16 +3079,16 @@ test "SQL scoped ordered scans own cursor callbacks preserve ordered quotas and 
                 },
             }
         }
-        try std.testing.expectEqual(@as(usize, 1), owner.splits);
+        try std.testing.expectEqual(@as(usize, if (coordinator_only) 0 else 1), owner.splits);
         try std.testing.expectEqual(@as(usize, 1), owner.closes);
         for (owner.children) |child| {
-            try std.testing.expectEqual(@as(usize, 1), child.fixture.closed);
+            try std.testing.expectEqual(@as(usize, if (coordinator_only) 0 else 1), child.fixture.closed);
             try std.testing.expect(child.execution == null);
         }
         try std.testing.expectEqual(@as(usize, 0), owner.invalid_callbacks.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().child_operations);
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
-    }
+    };
 }
 
 test "SQL encoded JSON streaming retains bytes across pages and materializes only expressions" {

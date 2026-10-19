@@ -53,6 +53,35 @@ pub fn isLocallyExhausted(self: *Budget) bool {
     defer self.mutex.unlock();
     return self.exhausted or self.admission_exhausted;
 }
+/// Allocate a required object with this attempt's failure identity. Generic
+/// allocator callers retain the standard OutOfMemory contract. No remembered
+/// exhaustion flag is consulted, even across a known parent budget chain.
+pub fn create(self: *Budget, comptime T: type) error{ OutOfMemory, MemoryBudgetExceeded }!*T {
+    if (@sizeOf(T) == 0) return self.allocator().create(T);
+    const bytes = try self.allocChecked(@sizeOf(T), .of(T), @returnAddress());
+    return @ptrCast(@alignCast(bytes));
+}
+
+fn allocChecked(self: *Budget, len: usize, alignment: std.mem.Alignment, ra: usize) error{ OutOfMemory, MemoryBudgetExceeded }![*]u8 {
+    return self.allocCheckedMode(false, len, alignment, ra);
+}
+fn allocCheckedMode(self: *Budget, comptime scratch: bool, len: usize, alignment: std.mem.Alignment, ra: usize) error{ OutOfMemory, MemoryBudgetExceeded }![*]u8 {
+    self.lock();
+    defer self.mutex.unlock();
+    if (!self.admit(len)) return error.MemoryBudgetExceeded;
+    errdefer self.releaseAdmission(len);
+    const backing = if (scratch) reclaimingAllocator(self.backing) else self.backing;
+    const result = if (backing.vtable.alloc == alloc or backing.vtable.alloc == scratchAlloc) blk: {
+        const parent: *Budget = @ptrCast(@alignCast(backing.ptr));
+        break :blk if (backing.vtable.alloc == scratchAlloc)
+            try parent.allocCheckedMode(true, len, alignment, ra)
+        else
+            try parent.allocCheckedMode(false, len, alignment, ra);
+    } else backing.rawAlloc(len, alignment, ra) orelse return error.OutOfMemory;
+    self.account(0, len);
+    return result;
+}
+
 /// Temporary owners may bypass standard arenas without bypassing this budget
 /// or any enclosing budget/failure allocator. Returned objects must be freed
 /// through this allocator, never through the original region allocator.
@@ -372,4 +401,75 @@ test "SQL memory budget reports parent admission without misclassifying allocato
     locked.backing = fixed.allocator();
     try std.testing.expectError(error.OutOfMemory, wrapped.allocator().alloc(u8, 1));
     try std.testing.expect(!wrapped.isExhausted());
+}
+
+test "SQL checked budget creation carries only the current allocation cause" {
+    const Credit = struct {
+        available: usize = 64,
+        fn reserve(raw: *anyopaque, bytes: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (bytes > self.available) return false;
+            self.available -= bytes;
+            return true;
+        }
+        fn release(raw: *anyopaque, bytes: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.available += bytes;
+        }
+    };
+    var credit: Credit = .{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var parent: Budget = .{ .backing = failing.allocator(), .limit = 32 };
+    var child: Budget = .{ .backing = parent.allocator(), .limit = 64, .admission = .{ .ptr = &credit, .reserve = Credit.reserve, .release = Credit.release } };
+    // An optional oversized allocation was refused and recovered earlier.
+    try std.testing.expectError(error.OutOfMemory, parent.allocator().alloc(u8, 33));
+    try std.testing.expect(parent.isExhausted());
+    // The current required allocation fits both quotas; its physical OOM must
+    // not be inferred from that historical refusal in the shared parent.
+    try std.testing.expectError(error.OutOfMemory, child.create(u64));
+    try std.testing.expectEqual(@as(usize, 64), credit.available);
+    try std.testing.expectEqual(@as(usize, 0), parent.live);
+    try std.testing.expectEqual(@as(usize, 0), child.live);
+    try std.testing.expectError(error.MemoryBudgetExceeded, child.create([33]u8));
+    try std.testing.expectEqual(@as(usize, 64), credit.available);
+    try std.testing.expectError(error.MemoryBudgetExceeded, child.create([65]u8));
+    try std.testing.expectEqual(@as(usize, 64), credit.available);
+    failing.fail_index = std.math.maxInt(usize);
+    const object = try child.create(u64);
+    try std.testing.expectEqual(@as(usize, 56), credit.available);
+    object.* = 42;
+    try std.testing.expectEqual(@as(usize, 8), parent.live);
+    try std.testing.expectEqual(@as(usize, 8), child.live);
+    child.allocator().destroy(object);
+    try std.testing.expectEqual(@as(usize, 64), credit.available);
+    try std.testing.expectEqual(@as(usize, 0), parent.live);
+    try std.testing.expectEqual(@as(usize, 0), child.live);
+}
+
+test "SQL memory budget checked creation preserves scratch parent refusal and exact release" {
+    var region = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer region.deinit();
+    var parent: Budget = .{ .backing = region.allocator(), .limit = 8 };
+    var child: Budget = .{ .backing = reclaimingAllocator(parent.allocator()), .limit = 128 };
+    try std.testing.expectError(error.MemoryBudgetExceeded, child.create([16]u8));
+    try std.testing.expectEqual(@as(usize, 0), parent.live);
+    try std.testing.expectEqual(@as(usize, 0), child.live);
+    parent.limit = 32;
+    const value = try child.create([16]u8);
+    try std.testing.expectEqual(@as(usize, 16), parent.live);
+    try std.testing.expectEqual(@as(usize, 16), child.live);
+    child.allocator().destroy(value);
+    try std.testing.expectEqual(@as(usize, 0), parent.live);
+    try std.testing.expectEqual(@as(usize, 0), child.live);
+}
+
+test "SQL memory budget checked scratch creation preserves genuine allocation failure" {
+    var empty = std.heap.FixedBufferAllocator.init(&.{});
+    var region = std.heap.ArenaAllocator.init(empty.allocator());
+    defer region.deinit();
+    var parent: Budget = .{ .backing = region.allocator(), .limit = 128 };
+    var child: Budget = .{ .backing = reclaimingAllocator(parent.allocator()), .limit = 128 };
+    try std.testing.expectError(error.OutOfMemory, child.create([16]u8));
+    try std.testing.expectEqual(@as(usize, 0), parent.live);
+    try std.testing.expectEqual(@as(usize, 0), child.live);
 }

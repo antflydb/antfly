@@ -60,6 +60,13 @@ pub const Context = struct {
         self.handle = handle orelse return error.StorageKernelFailure;
     }
 
+    /// The node runtime outlives this context and every attached owner.
+    pub fn ensureWithBackendRuntime(self: *Context, runtime: *@import("antfly_local_sources").storage_background_runtime.BackendRuntime, options: @import("kernel_runtime_services.zig").RuntimeRequest.Options) !void {
+        if (self.handle != null) return;
+        var request = try @import("kernel_runtime_services.zig").RuntimeRequest.init(runtime, options);
+        try self.ensureWithRuntime(request.request());
+    }
+
     pub fn ensureWithRuntime(self: *Context, request: @import("kernel_runtime_services.zig").Request) !void {
         if (self.handle != null) return;
         var handle: ?*anyopaque = null;
@@ -485,21 +492,27 @@ pub const Owner = struct {
         committed_effects_fn: ?abi.CommittedBatchEffectsFn,
         response: *Response,
     ) abi.Status {
+        return self.batchJsonWithCallbacksAndAdmissionStatus(table_name, request_json, dispatch_ctx, dispatch_fn, committed_effects_ctx, committed_effects_fn, null, response);
+    }
+
+    pub fn batchJsonWithCallbacksAndAdmissionStatus(self: *Owner, table_name: []const u8, request_json: []const u8, dispatch_ctx: ?*anyopaque, dispatch_fn: ?abi.DocumentChildRangeDispatchFn, committed_effects_ctx: ?*anyopaque, committed_effects_fn: ?abi.CommittedBatchEffectsFn, admission: ?*const @import("antfly_local_sources").common_read_admission.Port, response: *Response) abi.Status {
+        return self.batchJsonWithCallbacksAndAdmissionContextStatus(table_name, request_json, dispatch_ctx, dispatch_fn, committed_effects_ctx, committed_effects_fn, admission, response);
+    }
+
+    pub fn batchJsonWithCallbacksAndAdmissionContextStatus(self: *Owner, table_name: []const u8, request_json: []const u8, dispatch_ctx: ?*anyopaque, dispatch_fn: ?abi.DocumentChildRangeDispatchFn, committed_effects_ctx: ?*anyopaque, committed_effects_fn: ?abi.CommittedBatchEffectsFn, admission: ?*const anyopaque, response: *Response) abi.Status {
         response.* = .{};
         if ((dispatch_ctx == null) != (dispatch_fn == null)) return .invalid_argument;
         if ((committed_effects_ctx == null) != (committed_effects_fn == null)) return .invalid_argument;
-        return abi.antfly_storage_owner_batch_json(
-            self.handle,
-            &.{
-                .table_name = .fromSlice(table_name),
-                .request_json = .fromSlice(request_json),
-                .document_child_range_dispatch_ctx = dispatch_ctx,
-                .document_child_range_dispatch_fn = dispatch_fn,
-                .committed_batch_effects_ctx = committed_effects_ctx,
-                .committed_batch_effects_fn = committed_effects_fn,
-            },
-            &response.buffer,
-        );
+        const request: abi.BatchJsonOperationRequest = .{
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+            .document_child_range_dispatch_ctx = dispatch_ctx,
+            .document_child_range_dispatch_fn = dispatch_fn,
+            .committed_batch_effects_ctx = committed_effects_ctx,
+            .committed_batch_effects_fn = committed_effects_fn,
+        };
+        if (admission) |port| return abi.antfly_storage_owner_batch_json_with_admission(self.handle, &request, port, &response.buffer);
+        return abi.antfly_storage_owner_batch_json(self.handle, &request, &response.buffer);
     }
 
     pub fn replicatedBatchJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {

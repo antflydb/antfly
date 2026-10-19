@@ -13,6 +13,16 @@ class AntflyConnectionError(AntflyException):
     pass
 
 
+class ClientCapacityError(AntflyException):
+    """Local admission refused an operation before sending its HTTP request."""
+
+    request_sent = False
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"Client request admission refused: {reason}")
+
+
 class AntflyAuthError(AntflyException):
     """Raised when authentication fails."""
 

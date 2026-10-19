@@ -8093,8 +8093,11 @@ pub const IndexManager = struct {
     /// Quarantine an index whose persisted artifacts could not be opened:
     /// keep its config visible (catalog persistence, status, drop/recreate)
     /// while the runtime index stays absent, and record the load error.
-    /// Errors from an index open that indicate a transient read race rather
-    /// than persistent artifact damage: a read-only replica open can race
+    /// Errors from an index open that indicate transient read conditions or
+    /// admission pressure rather than persistent artifact damage. Memory
+    /// refusal must leave a read replica unpublished so a later request can
+    /// open it after pressure clears; it must not quarantine a healthy index.
+    /// A read-only replica open can race
     /// the writer's obsolete-run reclaim (FileNotFound after the manifest
     /// load), or table churn can invalidate the open mid-flight. On
     /// read-only opens these must propagate instead of quarantining — the
@@ -8109,7 +8112,12 @@ pub const IndexManager = struct {
     /// FileNotFound separately from UnsupportedVersion.
     fn indexOpenErrorIsTransientRead(err: anyerror) bool {
         return switch (err) {
-            error.FileNotFound, error.EndOfStream, error.TableReadChurn => true,
+            error.FileNotFound,
+            error.EndOfStream,
+            error.TableReadChurn,
+            error.OutOfMemory,
+            error.ResourceBudgetExceeded,
+            => true,
             else => false,
         };
     }
@@ -12034,6 +12042,7 @@ pub const IndexManager = struct {
             const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
             defer self.alloc.free(enrichment_data);
             try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+            try @import("../artifact_inventory.zig").requirePreparedCatalogUnchanged(&txn, enrichment_catalog_key, enrichment_data);
             try txn.put(enrichment_catalog_key, enrichment_data);
         }
         if (self.resolvers.items.len != resolver_checkpoint) {
@@ -12635,6 +12644,19 @@ pub const IndexManager = struct {
         updated,
         unchanged,
     };
+
+    /// Match the ordinary upsert's normalization without publishing or
+    /// detaching an inline-managed producer. Safe for idempotent DB refresh.
+    pub fn enrichmentConfigMatches(self: *IndexManager, cfg: types.EnrichmentConfig) !bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        var internal = try enrichmentFromPublic(self.alloc, cfg);
+        defer internal.deinit(self.alloc);
+        try validateEnrichmentConfig(self, internal);
+        const existing = self.getEnrichmentByName(internal.name) orelse return false;
+        if (existing.graph_inline_managed == true) return false;
+        return try internalEnrichmentConfigsEqual(self.alloc, existing.*, internal);
+    }
 
     pub fn upsertEnrichment(self: *IndexManager, store: anytype, cfg: types.EnrichmentConfig) !EnrichmentUpsertResult {
         self.catalog_mutex.lockExclusive();
@@ -14671,6 +14693,25 @@ pub const IndexManager = struct {
 
     pub fn count(self: *const IndexManager) u32 {
         return @intCast(self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len + self.graph_indexes.items.len + self.algebraic_indexes.items.len + self.status_only_index_configs.len);
+    }
+
+    /// Same eligibility as the portable target check, without cloning a
+    /// possibly large configuration merely to inspect its kind and name.
+    pub fn portableTargetIndexesAllowed(self: *const IndexManager) bool {
+        if (self.count() == 0) return true;
+        if (self.count() != 1) return false;
+        inline for (.{ self.text_indexes.items, self.dense_indexes.items, self.sparse_indexes.items, self.graph_indexes.items, self.algebraic_indexes.items }) |items| {
+            if (items.len == 1) return items[0].config.kind == .full_text and std.mem.eql(u8, items[0].config.name, "full_text_index_v0");
+        }
+        const cfg = self.status_only_index_configs[0];
+        return cfg.kind == .full_text and std.mem.eql(u8, cfg.name, "full_text_index_v0");
+    }
+
+    pub fn hasEnrichments(self: *const IndexManager) bool {
+        return self.enrichments.items.len != 0;
+    }
+    pub fn hasResolvers(self: *const IndexManager) bool {
+        return self.resolvers.items.len != 0;
     }
 
     pub fn listIndexesPublic(self: *const IndexManager, alloc: Allocator) ![]types.IndexConfig {
@@ -22486,6 +22527,19 @@ pub const IndexManager = struct {
     /// The caller holds catalog_mutex from before opening txn through commit
     /// and publication of the returned reader/envelope stamp.
     pub fn alignRowDerivedArtifactCatalogNoLock(self: *IndexManager, txn: anytype, expected: @import("../artifact_inventory.zig").Catalogs, configs: []const types.IndexConfig) !CatalogReaderStamp {
+        const inventory = @import("../artifact_inventory.zig");
+        try inventory.requirePreparedCatalogUnchanged(txn, index_catalog_key, expected.indexes);
+        try inventory.requirePreparedCatalogUnchanged(txn, enrichment_catalog_key, expected.enrichments);
+        try inventory.requirePreparedCatalogUnchanged(txn, resolver_catalog_key, expected.resolvers);
+        // An exact publication needs no reordering or mutation. Validate the
+        // in-memory definitions and load/repair state for every serving kind.
+        const actual = try inventory.catalogs(txn);
+        if (self.count() == configs.len and std.mem.eql(u8, actual.indexes, expected.indexes) and std.mem.eql(u8, actual.enrichments, expected.enrichments) and std.mem.eql(u8, actual.resolvers, expected.resolvers) and try self.matchesArtifactInventoryNoLock(expected)) {
+            return .{
+                .reader = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version),
+                .format = if (expected.resolvers.len == 0) 1 else try resolver_catalog.catalogReaderVersion(self.alloc, expected.resolvers),
+            };
+        }
         if (self.count() != configs.len or self.text_indexes.items.len + self.dense_indexes.items.len + self.sparse_indexes.items.len != configs.len or self.resolvers.items.len != 0 or self.failed_index_loads.count() != 0) return error.ArtifactCatalogDrift;
         const desired_format = if (expected.resolvers.len == 0) 1 else try resolver_catalog.catalogReaderVersion(self.alloc, expected.resolvers);
         const current_reader = try resolver_catalog.readMinimumReaderVersion(txn, resolver_catalog.supported_reader_version);
@@ -22574,6 +22628,11 @@ pub const IndexManager = struct {
     pub fn matchesArtifactInventory(self: *IndexManager, expected: @import("../artifact_inventory.zig").Catalogs) !bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
+        return self.matchesArtifactInventoryNoLock(expected);
+    }
+
+    /// Caller retains catalog ownership through this observation.
+    fn matchesArtifactInventoryNoLock(self: *IndexManager, expected: @import("../artifact_inventory.zig").Catalogs) !bool {
         if (self.failed_index_loads.count() != 0 or self.status_only_index_configs.len != 0) return false;
         var repairs = self.repair_unavailable_indexes.valueIterator();
         while (repairs.next()) |slot| if (slot.blocked()) return false;
@@ -22944,6 +23003,7 @@ pub const IndexManager = struct {
         const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, retained_producers);
         defer self.alloc.free(enrichment_data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+        try @import("../artifact_inventory.zig").requirePreparedCatalogUnchanged(&txn, enrichment_catalog_key, enrichment_data);
         try txn.put(enrichment_catalog_key, enrichment_data);
         // Allocate the complete post-commit catalog before crossing durability.
         var next_active: std.ArrayListUnmanaged(ResolverConfig) = .empty;
@@ -23102,6 +23162,7 @@ pub const IndexManager = struct {
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
+        try @import("../artifact_inventory.zig").requirePreparedCatalogUnchanged(&txn, enrichment_catalog_key, enrichment_data);
         try txn.put(enrichment_catalog_key, enrichment_data);
         const reader_version = try self.stampCatalogReaderVersion(&txn, resolver_data);
         const merge_data = try self.serializeResolverMerges(self.alloc);
@@ -48811,6 +48872,54 @@ test "ordered artifact inventory TTL replacement retains temporary envelope with
             try std.testing.expect(try manager.cancelGraphReplacement(&store, "new"));
             try std.testing.expectEqual(if (upgrade) @as(u32, 4) else baseline, try manager.authoritativeReaderVersion(&store));
             try Check.matches(&manager, &store);
+        }
+    }
+}
+
+test "read-only index memory refusal leaves healthy indexes retryable without quarantine" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    const configs = [_]types.IndexConfig{
+        .{ .name = "ft_title", .kind = .full_text, .config_json = "{\"field\":\"title\"}" },
+        .{ .name = "ft_body", .kind = .full_text, .config_json = "{\"field\":\"body\"}" },
+    };
+    {
+        var setup = try IndexManager.init(alloc, path);
+        defer setup.deinit();
+        setup.updateRange(.{ .start = "", .end = "" });
+        try setup.addAllNoBackfill(&store, &configs);
+    }
+    defer test_inject_index_open_error = null;
+    for ([_]?std.Io{ std.testing.io, null }) |scheduling_io| {
+        for ([_]usize{ 1, 2 }) |parallelism| {
+            for ([_]anyerror{ error.OutOfMemory, error.ResourceBudgetExceeded }) |refusal| {
+                var manager = try IndexManager.init(alloc, path);
+                defer manager.deinit();
+                manager.setIo(scheduling_io);
+                manager.load_parallelism = parallelism;
+                manager.updateRange(.{ .start = "", .end = "" });
+                test_inject_index_open_error = refusal;
+                try std.testing.expectError(refusal, manager.loadNoBackfill(&store));
+                try std.testing.expect(manager.textIndexEntry("ft_title") == null);
+                try std.testing.expect(manager.textIndexEntry("ft_body") == null);
+                try std.testing.expect(manager.loadFailure("ft_title") == null);
+                try std.testing.expect(manager.loadFailure("ft_body") == null);
+                test_inject_index_open_error = null;
+                // The exact manager and catalog can reopen after refusal;
+                // recovery needs neither a writer nor cache invalidation.
+                try manager.loadNoBackfill(&store);
+                try std.testing.expect(manager.textIndexEntry("ft_title") != null);
+                try std.testing.expect(manager.textIndexEntry("ft_body") != null);
+                try std.testing.expect(manager.loadFailure("ft_title") == null);
+                try std.testing.expect(manager.loadFailure("ft_body") == null);
+            }
         }
     }
 }

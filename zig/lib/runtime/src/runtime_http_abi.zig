@@ -114,6 +114,21 @@ pub const RequestBodySource = extern struct {
     context: ?*anyopaque = null,
     read_all: ?*const fn (?*anyopaque, *OptionalBytes) callconv(.c) CallbackStatus = null,
     streaming: u8 = 0,
+    read_all_controlled: ?*const fn (?*anyopaque, *OptionalBytes, *const RequestControl) callconv(.c) CallbackStatus = null,
+};
+
+pub const OptionalTimeout = extern struct {
+    milliseconds: u64 = 0,
+    present: u8 = 0,
+};
+
+/// Borrowed only until the synchronous transport callback returns, including
+/// its joined I/O monitors. Checks may run on a monitor and must never yield a
+/// CPU grant. No receiver may retain this view in a returned stream writer.
+pub const RequestControl = extern struct {
+    context: ?*anyopaque = null,
+    check: ?*const fn (?*anyopaque) callconv(.c) CallbackStatus = null,
+    remaining: ?*const fn (?*anyopaque, *OptionalTimeout) callconv(.c) CallbackStatus = null,
 };
 
 /// Transport-owned request lifetime state. The callback is the complete
@@ -146,6 +161,9 @@ pub const StreamSink = extern struct {
     /// caller clears them after its acknowledged worker call joins or fences.
     /// Transport monitors must never invoke these execution transitions.
     set_execution_wait: ?*const fn (?*anyopaque, ?*const ExecutionWait) callconv(.c) CallbackStatus = null,
+    start_controlled: ?*const fn (?*anyopaque, u16, Bytes, HeaderList, *const RequestControl) callconv(.c) CallbackStatus = null,
+    write_controlled: ?*const fn (?*anyopaque, Bytes, *const RequestControl) callconv(.c) CallbackStatus = null,
+    close_controlled: ?*const fn (?*anyopaque, *const RequestControl) callconv(.c) CallbackStatus = null,
 };
 
 pub const HttpResponseView = extern struct {
@@ -164,4 +182,6 @@ test "runtime HTTP values retain C layout" {
     try std.testing.expectEqual(.@"extern", @typeInfo(CancellationView).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(RequestBodySource).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(StreamSink).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(RequestControl).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(OptionalTimeout).@"struct".layout);
 }

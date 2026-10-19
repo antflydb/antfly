@@ -2714,6 +2714,7 @@ pub const LoadedModel = struct {
                 gpt_config,
                 kv_dtype,
                 self.shared_moe_cache,
+                self.prompt_prefix_cache.device_memory_budget,
             );
         }
         if (!graph_mod.live_model_executor.supportsSession(self.session)) return null;
@@ -2723,6 +2724,7 @@ pub const LoadedModel = struct {
             gpt_config,
             kv_dtype,
             self.shared_moe_cache,
+            self.prompt_prefix_cache.device_memory_budget,
         );
     }
 
@@ -4205,6 +4207,7 @@ pub const ModelManager = struct {
         allocator: std.mem.Allocator,
         admission: runtime.tier.memory.AdmissionController = .{},
         admission_limits: runtime.tier.memory.Limits = .{},
+        device_admission_limits: runtime.tier.memory.Limits = .{},
         tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
         external_tokenizer_cache_budget: ?hf_tokenizer.HfTokenizer.BpeCacheResourceBudget = null,
         tokenizer_cache_budget_shards: [tokenizer_cache_budget_shard_count]TokenizerCacheBudgetShard =
@@ -4213,6 +4216,157 @@ pub const ModelManager = struct {
         closing: std.atomic.Value(bool) = .init(false),
         managed_mutex: std.atomic.Mutex = .unlocked,
         managed_head: ?*ManagedTokenizerLifetime = null,
+
+        const DeviceCredit = struct {
+            domain: *ResourceDomain,
+            allocator: std.mem.Allocator,
+            lease: runtime.tier.memory.AdmissionLease,
+
+            fn release(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const domain = self.domain;
+                const allocator = self.allocator;
+                self.lease.release();
+                allocator.destroy(self);
+                domain.release();
+            }
+        };
+
+        fn acquireDeviceCredit(raw: *anyopaque, allocator: std.mem.Allocator, bytes: usize) !runtime.kv.device_memory.Credit {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.retain()) return error.ResourceTemporarilyUnavailable;
+            errdefer self.release();
+            const credit = try allocator.create(DeviceCredit);
+            errdefer allocator.destroy(credit);
+            const lease = try self.admission.tryAcquire(.gpu, self.device_admission_limits, .{ .backend_kv_bytes = bytes }, false);
+            credit.* = .{ .domain = self, .allocator = allocator, .lease = lease };
+            return .{ .context = credit, .release_fn = DeviceCredit.release };
+        }
+
+        fn deviceBudget(self: *@This(), allocator: std.mem.Allocator) !runtime.kv.device_memory.Budget {
+            const budget: runtime.kv.device_memory.Budget = .{
+                .context = self,
+                .allocator = allocator,
+                .retain_context = retainContext,
+                .release_context = releaseContext,
+                .acquire = acquireDeviceCredit,
+            };
+            return budget.clone();
+        }
+
+        /// Prepaid KV belongs to this pool, never to the model's weight lease.
+        /// Each physical allocation receives an independently registered lease.
+        const DeviceFundingPool = struct {
+            domain: *ResourceDomain,
+            allocator: std.mem.Allocator,
+            limits: runtime.tier.memory.Limits,
+            available: runtime.tier.memory.AdmissionLease,
+            mutex: std.atomic.Mutex = .unlocked,
+            references: usize = 1,
+            capabilities: usize = 1,
+            closed: bool = false,
+
+            const PhysicalCredit = struct {
+                pool: *DeviceFundingPool,
+                allocator: std.mem.Allocator,
+                lease: runtime.tier.memory.AdmissionLease,
+
+                fn release(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const pool = self.pool;
+                    spinLock(&pool.mutex);
+                    // A release means allocation failed or physical free was
+                    // confirmed. Refusal to refund may safely retire this credit
+                    // directly; later growth must acquire the missing capacity.
+                    if (!pool.closed) self.lease.transferCreditTo(&pool.available, self.lease.amounts) catch {};
+                    self.lease.release();
+                    const allocator = self.allocator;
+                    allocator.destroy(self);
+                    pool.references -= 1;
+                    const destroy_pool = pool.references == 0;
+                    pool.mutex.unlock();
+                    if (destroy_pool) pool.destroy();
+                }
+            };
+
+            fn destroy(self: *@This()) void {
+                std.debug.assert(self.closed and self.capabilities == 0 and self.available.controller == null);
+                const domain = self.domain;
+                self.allocator.destroy(self);
+                domain.release();
+            }
+
+            fn closeLocked(self: *@This()) void {
+                if (self.closed) return;
+                self.closed = true;
+                self.available.release();
+            }
+
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                spinLock(&self.mutex);
+                defer self.mutex.unlock();
+                self.closeLocked();
+            }
+
+            fn retain(raw: *anyopaque) bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (!self.mutex.tryLock()) return false;
+                defer self.mutex.unlock();
+                if (self.closed or self.domain.closing.load(.acquire) or self.references == std.math.maxInt(usize)) return false;
+                self.references += 1;
+                self.capabilities += 1;
+                return true;
+            }
+
+            fn release(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                spinLock(&self.mutex);
+                std.debug.assert(self.capabilities != 0);
+                self.capabilities -= 1;
+                self.references -= 1;
+                if (self.capabilities == 0) self.closeLocked();
+                const destroy_pool = self.references == 0;
+                self.mutex.unlock();
+                if (destroy_pool) self.destroy();
+            }
+
+            fn acquire(raw: *anyopaque, allocator: std.mem.Allocator, bytes: usize) !runtime.kv.device_memory.Credit {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                // All bookkeeping is ready before root ownership moves.
+                const credit = try allocator.create(PhysicalCredit);
+                errdefer allocator.destroy(credit);
+                if (!self.mutex.tryLock()) return error.ResourceTemporarilyUnavailable;
+                defer self.mutex.unlock();
+                if (self.closed or self.domain.closing.load(.acquire)) return error.ResourceOwnerShuttingDown;
+                if (self.references == std.math.maxInt(usize)) return error.ResourceTemporarilyUnavailable;
+                const prepaid = @min(bytes, self.available.amounts.backend_kv_bytes);
+                // Only incremental capacity is newly acquired. Empty leases are
+                // real registered identities, prepared before prepaid transfer.
+                var lease = try self.domain.admission.tryAcquire(.gpu, self.limits, .{ .backend_kv_bytes = bytes - prepaid }, false);
+                errdefer lease.release();
+                if (prepaid != 0) try self.available.transferCreditTo(&lease, .{ .backend_kv_bytes = prepaid });
+                credit.* = .{ .pool = self, .allocator = allocator, .lease = lease };
+                self.references += 1;
+                return .{ .context = credit, .release_fn = PhysicalCredit.release };
+            }
+        };
+
+        fn prepaidDeviceBudget(self: *@This(), allocator: std.mem.Allocator, source: *runtime.tier.memory.AdmissionLease, limits: runtime.tier.memory.Limits, bytes: usize) !runtime.kv.device_memory.Budget {
+            if (!self.retain()) return error.ResourceTemporarilyUnavailable;
+            errdefer self.release();
+            const pool = try allocator.create(DeviceFundingPool);
+            errdefer allocator.destroy(pool);
+            var available = try self.admission.tryAcquire(.gpu, limits, .{}, false);
+            errdefer available.release();
+            if (bytes != 0) try source.transferCreditTo(&available, .{ .backend_kv_bytes = bytes });
+            // The prepaid floor stays charged just as the original resident
+            // reservation did; physical consumers partition settled ownership.
+            // If settling is refused, this load attempt unwinds both owners.
+            try available.retain(available.amounts);
+            pool.* = .{ .domain = self, .allocator = allocator, .limits = limits, .available = available };
+            return .{ .context = pool, .allocator = allocator, .retain_context = DeviceFundingPool.retain, .release_context = DeviceFundingPool.release, .close_context = DeviceFundingPool.close, .acquire = DeviceFundingPool.acquire };
+        }
 
         fn create(allocator: std.mem.Allocator) !*@This() {
             const lifetime = try allocator.create(@This());
@@ -4357,6 +4511,22 @@ pub const ModelManager = struct {
         }
     };
 
+    fn constructionDeviceBudget(
+        self: *ModelManager,
+        backend: backends.BackendType,
+        source: ?*runtime.tier.memory.AdmissionLease,
+        limits: runtime.tier.memory.Limits,
+        prepaid_kv_bytes: usize,
+    ) !?runtime.kv.device_memory.Budget {
+        if (backend != .metal) return null;
+        const domain = self.resource_domain orelse return null;
+        const allocator = self.prompt_cache_allocator orelse self.allocator;
+        return if (source) |lease|
+            try domain.prepaidDeviceBudget(allocator, lease, limits, prepaid_kv_bytes)
+        else
+            try domain.deviceBudget(allocator);
+    }
+
     const ManagedTokenizerLifetime = struct {
         lifetime: *ResourceDomain,
         resource_lease: ?runtime.tier.memory.AdmissionLease = null,
@@ -4379,6 +4549,9 @@ pub const ModelManager = struct {
     };
 
     allocator: std.mem.Allocator,
+    /// Stable admitted allocator owned by the host/child through model teardown.
+    /// Cache pool buffers retain its physical credit across eviction and reuse.
+    prompt_cache_allocator: ?std.mem.Allocator = null,
     session_manager: backends.SessionManager,
     /// Null for diagnostic/offline CLIs. Serving Nodes set this before any model load.
     serving_policy: ?model_compatibility.Policy = null,
@@ -4430,6 +4603,26 @@ pub const ModelManager = struct {
     resource_domain: ?*ResourceDomain = null,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe_config: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
+
+    pub fn hasPromptCacheDeviceBudget(self: *const ModelManager) bool {
+        return self.resource_domain != null;
+    }
+
+    pub fn initPromptCache(self: *const ModelManager) !runtime.kv.prompt_cache.PromptPrefixCache {
+        const allocator = self.prompt_cache_allocator orelse self.allocator;
+        var cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
+        if (self.resource_domain) |domain| cache.device_memory_budget = try domain.deviceBudget(allocator);
+        return cache;
+    }
+
+    /// Publication can be rejected after cache construction. Keep its owned
+    /// budget under a rollback owner until the final construction check passes.
+    pub fn initPromptCacheForPublication(self: *const ModelManager, control: ?InferenceExecutionControl) !runtime.kv.prompt_cache.PromptPrefixCache {
+        var cache = try self.initPromptCache();
+        errdefer cache.deinit();
+        if (control) |active| try active.update(.loading_model, 4, 4);
+        return cache;
+    }
 
     pub fn init(allocator: std.mem.Allocator, session_manager: backends.SessionManager) ModelManager {
         return .{
@@ -4529,6 +4722,10 @@ pub const ModelManager = struct {
             self.forced_run_admission_denials_for_testing,
         );
         domain.admission_limits = self.admissionLimitsForBackend(.{ .backend = .native });
+        domain.device_admission_limits = runtime.tier.memory.applyLimitOverrides(
+            runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(.gpu, self.process_memory_limit_bytes),
+            self.admission_limit_overrides,
+        );
     }
 
     fn admissionController(
@@ -6092,6 +6289,7 @@ pub const ModelManager = struct {
             defer if (resource_lease) |*lease| lease.release();
             var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
             var admission_limits = runtime.tier.memory.Limits{};
+            var partitioned_device_kv_bytes: usize = 0;
             if (self.admission_enabled) {
                 const artifact_bytes = artifact_estimate.encodedBytes() catch |err| {
                     rememberPreferredLoadError(&first_err, err);
@@ -6128,6 +6326,18 @@ pub const ModelManager = struct {
                 };
             }
 
+            const construction_device_budget = self.constructionDeviceBudget(
+                backend,
+                if (resource_lease) |*lease| lease else null,
+                admission_limits,
+                resident_amounts.backend_kv_bytes,
+            ) catch |err| {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
+            };
+            if (construction_device_budget != null and resource_lease != null)
+                partitioned_device_kv_bytes = resident_amounts.backend_kv_bytes;
+            defer if (construction_device_budget) |budget| budget.deinit();
             var construction = enterSessionConstruction(control, backend_runtime) catch |err| {
                 if (err == error.ProcessIsolationRequired) {
                     // An in-process caller can still use a later cooperative
@@ -6147,9 +6357,10 @@ pub const ModelManager = struct {
                 return err;
             };
             defer if (close_protection) |protection| protection.release();
-            if (session_manager.loadModelWithImportedOnnxContext(
+            if (session_manager.loadModelWithImportedOnnxContextAndDeviceBudget(
                 model_path,
                 shared_backend_ctx,
+                construction_device_budget,
             )) |loaded_session| {
                 var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
                 std.debug.assert(loaded.session.close_protection == null);
@@ -6158,7 +6369,11 @@ pub const ModelManager = struct {
                 resource_lease = null;
                 defer loaded.deinit();
                 if (control) |active| try active.check();
-                if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
+                if (loaded.resource_lease) |*lease| {
+                    var source_resident = resident_amounts;
+                    source_resident.backend_kv_bytes -= partitioned_device_kv_bytes;
+                    try lease.retain(source_resident);
+                }
                 if (self.admission_enabled) {
                     const session_admission_limits = self.admissionLimitsForSession(
                         backend_runtime,
@@ -7968,8 +8183,18 @@ pub const ModelManager = struct {
         errdefer if (model_storage_owned) self.allocator.destroy(model);
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
         if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
+        const chunk_planning = try chunkPlanningSnapshot(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision);
+        var prompt_prefix_cache = try self.initPromptCacheForPublication(control);
+        var prompt_prefix_cache_owned = true;
+        errdefer if (prompt_prefix_cache_owned) prompt_prefix_cache.deinit();
+        // Constructor/provider and later physical KV growth use the exact same
+        // session pool; a process-wide capability cannot replace its funding.
+        if (try session_factory.cloneSessionDeviceMemoryBudget(session)) |budget| {
+            if (prompt_prefix_cache.device_memory_budget) |previous| previous.deinit();
+            prompt_prefix_cache.device_memory_budget = budget;
+        }
         model.* = .{
-            .chunk_planning = try chunkPlanningSnapshot(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision),
+            .chunk_planning = chunk_planning,
             .resolution_revision = resolution_revision,
             .embedding_identity = if (embedding_snapshot) |snapshot| snapshot.digest else null,
             .embedding_asset_signature = if (embedding_snapshot) |snapshot| snapshot.signature else null,
@@ -7988,7 +8213,7 @@ pub const ModelManager = struct {
             .chat_template_failed = chat_template_failed,
             .shared_moe_cache = shared_moe_cache,
             .shared_prefetch = shared_prefetch,
-            .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(self.allocator),
+            .prompt_prefix_cache = prompt_prefix_cache,
             .native_generate_coordinator = native_generate_coordinator,
             .native_generation_graph_cache = graph_mod.cache.GraphCache.init(self.allocator),
             .vision_session = null,
@@ -8001,11 +8226,6 @@ pub const ModelManager = struct {
             .resource_lease = loaded_session.resource_lease,
         };
         model.session.execution_gate = &model.target_inference_run_lock;
-
-        // Keep publication behind the same cooperative boundary as expensive
-        // construction. An abandoned manager task should release its fully
-        // built model through the armed errdefers, not briefly expose it.
-        if (control) |active| try active.update(.loading_model, 4, 4);
 
         // The fully initialized model is now the sole owner. Disarm every
         // construction errdefer before publishLoadedModel takes responsibility
@@ -8020,6 +8240,7 @@ pub const ModelManager = struct {
         shared_prefetch = null;
         native_generate_coordinator = null;
         owned_model_dir_owned = false;
+        prompt_prefix_cache_owned = false;
         model_storage_owned = false;
         _ = loaded_session.take();
         model.kernel_jit_profile_bundle = qualified_profile_bundle;
@@ -8031,6 +8252,15 @@ pub const ModelManager = struct {
             model.deinit();
             self.allocator.destroy(model);
         };
+
+        // Bind before prewarm can allocate the first KV buffer. This only
+        // attaches metadata under the provider lease; it starts no device work.
+        if (build_options.enable_metal and session.backend() == .metal and
+            session_factory.getGptConfig(session) != null)
+        {
+            if (model.prompt_prefix_cache.device_memory_budget) |budget|
+                try session_factory.configureSessionDeviceMemoryBudget(session, budget);
+        }
 
         // Publication performs max-loaded eviction. When the cache is already
         // full, prewarming first makes the incoming runtime compete with the
@@ -9450,6 +9680,311 @@ const ComponentArtifactEstimate = union(enum) {
     }
 };
 
+test "prepaid device funding partitions full capacity and survives physical aliases and owner closure" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const memory = runtime.tier.memory;
+    const bridge = @import("../backends/metal_device_credit.zig");
+    const allocator = std.testing.allocator;
+    const domain = try ModelManager.ResourceDomain.create(allocator);
+    var owner_live = true;
+    defer if (owner_live) {
+        domain.close();
+        domain.release();
+    };
+    const limits: memory.Limits = .{ .backend_limit_bytes = 100 };
+    var source = try domain.admission.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 60, .backend_kv_bytes = 40 }, false);
+    defer source.release();
+    const budget = try domain.prepaidDeviceBudget(allocator, &source, limits, 40);
+    var capability_live = true;
+    defer if (capability_live) budget.deinit();
+    try std.testing.expectEqual(@as(usize, 0), source.amounts.backend_kv_bytes);
+    try source.retain(.{ .backend_weight_bytes = 60 });
+    try std.testing.expectEqual(@as(usize, 100), domain.admission.snapshot().backendTotalBytes());
+    var port = try bridge.create(budget);
+    var port_live = true;
+    defer if (port_live) port.release_context(port.context);
+    const before = bridge.termite_metal_device_credit_fixture_allocations();
+    // Failed physical allocation returns prepaid credit to the same pool.
+    try std.testing.expect(bridge.termite_metal_device_credit_fixture_buffer(&port, 40, 1) == null);
+    try std.testing.expectEqual(before + 1, bridge.termite_metal_device_credit_fixture_allocations());
+    try std.testing.expectEqual(@as(usize, 100), domain.admission.snapshot().backendTotalBytes());
+    const buffer = bridge.termite_metal_device_credit_fixture_buffer(&port, 40, 0).?;
+    var buffer_refs: usize = 1;
+    defer while (buffer_refs != 0) : (buffer_refs -= 1) bridge.termite_metal_device_credit_fixture_release(buffer);
+    bridge.termite_metal_device_credit_fixture_retain(buffer);
+    buffer_refs += 1;
+    // Full-capacity transfer succeeds; one extra byte refuses before allocation.
+    try std.testing.expect(bridge.termite_metal_device_credit_fixture_buffer(&port, 1, 0) == null);
+    try std.testing.expectEqual(before + 2, bridge.termite_metal_device_credit_fixture_allocations());
+    bridge.termite_metal_device_credit_fixture_release(buffer);
+    buffer_refs -= 1;
+    try std.testing.expectEqual(@as(usize, 100), domain.admission.snapshot().backendTotalBytes());
+    // Owner closure cannot refund the alias's still-live physical allocation.
+    budget.close();
+    try std.testing.expectError(error.ResourceOwnerShuttingDown, budget.reserve(0));
+    port.release_context(port.context);
+    port_live = false;
+    budget.deinit();
+    capability_live = false;
+    source.release();
+    try std.testing.expectEqual(@as(usize, 40), domain.admission.snapshot().backend_kv_bytes);
+    domain.close();
+    domain.release();
+    owner_live = false;
+    // The final alias owns the pool/domain independently of model weights.
+    bridge.termite_metal_device_credit_fixture_release(buffer);
+    buffer_refs -= 1;
+}
+
+test "prepaid device funding refunds incremental growth and releases unused floor on close" {
+    const memory = runtime.tier.memory;
+    const domain = try ModelManager.ResourceDomain.create(std.testing.allocator);
+    defer {
+        domain.close();
+        domain.release();
+    }
+    const limits: memory.Limits = .{ .backend_limit_bytes = 100 };
+    var source = try domain.admission.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 20, .backend_kv_bytes = 30 }, false);
+    defer source.release();
+    const budget = try domain.prepaidDeviceBudget(std.testing.allocator, &source, limits, 30);
+    defer budget.deinit();
+    const first = try budget.reserve(50);
+    const second = try budget.reserve(30);
+    try std.testing.expectEqual(@as(usize, 100), domain.admission.snapshot().backendTotalBytes());
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, budget.reserve(1));
+    first.release();
+    second.release();
+    // Both incremental and prepaid capacity are reusable without new admission.
+    const reused = try budget.reserve(80);
+    reused.release();
+    try std.testing.expectEqual(@as(usize, 80), domain.admission.snapshot().backend_kv_bytes);
+    budget.close();
+    budget.close();
+    try std.testing.expectEqual(@as(usize, 0), domain.admission.snapshot().backend_kv_bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, budget.clone());
+    try std.testing.expectEqual(@as(usize, 20), source.amounts.backend_weight_bytes);
+}
+
+test "prepaid device funding metadata refusal and contention preserve prepaid ownership" {
+    const memory = runtime.tier.memory;
+    const domain = try ModelManager.ResourceDomain.create(std.testing.allocator);
+    defer {
+        domain.close();
+        domain.release();
+    }
+    const limits: memory.Limits = .{ .backend_limit_bytes = 40 };
+    var source = try domain.admission.tryAcquire(.gpu, limits, .{ .backend_kv_bytes = 40 }, false);
+    defer source.release();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, domain.prepaidDeviceBudget(failing.allocator(), &source, limits, 40));
+    try std.testing.expectEqual(@as(usize, 40), source.amounts.backend_kv_bytes);
+    const budget = try domain.prepaidDeviceBudget(std.testing.allocator, &source, limits, 40);
+    defer budget.deinit();
+    var denied = budget;
+    denied.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, denied.reserve(40));
+    const pool: *ModelManager.ResourceDomain.DeviceFundingPool = @ptrCast(@alignCast(budget.context));
+    spinLock(&pool.mutex);
+    const refused = budget.reserve(1);
+    pool.mutex.unlock();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, refused);
+    const credit = try budget.reserve(40);
+    credit.release();
+    try std.testing.expectEqual(@as(usize, 40), domain.admission.snapshot().backend_kv_bytes);
+}
+
+test "prepaid device funding external transfer refusal preserves live owners and confirmed free retires safely" {
+    const memory = runtime.tier.memory;
+    const Ledger = struct {
+        records: [16]?memory.AdmissionAmounts = @splat(null),
+        next: usize = 1,
+        used: usize = 0,
+        allow_transfer: bool = true,
+        fn reserve(raw: *anyopaque, amounts: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = amounts.backendTotalBytes();
+            if (bytes > 100 - self.used or self.next == self.records.len) return error.ResourceTemporarilyUnavailable;
+            const id = self.next;
+            self.next += 1;
+            self.records[id] = amounts;
+            self.used += bytes;
+            return id;
+        }
+        fn retain(raw: *anyopaque, id: usize, amounts: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const previous = self.records[id].?;
+            self.used -= previous.backendTotalBytes() - amounts.backendTotalBytes();
+            self.records[id] = amounts;
+        }
+        fn release(raw: *anyopaque, id: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.used -= self.records[id].?.backendTotalBytes();
+            self.records[id] = null;
+        }
+        fn transfer(raw: *anyopaque, source: usize, destination: usize, amounts: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.allow_transfer) return error.ResourceTemporarilyUnavailable;
+            self.records[source].?.backend_kv_bytes -= amounts.backend_kv_bytes;
+            self.records[destination].?.backend_kv_bytes += amounts.backend_kv_bytes;
+        }
+    };
+    var ledger: Ledger = .{};
+    const domain = try ModelManager.ResourceDomain.create(std.testing.allocator);
+    defer {
+        domain.close();
+        domain.release();
+    }
+    try domain.admission.configureResourceBudget(.{ .context = &ledger, .try_reserve = Ledger.reserve, .retain = Ledger.retain, .release = Ledger.release, .transfer = Ledger.transfer });
+    const limits: memory.Limits = .{ .backend_limit_bytes = 100 };
+    var source = try domain.admission.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 60, .backend_kv_bytes = 40 }, false);
+    defer source.release();
+    ledger.allow_transfer = false;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, domain.prepaidDeviceBudget(std.testing.allocator, &source, limits, 40));
+    try std.testing.expectEqual(@as(usize, 40), source.amounts.backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 100), ledger.used);
+    ledger.allow_transfer = true;
+    const budget = try domain.prepaidDeviceBudget(std.testing.allocator, &source, limits, 40);
+    defer budget.deinit();
+    ledger.allow_transfer = false;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, budget.reserve(40));
+    try std.testing.expectEqual(@as(usize, 100), ledger.used);
+    ledger.allow_transfer = true;
+    const credit = try budget.reserve(40);
+    // A refused refund never abandons a token for a physically freed buffer.
+    ledger.allow_transfer = false;
+    credit.release();
+    try std.testing.expectEqual(@as(usize, 60), ledger.used);
+    ledger.allow_transfer = true;
+    const retry = try budget.reserve(40);
+    retry.release();
+    try std.testing.expectEqual(@as(usize, 100), ledger.used);
+    budget.close();
+    source.release();
+    try std.testing.expectEqual(@as(usize, 0), ledger.used);
+    for (ledger.records) |record| try std.testing.expect(record == null);
+}
+
+test "prepaid device funding concurrent physical retirement and capability closure preserve shared ownership" {
+    const memory = runtime.tier.memory;
+    const domain = try ModelManager.ResourceDomain.create(std.testing.allocator);
+    defer {
+        domain.close();
+        domain.release();
+    }
+    const limits: memory.Limits = .{ .backend_limit_bytes = 100 };
+    var source = try domain.admission.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 60, .backend_kv_bytes = 40 }, false);
+    defer source.release();
+    const budget = try domain.prepaidDeviceBudget(std.testing.allocator, &source, limits, 40);
+    var capability_live = true;
+    defer if (capability_live) budget.deinit();
+    const Borrower = struct {
+        fn retire(start: *std.atomic.Value(bool), capability: runtime.kv.device_memory.Budget, credit: runtime.kv.device_memory.Credit) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            credit.release();
+            capability.deinit();
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var threads: [4]std.Thread = undefined;
+    var spawned: usize = 0;
+    // A spawn failure must also release already-started owners and join them.
+    defer {
+        start.store(true, .release);
+        for (threads[0..spawned]) |thread| thread.join();
+    }
+    for (&threads) |*thread| {
+        const credit = try budget.reserve(10);
+        errdefer credit.release();
+        const capability = try budget.clone();
+        errdefer capability.deinit();
+        thread.* = try std.Thread.spawn(.{}, Borrower.retire, .{ &start, capability, credit });
+        spawned += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 100), domain.admission.snapshot().backendTotalBytes());
+    start.store(true, .release);
+    // Refunding a confirmed physical free may race closure of the available
+    // owner. Either ordering retires the same total exactly once.
+    budget.close();
+    budget.deinit();
+    capability_live = false;
+    for (threads[0..spawned]) |thread| thread.join();
+    spawned = 0;
+    try std.testing.expectEqual(@as(usize, 0), domain.admission.snapshot().backend_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 60), domain.admission.snapshot().backend_weight_bytes);
+    source.release();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, domain.admission.snapshot());
+}
+
+test "prepaid device funding constructor pressure preserves preferred backend fallback" {
+    const allocator = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, allocator);
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var manager = ModelManager.init(allocator, .{
+        .allocator = allocator,
+        .preferred_backends = &.{ .metal, .native },
+        .process_termination_available = false,
+    });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 128 * 1024 * 1024, .backend_limit_bytes = 128 * 1024 * 1024 });
+    try manager.ensureResourceOwnerReady();
+    const Owner = struct {
+        active: [16]bool = @splat(false),
+        next: usize = 1,
+        refused_destinations: usize = 0,
+        fn reserve(raw: *anyopaque, amounts: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.meta.eql(amounts, runtime.tier.memory.AdmissionAmounts{})) {
+                self.refused_destinations += 1;
+                return error.ResourceTemporarilyUnavailable;
+            }
+            if (self.next == self.active.len) return error.ResourceTemporarilyUnavailable;
+            const token = self.next;
+            self.next += 1;
+            self.active[token] = true;
+            return token;
+        }
+        fn retain(_: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {}
+        fn release(raw: *anyopaque, token: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active[token]);
+            self.active[token] = false;
+        }
+    };
+    var owner: Owner = .{};
+    try manager.admissionController().configureResourceBudget(.{ .context = &owner, .try_reserve = Owner.reserve, .retain = Owner.retain, .release = Owner.release });
+    var man = try manifest_mod.loadFromDir(allocator, root);
+    defer man.deinit();
+    inline for (.{ false, true }) |component| {
+        var loaded = if (component)
+            try manager.loadManagedSessionWithAdmission(root, &.{ .metal, .native }, null, .{})
+        else
+            try loadSessionForPreferredBackends(&manager, &.{ .metal, .native }, root, man, &manager.session_manager, .{});
+        try std.testing.expectEqual(backends.BackendType.native, loaded.session.backend());
+        loaded.deinit();
+        try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
+        for (owner.active) |active| try std.testing.expect(!active);
+    }
+    try std.testing.expectEqual(@as(usize, 2), owner.refused_destinations);
+}
+
+test "prepaid device funding distinguishes scratch from KV for the same opaque context" {
+    const domain = try ModelManager.ResourceDomain.create(std.testing.allocator);
+    defer {
+        domain.close();
+        domain.release();
+    }
+    const budget = try domain.deviceBudget(std.testing.allocator);
+    defer budget.deinit();
+    var scratch = budget;
+    scratch.family = .scratch;
+    try std.testing.expect(!budget.sameOwner(scratch));
+    try std.testing.expectError(error.MetalDeviceBudgetOwnershipConflict, @import("../backends/metal_device_credit.zig").create(scratch));
+}
+
 test "tokenizer admission reserves parse peak and retains live structures" {
     const encoded: usize = 2 * 1024 * 1024;
     const plan = try tokenizerAdmissionPlan(encoded, .huggingface);
@@ -9973,6 +10508,7 @@ fn loadSessionForPreferredBackends(
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
         var serving_floor: ?runtime.tier.memory.Limits = null;
+        var partitioned_device_kv_bytes: usize = 0;
         if (manager.admission_enabled) {
             const admission_plan = estimateModelLoadAdmission(
                 model_dir,
@@ -10017,6 +10553,18 @@ fn loadSessionForPreferredBackends(
                 continue;
             };
         }
+        const construction_device_budget = manager.constructionDeviceBudget(
+            backend,
+            if (resource_lease) |*lease| lease else null,
+            admission_limits,
+            resident_amounts.backend_kv_bytes,
+        ) catch |err| {
+            rememberPreferredLoadError(&first_err, err);
+            continue;
+        };
+        if (construction_device_budget != null and resource_lease != null)
+            partitioned_device_kv_bytes = resident_amounts.backend_kv_bytes;
+        defer if (construction_device_budget) |budget| budget.deinit();
         var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
             if (err == error.ProcessIsolationRequired) {
                 rememberPreferredLoadError(&first_err, err);
@@ -10033,7 +10581,7 @@ fn loadSessionForPreferredBackends(
             return err;
         };
         defer if (close_protection) |protection| protection.release();
-        if (backend_session_manager.loadModel(candidate_path)) |loaded_session| {
+        if (backend_session_manager.loadModelWithDeviceMemoryBudget(candidate_path, construction_device_budget)) |loaded_session| {
             var loaded = ManagedSession{ .session = loaded_session, .resource_lease = resource_lease };
             std.debug.assert(loaded.session.close_protection == null);
             loaded.session.close_protection = close_protection;
@@ -10066,7 +10614,11 @@ fn loadSessionForPreferredBackends(
             // keeping the construction peak leased until preparation drains.
             try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
             try session_factory.prepareLayaResident(loaded.session, control);
-            if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
+            if (loaded.resource_lease) |*lease| {
+                var source_resident = resident_amounts;
+                source_resident.backend_kv_bytes -= partitioned_device_kv_bytes;
+                try lease.retain(source_resident);
+            }
             return loaded.take();
         } else |err| {
             std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });

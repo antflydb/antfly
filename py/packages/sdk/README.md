@@ -72,7 +72,46 @@ results = client.query(
 
 # Get specific record
 user = client.get(table="users", key="user:1")
+
+client.close()
 ```
+
+Reuse a client across requests to share its HTTP connection pool. A context
+manager closes the pool when the scope exits, including when an exception occurs:
+
+```python
+with AntflyClient(base_url="http://localhost:8080") as client:
+    tables = client.list_tables()
+```
+
+Each client admits up to 100 HTTP requests at once and retains up to 100 waiting
+callers in FIFO order. Local waiting is limited to one second and the remaining
+request timeout. Configure these limits for the application's concurrency:
+
+```python
+with AntflyClient(
+    base_url="http://localhost:8080",
+    max_concurrent_requests=16,
+    max_queued_requests=32,
+    max_queue_wait=0.25,
+    timeout=10,
+) as client:
+    tables = client.list_tables()
+```
+
+Set `max_queued_requests=0` or `max_queue_wait=0` for immediate refusal when all
+request slots are occupied. `ClientCapacityError.reason` identifies `queue_full`,
+`wait_timeout`, or `deadline_exceeded`; `request_sent` is `False`. An admitted
+request is sent once. Queue waiting and deferred write encoding reduce the
+remaining HTTPX I/O timeouts. These phase timeouts also apply while reading a response; server query
+deadlines and cancellation have their own lifecycle.
+
+A response holds its request slot through body consumption and cleanup.
+`chunk_and_embed()` and `chunk_and_embed_stream()` share the same admission owner
+as database and other inference operations. Keep `generate_stream()` and
+`chunk_and_embed_stream()` contexts open only while consuming their streams.
+Closing the client wakes waiting callers and closes the shared connection pool. These limits
+apply to one client instance; the server enforces its own execution policy.
 
 ## Features
 

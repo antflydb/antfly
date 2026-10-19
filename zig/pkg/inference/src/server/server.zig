@@ -127,9 +127,11 @@ pub fn installHttpExecutionControl(ctx: *httpx.Context, control: *const Inferenc
 }
 
 fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
+    const context_deadline = ctx.nativeDeadlineInClock(platform.time.monotonicNs);
     if (ctx.getData(borrowed_http_control_key)) |raw| {
         const borrowed: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
         var control = borrowed.*;
+        if (context_deadline) |deadline| control.deadline_ns = @min(control.deadline_ns orelse deadline, deadline);
         if (control.hard_cancellation == null) {
             if (node.hard_cancellation_watchdog) |watchdog| control.hard_cancellation = watchdog.boundary();
         }
@@ -149,7 +151,7 @@ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExec
     return .{
         .io = ctx.io,
         .native_call_policy = node.session_manager.native_call_policy,
-        .deadline_ns = ctx.application_deadline_ns,
+        .deadline_ns = context_deadline,
         .cancellation_grace_ns = native_call_cancellation_grace_ns,
         .ptr = ctx,
         .check_fn = Check.check,
@@ -1280,6 +1282,10 @@ pub const NodeConfig = struct {
     executor_microbatch_max_wait_us: u64 = 200,
     kernel_jit: graph_mod.kernel_jit.Config = .{},
     prompt_cache: PromptCacheConfig = .{},
+    /// Physical host cache buffers use this allocator; its owner outlives models.
+    /// Native cache estimates are not billed again; GPU observation remains
+    /// conservative until device-buffer ownership has a physical admission port.
+    prompt_cache_allocator: ?std.mem.Allocator = null,
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
     tokenizer_cache: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe: hf_tokenizer_mod.HfTokenizer.ParallelBpeConfig = .{},
@@ -4021,6 +4027,18 @@ pub const Node = struct {
         }
     };
 
+    /// Host buffers use the admitted allocator; CUDA and Metal buffers carry
+    /// independent physical credits through actual resource retirement.
+    pub fn promptCacheRuntimeConfig(self: *const Node, backend: runtime.kv.pool.BackendKind) runtime.kv.prompt_cache.Config {
+        const physical = self.config.prompt_cache_allocator != null and
+            (backend == .native or ((backend == .cuda or backend == .metal) and self.model_manager.hasPromptCacheDeviceBudget()));
+        const observer = if (physical)
+            null
+        else
+            self.config.prompt_cache_resource_usage_observer;
+        return self.config.prompt_cache.runtimeConfig(observer);
+    }
+
     pub fn init(allocator: std.mem.Allocator, supplied_config: NodeConfig) !Node {
         var config = supplied_config;
         config.chunking_limits = try config.chunking_limits.environment(allocator);
@@ -4074,6 +4092,7 @@ pub const Node = struct {
             .compatibility_cache = .empty,
             .hard_cancellation_watchdog = hard_cancellation_watchdog,
         };
+        node.model_manager.prompt_cache_allocator = config.prompt_cache_allocator;
         try node.model_manager.configureResourceOwnership(config.resource_ownership);
         node.model_manager.configureProcessMemoryLimit(
             config.process_memory_limit_bytes,
@@ -5877,7 +5896,7 @@ pub const Node = struct {
         var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
         var pool_id: runtime.kv.block.KvPoolId = undefined;
         if (prompt_cache_requested) {
-            const prompt_cache_config = self.config.prompt_cache.runtimeConfig(self.config.prompt_cache_resource_usage_observer);
+            const prompt_cache_config = self.promptCacheRuntimeConfig(backend_kind);
             self.model_manager.rebalancePromptCaches(model, prompt_cache_config);
             const cache_ready = if (backend_kind == .metal or backend_kind == .cuda) blk: {
                 const ensured = model.prompt_prefix_cache.ensureStorage(kv_pool_config) catch |err| {
@@ -5921,6 +5940,7 @@ pub const Node = struct {
         else
             null;
         defer if (kv_storage) |*storage| storage.deinit();
+        if (kv_storage) |*storage| storage.device_memory_budget = model.prompt_prefix_cache.device_memory_budget;
         if (kv_storage) |*storage| try cb.provisionKvDeviceWriteHook(storage);
         var decode_state = generation.NativeDecodeState.initPaged(allocator, active_kv_manager, pool_id, model.shared_moe_cache);
         if (active_kv_storage) |storage| {
@@ -13688,9 +13708,7 @@ pub const Node = struct {
             effective_draft_model_name == null and
             config.cache_compaction_ratio == null)
         {
-            const prompt_cache_config = self.config.prompt_cache.runtimeConfig(
-                self.config.prompt_cache_resource_usage_observer,
-            );
+            const prompt_cache_config = self.promptCacheRuntimeConfig(backend_kind);
             self.model_manager.rebalancePromptCaches(
                 model,
                 prompt_cache_config,
@@ -13743,6 +13761,7 @@ pub const Node = struct {
         else
             null;
         defer if (kv_storage) |*storage| storage.deinit();
+        if (kv_storage) |*storage| storage.device_memory_budget = model.prompt_prefix_cache.device_memory_budget;
         if (kv_storage) |*storage| {
             cb.provisionKvDeviceWriteHook(storage) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
@@ -13817,6 +13836,7 @@ pub const Node = struct {
             .gpt_config = gpt_config,
             .kv_dtype = kv_dtype,
             .shared_moe_cache = model.shared_moe_cache,
+            .device_memory_budget = model.prompt_prefix_cache.device_memory_budget,
             .tokenizer = tok,
             .add_bos_token = model.manifest.add_bos_token,
             .bos_token = model.manifest.bos_token,
@@ -15738,6 +15758,7 @@ pub const Node = struct {
                     continue;
                 };
                 defer kv_storage.deinit();
+                kv_storage.device_memory_budget = model.prompt_prefix_cache.device_memory_budget;
                 if (shared_cb) |*cb| {
                     cb.provisionKvDeviceWriteHook(&kv_storage) catch |err| {
                         for (group_indices.items) |idx| {
@@ -15817,6 +15838,7 @@ pub const Node = struct {
                             .gpt_config = gpt_config,
                             .kv_dtype = kv_dtype,
                             .shared_moe_cache = model.shared_moe_cache,
+                            .device_memory_budget = model.prompt_prefix_cache.device_memory_budget,
                             .tokenizer = model.getTokenizer(),
                             .add_bos_token = model.manifest.add_bos_token,
                             .bos_token = model.manifest.bos_token,
@@ -37618,4 +37640,62 @@ test "embeddinggemma2 video partial DASH pretrained windows preserve vectors acr
     }
     try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
     std.debug.print("partial DASH live pretrained metal={} windows={d} callbacks={d} early={d} prefix=2 requests={d} max_error={d:.9}\n", .{ metal, capture.count, capture.calls, capture.early, transport.requests, max_error });
+}
+
+test "runnable execution HTTP native deadline preserves borrowed authority and intersects context time" {
+    const State = struct {
+        fn check(_: ?*anyopaque) !void {}
+    };
+    var node: Node = undefined;
+    node.hard_cancellation_watchdog = null;
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "/");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    var marker: u8 = 0;
+    var borrowed: InferenceExecutionControl = .{ .deadline_ns = 1000, .ptr = &marker, .check_fn = State.check, .io = std.testing.io };
+    try installHttpExecutionControl(&context, &borrowed);
+    context.application_deadline_ns = 50;
+    var result = httpInferenceExecutionControl(&node, &context);
+    try std.testing.expectEqual(@as(?u64, 50), result.deadline_ns);
+    try std.testing.expect(result.ptr == borrowed.ptr and result.check_fn == borrowed.check_fn);
+    context.application_deadline_ns = 5000;
+    try std.testing.expectEqual(@as(?u64, 1000), httpInferenceExecutionControl(&node, &context).deadline_ns);
+    borrowed.deadline_ns = 0;
+    try std.testing.expectEqual(@as(?u64, 0), httpInferenceExecutionControl(&node, &context).deadline_ns);
+    borrowed.deadline_ns = 1000;
+    context.application_deadline_ns = null;
+    result = httpInferenceExecutionControl(&node, &context);
+    try std.testing.expectEqual(borrowed.deadline_ns, result.deadline_ns);
+    try std.testing.expect(result.ptr == borrowed.ptr and result.check_fn == borrowed.check_fn);
+}
+
+test "runnable execution HTTP native deadline projects Io time for borrowed and fallback controls" {
+    const Clock = struct {
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = 500 * std.time.ns_per_s };
+        }
+    };
+    var vtable = std.Io.failing.vtable.*;
+    vtable.now = Clock.now;
+    const source_io: std.Io = .{ .userdata = null, .vtable = &vtable };
+    var node: Node = undefined;
+    node.hard_cancellation_watchdog = null;
+    node.session_manager.native_call_policy = .require_supervision;
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "/");
+    defer request.deinit();
+    for ([_]bool{ false, true }) |with_borrowed| {
+        var context = httpx.Context.init(std.testing.allocator, source_io, &request);
+        defer context.deinit();
+        context.application_deadline_ns = 500 * std.time.ns_per_s + 200 * std.time.ns_per_ms;
+        context.application_deadline_io = source_io;
+        var borrowed: InferenceExecutionControl = .{ .deadline_ns = platform.time.monotonicNs() + std.time.ns_per_s };
+        if (with_borrowed) try installHttpExecutionControl(&context, &borrowed);
+        const before = platform.time.monotonicNs();
+        const result = httpInferenceExecutionControl(&node, &context);
+        const after = platform.time.monotonicNs();
+        try std.testing.expect(result.deadline_ns.? >= before + 200 * std.time.ns_per_ms);
+        try std.testing.expect(result.deadline_ns.? <= after + 200 * std.time.ns_per_ms);
+        try std.testing.expectEqual(@as(?u64, 500 * std.time.ns_per_s + 200 * std.time.ns_per_ms), context.application_deadline_ns);
+    }
 }

@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! SQL write capability on one already admitted execution. The caller supplies
 //! a stable concurrent bounded allocator, and retains it through all joins.
@@ -29,7 +41,7 @@ fn initTeam(execution: *scheduler.Execution, allocator: std.mem.Allocator) !runt
             .current_class = currentClass,
         },
         // Protected terminal SQL work must leave the health reserve available.
-        .maximum_slots = if (entry.class == .control) 1 else owner.config.ordinarySlots(),
+        .maximum_slots = if (entry.class == .control) 1 else owner.config.generalSlots(),
         .allocator = allocator,
     };
 }

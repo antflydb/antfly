@@ -77,6 +77,7 @@ pub const AsyncEffectMirror = struct {
 
     pub fn eql(self: AsyncEffectMirror, other: AsyncEffectMirror) bool {
         return self.publisher.ptr == other.publisher.ptr and self.publisher.vtable == other.publisher.vtable and
+            self.publisher.poll_completion == other.publisher.poll_completion and
             self.mutation_barrier == other.mutation_barrier and self.transition_mutex == other.transition_mutex and
             std.meta.eql(self.requirements, other.requirements) and self.publisher.vtable.equal_capture(self, other);
     }
@@ -95,21 +96,57 @@ pub const AsyncMetadataMirror = AsyncEffectMirror;
 /// Borrowed publisher operations used by storage. No replication runtime,
 /// transport session, slot store, or fencing implementation is exposed here.
 /// All referenced runtime state and callback contexts must outlive the DB.
+/// Provider-owned envelope funding, acquired before primary commit. The
+/// publisher target stays alive through deinit. Publication is one attempt;
+/// uncertain errors retain durable recovery ownership instead of reusing it.
+pub const PreparedPublication = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    callback_dispatch: @import("../named_callback.zig").Dispatch = Boundary.local_dispatch,
+    pub const VTable = struct {
+        publish: *const fn (*anyopaque) anyerror!u64,
+        deinit: *const fn (*anyopaque) void,
+    };
+    const NativeCallbacks = struct { publish: @FieldType(VTable, "publish") };
+    const Boundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    pub fn publish(self: *const PreparedPublication) !u64 {
+        return Boundary.call("publish", self.callback_dispatch, self.vtable.publish, .{self.ptr});
+    }
+    pub fn deinit(self: *PreparedPublication) void {
+        self.vtable.deinit(self.ptr);
+        self.* = undefined;
+    }
+};
+
 pub const Publisher = struct {
-    const NativeCallbacks = struct { publish: @FieldType(Publisher.VTable, "publish"), recover: @FieldType(Publisher.VTable, "recover"), preflight: @FieldType(Publisher.VTable, "preflight"), complete: @FieldType(Publisher.VTable, "complete") };
+    pub const PrepareFn = *const fn (AsyncEffectMirror, outbox.Kind, []const u8, Namespace, ?@import("../../common/read_admission.zig").Port) anyerror!PreparedPublication;
+    pub const CompletionPollFn = *const fn (AsyncEffectMirror, u64) anyerror!bool;
+    pub const RecoverAdmissionFn = *const fn (AsyncEffectMirror, outbox.Kind, outbox.DurableReplicationOutbox, Namespace, @import("../../common/read_admission.zig").Port) anyerror!u64;
+    const NativeCallbacks = struct { prepare: PrepareFn, recover_with_admission: RecoverAdmissionFn, poll_completion: CompletionPollFn, publish: @FieldType(Publisher.VTable, "publish"), recover: @FieldType(Publisher.VTable, "recover"), preflight: @FieldType(Publisher.VTable, "preflight"), complete: @FieldType(Publisher.VTable, "complete") };
     const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
     callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
 
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Pending is not success. This capability must never invoke a standby
+    /// wait hook. Missing capabilities refuse polling instead of falling back
+    /// to the blocking completion contract. Targets outlive the DB binding.
+    poll_completion: ?CompletionPollFn = null,
 
     pub const Identity = struct { table_id: u64, shard_id: u64, timeline_id: u64, epoch: u64 };
     pub const VTable = struct {
         next_lsn: *const fn (*anyopaque) u64,
         identity: *const fn (*anyopaque) Identity,
         publish: *const fn (AsyncEffectMirror, outbox.Kind, []const u8, Namespace) anyerror!u64,
+        /// Legacy providers may omit this capability. Failure from a present
+        /// provider is authoritative; callers must not retry via publish.
+        prepare: ?PrepareFn = null,
         recover: *const fn (AsyncEffectMirror, outbox.Kind, outbox.DurableReplicationOutbox, Namespace) anyerror!u64,
+        /// Original lifetime only while the caller holds publication fences.
+        /// Rejection is permitted before append; completion after append is mandatory.
+        recover_with_admission: ?RecoverAdmissionFn = null,
         preflight: *const fn (AsyncEffectMirror, bool) anyerror!void,
+        preflight_with_admission: ?*const fn (AsyncEffectMirror, bool, @import("../../common/read_admission.zig").Port) anyerror!void = null,
         complete: *const fn (AsyncEffectMirror, u64) anyerror!void,
         note_published: *const fn (AsyncEffectMirror, u64) void = ignorePublished,
         note_failure: *const fn (AsyncEffectMirror) void = ignoreFailure,
@@ -134,9 +171,30 @@ pub const Publisher = struct {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
         return NativeBoundary.call("publish", self.callback_dispatch, self.vtable.publish, .{ mirror, kind, payload, namespace });
     }
+    pub fn prepare(self: Publisher, mirror: AsyncEffectMirror, kind: outbox.Kind, payload: []const u8, namespace: Namespace, original: ?@import("../../common/read_admission.zig").Port) !?PreparedPublication {
+        std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
+        const callback = self.vtable.prepare orelse return null;
+        var retained: @import("../../common/read_admission.zig").RetainedDependency = .{};
+        const control = retained.bind(original);
+        if (control) |port| try port.checkpoint();
+        var result = NativeBoundary.call("prepare", self.callback_dispatch, callback, .{ mirror, kind, payload, namespace, control }) catch |err| return retained.rejection orelse err;
+        errdefer result.deinit();
+        if (control) |port| try port.checkpoint();
+        return result;
+    }
     pub fn recover(self: Publisher, mirror: AsyncEffectMirror, kind: outbox.Kind, pending: outbox.DurableReplicationOutbox, namespace: Namespace) !u64 {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
         return NativeBoundary.call("recover", self.callback_dispatch, self.vtable.recover, .{ mirror, kind, pending, namespace });
+    }
+    pub fn recoverWithAdmission(self: Publisher, mirror: AsyncEffectMirror, kind: outbox.Kind, pending: outbox.DurableReplicationOutbox, namespace: Namespace, original: @import("../../common/read_admission.zig").Port) !u64 {
+        std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
+        var retained: @import("../../common/read_admission.zig").RetainedDependency = .{};
+        const control = retained.bind(original).?;
+        try control.checkpoint();
+        const callback = self.vtable.recover_with_admission orelse return error.ExecutionWaitUnsupported;
+        // Do not checkpoint after callback success: it may have appended the
+        // durable obligation and transferred mandatory completion ownership.
+        return NativeBoundary.call("recover_with_admission", self.callback_dispatch, callback, .{ mirror, kind, pending, namespace, control });
     }
     pub fn preflight(self: Publisher, mirror: AsyncEffectMirror) !void {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
@@ -147,6 +205,19 @@ pub const Publisher = struct {
     pub fn preflightRecordingDecision(self: Publisher, mirror: AsyncEffectMirror) !void {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
         return NativeBoundary.call("preflight", self.callback_dispatch, self.vtable.preflight, .{ mirror, true });
+    }
+    pub fn preflightWithAdmission(self: Publisher, mirror: AsyncEffectMirror, record_decision: bool, control: @import("../../common/read_admission.zig").Port) !void {
+        std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
+        try control.checkpoint();
+        const callback = self.vtable.preflight_with_admission orelse return error.ExecutionWaitUnsupported;
+        try callback(mirror, record_decision, control);
+        try control.checkpoint();
+    }
+    pub fn pollCompletion(self: Publisher, mirror: AsyncEffectMirror, lsn: u64) !bool {
+        std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);
+        std.debug.assert(self.poll_completion == mirror.publisher.poll_completion);
+        const callback = self.poll_completion orelse return error.ExecutionWaitUnsupported;
+        return NativeBoundary.call("poll_completion", self.callback_dispatch, callback, .{ mirror, lsn });
     }
     pub fn complete(self: Publisher, mirror: AsyncEffectMirror, lsn: u64) !void {
         std.debug.assert(self.ptr == mirror.publisher.ptr and self.vtable == mirror.publisher.vtable);

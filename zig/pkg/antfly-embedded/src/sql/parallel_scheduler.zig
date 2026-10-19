@@ -22,6 +22,35 @@ const std = @import("std");
 const A = std.mem.Allocator;
 const Runnable = @import("../common/runnable_scheduler.zig");
 
+/// An optional prepared operator allocation admitted with the original CPU
+/// continuation. The operator frees its buffer before releasing this lease.
+pub const ScratchLease = struct {
+    allocator: A,
+    context: *anyopaque,
+    release: *const fn (*anyopaque) void,
+
+    pub fn deinit(self: ScratchLease) void {
+        self.release(self.context);
+    }
+};
+pub const ScratchSource = struct {
+    context: *anyopaque,
+    acquire: *const fn (*anyopaque, usize) anyerror!?ScratchLease,
+};
+
+/// Inline arithmetic on an existing root. This view has no worker IO, wait
+/// boundary or child-submission methods; it cannot accidentally select fan-out.
+pub const CoordinatorScope = struct {
+    execution: *Runnable.Execution,
+    allocator: A,
+    check: ?Runnable.AdmissionCheck = null,
+    scratch: ?ScratchSource = null,
+
+    pub fn checkpointCurrent(self: CoordinatorScope) !void {
+        if (self.check) |hook| try hook.checkpoint() else try self.execution.checkpoint();
+    }
+};
+
 /// Coordinator-owned authority for CPU kernels over immutable input and private
 /// operator files with independent receivers. This does not permit sharing a
 /// mutable backend, cursor or policy cache; the manager only retains locked
@@ -32,6 +61,18 @@ pub const ExecutionScope = struct {
     allocator: A,
     io: std.Io,
     wait: @import("execution_wait.zig").Boundary,
+    /// Coordinator checkpoint on the same context as wait. Production read
+    /// owners validate current authority after any scheduler reentry here.
+    checkpoint: ?*const fn (*anyopaque) anyerror!void = null,
+    scratch: ?ScratchSource = null,
+
+    pub fn coordinator(self: ExecutionScope) CoordinatorScope {
+        return .{ .execution = self.execution, .allocator = self.allocator, .scratch = self.scratch, .check = if (self.checkpoint) |check| .{ .context = self.wait.ptr, .check = check } else null };
+    }
+
+    pub fn checkpointCurrent(self: ExecutionScope) !void {
+        try self.coordinator().checkpointCurrent();
+    }
 
     pub fn submit(self: ExecutionScope, bytes: usize, result_allocator: A, comptime function: anytype, args: anytype, comptime discard: anytype) !?Task(@TypeOf(@call(.auto, function, args ++ .{@as(*Runnable.Execution, undefined)}))) {
         return self.submitNotified(bytes, result_allocator, function, args, discard, ignoreRetirement);

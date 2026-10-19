@@ -45,11 +45,15 @@ const ExecutorAdmissionProvider = inference.server.ExecutorAdmissionProvider(@im
 
 pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
+    creation_allocator: ?std.mem.Allocator = null,
     executor: @import("antfly_runtime_abi").io_abi.Receiver,
     /// Host-owned interface protected by standalone's inference-lane lease.
     io: std.Io,
     node: inference.server.Node,
     worker: ?*worker_runtime.Client = null,
+    /// Installed by the supervised child before HTTP routes are published.
+    /// Backend/model residency retains its independent allocation owner.
+    http_allocator: ?std.mem.Allocator = null,
     warm_models: ResolvedWarmModels,
     content_security: ?std.json.Parsed(scraping.ContentSecurityConfig),
     s3_credentials: ?std.json.Parsed(scraping.S3CredentialsConfig),
@@ -109,8 +113,10 @@ const LinkedResourceBudgetContext = struct {
         const previous = self.references.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
         if (previous == 1) {
-            self.budget.release_context(self.budget.context);
-            self.alloc.destroy(self);
+            const budget = self.budget;
+            const alloc = self.alloc;
+            alloc.destroy(self);
+            budget.release_context(budget.context);
         }
     }
 };
@@ -673,9 +679,13 @@ const ClassifyTextsRequest = struct {
 
 const ResolvedWarmModels = struct {
     items: []const inference.server.WarmModel,
+    region: ?*std.heap.ArenaAllocator = null,
 
     pub fn deinit(self: *ResolvedWarmModels, alloc: std.mem.Allocator) void {
-        if (self.items.len != 0) alloc.free(self.items);
+        if (self.region) |region| {
+            region.deinit();
+            alloc.destroy(region);
+        } else if (self.items.len != 0) alloc.free(self.items);
         self.* = undefined;
     }
 };
@@ -694,17 +704,23 @@ fn convertWarmModels(
     if (context.preload_ptr) |preload_ptr| {
         const specs = preload_ptr[0..context.preload_len];
         if (specs.len != 0) {
-            const out = try alloc.alloc(inference.server.WarmModel, specs.len);
-            errdefer alloc.free(out);
+            const region = try alloc.create(std.heap.ArenaAllocator);
+            region.* = std.heap.ArenaAllocator.init(alloc);
+            errdefer {
+                region.deinit();
+                alloc.destroy(region);
+            }
+            const owned = region.allocator();
+            const out = try owned.alloc(inference.server.WarmModel, specs.len);
             for (specs, 0..) |model, i| {
                 out[i] = .{
                     .kind = parseWarmModelKind(model.kind.slice()) orelse return error.InvalidArguments,
-                    .name = model.name.slice(),
+                    .name = try owned.dupe(u8, model.name.slice()),
                     .cuda_precision = if (model.cuda_precision.slice()) |value| std.meta.stringToEnum(@typeInfo(@FieldType(inference.server.WarmModel, "cuda_precision")).optional.child, value) orelse return error.InvalidArguments else null,
                     .backend = inference.backends.BackendType.parseOptional(model.backend.slice()) catch
                         return error.InvalidArguments,
-                    .format = model.format.slice(),
-                    .quantization = model.quantization.slice(),
+                    .format = if (model.format.slice()) |value| try owned.dupe(u8, value) else null,
+                    .quantization = if (model.quantization.slice()) |value| try owned.dupe(u8, value) else null,
                     .residency_mode = switch (model.residency_mode) {
                         .auto => .auto,
                         .resident => .resident,
@@ -713,7 +729,7 @@ fn convertWarmModels(
                     .memory_budget_mb = model.memory_budget_mb,
                 };
             }
-            return .{ .items = out };
+            return .{ .items = out, .region = region };
         }
     }
 
@@ -819,53 +835,73 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
     return linkedInferenceCreateLocal(context, false);
 }
 
+const CreationSettings = struct {
+    content_security: ?std.json.Parsed(scraping.ContentSecurityConfig),
+    s3_credentials: ?std.json.Parsed(scraping.S3CredentialsConfig),
+    runtime_config: std.json.Parsed(InferenceRuntimeConfig),
+    warm_models: ResolvedWarmModels,
+    owned_models_dir: []u8,
+    owned_ml_dir: []u8,
+
+    fn init(alloc: std.mem.Allocator, context: *const inference_bridge.CreateContext) !CreationSettings {
+        var security = if (context.content_security_json.slice()) |json|
+            try std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })
+        else
+            null;
+        errdefer if (security) |*parsed| parsed.deinit();
+        var credentials = if (context.s3_credentials_json.slice()) |json|
+            try std.json.parseFromSlice(scraping.S3CredentialsConfig, alloc, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })
+        else
+            null;
+        errdefer if (credentials) |*parsed| parsed.deinit();
+        var runtime = try std.json.parseFromSlice(InferenceRuntimeConfig, alloc, context.runtime_config_json.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always });
+        errdefer runtime.deinit();
+        try runtime.value.kernel_jit.validate();
+        try runtime.value.prompt_cache.validate();
+        var models = try convertWarmModels(alloc, context);
+        errdefer models.deinit(alloc);
+        const data_dir = context.data_dir_ptr[0..context.data_dir_len];
+        const models_dir = if (context.models_dir.slice()) |path| try alloc.dupe(u8, path) else try runtime_paths.defaultModelsDirForDataDirAlloc(alloc, data_dir);
+        errdefer alloc.free(models_dir);
+        const ml_dir = if (context.ml_dir.slice()) |path| try alloc.dupe(u8, path) else try runtime_paths.defaultMlDirForDataDirAlloc(alloc, data_dir);
+        return .{ .content_security = security, .s3_credentials = credentials, .runtime_config = runtime, .warm_models = models, .owned_models_dir = models_dir, .owned_ml_dir = ml_dir };
+    }
+
+    fn deinit(self: *CreationSettings, alloc: std.mem.Allocator) void {
+        if (self.content_security) |*parsed| parsed.deinit();
+        if (self.s3_credentials) |*parsed| parsed.deinit();
+        self.runtime_config.deinit();
+        self.warm_models.deinit(alloc);
+        alloc.free(self.owned_models_dir);
+        alloc.free(self.owned_ml_dir);
+    }
+};
+
 pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext, supervised: bool) !*anyopaque {
-    const data_dir = context.data_dir_ptr[0..context.data_dir_len];
-    const alloc = std.heap.c_allocator;
+    const backing = std.heap.c_allocator;
+    const bootstrap = if (context.bootstrap_memory_parent) |parent| try worker_runtime.BootstrapOwner.create(backing, parent) else null;
+    defer if (bootstrap) |owner| owner.release();
+    return createLocalWithAllocators(context, supervised, backing, if (bootstrap) |owner| owner.allocator() else backing);
+}
+
+/// The child already has process-wide heap admission through its resource RPC.
+/// Backend/model allocations retain their separate existing backing and budgets.
+pub fn linkedInferenceCreateSupervised(context: *const inference_bridge.CreateContext, metadata: std.mem.Allocator) !*anyopaque {
+    return createLocalWithAllocators(context, true, std.heap.c_allocator, metadata);
+}
+
+fn createLocalWithAllocators(context: *const inference_bridge.CreateContext, supervised: bool, alloc: std.mem.Allocator, metadata: std.mem.Allocator) !*anyopaque {
     const executor = try context.executor.receive();
-
-    var content_security = if (context.content_security_json.slice()) |json|
-        try std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, json, .{ .ignore_unknown_fields = true })
-    else
-        null;
-    errdefer if (content_security) |*parsed| parsed.deinit();
-    var s3_credentials = if (context.s3_credentials_json.slice()) |json|
-        try std.json.parseFromSlice(scraping.S3CredentialsConfig, alloc, json, .{ .ignore_unknown_fields = true })
-    else
-        null;
-    errdefer if (s3_credentials) |*parsed| parsed.deinit();
-    var runtime_config = try std.json.parseFromSlice(
-        InferenceRuntimeConfig,
-        alloc,
-        context.runtime_config_json.slice(),
-        .{ .ignore_unknown_fields = false },
-    );
-    errdefer runtime_config.deinit();
-    try runtime_config.value.kernel_jit.validate();
-    try runtime_config.value.prompt_cache.validate();
+    var settings = try CreationSettings.init(metadata, context);
+    errdefer settings.deinit(metadata);
     const use_worker = !supervised and !@import("builtin").is_test and
-        runtime_config.value.embedded_enabled and
-        context.execution_host == .server and
+        settings.runtime_config.value.embedded_enabled and context.execution_host == .server and
         inference.backends.BackendRuntime.availableHasUninterruptibleCalls();
-
-    const state = try alloc.create(LinkedInferenceState);
-    errdefer alloc.destroy(state);
-    var warm_models = try convertWarmModels(alloc, context);
-    errdefer warm_models.deinit(alloc);
-    const owned_models_dir = if (context.models_dir.slice() == null)
-        try runtime_paths.defaultModelsDirForDataDirAlloc(alloc, data_dir)
-    else
-        null;
-    errdefer if (owned_models_dir) |path| alloc.free(path);
-    const owned_ml_dir = if (context.ml_dir.slice() == null)
-        try runtime_paths.defaultMlDirForDataDirAlloc(alloc, data_dir)
-    else
-        null;
-    errdefer if (owned_ml_dir) |path| alloc.free(path);
-
+    const state = try metadata.create(LinkedInferenceState);
+    errdefer metadata.destroy(state);
     var node_config = inference.server.NodeConfig{
-        .models_dir = context.models_dir.slice() orelse owned_models_dir.?,
-        .ml_dir = context.ml_dir.slice() orelse owned_ml_dir.?,
+        .models_dir = settings.owned_models_dir,
+        .ml_dir = settings.owned_ml_dir,
         .generation_budget_overrides = .{
             .host_limit_bytes = context.host_limit_bytes,
             .backend_limit_bytes = context.backend_limit_bytes,
@@ -873,7 +909,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
             .kv_limit_bytes = context.kv_limit_bytes,
             .scratch_limit_bytes = context.scratch_limit_bytes,
         },
-        .preload = warm_models.items,
+        .preload = settings.warm_models.items,
         .process_memory_limit_bytes = context.process_memory_limit_bytes,
         .process_memory_limit_provenance = switch (context.process_memory_limit_provenance) {
             .automatic => .automatic,
@@ -890,33 +926,39 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
         .tokenizer_cache = .{
             .bulk_slots_per_shard = 16 * 1024,
         },
-        .kernel_jit = runtime_config.value.kernel_jit,
-        .prompt_cache = runtime_config.value.prompt_cache,
+        .kernel_jit = settings.runtime_config.value.kernel_jit,
+        .prompt_cache = settings.runtime_config.value.prompt_cache,
+        // Borrow the same actual parent-backed allocator used by metadata. In
+        // a supervised child this is its admitted heap, never a parent pointer
+        // sent over the wire. Device buffers outside this allocator need their
+        // backend's own admission/retirement contract.
+        .prompt_cache_allocator = if (context.bootstrap_memory_parent != null or supervised) metadata else null,
     };
     std.log.info("standalone inference paths models_dir={s} ml_dir={s}", .{
         node_config.models_dir,
         node_config.ml_dir,
     });
-    if (content_security) |*parsed| node_config.content_security = parsed.value;
-    if (s3_credentials) |*parsed| node_config.s3_credentials = parsed.value;
+    if (settings.content_security) |*parsed| node_config.content_security = parsed.value;
+    if (settings.s3_credentials) |*parsed| node_config.s3_credentials = parsed.value;
     if (context.keep_alive.slice()) |value| node_config.keep_alive_ms = try parseKeepAliveMs(value);
     if (context.has_max_loaded_models != 0)
         node_config.max_loaded_models = std.math.cast(usize, context.max_loaded_models) orelse
             return error.InvalidInferenceModelCacheConfig;
-    if (runtime_config.value.max_concurrent_requests) |limit|
+    if (settings.runtime_config.value.max_concurrent_requests) |limit|
         node_config.max_concurrent_requests = limit;
 
     state.* = .{
         .alloc = alloc,
+        .creation_allocator = metadata,
         .executor = executor,
         .io = undefined,
         .node = undefined,
-        .warm_models = warm_models,
-        .content_security = content_security,
-        .s3_credentials = s3_credentials,
-        .runtime_config = runtime_config,
-        .owned_models_dir = owned_models_dir,
-        .owned_ml_dir = owned_ml_dir,
+        .warm_models = settings.warm_models,
+        .content_security = settings.content_security,
+        .s3_credentials = settings.s3_credentials,
+        .runtime_config = settings.runtime_config,
+        .owned_models_dir = settings.owned_models_dir,
+        .owned_ml_dir = settings.owned_ml_dir,
         .route_validator = httpx.Router.init(alloc),
     };
     errdefer state.route_validator.deinit();
@@ -951,7 +993,7 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
         null;
     errdefer if (runnable_lease) |*lease| lease.deinit();
     const resource_context = try LinkedResourceBudgetContext.create(
-        state.alloc,
+        state.creation_allocator orelse state.alloc,
         context.resource_budget.*,
     );
     state.resource_budget_context = resource_context;
@@ -1190,32 +1232,8 @@ fn invokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void 
         // Mirror the shared local request gate before crossing the transport.
         if (!state.node.tryAcquireRequestSlot()) return error.QueueFull;
         defer state.node.releaseRequestSlot();
-        const result = try worker_runtime.invokeProvider(worker, context);
-        var json = switch (result) {
-            .json => |json| json,
-            .numeric => |numeric| {
-                errdefer {
-                    for (numeric.rows) |row| state.alloc.free(row);
-                    state.alloc.free(numeric.rows);
-                }
-                try publishNumericProviderResponse(context, state.alloc, numeric.rows, numeric.kind);
-                return;
-            },
-        };
-        errdefer state.alloc.free(json);
-        if (context.operation == @backingInt(inference_bridge.ProviderOperation.model_capabilities)) {
-            var capabilities = try std.json.parseFromSlice(inference_work.InferenceCapabilities, state.alloc, json, .{});
-            defer capabilities.deinit();
-            const constrained = worker_runtime.wire.constrainCapabilities(capabilities.value);
-            const updated = try std.json.Stringify.valueAlloc(state.alloc, constrained, .{});
-            state.alloc.free(json);
-            json = updated;
-        }
-        const response = try state.alloc.create(ProviderResponseState);
-        response.* = .{ .alloc = state.alloc, .json = json };
-        context.out_response_handle.* = response;
-        context.out_response_json.* = .init(json);
-        return;
+        const result = worker_runtime.invokeProvider(worker, context) catch |err| return workerResultError(err);
+        return publishWorkerProviderResponse(context, result) catch |err| return workerResultError(err);
     }
     const operation = std.enums.fromInt(inference_bridge.ProviderOperation, context.operation) orelse
         return error.UnsupportedOperation;
@@ -1968,6 +1986,45 @@ fn invokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void 
     context.out_response_json.* = inference_bridge.String.init(response_json);
 }
 
+fn workerResultError(err: anyerror) anyerror {
+    // A bounded result allocator reports quota refusal as allocator OOM. Both
+    // quota and backing-heap refusal are retryable capacity at this boundary.
+    return if (err == error.OutOfMemory) error.ResourceTemporarilyUnavailable else err;
+}
+
+/// Consumes the result on every path. Published bytes and ABI descriptors use
+/// its original budget allocator through linkedInferenceDestroyProviderResponse.
+pub fn publishWorkerProviderResponse(context: *const inference_bridge.ProviderInvokeContext, result: worker_runtime.ProviderResult) !void {
+    var owned = true;
+    defer if (owned) result.deinit();
+    try checkProviderInvokeControls(context);
+    const alloc = result.allocator();
+    switch (result) {
+        .numeric => |numeric| {
+            try publishNumericProviderResponse(context, alloc, numeric.rows, numeric.kind);
+            owned = false;
+        },
+        .json => |value| {
+            var updated: ?[]u8 = null;
+            defer if (updated) |bytes| alloc.free(bytes);
+            if (context.operation == @backingInt(inference_bridge.ProviderOperation.model_capabilities)) {
+                var capabilities = try std.json.parseFromSlice(inference_work.InferenceCapabilities, alloc, value.bytes, .{});
+                defer capabilities.deinit();
+                updated = try std.json.Stringify.valueAlloc(alloc, worker_runtime.wire.constrainCapabilities(capabilities.value), .{});
+            }
+            try checkProviderInvokeControls(context);
+            const response = try alloc.create(ProviderResponseState);
+            const bytes = updated orelse value.bytes;
+            response.* = .{ .alloc = alloc, .json = bytes };
+            context.out_response_handle.* = response;
+            context.out_response_json.* = .init(bytes);
+            if (updated != null) result.deinit();
+            updated = null;
+            owned = false;
+        },
+    }
+}
+
 fn checkProviderInvokeControls(context: *const inference_bridge.ProviderInvokeContext) !void {
     if (context.cancellation.requested()) return error.Canceled;
     if (context.has_deadline != 0 and platform_time.monotonicNs() >= context.deadline_ns)
@@ -2002,6 +2059,7 @@ fn publishNumericProviderResponse(context: *const inference_bridge.ProviderInvok
     const rows = try alloc.alloc(inference_bridge.NumericRow, vectors.len);
     errdefer alloc.free(rows);
     for (vectors, rows) |vector, *row| row.* = .{ .values = vector.ptr, .len = vector.len };
+    try checkProviderInvokeControls(context);
     const response = try alloc.create(ProviderResponseState);
     response.* = .{ .alloc = alloc, .vectors = vectors, .rows = rows };
     context.out_response_json.* = inference_bridge.String.init("");
@@ -2366,10 +2424,17 @@ fn checkHttpControls(context: *const inference_bridge.HttpHandleContext) !void {
 }
 
 fn handleHttp(context: *const inference_bridge.HttpHandleContext) !void {
+    return handleHttpOwned(context) catch |err| {
+        const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
+        return if (route.owner.worker != null or route.owner.http_allocator != null) workerResultError(err) else err;
+    };
+}
+
+fn handleHttpOwned(context: *const inference_bridge.HttpHandleContext) !void {
     try checkHttpControls(context);
     const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
     const state = route.owner;
-    const alloc = state.alloc;
+    const alloc = if (state.worker) |worker| try worker.resultAllocator() else state.http_allocator orelse state.alloc;
     const request = context.request;
     const query = request.query.slice();
     const target = if (query) |value|
@@ -2408,7 +2473,8 @@ fn handleHttp(context: *const inference_bridge.HttpHandleContext) !void {
     http_context.params = params;
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
     http_context.application_deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null;
-    var response = if (state.worker) |worker| remote: {
+    http_context.application_deadline_clock = platform_time.monotonicNs;
+    const response = if (state.worker) |worker| remote: {
         // Preserve admission-before-upload, including lazy streaming bodies.
         const admitted = request.method != .get;
         if (admitted and !state.node.tryAcquireRequestSlot()) {
@@ -2422,6 +2488,13 @@ fn handleHttp(context: *const inference_bridge.HttpHandleContext) !void {
         defer if (admitted) state.node.releaseRequestSlot();
         break :remote try worker_runtime.invokeHttp(worker, route.path, context);
     } else try route.handler.invoke(&http_context);
+    return publishHttpResponse(context, response, alloc);
+}
+
+/// Consumes the response on every path; descriptors retain the same allocation
+/// owner as worker headers and body through the public response destructor.
+pub fn publishHttpResponse(context: *const inference_bridge.HttpHandleContext, owned_response: httpx.Response, alloc: std.mem.Allocator) !void {
+    var response = owned_response;
     errdefer response.deinit();
     try checkHttpControls(context);
 
@@ -2502,24 +2575,26 @@ pub fn linkedInferenceMemoryAdmissionStats(handle: *anyopaque) !inference_bridge
 pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
     const alloc = state.alloc;
+    const metadata = state.creation_allocator orelse alloc;
+    const resource_context = state.resource_budget_context;
     if (state.worker) |worker| worker.deinit();
     state.node.detachPromptCacheResourceUsageObserver();
     state.node.deinit();
-    if (state.resource_budget_context) |context| context.release();
     state.resource_budget_context = null;
     for (state.routes.items) |route| alloc.destroy(route);
     state.routes.deinit(alloc);
     state.route_manifest.deinit(alloc);
     state.route_validator.deinit();
-    state.warm_models.deinit(alloc);
+    state.warm_models.deinit(metadata);
     if (state.content_security) |*parsed| parsed.deinit();
     if (state.s3_credentials) |*parsed| parsed.deinit();
     state.runtime_config.deinit();
-    if (state.owned_models_dir) |path| alloc.free(path);
-    if (state.owned_ml_dir) |path| alloc.free(path);
+    if (state.owned_models_dir) |path| metadata.free(path);
+    if (state.owned_ml_dir) |path| metadata.free(path);
     state.executor_admission_provider = null;
     if (state.runnable_owner) |*lease| lease.deinit();
-    alloc.destroy(state);
+    metadata.destroy(state);
+    if (resource_context) |context| context.release();
 }
 
 fn promptCacheResourceUsageObserver(state: *LinkedInferenceState) inference.runtime.kv.prompt_cache.ResourceUsageObserver {
@@ -2538,6 +2613,7 @@ fn inferenceAdmissionResourceBudget(
         .release_context = releaseLinkedResourceBudgetContext,
         .try_reserve = reserveInferenceAdmissionResources,
         .retain = retainInferenceAdmissionResources,
+        .transfer = if (context.budget.transfer_admission != null) transferInferenceAdmissionResources else null,
         .release = releaseInferenceAdmissionResources,
     };
 }
@@ -2595,6 +2671,23 @@ fn retainInferenceAdmissionResources(
     if (status.isOk()) return;
     const err = inference_bridge.errorFromStatus(status);
     if (err == error.ResourceTemporarilyUnavailable) return error.ResourceTemporarilyUnavailable;
+    return error.ResourceLimitExceeded;
+}
+
+fn transferInferenceAdmissionResources(
+    context: *anyopaque,
+    source: usize,
+    destination: usize,
+    amounts: inference.runtime.tier.memory.AdmissionAmounts,
+) inference.runtime.tier.memory.AdmissionResourceError!void {
+    const resource_context: *LinkedResourceBudgetContext = @ptrCast(@alignCast(context));
+    const budget = &resource_context.budget;
+    const transfer = budget.transfer_admission orelse return error.ResourceLimitExceeded;
+    const bridged = bridgeAdmissionAmounts(amounts);
+    const status = transfer(budget.context, source, destination, &bridged);
+    if (status.isOk()) return;
+    if (inference_bridge.errorFromStatus(status) == error.ResourceTemporarilyUnavailable)
+        return error.ResourceTemporarilyUnavailable;
     return error.ResourceLimitExceeded;
 }
 
@@ -4208,4 +4301,690 @@ test "standalone inference host placement keeps embedded policy local" {
     try std.testing.expectEqual(@as(u64, 0), diagnostic.denied_count);
     context.runtime_config_json = .init("{\"process_isolation\":false}");
     try std.testing.expectError(error.UnknownField, linkedInferenceCreate(&context));
+}
+
+/// Model-free execution of the real child HTTP ABI path and its public cleanup.
+pub fn qualifyChildHttpScratchOwnership() !void {
+    if (!@import("builtin").is_test) @compileError("HTTP scratch qualification is test-only");
+    const rpc = @import("antfly_inference_worker_rpc");
+    const Owner = struct {
+        bytes: u64 = 0,
+        refs: usize = 1,
+        fn retain(raw: *anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+            return 1;
+        }
+        fn release(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+        fn adjust(raw: *anyopaque, _: usize, previous: u64, next: u64) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.bytes != previous) return 0;
+            self.bytes = next;
+            return 1;
+        }
+    };
+    const Handler = struct {
+        budget: *rpc.PayloadBudget,
+        calls: usize = 0,
+        deny_publication: bool = false,
+        cancel_after_dispatch: bool = false,
+        canceled: bool = false,
+        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return @intFromBool(self.canceled);
+        }
+        fn run(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            self.calls += 1;
+            try std.testing.expect(ctx.allocator.ptr == self.budget.retainedAllocator().ptr);
+            try std.testing.expect(self.budget.used().retained > 0);
+            try std.testing.expectEqualStrings("input", ctx.request.body.?);
+            try std.testing.expectEqualStrings("value", ctx.request.headers.get("x-input").?);
+            try std.testing.expectEqualStrings("42", ctx.param("id").?);
+            try std.testing.expectEqualStrings("hello world", (try ctx.queryDecoded("q")).?);
+            var response = try httpx.Response.fromText(ctx.allocator, 201, "budgeted child route");
+            errdefer response.deinit();
+            try response.headers.append("x-child", "owned");
+            if (self.deny_publication) self.budget.limits.retained = self.budget.used().retained;
+            if (self.cancel_after_dispatch) self.canceled = true;
+            return response;
+        }
+    };
+    var owner: Owner = .{};
+    const budget = try rpc.PayloadBudget.create(std.testing.allocator, .{ .retained = 0 });
+    var anchored = true;
+    defer if (anchored) budget.releaseOwner();
+    try budget.configureExternal(.{ .context = &owner, .retain = Owner.retain, .release = Owner.release, .adjust = Owner.adjust });
+    var denied = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const io = std.testing.io;
+    var state = LinkedInferenceState{
+        .alloc = denied.allocator(),
+        .http_allocator = budget.retainedAllocator(),
+        .executor = try @import("antfly_runtime_abi").io_abi.Borrow.init(&io).receive(),
+        .io = io,
+        .node = undefined, // Only the supplied route runs; no model is created.
+        .warm_models = undefined,
+        .content_security = null,
+        .s3_credentials = null,
+        .runtime_config = undefined,
+        .owned_models_dir = null,
+        .owned_ml_dir = null,
+        .route_validator = undefined,
+    };
+    var handler = Handler{ .budget = budget };
+    var route = RouteState{ .owner = &state, .handler = httpx.Handler.bind(&handler, Handler.run), .path = "/scratch" };
+    const headers = [_]http_abi.HeaderView{.{ .name = .init("x-input"), .value = .init("value") }};
+    const params = [_]http_abi.RouteParamView{.{ .name = .init("id"), .value = .init("42") }};
+    const request = http_abi.HttpRequestView{ .method = .post, .path = .init(route.path), .query = .init("q=hello%20world"), .headers_ptr = &headers, .headers_len = headers.len, .params_ptr = &params, .params_len = params.len, .body = .init("input") };
+    var response_handle: ?*anyopaque = null;
+    var response: http_abi.HttpResponseView = undefined;
+    const context = inference_bridge.HttpHandleContext{ .abi_version = inference_bridge.abi_version, .route_handle = &route, .request = &request, .cancellation = .{ .context = &handler, .is_cancelled = Handler.requested }, .out_response_handle = &response_handle, .out_response = &response };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, linkedInferenceHandleHttp(&context));
+    try std.testing.expectEqual(@as(usize, 0), handler.calls);
+    try std.testing.expect(response_handle == null);
+    try std.testing.expectEqual(@as(u64, 0), owner.bytes);
+    budget.limits.retained = 1024 * 1024;
+    handler.deny_publication = true;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, linkedInferenceHandleHttp(&context));
+    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+    try std.testing.expect(response_handle == null);
+    try std.testing.expectEqual(@as(u64, 0), owner.bytes);
+    budget.limits.retained = 1024 * 1024;
+    handler.deny_publication = false;
+    handler.cancel_after_dispatch = true;
+    try std.testing.expectError(error.Canceled, linkedInferenceHandleHttp(&context));
+    try std.testing.expectEqual(@as(usize, 2), handler.calls);
+    try std.testing.expect(response_handle == null);
+    try std.testing.expectEqual(@as(u64, 0), owner.bytes);
+    handler.cancel_after_dispatch = false;
+    handler.canceled = false;
+    try linkedInferenceHandleHttp(&context);
+    defer if (response_handle) |handle| linkedInferenceDestroyHttpResponse(handle);
+    try std.testing.expectEqual(@as(usize, 3), handler.calls);
+    try std.testing.expectEqual(@as(u16, 201), response.status);
+    try std.testing.expectEqualStrings("budgeted child route", response.body.slice());
+    try std.testing.expect(owner.bytes > response.body.len);
+    try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+    budget.releaseOwner();
+    anchored = false;
+    try std.testing.expectEqualStrings("budgeted child route", response.body.slice());
+    linkedInferenceDestroyHttpResponse(response_handle.?);
+    response_handle = null;
+    try std.testing.expectEqual(@as(u64, 0), owner.bytes);
+    try std.testing.expectEqual(@as(usize, 1), owner.refs);
+}
+
+const CreationTest = struct {
+    const Probe = struct {
+        used: u64 = 0,
+        limit: u64 = 64 * 1024 * 1024,
+        references: usize = 0,
+        prompt_observations: usize = 0,
+        device_bytes: usize = 0,
+        device_records: [16]usize = @splat(0),
+        deny_device: bool = false,
+        fn reserve(raw: *anyopaque, bytes: u64) callconv(.c) inference_bridge.MemoryParent.ReserveResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (bytes > self.limit -| self.used) return .denied;
+            self.used += bytes;
+            return .reserved;
+        }
+        fn release(raw: *anyopaque, bytes: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(bytes <= self.used);
+            self.used -= bytes;
+        }
+        fn parent(self: *@This()) inference_bridge.MemoryParent {
+            return .{ .ptr = self, .reserve_fn = undefined, .reclaim_fn = undefined, .observe_fn = undefined, .release_fn = release, .snapshot_fn = undefined, .epoch_fn = undefined, .wait_fn = undefined, .notify_fn = undefined, .try_reserve_fn = reserve };
+        }
+        fn retainContext(raw: *anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+            return 1;
+        }
+        fn releaseContext(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.references != 0 and self.used == 0);
+            self.references -= 1;
+        }
+        fn observePrompt(raw: *anyopaque, _: usize, _: u64, _: u64) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.prompt_observations += 1;
+            return 1;
+        }
+        fn reserveDevice(raw: *anyopaque, amounts: *const inference_bridge.AdmissionAmounts, out: *usize) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.deny_device) return inference_bridge.statusFromError(error.ResourceTemporarilyUnavailable);
+            for (&self.device_records, 0..) |*record, index| if (record.* == 0) {
+                record.* = amounts.backend_kv_bytes;
+                self.device_bytes += record.*;
+                out.* = index + 1;
+                return .ok;
+            };
+            return inference_bridge.statusFromError(error.ResourceTemporarilyUnavailable);
+        }
+        fn releaseDevice(raw: *anyopaque, id: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(id != 0 and id <= self.device_records.len);
+            const record = &self.device_records[id - 1];
+            std.debug.assert(record.* != 0 and record.* <= self.device_bytes);
+            self.device_bytes -= record.*;
+            record.* = 0;
+        }
+        fn resource(self: *@This()) inference_bridge.ResourceBudget {
+            return .{ .abi_version = inference_bridge.abi_version, .context = self, .retain_context = retainContext, .release_context = releaseContext, .reserve_admission = reserveDevice, .retain_admission = undefined, .release_admission = releaseDevice, .observe_prompt_cache = observePrompt, .observe_tokenizer_cache = undefined };
+        }
+    };
+
+    fn context(io: *const std.Io, out: *?*anyopaque) inference_bridge.CreateContext {
+        return .{ .abi_version = inference_bridge.abi_version, .data_dir_ptr = ".".ptr, .data_dir_len = 1, .models_dir = .init("fixture-models"), .ml_dir = .init("fixture-ml"), .host_limit_bytes = 0, .backend_limit_bytes = 0, .combined_limit_bytes = 0, .kv_limit_bytes = 0, .scratch_limit_bytes = 0, .process_memory_limit_bytes = 0, .preload_ptr = null, .preload_len = 0, .keep_alive = .{}, .max_loaded_models = 0, .has_max_loaded_models = 0, .content_security_json = .init("{}"), .s3_credentials_json = .init("{}"), .runtime_config_json = .init("{\"embedded_enabled\":false,\"worker_environment\":[{\"name\":\"KEY\",\"value\":\"value\"}]}"), .executor = .init(io), .out_handle = out, .execution_host = .embedded };
+    }
+
+    fn allocationCase(backing: std.mem.Allocator) !void {
+        var probe: Probe = .{};
+        defer std.debug.assert(probe.used == 0);
+        var parent = probe.parent();
+        const owner = try worker_runtime.BootstrapOwner.create(backing, &parent);
+        defer owner.release();
+        const metadata = owner.allocator();
+        var out: ?*anyopaque = null;
+        var io = std.testing.io;
+        var input = context(&io, &out);
+        var name = "model".*;
+        var format = "gguf".*;
+        var quantization = "int4".*;
+        var models_dir = "models".*;
+        var runtime = "{\"embedded_enabled\":false,\"worker_environment\":[{\"name\":\"KEY\",\"value\":\"value\"}]}".*;
+        const models = [_]inference_bridge.WarmModel{.{ .kind = .init("generator"), .name = .init(&name), .format = .init(&format), .quantization = .init(&quantization) }};
+        input.models_dir = .init(&models_dir);
+        input.runtime_config_json = .init(&runtime);
+        input.preload_ptr = &models;
+        input.preload_len = models.len;
+        var settings = try CreationSettings.init(metadata, &input);
+        defer settings.deinit(metadata);
+        const state = try metadata.create(LinkedInferenceState);
+        defer metadata.destroy(state);
+        @memset(&name, 'x');
+        @memset(&format, 'x');
+        @memset(&quantization, 'x');
+        @memset(&models_dir, 'x');
+        @memset(&runtime, 'x');
+        try std.testing.expectEqualStrings("model", settings.warm_models.items[0].name);
+        try std.testing.expectEqualStrings("gguf", settings.warm_models.items[0].format.?);
+        try std.testing.expectEqualStrings("int4", settings.warm_models.items[0].quantization.?);
+        try std.testing.expectEqualStrings("models", settings.owned_models_dir);
+        try std.testing.expectEqualStrings("value", settings.runtime_config.value.worker_environment[0].value);
+        try std.testing.expect(probe.used >= @sizeOf(LinkedInferenceState));
+    }
+};
+
+test "inference worker host creation metadata owns input strings and cleans every allocation failure" {
+    try CreationTest.allocationCase(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, CreationTest.allocationCase, .{});
+}
+
+test "inference worker host creation refuses before input access and retires admitted state" {
+    var probe: CreationTest.Probe = .{ .limit = 0 };
+    defer std.debug.assert(probe.used == 0);
+    var parent = probe.parent();
+    var invalid: inference_bridge.CreateContext = undefined;
+    invalid.bootstrap_memory_parent = &parent;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, linkedInferenceCreate(&invalid));
+    probe.limit = 64 * 1024 * 1024;
+    var io = std.testing.io;
+    var out: ?*anyopaque = null;
+    var input = CreationTest.context(&io, &out);
+    input.bootstrap_memory_parent = &parent;
+    const handle = try linkedInferenceCreate(&input);
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    defer linkedInferenceDestroy(handle);
+    try std.testing.expect(state.creation_allocator != null);
+    try std.testing.expect(probe.used >= @sizeOf(LinkedInferenceState));
+    try std.testing.expectEqualStrings("fixture-models", state.node.config.models_dir);
+    try std.testing.expectEqualStrings("value", state.runtime_config.value.worker_environment[0].value);
+}
+
+test "inference worker host resource context frees parent metadata before its capability" {
+    var probe: CreationTest.Probe = .{};
+    defer std.debug.assert(probe.used == 0 and probe.references == 0);
+    var parent = probe.parent();
+    const owner = try worker_runtime.BootstrapOwner.create(std.testing.allocator, &parent);
+    var anchored = true;
+    defer if (anchored) owner.release();
+    const context = try LinkedResourceBudgetContext.create(owner.allocator(), probe.resource());
+    owner.release();
+    anchored = false;
+    try std.testing.expect(probe.used != 0 and probe.references == 1);
+    context.release();
+    try std.testing.expectEqual(@as(u64, 0), probe.used);
+    try std.testing.expectEqual(@as(usize, 0), probe.references);
+}
+
+test "inference worker prompt cache factory admits physical pools before growth and preserves pinned credit" {
+    var probe: CreationTest.Probe = .{};
+    defer std.debug.assert(probe.used == 0 and probe.references == 0);
+    var parent = probe.parent();
+    var io = std.testing.io;
+    var out: ?*anyopaque = null;
+    // The wire shape is unchanged, but an older bridge lacks this allocation
+    // contract. Reject it before reading any undefined launch fields.
+    var stale: worker_runtime.wire.Create = undefined;
+    stale.protocol_version = worker_runtime.wire.version;
+    stale.bridge_version = inference_bridge.abi_version - 1;
+    try std.testing.expectError(error.UnsupportedVersion, stale.toContext(std.testing.allocator, &io, &out));
+    try std.testing.expect(!inference_bridge.validContext(inference_bridge.CreateContext, inference_bridge.abi_version - 1, @sizeOf(inference_bridge.CreateContext)));
+    var input = CreationTest.context(&io, &out);
+    input.bootstrap_memory_parent = &parent;
+    const handle = try linkedInferenceCreate(&input);
+    defer linkedInferenceDestroy(handle);
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    var budget = probe.resource();
+    try linkedInferenceConfigure(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .resource_budget = &budget });
+    try std.testing.expect(state.node.config.prompt_cache_allocator != null);
+    try std.testing.expect(state.node.promptCacheRuntimeConfig(.native).resource_usage_observer == null);
+    try std.testing.expect(state.node.promptCacheRuntimeConfig(.cuda).resource_usage_observer == null);
+    try std.testing.expect(state.node.promptCacheRuntimeConfig(.metal).resource_usage_observer == null);
+    try std.testing.expectEqual(@as(usize, 0), probe.prompt_observations);
+    const baseline = probe.used;
+    for ([_]inference.runtime.kv.prompt_cache.Mode{ .simple, .block_hash, .radix }) |mode| {
+        var cache = try state.node.model_manager.initPromptCache();
+        var cache_live = true;
+        defer if (cache_live) cache.deinit();
+        var config = state.node.promptCacheRuntimeConfig(.native);
+        config.enabled = true;
+        config.mode = mode;
+        config.min_tokens = 2;
+        config.max_bytes = 1024 * 1024;
+        cache.configure(config);
+        // GPU credits retain the shared resource domain independently of the
+        // cache, and their bookkeeping uses the same admitted host allocator.
+        const device_budget = cache.device_memory_budget.?;
+        const before_device = probe.used;
+        probe.deny_device = true;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, device_budget.reserve(17));
+        try std.testing.expectEqual(before_device, probe.used);
+        probe.deny_device = false;
+        const device_credit = try device_budget.reserve(17);
+        try std.testing.expectEqual(@as(usize, 17), probe.device_bytes);
+        try std.testing.expect(probe.used > before_device);
+        device_credit.release();
+        try std.testing.expectEqual(before_device, probe.used);
+        const pool_config: inference.runtime.kv.pool.KvPoolConfig = .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 };
+        probe.limit = probe.used;
+        try std.testing.expectError(error.OutOfMemory, cache.ensurePool(pool_config));
+        try std.testing.expectEqual(baseline, probe.used);
+        try std.testing.expect(cache.pool_id == null);
+        probe.limit = 64 * 1024 * 1024;
+        const pool_id = (try cache.ensurePool(pool_config)).?;
+        const source = try cache.manager.attachSequence(pool_id);
+        try cache.manager.appendTokens(source, 2);
+        try cache.storeFromSequence("namespace", &.{ 1, 2 }, source);
+        const attached = (try cache.attachLongestPrefix("namespace", &.{ 1, 2, 3 }, 2)).?;
+        try cache.manager.releaseSequence(source);
+        cache.configure(.{ .enabled = false, .mode = mode, .min_tokens = 2, .max_bytes = 0 });
+        try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+        const pool = cache.manager.getPool(pool_id).?;
+        try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(0).?.refcount);
+        try std.testing.expect(probe.used > baseline);
+        const pinned_charge = probe.used;
+        cache.releaseAttachedPrefix(attached);
+        try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(0).?.refcount);
+        // Disabled owner-side retirement frees physical buffers immediately.
+        try std.testing.expectEqual(pinned_charge - 32, probe.used);
+        probe.limit = probe.used;
+        const reuse = try cache.manager.attachSequence(pool_id);
+        try std.testing.expectError(error.OutOfMemory, cache.manager.appendTokens(reuse, 2));
+        try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(0).?.refcount);
+        probe.limit = 64 * 1024 * 1024;
+        try cache.manager.appendTokens(reuse, 2);
+        try cache.manager.releaseSequence(reuse);
+        cache.deinit();
+        cache_live = false;
+        try std.testing.expectEqual(baseline, probe.used);
+    }
+}
+
+test "inference worker prompt cache available Metal hook retires its construction allocator" {
+    if (comptime @hasDecl(inference.backends.metal_kv_storage, "qualifyHostAllocatorOwnership"))
+        try inference.backends.metal_kv_storage.qualifyHostAllocatorOwnership();
+}
+
+test "inference worker physical device credit outlives cache and host until driver retirement" {
+    var probe: CreationTest.Probe = .{};
+    var parent = probe.parent();
+    var io = std.testing.io;
+    var out: ?*anyopaque = null;
+    var input = CreationTest.context(&io, &out);
+    input.bootstrap_memory_parent = &parent;
+    const handle = try linkedInferenceCreate(&input);
+    var handle_live = true;
+    defer if (handle_live) linkedInferenceDestroy(handle);
+    var budget = probe.resource();
+    try linkedInferenceConfigure(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .resource_budget = &budget });
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    var cache = try state.node.model_manager.initPromptCache();
+    const credit = try cache.device_memory_budget.?.reserve(19);
+    var credit_live = true;
+    defer if (credit_live) credit.release();
+    cache.deinit();
+    linkedInferenceDestroy(handle);
+    handle_live = false;
+    try std.testing.expectEqual(@as(usize, 19), probe.device_bytes);
+    try std.testing.expect(probe.used > 0 and probe.references == 1);
+    credit.release();
+    credit_live = false;
+    try std.testing.expectEqual(@as(usize, 0), probe.device_bytes);
+    try std.testing.expectEqual(@as(u64, 0), probe.used);
+    try std.testing.expectEqual(@as(usize, 0), probe.references);
+}
+
+test "inference worker prompt cache publication rejection retires owned budget and preserves original cause" {
+    const Reject = struct {
+        cause: anyerror,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.cause;
+        }
+    };
+    var probe: CreationTest.Probe = .{};
+    defer std.debug.assert(probe.used == 0 and probe.device_bytes == 0 and probe.references == 0);
+    var parent = probe.parent();
+    var io = std.testing.io;
+    var out: ?*anyopaque = null;
+    var input = CreationTest.context(&io, &out);
+    input.bootstrap_memory_parent = &parent;
+    const handle = try linkedInferenceCreate(&input);
+    defer linkedInferenceDestroy(handle);
+    var resource_budget = probe.resource();
+    try linkedInferenceConfigure(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .resource_budget = &resource_budget });
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    const baseline = probe.used;
+    for ([_]anyerror{ error.Cancelled, error.Timeout, error.ResourceTemporarilyUnavailable, error.OutOfMemory }) |cause| {
+        var reject: Reject = .{ .cause = cause };
+        try std.testing.expectError(cause, state.node.model_manager.initPromptCacheForPublication(.{ .ptr = &reject, .check_fn = Reject.check }));
+        try std.testing.expectEqual(baseline, probe.used);
+        var retry = try state.node.model_manager.initPromptCacheForPublication(null);
+        retry.deinit();
+    }
+}
+
+test "inference worker Metal constructor budget precedes qualification and rolls back refusal" {
+    if (comptime !@hasDecl(inference.backends.metal_kv_storage, "device_credit_bridge")) return;
+    const store_mod = inference.native_compute.gpu_hosted_store;
+    const Provider = @typeInfo(@typeInfo(@FieldType(store_mod.WeightStore, "shared_metal_native_provider")).optional.child).pointer.child;
+    const raw_metal = inference.metal_runtime;
+    const memory = inference.runtime.kv.device_memory;
+    const Probe = struct {
+        references: usize = 1,
+        retains: usize = 0,
+        allow_retain: bool = true,
+        fn retain(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retains += 1;
+            if (!self.allow_retain) return false;
+            self.references += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.references > 0);
+            self.references -= 1;
+        }
+        fn reserve(_: *anyopaque, _: std.mem.Allocator, _: usize) !memory.Credit {
+            return error.UnexpectedDeviceAllocation;
+        }
+    };
+    var probe: Probe = .{};
+    const budget: memory.Budget = .{ .context = &probe, .allocator = std.testing.allocator, .retain_context = Probe.retain, .release_context = Probe.release, .acquire = Probe.reserve };
+    // Required JIT in a dynamic load rejects before touching a GPU. Budget
+    // refusal must win first, proving it occurs before JIT initialization.
+    const options: raw_metal.MetalJitOptions = .{ .config = .{ .mode = .required }, .load_context = .dynamic };
+    probe.allow_retain = false;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, Provider.initializeOwned(null, raw_metal.termite_metal_device_budget_fixture_runtime().?, options, budget));
+    try std.testing.expectEqual(@as(usize, 1), probe.references);
+    probe.allow_retain = true;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var no_metadata = budget;
+    no_metadata.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, Provider.initializeOwned(null, raw_metal.termite_metal_device_budget_fixture_runtime().?, options, no_metadata));
+    try std.testing.expectEqual(@as(usize, 1), probe.references);
+    const before_jit = probe.retains;
+    try std.testing.expectError(error.KernelJitRequiredDynamicLoad, Provider.initializeOwned(null, raw_metal.termite_metal_device_budget_fixture_runtime().?, options, budget));
+    try std.testing.expect(probe.retains > before_jit);
+    try std.testing.expectEqual(@as(usize, 1), probe.references);
+    var provider = try Provider.initializeOwned(null, raw_metal.termite_metal_device_budget_fixture_runtime().?, .{}, budget);
+    var live = true;
+    defer if (live) provider.deinitOwned();
+    try std.testing.expect(raw_metal.termite_metal_decode_runtime_kv_device_budget_identity(provider.raw_decode_runtime) == budget.context);
+    budget.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.references);
+    provider.deinitOwned();
+    live = false;
+    try std.testing.expectEqual(@as(usize, 0), probe.references);
+}
+
+test "inference worker Metal shared provider budget binds before creation and survives provider recreation" {
+    if (comptime !@hasDecl(inference.backends.metal_kv_storage, "device_credit_bridge")) return;
+    const metal = inference.native_compute.metal;
+    const store_mod = inference.native_compute.gpu_hosted_store;
+    const Provider = @typeInfo(@typeInfo(@FieldType(store_mod.WeightStore, "shared_metal_native_provider")).optional.child).pointer.child;
+    const raw_metal = inference.metal_runtime;
+    const Fixture = struct {
+        fn provider() !*Provider {
+            const owner = try std.heap.c_allocator.create(Provider);
+            errdefer std.heap.c_allocator.destroy(owner);
+            owner.* = .{ .raw_provider = null, .raw_decode_runtime = raw_metal.termite_metal_device_budget_fixture_runtime() orelse return error.OutOfMemory };
+            return owner;
+        }
+    };
+    var probe: CreationTest.Probe = .{};
+    defer std.debug.assert(probe.used == 0 and probe.device_bytes == 0 and probe.references == 0);
+    var parent = probe.parent();
+    var io = std.testing.io;
+    var out: ?*anyopaque = null;
+    var input = CreationTest.context(&io, &out);
+    input.bootstrap_memory_parent = &parent;
+    const handle = try linkedInferenceCreate(&input);
+    var handle_live = true;
+    defer if (handle_live) linkedInferenceDestroy(handle);
+    var resource_budget = probe.resource();
+    try linkedInferenceConfigure(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .resource_budget = &resource_budget });
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    var cache = try state.node.model_manager.initPromptCache();
+    var cache_live = true;
+    defer if (cache_live) cache.deinit();
+    const budget = cache.device_memory_budget.?;
+    var store: store_mod.WeightStore = .{ .allocator = std.testing.allocator, .prefix = "", .lazy_weights = .empty };
+    defer {
+        metal.deinitSharedNativeProvider(&store);
+        if (store.device_memory_budget) |owned| owned.deinit();
+    }
+    try metal.MetalCompute.configureSharedDeviceMemoryBudget(&store, io, budget);
+    try std.testing.expect(store.shared_metal_native_provider == null);
+    const pending = probe.used;
+    try std.testing.expect(store.shared_metal_native_provider_lock.tryLock());
+    const contention = metal.MetalCompute.configureSharedDeviceMemoryBudget(&store, io, budget);
+    store.shared_metal_native_provider_lock.unlock(io);
+    try std.testing.expectError(error.QueueFull, contention);
+    try std.testing.expectEqual(pending, probe.used);
+    var foreign = budget;
+    var marker: u8 = 0;
+    foreign.context = &marker;
+    try std.testing.expectError(error.MetalDeviceBudgetOwnershipConflict, metal.MetalCompute.configureSharedDeviceMemoryBudget(&store, io, foreign));
+    for (0..2) |_| {
+        store.shared_metal_native_provider = try Fixture.provider();
+        try metal.MetalCompute.configureSharedDeviceMemoryBudget(&store, io, budget);
+        try std.testing.expect(raw_metal.termite_metal_decode_runtime_kv_device_budget_identity(store.shared_metal_native_provider.?.raw_decode_runtime) == budget.context);
+        const baseline = probe.used;
+        const saved_limit = probe.limit;
+        probe.limit = baseline;
+        const repeated = metal.MetalCompute.configureSharedDeviceMemoryBudget(&store, io, budget);
+        probe.limit = saved_limit;
+        try repeated;
+        try std.testing.expectEqual(baseline, probe.used);
+        metal.deinitSharedNativeProvider(&store);
+        try std.testing.expect(store.device_memory_budget.?.context == budget.context);
+    }
+    cache.deinit();
+    cache_live = false;
+    linkedInferenceDestroy(handle);
+    handle_live = false;
+    try std.testing.expect(probe.used > 0 and probe.references == 1);
+    store.device_memory_budget.?.deinit();
+    store.device_memory_budget = null;
+    try std.testing.expectEqual(@as(u64, 0), probe.used);
+    try std.testing.expectEqual(@as(usize, 0), probe.references);
+}
+
+test "inference worker Metal physical buffer credit survives aliases runtime and host retirement" {
+    if (comptime !@hasDecl(inference.backends.metal_kv_storage, "device_credit_bridge")) return;
+    const bridge = inference.backends.metal_kv_storage.device_credit_bridge;
+    var probe: CreationTest.Probe = .{};
+    var parent = probe.parent();
+    var io = std.testing.io;
+    var out: ?*anyopaque = null;
+    var input = CreationTest.context(&io, &out);
+    input.bootstrap_memory_parent = &parent;
+    const handle = try linkedInferenceCreate(&input);
+    var handle_live = true;
+    defer if (handle_live) linkedInferenceDestroy(handle);
+    var resource_budget = probe.resource();
+    try linkedInferenceConfigure(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .resource_budget = &resource_budget });
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    var cache = try state.node.model_manager.initPromptCache();
+    var cache_live = true;
+    defer if (cache_live) cache.deinit();
+    const port = try bridge.create(cache.device_memory_budget.?);
+    var port_live = true;
+    defer if (port_live) port.release_context(port.context);
+    try std.testing.expectEqual(@as(c_int, 0), bridge.termite_metal_device_budget_qualify_install(&port));
+    const before = probe.used;
+    const before_allocations = bridge.termite_metal_device_credit_fixture_allocations();
+    const saved_limit = probe.limit;
+    probe.limit = probe.used;
+    try std.testing.expect(bridge.termite_metal_device_credit_fixture_buffer(&port, 23, 0) == null);
+    probe.limit = saved_limit;
+    try std.testing.expectEqual(before_allocations, bridge.termite_metal_device_credit_fixture_allocations());
+    try std.testing.expectEqual(before, probe.used);
+    probe.deny_device = true;
+    try std.testing.expect(bridge.termite_metal_device_credit_fixture_buffer(&port, 23, 0) == null);
+    probe.deny_device = false;
+    try std.testing.expectEqual(before_allocations, bridge.termite_metal_device_credit_fixture_allocations());
+    try std.testing.expectEqual(before, probe.used);
+    // A physical factory failure rolls back both bridge metadata and GPU lease.
+    try std.testing.expect(bridge.termite_metal_device_credit_fixture_buffer(&port, 23, 1) == null);
+    try std.testing.expectEqual(@as(usize, 0), probe.device_bytes);
+    try std.testing.expectEqual(before, probe.used);
+    const buffer = bridge.termite_metal_device_credit_fixture_buffer(&port, 23, 0).?;
+    var buffer_refs: usize = 1;
+    defer while (buffer_refs != 0) : (buffer_refs -= 1) bridge.termite_metal_device_credit_fixture_release(buffer);
+    bridge.termite_metal_device_credit_fixture_retain(buffer);
+    buffer_refs += 1;
+    const allocations_before_growth = bridge.termite_metal_device_credit_fixture_allocations();
+    probe.deny_device = true;
+    try std.testing.expect(bridge.termite_metal_device_credit_fixture_buffer(&port, 41, 0) == null);
+    probe.deny_device = false;
+    try std.testing.expectEqual(@as(usize, 23), probe.device_bytes);
+    try std.testing.expectEqual(allocations_before_growth, bridge.termite_metal_device_credit_fixture_allocations());
+    const grown = bridge.termite_metal_device_credit_fixture_buffer(&port, 41, 0).?;
+    try std.testing.expectEqual(@as(usize, 64), probe.device_bytes);
+    bridge.termite_metal_device_credit_fixture_release(grown);
+    try std.testing.expectEqual(@as(usize, 23), probe.device_bytes);
+    port.release_context(port.context);
+    port_live = false;
+    cache.deinit();
+    cache_live = false;
+    linkedInferenceDestroy(handle);
+    handle_live = false;
+    const frees_before = bridge.termite_metal_device_credit_fixture_frees();
+    bridge.termite_metal_device_credit_fixture_release(buffer);
+    buffer_refs -= 1;
+    try std.testing.expectEqual(frees_before, bridge.termite_metal_device_credit_fixture_frees());
+    try std.testing.expectEqual(@as(usize, 23), probe.device_bytes);
+    try std.testing.expect(probe.used != 0 and probe.references == 1);
+    bridge.termite_metal_device_credit_fixture_release(buffer);
+    buffer_refs -= 1;
+    try std.testing.expectEqual(frees_before + 1, bridge.termite_metal_device_credit_fixture_frees());
+    try std.testing.expectEqual(@as(usize, 0), probe.device_bytes);
+    try std.testing.expectEqual(@as(u64, 0), probe.used);
+    try std.testing.expectEqual(@as(usize, 0), probe.references);
+}
+
+test "inference worker host transfers every admission family through retained opaque context" {
+    const memory = inference.runtime.tier.memory;
+    const Budget = struct {
+        tokens: [2]?inference_bridge.AdmissionAmounts = @splat(null),
+        next: usize = 0,
+        references: usize = 0,
+        deny: bool = true,
+        fn retainContext(raw: *anyopaque) callconv(.c) u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+            return 1;
+        }
+        fn releaseContext(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn reserve(raw: *anyopaque, value: *const inference_bridge.AdmissionAmounts, out: *usize) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.next == 2) return inference_bridge.statusFromError(error.ResourceLimitExceeded);
+            self.tokens[self.next] = value.*;
+            self.next += 1;
+            out.* = self.next;
+            return .ok;
+        }
+        fn release(raw: *anyopaque, token: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.tokens[token - 1] != null);
+            self.tokens[token - 1] = null;
+        }
+        fn transfer(raw: *anyopaque, source: usize, destination: usize, value: *const inference_bridge.AdmissionAmounts) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.deny) return inference_bridge.statusFromError(error.ResourceTemporarilyUnavailable);
+            var from = self.tokens[source - 1].?;
+            var to = self.tokens[destination - 1].?;
+            inline for (@typeInfo(inference_bridge.AdmissionAmounts).@"struct".field_names) |field_name| {
+                if (@field(value, field_name) > @field(from, field_name)) return inference_bridge.statusFromError(error.ResourceLimitExceeded);
+                @field(from, field_name) -= @field(value, field_name);
+                @field(to, field_name) = std.math.add(usize, @field(to, field_name), @field(value, field_name)) catch return inference_bridge.statusFromError(error.ResourceLimitExceeded);
+            }
+            self.tokens[source - 1] = from;
+            self.tokens[destination - 1] = to;
+            return .ok;
+        }
+    };
+    var owner: Budget = .{};
+    const port: inference_bridge.ResourceBudget = .{ .abi_version = inference_bridge.abi_version, .context = &owner, .retain_context = Budget.retainContext, .release_context = Budget.releaseContext, .reserve_admission = Budget.reserve, .retain_admission = undefined, .release_admission = Budget.release, .transfer_admission = Budget.transfer, .observe_prompt_cache = undefined, .observe_tokenizer_cache = undefined };
+    const context = try LinkedResourceBudgetContext.create(std.testing.allocator, port);
+    var context_live = true;
+    defer if (context_live) context.release();
+    var controller: memory.AdmissionController = .{};
+    defer controller.deinit();
+    try controller.configureResourceBudget(inferenceAdmissionResourceBudget(context));
+    context.release();
+    context_live = false;
+    const initial: memory.AdmissionAmounts = .{ .host_weight_bytes = 10, .backend_weight_bytes = 20, .host_kv_bytes = 30, .backend_kv_bytes = 40, .host_scratch_bytes = 50, .backend_scratch_bytes = 60 };
+    var source = try controller.tryAcquire(.gpu, .{}, initial, false);
+    defer source.release();
+    var destination = try controller.tryAcquire(.gpu, .{}, .{}, false);
+    defer destination.release();
+    const moved: memory.AdmissionAmounts = .{ .host_weight_bytes = 1, .backend_weight_bytes = 2, .host_kv_bytes = 3, .backend_kv_bytes = 4, .host_scratch_bytes = 5, .backend_scratch_bytes = 6 };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, source.transferCreditTo(&destination, moved));
+    try std.testing.expectEqualDeep(initial, source.amounts);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, destination.amounts);
+    owner.deny = false;
+    try source.transferCreditTo(&destination, moved);
+    try std.testing.expectEqualDeep(bridgeAdmissionAmounts(source.amounts), owner.tokens[0].?);
+    try std.testing.expectEqualDeep(bridgeAdmissionAmounts(moved), owner.tokens[1].?);
+    try std.testing.expectEqualDeep(initial, controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 1), owner.references);
+    source.release();
+    try std.testing.expectEqualDeep(moved, controller.snapshot());
+    destination.release();
+    try std.testing.expect(owner.tokens[0] == null and owner.tokens[1] == null);
+    controller.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owner.references);
 }

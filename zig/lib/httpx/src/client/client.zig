@@ -550,7 +550,7 @@ const RequestInterrupt = struct {
         h2.write_mutex.unlock(io);
 
         // A body blocked on flow control can now observe stream_error.
-        h2.send_window_event.set(io);
+        h2.notifySendCredit(io);
         if (!entry.recv_running) entry.socket.setRecvTimeout(1) catch {};
     }
 
@@ -775,7 +775,7 @@ const H2ConnectionBudget = struct {
     fn retire(entry: *H2PoolEntry, io: Io) void {
         entry.broken = true;
         entry.socket.shutdown();
-        entry.h2.send_window_event.set(io);
+        entry.h2.notifySendCredit(io);
     }
     fn lock(self: *@This(), entry: *H2PoolEntry) bool {
         self.control().lock(&entry.h2.write_mutex, self.io) catch {
@@ -4043,11 +4043,7 @@ pub const Client = struct {
         if (res.body) |body| {
             try writer.writeAll(body);
             if (progress_cb) |cb| cb(.{ .bytes_written = body.len, .total_bytes = res.contentLength() }, progress_ctx);
-            if (res.body_owned) {
-                res.allocator.free(body);
-                res.body_owned = false;
-            }
-            res.body = null;
+            res.releaseBody();
         }
     }
 

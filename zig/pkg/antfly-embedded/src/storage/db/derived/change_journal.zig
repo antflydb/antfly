@@ -19,6 +19,7 @@ const derived_log_mod = @import("derived_log.zig");
 const derived_types = @import("derived_types.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
+const read_control = @import("../../../common/read_admission.zig");
 
 pub const Journal = derived_log_mod.DerivedLog;
 pub const StorageBackend = derived_log_mod.StorageBackend;
@@ -371,8 +372,40 @@ fn appendUniqueHintAlloc(alloc: Allocator, list: *std.ArrayListUnmanaged(TargetH
 }
 
 pub fn encodeRecord(alloc: Allocator, record: Record) ![]u8 {
-    var payload = std.ArrayListUnmanaged(u8).empty;
-    errdefer payload.deinit(alloc);
+    return encodeRecordWithAdmission(alloc, record, null);
+}
+
+/// Exact CJ2 wire bytes, including list counts and key-length prefixes. This
+/// measures borrowed immutable keys without scanning their contents or allocating.
+/// It does not predict which artifact keys a later mutation will produce.
+pub fn encodedRecordSize(record: Record, control: ?read_control.Port) !usize {
+    if (control) |port| try port.checkpoint();
+    var size: usize = binary_magic.len + 2 + 8 + 1 + 1;
+    inline for (.{ record.changed_doc_keys, record.deleted_doc_keys, record.overwritten_doc_keys, record.changed_artifact_keys }) |keys| {
+        if (keys.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+        if (keys.len != 0) size = std.math.add(usize, size, 4) catch return error.RecordTooLarge;
+        for (keys, 0..) |key, index| {
+            if (index % 64 == 0) if (control) |port| try port.checkpoint();
+            if (key.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+            size = std.math.add(usize, size, 4) catch return error.RecordTooLarge;
+            size = std.math.add(usize, size, key.len) catch return error.RecordTooLarge;
+        }
+    }
+    if (control) |port| try port.checkpoint();
+    return size;
+}
+
+/// Fund one exact buffer before copying. Checks bound key copying to 4 KiB and
+/// metadata traversal to 64 entries; the original control remains borrowed only
+/// through this call. Callers holding physical fences retain their runnable lease.
+pub fn encodeRecordWithAdmission(alloc: Allocator, record: Record, control: ?read_control.Port) ![]u8 {
+    const size = try encodedRecordSize(record, control);
+    const payload = alloc.alloc(u8, size) catch |cause| {
+        if (control) |port| try port.checkpoint();
+        return cause;
+    };
+    errdefer alloc.free(payload);
+    if (control) |port| try port.checkpoint();
 
     const field_mask = FieldMask{
         .changed_doc_keys = record.changed_doc_keys.len > 0,
@@ -381,18 +414,53 @@ pub fn encodeRecord(alloc: Allocator, record: Record) ![]u8 {
         .changed_artifact_keys = record.changed_artifact_keys.len > 0,
     };
 
-    try payload.appendSlice(alloc, binary_magic);
-    try appendInt(&payload, alloc, u16, record.version);
-    try appendInt(&payload, alloc, u64, record.sequence);
-    try payload.append(alloc, hintMask(record.target_hints));
-    try payload.append(alloc, @bitCast(field_mask));
-
-    if (field_mask.changed_doc_keys) try encodeStringList(&payload, alloc, record.changed_doc_keys);
-    if (field_mask.deleted_doc_keys) try encodeStringList(&payload, alloc, record.deleted_doc_keys);
-    if (field_mask.overwritten_doc_keys) try encodeStringList(&payload, alloc, record.overwritten_doc_keys);
-    if (field_mask.changed_artifact_keys) try encodeStringList(&payload, alloc, record.changed_artifact_keys);
-
-    return try payload.toOwnedSlice(alloc);
+    @memcpy(payload[0..4], binary_magic);
+    std.mem.writeInt(u16, payload[4..6], record.version, .little);
+    std.mem.writeInt(u64, payload[6..14], record.sequence, .little);
+    var hints: u8 = 0;
+    for (record.target_hints, 0..) |hint, index| {
+        if (index % 64 == 0) if (control) |port| try port.checkpoint();
+        hints |= singleHintMask(hint);
+    }
+    payload[14] = hints;
+    payload[15] = @bitCast(field_mask);
+    var offset: usize = 16;
+    var quantum: usize = 0;
+    inline for (.{ record.changed_doc_keys, record.deleted_doc_keys, record.overwritten_doc_keys, record.changed_artifact_keys }) |keys| {
+        if (keys.len != 0) {
+            if (quantum > 4092) {
+                if (control) |port| try port.checkpoint();
+                quantum = 0;
+            }
+            std.mem.writeInt(u32, payload[offset..][0..4], @intCast(keys.len), .little);
+            offset += 4;
+            quantum += 4;
+        }
+        for (keys, 0..) |key, index| {
+            if (index % 64 == 0 or quantum > 4092) {
+                if (control) |port| try port.checkpoint();
+                quantum = 0;
+            }
+            std.mem.writeInt(u32, payload[offset..][0..4], @intCast(key.len), .little);
+            offset += 4;
+            quantum += 4;
+            var copied: usize = 0;
+            while (copied < key.len) {
+                if (quantum == 4096) {
+                    if (control) |port| try port.checkpoint();
+                    quantum = 0;
+                }
+                const len = @min(4096 - quantum, key.len - copied);
+                @memcpy(payload[offset..][0..len], key[copied..][0..len]);
+                offset += len;
+                copied += len;
+                quantum += len;
+            }
+        }
+    }
+    std.debug.assert(offset == size);
+    if (control) |port| try port.checkpoint();
+    return payload;
 }
 
 pub fn decodeRecord(alloc: Allocator, raw: []const u8) !DecodedRecord {
@@ -1562,4 +1630,116 @@ test "change journal trimming preserves small buffers after an oversized record"
     try std.testing.expect(scratch.retainedCapacityBytes() <= 4096);
     scratch.trimRetainedCapacity(alloc, 0);
     try std.testing.expectEqual(@as(usize, 0), scratch.retainedCapacityBytes());
+}
+
+test "change journal exact encoding matches legacy wire in an exactly funded buffer" {
+    const a = std.testing.allocator;
+    const Legacy = struct {
+        fn encode(allocator: Allocator, record: Record) ![]u8 {
+            var bytes = std.ArrayListUnmanaged(u8).empty;
+            errdefer bytes.deinit(allocator);
+            try bytes.appendSlice(allocator, binary_magic);
+            try appendInt(&bytes, allocator, u16, record.version);
+            try appendInt(&bytes, allocator, u64, record.sequence);
+            try bytes.append(allocator, hintMask(record.target_hints));
+            const mask: FieldMask = .{
+                .changed_doc_keys = record.changed_doc_keys.len != 0,
+                .deleted_doc_keys = record.deleted_doc_keys.len != 0,
+                .overwritten_doc_keys = record.overwritten_doc_keys.len != 0,
+                .changed_artifact_keys = record.changed_artifact_keys.len != 0,
+            };
+            try bytes.append(allocator, @bitCast(mask));
+            inline for (.{ record.changed_doc_keys, record.deleted_doc_keys, record.overwritten_doc_keys, record.changed_artifact_keys }) |keys| {
+                if (keys.len != 0) try encodeStringList(&bytes, allocator, keys);
+            }
+            return bytes.toOwnedSlice(allocator);
+        }
+    };
+    var bytes: [8193]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i *% 73 +% 41);
+    for ([_]usize{ 0, 1, 4091, 4092, 4093, 4096, 8193 }) |len| {
+        const keys: []const []const u8 = &.{ bytes[0..len], "\x00\xff", "", "tail" };
+        for (0..16) |bits| {
+            const record: Record = .{
+                .version = 1,
+                .sequence = std.math.maxInt(u64),
+                .changed_doc_keys = if (bits & 1 != 0) keys else &.{},
+                .deleted_doc_keys = if (bits & 2 != 0) keys else &.{},
+                .overwritten_doc_keys = if (bits & 4 != 0) keys else &.{},
+                .changed_artifact_keys = if (bits & 8 != 0) keys else &.{},
+                .target_hints = &.{ .enrichment, .full_text, .dense_vector, .sparse_vector, .graph, .algebraic, .resolution, .promotion },
+            };
+            const expected = try Legacy.encode(a, record);
+            defer a.free(expected);
+            try std.testing.expectEqual(expected.len, try encodedRecordSize(record, null));
+            const backing = try a.alloc(u8, expected.len);
+            defer a.free(backing);
+            var fixed = std.heap.FixedBufferAllocator.init(backing);
+            const actual = try encodeRecordWithAdmission(fixed.allocator(), record, null);
+            try std.testing.expectEqualSlices(u8, expected, actual);
+            try std.testing.expectEqual(expected.len, fixed.end_index);
+            var decoded = try decodeRecord(a, actual);
+            defer decoded.deinit();
+            try std.testing.expectEqual(record.sequence, decoded.record.sequence);
+        }
+    }
+}
+
+test "change journal exact encoding preserves every original refusal and unwinds allocations" {
+    const a = std.testing.allocator;
+    const large: [8193]u8 = @splat(97);
+    var keys: [130][]const u8 = @splat("short");
+    keys[64] = &large;
+    const hints: [129]TargetHint = @splat(.full_text);
+    const record: Record = .{ .changed_doc_keys = &keys, .changed_artifact_keys = &keys, .target_hints = &hints };
+    const State = struct {
+        checks: usize = 0,
+        reject: usize = std.math.maxInt(usize),
+        failure: ?*std.testing.FailingAllocator = null,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.reject or (if (self.failure) |f| f.has_induced_failure else false)) return error.DeadlineExceeded;
+        }
+    };
+    var state: State = .{};
+    const payload: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+    const port = read_control.Port.init(&payload);
+    const encoded = try encodeRecordWithAdmission(a, record, port);
+    a.free(encoded);
+    const checks = state.checks;
+    try std.testing.expect(checks > 20);
+    for (1..checks + 1) |reject| {
+        state = .{ .reject = reject };
+        try std.testing.expectError(error.DeadlineExceeded, encodeRecordWithAdmission(a, record, port));
+        try std.testing.expectEqual(reject, state.checks);
+    }
+    const Fixture = struct {
+        fn run(allocator: Allocator, value: Record) !void {
+            const owned = try encodeRecordWithAdmission(allocator, value, null);
+            defer allocator.free(owned);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{record});
+    var deny = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    state = .{ .failure = &deny };
+    try std.testing.expectError(error.DeadlineExceeded, encodeRecordWithAdmission(deny.allocator(), record, port));
+    try std.testing.expect(deny.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), deny.allocated_bytes - deny.freed_bytes);
+}
+
+test "change journal exact encoding rejects oversized wire lengths before allocation or key access" {
+    if (comptime @bitSizeOf(usize) > 32) {
+        var empty: [0]u8 = .{};
+        var deny = std.heap.FixedBufferAllocator.init(&empty);
+        const too_large = @as(usize, std.math.maxInt(u32)) + 1;
+        const byte: u8 = 0;
+        const oversized_key = @as([*]const u8, @ptrCast(&byte))[0..too_large];
+        try std.testing.expectError(error.RecordTooLarge, encodedRecordSize(.{ .changed_doc_keys = &.{oversized_key} }, null));
+        try std.testing.expectError(error.RecordTooLarge, encodeRecord(deny.allocator(), .{ .changed_artifact_keys = &.{oversized_key} }));
+        const key: []const u8 = "";
+        const oversized_list = @as([*]const []const u8, @ptrCast(&key))[0..too_large];
+        try std.testing.expectError(error.RecordTooLarge, encodedRecordSize(.{ .deleted_doc_keys = oversized_list }, null));
+        try std.testing.expectError(error.RecordTooLarge, encodeRecord(deny.allocator(), .{ .overwritten_doc_keys = oversized_list }));
+    }
 }

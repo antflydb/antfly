@@ -853,6 +853,7 @@ pub const NamespaceReadTxn = struct {
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         get: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror![]const u8,
+        get_with_admission: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, read_admission.Port) anyerror![]const u8 = null,
         get_many_sorted: ?*const fn (*anyopaque, backend_types.Namespace, []const []const u8, []?[]const u8) anyerror!void = null,
         open_cursor: ?*const fn (Allocator, *anyopaque, backend_types.Namespace) anyerror!Cursor = null,
     };
@@ -865,6 +866,17 @@ pub const NamespaceReadTxn = struct {
 
     pub fn get(self: *NamespaceReadTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
         return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, namespace, key });
+    }
+
+    pub fn getWithAdmission(self: *NamespaceReadTxn, namespace: backend_types.Namespace, key: []const u8, control: read_admission.Port) ![]const u8 {
+        try control.checkpoint();
+        const admitted_get = self.vtable.get_with_admission orelse return error.ExecutionWaitUnsupported;
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        const value = BoundaryAbi.call("get_with_admission", self.boundary_dispatch, admitted_get, .{ self.ptr, namespace, key, borrowed }) catch |err| return relay.rejection orelse err;
+        if (relay.rejection) |err| return err;
+        try control.checkpoint();
+        return value;
     }
 
     pub fn getManySorted(self: *NamespaceReadTxn, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) !void {
@@ -1254,6 +1266,12 @@ pub const Store = struct {
     /// The backend owns this gate and must outlive all stores/transactions.
     /// Reads and computation outside a write transaction remain concurrent.
     write_gate: ?*std.atomic.Mutex = null,
+    /// Shared across all namespace views; borrowed for publication debt RMW.
+    publication_gate: ?*std.atomic.Mutex = null,
+
+    pub fn publicationGate(self: *Store) ?*std.atomic.Mutex {
+        return self.publication_gate;
+    }
 
     pub const ReplayCallback = *const fn (*anyopaque, u64, []const u8) anyerror!void;
 
@@ -1326,6 +1344,8 @@ pub const Store = struct {
         begin_replay_lane_scan: ?*const fn (Allocator, *anyopaque, u8, u64) anyerror!CurrentScanTxn = null,
         /// Required control never falls back to an unbounded legacy read.
         begin_read_with_admission: ?*const fn (Allocator, *anyopaque, backend_types.Namespace.BlockCacheAdmission, read_admission.Port) anyerror!ReadTxn = null,
+        begin_owned_value_read: ?*const fn (Allocator, *anyopaque, []const u8, read_admission.Port) anyerror!OwnedValueRead = null,
+        begin_owned_key_cursor: ?*const fn (Allocator, *anyopaque, read_admission.Port) anyerror!OwnedKeyCursor = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -1347,6 +1367,32 @@ pub const Store = struct {
         try control.checkpoint();
         const begin = self.vtable.begin_read_with_admission orelse return error.ExecutionWaitUnsupported;
         return try BoundaryAbi.call("begin_read_with_admission", self.boundary_dispatch, begin, .{ self.allocator, self.ptr, admission, control });
+    }
+
+    /// Detached values and operation metadata belong to the independent caller
+    /// root. Only synchronous original authority crosses the owning boundary.
+    pub fn beginOwnedValueRead(self: *Store, allocator: Allocator, key: []const u8, control: read_admission.Port) !OwnedValueRead {
+        try control.checkpoint();
+        const begin = self.vtable.begin_owned_value_read orelse return error.ExecutionWaitUnsupported;
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        var owned = BoundaryAbi.call("begin_owned_value_read", self.boundary_dispatch, begin, .{ allocator, self.ptr, key, borrowed }) catch |err| return relay.rejection orelse err;
+        errdefer owned.deinit();
+        if (relay.rejection) |err| return err;
+        try control.checkpoint();
+        return owned;
+    }
+
+    pub fn beginOwnedKeyCursor(self: *Store, allocator: Allocator, control: read_admission.Port) !OwnedKeyCursor {
+        try control.checkpoint();
+        const begin = self.vtable.begin_owned_key_cursor orelse return error.ExecutionWaitUnsupported;
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        var owner = BoundaryAbi.call("begin_owned_key_cursor", self.boundary_dispatch, begin, .{ allocator, self.ptr, borrowed }) catch |err| return relay.rejection orelse err;
+        errdefer owner.deinit();
+        if (relay.rejection) |err| return err;
+        try control.checkpoint();
+        return owner;
     }
 
     pub fn beginReadWithBlockCacheAdmission(self: *Store, admission: backend_types.Namespace.BlockCacheAdmission) !ReadTxn {
@@ -1561,6 +1607,215 @@ pub const Store = struct {
     }
 };
 
+/// Caller-allocator-owned bytes and their logical value span. The allocator
+/// context, not a store/transaction wrapper, owns eventual destruction.
+pub const OwnedValue = struct {
+    allocator: Allocator,
+    allocation: []u8,
+    offset: usize,
+    len: usize,
+    pub fn bytes(self: @This()) []const u8 {
+        return self.allocation[self.offset..][0..self.len];
+    }
+    pub fn deinit(self: *@This()) void {
+        self.allocator.free(self.allocation);
+        self.* = undefined;
+    }
+};
+
+pub const OwnedValueRead = struct {
+    pub const Status = enum { pending, ready };
+    allocator: Allocator,
+    ptr: ?*anyopaque,
+    vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    failure: ?anyerror = null,
+    pub const VTable = struct {
+        deinit: *const fn (Allocator, *anyopaque) void,
+        step: *const fn (*anyopaque, usize, read_admission.Port) anyerror!Status,
+        take_output: *const fn (*anyopaque) anyerror!OwnedValue,
+    };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn step(self: *@This(), quantum: usize, control: read_admission.Port) !Status {
+        if (quantum == 0 or quantum > 64 * 1024) return error.InvalidArgument;
+        if (self.failure) |err| return err;
+        const ptr = self.ptr orelse return error.TransactionClosed;
+        return self.stepControlled(ptr, quantum, control) catch |err| {
+            self.deinit();
+            self.failure = err;
+            return err;
+        };
+    }
+    fn stepControlled(self: *@This(), ptr: *anyopaque, quantum: usize, control: read_admission.Port) !Status {
+        try control.checkpoint();
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        const result = BoundaryAbi.call("step", self.boundary_dispatch, self.vtable.step, .{ ptr, quantum, borrowed }) catch |err| return relay.rejection orelse err;
+        if (relay.rejection) |err| return err;
+        try control.checkpoint();
+        return result;
+    }
+    pub fn takeOutput(self: *@This()) !OwnedValue {
+        const ptr = self.ptr orelse return error.TransactionClosed;
+        const result = try BoundaryAbi.call("take_output", self.boundary_dispatch, self.vtable.take_output, .{ptr});
+        self.deinit();
+        return result;
+    }
+    pub fn deinit(self: *@This()) void {
+        const ptr = self.ptr orelse return;
+        self.ptr = null;
+        self.vtable.deinit(self.allocator, ptr);
+    }
+};
+
+fn ownedValueReadFrom(allocator: Allocator, handle: anytype) !OwnedValueRead {
+    const Handle = @TypeOf(handle);
+    const box = try allocBox(allocator, handle);
+    const vt = struct {
+        fn state(raw: *anyopaque) *Box(Handle) {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn deinit(_: Allocator, raw: *anyopaque) void {
+            const owner = state(raw);
+            const allocation = owner.allocator;
+            owner.handle.deinit();
+            allocation.destroy(owner);
+        }
+        fn step(raw: *anyopaque, quantum: usize, control: read_admission.Port) !OwnedValueRead.Status {
+            return switch (try state(raw).handle.step(quantum, control)) {
+                .pending => .pending,
+                .ready => .ready,
+            };
+        }
+        fn take(raw: *anyopaque) !OwnedValue {
+            const value = try state(raw).handle.takeOutput();
+            return .{ .allocator = value.allocator, .allocation = value.allocation, .offset = value.offset, .len = value.len };
+        }
+    };
+    return .{ .allocator = allocator, .ptr = box, .vtable = &.{ .deinit = vt.deinit, .step = vt.step, .take_output = vt.take } };
+}
+
+/// Caller-funded cursor metadata and snapshot. Key spans are synchronous
+/// borrows. intoValueRead transfers the same snapshot to a funded point reader.
+pub const OwnedKeyCursor = struct {
+    pub const Status = OwnedValueRead.Status;
+    allocator: Allocator,
+    ptr: ?*anyopaque,
+    vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    failure: ?anyerror = null,
+    pub const VTable = struct {
+        deinit: *const fn (Allocator, *anyopaque) void,
+        seek: *const fn (*anyopaque, []const u8, ?[]const u8, bool, read_admission.Port) anyerror!void,
+        step: *const fn (*anyopaque, usize, read_admission.Port) anyerror!Status,
+        key: *const fn (*anyopaque) anyerror!?[]const u8,
+        into_value: *const fn (*anyopaque, read_admission.Port) anyerror!OwnedValueRead,
+    };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+    fn live(self: *@This()) !*anyopaque {
+        if (self.failure) |err| return err;
+        return self.ptr orelse error.TransactionClosed;
+    }
+    fn fail(self: *@This(), err: anyerror) anyerror {
+        self.deinit();
+        self.failure = err;
+        return err;
+    }
+    pub fn seek(self: *@This(), lower: []const u8, upper: ?[]const u8, exclusive: bool, control: read_admission.Port) !void {
+        const ptr = try self.live();
+        self.seekControlled(ptr, lower, upper, exclusive, control) catch |err| return self.fail(err);
+    }
+    fn seekControlled(self: *@This(), ptr: *anyopaque, lower: []const u8, upper: ?[]const u8, exclusive: bool, control: read_admission.Port) !void {
+        try control.checkpoint();
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        BoundaryAbi.call("seek", self.boundary_dispatch, self.vtable.seek, .{ ptr, lower, upper, exclusive, borrowed }) catch |err| return relay.rejection orelse err;
+        if (relay.rejection) |err| return err;
+        try control.checkpoint();
+    }
+    pub fn step(self: *@This(), quantum: usize, control: read_admission.Port) !Status {
+        if (quantum == 0 or quantum > 65536) return error.InvalidArgument;
+        const ptr = try self.live();
+        return self.stepControlled(ptr, quantum, control) catch |err| return self.fail(err);
+    }
+    fn stepControlled(self: *@This(), ptr: *anyopaque, quantum: usize, control: read_admission.Port) !Status {
+        try control.checkpoint();
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        const result = BoundaryAbi.call("step", self.boundary_dispatch, self.vtable.step, .{ ptr, quantum, borrowed }) catch |err| return relay.rejection orelse err;
+        if (relay.rejection) |err| return err;
+        try control.checkpoint();
+        return result;
+    }
+    pub fn key(self: *@This(), control: read_admission.Port) !?[]const u8 {
+        const ptr = try self.live();
+        return self.keyControlled(ptr, control) catch |err| return self.fail(err);
+    }
+    fn keyControlled(self: *@This(), ptr: *anyopaque, control: read_admission.Port) !?[]const u8 {
+        try control.checkpoint();
+        const result = try BoundaryAbi.call("key", self.boundary_dispatch, self.vtable.key, .{ptr});
+        try control.checkpoint();
+        return result;
+    }
+    pub fn intoValueRead(self: *@This(), control: read_admission.Port) !OwnedValueRead {
+        const ptr = try self.live();
+        return self.intoControlled(ptr, control) catch |err| return self.fail(err);
+    }
+    fn intoControlled(self: *@This(), ptr: *anyopaque, control: read_admission.Port) !OwnedValueRead {
+        try control.checkpoint();
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        var result = BoundaryAbi.call("into_value", self.boundary_dispatch, self.vtable.into_value, .{ ptr, borrowed }) catch |err| return relay.rejection orelse err;
+        errdefer result.deinit();
+        if (relay.rejection) |err| return err;
+        try control.checkpoint();
+        self.deinit();
+        return result;
+    }
+    pub fn deinit(self: *@This()) void {
+        const ptr = self.ptr orelse return;
+        self.ptr = null;
+        self.vtable.deinit(self.allocator, ptr);
+    }
+};
+
+fn ownedKeyCursorFrom(allocator: Allocator, handle: anytype) !OwnedKeyCursor {
+    const Handle = @TypeOf(handle);
+    const box = try allocBox(allocator, handle);
+    const vt = struct {
+        fn state(ptr: *anyopaque) *Box(Handle) {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn deinit(_: Allocator, ptr: *anyopaque) void {
+            const owner = state(ptr);
+            const allocation = owner.allocator;
+            owner.handle.deinit();
+            allocation.destroy(owner);
+        }
+        fn seek(ptr: *anyopaque, lower: []const u8, upper: ?[]const u8, exclusive: bool, control: read_admission.Port) !void {
+            return state(ptr).handle.seek(lower, upper, exclusive, control);
+        }
+        fn step(ptr: *anyopaque, quantum: usize, control: read_admission.Port) !OwnedKeyCursor.Status {
+            return switch (try state(ptr).handle.step(quantum, control)) {
+                .pending => .pending,
+                .ready => .ready,
+            };
+        }
+        fn key(ptr: *anyopaque) !?[]const u8 {
+            return state(ptr).handle.key();
+        }
+        fn into(ptr: *anyopaque, control: read_admission.Port) !OwnedValueRead {
+            const owner = state(ptr);
+            var value = try owner.handle.intoValueRead(control);
+            errdefer value.deinit();
+            try control.checkpoint();
+            return ownedValueReadFrom(owner.allocator, value);
+        }
+    };
+    return .{ .allocator = allocator, .ptr = box, .vtable = &.{ .deinit = vt.deinit, .seek = vt.seek, .step = vt.step, .key = vt.key, .into_value = vt.into } };
+}
+
 pub const NamespaceStore = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -1571,7 +1826,9 @@ pub const NamespaceStore = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         capabilities: *const fn (*anyopaque) backend_types.Capabilities,
         begin_read: *const fn (Allocator, *anyopaque) anyerror!NamespaceReadTxn,
+        begin_read_with_admission: ?*const fn (Allocator, *anyopaque, read_admission.Port) anyerror!NamespaceReadTxn = null,
         begin_probe: ?*const fn (Allocator, *anyopaque) anyerror!NamespaceReadTxn = null,
+        begin_owned_value_read: ?*const fn (Allocator, *anyopaque, backend_types.Namespace, []const u8, read_admission.Port) anyerror!OwnedValueRead = null,
         begin_write: *const fn (Allocator, *anyopaque) anyerror!NamespaceWriteTxn,
         begin_batch: *const fn (Allocator, *anyopaque) anyerror!NamespaceBatch,
         begin_batch_with_options: ?*const fn (Allocator, *anyopaque, backend_types.BatchOptions) anyerror!NamespaceBatch = null,
@@ -1589,6 +1846,30 @@ pub const NamespaceStore = struct {
 
     pub fn beginRead(self: *NamespaceStore) !NamespaceReadTxn {
         return try BoundaryAbi.call("begin_read", self.boundary_dispatch, self.vtable.begin_read, .{ self.allocator, self.ptr });
+    }
+
+    pub fn beginReadWithAdmission(self: *NamespaceStore, control: read_admission.Port) !NamespaceReadTxn {
+        try control.checkpoint();
+        const begin = self.vtable.begin_read_with_admission orelse return error.ExecutionWaitUnsupported;
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        var txn = BoundaryAbi.call("begin_read_with_admission", self.boundary_dispatch, begin, .{ self.allocator, self.ptr, borrowed }) catch |err| return relay.rejection orelse err;
+        errdefer txn.abort();
+        if (relay.rejection) |err| return err;
+        try control.checkpoint();
+        return txn;
+    }
+
+    pub fn beginOwnedValueRead(self: *@This(), allocator: Allocator, namespace: backend_types.Namespace, key: []const u8, control: read_admission.Port) !OwnedValueRead {
+        try control.checkpoint();
+        const begin = self.vtable.begin_owned_value_read orelse return error.ExecutionWaitUnsupported;
+        var relay: read_admission.ErrorRelay = .{};
+        const borrowed = try relay.bind(control);
+        var owned = BoundaryAbi.call("begin_owned_value_read", self.boundary_dispatch, begin, .{ allocator, self.ptr, namespace, key, borrowed }) catch |err| return relay.rejection orelse err;
+        errdefer owned.deinit();
+        if (relay.rejection) |err| return err;
+        try control.checkpoint();
+        return owned;
     }
 
     pub fn beginProbe(self: *NamespaceStore) !NamespaceReadTxn {
@@ -1689,13 +1970,19 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
         }
 
         pub fn nextWithAdmission(ptr: *anyopaque, control: read_admission.Port) anyerror!?Entry {
-            return unbox(ptr).handle.nextWithAdmission(control) catch |err| {
+            var trace: read_admission.RejectionTrace = .{};
+            const result = unbox(ptr).handle.nextWithAdmission(trace.bind(control).?);
+            if (trace.failure) |cause| return cause;
+            return result catch |err| {
                 if (err == error.NotFound) return null;
                 return err;
             };
         }
         pub fn seekAtOrAfterWithAdmission(ptr: *anyopaque, key: []const u8, control: read_admission.Port) anyerror!?Entry {
-            return unbox(ptr).handle.seekAtOrAfterWithAdmission(key, control) catch |err| {
+            var trace: read_admission.RejectionTrace = .{};
+            const result = unbox(ptr).handle.seekAtOrAfterWithAdmission(key, trace.bind(control).?);
+            if (trace.failure) |cause| return cause;
+            return result catch |err| {
                 if (err == error.NotFound) return null;
                 return err;
             };
@@ -1984,6 +2271,10 @@ pub fn namespaceReadTxnFrom(
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
 
+        pub fn getWithAdmission(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8, control: read_admission.Port) anyerror![]const u8 {
+            return try unbox(ptr).handle.getWithAdmission(try mapNamespace(namespace), key, control);
+        }
+
         pub fn getManySorted(ptr: *anyopaque, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (keys.len != values.len) return error.InvalidBatch;
             if (@hasDecl(Handle, "getManySorted")) {
@@ -2013,6 +2304,7 @@ pub fn namespaceReadTxnFrom(
         .vtable = &.{
             .abort = vt.abort,
             .get = vt.get,
+            .get_with_admission = if (@hasDecl(Handle, "getWithAdmission")) vt.getWithAdmission else null,
             .get_many_sorted = vt.getManySorted,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
         },
@@ -2360,6 +2652,22 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return try readTxnFrom(alloc, try unbox(ptr).handle.beginRead());
         }
 
+        pub fn beginOwnedKeyCursor(alloc: Allocator, ptr: *anyopaque, control: read_admission.Port) !OwnedKeyCursor {
+            if (Handle == Store) return unbox(ptr).handle.beginOwnedKeyCursor(alloc, control);
+            var owner = try unbox(ptr).handle.beginOwnedKeyCursor(alloc, control);
+            errdefer owner.deinit();
+            try control.checkpoint();
+            return ownedKeyCursorFrom(alloc, owner);
+        }
+
+        pub fn beginOwnedValueRead(alloc: Allocator, ptr: *anyopaque, key: []const u8, control: read_admission.Port) !OwnedValueRead {
+            if (Handle == Store) return unbox(ptr).handle.beginOwnedValueRead(alloc, key, control);
+            var owner = try unbox(ptr).handle.beginOwnedValueRead(alloc, key, control);
+            errdefer owner.deinit();
+            try control.checkpoint();
+            return ownedValueReadFrom(alloc, owner);
+        }
+
         pub fn beginReadWithAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) anyerror!ReadTxn {
             if (Handle == Store) return try unbox(ptr).handle.beginReadWithAdmission(admission, control);
             var txn = try unbox(ptr).handle.beginReadWithAdmission(admission, control);
@@ -2609,10 +2917,13 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
     return .{
         .allocator = wrapper_box_allocator,
         .ptr = box_ptr,
+        .publication_gate = if (@hasDecl(Handle, "publicationGate")) box_ptr.handle.publicationGate() else null,
         .vtable = &.{
             .deinit = vt.deinit,
             .capabilities = vt.capabilities,
             .begin_read = vt.beginRead,
+            .begin_owned_value_read = if (Handle == Store or @hasDecl(Handle, "beginOwnedValueRead")) vt.beginOwnedValueRead else null,
+            .begin_owned_key_cursor = if (Handle == Store or @hasDecl(Handle, "beginOwnedKeyCursor")) vt.beginOwnedKeyCursor else null,
             .begin_read_with_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithAdmission")) vt.beginReadWithAdmission else null,
             .begin_read_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithBlockCacheAdmission")) vt.beginReadWithBlockCacheAdmission else null,
             .begin_probe = if (Handle == Store or @hasDecl(Handle, "beginProbe")) vt.beginProbe else null,
@@ -2675,6 +2986,20 @@ pub fn namespaceStoreFrom(
             return try namespaceReadTxnFrom(alloc, try unbox(ptr).handle.beginRead(), LocalNamespace, mapNamespace);
         }
 
+        pub fn beginReadWithAdmission(alloc: Allocator, ptr: *anyopaque, control: read_admission.Port) anyerror!NamespaceReadTxn {
+            var txn = try unbox(ptr).handle.beginReadWithAdmission(control);
+            errdefer txn.abort();
+            try control.checkpoint();
+            return try namespaceReadTxnFrom(alloc, txn, LocalNamespace, mapNamespace);
+        }
+
+        pub fn beginOwnedValueRead(alloc: Allocator, ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8, control: read_admission.Port) !OwnedValueRead {
+            var owned = try unbox(ptr).handle.beginOwnedValueRead(alloc, try mapNamespace(namespace), key, control);
+            errdefer owned.deinit();
+            try control.checkpoint();
+            return ownedValueReadFrom(alloc, owned);
+        }
+
         pub fn beginProbe(alloc: Allocator, ptr: *anyopaque) anyerror!NamespaceReadTxn {
             if (@hasDecl(HandleDecl, "beginProbe")) {
                 return try namespaceReadTxnFrom(alloc, try unbox(ptr).handle.beginProbe(), LocalNamespace, mapNamespace);
@@ -2705,6 +3030,8 @@ pub fn namespaceStoreFrom(
             .deinit = vt.deinit,
             .capabilities = vt.capabilities,
             .begin_read = vt.beginRead,
+            .begin_read_with_admission = if (@hasDecl(HandleDecl, "beginReadWithAdmission")) vt.beginReadWithAdmission else null,
+            .begin_owned_value_read = if (@hasDecl(HandleDecl, "beginOwnedValueRead")) vt.beginOwnedValueRead else null,
             .begin_probe = if (Handle == NamespaceStore or @hasDecl(HandleDecl, "beginProbe")) vt.beginProbe else null,
             .begin_write = vt.beginWrite,
             .begin_batch = vt.beginBatch,
@@ -3627,4 +3954,369 @@ test "foreign replay visitors preserve consumer failures and resume rejected ent
         state.fail_read = false;
     }
     try std.testing.expect(Foreign.calls > 0);
+}
+
+test "namespace read admission dispatches original controls and retires rejected captures" {
+    const State = struct {
+        active: usize = 0,
+        opens: usize = 0,
+        aborts: usize = 0,
+        legacy: usize = 0,
+        checks: usize = 0,
+        reject_at: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.reject_at) return error.NamespaceOwnerRetired;
+        }
+    };
+    const Txn = struct {
+        state: *State,
+        pub fn abort(self: *@This()) void {
+            std.debug.assert(self.state.active == 1);
+            self.state.active -= 1;
+            self.state.aborts += 1;
+        }
+        pub fn get(self: *@This(), _: backend_types.Namespace, _: []const u8) ![]const u8 {
+            self.state.legacy += 1;
+            return error.TestUnexpectedResult;
+        }
+        pub fn getWithAdmission(_: *@This(), _: backend_types.Namespace, _: []const u8, control: read_admission.Port) ![]const u8 {
+            try control.checkpoint();
+            return "value";
+        }
+    };
+    const NamespaceBackend = struct {
+        state: *State,
+        pub fn capabilities(_: *@This()) backend_types.Capabilities {
+            return .{};
+        }
+        pub fn beginRead(self: *@This()) !Txn {
+            self.state.legacy += 1;
+            return error.TestUnexpectedResult;
+        }
+        pub fn beginReadWithAdmission(self: *@This(), control: read_admission.Port) !Txn {
+            try control.checkpoint();
+            self.state.active += 1;
+            self.state.opens += 1;
+            return .{ .state = self.state };
+        }
+        pub fn beginWrite(_: *@This()) !NamespaceWriteTxn {
+            return error.Unsupported;
+        }
+        pub fn beginBatch(_: *@This()) !NamespaceBatch {
+            return error.Unsupported;
+        }
+    };
+    const Map = struct {
+        fn namespace(ns: backend_types.Namespace) !backend_types.Namespace {
+            return ns;
+        }
+    };
+    var state: State = .{};
+    var backend: NamespaceBackend = .{ .state = &state };
+    var store = try namespaceStoreFrom(std.testing.allocator, &backend, backend_types.Namespace, Map.namespace);
+    defer store.deinit();
+    const ForeignStore = TestForeignDispatch(NamespaceStore);
+    const ForeignRead = TestForeignDispatch(NamespaceReadTxn);
+    store.boundary_dispatch = ForeignStore.dispatch;
+    ForeignStore.calls = 0;
+    ForeignRead.calls = 0;
+    const payload: read_admission.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+    const control = read_admission.Port.init(&payload);
+    {
+        var txn = try store.beginReadWithAdmission(control);
+        defer txn.abort();
+        txn.boundary_dispatch = ForeignRead.dispatch;
+        try std.testing.expectEqualStrings("value", try txn.getWithAdmission(.{}, "key", control));
+    }
+    const checks = state.checks;
+    try std.testing.expect(ForeignStore.calls > 0 and ForeignRead.calls > 0);
+    for (1..checks + 1) |reject_at| {
+        state.checks = 0;
+        state.reject_at = reject_at;
+        const result = blk: {
+            var txn = store.beginReadWithAdmission(control) catch |err| break :blk err;
+            defer txn.abort();
+            txn.boundary_dispatch = ForeignRead.dispatch;
+            _ = txn.getWithAdmission(.{}, "key", control) catch |err| break :blk err;
+            break :blk error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqual(error.NamespaceOwnerRetired, result);
+        try std.testing.expectEqual(@as(usize, 0), state.active);
+        try std.testing.expectEqual(state.opens, state.aborts);
+    }
+    state.reject_at = 0;
+    var legacy_store = store.vtable.*;
+    legacy_store.begin_read_with_admission = null;
+    const original = store.vtable;
+    store.vtable = &legacy_store;
+    try std.testing.expectError(error.ExecutionWaitUnsupported, store.beginReadWithAdmission(control));
+    store.vtable = original;
+    {
+        var txn = try store.beginReadWithAdmission(control);
+        defer txn.abort();
+        var legacy_read = txn.vtable.*;
+        legacy_read.get_with_admission = null;
+        txn.vtable = &legacy_read;
+        try std.testing.expectError(error.ExecutionWaitUnsupported, txn.getWithAdmission(.{}, "key", control));
+    }
+    try std.testing.expectEqual(@as(usize, 0), state.legacy);
+    try std.testing.expectEqual(state.opens, state.aborts);
+}
+
+test "owned namespace boundary preserves ignored original rejection and retires returned owners through checked calls" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        var rejected: bool = false;
+        var closes: usize = 0;
+        const Outer = @This();
+        const Fake = struct {
+            pub fn deinit(_: *@This()) void {
+                Outer.closes += 1;
+            }
+            pub fn step(_: *@This(), _: usize, control: read_admission.Port) !OwnedValueRead.Status {
+                Outer.rejected = true;
+                control.checkpoint() catch {};
+                return .ready;
+            }
+            pub fn takeOutput(_: *@This()) !OwnedValue {
+                return error.TestUnexpectedOwnedTake;
+            }
+        };
+        fn begin(allocator: Allocator, _: *anyopaque, _: backend_types.Namespace, _: []const u8, control: read_admission.Port) !OwnedValueRead {
+            rejected = true;
+            control.checkpoint() catch {};
+            return ownedValueReadFrom(allocator, Fake{});
+        }
+        fn storeDispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, result: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return NamespaceStore.BoundaryAbi.local_dispatch(contract, callback, args, result);
+        }
+        fn readDispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, result: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return OwnedValueRead.BoundaryAbi.local_dispatch(contract, callback, args, result);
+        }
+    };
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {
+            if (Fixture.rejected) return error.TestOwnedBoundaryOriginalRejection;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedOwnedWait;
+        }
+    };
+    var memory = @import("lsm_backend/storage_io.zig").MemoryStorage.init(a);
+    defer memory.deinit();
+    var backend = @import("lsm_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeNamespaceStore(a);
+    defer store.deinit();
+    var table = store.vtable.*;
+    table.begin_owned_value_read = Fixture.begin;
+    store.vtable = &table;
+    var budget: Budget = .{};
+    var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    const control = read_admission.Port.init(&payload);
+    for ([_]bool{ false, true }) |checked| {
+        store.boundary_dispatch = if (checked) Fixture.storeDispatch else NamespaceStore.BoundaryAbi.local_dispatch;
+        Fixture.rejected = false;
+        Fixture.closes = 0;
+        try std.testing.expectError(error.TestOwnedBoundaryOriginalRejection, store.beginOwnedValueRead(a, .{}, "key", control));
+        try std.testing.expectEqual(@as(usize, 1), Fixture.closes);
+        Fixture.rejected = false;
+        var read = try ownedValueReadFrom(a, Fixture.Fake{});
+        defer read.deinit();
+        if (checked) read.boundary_dispatch = Fixture.readDispatch;
+        try std.testing.expectError(error.TestOwnedBoundaryOriginalRejection, read.step(1, control));
+        try std.testing.expect(read.ptr == null);
+        Fixture.rejected = false;
+        try std.testing.expectError(error.TestOwnedBoundaryOriginalRejection, read.step(1, control));
+        try std.testing.expectEqual(@as(usize, 2), Fixture.closes);
+        table.begin_owned_value_read = null;
+        try std.testing.expectError(error.ExecutionWaitUnsupported, store.beginOwnedValueRead(a, .{}, "key", control));
+        table.begin_owned_value_read = Fixture.begin;
+    }
+}
+
+test "owned namespace boundary single Store preserves ignored original rejection and retires returned owners through checked calls" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        var rejected: bool = false;
+        var closes: usize = 0;
+        const Outer = @This();
+        const Fake = struct {
+            pub fn deinit(_: *@This()) void {
+                Outer.closes += 1;
+            }
+            pub fn step(_: *@This(), _: usize, control: read_admission.Port) !OwnedValueRead.Status {
+                Outer.rejected = true;
+                control.checkpoint() catch {};
+                return .ready;
+            }
+            pub fn takeOutput(_: *@This()) !OwnedValue {
+                return error.TestUnexpectedOwnedTake;
+            }
+        };
+        fn begin(allocator: Allocator, _: *anyopaque, _: []const u8, control: read_admission.Port) !OwnedValueRead {
+            rejected = true;
+            control.checkpoint() catch {};
+            return ownedValueReadFrom(allocator, Fake{});
+        }
+        fn storeDispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, result: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return Store.BoundaryAbi.local_dispatch(contract, callback, args, result);
+        }
+        fn readDispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, result: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return OwnedValueRead.BoundaryAbi.local_dispatch(contract, callback, args, result);
+        }
+    };
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {
+            if (Fixture.rejected) return error.TestOwnedBoundaryOriginalRejection;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedOwnedWait;
+        }
+    };
+    var memory = @import("lsm_backend/storage_io.zig").MemoryStorage.init(a);
+    defer memory.deinit();
+    var backend = @import("lsm_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{});
+    defer store.deinit();
+    var table = store.vtable.*;
+    table.begin_owned_value_read = Fixture.begin;
+    store.vtable = &table;
+    var budget: Budget = .{};
+    var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    const control = read_admission.Port.init(&payload);
+    for ([_]bool{ false, true }) |checked| {
+        store.boundary_dispatch = if (checked) Fixture.storeDispatch else Store.BoundaryAbi.local_dispatch;
+        Fixture.rejected = false;
+        Fixture.closes = 0;
+        try std.testing.expectError(error.TestOwnedBoundaryOriginalRejection, store.beginOwnedValueRead(a, "key", control));
+        try std.testing.expectEqual(@as(usize, 1), Fixture.closes);
+        Fixture.rejected = false;
+        var read = try ownedValueReadFrom(a, Fixture.Fake{});
+        defer read.deinit();
+        if (checked) read.boundary_dispatch = Fixture.readDispatch;
+        try std.testing.expectError(error.TestOwnedBoundaryOriginalRejection, read.step(1, control));
+        try std.testing.expect(read.ptr == null);
+        Fixture.rejected = false;
+        try std.testing.expectError(error.TestOwnedBoundaryOriginalRejection, read.step(1, control));
+        try std.testing.expectEqual(@as(usize, 2), Fixture.closes);
+        table.begin_owned_value_read = null;
+        try std.testing.expectError(error.ExecutionWaitUnsupported, store.beginOwnedValueRead(a, "key", control));
+        table.begin_owned_value_read = Fixture.begin;
+    }
+}
+
+test "owned namespace boundary key cursor preserves ignored original errors and retires snapshot and value handoff" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        const Stage = enum { begin, seek, step, into };
+        var stage: Stage = .begin;
+        var rejected: bool = false;
+        var keys_closed: usize = 0;
+        var values_closed: usize = 0;
+        const Outer = @This();
+        fn ignore(control: read_admission.Port) void {
+            rejected = true;
+            control.checkpoint() catch {};
+        }
+        const Value = struct {
+            pub fn deinit(_: *@This()) void {
+                Outer.values_closed += 1;
+            }
+            pub fn step(_: *@This(), _: usize, _: read_admission.Port) !OwnedValueRead.Status {
+                return .ready;
+            }
+            pub fn takeOutput(_: *@This()) !OwnedValue {
+                return error.TestUnexpectedKeyValueTake;
+            }
+        };
+        const Key = struct {
+            pub fn deinit(_: *@This()) void {
+                Outer.keys_closed += 1;
+            }
+            pub fn seek(_: *@This(), _: []const u8, _: ?[]const u8, _: bool, control: read_admission.Port) !void {
+                if (Outer.stage == .seek) Outer.ignore(control);
+            }
+            pub fn step(_: *@This(), _: usize, control: read_admission.Port) !OwnedKeyCursor.Status {
+                if (Outer.stage == .step) Outer.ignore(control);
+                return .ready;
+            }
+            pub fn key(_: *@This()) !?[]const u8 {
+                return "key";
+            }
+            pub fn intoValueRead(_: *@This(), control: read_admission.Port) !Value {
+                if (Outer.stage == .into) Outer.ignore(control);
+                return .{};
+            }
+        };
+        fn begin(allocator: Allocator, _: *anyopaque, control: read_admission.Port) !OwnedKeyCursor {
+            if (stage == .begin) ignore(control);
+            return ownedKeyCursorFrom(allocator, Key{});
+        }
+        fn storeDispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, result: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return Store.BoundaryAbi.local_dispatch(contract, callback, args, result);
+        }
+        fn cursorDispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, result: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            return OwnedKeyCursor.BoundaryAbi.local_dispatch(contract, callback, args, result);
+        }
+    };
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {
+            if (Fixture.rejected) return error.TestOwnedKeyBoundaryOriginal;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedKeyBoundaryWait;
+        }
+    };
+    var backend = @import("lsm_backend.zig").Backend.init(a, .{ .wal_enabled = false });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{});
+    defer store.deinit();
+    var table = store.vtable.*;
+    table.begin_owned_key_cursor = Fixture.begin;
+    store.vtable = &table;
+    var budget: Budget = .{};
+    var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    const control = read_admission.Port.init(&payload);
+    for ([_]bool{ false, true }) |checked| {
+        store.boundary_dispatch = if (checked) Fixture.storeDispatch else Store.BoundaryAbi.local_dispatch;
+        for ([_]Fixture.Stage{ .begin, .seek, .step, .into }) |stage| {
+            Fixture.stage = stage;
+            Fixture.rejected = false;
+            Fixture.keys_closed = 0;
+            Fixture.values_closed = 0;
+            if (stage == .begin) {
+                try std.testing.expectError(error.TestOwnedKeyBoundaryOriginal, store.beginOwnedKeyCursor(a, control));
+            } else {
+                var cursor = try store.beginOwnedKeyCursor(a, control);
+                defer cursor.deinit();
+                if (checked) cursor.boundary_dispatch = Fixture.cursorDispatch;
+                if (stage == .seek) {
+                    try std.testing.expectError(error.TestOwnedKeyBoundaryOriginal, cursor.seek("", null, false, control));
+                } else {
+                    try cursor.seek("", null, false, control);
+                    if (stage == .step) {
+                        try std.testing.expectError(error.TestOwnedKeyBoundaryOriginal, cursor.step(1, control));
+                    } else {
+                        try std.testing.expectEqual(OwnedKeyCursor.Status.ready, try cursor.step(1, control));
+                        try std.testing.expectError(error.TestOwnedKeyBoundaryOriginal, cursor.intoValueRead(control));
+                    }
+                }
+                Fixture.rejected = false;
+                try std.testing.expectError(error.TestOwnedKeyBoundaryOriginal, cursor.step(1, control));
+                try std.testing.expect(cursor.ptr == null);
+            }
+            try std.testing.expectEqual(@as(usize, 1), Fixture.keys_closed);
+            try std.testing.expectEqual(@as(usize, @intFromBool(stage == .into)), Fixture.values_closed);
+        }
+    }
+    Fixture.rejected = false;
+    table.begin_owned_key_cursor = null;
+    try std.testing.expectError(error.ExecutionWaitUnsupported, store.beginOwnedKeyCursor(a, control));
 }

@@ -57,12 +57,27 @@ fn IdentityLedger(comptime K: type, comptime V: type) type {
             return self.map.getPtr(key);
         }
 
-        fn put(self: *Self, allocator: std.mem.Allocator, key: K, value: V) !void {
-            try self.map.put(allocator, key, value);
+        fn put(self: *Self, manager: *ResourceManager, key: K, value: V) !void {
+            return self.putWithParentPolicy(manager, key, value, false);
         }
 
-        fn getOrPut(self: *Self, allocator: std.mem.Allocator, key: K) !Map.GetOrPutResult {
-            return self.map.getOrPut(allocator, key);
+        fn putWithParentPolicy(self: *Self, manager: *ResourceManager, key: K, value: V, bounded_parent: bool) !void {
+            var admission_context = IdentityAllocation{ .manager = manager, .bounded_parent = bounded_parent };
+            self.map.put(admission_context.allocator(), key, value) catch return admission_context.failure orelse error.OutOfMemory;
+        }
+
+        fn getOrPut(self: *Self, manager: *ResourceManager, key: K) !Map.GetOrPutResult {
+            return self.getOrPutWithParentPolicy(manager, key, false);
+        }
+
+        fn getOrPutWithParentPolicy(self: *Self, manager: *ResourceManager, key: K, bounded_parent: bool) !Map.GetOrPutResult {
+            var admission_context = IdentityAllocation{ .manager = manager, .bounded_parent = bounded_parent };
+            return self.map.getOrPut(admission_context.allocator(), key) catch return admission_context.failure orelse error.OutOfMemory;
+        }
+
+        fn ensureUnusedCapacity(self: *Self, manager: *ResourceManager, additional: u32) !void {
+            var admission_context = IdentityAllocation{ .manager = manager };
+            self.map.ensureUnusedCapacity(admission_context.allocator(), additional) catch return admission_context.failure orelse error.OutOfMemory;
         }
 
         fn remove(self: *Self, key: K) bool {
@@ -76,12 +91,133 @@ fn IdentityLedger(comptime K: type, comptime V: type) type {
             return true;
         }
 
-        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            self.map.deinit(allocator);
+        pub fn deinit(self: *Self, manager: *ResourceManager) void {
+            var admission_context = IdentityAllocation{ .manager = manager };
+            self.map.deinit(admission_context.allocator());
             self.* = .empty;
         }
     };
 }
+/// Operation-local adapter: unmanaged maps retain no allocator pointer, so a
+/// ResourceManager may move during startup without capturing its old address.
+/// Every call holds manager.mutex. Charge the complete new allocation before
+/// asking the backing allocator; the old table stays charged through rehash.
+const IdentityAllocation = struct {
+    manager: *ResourceManager,
+    failure: ?anyerror = null,
+    bounded_parent: bool = false,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const manager = self.manager;
+        manager.drainIdentityMetadataRetirementLocked(self.bounded_parent) catch |err| {
+            self.failure = err;
+            return null;
+        };
+        const metadata_next = std.math.add(u64, manager.identity_metadata_bytes, len) catch {
+            self.failure = error.ResourceBudgetExceeded;
+            return null;
+        };
+        if (metadata_next > manager.identity_metadata_limit_bytes or
+            manager.control_object_bytes > manager.identity_metadata_limit_bytes -| metadata_next)
+        {
+            self.failure = error.ResourceBudgetExceeded;
+            return null;
+        }
+        const memory_next = manager.checkMemoryLocked(len) catch |err| {
+            self.failure = err;
+            return null;
+        };
+        (if (self.bounded_parent) manager.reserveParentWithoutWaiting(len) else manager.reserveParentLocked(len)) catch |err| {
+            self.failure = err;
+            return null;
+        };
+        manager.commitMemoryLocked(memory_next);
+        manager.identity_metadata_bytes = metadata_next;
+        return manager.identity_allocator.rawAlloc(len, alignment, ret_addr) orelse {
+            manager.identity_metadata_bytes -= len;
+            manager.retireIdentityMetadataLocked(len, self.bounded_parent);
+            return null;
+        };
+    }
+
+    fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.manager.identity_allocator.rawFree(bytes, alignment, ret_addr);
+        self.manager.identity_metadata_bytes -= bytes.len;
+        self.manager.retireIdentityMetadataLocked(bytes.len, self.bounded_parent);
+    }
+};
+/// An operation-local allocator for node-owned control objects and unmanaged
+/// wrapper maps. Containers must not retain this allocator/context. Allocation
+/// and free use the same backing allocator, and the manager must outlive every
+/// object. Provisional and cached storage shares the identity-table byte cap.
+/// Supply a raw lifetime backing allocator, not one already charging this
+/// manager or its parent. It runs outside the accounting mutex.
+pub const ControlMetadataAllocation = struct {
+    manager: *ResourceManager,
+    backing: std.mem.Allocator,
+    failure: ?anyerror = null,
+
+    pub fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+
+    pub fn allocationError(self: *const @This(), err: anyerror) anyerror {
+        return self.failure orelse err;
+    }
+
+    fn admit(self: *@This(), len: usize) !void {
+        const manager = self.manager;
+        lockAtomic(&manager.mutex);
+        defer manager.mutex.unlock();
+        try manager.drainIdentityMetadataRetirementLocked(false);
+        const active = std.math.add(u64, manager.identity_metadata_bytes, manager.control_object_bytes) catch return error.ResourceBudgetExceeded;
+        const total = std.math.add(u64, active, len) catch return error.ResourceBudgetExceeded;
+        if (total > manager.identity_metadata_limit_bytes) return error.ResourceBudgetExceeded;
+        const next = try manager.checkMemoryLocked(len);
+        try manager.reserveParentLocked(len);
+        manager.control_object_bytes += len;
+        manager.commitMemoryLocked(next);
+    }
+
+    fn retire(self: *@This(), len: usize) void {
+        const manager = self.manager;
+        lockAtomic(&manager.mutex);
+        std.debug.assert(manager.control_object_bytes >= len);
+        manager.control_object_bytes -= len;
+        manager.retireIdentityMetadataLocked(len, false);
+        manager.mutex.unlock();
+        // Provisional admission is observable while the backing allocator
+        // runs. Return its capacity and wake waiters after physical retirement.
+        manager.notifyPressureChange();
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.failure = null;
+        self.admit(len) catch |err| {
+            self.failure = err;
+            return null;
+        };
+        return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
+            self.retire(len);
+            return null;
+        };
+    }
+
+    fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.backing.rawFree(bytes, alignment, ret_addr);
+        self.retire(bytes.len);
+    }
+};
+
+pub const metadata_fixture = if (builtin.is_test) @import("identity_metadata_test_fixture.zig") else struct {};
 const dense_replay_window_min_bytes: u64 = 16 * MiB;
 const dense_replay_window_growth_numerator: u64 = 5;
 const dense_replay_window_growth_denominator: u64 = 4;
@@ -268,6 +404,102 @@ pub const SliceAmount = struct {
     bytes: u64,
 };
 
+/// Metadata prepared before entering an executor lock. Preparation owns no
+/// working-set capacity. A successful attempt moves the same identity into a
+/// BatchReservation; no insertion, allocator, reclaimer, wait or legacy parent
+/// callback occurs in that attempt. Callers serialize this token's lifetime.
+/// CPU/I/O bundle coordination and continuation progress belong to the caller.
+pub const PreparedBatchReservation = struct {
+    manager: *ResourceManager,
+    identity: u64,
+    amounts: [slice_count]u64,
+    host_charge_bytes: u64,
+    consumed: bool = false,
+
+    pub const Probe = enum { ready, wait, unknown, too_large, unsupported, mismatch };
+
+    pub fn probe(self: *const PreparedBatchReservation) Probe {
+        return self.manager.probePreparedBatch(self);
+    }
+
+    pub const Attempt = union(enum) {
+        acquired: BatchReservation,
+        busy,
+        denied,
+        too_large,
+        unsupported,
+        mismatch,
+    };
+
+    pub fn tryAcquire(self: *PreparedBatchReservation) Attempt {
+        return self.manager.tryAcquirePreparedBatch(self);
+    }
+
+    /// Retire unused metadata outside executor locks: ledger removal can
+    /// compact its hash table. A stale copy cannot retire an acquired lease.
+    pub fn deinit(self: *PreparedBatchReservation) void {
+        if (self.consumed) return;
+        self.manager.discardPreparedBatch(self);
+        self.consumed = true;
+    }
+};
+
+/// A dense scan's memory and bandwidth are checked under one lock order.
+/// The parent memory attempt is the last fallible action; bandwidth is charged
+/// only after it succeeds. CPU publication follows in the executor lock.
+/// These leases survive CPU parking and retire only after physical users join.
+pub const PreparedDenseBundle = struct {
+    memory: PreparedBatchReservation,
+    requested_bandwidth_bytes: u64,
+    lease: ?struct { memory: BatchReservation, bandwidth: DenseSearchAdmissionLease } = null,
+    pub const Acquire = enum { acquired, wait, too_large, unsupported, mismatch };
+
+    pub fn probe(self: *const PreparedDenseBundle) PreparedBatchReservation.Probe {
+        if (self.lease != null) return .mismatch;
+        const manager = self.memory.manager;
+        if (!manager.dense_search_admission_mutex.tryLock()) return .wait;
+        defer manager.dense_search_admission_mutex.unlock();
+        const bytes = manager.denseSearchGrantBytes(self.requested_bandwidth_bytes);
+        if (bytes != 0 and (manager.dense_search_waiters.head != null or !manager.canGrantDenseSearchLocked(bytes))) return .wait;
+        return self.memory.probe();
+    }
+
+    pub fn tryAcquire(self: *PreparedDenseBundle) Acquire {
+        if (self.lease != null) return .mismatch;
+        const manager = self.memory.manager;
+        if (!manager.dense_search_admission_mutex.tryLock()) return .wait;
+        defer manager.dense_search_admission_mutex.unlock();
+        const bytes = manager.denseSearchGrantBytes(self.requested_bandwidth_bytes);
+        if (bytes != 0 and (manager.dense_search_waiters.head != null or !manager.canGrantDenseSearchLocked(bytes))) return .wait;
+        const credit = switch (self.memory.tryAcquire()) {
+            .acquired => |credit| credit,
+            .busy, .denied => return .wait,
+            .too_large => return .too_large,
+            .unsupported => return .unsupported,
+            .mismatch => return .mismatch,
+        };
+        // No fallible work, callback, allocation or publication after memory
+        // admission until both non-CPU resources have a single physical owner.
+        if (bytes != 0) manager.noteDenseSearchGrantLocked(bytes);
+        self.lease = .{ .memory = credit, .bandwidth = if (bytes == 0) .{} else .{ .manager = manager, .bytes = bytes } };
+        return .acquired;
+    }
+
+    /// Call outside executor/resource locks after every physical user joined.
+    pub fn deinitAfterJoin(self: *PreparedDenseBundle) void {
+        if (self.lease) |*lease| {
+            if (!lease.memory.released) {
+                // The memory identity is also this bundle's retirement fence.
+                // A stale copied bundle cannot refund another scan's bandwidth.
+                const released = lease.memory.manager.releaseBatchReservation(&lease.memory);
+                lease.memory.released = true;
+                if (released) lease.bandwidth.release();
+            }
+        }
+        self.memory.deinit();
+    }
+};
+
 /// An exactly-once batch ownership token. Callers retain this value for the
 /// lifetime of the admitted memory instead of reconstructing release amounts.
 /// This prevents a duplicate teardown from consuming an equivalent reservation
@@ -294,6 +526,23 @@ pub const BatchReservation = struct {
             normalized,
             retained_host_charge_bytes,
         );
+    }
+
+    /// Partition admitted credit into another registered live owner. Prepare
+    /// the destination (possibly empty) before handoff: this operation never
+    /// allocates, reacquires capacity, or changes aggregate/ancestor usage.
+    /// Logical slices and physical host charge remain independent quantities.
+    pub fn transferCreditTo(
+        self: *BatchReservation,
+        destination: *BatchReservation,
+        amounts: []const SliceAmount,
+        host_charge_bytes: u64,
+    ) !void {
+        const normalized = ResourceManager.normalizeSliceAmounts(amounts) catch |err| {
+            self.manager.recordAccountingError();
+            return err;
+        };
+        try self.manager.transferBatchReservationCredit(self, destination, normalized, host_charge_bytes);
     }
 
     pub fn release(self: *BatchReservation) void {
@@ -451,6 +700,12 @@ pub const Options = struct {
     /// pass their lifetime allocator; the page allocator keeps lightweight
     /// tests source-compatible.
     identity_allocator: std.mem.Allocator = platformAllocator(),
+    /// Shared high-water storage for reservation, queued batch and observer
+    /// identities plus provisional/cached control objects and wrapper maps,
+    /// including the simultaneous old/new tables during growth.
+    /// This finite cap applies even when memory_budget is unlimited; with a
+    /// process envelope these bytes also consume that same envelope.
+    identity_metadata_limit_bytes: u64 = 64 * MiB,
 
     pub fn defaultBudgets() [slice_count]Budget {
         // Name every slice: additions cannot silently shift another owner's policy.
@@ -558,6 +813,10 @@ pub const SliceStats = struct {
 
 pub const Stats = struct {
     memory: MemoryStats,
+    control_object_bytes: u64 = 0,
+    identity_metadata_bytes: u64 = 0,
+    identity_metadata_retirement_bytes: u64 = 0,
+    identity_metadata_limit_bytes: u64 = 0,
     slices: [slice_count]SliceStats,
     reclaim_requests: u64 = 0,
     reclaimed_bytes: u64 = 0,
@@ -601,10 +860,13 @@ pub const DenseSearchAdmissionLease = struct {
     }
 };
 
-const DenseSearchWaiters = admission.Fifo(struct {
+// This payload appears in ResourceManager's cross-archive layout contract.
+// An anonymous generic argument gains an unstable compiler-generated name.
+const DenseSearchWaitRequest = struct {
     bytes: u64,
     enqueued_ns: u64,
-});
+};
+const DenseSearchWaiters = admission.Fifo(DenseSearchWaitRequest);
 const DenseSearchWaiter = DenseSearchWaiters.Waiter;
 
 pub const MemoryStats = struct {
@@ -1031,6 +1293,7 @@ const ReservationIdentity = struct {
 };
 
 const BatchReservationIdentity = struct {
+    prepared: bool = false,
     amounts: [slice_count]u64,
     host_charge_bytes: u64,
 };
@@ -1127,8 +1390,57 @@ test "dense aggregate resource manager bounds callers and helpers together" {
     manager.dense_driver_admission.assertIdle();
 }
 
+/// Stable ownership for managers created by embedded convenience entrypoints.
+/// File and provider IO may retain this manager after their public owner closes.
+pub const SharedResourceManager = struct {
+    allocator: std.mem.Allocator,
+    manager: *ResourceManager,
+    references: std.atomic.Value(usize) = .init(1),
+
+    pub fn create(allocator: std.mem.Allocator, options: Options) !*ResourceManager {
+        const manager = try allocator.create(ResourceManager);
+        errdefer allocator.destroy(manager);
+        manager.* = ResourceManager.init(options);
+        errdefer manager.deinit(allocator);
+        if (!manager.reserveExternal(@sizeOf(SharedResourceManager))) return error.ResourceBudgetExceeded;
+        errdefer manager.releaseExternal(@sizeOf(SharedResourceManager));
+        const self = try allocator.create(SharedResourceManager);
+        self.* = .{ .allocator = allocator, .manager = manager };
+        manager.shared_owner = self;
+        return manager;
+    }
+    pub fn retain(self: *SharedResourceManager) *SharedResourceManager {
+        const previous = self.references.fetchAdd(1, .acq_rel);
+        std.debug.assert(previous != 0 and previous != std.math.maxInt(usize));
+        return self;
+    }
+    pub fn release(self: *SharedResourceManager) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        const manager = self.manager;
+        manager.shared_owner = null;
+        allocator.destroy(self);
+        manager.releaseExternal(@sizeOf(SharedResourceManager));
+        manager.deinit(allocator);
+        allocator.destroy(manager);
+    }
+};
+
 pub const ResourceManager = struct {
+    pub fn retainLifetime(self: *ResourceManager) ?*SharedResourceManager {
+        return if (self.shared_owner) |owner| owner.retain() else null;
+    }
+    /// Release a convenience owner or destroy a legacy independently allocated
+    /// manager. Borrowed managers must never be passed to this function.
+    pub fn releaseOwned(self: *ResourceManager, allocator: std.mem.Allocator) void {
+        if (self.shared_owner) |owner| owner.release() else {
+            self.deinit(allocator);
+            allocator.destroy(self);
+        }
+    }
+
     pub const MemoryParent = @import("runtime_memory_abi").Parent;
+    shared_owner: ?*SharedResourceManager = null,
     memory_parent: ?MemoryParent = null,
     // Construction claims are admitted before a local decoder starts. Slots
     // hold only accounting credit after physical failure, never a read scope.
@@ -1240,6 +1552,10 @@ pub const ResourceManager = struct {
     replay_not_visible_tracker: ReplayNotVisibleTracker = .{},
     capacity_source: ?CapacitySource = null,
     identity_allocator: std.mem.Allocator,
+    control_object_bytes: u64 = 0,
+    identity_metadata_bytes: u64 = 0,
+    identity_metadata_retirement_bytes: u64 = 0,
+    identity_metadata_limit_bytes: u64,
     next_identity: u64 = 1,
     reservation_identities: IdentityLedger(u64, ReservationIdentity) = .empty,
     batch_reservation_identities: IdentityLedger(u64, BatchReservationIdentity) = .empty,
@@ -1368,6 +1684,49 @@ pub const ResourceManager = struct {
         }
     }
 
+    pub fn controlMetadataAllocation(self: *ResourceManager, backing: std.mem.Allocator) ControlMetadataAllocation {
+        return .{ .manager = self, .backing = backing };
+    }
+
+    fn identityMetadataCharge(self: *const ResourceManager) u64 {
+        return self.identity_metadata_bytes + self.control_object_bytes + self.identity_metadata_retirement_bytes;
+    }
+
+    /// Physical free precedes credit return. A bounded operation must never
+    /// enter the legacy parent callback: busy ancestors leave exact debt in
+    /// fixed manager storage for an independent cleanup pass. New metadata
+    /// allocations first retire this debt, so repeated OOM cannot accumulate
+    /// additional charges beyond the finite metadata cap.
+    fn retireIdentityMetadataLocked(self: *ResourceManager, bytes: u64, bounded_parent: bool) void {
+        self.identity_metadata_retirement_bytes += bytes;
+        self.drainIdentityMetadataRetirementLocked(bounded_parent) catch |err| {
+            if (err == error.ResourceAccountingMismatch) self.memory.accounting_errors +|= 1;
+        };
+    }
+
+    fn drainIdentityMetadataRetirementLocked(self: *ResourceManager, bounded_parent: bool) !void {
+        const bytes = self.identity_metadata_retirement_bytes;
+        if (bytes == 0) return;
+        if (bounded_parent) {
+            try self.releaseParentWithoutWaiting(bytes);
+            self.memory.used_bytes -= bytes;
+        } else {
+            self.releaseMemoryLocked(bytes);
+        }
+        self.identity_metadata_retirement_bytes = 0;
+    }
+
+    fn tryDrainIdentityMetadataRetirement(self: *ResourceManager) bool {
+        if (!self.mutex.tryLock()) return false;
+        defer self.mutex.unlock();
+        if (self.identity_metadata_retirement_bytes == 0) return true;
+        if (!self.pressure_change.tryLock()) return false;
+        defer self.pressure_change.unlock();
+        self.drainIdentityMetadataRetirementLocked(true) catch return false;
+        self.pressure_change.advanceLocked();
+        return true;
+    }
+
     fn releaseMemoryLocked(self: *ResourceManager, bytes: u64) void {
         self.memory.used_bytes -= bytes;
         if (self.memory_parent) |parent| parent.release_fn(parent.ptr, bytes);
@@ -1452,6 +1811,7 @@ pub const ResourceManager = struct {
             .dense_read_adaptive = dense_perf.enabled("ANTFLY_EXPERIMENT_VECTOR_READ_ADAPTIVE"),
             .dense_read_profile = dense_perf.enabled("ANTFLY_EXPERIMENT_VECTOR_READ_PROFILE"),
             .identity_allocator = options.identity_allocator,
+            .identity_metadata_limit_bytes = options.identity_metadata_limit_bytes,
         };
     }
 
@@ -2358,6 +2718,7 @@ pub const ResourceManager = struct {
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
         std.debug.assert(!self.cleanup_consumer_bound.load(.acquire));
         std.debug.assert(self.memory.external_bytes == 0);
+        if (self.control_object_bytes != 0) @panic("resource manager closed with live control metadata objects");
         self.dense_checkpoint_ready.assertUnbound();
         self.dense_rerank_admission.assertIdle();
         self.dense_driver_admission.assertIdle();
@@ -2420,13 +2781,14 @@ pub const ResourceManager = struct {
             @panic("resource manager deinitialized with live reservations");
         if (self.batch_reservation_identities.count() != 0)
             @panic("resource manager deinitialized with live batch reservations");
+        self.drainIdentityMetadataRetirementLocked(false) catch unreachable;
         self.capacity_domains.deinit(self.identity_allocator);
         self.capacity_domains = .empty;
-        self.reservation_identities.deinit(self.identity_allocator);
+        self.reservation_identities.deinit(self);
         self.reservation_identities = .empty;
-        self.batch_reservation_identities.deinit(self.identity_allocator);
+        self.batch_reservation_identities.deinit(self);
         self.batch_reservation_identities = .empty;
-        self.observer_identities.deinit(self.identity_allocator);
+        self.observer_identities.deinit(self);
         self.observer_identities = .empty;
         // Observations end with their backing owners; strict leases were
         // checked above. Return the terminal observer balance to the parent.
@@ -2726,7 +3088,7 @@ pub const ResourceManager = struct {
         // Reserve notification serialization before any ancestor commits.
         if (!self.pressure_change.tryLock()) return .busy;
         defer self.pressure_change.unlock();
-        if (bytes > self.memory.external_bytes or bytes > self.memory.used_bytes) return .mismatch;
+        if (bytes > self.memory.external_bytes or bytes > self.memory.used_bytes -| self.identityMetadataCharge()) return .mismatch;
         if (self.memory_parent) |parent| {
             if (!parent.valid()) return .unsupported;
             const attempt = parent.try_release_fn orelse return .unsupported;
@@ -2779,12 +3141,14 @@ pub const ResourceManager = struct {
         slice: Slice,
         bytes: u64,
         host_charge: bool,
+        bounded_parent: bool,
     ) !u64 {
         const identity = self.issueIdentityLocked();
-        try self.reservation_identities.put(
-            self.identity_allocator,
+        try self.reservation_identities.putWithParentPolicy(
+            self,
             identity,
             .{ .slice = slice, .bytes = bytes, .host_charge = host_charge },
+            bounded_parent,
         );
         return identity;
     }
@@ -2792,6 +3156,7 @@ pub const ResourceManager = struct {
     fn reservationIdentityLocked(
         self: *ResourceManager,
         reservation: *Reservation,
+        bounded_parent: bool,
     ) !*ReservationIdentity {
         if (reservation.identity == 0) {
             if (reservation.bytes != 0) {
@@ -2802,6 +3167,7 @@ pub const ResourceManager = struct {
                 reservation.slice,
                 0,
                 reservation.host_charge,
+                bounded_parent,
             );
         }
         const owned = self.reservation_identities.getPtr(reservation.identity) orelse {
@@ -2813,6 +3179,118 @@ pub const ResourceManager = struct {
             return error.ResourceAccountingMismatch;
         }
         return owned;
+    }
+
+    /// Prepare the complete normalized request, including its ownership
+    /// identity, outside scheduler locks. No working-set credit is held while
+    /// waiting; queued metadata must remain covered by operation admission.
+    pub fn prepareBatch(self: *ResourceManager, amounts: []const SliceAmount) !PreparedBatchReservation {
+        const normalized = try normalizeSliceAmounts(amounts);
+        const host_charge_bytes = try hostChargeForAmounts(amounts);
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const identity = self.issueIdentityLocked();
+        try self.batch_reservation_identities.put(self, identity, .{
+            .prepared = true,
+            .amounts = normalized,
+            .host_charge_bytes = host_charge_bytes,
+        });
+        return .{ .manager = self, .identity = identity, .amounts = normalized, .host_charge_bytes = host_charge_bytes };
+    }
+
+    pub fn prepareDenseBundle(self: *ResourceManager, amounts: []const SliceAmount, requested_bandwidth_bytes: u64) !PreparedDenseBundle {
+        return .{ .memory = try self.prepareBatch(amounts), .requested_bandwidth_bytes = requested_bandwidth_bytes };
+    }
+
+    /// A local snapshot can disprove fit. An arbitrary parent chain cannot be
+    /// proven by one parent's local snapshot; report unknown and permit a full
+    /// atomic attempt when CPU fits, without suppressing owner continuations.
+    fn probePreparedBatch(self: *ResourceManager, prepared: *const PreparedBatchReservation) PreparedBatchReservation.Probe {
+        if (prepared.manager != self or prepared.consumed) return .mismatch;
+        if (!self.mutex.tryLock()) return .wait;
+        defer self.mutex.unlock();
+        const owned = self.batch_reservation_identities.get(prepared.identity) orelse return .mismatch;
+        if (!owned.prepared or !std.meta.eql(owned.amounts, prepared.amounts) or
+            owned.host_charge_bytes != prepared.host_charge_bytes) return .mismatch;
+        const limit = self.memory.budget.hard_limit_bytes;
+        if (limit != 0 and prepared.host_charge_bytes > limit -| self.identity_metadata_bytes) return .too_large;
+        for (prepared.amounts, 0..) |bytes, index| {
+            const hard = self.slices[index].budget.hard_limit_bytes;
+            if (hard != 0 and bytes > hard) return .too_large;
+        }
+        const next = std.math.add(u64, self.memory.used_bytes, prepared.host_charge_bytes) catch return .wait;
+        if (limit != 0 and next > limit) return .wait;
+        for (prepared.amounts, 0..) |bytes, index| {
+            const state = &self.slices[index];
+            const next_slice = std.math.add(u64, state.used_bytes, bytes) catch return .wait;
+            if (state.budget.hard_limit_bytes != 0 and next_slice > state.budget.hard_limit_bytes) return .wait;
+        }
+        if (prepared.host_charge_bytes != 0) if (self.memory_parent) |parent| {
+            if (parent.try_reserve_fn == null) return .unsupported;
+            return .unknown;
+        };
+        return .ready;
+    }
+
+    fn discardPreparedBatch(self: *ResourceManager, prepared: *const PreparedBatchReservation) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const owned = self.batch_reservation_identities.get(prepared.identity) orelse return;
+        if (owned.prepared and std.meta.eql(owned.amounts, prepared.amounts) and
+            owned.host_charge_bytes == prepared.host_charge_bytes)
+            _ = self.batch_reservation_identities.remove(prepared.identity);
+    }
+
+    /// One bounded attempt, with scheduler -> child -> parent lock order.
+    /// Ancestor admission is the last fallible action: failure commits no
+    /// slice/aggregate usage or ownership change at any level of the chain.
+    fn tryAcquirePreparedBatch(self: *ResourceManager, prepared: *PreparedBatchReservation) PreparedBatchReservation.Attempt {
+        if (prepared.manager != self or prepared.consumed) return .mismatch;
+        if (!self.mutex.tryLock()) return .busy;
+        defer self.mutex.unlock();
+        if (!self.pressure_change.tryLock()) return .busy;
+        defer self.pressure_change.unlock();
+        const owned = self.batch_reservation_identities.getPtr(prepared.identity) orelse return .mismatch;
+        if (!owned.prepared or !std.meta.eql(owned.amounts, prepared.amounts) or
+            owned.host_charge_bytes != prepared.host_charge_bytes) return .mismatch;
+
+        const memory_limit = self.memory.budget.hard_limit_bytes;
+        if (memory_limit != 0 and prepared.host_charge_bytes > memory_limit -| self.identity_metadata_bytes) return .too_large;
+        // Check intrinsic size for every slice before testing occupancy.
+        for (prepared.amounts, 0..) |bytes, index| {
+            const limit = self.slices[index].budget.hard_limit_bytes;
+            if (limit != 0 and bytes > limit) return .too_large;
+        }
+        const next_memory = std.math.add(u64, self.memory.used_bytes, prepared.host_charge_bytes) catch return .denied;
+        if (memory_limit != 0 and next_memory > memory_limit) return .denied;
+        for (prepared.amounts, 0..) |bytes, index| {
+            const state = &self.slices[index];
+            const next = std.math.add(u64, state.used_bytes, bytes) catch return .denied;
+            if (state.budget.hard_limit_bytes != 0 and next > state.budget.hard_limit_bytes) return .denied;
+        }
+        if (prepared.host_charge_bytes != 0) self.reserveParentWithoutWaiting(prepared.host_charge_bytes) catch |err| return switch (err) {
+            error.ParentMemoryBusy => .busy,
+            error.ExecutionWaitUnsupported => .unsupported,
+            else => .denied,
+        };
+        for (prepared.amounts, 0..) |bytes, index| {
+            if (bytes == 0) continue;
+            const state = &self.slices[index];
+            state.used_bytes += bytes;
+            state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
+            if (state.budget.soft_limit_bytes != 0 and state.used_bytes > state.budget.soft_limit_bytes)
+                state.soft_limit_events +|= 1;
+        }
+        self.commitMemoryLocked(next_memory);
+        owned.prepared = false;
+        prepared.consumed = true;
+        self.pressure_change.advanceLocked();
+        return .{ .acquired = .{
+            .manager = self,
+            .identity = prepared.identity,
+            .amounts = prepared.amounts,
+            .host_charge_bytes = prepared.host_charge_bytes,
+        } };
     }
 
     /// Atomically reserve several independent slices while distinguishing a
@@ -2839,7 +3317,26 @@ pub const ResourceManager = struct {
         amounts: []const SliceAmount,
         host_charge_bytes: u64,
     ) ClassifiedBatchReserveError!BatchReservation {
-        return self.reserveBatchClassifiedWithHostChargeOnce(amounts, host_charge_bytes) catch |err| {
+        return self.reserveBatchWithHostCharge(false, amounts, host_charge_bytes);
+    }
+
+    /// Preserve physical identity-ledger allocation failure separately from a
+    /// budget refusal. Legacy classified callers retain their existing policy.
+    pub fn reserveBatchCheckedWithHostCharge(
+        self: *ResourceManager,
+        amounts: []const SliceAmount,
+        host_charge_bytes: u64,
+    ) (ClassifiedBatchReserveError || error{OutOfMemory})!BatchReservation {
+        return self.reserveBatchWithHostCharge(true, amounts, host_charge_bytes);
+    }
+
+    fn reserveBatchWithHostCharge(
+        self: *ResourceManager,
+        comptime checked_metadata: bool,
+        amounts: []const SliceAmount,
+        host_charge_bytes: u64,
+    ) (if (checked_metadata) ClassifiedBatchReserveError || error{OutOfMemory} else ClassifiedBatchReserveError)!BatchReservation {
+        return self.reserveBatchClassifiedWithHostChargeOnce(checked_metadata, amounts, host_charge_bytes) catch |err| {
             if (err != error.ResourceTemporarilyUnavailable) return err;
             const requester = blk: {
                 for (amounts) |amount| switch (amount.slice) {
@@ -2849,15 +3346,16 @@ pub const ResourceManager = struct {
                 break :blk if (amounts.len == 0) Slice.dense_apply_working_set else amounts[0].slice;
             };
             if (self.reclaimForAllocation(requester, host_charge_bytes) == 0) return err;
-            return self.reserveBatchClassifiedWithHostChargeOnce(amounts, host_charge_bytes);
+            return self.reserveBatchClassifiedWithHostChargeOnce(checked_metadata, amounts, host_charge_bytes);
         };
     }
 
     fn reserveBatchClassifiedWithHostChargeOnce(
         self: *ResourceManager,
+        comptime checked_metadata: bool,
         amounts: []const SliceAmount,
         host_charge_bytes: u64,
-    ) ClassifiedBatchReserveError!BatchReservation {
+    ) (if (checked_metadata) ClassifiedBatchReserveError || error{OutOfMemory} else ClassifiedBatchReserveError)!BatchReservation {
         const normalized = try normalizeSliceAmounts(amounts);
 
         lockAtomic(&self.mutex);
@@ -2879,11 +3377,11 @@ pub const ResourceManager = struct {
             }
         }
 
-        const next_memory = std.math.add(u64, self.memory.used_bytes, host_charge_bytes) catch {
+        const next_memory_preflight = std.math.add(u64, self.memory.used_bytes, host_charge_bytes) catch {
             self.memory.hard_limit_rejections +|= 1;
             return error.ResourceTemporarilyUnavailable;
         };
-        if (memory_hard_limit > 0 and next_memory > memory_hard_limit) {
+        if (memory_hard_limit > 0 and next_memory_preflight > memory_hard_limit) {
             self.memory.hard_limit_rejections +|= 1;
             return error.ResourceTemporarilyUnavailable;
         }
@@ -2903,17 +3401,22 @@ pub const ResourceManager = struct {
 
         const identity = self.issueIdentityLocked();
         self.batch_reservation_identities.put(
-            self.identity_allocator,
+            self,
             identity,
             .{
                 .amounts = normalized,
                 .host_charge_bytes = host_charge_bytes,
             },
-        ) catch {
+        ) catch |err| {
+            if (checked_metadata and err == error.OutOfMemory) return error.OutOfMemory;
             self.memory.hard_limit_rejections +|= 1;
             return error.ResourceTemporarilyUnavailable;
         };
 
+        const next_memory = self.checkMemoryLocked(host_charge_bytes) catch {
+            _ = self.batch_reservation_identities.remove(identity);
+            return error.ResourceTemporarilyUnavailable;
+        };
         self.reserveParentLocked(host_charge_bytes) catch {
             _ = self.batch_reservation_identities.remove(identity);
             return error.ResourceTemporarilyUnavailable;
@@ -2961,7 +3464,7 @@ pub const ResourceManager = struct {
             self.memory.accounting_errors +|= 1;
             return error.ReservationReleased;
         };
-        if (!std.meta.eql(owned.amounts, reservation.amounts) or
+        if (owned.prepared or !std.meta.eql(owned.amounts, reservation.amounts) or
             owned.host_charge_bytes != reservation.host_charge_bytes)
         {
             self.memory.accounting_errors +|= 1;
@@ -2980,7 +3483,7 @@ pub const ResourceManager = struct {
         }
 
         const released_host = reservation.host_charge_bytes - retained_host_charge_bytes;
-        if (released_host > self.memory.used_bytes) {
+        if (released_host > self.memory.used_bytes -| self.identityMetadataCharge()) {
             self.memory.accounting_errors +|= 1;
             return error.ResourceAccountingMismatch;
         }
@@ -3002,6 +3505,63 @@ pub const ResourceManager = struct {
         self.notifyPressureChange();
     }
 
+    fn transferBatchReservationCredit(
+        self: *ResourceManager,
+        source: *BatchReservation,
+        destination: *BatchReservation,
+        amounts: [slice_count]u64,
+        host_charge_bytes: u64,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        // Validate even a zero-byte move: it must not bless a stale, aliased,
+        // prepared, foreign, or already-consumed ownership descriptor.
+        if (source.manager != self or destination.manager != self or
+            source == destination or source.identity == destination.identity)
+        {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        if (source.released or destination.released) return error.ReservationReleased;
+        const source_owned = self.batch_reservation_identities.getPtr(source.identity) orelse
+            return error.ReservationReleased;
+        const destination_owned = self.batch_reservation_identities.getPtr(destination.identity) orelse
+            return error.ReservationReleased;
+        if (source_owned.prepared or destination_owned.prepared or
+            !std.meta.eql(source_owned.amounts, source.amounts) or
+            !std.meta.eql(destination_owned.amounts, destination.amounts) or
+            source_owned.host_charge_bytes != source.host_charge_bytes or
+            destination_owned.host_charge_bytes != destination.host_charge_bytes)
+        {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+
+        // Compute every result before publishing either owner. No fallible
+        // work, parent callback, or resource notification follows mutation.
+        var next_source = source.amounts;
+        var next_destination = destination.amounts;
+        inline for (0..slice_count) |index| {
+            if (amounts[index] > source.amounts[index]) return error.InvalidReservationReduction;
+            next_destination[index] = std.math.add(u64, destination.amounts[index], amounts[index]) catch
+                return error.ResourceAccountingMismatch;
+            next_source[index] -= amounts[index];
+        }
+        if (host_charge_bytes > source.host_charge_bytes) return error.InvalidReservationReduction;
+        const next_destination_host = std.math.add(u64, destination.host_charge_bytes, host_charge_bytes) catch
+            return error.ResourceAccountingMismatch;
+        const next_source_host = source.host_charge_bytes - host_charge_bytes;
+        source.amounts = next_source;
+        source.host_charge_bytes = next_source_host;
+        destination.amounts = next_destination;
+        destination.host_charge_bytes = next_destination_host;
+        source_owned.amounts = next_source;
+        source_owned.host_charge_bytes = next_source_host;
+        destination_owned.amounts = next_destination;
+        destination_owned.host_charge_bytes = next_destination_host;
+    }
+
     pub fn recordAccountingError(self: *ResourceManager) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -3019,14 +3579,14 @@ pub const ResourceManager = struct {
             self.memory.accounting_errors +|= 1;
             return false;
         };
-        if (!std.meta.eql(owned.amounts, reservation.amounts) or
+        if (owned.prepared or !std.meta.eql(owned.amounts, reservation.amounts) or
             owned.host_charge_bytes != reservation.host_charge_bytes)
         {
             self.memory.accounting_errors +|= 1;
             return false;
         }
 
-        if (reservation.host_charge_bytes > self.memory.used_bytes) {
+        if (reservation.host_charge_bytes > self.memory.used_bytes -| self.identityMetadataCharge()) {
             self.memory.accounting_errors +|= 1;
             return false;
         }
@@ -3143,6 +3703,7 @@ pub const ResourceManager = struct {
             var registry_held = true;
             defer if (registry_held) self.payload_retirement_mutex.unlock();
             try control.checkpoint();
+            _ = self.tryDrainIdentityMetadataRetirement();
             const node = self.payload_retirement_cursor orelse break;
             self.payload_retirement_cursor = node.next orelse self.payload_retirement_head;
             if (!node.ready.load(.acquire)) continue;
@@ -3296,6 +3857,9 @@ pub const ResourceManager = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
+        // Admit any identity-table growth before computing payload headroom.
+        // A rejected full request need not have allocated its identity table.
+        try self.reservation_identities.ensureUnusedCapacity(self, 1);
         const state = &self.slices[sliceIndex(slice)];
         const slice_available = if (state.budget.hard_limit_bytes == 0)
             requested_total
@@ -3316,12 +3880,14 @@ pub const ResourceManager = struct {
             state.hard_limit_rejections +|= 1;
             return error.ResourceBudgetExceeded;
         };
-        const next_memory = std.math.add(u64, self.memory.used_bytes, granted) catch {
+        _ = std.math.add(u64, self.memory.used_bytes, granted) catch {
             self.memory.hard_limit_rejections +|= 1;
             return error.ResourceBudgetExceeded;
         };
 
-        const identity = try self.registerReservationIdentityLocked(slice, granted, true);
+        const identity = try self.registerReservationIdentityLocked(slice, granted, true, false);
+        errdefer _ = self.reservation_identities.remove(identity);
+        const admitted_memory = try self.checkMemoryLocked(granted);
         self.reserveParentLocked(granted) catch |err| {
             _ = self.reservation_identities.remove(identity);
             return err;
@@ -3330,7 +3896,7 @@ pub const ResourceManager = struct {
         state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
         if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
             state.soft_limit_events +|= 1;
-        self.memory.used_bytes = next_memory;
+        self.memory.used_bytes = admitted_memory;
         self.memory.peak_bytes = @max(self.memory.peak_bytes, self.memory.used_bytes);
         if (self.memory.budget.soft_limit_bytes > 0 and self.memory.used_bytes > self.memory.budget.soft_limit_bytes)
             self.memory.soft_limit_events +|= 1;
@@ -3365,8 +3931,10 @@ pub const ResourceManager = struct {
             state.hard_limit_rejections += 1;
             return error.ResourceBudgetExceeded;
         }
+        _ = try self.checkMemoryLocked(bytes);
+        const identity = try self.registerReservationIdentityLocked(slice, bytes, true, control != null);
+        errdefer _ = self.reservation_identities.remove(identity);
         const next_memory = try self.checkMemoryLocked(bytes);
-        const identity = try self.registerReservationIdentityLocked(slice, bytes, true);
         (if (control != null) self.reserveParentWithoutWaiting(bytes) else self.reserveParentLocked(bytes)) catch |err| {
             _ = self.reservation_identities.remove(identity);
             return err;
@@ -3414,8 +3982,10 @@ pub const ResourceManager = struct {
         }
         // Minimum-progress exceptions are local slice policy; they may never
         // bypass the process-wide physical-memory envelope.
+        _ = try self.checkMemoryLocked(bytes);
+        const identity = try self.registerReservationIdentityLocked(slice, bytes, true, false);
+        errdefer _ = self.reservation_identities.remove(identity);
         const next_memory = try self.checkMemoryLocked(bytes);
-        const identity = try self.registerReservationIdentityLocked(slice, bytes, true);
         self.reserveParentLocked(bytes) catch |err| {
             _ = self.reservation_identities.remove(identity);
             return err;
@@ -3441,7 +4011,7 @@ pub const ResourceManager = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
-        const owned = try self.reservationIdentityLocked(reservation);
+        const owned = try self.reservationIdentityLocked(reservation, false);
         const state = &self.slices[sliceIndex(reservation.slice)];
         const next = std.math.add(u64, state.used_bytes, additional_bytes) catch {
             state.hard_limit_rejections +|= 1;
@@ -3488,7 +4058,7 @@ pub const ResourceManager = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
-        const owned = try self.reservationIdentityLocked(reservation);
+        const owned = try self.reservationIdentityLocked(reservation, false);
         const state = &self.slices[sliceIndex(reservation.slice)];
         const hard_limit = state.budget.hard_limit_bytes;
         const bounded_limit = if (hard_limit == 0)
@@ -3600,7 +4170,7 @@ pub const ResourceManager = struct {
             return false;
         }
         const state = &self.slices[sliceIndex(owned.slice)];
-        if (owned.bytes > state.used_bytes or (owned.host_charge and owned.bytes > self.memory.used_bytes)) {
+        if (owned.bytes > state.used_bytes or (owned.host_charge and owned.bytes > self.memory.used_bytes -| self.identityMetadataCharge())) {
             self.memory.accounting_errors +|= 1;
             return false;
         }
@@ -3628,7 +4198,7 @@ pub const ResourceManager = struct {
         defer self.pressure_change.unlock();
         const owned = self.reservation_identities.get(reservation.identity) orelse return .mismatch;
         const state = &self.slices[sliceIndex(owned.slice)];
-        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes or owned.host_charge != reservation.host_charge or owned.bytes > state.used_bytes or (owned.host_charge and owned.bytes > self.memory.used_bytes)) return .mismatch;
+        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes or owned.host_charge != reservation.host_charge or owned.bytes > state.used_bytes or (owned.host_charge and owned.bytes > self.memory.used_bytes -| self.identityMetadataCharge())) return .mismatch;
         if (owned.host_charge and owned.bytes != 0) self.releaseParentWithoutWaiting(owned.bytes) catch |err| return switch (err) {
             error.ParentMemoryBusy => .busy,
             error.ExecutionWaitUnsupported => .unsupported,
@@ -3656,7 +4226,7 @@ pub const ResourceManager = struct {
         }
         const released = @min(bytes, owned.bytes);
         const state = &self.slices[sliceIndex(owned.slice)];
-        if (released > state.used_bytes or (owned.host_charge and released > self.memory.used_bytes)) {
+        if (released > state.used_bytes or (owned.host_charge and released > self.memory.used_bytes -| self.identityMetadataCharge())) {
             self.memory.accounting_errors +|= 1;
             return false;
         }
@@ -3722,7 +4292,7 @@ pub const ResourceManager = struct {
 
         // Register an empty destination first. The insertion may rehash the
         // identity map, so acquire both entry pointers only afterwards.
-        _ = try self.reservationIdentityLocked(destination);
+        _ = try self.reservationIdentityLocked(destination, false);
         const source_owned = self.reservation_identities.getPtr(source.identity) orelse {
             self.memory.accounting_errors +|= 1;
             return error.ReservationReleased;
@@ -3778,9 +4348,10 @@ pub const ResourceManager = struct {
                 return error.ResourceAccountingMismatch;
             }
             if (next == 0) return;
-            const entry = try self.observer_identities.getOrPut(
-                self.identity_allocator,
+            const entry = try self.observer_identities.getOrPutWithParentPolicy(
+                self,
                 key,
+                bounded_parent,
             );
             entry.value_ptr.* = .{ .current = 0 };
             inserted = true;
@@ -3795,7 +4366,7 @@ pub const ResourceManager = struct {
         }
 
         const state = &self.slices[sliceIndex(slice)];
-        if (previous > state.used_bytes or previous > self.memory.used_bytes) {
+        if (previous > state.used_bytes or previous > self.memory.used_bytes -| self.identityMetadataCharge()) {
             self.memory.accounting_errors +|= 1;
             return error.ResourceAccountingMismatch;
         }
@@ -3873,13 +4444,13 @@ pub const ResourceManager = struct {
         if (control != null and !self.pressure_change.tryLock()) return error.ParentMemoryBusy;
         defer if (control != null) self.pressure_change.unlock();
         if (reservation.manager != self or reservation.released or !reservation.host_charge) return error.ResourceAccountingMismatch;
-        const source_owned = try self.reservationIdentityLocked(reservation);
+        const source_owned = try self.reservationIdentityLocked(reservation, control != null);
         const credit = @min(reservation.bytes, added);
         const key: ObserverKey = .{ .slice = destination, .identity = @intFromPtr(current) };
         var inserted = false;
         const observed = self.observer_identities.getPtr(key) orelse blk: {
             if (current.* != 0) return error.ResourceAccountingMismatch;
-            const entry = try self.observer_identities.getOrPut(self.identity_allocator, key);
+            const entry = try self.observer_identities.getOrPutWithParentPolicy(self, key, control != null);
             entry.value_ptr.* = .{ .current = 0 };
             inserted = true;
             break :blk entry.value_ptr;
@@ -3890,7 +4461,7 @@ pub const ResourceManager = struct {
         if (observed.current != current.*) return error.ResourceAccountingMismatch;
         const source = &self.slices[sliceIndex(reservation.slice)];
         const target = &self.slices[sliceIndex(destination)];
-        if (source.used_bytes < credit or self.memory.used_bytes < credit) return error.ResourceAccountingMismatch;
+        if (source.used_bytes < credit or self.memory.used_bytes -| self.identityMetadataCharge() < credit) return error.ResourceAccountingMismatch;
         const target_previous = target.used_bytes - if (reservation.slice == destination) credit else @as(u64, 0);
         const target_next = std.math.add(u64, target_previous, added) catch return error.ResourceBudgetExceeded;
         const memory_next = std.math.add(u64, self.memory.used_bytes - credit, added) catch return error.ResourceBudgetExceeded;
@@ -3939,7 +4510,7 @@ pub const ResourceManager = struct {
         const key = ObserverKey{ .slice = slice, .identity = @intFromPtr(current) };
         const owned = self.observer_identities.getPtr(key) orelse return error.ResourceAccountingMismatch;
         const state = &self.slices[sliceIndex(slice)];
-        if (owned.current != current.* or current.* > state.used_bytes or current.* > self.memory.used_bytes)
+        if (owned.current != current.* or current.* > state.used_bytes or current.* > self.memory.used_bytes -| self.identityMetadataCharge())
             return error.ResourceAccountingMismatch;
         // Decreasing an existing validated identity cannot allocate or exceed
         // a budget. Physical bytes stop existing before their capacity becomes
@@ -4012,7 +4583,7 @@ pub const ResourceManager = struct {
         const key = ObserverKey{ .slice = slice, .identity = @intFromPtr(current) };
         const owned = self.observer_identities.getPtr(key) orelse return error.ResourceAccountingMismatch;
         const state = &self.slices[sliceIndex(slice)];
-        if (owned.current != current.* or current.* > state.used_bytes or current.* > self.memory.used_bytes or
+        if (owned.current != current.* or current.* > state.used_bytes or current.* > self.memory.used_bytes -| self.identityMetadataCharge() or
             debt.* > current.* or amount > current.* - debt.*)
             return error.ResourceAccountingMismatch;
         debt.* += amount;
@@ -4147,7 +4718,7 @@ pub const ResourceManager = struct {
         if (destination_previous == 0 and destination_next != 0 and
             !self.observer_identities.contains(destination_key))
         {
-            const entry = try self.observer_identities.getOrPut(self.identity_allocator, destination_key);
+            const entry = try self.observer_identities.getOrPut(self, destination_key);
             entry.value_ptr.* = .{ .current = 0 };
             inserted_destination = true;
         }
@@ -4162,7 +4733,7 @@ pub const ResourceManager = struct {
         const next_total = std.math.add(u64, source_next, destination_next) catch
             return error.ResourceBudgetExceeded;
         const state = &self.slices[sliceIndex(slice)];
-        if (previous_total > state.used_bytes or previous_total > self.memory.used_bytes) {
+        if (previous_total > state.used_bytes or previous_total > self.memory.used_bytes -| self.identityMetadataCharge()) {
             self.memory.accounting_errors +|= 1;
             return error.ResourceAccountingMismatch;
         }
@@ -4301,6 +4872,10 @@ pub const ResourceManager = struct {
             };
         }
         return .{
+            .control_object_bytes = self.control_object_bytes,
+            .identity_metadata_bytes = self.identity_metadata_bytes,
+            .identity_metadata_retirement_bytes = self.identity_metadata_retirement_bytes,
+            .identity_metadata_limit_bytes = self.identity_metadata_limit_bytes,
             .memory = .{
                 .used_bytes = self.memory.used_bytes,
                 .peak_bytes = self.memory.peak_bytes,
@@ -4390,11 +4965,25 @@ pub const ResourceManager = struct {
     pub fn admissionDecision(self: *ResourceManager, slice: Slice, additional_bytes: u64) PressureDecision {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        return self.admissionDecisionLocked(slice, additional_bytes, if (self.memory_parent) |parent| parent.snapshot() else null, self.pressureEpoch());
+    }
 
+    /// Observe the parent before acquiring the child ledger. Progress must never
+    /// reenter a held child lock; parent and child contention use the same port.
+    /// Controlled callers poll pressure, so they need no legacy epoch callback.
+    pub fn admissionDecisionWithAdmission(self: *ResourceManager, slice: Slice, additional_bytes: u64, control: read_admission.Port) !PressureDecision {
+        const parent_snapshot = if (self.memory_parent) |parent| try snapshotParentWithAdmission(parent, control) else null;
+        try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, control);
+        defer self.mutex.unlock();
+        const decision = self.admissionDecisionLocked(slice, additional_bytes, parent_snapshot, 0);
+        try control.checkpoint();
+        return decision;
+    }
+
+    fn admissionDecisionLocked(self: *ResourceManager, slice: Slice, additional_bytes: u64, parent_snapshot: ?@import("runtime_memory_abi").ParentSnapshot, change_epoch: u64) PressureDecision {
         const state = self.slices[sliceIndex(slice)];
         const projected_bytes = state.used_bytes +| additional_bytes;
         const slice_pressure = pressureFor(state.budget, projected_bytes);
-        const parent_snapshot = if (self.memory_parent) |parent| parent.snapshot() else null;
         const memory_budget: Budget = if (parent_snapshot) |parent| .{
             .soft_limit_bytes = parent.soft_limit_bytes,
             .hard_limit_bytes = parent.hard_limit_bytes,
@@ -4416,7 +5005,7 @@ pub const ResourceManager = struct {
             .used_bytes = if (aggregate_dominates) projected_memory else projected_bytes,
             .soft_limit_bytes = if (aggregate_dominates) memory_budget.soft_limit_bytes else state.budget.soft_limit_bytes,
             .hard_limit_bytes = if (aggregate_dominates) memory_budget.hard_limit_bytes else state.budget.hard_limit_bytes,
-            .change_epoch = self.pressureEpoch(),
+            .change_epoch = change_epoch,
         };
     }
 
@@ -4464,6 +5053,20 @@ pub const ResourceManager = struct {
             }
             self.waitForPressureChange(decision.change_epoch);
         }
+    }
+
+    /// Original request authority bounds pressure waiting. The synchronous port
+    /// is never retained, and admission still reserves no bytes. Recheck at the
+    /// actual allocation/WAL boundary as for legacy awaitAdmission.
+    pub fn awaitAdmissionWithAdmission(self: *ResourceManager, slice: Slice, additional_bytes: u64, control: read_admission.Port) !void {
+        try @import("pressure_admission.zig").awaitAdmission(self, slice, additional_bytes, control);
+    }
+
+    /// Explicit pre-decision policy; this creates no reservation or new scope.
+    /// Non-lending soft pacing is skipped, while the allocation/WAL guard still
+    /// rejects hard overcommit. Mandatory callers keep the existing method.
+    pub fn awaitAdmissionPreDecisionWithAdmission(self: *ResourceManager, slice: Slice, additional_bytes: u64, control: read_admission.Port) !void {
+        try @import("pressure_admission.zig").awaitAdmissionPreDecision(self, slice, additional_bytes, control);
     }
 
     /// Returns whether replay retention has reached a hard limit while a
@@ -5086,7 +5689,7 @@ pub const BudgetedAllocator = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         const arena_vtable = arena.allocator().vtable;
         for (0..8) |_| {
-            if (current.vtable.alloc == alloc or current.vtable.alloc == lockedAlloc)
+            if (current.vtable.alloc == alloc or current.vtable.alloc == lockedAlloc or current.vtable.alloc == lockedNoReclaimAlloc)
                 return @ptrCast(@alignCast(current.ptr));
             if (current.vtable != arena_vtable) return null;
             const wrapped: *std.heap.ArenaAllocator = @ptrCast(@alignCast(current.ptr));
@@ -5115,6 +5718,14 @@ pub const BudgetedAllocator = struct {
         return .{ .ptr = self, .vtable = &.{ .alloc = lockedAlloc, .resize = lockedResize, .remap = lockedRemap, .free = lockedFree } };
     }
 
+    /// Share the same ledger and physical owner while suppressing this
+    /// budget's reclamation hooks for every operation. Suitable for scratch
+    /// under storage dependencies; the backing allocator must obey that lock
+    /// contract too. Does not mutate the owner's policy or allocate a wrapper.
+    pub fn threadSafeNoReclaimAllocator(self: *BudgetedAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = lockedNoReclaimAlloc, .resize = lockedNoReclaimResize, .remap = lockedNoReclaimRemap, .free = lockedFree } };
+    }
+
     pub fn liveBytesThreadSafe(self: *BudgetedAllocator) u64 {
         lockAtomic(&self.allocator_mutex);
         defer self.allocator_mutex.unlock();
@@ -5123,15 +5734,18 @@ pub const BudgetedAllocator = struct {
 
     const LockedAllocationResult = struct { ptr: ?[*]u8, cause: ?@FieldType(AllocationFailure, "cause") };
     fn lockedAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        return lockedAllocOutcome(ctx, len, alignment, ret_addr).ptr;
+        return lockedAllocOutcome(ctx, len, alignment, ret_addr, true).ptr;
     }
-    fn lockedAllocOutcome(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) LockedAllocationResult {
+    fn lockedNoReclaimAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        return lockedAllocOutcome(ctx, len, alignment, ret_addr, false).ptr;
+    }
+    fn lockedAllocOutcome(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize, allow_reclaim: bool) LockedAllocationResult {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         lockAtomic(&self.allocator_mutex);
         const generation = self.denial_generation;
         const ptr = allocImpl(ctx, len, alignment, ret_addr, false);
         const result = LockedAllocationResult{ .ptr = ptr, .cause = if (ptr == null) self.last_allocation_failure.?.cause else null };
-        const reclaim = ptr == null and self.reclaim_on_denial and self.denial_generation != generation;
+        const reclaim = allow_reclaim and ptr == null and self.reclaim_on_denial and self.denial_generation != generation;
         const deficit = if (reclaim) self.reclaim_deficit else 0;
         self.allocator_mutex.unlock();
         if (!reclaim or deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) == 0) return result;
@@ -5141,11 +5755,17 @@ pub const BudgetedAllocator = struct {
         return .{ .ptr = retried, .cause = if (retried == null) self.last_allocation_failure.?.cause else null };
     }
     fn lockedResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        return lockedResizeWithPolicy(ctx, memory, alignment, new_len, ret_addr, true);
+    }
+    fn lockedNoReclaimResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        return lockedResizeWithPolicy(ctx, memory, alignment, new_len, ret_addr, false);
+    }
+    fn lockedResizeWithPolicy(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize, allow_reclaim: bool) bool {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         lockAtomic(&self.allocator_mutex);
         const generation = self.denial_generation;
         const result = resizeImpl(ctx, memory, alignment, new_len, ret_addr, false);
-        const reclaim = !result and self.reclaim_on_denial and self.denial_generation != generation;
+        const reclaim = allow_reclaim and !result and self.reclaim_on_denial and self.denial_generation != generation;
         const deficit = if (reclaim) self.reclaim_deficit else 0;
         self.allocator_mutex.unlock();
         if (!reclaim or deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) == 0) return result;
@@ -5154,11 +5774,17 @@ pub const BudgetedAllocator = struct {
         return resizeImpl(ctx, memory, alignment, new_len, ret_addr, false);
     }
     fn lockedRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        return lockedRemapWithPolicy(ctx, memory, alignment, new_len, ret_addr, true);
+    }
+    fn lockedNoReclaimRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        return lockedRemapWithPolicy(ctx, memory, alignment, new_len, ret_addr, false);
+    }
+    fn lockedRemapWithPolicy(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize, allow_reclaim: bool) ?[*]u8 {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         lockAtomic(&self.allocator_mutex);
         const generation = self.denial_generation;
         const result = remapImpl(ctx, memory, alignment, new_len, ret_addr, false);
-        const reclaim = result == null and self.reclaim_on_denial and self.denial_generation != generation;
+        const reclaim = allow_reclaim and result == null and self.reclaim_on_denial and self.denial_generation != generation;
         const deficit = if (reclaim) self.reclaim_deficit else 0;
         self.allocator_mutex.unlock();
         if (!reclaim or deficit == 0 or self.reservation.manager.reclaimForAllocation(self.reservation.slice, deficit) == 0) return result;
@@ -5187,7 +5813,7 @@ pub const BudgetedAllocator = struct {
 
         fn trackedAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            const result = lockedAllocOutcome(self.owner, len, alignment, ra);
+            const result = lockedAllocOutcome(self.owner, len, alignment, ra, true);
             self.last_failure = result.cause;
             return result.ptr;
         }
@@ -5562,7 +6188,7 @@ test "manager teardown retires live observer snapshots" {
         &observed,
         4096,
     ));
-    try std.testing.expectEqual(@as(u64, 4096), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 4096), metadata_fixture.payloadUsage(&manager));
 
     // The observed allocation and manager share this shutdown boundary. The
     // manager owns and frees the identity registry even when no final zero
@@ -5635,7 +6261,7 @@ test "batch reservation is atomic across inference resource slices" {
     var budgets = Options.defaultBudgets();
     budgets[sliceIndex(.inference_model_residency)] = .{ .hard_limit_bytes = 100 };
     budgets[sliceIndex(.inference_kv_working_set)] = .{ .hard_limit_bytes = 20 };
-    var manager = ResourceManager.init(.{ .budgets = budgets });
+    var manager = try metadata_fixture.init(.{ .budgets = budgets });
 
     try std.testing.expectError(
         error.ResourceBudgetExceeded,
@@ -5668,7 +6294,7 @@ test "batch reservation is atomic across inference resource slices" {
 test "classified batch reservation distinguishes size from contention" {
     var budgets = Options.defaultBudgets();
     budgets[sliceIndex(.inference_model_residency)] = .{ .hard_limit_bytes = 100 };
-    var manager = ResourceManager.init(.{ .budgets = budgets });
+    var manager = try metadata_fixture.init(.{ .budgets = budgets });
 
     try std.testing.expectError(
         error.ResourceRequestTooLarge,
@@ -5701,7 +6327,7 @@ test "classified batch reservation distinguishes size from contention" {
 }
 
 test "aggregate host memory admission is atomic across slices" {
-    var manager = ResourceManager.init(.{
+    var manager = try metadata_fixture.init(.{
         .memory_budget = .{ .soft_limit_bytes = 75, .hard_limit_bytes = 100 },
     });
 
@@ -5715,13 +6341,13 @@ test "aggregate host memory admission is atomic across slices" {
         }),
     );
     const stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 70), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 70), (stats.memory.used_bytes - manager.identity_metadata_bytes));
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_compaction_work).used_bytes);
     try std.testing.expectEqual(@as(u64, 1), stats.memory.hard_limit_rejections);
 }
 
 test "logical inference slices can charge only physical host memory" {
-    var manager = ResourceManager.init(.{
+    var manager = try metadata_fixture.init(.{
         .memory_budget = .{ .hard_limit_bytes = 100 },
     });
     const logical = [_]SliceAmount{
@@ -5731,13 +6357,13 @@ test "logical inference slices can charge only physical host memory" {
     var reservation = try manager.reserveBatchClassifiedWithHostCharge(&logical, 80);
     try std.testing.expectEqual(@as(u64, 300), manager.sliceStats(.inference_model_residency).used_bytes +
         manager.sliceStats(.inference_kv_working_set).used_bytes);
-    try std.testing.expectEqual(@as(u64, 80), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 80), metadata_fixture.payloadUsage(&manager));
     reservation.release();
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
 }
 
 test "batch release accounting errors fail closed" {
-    var manager = ResourceManager.init(.{});
+    var manager = try metadata_fixture.init(.{});
     const admitted = [_]SliceAmount{
         .{ .slice = .inference_model_residency, .bytes = 20 },
         .{ .slice = .inference_kv_working_set, .bytes = 10 },
@@ -5750,7 +6376,7 @@ test "batch release accounting errors fail closed" {
     first.release();
     first_copy.release();
     var stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 15), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 15), (stats.memory.used_bytes - manager.identity_metadata_bytes));
     try std.testing.expectEqual(@as(u64, 20), manager.sliceStats(.inference_model_residency).used_bytes);
     try std.testing.expectEqual(@as(u64, 1), stats.memory.accounting_errors);
 
@@ -5765,20 +6391,20 @@ test "batch release accounting errors fail closed" {
             .{ .slice = .inference_model_residency, .bytes = 10 },
         }, 15),
     );
-    try std.testing.expectEqual(@as(u64, 15), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 15), metadata_fixture.payloadUsage(&manager));
 
     // Simulate a damaged aggregate ledger. Release must retain every slice
     // reservation and make the mismatch observable rather than saturating.
-    manager.memory.used_bytes = 14;
+    manager.memory.used_bytes = manager.identity_metadata_bytes + 14;
     second.release();
     stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 14), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 14), (stats.memory.used_bytes - manager.identity_metadata_bytes));
     try std.testing.expectEqual(@as(u64, 20), manager.sliceStats(.inference_model_residency).used_bytes);
     try std.testing.expectEqual(@as(u64, 4), stats.memory.accounting_errors);
 }
 
 test "resource identity ledgers bound tombstones across churn and reject stale owners" {
-    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    var manager = try metadata_fixture.init(.{ .identity_allocator = std.testing.allocator });
     defer manager.deinit(std.testing.allocator);
     var pinned = try manager.reserve(.dense_apply_working_set, 7);
     defer pinned.release();
@@ -5796,14 +6422,14 @@ test "resource identity ledgers bound tombstones across churn and reject stale o
         try std.testing.expect(manager.tryObserveUsageIdentity(.dense_apply_working_set, key, 11, 0));
         reservation.release();
         batch.release();
-        try std.testing.expectEqual(@as(u64, 7), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 7), metadata_fixture.payloadUsage(&manager));
         try std.testing.expect(manager.reservation_identities.removals < @max(1, manager.reservation_identities.map.capacity() / 8));
         try std.testing.expect(manager.batch_reservation_identities.removals < @max(1, manager.batch_reservation_identities.map.capacity() / 8));
         try std.testing.expect(manager.observer_identities.removals < @max(1, manager.observer_identities.map.capacity() / 8));
     }
     stale.?.release();
     stale_batch.?.release();
-    try std.testing.expectEqual(@as(u64, 7), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 7), metadata_fixture.payloadUsage(&manager));
     try std.testing.expectEqual(@as(u64, 2), manager.snapshot().memory.accounting_errors);
     try std.testing.expect(manager.reservation_identities.rehashes > 0);
     try std.testing.expect(manager.batch_reservation_identities.rehashes > 0);
@@ -5811,7 +6437,7 @@ test "resource identity ledgers bound tombstones across churn and reject stale o
 }
 
 test "single release and observer mismatch cannot debit unrelated memory" {
-    var manager = ResourceManager.init(.{});
+    var manager = try metadata_fixture.init(.{});
     var first = try manager.reserve(.inference_tokenizer_cache, 10);
     var unrelated = try manager.reserve(.inference_model_residency, 20);
 
@@ -5819,7 +6445,7 @@ test "single release and observer mismatch cannot debit unrelated memory" {
     corrupt_copy.bytes = 11;
     corrupt_copy.release();
     var stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 30), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 30), (stats.memory.used_bytes - manager.identity_metadata_bytes));
     try std.testing.expectEqual(@as(u64, 10), manager.sliceStats(.inference_tokenizer_cache).used_bytes);
 
     var stale_observation: u64 = 11;
@@ -5829,7 +6455,7 @@ test "single release and observer mismatch cannot debit unrelated memory" {
         0,
     ));
     stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 30), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 30), (stats.memory.used_bytes - manager.identity_metadata_bytes));
     try std.testing.expectEqual(@as(u64, 11), stale_observation);
     try std.testing.expectEqual(@as(u64, 2), stats.memory.accounting_errors);
 
@@ -5861,7 +6487,7 @@ test "single release and observer mismatch cannot debit unrelated memory" {
 
     first.release();
     unrelated.release();
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
 }
 
 test "bounded oversized progress cannot bypass aggregate host memory" {
@@ -6162,7 +6788,7 @@ test "resource manager tracks full text build working set independently" {
 test "bounded observer growth grants aggregate slice and host capacity atomically" {
     var budgets = Options.defaultBudgets();
     budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
-    var manager = ResourceManager.init(.{
+    var manager = try metadata_fixture.init(.{
         .budgets = budgets,
         .memory_budget = .{ .hard_limit_bytes = 80 },
     });
@@ -6182,7 +6808,7 @@ test "bounded observer growth grants aggregate slice and host capacity atomicall
     );
     try std.testing.expectEqual(@as(u64, 30), requester);
     try std.testing.expectEqual(@as(u64, 60), manager.sliceStats(.document_extraction_working_set).used_bytes);
-    try std.testing.expectEqual(@as(u64, 80), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 80), metadata_fixture.payloadUsage(&manager));
     try std.testing.expectError(
         error.ResourceBudgetExceeded,
         manager.adjustUsageAtMost(.document_extraction_working_set, &requester, 1),
@@ -6192,7 +6818,7 @@ test "bounded observer growth grants aggregate slice and host capacity atomicall
 test "owned split reservations prevent concurrent headroom theft" {
     var budgets = Options.defaultBudgets();
     budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
-    var manager = ResourceManager.init(.{
+    var manager = try metadata_fixture.init(.{
         .budgets = budgets,
         .memory_budget = .{ .hard_limit_bytes = 90 },
     });
@@ -6203,7 +6829,7 @@ test "owned split reservations prevent concurrent headroom theft" {
     try std.testing.expectEqual(@as(u64, 30), reservation.secondary_bytes);
     try std.testing.expectEqual(@as(u64, 90), reservation.reservation.reservedBytes());
     try std.testing.expectEqual(@as(u64, 90), manager.sliceStats(.document_extraction_working_set).used_bytes);
-    try std.testing.expectEqual(@as(u64, 90), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 90), metadata_fixture.payloadUsage(&manager));
     try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.document_extraction_working_set, 1));
     if (!builtin.single_threaded and builtin.os.tag != .freestanding) {
         const Concurrent = struct {
@@ -6235,7 +6861,7 @@ test "nonreclaiming partial reservations atomically respect slice and host headr
     for ([_]u64{ 90, 200 }) |host_limit| {
         var budgets = Options.defaultBudgets();
         budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
-        var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = host_limit } });
+        var manager = try metadata_fixture.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = host_limit } });
         defer manager.deinit(std.testing.allocator);
         var probe = Probe{};
         const id = try manager.registerReclaimer(.document_extraction_working_set, &probe, Probe.reclaim);
@@ -6274,7 +6900,7 @@ test "owned split reservations reclaim before partial fallback for slice pressur
     };
     var budgets = Options.defaultBudgets();
     budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
-    var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 200 } });
+    var manager = try metadata_fixture.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 200 } });
     defer manager.deinit(std.testing.allocator);
     var unrelated = Context{ .manager = &manager, .slice = .hbc_node_metadata_cache };
     manager.observeUsage(unrelated.slice, &unrelated.accounted, 40);
@@ -6312,7 +6938,7 @@ test "owned split reservations reclaim before partial fallback" {
 
     var budgets = Options.defaultBudgets();
     budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 200 };
-    var manager = ResourceManager.init(.{
+    var manager = try metadata_fixture.init(.{
         .budgets = budgets,
         .memory_budget = .{ .hard_limit_bytes = 100 },
     });
@@ -6327,7 +6953,7 @@ test "owned split reservations reclaim before partial fallback" {
     try std.testing.expectEqual(@as(u64, 70), reservation.primary_bytes);
     try std.testing.expectEqual(@as(u64, 30), reservation.secondary_bytes);
     try std.testing.expectEqual(@as(u64, 0), reclaimable.accounted);
-    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 100), metadata_fixture.payloadUsage(&manager));
 }
 
 test "owned split secondary credit transfers into a budgeted allocator" {
@@ -6650,7 +7276,7 @@ test "foreground admission reclaims cache bytes and retries atomically" {
     var budgets = Options.defaultBudgets();
     budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .soft_limit_bytes = 80, .hard_limit_bytes = 100 };
     budgets[sliceIndex(.dense_apply_working_set)] = .{ .soft_limit_bytes = 80, .hard_limit_bytes = 100 };
-    var manager = ResourceManager.init(.{
+    var manager = try metadata_fixture.init(.{
         .memory_budget = .{ .soft_limit_bytes = 90, .hard_limit_bytes = 100 },
         .budgets = budgets,
     });
@@ -6665,7 +7291,7 @@ test "foreground admission reclaims cache bytes and retries atomically" {
     defer foreground.release();
     try std.testing.expectEqual(@as(u64, 70), context.accounted);
     const stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 100), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 100), (stats.memory.used_bytes - manager.identity_metadata_bytes));
     try std.testing.expectEqual(@as(u64, 1), stats.reclaim_requests);
     try std.testing.expectEqual(@as(u64, 10), stats.reclaimed_bytes);
 }
@@ -6843,7 +7469,7 @@ test "resource manager apportions reclaim across weighted cache owners" {
         }
     };
 
-    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 300 } });
+    var manager = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 300 } });
     defer manager.deinit(std.testing.allocator);
     var first = ReclaimContext{ .manager = &manager, .accounted = 0 };
     var second = ReclaimContext{ .manager = &manager, .accounted = 0 };
@@ -6885,13 +7511,14 @@ test "resource manager invokes reclaimers without holding registry mutex" {
         }
     };
 
-    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 } });
+    var manager = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 } });
     defer manager.deinit(std.testing.allocator);
     var retiring = RetiringContext{ .manager = &manager };
     var passive = PassiveContext{};
     const retiring_id = try manager.registerReclaimer(.hbc_node_metadata_cache, &retiring, RetiringContext.reclaim);
     defer manager.unregisterReclaimer(retiring_id);
     retiring.retire_identity = try manager.registerReclaimer(.hbc_node_metadata_cache, &passive, PassiveContext.reclaim);
+    defer manager.unregisterReclaimer(retiring.retire_identity);
 
     manager.observeUsage(.hbc_node_metadata_cache, &retiring.accounted, 100);
     // The second bounded pass can revisit the surviving owner, but never
@@ -6913,7 +7540,7 @@ test "resource manager grows reclaimer registry beyond 128 owners" {
         }
     };
 
-    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 } });
+    var manager = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 } });
     defer manager.deinit(std.testing.allocator);
     var contexts = @as([owner_count]PassiveContext, @splat(.{}));
     var identities: [owner_count]u64 = undefined;
@@ -6947,7 +7574,7 @@ test "classified batch chooses foreground requester when cache slice is first" {
         }
     };
 
-    var manager = ResourceManager.init(.{
+    var manager = try metadata_fixture.init(.{
         .memory_budget = .{ .soft_limit_bytes = 90, .hard_limit_bytes = 100 },
     });
     defer manager.deinit(std.testing.allocator);
@@ -6963,7 +7590,7 @@ test "classified batch chooses foreground requester when cache slice is first" {
     });
     defer foreground.release();
     try std.testing.expectEqual(@as(u64, 70), context.accounted);
-    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 100), metadata_fixture.payloadUsage(&manager));
 }
 
 test "resource manager adjusts tracked usage" {
@@ -7027,7 +7654,7 @@ test "identity-aware cache admission rejects growth and always permits shrink" {
         .soft_limit_bytes = 10,
         .hard_limit_bytes = 20,
     };
-    var manager = ResourceManager.init(.{
+    var manager = try metadata_fixture.init(.{
         .memory_budget = .{ .hard_limit_bytes = 24 },
         .budgets = budgets,
         .identity_allocator = std.testing.allocator,
@@ -7083,7 +7710,7 @@ test "identity-aware cache admission rejects growth and always permits shrink" {
         12,
         0,
     ));
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
 }
 
 test "resource manager evaluates projected admission with configured action" {
@@ -7110,6 +7737,77 @@ test "resource manager evaluates projected admission with configured action" {
     try std.testing.expectEqual(Pressure.hard, projected.pressure);
     try std.testing.expectEqual(PressureAction.reject_work, projected.action);
     try std.testing.expect(projected.change_epoch >= current_decision.change_epoch);
+}
+
+test "controlled pressure admission resource manager preserves original authority across parent and child contention" {
+    var parent = ResourceManager.init(.{});
+    var child = ResourceManager.init(.{});
+    try child.installMemoryParent(parent.memoryParentPort());
+    const Authority = struct {
+        child: *ResourceManager,
+        target: *std.atomic.Mutex,
+        target_is_parent: bool,
+        held: *bool,
+        checks: usize = 0,
+        waits: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.fail_at) return self.cause;
+        }
+        fn wait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waits += 1;
+            if (self.target_is_parent) {
+                // Parent contention must never retain the child's ledger lock.
+                try std.testing.expect(self.child.mutex.tryLock());
+                self.child.mutex.unlock();
+            }
+            try std.testing.expect(self.held.*);
+            self.target.unlock();
+            self.held.* = false;
+        }
+    };
+    for ([_]bool{ true, false }) |target_is_parent| {
+        const target = if (target_is_parent) &parent.mutex else &child.mutex;
+        try std.testing.expect(target.tryLock());
+        var held = true;
+        defer if (held) target.unlock();
+        var authority: Authority = .{ .child = &child, .target = target, .target_is_parent = target_is_parent, .held = &held };
+        const payload: read_admission.Payload = .{ .ptr = &authority, .vtable = &.{ .checkpoint = Authority.check, .wait_for_progress = Authority.wait } };
+        const control = read_admission.Port.init(&payload);
+        var decision = try child.admissionDecisionWithAdmission(.lsm_in_memory_state, 1, control);
+        try std.testing.expectEqual(@as(usize, 1), authority.waits);
+        try std.testing.expect(!held);
+        // Epoch is deliberately unused for controlled polling. Pressure and
+        // thresholds otherwise match the legacy decision exactly.
+        decision.change_epoch = child.pressureEpoch();
+        try std.testing.expectEqualDeep(child.admissionDecision(.lsm_in_memory_state, 1), decision);
+        const checks = authority.checks;
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+            for (1..checks + 1) |fail_at| {
+                try std.testing.expect(target.tryLock());
+                held = true;
+                authority = .{ .child = &child, .target = target, .target_is_parent = target_is_parent, .held = &held, .fail_at = fail_at, .cause = cause };
+                try std.testing.expectError(cause, child.admissionDecisionWithAdmission(.lsm_in_memory_state, 1, control));
+                if (held) {
+                    // Rejection before progress cannot unlock another owner.
+                    try std.testing.expect(!target.tryLock());
+                    target.unlock();
+                    held = false;
+                } else {
+                    // Rejection racing acquisition must retire our own lock.
+                    try std.testing.expect(target.tryLock());
+                    target.unlock();
+                }
+            }
+        }
+        authority = .{ .child = &child, .target = target, .target_is_parent = target_is_parent, .held = &held };
+        try child.awaitAdmissionWithAdmission(.lsm_in_memory_state, 1, control);
+        try std.testing.expectEqual(@as(usize, 0), authority.waits);
+    }
 }
 
 test "resource manager bounds soft write throttling without waiting for compaction publication" {
@@ -7272,7 +7970,7 @@ test "budgeted allocator reclaims aggregate cache before denying growth" {
     var budgets = Options.defaultBudgets();
     budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .soft_limit_bytes = 80, .hard_limit_bytes = 100 };
     budgets[sliceIndex(.dense_vector_block_build_working_set)] = .{ .soft_limit_bytes = 80, .hard_limit_bytes = 100 };
-    var manager = ResourceManager.init(.{
+    var manager = try metadata_fixture.init(.{
         .memory_budget = .{ .soft_limit_bytes = 90, .hard_limit_bytes = 100 },
         .budgets = budgets,
     });
@@ -7296,7 +7994,7 @@ test "budgeted allocator reclaims aggregate cache before denying growth" {
     try std.testing.expectEqual(@as(u64, 70), context.accounted);
     try std.testing.expectEqual(@as(u64, 30), budgeted.live_bytes);
     const stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 100), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 100), (stats.memory.used_bytes - manager.identity_metadata_bytes));
     try std.testing.expectEqual(@as(u64, 1), stats.reclaim_requests);
     try std.testing.expectEqual(@as(u64, 10), stats.reclaimed_bytes);
 }
@@ -7635,7 +8333,7 @@ test "source vector payloads scoped allocator receipts distinguish admission and
 }
 
 test "resource manager external allocator shares storage ceiling and preserves pinned control" {
-    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    var manager = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
     defer manager.deinit(std.testing.allocator);
     // Pin control headroom before publishing foreground work. Its allocations
     // consume this reservation, so they must not charge it again.
@@ -7644,23 +8342,23 @@ test "resource manager external allocator shares storage ceiling and preserves p
     var storage = try manager.reserveWithoutReclaim(.lsm_compaction_work, 60);
     try std.testing.expect(!manager.reserveExternal(1));
     try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveWithoutReclaim(.dense_search_working_set, 1));
-    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 100), metadata_fixture.payloadUsage(&manager));
     try std.testing.expectEqual(@as(u64, 40), manager.snapshot().memory.external_bytes);
     manager.releaseExternal(30);
     storage.release();
-    try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 10), metadata_fixture.payloadUsage(&manager));
     manager.releaseExternal(10);
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
 }
 
 test "resource manager parent reclaims sibling cache outside child locks and preserves local ceilings" {
-    var root = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    var root = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
     defer root.deinit(std.testing.allocator);
     var budgets = Options.defaultBudgets();
     budgets[sliceIndex(.inference_tokenizer_cache)] = .{ .hard_limit_bytes = 5 };
-    var child = ResourceManager.init(.{ .budgets = budgets, .identity_allocator = std.testing.allocator });
+    var child = try metadata_fixture.init(.{ .budgets = budgets, .identity_allocator = std.testing.allocator });
     defer child.deinit(std.testing.allocator);
-    try child.installMemoryParent(root.memoryParentPort());
+    try metadata_fixture.installParent(&child, &root);
     const Cache = struct {
         root: *ResourceManager,
         child: *ResourceManager,
@@ -7690,26 +8388,26 @@ test "resource manager parent reclaims sibling cache outside child locks and pre
     defer model.release();
     try std.testing.expectEqual(@as(usize, 1), cache.calls);
     try std.testing.expectEqual(@as(u64, 90), cache.bytes);
-    try std.testing.expectEqual(@as(u64, 100), root.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 10), child.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 100), (metadata_fixture.payloadUsage(&root) - child.identity_metadata_bytes));
+    try std.testing.expectEqual(@as(u64, 10), metadata_fixture.payloadUsage(&child));
 }
 
 test "resource manager parent atomically coordinates storage inference and API memory" {
-    var root = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    var root = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
     defer root.deinit(std.testing.allocator);
-    var inference = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    var inference = try metadata_fixture.init(.{ .identity_allocator = std.testing.allocator });
     defer inference.deinit(std.testing.allocator);
-    var storage = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    var storage = try metadata_fixture.init(.{ .identity_allocator = std.testing.allocator });
     defer storage.deinit(std.testing.allocator);
-    try inference.installMemoryParent(root.memoryParentPort());
-    try storage.installMemoryParent(root.memoryParentPort());
+    try metadata_fixture.installParent(&inference, &root);
+    try metadata_fixture.installParent(&storage, &root);
     var model = try inference.reserveWithoutReclaim(.inference_model_residency, 40);
     defer model.release();
     try std.testing.expect(root.reserveExternal(10));
     defer root.releaseExternal(10);
     var work = try storage.reserveWithoutReclaim(.lsm_wal_write_working_set, 50);
-    try std.testing.expectEqual(@as(u64, 100), root.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 100), root.snapshot().memory.external_bytes);
+    try std.testing.expectEqual(@as(u64, 100), (metadata_fixture.payloadUsage(&root) - inference.identity_metadata_bytes - storage.identity_metadata_bytes));
+    try std.testing.expectEqual(@as(u64, 100), (root.snapshot().memory.external_bytes - inference.identity_metadata_bytes - storage.identity_metadata_bytes));
     try std.testing.expectError(error.ResourceBudgetExceeded, model.growBoundedOversized(1, 2));
     try std.testing.expectEqual(@as(u64, 40), model.bytes);
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, storage.reserveBatchClassified(&.{.{ .slice = .dense_search_working_set, .bytes = 1 }}));
@@ -7717,39 +8415,39 @@ test "resource manager parent atomically coordinates storage inference and API m
     try std.testing.expectEqual(@as(u64, 0), storage.availableAdmissionBytes(.dense_search_working_set));
     try std.testing.expectEqual(Pressure.hard, storage.admissionDecision(.dense_search_working_set, 1).pressure);
     work.shrink(20);
-    try std.testing.expectEqual(@as(u64, 80), root.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 80), (metadata_fixture.payloadUsage(&root) - inference.identity_metadata_bytes - storage.identity_metadata_bytes));
     var split = try storage.reserveOwnedSplitAtMost(.document_extraction_working_set, 80, 5);
     try std.testing.expectEqual(@as(u64, 15), split.primary_bytes);
     split.release();
     work.release();
-    try std.testing.expectEqual(@as(u64, 50), root.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 50), (metadata_fixture.payloadUsage(&root) - inference.identity_metadata_bytes - storage.identity_metadata_bytes));
 }
 
 test "resource manager parent retains over-budget observations and returns terminal balance" {
-    var root = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    var root = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
     defer root.deinit(std.testing.allocator);
-    var child = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    var child = try metadata_fixture.init(.{ .identity_allocator = std.testing.allocator });
     var observed: u64 = 0;
     child.observeUsage(.inference_model_residency, &observed, 20);
-    try child.installMemoryParent(root.memoryParentPort());
-    try std.testing.expectEqual(@as(u64, 20), root.snapshot().memory.used_bytes);
+    try metadata_fixture.installParent(&child, &root);
+    try std.testing.expectEqual(@as(u64, 20), (metadata_fixture.payloadUsage(&root) - child.identity_metadata_bytes));
     try std.testing.expect(root.reserveExternal(80));
     try std.testing.expectError(error.ResourceBudgetExceeded, child.adjustUsage(.inference_model_residency, &observed, 21));
     try std.testing.expectEqual(@as(u64, 20), observed);
     child.observeUsage(.inference_model_residency, &observed, 30);
-    try std.testing.expectEqual(@as(u64, 110), root.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 110), (metadata_fixture.payloadUsage(&root) - child.identity_metadata_bytes));
     child.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 80), root.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 80), (metadata_fixture.payloadUsage(&root) - child.identity_metadata_bytes));
     root.releaseExternal(80);
 }
 
 test "resource manager parent wakes child waiters when another owner releases memory" {
     if (!supports_pressure_wait) return error.SkipZigTest;
-    var root = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    var root = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
     defer root.deinit(std.testing.allocator);
-    var child = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    var child = try metadata_fixture.init(.{ .identity_allocator = std.testing.allocator });
     defer child.deinit(std.testing.allocator);
-    try child.installMemoryParent(root.memoryParentPort());
+    try metadata_fixture.installParent(&child, &root);
     try std.testing.expect(root.reserveExternal(100));
     const epoch = child.admissionDecision(.dense_search_working_set, 1).change_epoch;
     const Waiter = struct {
@@ -7769,7 +8467,7 @@ test "resource manager reclassifies owned read credit without a second host char
     for ([_]u64{ 128, 256 }) |limit| {
         var budgets = Options.defaultBudgets();
         budgets[@backingInt(Slice.lsm_block_table_cache)] = .{ .hard_limit_bytes = limit };
-        var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 150 } });
+        var manager = try metadata_fixture.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 150 } });
         defer manager.deinit(a);
         var credit = try manager.reserveWithoutReclaim(.lsm_read_working_set, 150);
         defer credit.release();
@@ -7783,9 +8481,9 @@ test "resource manager reclassifies owned read credit without a second host char
             try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
             try std.testing.expectEqual(@as(u64, 150), manager.sliceStats(.lsm_block_table_cache).used_bytes);
         }
-        try std.testing.expectEqual(@as(u64, 150), manager.snapshot().memory.peak_bytes);
+        try std.testing.expectEqual(@as(u64, 150), (manager.snapshot().memory.peak_bytes - manager.identity_metadata_bytes));
         credit.release();
-        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
     }
 }
@@ -7793,7 +8491,7 @@ test "resource manager reclassifies owned read credit without a second host char
 test "resource manager adopts construction credit without a second host charge" {
     const a = std.testing.allocator;
     for ([_]Slice{ .lsm_read_working_set, .lsm_block_table_cache }) |source| {
-        var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 140 } });
+        var manager = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 140 } });
         defer manager.deinit(a);
         var credit = try manager.reserveWithoutReclaim(source, 128);
         defer credit.release();
@@ -7801,11 +8499,11 @@ test "resource manager adopts construction credit without a second host charge" 
         try manager.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136);
         try std.testing.expectEqual(@as(u64, 0), credit.bytes);
         try std.testing.expectEqual(@as(u64, 136), retained);
-        try std.testing.expectEqual(@as(u64, 136), manager.snapshot().memory.peak_bytes);
+        try std.testing.expectEqual(@as(u64, 136), (manager.snapshot().memory.peak_bytes - manager.identity_metadata_bytes));
         credit.release();
-        try std.testing.expectEqual(@as(u64, 136), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 136), metadata_fixture.payloadUsage(&manager));
         try manager.adjustUsage(.lsm_block_table_cache, &retained, 0);
-        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
     }
 }
@@ -7815,11 +8513,11 @@ pub fn qualifyParentConstructionCredit() !void {
     const a = std.testing.allocator;
     for ([_]Slice{ .lsm_read_working_set, .lsm_block_table_cache }) |source| {
         for ([_]u64{ 128, 136, 140 }) |parent_limit| {
-            var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = parent_limit } });
+            var parent = try metadata_fixture.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = parent_limit } });
             defer parent.deinit(a);
-            var child = ResourceManager.init(.{ .identity_allocator = a });
+            var child = try metadata_fixture.init(.{ .identity_allocator = a });
             defer child.deinit(a);
-            try child.installMemoryParent(parent.memoryParentPort());
+            try metadata_fixture.installParent(&child, &parent);
             var credit = try child.reserveWithoutReclaim(source, 128);
             defer credit.release();
             var retained: u64 = 0;
@@ -7828,21 +8526,21 @@ pub fn qualifyParentConstructionCredit() !void {
                 try std.testing.expectError(error.ResourceBudgetExceeded, child.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136));
                 try std.testing.expectEqual(@as(u64, 128), credit.bytes);
                 try std.testing.expectEqual(@as(u64, 0), retained);
-                try std.testing.expectEqual(@as(u64, 128), child.snapshot().memory.used_bytes);
+                try std.testing.expectEqual(@as(u64, 128), metadata_fixture.payloadUsage(&child));
                 try std.testing.expectEqual(@as(usize, 0), child.observer_identities.count());
                 // An exact-credit handoff needs no new parent capacity.
                 try child.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 128);
             } else {
                 try child.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136);
             }
-            try std.testing.expectEqual(retained, parent.snapshot().memory.used_bytes);
-            try std.testing.expectEqual(retained, parent.snapshot().memory.peak_bytes);
-            try std.testing.expectEqual(retained, child.snapshot().memory.used_bytes);
+            try std.testing.expectEqual(retained, (metadata_fixture.payloadUsage(&parent) - child.identity_metadata_bytes));
+            try std.testing.expectEqual(retained, (parent.snapshot().memory.peak_bytes - parent.identity_metadata_bytes - child.identity_metadata_bytes));
+            try std.testing.expectEqual(retained, metadata_fixture.payloadUsage(&child));
             credit.release();
-            try std.testing.expectEqual(retained, parent.snapshot().memory.used_bytes);
+            try std.testing.expectEqual(retained, (metadata_fixture.payloadUsage(&parent) - child.identity_metadata_bytes));
             try child.adjustUsage(.lsm_block_table_cache, &retained, 0);
-            try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
-            try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.used_bytes);
+            try std.testing.expectEqual(@as(u64, 0), (metadata_fixture.payloadUsage(&parent) - child.identity_metadata_bytes));
+            try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&child));
             try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.accounting_errors);
             try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.accounting_errors);
         }
@@ -7902,7 +8600,7 @@ test "resource manager adopts construction credit only within both destination l
     for ([_]bool{ false, true }) |aggregate| {
         var budgets = Options.defaultBudgets();
         budgets[@backingInt(Slice.lsm_block_table_cache)] = .{ .hard_limit_bytes = if (aggregate) 0 else 128 };
-        var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = if (aggregate) 128 else 140 } });
+        var manager = try metadata_fixture.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = if (aggregate) 128 else 140 } });
         defer manager.deinit(a);
         var credit = try manager.reserveWithoutReclaim(.lsm_read_working_set, 128);
         defer credit.release();
@@ -7910,10 +8608,10 @@ test "resource manager adopts construction credit only within both destination l
         try std.testing.expectError(error.ResourceBudgetExceeded, manager.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136));
         try std.testing.expectEqual(@as(u64, 128), credit.bytes);
         try std.testing.expectEqual(@as(u64, 0), retained);
-        try std.testing.expectEqual(@as(u64, 128), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 128), metadata_fixture.payloadUsage(&manager));
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_block_table_cache).used_bytes);
         credit.release();
-        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
     }
 }
@@ -7930,7 +8628,7 @@ test "resource manager adopts construction credit preserves ownership on identit
     try std.testing.expectError(error.OutOfMemory, manager.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136));
     try std.testing.expectEqual(@as(u64, 128), credit.bytes);
     try std.testing.expectEqual(@as(u64, 0), retained);
-    try std.testing.expectEqual(@as(u64, 128), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 128), metadata_fixture.payloadUsage(&manager));
     failing.fail_index = std.math.maxInt(usize);
     try manager.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136);
     credit.release();
@@ -8319,14 +9017,14 @@ pub fn qualifyBoundConsumerConstruction(control: read_admission.Port, deny: bool
 
 test "logical resident credit cleanup preserves host charge through ledger contention" {
     const a = std.testing.allocator;
-    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 } });
+    var manager = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 } });
     defer manager.deinit(a);
     var resident = try manager.reserveWithoutReclaim(.lite_docstore_snapshot_cache, 128);
     defer resident.release();
     var logical: Reservation = .{ .manager = &manager, .identity = 0, .slice = .relational_preparation_working_set, .bytes = 0, .host_charge = false };
     defer logical.release();
     _ = try manager.growReservationAmortized(&logical, 256, 256, 1, 0);
-    try std.testing.expectEqual(@as(u64, 128), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 128), metadata_fixture.payloadUsage(&manager));
     lockAtomic(&manager.mutex);
     const busy = manager.tryReleaseReservation(&logical);
     manager.mutex.unlock();
@@ -8334,16 +9032,16 @@ test "logical resident credit cleanup preserves host charge through ledger conte
     try std.testing.expectEqual(@as(u64, 256), logical.bytes);
     try std.testing.expect(!logical.released);
     try std.testing.expectEqual(ResourceManager.MemoryParent.ReleaseResult.released, manager.tryReleaseReservation(&logical));
-    try std.testing.expectEqual(@as(u64, 128), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 128), metadata_fixture.payloadUsage(&manager));
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
     resident.release();
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }
 
 test "logical resident credit growth shrink and identity reject forged host ownership" {
     const a = std.testing.allocator;
-    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 } });
+    var manager = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 } });
     defer manager.deinit(a);
     var resident = try manager.reserveWithoutReclaim(.lite_docstore_snapshot_cache, 128);
     defer resident.release();
@@ -8357,10 +9055,903 @@ test "logical resident credit growth shrink and identity reject forged host owne
     forged.host_charge = true;
     try std.testing.expectEqual(ResourceManager.MemoryParent.ReleaseResult.mismatch, manager.tryReleaseReservation(&forged));
     try std.testing.expect(!logical.released);
-    try std.testing.expectEqual(@as(u64, 128), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 128), metadata_fixture.payloadUsage(&manager));
     logical.release();
-    try std.testing.expectEqual(@as(u64, 128), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 128), metadata_fixture.payloadUsage(&manager));
     resident.release();
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+test "prepared memory batch acquires without allocation and keeps failures atomic through ancestors" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var root = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = failing.allocator() });
+    defer root.deinit(std.testing.allocator);
+    var middle = try metadata_fixture.init(.{ .identity_allocator = failing.allocator() });
+    defer middle.deinit(std.testing.allocator);
+    try metadata_fixture.installParent(&middle, &root);
+    var child = try metadata_fixture.init(.{ .identity_allocator = failing.allocator() });
+    defer child.deinit(std.testing.allocator);
+    try metadata_fixture.installParent(&child, &middle);
+    var prepared = try child.prepareBatch(&.{
+        .{ .slice = .lsm_read_working_set, .bytes = 40 },
+        .{ .slice = .text_merge_buffers, .bytes = 20 },
+    });
+    defer prepared.deinit();
+    var stale = prepared;
+    const allocations = failing.alloc_index;
+    failing.fail_index = allocations;
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&child));
+    const epoch = child.pressureEpoch();
+    // Exercise both local serialization points and each ancestor, including
+    // its notification lock. These calls must return while locks stay held.
+    const locks = [_]*std.atomic.Mutex{ &child.mutex, &middle.mutex, &root.mutex };
+    for (locks) |mutex| {
+        try std.testing.expect(mutex.tryLock());
+        const attempt = prepared.tryAcquire();
+        mutex.unlock();
+        try std.testing.expect(attempt == .busy);
+    }
+    const changes = [_]*PressureChange{ &child.pressure_change, &middle.pressure_change, &root.pressure_change };
+    for (changes) |change| {
+        try std.testing.expect(change.tryLock());
+        const attempt = prepared.tryAcquire();
+        change.unlock();
+        try std.testing.expect(attempt == .busy);
+    }
+    try std.testing.expectEqual(epoch, child.pressureEpoch());
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&child));
+    try std.testing.expectEqual(@as(u64, 0), (metadata_fixture.payloadUsage(&middle) - child.identity_metadata_bytes));
+    try std.testing.expectEqual(@as(u64, 0), (metadata_fixture.payloadUsage(&root) - middle.identity_metadata_bytes - child.identity_metadata_bytes));
+    var credit = switch (prepared.tryAcquire()) {
+        .acquired => |credit| credit,
+        else => return error.TestExpectedEqual,
+    };
+    defer credit.release();
+    try std.testing.expectEqual(allocations, failing.alloc_index);
+    try std.testing.expectEqual(@as(u64, 60), metadata_fixture.payloadUsage(&child));
+    try std.testing.expectEqual(@as(u64, 60), (metadata_fixture.payloadUsage(&middle) - child.identity_metadata_bytes));
+    try std.testing.expectEqual(@as(u64, 60), (metadata_fixture.payloadUsage(&root) - middle.identity_metadata_bytes - child.identity_metadata_bytes));
+    try std.testing.expect(prepared.tryAcquire() == .mismatch);
+    try std.testing.expect(stale.tryAcquire() == .mismatch);
+    stale.deinit(); // Cannot remove the now-active identity.
+    credit.release();
+    credit.release();
+    try std.testing.expectEqual(@as(u64, 0), (metadata_fixture.payloadUsage(&root) - middle.identity_metadata_bytes - child.identity_metadata_bytes));
+    try std.testing.expectEqual(@as(usize, 0), child.batch_reservation_identities.count());
+    try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.accounting_errors);
+}
+
+test "prepared memory batch distinguishes intrinsic demand and retries without partial credit" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.lsm_read_working_set)].hard_limit_bytes = 60;
+    budgets[sliceIndex(.text_merge_buffers)].hard_limit_bytes = 60;
+    var root = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 1000 }, .identity_allocator = std.testing.allocator });
+    defer root.deinit(std.testing.allocator);
+    var child = try metadata_fixture.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 1000 }, .identity_allocator = std.testing.allocator });
+    defer child.deinit(std.testing.allocator);
+    try metadata_fixture.installParent(&child, &root);
+    var prepared = try child.prepareBatch(&.{
+        .{ .slice = .lsm_read_working_set, .bytes = 40 },
+        .{ .slice = .text_merge_buffers, .bytes = 20 },
+    });
+    defer prepared.deinit();
+    var blocker = try child.reserveWithoutReclaim(.text_merge_buffers, 50);
+    try std.testing.expect(prepared.tryAcquire() == .denied);
+    try std.testing.expectEqual(@as(u64, 0), child.sliceStats(.lsm_read_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 50), (metadata_fixture.payloadUsage(&root) - child.identity_metadata_bytes));
+    // Intrinsically impossible second slices win over occupancy in the first.
+    child.slices[sliceIndex(.text_merge_buffers)].budget.hard_limit_bytes = 19;
+    try std.testing.expect(prepared.tryAcquire() == .too_large);
+    child.slices[sliceIndex(.text_merge_buffers)].budget.hard_limit_bytes = 60;
+    blocker.release();
+    metadata_fixture.setPayloadLimit(&root, 100, &.{&child});
+    var sibling = try root.reserveWithoutReclaim(.text_merge_buffers, 50);
+    try std.testing.expect(prepared.tryAcquire() == .denied);
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&child));
+    try std.testing.expectEqual(@as(u64, 50), (metadata_fixture.payloadUsage(&root) - child.identity_metadata_bytes));
+    sibling.release();
+    metadata_fixture.setPayloadLimit(&child, 59, &.{});
+    try std.testing.expect(prepared.tryAcquire() == .too_large);
+    metadata_fixture.setPayloadLimit(&child, 100, &.{});
+    var credit = switch (prepared.tryAcquire()) {
+        .acquired => |credit| credit,
+        else => return error.TestExpectedEqual,
+    };
+    defer credit.release();
+    try credit.retain(&.{.{ .slice = .lsm_read_working_set, .bytes = 30 }}, 30);
+    try std.testing.expectEqual(@as(u64, 30), (metadata_fixture.payloadUsage(&root) - child.identity_metadata_bytes));
+    credit.release();
+    try std.testing.expectEqual(@as(u64, 0), (metadata_fixture.payloadUsage(&root) - child.identity_metadata_bytes));
+}
+
+test "prepared memory batch rejects unsupported parent and inactive release without consuming other credit" {
+    var root = try metadata_fixture.init(.{ .identity_allocator = std.testing.allocator });
+    defer root.deinit(std.testing.allocator);
+    var child = try metadata_fixture.init(.{ .identity_allocator = std.testing.allocator });
+    defer child.deinit(std.testing.allocator);
+    var port = root.memoryParentPort();
+    port.try_reserve_fn = null;
+    try child.installMemoryParent(port);
+    var active = try child.reserveBatch(&.{.{ .slice = .text_merge_buffers, .bytes = 20 }});
+    defer active.release();
+    var prepared = try child.prepareBatch(&.{.{ .slice = .text_merge_buffers, .bytes = 20 }});
+    defer prepared.deinit();
+    try std.testing.expect(prepared.tryAcquire() == .unsupported);
+    // Same amounts are not ownership. An unused identity is never a lease.
+    var forged = BatchReservation{ .manager = &child, .identity = prepared.identity, .amounts = prepared.amounts, .host_charge_bytes = prepared.host_charge_bytes };
+    try std.testing.expectError(error.ResourceAccountingMismatch, forged.retain(&.{}, 0));
+    forged.release();
+    try std.testing.expectEqual(@as(u64, 20), metadata_fixture.payloadUsage(&child));
+    try std.testing.expectEqual(@as(u64, 20), (metadata_fixture.payloadUsage(&root) - child.identity_metadata_bytes));
+    prepared.deinit();
+    prepared.deinit();
+    active.release();
+    try std.testing.expectEqual(@as(u64, 0), (metadata_fixture.payloadUsage(&root) - child.identity_metadata_bytes));
+    try std.testing.expectEqual(@as(usize, 0), child.batch_reservation_identities.count());
+    try std.testing.expectError(error.DuplicateResourceSlice, child.prepareBatch(&.{
+        .{ .slice = .text_merge_buffers, .bytes = 1 },
+        .{ .slice = .text_merge_buffers, .bytes = 2 },
+    }));
+}
+
+test "shared control metadata charges prepared identity storage through the parent until physical free" {
+    const alloc = std.testing.allocator;
+    var tracked = std.testing.FailingAllocator.init(alloc, .{});
+    var parent = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 }, .identity_allocator = alloc });
+    defer parent.deinit(alloc);
+    var child = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 }, .identity_allocator = tracked.allocator() });
+    var child_live = true;
+    defer if (child_live) child.deinit(alloc);
+    try child.installMemoryParent(parent.memoryParentPort());
+    var prepared = try child.prepareBatch(&.{});
+    defer prepared.deinit();
+    const allocated = tracked.allocated_bytes - tracked.freed_bytes;
+    try std.testing.expect(allocated > 0);
+    // Zero payload does not mean zero physical bookkeeping. Neither owner may
+    // omit the actual allocation made by its identity table.
+    try std.testing.expect(child.snapshot().memory.used_bytes >= allocated);
+    try std.testing.expect(parent.snapshot().memory.used_bytes >= allocated);
+    prepared.deinit();
+    const retained = tracked.allocated_bytes - tracked.freed_bytes;
+    try std.testing.expect(child.snapshot().memory.used_bytes >= retained);
+    try std.testing.expect(parent.snapshot().memory.used_bytes >= retained);
+    child.deinit(alloc);
+    child_live = false;
+    try std.testing.expectEqual(tracked.allocated_bytes, tracked.freed_bytes);
+}
+
+test "shared control metadata refuses table growth beyond the envelope before allocation or publication" {
+    const alloc = std.testing.allocator;
+    var tracked = std.testing.FailingAllocator.init(alloc, .{});
+    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 64 }, .identity_allocator = tracked.allocator() });
+    defer manager.deinit(alloc);
+    const before = manager.snapshot().memory.used_bytes;
+    // A complete identity table cannot fit in this envelope even for an empty
+    // request. Retire unexpected success before failing so the red regression
+    // does not lose a live identity during teardown.
+    if (manager.prepareBatch(&.{})) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(error.ResourceBudgetExceeded, err);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracked.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.batch_reservation_identities.count());
+    try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+}
+
+test "shared control metadata charges ordinary reservation and observer tables without overwriting physical admission" {
+    const a = std.testing.allocator;
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var parent = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = MiB } });
+    defer parent.deinit(a);
+    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = MiB }, .identity_allocator = backing.allocator() });
+    var live = true;
+    defer if (live) manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var reservation = try manager.reserveImmediate(.text_merge_buffers, 37);
+    defer reservation.release();
+    var batch = try manager.reserveBatchCheckedWithHostCharge(&.{}, 19);
+    defer batch.release();
+    var current: u64 = 0;
+    try manager.adjustUsage(.inference_prompt_cache, &current, 11);
+    defer if (live) manager.adjustUsage(.inference_prompt_cache, &current, 0) catch unreachable;
+    const physical = backing.allocated_bytes - backing.freed_bytes;
+    try std.testing.expectEqual(physical, manager.identity_metadata_bytes);
+    try std.testing.expectEqual(physical + 67, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(physical + 67, parent.snapshot().memory.used_bytes);
+    try manager.adjustUsage(.inference_prompt_cache, &current, 0);
+    reservation.release();
+    batch.release();
+    try std.testing.expectEqual(physical, manager.snapshot().memory.used_bytes);
+    manager.deinit(a);
+    live = false;
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+}
+
+test "shared control metadata parent refusal and backing OOM roll back before identity publication" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |deny_backing| {
+        var backing = std.testing.FailingAllocator.init(a, .{ .fail_index = if (deny_backing) 0 else std.math.maxInt(usize) });
+        var parent = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = if (deny_backing) MiB else 64 } });
+        defer parent.deinit(a);
+        var manager = ResourceManager.init(.{ .identity_allocator = backing.allocator() });
+        defer manager.deinit(a);
+        try manager.installMemoryParent(parent.memoryParentPort());
+        if (deny_backing) {
+            try std.testing.expectError(error.OutOfMemory, manager.prepareBatch(&.{}));
+        } else {
+            try std.testing.expectError(error.ResourceBudgetExceeded, manager.prepareBatch(&.{}));
+        }
+        try std.testing.expectEqual(@as(usize, 0), backing.allocated_bytes);
+        try std.testing.expectEqual(@as(u32, 0), manager.batch_reservation_identities.count());
+        try std.testing.expectEqual(@as(u64, 0), manager.identity_metadata_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+    }
+}
+
+test "shared control metadata bounds simultaneous growth storage and preserves old identities on refusal" {
+    const a = std.testing.allocator;
+    var final_size: u64 = 0;
+    var growth_peak: u64 = 0;
+    for ([_]bool{ false, true }) |limited| {
+        var backing = std.testing.FailingAllocator.init(a, .{});
+        var manager = ResourceManager.init(.{ .identity_allocator = backing.allocator(), .identity_metadata_limit_bytes = if (limited) final_size else 64 * MiB });
+        defer manager.deinit(a);
+        var prepared: std.ArrayList(PreparedBatchReservation) = .empty;
+        defer {
+            for (prepared.items) |*item| item.deinit();
+            prepared.deinit(a);
+        }
+        try prepared.ensureUnusedCapacity(a, 1);
+        prepared.appendAssumeCapacity(try manager.prepareBatch(&.{}));
+        const initial = manager.identity_metadata_bytes;
+        while (manager.batch_reservation_identities.map.available > 0) {
+            try prepared.ensureUnusedCapacity(a, 1);
+            prepared.appendAssumeCapacity(try manager.prepareBatch(&.{}));
+        }
+        try prepared.ensureUnusedCapacity(a, 1);
+        if (limited) {
+            const count = manager.batch_reservation_identities.count();
+            const allocations = backing.alloc_index;
+            try std.testing.expectError(error.ResourceBudgetExceeded, manager.prepareBatch(&.{}));
+            try std.testing.expectEqual(allocations, backing.alloc_index);
+            try std.testing.expectEqual(count, manager.batch_reservation_identities.count());
+            try std.testing.expectEqual(initial, manager.identity_metadata_bytes);
+            try std.testing.expectEqual(initial, manager.snapshot().memory.used_bytes);
+            manager.identity_metadata_limit_bytes = growth_peak;
+        }
+        prepared.appendAssumeCapacity(try manager.prepareBatch(&.{}));
+        const physical = backing.allocated_bytes - backing.freed_bytes;
+        try std.testing.expectEqual(physical, manager.identity_metadata_bytes);
+        try std.testing.expect(physical > initial);
+        try std.testing.expectEqual(initial + physical, manager.snapshot().memory.peak_bytes);
+        if (!limited) {
+            final_size = physical;
+            growth_peak = initial + physical;
+        }
+        for (prepared.items) |*item| {
+            var acquired = switch (item.tryAcquire()) {
+                .acquired => |credit| credit,
+                else => return error.TestExpectedEqual,
+            };
+            acquired.release();
+        }
+        try std.testing.expectEqual(@as(u32, 0), manager.batch_reservation_identities.count());
+        try std.testing.expectEqual(physical, manager.snapshot().memory.used_bytes);
+    }
+}
+
+test "shared control metadata finite cap applies without an aggregate memory limit" {
+    const a = std.testing.allocator;
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var manager = ResourceManager.init(.{ .identity_allocator = backing.allocator(), .identity_metadata_limit_bytes = 64 });
+    defer manager.deinit(a);
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.prepareBatch(&.{}));
+    try std.testing.expectEqual(@as(usize, 0), backing.allocated_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "shared control metadata operation allocator survives startup move and late parent installation" {
+    const a = std.testing.allocator;
+    const Startup = struct {
+        fn init() !ResourceManager {
+            var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+            errdefer manager.deinit(std.testing.allocator);
+            var prepared = try manager.prepareBatch(&.{});
+            prepared.deinit();
+            return manager;
+        }
+    };
+    var parent = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = MiB } });
+    defer parent.deinit(a);
+    var manager = try Startup.init();
+    var live = true;
+    defer if (live) manager.deinit(a);
+    const physical = manager.identity_metadata_bytes;
+    try std.testing.expect(physical > 0);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    try std.testing.expectEqual(physical, parent.snapshot().memory.used_bytes);
+    var prepared = try manager.prepareBatch(&.{});
+    prepared.deinit();
+    manager.deinit(a);
+    live = false;
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+}
+
+test "shared control metadata bounded observer admission refuses a busy parent without allocation" {
+    const a = std.testing.allocator;
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var parent = ResourceManager.init(.{});
+    defer parent.deinit(a);
+    var manager = ResourceManager.init(.{ .identity_allocator = backing.allocator() });
+    defer manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    try std.testing.expect(manager.mutex.tryLock());
+    try std.testing.expect(parent.mutex.tryLock());
+    const result = manager.reconcileUsageLockedWithParentAdmission(.inference_prompt_cache, 123, 0, 1, true, true);
+    parent.mutex.unlock();
+    manager.mutex.unlock();
+    try std.testing.expectError(error.ParentMemoryBusy, result);
+    try std.testing.expectEqual(@as(usize, 0), backing.allocated_bytes);
+    try std.testing.expectEqual(@as(u32, 0), manager.observer_identities.count());
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "shared control metadata partial grants compute headroom after first identity allocation" {
+    const a = std.testing.allocator;
+    var probe = ResourceManager.init(.{ .identity_allocator = a });
+    var initial = try probe.reserveImmediate(.text_merge_buffers, 1);
+    initial.release();
+    const table_bytes = probe.identity_metadata_bytes;
+    probe.deinit(a);
+    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = table_bytes + 50 }, .identity_allocator = a });
+    defer manager.deinit(a);
+    var split = try manager.reserveOwnedSplitAtMost(.text_merge_buffers, 10000, 10);
+    defer split.release();
+    try std.testing.expectEqual(@as(u64, 40), split.primary_bytes);
+    try std.testing.expectEqual(@as(u64, 10), split.secondary_bytes);
+    try std.testing.expectEqual(table_bytes + 50, manager.snapshot().memory.used_bytes);
+}
+
+test "shared control metadata checked batch reports quota refusal separately from backing OOM" {
+    const a = std.testing.allocator;
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var manager = ResourceManager.init(.{ .identity_allocator = backing.allocator(), .identity_metadata_limit_bytes = 64 });
+    defer manager.deinit(a);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.reserveBatchCheckedWithHostCharge(&.{}, 0));
+    try std.testing.expectEqual(@as(usize, 0), backing.allocated_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "shared control metadata bounded allocation failure never calls a legacy parent release" {
+    const a = std.testing.allocator;
+    const Legacy = struct {
+        var releases: usize = 0;
+        fn release(ptr: *anyopaque, bytes: u64) callconv(.c) void {
+            releases += 1;
+            const owner: *ResourceManager = @ptrCast(@alignCast(ptr));
+            owner.releaseExternal(bytes);
+        }
+    };
+    Legacy.releases = 0;
+    var backing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var parent = ResourceManager.init(.{});
+    defer parent.deinit(a);
+    var manager = ResourceManager.init(.{ .identity_allocator = backing.allocator() });
+    defer manager.deinit(a);
+    var port = parent.memoryParentPort();
+    port.release_fn = Legacy.release;
+    try manager.installMemoryParent(port);
+    try std.testing.expect(manager.mutex.tryLock());
+    const result = manager.reconcileUsageLockedWithParentAdmission(.inference_prompt_cache, 123, 0, 1, true, true);
+    manager.mutex.unlock();
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expectEqual(@as(usize, 0), Legacy.releases);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+}
+
+test "shared control metadata bounded allocation failure retains busy parent debt until independent cleanup" {
+    const a = std.testing.allocator;
+    const Gate = struct {
+        var busy = true;
+        var legacy_releases: usize = 0;
+        fn release(ptr: *anyopaque, bytes: u64) callconv(.c) void {
+            legacy_releases += 1;
+            const owner: *ResourceManager = @ptrCast(@alignCast(ptr));
+            owner.releaseExternal(bytes);
+        }
+        fn tryRelease(ptr: *anyopaque, bytes: u64) callconv(.c) ResourceManager.MemoryParent.ReleaseResult {
+            if (busy) return .busy;
+            const owner: *ResourceManager = @ptrCast(@alignCast(ptr));
+            return owner.tryReleaseExternal(bytes);
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    Gate.busy = true;
+    Gate.legacy_releases = 0;
+    var backing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var parent = ResourceManager.init(.{});
+    defer parent.deinit(a);
+    var manager = ResourceManager.init(.{ .identity_allocator = backing.allocator() });
+    defer manager.deinit(a);
+    var port = parent.memoryParentPort();
+    port.release_fn = Gate.release;
+    port.try_release_fn = Gate.tryRelease;
+    try manager.installMemoryParent(port);
+    try std.testing.expect(manager.mutex.tryLock());
+    const result = manager.reconcileUsageLockedWithParentAdmission(.inference_prompt_cache, 123, 0, 1, true, true);
+    manager.mutex.unlock();
+    try std.testing.expectError(error.OutOfMemory, result);
+    const debt = manager.snapshot().memory.used_bytes;
+    try std.testing.expect(debt > 0);
+    try std.testing.expectEqual(debt, parent.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), Gate.legacy_releases);
+    try std.testing.expectEqual(@as(usize, 0), backing.allocated_bytes);
+    var context: u8 = 0;
+    const payload: read_admission.Payload = .{ .ptr = &context, .vtable = &.{ .checkpoint = Gate.checkpoint } };
+    const cleanup = read_admission.Port.init(&payload);
+    try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(cleanup));
+    try std.testing.expectEqual(debt, manager.snapshot().memory.used_bytes);
+    Gate.busy = false;
+    try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(cleanup));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), Gate.legacy_releases);
+}
+
+test "shared control metadata bounded rehash retains old table retirement through a busy parent" {
+    const a = std.testing.allocator;
+    const Gate = struct {
+        var busy = true;
+        var legacy_releases: usize = 0;
+        fn release(ptr: *anyopaque, bytes: u64) callconv(.c) void {
+            legacy_releases += 1;
+            const owner: *ResourceManager = @ptrCast(@alignCast(ptr));
+            owner.releaseExternal(bytes);
+        }
+        fn tryRelease(ptr: *anyopaque, bytes: u64) callconv(.c) ResourceManager.MemoryParent.ReleaseResult {
+            if (busy) return .busy;
+            const owner: *ResourceManager = @ptrCast(@alignCast(ptr));
+            return owner.tryReleaseExternal(bytes);
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn insert(manager: *ResourceManager, id: usize) !void {
+            try std.testing.expect(manager.mutex.tryLock());
+            defer manager.mutex.unlock();
+            try manager.reconcileUsageLockedWithParentAdmission(.inference_prompt_cache, id, 0, 1, true, true);
+        }
+    };
+    Gate.busy = true;
+    Gate.legacy_releases = 0;
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var parent = ResourceManager.init(.{});
+    defer parent.deinit(a);
+    var manager = ResourceManager.init(.{ .identity_allocator = backing.allocator() });
+    defer manager.deinit(a);
+    var port = parent.memoryParentPort();
+    port.release_fn = Gate.release;
+    port.try_release_fn = Gate.tryRelease;
+    try manager.installMemoryParent(port);
+    var count: usize = 1;
+    try Gate.insert(&manager, count);
+    const initial_table = backing.allocated_bytes - backing.freed_bytes;
+    while (manager.observer_identities.map.available > 0) {
+        count += 1;
+        try Gate.insert(&manager, count);
+    }
+    count += 1;
+    try Gate.insert(&manager, count);
+    const current_table = backing.allocated_bytes - backing.freed_bytes;
+    try std.testing.expect(current_table > initial_table);
+    try std.testing.expectEqual(@as(usize, 0), Gate.legacy_releases);
+    try std.testing.expectEqual(current_table + initial_table + count, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(manager.snapshot().memory.used_bytes, parent.snapshot().memory.used_bytes);
+    var context: u8 = 0;
+    const payload: read_admission.Payload = .{ .ptr = &context, .vtable = &.{ .checkpoint = Gate.checkpoint } };
+    const cleanup = read_admission.Port.init(&payload);
+    Gate.busy = false;
+    try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(cleanup));
+    try std.testing.expectEqual(current_table + count, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(manager.snapshot().memory.used_bytes, parent.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), Gate.legacy_releases);
+}
+
+test "shared control metadata object backing runs unlocked with admission held through physical free" {
+    const a = std.testing.allocator;
+    const Backing = struct {
+        manager: *ResourceManager,
+        admitted: bool = false,
+        retired_after_free: bool = false,
+        fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.manager.mutex.tryLock()) return null;
+            self.admitted = self.manager.control_object_bytes >= len and self.manager.memory.used_bytes >= len;
+            self.manager.mutex.unlock();
+            return std.testing.allocator.rawAlloc(len, alignment, ra);
+        }
+        fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.manager.mutex.tryLock()) {
+                self.retired_after_free = self.manager.control_object_bytes >= bytes.len and self.manager.memory.used_bytes >= bytes.len;
+                self.manager.mutex.unlock();
+            }
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+    };
+    var parent = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 4096 } });
+    defer parent.deinit(a);
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var backing = Backing{ .manager = &manager };
+    var operation = manager.controlMetadataAllocation(backing.allocator());
+    const alloc = operation.allocator();
+    const bytes = try alloc.alloc(u8, 73);
+    var live = true;
+    defer if (live) alloc.free(bytes);
+    try std.testing.expect(backing.admitted);
+    try std.testing.expectEqual(@as(u64, 73), parent.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 73), manager.snapshot().control_object_bytes);
+    alloc.free(bytes);
+    live = false;
+    try std.testing.expect(backing.retired_after_free);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+}
+
+test "shared control metadata objects and identity tables compete for one finite cap" {
+    const a = std.testing.allocator;
+    var probe = ResourceManager.init(.{ .identity_allocator = a });
+    var prepared_probe = try probe.prepareBatch(&.{});
+    prepared_probe.deinit();
+    const table_bytes = probe.identity_metadata_bytes;
+    probe.deinit(a);
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    var manager = ResourceManager.init(.{ .identity_allocator = backing.allocator(), .identity_metadata_limit_bytes = table_bytes });
+    defer manager.deinit(a);
+    var operation = manager.controlMetadataAllocation(backing.allocator());
+    const alloc = operation.allocator();
+    const bytes = try alloc.alloc(u8, 1);
+    var live = true;
+    defer if (live) alloc.free(bytes);
+    const allocations = backing.alloc_index;
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.prepareBatch(&.{}));
+    try std.testing.expectEqual(allocations, backing.alloc_index);
+    try std.testing.expectEqual(@as(u64, 1), manager.snapshot().memory.used_bytes);
+    alloc.free(bytes);
+    live = false;
+    var prepared = try manager.prepareBatch(&.{});
+    defer prepared.deinit();
+    try std.testing.expectEqual(table_bytes, manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 1));
+    try std.testing.expectEqual(error.ResourceBudgetExceeded, operation.allocationError(error.OutOfMemory));
+    try std.testing.expectEqual(table_bytes, manager.snapshot().memory.used_bytes);
+}
+
+test "shared control metadata object OOM and parent quota refusal preserve distinct causes and exact rollback" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |deny_parent| {
+        var backing = std.testing.FailingAllocator.init(a, .{ .fail_index = if (deny_parent) std.math.maxInt(usize) else 0 });
+        var parent = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = if (deny_parent) 1 else 4096 } });
+        defer parent.deinit(a);
+        var manager = ResourceManager.init(.{});
+        defer manager.deinit(a);
+        try manager.installMemoryParent(parent.memoryParentPort());
+        var operation = manager.controlMetadataAllocation(backing.allocator());
+        try std.testing.expectError(error.OutOfMemory, operation.allocator().alloc(u8, 128));
+        try std.testing.expectEqual(if (deny_parent) error.ResourceBudgetExceeded else error.OutOfMemory, operation.allocationError(error.OutOfMemory));
+        try std.testing.expectEqual(@as(usize, 0), backing.allocated_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().control_object_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+    }
+}
+
+test "shared control metadata objects survive startup relocation and join a late parent exactly once" {
+    const a = std.testing.allocator;
+    const Startup = struct {
+        const Owned = struct { manager: ResourceManager, bytes: []u8 };
+        fn init() !Owned {
+            var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+            var operation = manager.controlMetadataAllocation(std.testing.allocator);
+            const bytes = try operation.allocator().alloc(u8, 91);
+            return .{ .manager = manager, .bytes = bytes };
+        }
+    };
+    var parent = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 4096 } });
+    defer parent.deinit(a);
+    var value = try Startup.init();
+    var operation = value.manager.controlMetadataAllocation(a);
+    defer value.manager.deinit(a);
+    var live = true;
+    defer if (live) operation.allocator().free(value.bytes);
+    // Deinit order is explicit below: physical storage outlives its startup
+    // stack frame, then joins and leaves the published parent's envelope.
+    try value.manager.installMemoryParent(parent.memoryParentPort());
+    try std.testing.expectEqual(@as(u64, 91), parent.snapshot().memory.used_bytes);
+    try value.manager.installMemoryParent(parent.memoryParentPort());
+    try std.testing.expectEqual(@as(u64, 91), parent.snapshot().memory.used_bytes);
+    operation.allocator().free(value.bytes);
+    live = false;
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+}
+
+test "prepared memory batch rejects metadata OOM and overflow before capacity admission" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator() });
+    defer manager.deinit(std.testing.allocator);
+    try std.testing.expectError(error.OutOfMemory, manager.prepareBatch(&.{.{ .slice = .text_merge_buffers, .bytes = 10 }}));
+    try std.testing.expectError(error.ResourceRequestTooLarge, manager.prepareBatch(&.{
+        .{ .slice = .text_merge_buffers, .bytes = std.math.maxInt(u64) },
+        .{ .slice = .lsm_read_working_set, .bytes = 1 },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), manager.batch_reservation_identities.count());
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    failing.fail_index = std.math.maxInt(usize);
+    var empty = try manager.prepareBatch(&.{});
+    defer empty.deinit();
+    var credit = switch (empty.tryAcquire()) {
+        .acquired => |credit| credit,
+        else => return error.TestExpectedEqual,
+    };
+    credit.release();
+    try std.testing.expectEqual(@as(usize, 0), manager.batch_reservation_identities.count());
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+test "batch reservation transfer preserves full-capacity ancestors and exact independent retirement" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var parent = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    defer parent.deinit(std.testing.allocator);
+    var manager = try metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = failing.allocator() });
+    defer manager.deinit(std.testing.allocator);
+    try metadata_fixture.installParent(&manager, &parent);
+    var source = try manager.reserveBatchCheckedWithHostCharge(&.{
+        .{ .slice = .inference_model_residency, .bytes = 240 },
+        .{ .slice = .inference_kv_working_set, .bytes = 60 },
+    }, 100);
+    defer source.release();
+    var destination = try manager.reserveBatchCheckedWithHostCharge(&.{}, 0);
+    defer destination.release();
+    const before = manager.snapshot();
+    const epoch = manager.pressureEpoch();
+    const parent_epoch = parent.pressureEpoch();
+    const allocations = failing.alloc_index;
+    failing.fail_index = allocations;
+    // The ancestor is completely full and all further identity allocations
+    // fail. Physical KV credit can still leave the model-load reservation.
+    try source.transferCreditTo(&destination, &.{.{ .slice = .inference_kv_working_set, .bytes = 60 }}, 20);
+    try std.testing.expectEqual(allocations, failing.alloc_index);
+    try std.testing.expectEqualDeep(before, manager.snapshot());
+    try std.testing.expectEqual(epoch, manager.pressureEpoch());
+    try std.testing.expectEqual(parent_epoch, parent.pressureEpoch());
+    try std.testing.expectEqual(@as(u64, 100), (metadata_fixture.payloadUsage(&parent) - manager.identity_metadata_bytes));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.reserveBatchCheckedWithHostCharge(&.{}, 1));
+    // A stale copy taken after this handoff cannot retire credit after another
+    // partition changes its registered descriptor.
+    var stale_destination = destination;
+    try destination.transferCreditTo(&source, &.{.{ .slice = .inference_kv_working_set, .bytes = 10 }}, 3);
+    stale_destination.release();
+    try std.testing.expectEqual(@as(u64, 100), (metadata_fixture.payloadUsage(&parent) - manager.identity_metadata_bytes));
+    source.release();
+    try std.testing.expectEqual(@as(u64, 17), metadata_fixture.payloadUsage(&manager));
+    try std.testing.expectEqual(@as(u64, 17), (metadata_fixture.payloadUsage(&parent) - manager.identity_metadata_bytes));
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.inference_model_residency).used_bytes);
+    try std.testing.expectEqual(@as(u64, 50), manager.sliceStats(.inference_kv_working_set).used_bytes);
+    destination.release();
+    destination.release();
+    source.release();
+    try std.testing.expectEqual(@as(u64, 0), (metadata_fixture.payloadUsage(&parent) - manager.identity_metadata_bytes));
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.inference_kv_working_set).used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.batch_reservation_identities.count());
+    try std.testing.expectEqual(@as(u64, 1), manager.snapshot().memory.accounting_errors);
+}
+
+test "batch reservation transfer rejects invalid owners and partial moves atomically" {
+    var manager = try metadata_fixture.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var foreign = try metadata_fixture.init(.{ .identity_allocator = std.testing.allocator });
+    defer foreign.deinit(std.testing.allocator);
+    var source = try manager.reserveBatchCheckedWithHostCharge(&.{
+        .{ .slice = .inference_model_residency, .bytes = 20 },
+        .{ .slice = .inference_kv_working_set, .bytes = 10 },
+    }, 15);
+    defer source.release();
+    var destination = try manager.reserveBatchCheckedWithHostCharge(&.{}, 0);
+    defer destination.release();
+    const source_before = source;
+    const destination_before = destination;
+    const epoch = manager.pressureEpoch();
+    // Earlier valid slices must not be moved when a later slice or host
+    // component is invalid.
+    try std.testing.expectError(error.InvalidReservationReduction, source.transferCreditTo(&destination, &.{
+        .{ .slice = .inference_model_residency, .bytes = 5 },
+        .{ .slice = .inference_kv_working_set, .bytes = 11 },
+    }, 1));
+    try std.testing.expectError(error.InvalidReservationReduction, source.transferCreditTo(&destination, &.{.{ .slice = .inference_model_residency, .bytes = 5 }}, 16));
+    try std.testing.expectError(error.DuplicateResourceSlice, source.transferCreditTo(&destination, &.{
+        .{ .slice = .inference_model_residency, .bytes = 1 },
+        .{ .slice = .inference_model_residency, .bytes = 1 },
+    }, 1));
+    try std.testing.expectError(error.ResourceAccountingMismatch, source.transferCreditTo(&source, &.{}, 0));
+    var alias = source;
+    try std.testing.expectError(error.ResourceAccountingMismatch, source.transferCreditTo(&alias, &.{}, 0));
+    var foreign_destination = try foreign.reserveBatchCheckedWithHostCharge(&.{}, 0);
+    defer foreign_destination.release();
+    try std.testing.expectError(error.ResourceAccountingMismatch, source.transferCreditTo(&foreign_destination, &.{}, 0));
+    var stale_source = source;
+    stale_source.amounts[sliceIndex(.inference_kv_working_set)] -= 1;
+    try std.testing.expectError(error.ResourceAccountingMismatch, stale_source.transferCreditTo(&destination, &.{}, 0));
+    var stale_destination = destination;
+    stale_destination.host_charge_bytes = 1;
+    try std.testing.expectError(error.ResourceAccountingMismatch, source.transferCreditTo(&stale_destination, &.{}, 0));
+    var prepared = try manager.prepareBatch(&.{});
+    defer prepared.deinit();
+    var unpublished: BatchReservation = .{ .manager = &manager, .identity = prepared.identity, .amounts = prepared.amounts, .host_charge_bytes = prepared.host_charge_bytes };
+    try std.testing.expectError(error.ResourceAccountingMismatch, source.transferCreditTo(&unpublished, &.{}, 0));
+    try std.testing.expectError(error.ResourceAccountingMismatch, unpublished.transferCreditTo(&destination, &.{}, 0));
+    var retired = try manager.reserveBatchCheckedWithHostCharge(&.{}, 0);
+    var stale_retired = retired;
+    retired.release();
+    try std.testing.expectError(error.ReservationReleased, source.transferCreditTo(&retired, &.{}, 0));
+    try std.testing.expectError(error.ReservationReleased, stale_retired.transferCreditTo(&destination, &.{}, 0));
+    try std.testing.expectError(error.ReservationReleased, source.transferCreditTo(&stale_retired, &.{}, 0));
+    try std.testing.expectEqualDeep(source_before, source);
+    try std.testing.expectEqualDeep(destination_before, destination);
+    try std.testing.expectEqual(@as(u64, 15), metadata_fixture.payloadUsage(&manager));
+    try std.testing.expectEqual(@as(u64, 20), manager.sliceStats(.inference_model_residency).used_bytes);
+    try std.testing.expectEqual(@as(u64, 10), manager.sliceStats(.inference_kv_working_set).used_bytes);
+    // Only explicit preparation/release above may advance the wait epoch.
+    const after_setup_epoch = manager.pressureEpoch();
+    try std.testing.expect(after_setup_epoch >= epoch);
+    try source.transferCreditTo(&destination, &.{}, 0);
+    try std.testing.expectEqual(after_setup_epoch, manager.pressureEpoch());
+}
+
+test "batch reservation transfer checks destination arithmetic before publishing either owner" {
+    var manager = try metadata_fixture.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var source = try manager.reserveBatchCheckedWithHostCharge(&.{.{ .slice = .inference_kv_working_set, .bytes = 2 }}, 2);
+    defer source.release();
+    var destination = try manager.reserveBatchCheckedWithHostCharge(&.{}, 0);
+    defer destination.release();
+    // Valid aggregate admission cannot overflow a destination. Inject matching
+    // descriptor/identity damage to exercise the defensive arithmetic checks;
+    // restore it before cleanup, leaving real aggregate ownership untouched.
+    const index = sliceIndex(.inference_kv_working_set);
+    const owned = manager.batch_reservation_identities.getPtr(destination.identity).?;
+    destination.amounts[index] = std.math.maxInt(u64);
+    owned.amounts = destination.amounts;
+    try std.testing.expectError(error.ResourceAccountingMismatch, source.transferCreditTo(&destination, &.{.{ .slice = .inference_kv_working_set, .bytes = 1 }}, 1));
+    try std.testing.expectEqual(@as(u64, 2), source.amounts[index]);
+    try std.testing.expectEqual(@as(u64, 0), destination.host_charge_bytes);
+    destination.amounts[index] = 0;
+    owned.amounts = destination.amounts;
+    destination.host_charge_bytes = std.math.maxInt(u64);
+    owned.host_charge_bytes = destination.host_charge_bytes;
+    try std.testing.expectError(error.ResourceAccountingMismatch, source.transferCreditTo(&destination, &.{.{ .slice = .inference_kv_working_set, .bytes = 1 }}, 1));
+    try std.testing.expectEqual(@as(u64, 2), source.host_charge_bytes);
+    try std.testing.expectEqual(@as(u64, 0), destination.amounts[index]);
+    destination.host_charge_bytes = 0;
+    owned.host_charge_bytes = 0;
+    try std.testing.expectEqual(@as(u64, 2), metadata_fixture.payloadUsage(&manager));
+}
+
+test "batch reservation transfer destination preparation failure preserves source credit" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator() });
+    defer manager.deinit(std.testing.allocator);
+    var source = try manager.reserveBatchCheckedWithHostCharge(&.{.{ .slice = .inference_kv_working_set, .bytes = 40 }}, 20);
+    defer source.release();
+    const before = source;
+    // Fill existing identity capacity without allocating, then deny the next
+    // expansion. Empty destination identities still require admitted metadata.
+    var destinations: std.ArrayList(BatchReservation) = .empty;
+    defer {
+        for (destinations.items) |*reservation| reservation.release();
+        destinations.deinit(std.testing.allocator);
+    }
+    while (manager.batch_reservation_identities.map.available > 0) {
+        try destinations.ensureUnusedCapacity(std.testing.allocator, 1);
+        destinations.appendAssumeCapacity(try manager.reserveBatchCheckedWithHostCharge(&.{}, 0));
+    }
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, manager.reserveBatchCheckedWithHostCharge(&.{}, 0));
+    try std.testing.expectEqualDeep(before, source);
+    try std.testing.expectEqual(@as(u64, 20), metadata_fixture.payloadUsage(&manager));
+    try std.testing.expectEqual(@as(u64, 40), manager.sliceStats(.inference_kv_working_set).used_bytes);
+    source.release();
+    // Empty destination tokens also own live identities and must be retired.
+    try std.testing.expectEqual(@as(u64, 0), metadata_fixture.payloadUsage(&manager));
+}
+
+test "budgeted allocator no reclaim view preserves shared ownership and ordinary reclamation" {
+    const Cache = struct {
+        retained: Reservation,
+        owner: ?*BudgetedAllocator = null,
+        dependency: std.atomic.Mutex = .unlocked,
+        calls: usize = 0,
+        locked_calls: usize = 0,
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (!self.dependency.tryLock()) {
+                self.locked_calls += 1;
+                return 0;
+            }
+            defer self.dependency.unlock();
+            if (!self.owner.?.allocator_mutex.tryLock()) {
+                self.locked_calls += 1;
+                return 0;
+            }
+            self.owner.?.allocator_mutex.unlock();
+            const bytes = @min(target, self.retained.bytes);
+            self.retained.shrink(bytes);
+            return bytes;
+        }
+    };
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var cache: Cache = .{ .retained = try manager.reserve(.document_extraction_working_set, 48) };
+    defer cache.retained.release();
+    const identity = try manager.registerReclaimer(.document_extraction_working_set, &cache, Cache.reclaim);
+    defer manager.unregisterReclaimer(identity);
+    var backing_bytes: [4096]u8 = undefined;
+    var backing = std.heap.FixedBufferAllocator.init(&backing_bytes);
+    var owner = BudgetedAllocator.initReclaiming(&manager, .document_extraction_working_set, backing.allocator(), 1);
+    defer owner.deinit();
+    owner.credit_quantum = 1;
+    cache.owner = &owner;
+    const ordinary = owner.threadSafeAllocator();
+    const quiet = owner.threadSafeNoReclaimAllocator();
+    try std.testing.expect(BudgetedAllocator.fromAllocator(quiet).? == &owner);
+    var arena = std.heap.ArenaAllocator.init(quiet);
+    defer arena.deinit();
+    try std.testing.expect(BudgetedAllocator.fromAllocator(arena.allocator()).? == &owner);
+    var bytes = try quiet.alloc(u8, 8);
+    @memset(bytes, 19);
+    {
+        try std.testing.expect(cache.dependency.tryLock());
+        defer cache.dependency.unlock();
+        try std.testing.expectError(error.OutOfMemory, quiet.alloc(u8, 32));
+        try std.testing.expect(!quiet.rawResize(bytes, .of(u8), 32, @returnAddress()));
+        try std.testing.expect(quiet.rawRemap(bytes, .of(u8), 32, @returnAddress()) == null);
+        try std.testing.expectEqual(@as(usize, 0), cache.calls);
+        try std.testing.expectEqual(@as(u64, 48), cache.retained.bytes);
+        try std.testing.expectEqual(@as(u64, 8), owner.liveBytesThreadSafe());
+        try std.testing.expect(owner.reclaim_on_denial);
+        try std.testing.expect(quiet.rawResize(bytes, .of(u8), 4, @returnAddress()));
+        bytes = bytes.ptr[0..4];
+        const remapped = quiet.rawRemap(bytes, .of(u8), 8, @returnAddress()).?;
+        bytes = remapped[0..8];
+    }
+    // Same physical allocation and ledger, even when the other view resizes,
+    // remaps or frees it. Reclaim runs outside both allocator and dependency.
+    try std.testing.expect(ordinary.rawResize(bytes, .of(u8), 32, @returnAddress()));
+    bytes = bytes.ptr[0..32];
+    try std.testing.expectEqual(@as(usize, 1), cache.calls);
+    bytes = ordinary.rawRemap(bytes, .of(u8), 48, @returnAddress()).?[0..48];
+    try std.testing.expectEqual(@as(usize, 2), cache.calls);
+    try std.testing.expectEqual(@as(usize, 0), cache.locked_calls);
+    try std.testing.expectEqual(@as(u8, 19), bytes[0]);
+    quiet.free(bytes);
+    try std.testing.expectEqual(@as(u64, 0), owner.liveBytesThreadSafe());
+    try std.testing.expect(owner.reclaim_on_denial);
+    const last = try ordinary.alloc(u8, 64);
+    try std.testing.expectEqual(@as(usize, 3), cache.calls);
+    quiet.free(last);
+    try std.testing.expectEqual(@as(u64, 0), owner.liveBytesThreadSafe());
+    try std.testing.expectEqual(@as(usize, 0), backing.end_index);
 }

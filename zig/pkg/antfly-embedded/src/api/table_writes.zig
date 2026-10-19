@@ -528,6 +528,13 @@ pub const BoundTableWriteSource = struct {
         const db_path = try alloc.dupe(u8, db.core.path);
         defer alloc.free(db_path);
         const primary_backend = db.primary_backend;
+        // The retained runtime's IO and storage states still charge this
+        // manager. Transfer both owners across close/reopen, including recovery;
+        // on failure join the runtime before releasing its memory authority.
+        const resource_manager = db.core.index_manager.resource_manager;
+        var owned_resource_manager = db.owned_resource_manager;
+        db.owned_resource_manager = null;
+        errdefer if (owned_resource_manager) |manager| manager.releaseOwned(alloc);
         var owned_backend_runtime = db.owned_backend_runtime;
         db.owned_backend_runtime = null;
         errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
@@ -557,6 +564,8 @@ pub const BoundTableWriteSource = struct {
             effective_recovery_open_options.identity_namespace = identity_namespace;
             effective_restored_open_options = try resolved.optionsForTarget(db_path);
         }
+        effective_recovery_open_options.resource_manager = resource_manager;
+        effective_restored_open_options.resource_manager = resource_manager;
         const publication_outcome = restoreBoundTableGeneration(
             alloc,
             snapshot_root,
@@ -574,6 +583,8 @@ pub const BoundTableWriteSource = struct {
             };
             self.db.owned_backend_runtime = owned_backend_runtime;
             owned_backend_runtime = null;
+            self.db.owned_resource_manager = owned_resource_manager;
+            owned_resource_manager = null;
             return restore_err;
         };
         self.db.* = db_mod.DB.open(alloc, db_path, effective_restored_open_options) catch |reopen_err| {
@@ -582,6 +593,8 @@ pub const BoundTableWriteSource = struct {
         };
         self.db.owned_backend_runtime = owned_backend_runtime;
         owned_backend_runtime = null;
+        self.db.owned_resource_manager = owned_resource_manager;
+        owned_resource_manager = null;
         if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
     }
 
@@ -1275,16 +1288,9 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         const db = try self.activeDb();
-        if (borrow) |original|
-            try db.resolveTransactionIntentsWithSyncLevelAndExecution(txn_id, status, commit_version, sync_level, cancellation, original)
-        else
-            try db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, cancellation);
         const participant = try distributed_txn.participantIdForGroup(db.alloc, table_name, group_id);
         defer db.alloc.free(participant);
-        db.markTransactionParticipantResolved(txn_id, participant) catch |err| switch (err) {
-            transactions_mod.TxnError.TxnNotFound => if (status != .aborted) return err,
-            else => return err,
-        };
+        try db.resolveTransactionIntentsAndAcknowledgeParticipant(txn_id, status, commit_version, sync_level, cancellation, participant, borrow);
     }
 
     pub fn txnResolveGroupLocalWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, _: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?void {

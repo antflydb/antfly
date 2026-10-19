@@ -26,9 +26,11 @@ const Allocator = std.mem.Allocator;
 const backup_manifest = @import("backup_manifest.zig");
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("antfly_local_sources").storage_db_replication_record;
+const wal_mod = @import("../wal_runtime.zig");
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
+const read_control = @import("antfly_local_sources").common_read_admission;
 
 var test_path_counter: u64 = 0;
 
@@ -79,6 +81,37 @@ pub const DurabilityStatus = replication_policy.DurabilityStatus;
 
 pub const DurabilityDecision = replication_policy.DurabilityDecision;
 
+pub const RecoveryPosition = @import("../wal_runtime.zig").RecoveryPosition;
+pub const RecoveryAppendResult = @import("../wal_runtime.zig").RecoveryAppendResult;
+pub const RecoveryMatch = union(enum) { busy, pending, found: u64, absent: RecoveryPosition };
+pub const recovery_record_quantum: usize = 16;
+const RecoveryIdentity = @import("antfly_local_sources").storage_db_durable_outbox.RecoveryIdentity;
+
+const RecoveryCursor = @import("antfly_local_sources").storage_db_durable_outbox.RecoveryCursor;
+
+const RecoveryRead = struct {
+    allocator: Allocator,
+    read: *@import("../wal_runtime.zig").WAL.OwnedRead,
+    matcher: replication_record.MatchCursor = .{},
+    buffer: [4096]u8 = undefined,
+    ready: bool = false,
+
+    fn destroy(raw: *anyopaque) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.read.destroy();
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+    fn advance(self: *@This(), expected: replication_record.MatchCursor.Expected, control: read_control.Port) !?bool {
+        if (!self.ready) {
+            self.ready = try self.read.step(self.buffer.len, control) == .ready;
+            return null;
+        }
+        const chunk = try self.read.readChunk(self.matcher.offset, &self.buffer, control);
+        return self.matcher.consume(self.buffer[0..chunk.len], chunk.done, expected, control);
+    }
+};
+
 pub const Primary = struct {
     alloc: Allocator,
     identity: Identity,
@@ -94,7 +127,7 @@ pub const Primary = struct {
     ) !Primary {
         try standby_mod.validateIdentity(identity);
 
-        var log = try replication_log.ReplicationLog.open(log_path, options.replication_log_options);
+        var log = try replication_log.ReplicationLog.openWithAllocator(alloc, log_path, options.replication_log_options);
         const slots = slot_store.SlotStore.open(alloc, slot_store_path, options.slot_store_options) catch |err| {
             log.close();
             return err;
@@ -189,27 +222,175 @@ pub const Primary = struct {
         shard_id: u64,
         table_id: u64,
     ) !?u64 {
+        return self.findMatchingRecordFromWithAdmission(from_lsn, kind, payload, shard_id, table_id, null);
+    }
+
+    pub fn findMatchingRecordFromWithAdmission(
+        self: *Primary,
+        from_lsn: u64,
+        kind: replication_record.RecordKind,
+        payload: []const u8,
+        shard_id: u64,
+        table_id: u64,
+        original: ?read_control.Port,
+    ) !?u64 {
+        // Recovery callers retain publication fences. This API never transfers
+        // CPU while holding those dependencies or an individual WAL snapshot.
+        var retained: read_control.RetainedDependency = .{};
+        const control = retained.bind(original);
+        if (control) |port| try port.checkpoint();
         if (from_lsn == 0) return null;
-        const last = self.lastLsn();
-        if (from_lsn > last) return null;
+        const last = if (control) |port| try @import("../wal_runtime.zig").lastLsnWithAdmission(&self.log.wal, port) else self.lastLsn();
+        return self.findMatchingRecordInRange(from_lsn, last, kind, payload, shard_id, table_id, control);
+    }
+
+    /// The absence result is meaningful only when consumed by a conditional
+    /// append on this same open WAL. Ordinary append cannot consume it safely.
+    pub fn findMatchingRecordForRecovery(self: *Primary, from_lsn: u64, kind: replication_record.RecordKind, payload: []const u8, shard_id: u64, table_id: u64, original: read_control.Port) !RecoveryMatch {
+        var retained: read_control.RetainedDependency = .{};
+        const control = retained.bind(original).?;
+        const position = (try self.log.wal.tryRecoveryPosition(control)) orelse return .busy;
+        if (try self.findMatchingRecordInRange(from_lsn, position.next_lsn - 1, kind, payload, shard_id, table_id, control)) |lsn| return .{ .found = lsn };
+        return .{ .absent = position };
+    }
+
+    /// Resume a funded owned WAL read and inner CRC/equality work without
+    /// retaining the caller's payload or execution control across attempts.
+    pub fn findMatchingRecordForRecoveryStep(self: *Primary, owner: *RecoveryCursor, identity: RecoveryIdentity, from_lsn: u64, kind: replication_record.RecordKind, payload: []const u8, shard_id: u64, table_id: u64, original: read_control.Port) !RecoveryMatch {
+        if (from_lsn == 0) return error.InvalidHAOutbox;
+        var retained: read_control.RetainedDependency = .{};
+        const control = retained.bind(original).?;
+        if (!owner.mutex.tryLock()) {
+            try control.checkpoint();
+            return .busy;
+        }
+        defer owner.mutex.unlock();
+        owner.runnable = false;
+        const result = self.advanceRecovery(owner, identity, from_lsn, kind, payload, shard_id, table_id, control) catch |err| {
+            const cause = retained.rejection orelse blk: {
+                control.checkpoint() catch |original_error| break :blk retained.rejection orelse original_error;
+                break :blk err;
+            };
+            // A lower owned-read layer may have made a provider error sticky.
+            // Retire it before retrying this record; completed records survive.
+            owner.retireRead();
+            if (cause == error.Backpressured and retained.rejection == null) return .busy;
+            owner.state.active = false;
+            return cause;
+        };
+        if (std.meta.activeTag(result) == .pending) {
+            owner.runnable = true;
+            _ = owner.progress_generation.fetchAdd(1, .release);
+        }
+        return result;
+    }
+
+    fn advanceRecovery(self: *Primary, owner: *RecoveryCursor, identity: RecoveryIdentity, from_lsn: u64, kind: replication_record.RecordKind, payload: []const u8, shard_id: u64, table_id: u64, control: read_control.Port) !RecoveryMatch {
+        try control.checkpoint();
+        const allocation = owner.allocator orelse return error.ExecutionWaitUnsupported;
+        const cursor = &owner.state;
+        const current = (try self.log.wal.tryRecoveryPosition(control)) orelse return .busy;
+        const same_owner = sameRecoveryHistory(cursor.position, current);
+        if (cursor.active and same_owner and current.next_lsn < cursor.position.next_lsn) return error.CorruptWal;
+        const foreign_continuation = if (owner.pending) |pending| pending.destroy != RecoveryRead.destroy else false;
+        if (!cursor.active or !same_owner or foreign_continuation or !std.mem.eql(u8, &cursor.identity, &identity) or
+            cursor.from_lsn != from_lsn or cursor.kind != kind or cursor.payload_len != payload.len or
+            cursor.shard_id != shard_id or cursor.table_id != table_id or
+            cursor.cluster_id != self.identity.cluster_id or cursor.timeline_id != self.identity.timeline_id or cursor.epoch != self.identity.epoch)
+        {
+            owner.retireRead();
+            cursor.* = .{ .active = true, .identity = identity, .from_lsn = from_lsn, .next_lsn = from_lsn, .kind = kind, .payload_len = payload.len, .shard_id = shard_id, .table_id = table_id, .cluster_id = self.identity.cluster_id, .timeline_id = self.identity.timeline_id, .epoch = self.identity.epoch, .position = cursorPosition(current) };
+        } else cursor.position = cursorPosition(current);
+        if (from_lsn > current.next_lsn) return error.WalNoLongerRetained;
+        // One attempt performs at most sixteen bounded storage/codec units.
+        // Header, copy, CRC and exact comparison resume without prefix replay.
+        var work: usize = 0;
+        while (cursor.matched_lsn == 0 and work < recovery_record_quantum and cursor.next_lsn < current.next_lsn) : (work += 1) {
+            if (owner.pending == null) {
+                const pending = try allocation.create(RecoveryRead);
+                errdefer allocation.destroy(pending);
+                pending.* = .{ .allocator = allocation, .read = try self.log.wal.beginOwnedRead(allocation, cursor.next_lsn, control) };
+                owner.pending = .{ .ptr = pending, .destroy = RecoveryRead.destroy };
+            }
+            const pending: *RecoveryRead = @ptrCast(@alignCast(owner.pending.?.ptr));
+            const matched = pending.advance(.{ .lsn = cursor.next_lsn, .kind = kind, .payload = payload, .shard_id = shard_id, .table_id = table_id }, control) catch |err| {
+                if (err == error.NotFound) return error.WalNoLongerRetained;
+                return err;
+            };
+            if (matched) |found| {
+                owner.retireRead();
+                if (found) cursor.matched_lsn = cursor.next_lsn else cursor.next_lsn += 1;
+            }
+        }
+        const confirmed = (try self.log.wal.tryRecoveryPosition(control)) orelse return .busy;
+        if (!sameRecoveryHistory(current, confirmed)) {
+            owner.retireRead();
+            cursor.active = false;
+            return .pending;
+        }
+        if (confirmed.next_lsn < current.next_lsn) return error.CorruptWal;
+        cursor.position = cursorPosition(confirmed);
+        try control.checkpoint();
+        if (cursor.matched_lsn != 0) return .{ .found = cursor.matched_lsn };
+        if (cursor.next_lsn < confirmed.next_lsn) return .pending;
+        // Only the conditional append may consume this exact absence witness.
+        return .{ .absent = confirmed };
+    }
+
+    fn cursorPosition(position: RecoveryPosition) RecoveryCursor.Position {
+        return .{ .origin = position.origin, .owner = position.owner, .revision = position.revision, .next_lsn = position.next_lsn };
+    }
+
+    fn sameRecoveryHistory(left: anytype, right: anytype) bool {
+        return left.origin == right.origin and left.owner == right.owner and left.revision == right.revision;
+    }
+
+    fn findMatchingRecordInRange(self: *Primary, from_lsn: u64, last: u64, kind: replication_record.RecordKind, payload: []const u8, shard_id: u64, table_id: u64, control: ?read_control.Port) !?u64 {
+        if (from_lsn == 0 or from_lsn > last) return null;
+        const Match = struct {
+            kind: replication_record.RecordKind,
+            payload: []const u8,
+            shard_id: u64,
+            table_id: u64,
+            control: ?read_control.Port,
+            found: bool = false,
+            fn visit(self_match: *@This(), entry: replication_log.EntryView) !void {
+                self_match.found = entry.record.kind == self_match.kind and
+                    entry.record.shard_id == self_match.shard_id and
+                    entry.record.table_id == self_match.table_id and
+                    try self_match.equalPayload(entry.record.payload);
+            }
+            fn equalPayload(self_match: *@This(), candidate: []const u8) !bool {
+                if (candidate.len != self_match.payload.len) return false;
+                if (self_match.control) |port| {
+                    var offset: usize = 0;
+                    while (offset < candidate.len) {
+                        try port.checkpoint();
+                        const end = offset + @min(64 * 1024, candidate.len - offset);
+                        if (!std.mem.eql(u8, candidate[offset..end], self_match.payload[offset..end])) return false;
+                        offset = end;
+                    }
+                    try port.checkpoint();
+                    return true;
+                }
+                return std.mem.eql(u8, candidate, self_match.payload);
+            }
+        };
+        var match: Match = .{ .kind = kind, .payload = payload, .shard_id = shard_id, .table_id = table_id, .control = control };
         var lsn = from_lsn;
         while (true) {
-            var entry = (try self.log.entryAt(self.alloc, lsn)) orelse return error.WalNoLongerRetained;
-            defer entry.deinit(self.alloc);
-            if (entry.record.kind == kind and
-                entry.record.shard_id == shard_id and
-                entry.record.table_id == table_id and
-                std.mem.eql(u8, entry.record.payload, payload))
-                return lsn;
+            if (control) |port| try port.checkpoint();
+            if (!try self.log.withEntryAtWithAdmission(lsn, control, &match, Match.visit)) return error.WalNoLongerRetained;
+            if (match.found) return lsn;
             if (lsn == last) break;
             lsn += 1;
         }
         return null;
     }
 
-    pub fn append(self: *Primary, options: AppendOptions) !u64 {
+    fn appendRecord(self: *Primary, options: AppendOptions) replication_record.Record {
         const lsn = self.nextLsn();
-        return try self.log.append(self.alloc, .{
+        return .{
             .kind = options.kind,
             .payload_codec = options.payload_codec,
             .flags = options.flags,
@@ -222,7 +403,65 @@ pub const Primary = struct {
             .previous_lsn = lsn - 1,
             .commit_timestamp_ns = options.commit_timestamp_ns,
             .payload = options.payload,
-        });
+        };
+    }
+
+    pub fn append(self: *Primary, options: AppendOptions) !u64 {
+        return try self.log.append(self.alloc, self.appendRecord(options));
+    }
+
+    pub const PreparedAppend = struct {
+        primary: *Primary,
+        identity: Identity,
+        options: AppendOptions,
+        record: replication_record.Prepared,
+        wal_entry: wal_mod.WAL.PreparedAppend,
+        attempted: std.atomic.Value(bool) = .init(false),
+
+        pub fn publish(self: *PreparedAppend) !u64 {
+            if (self.attempted.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.InvalidArgument;
+            if (!std.meta.eql(self.identity, self.primary.identity)) return error.InvalidArgument;
+            // Position is chosen at publication, not at prepare: aborting a
+            // source write cannot consume an LSN or leave a hole in the stream.
+            return self.primary.log.appendPrepared(&self.record, &self.wal_entry, self.primary.appendRecord(self.options));
+        }
+        pub fn deinit(self: *PreparedAppend) void {
+            self.wal_entry.deinit();
+            self.record.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub fn prepareAppend(self: *Primary, options: AppendOptions, control: ?read_control.Port) !PreparedAppend {
+        var record = try replication_record.Prepared.init(self.alloc, options.payload, control);
+        errdefer record.deinit();
+        var metadata = options;
+        metadata.payload = "";
+        // Validate record kind/codec and all fixed header fields now. No LSN
+        // or durable write is reserved by this temporary encoding.
+        _ = try record.seal(self.appendRecord(metadata));
+        const wal_entry = try self.log.wal.prepareAppend(replication_record.header_size, record.encoded[replication_record.header_size..], control);
+        return .{ .primary = self, .identity = self.identity, .options = metadata, .record = record, .wal_entry = wal_entry };
+    }
+
+    pub fn appendIfRecoveryPosition(self: *Primary, position: RecoveryPosition, options: AppendOptions, control: read_control.Port) !RecoveryAppendResult {
+        try control.checkLifetime();
+        if (position.origin == 0 or position.owner == 0 or position.revision == 0 or position.next_lsn == 0) return error.InvalidArgument;
+        const result = try self.log.appendIfRecoveryPosition(self.alloc, position, .{
+            .kind = options.kind,
+            .payload_codec = options.payload_codec,
+            .flags = options.flags,
+            .cluster_id = self.identity.cluster_id,
+            .shard_id = options.shard_id orelse self.identity.shard_id,
+            .table_id = options.table_id orelse self.identity.table_id,
+            .timeline_id = self.identity.timeline_id,
+            .epoch = self.identity.epoch,
+            .lsn = position.next_lsn,
+            .previous_lsn = position.next_lsn - 1,
+            .commit_timestamp_ns = options.commit_timestamp_ns,
+            .payload = options.payload,
+        }, control);
+        return result;
     }
 
     pub fn createSlot(self: *Primary, name: []const u8, initial_lsn: u64) !void {
@@ -438,15 +677,27 @@ pub const Primary = struct {
 
     pub fn evaluateDurability(self: *const Primary, target_lsn: u64, policy: SyncPolicy) !DurabilityDecision {
         if (target_lsn > self.lastLsn()) return error.TargetAheadOfPrimary;
-        return self.evaluateDurabilityAt(target_lsn, policy);
+        return self.evaluateDurabilityAt(target_lsn, policy, null);
     }
 
     pub fn evaluateAppendDurability(self: *const Primary, target_lsn: u64, policy: SyncPolicy) !DurabilityDecision {
         if (target_lsn != self.nextLsn()) return error.TargetAheadOfPrimary;
-        return self.evaluateDurabilityAt(target_lsn, policy);
+        return self.evaluateDurabilityAt(target_lsn, policy, null);
     }
 
-    fn evaluateDurabilityAt(self: *const Primary, target_lsn: u64, policy: SyncPolicy) !DurabilityDecision {
+    pub fn nextLsnWithAdmission(self: *Primary, control: read_control.Port) !u64 {
+        return (try @import("../wal_runtime.zig").lastLsnWithAdmission(&self.log.wal, control)) + 1;
+    }
+
+    pub fn evaluateAppendDurabilityWithAdmission(self: *Primary, target_lsn: u64, policy: SyncPolicy, control: read_control.Port) !DurabilityDecision {
+        if (target_lsn != try self.nextLsnWithAdmission(control)) return error.TargetAheadOfPrimary;
+        const decision = try self.evaluateDurabilityAt(target_lsn, policy, control);
+        try control.checkpoint();
+        return decision;
+    }
+
+    fn evaluateDurabilityAt(self: *const Primary, target_lsn: u64, policy: SyncPolicy, control: ?read_control.Port) !DurabilityDecision {
+        if (control) |original| try original.checkpoint();
         if (policy.mode == .async) {
             return .{
                 .status = .satisfied,
@@ -460,15 +711,18 @@ pub const Primary = struct {
                 .candidate_count = 0,
             };
         }
-        try validateSyncPolicyNames(policy.standby_names);
+        for (policy.standby_names) |name| {
+            if (control) |original| try original.checkpoint();
+            if (!validation.isIdentifier(name)) return error.InvalidSyncPolicy;
+        }
         if (policy.required == 0) return error.InvalidSyncPolicy;
         if (policy.selection != .all and policy.required > policy.standby_names.len) return error.InvalidSyncPolicy;
         if (policy.standby_names.len == 0) return decisionForUnsatisfied(target_lsn, policy, 0, policy.required, 0);
 
         const counts = switch (policy.selection) {
-            .any => self.evaluateAny(target_lsn, policy),
-            .first => self.evaluateFirst(target_lsn, policy),
-            .all => self.evaluateAll(target_lsn, policy),
+            .any => try self.evaluateAny(target_lsn, policy, control),
+            .first => try self.evaluateFirst(target_lsn, policy, control),
+            .all => try self.evaluateAll(target_lsn, policy, control),
         };
 
         const satisfied = counts.satisfied_count >= counts.required_count;
@@ -486,30 +740,30 @@ pub const Primary = struct {
         };
     }
 
-    fn evaluateAny(self: *const Primary, target_lsn: u64, policy: SyncPolicy) Counts {
+    fn evaluateAny(self: *const Primary, target_lsn: u64, policy: SyncPolicy, control: ?read_control.Port) !Counts {
         var counts = Counts{
             .required_count = policy.required,
         };
         for (policy.standby_names) |name| {
-            const state = self.eligibleSlot(name) orelse continue;
+            const state = (try self.eligibleSlot(name, control)) orelse continue;
             counts.candidate_count += 1;
             if (slotSatisfies(state, target_lsn, policy.mode)) counts.satisfied_count += 1;
         }
-        counts.progress_lsn = self.anyProgressLsn(policy);
+        counts.progress_lsn = try self.anyProgressLsn(policy, control);
         return counts;
     }
 
-    fn anyProgressLsn(self: *const Primary, policy: SyncPolicy) u64 {
+    fn anyProgressLsn(self: *const Primary, policy: SyncPolicy, control: ?read_control.Port) !u64 {
         if (policy.required == 0) return 0;
 
         var best: u64 = 0;
         for (policy.standby_names) |candidate_name| {
-            const candidate = self.eligibleSlot(candidate_name) orelse continue;
+            const candidate = (try self.eligibleSlot(candidate_name, control)) orelse continue;
             const candidate_progress = progressForMode(candidate, policy.mode);
             var at_or_above: usize = 0;
 
             for (policy.standby_names) |name| {
-                const state = self.eligibleSlot(name) orelse continue;
+                const state = (try self.eligibleSlot(name, control)) orelse continue;
                 if (progressForMode(state, policy.mode) >= candidate_progress) at_or_above += 1;
             }
 
@@ -518,12 +772,12 @@ pub const Primary = struct {
         return best;
     }
 
-    fn evaluateFirst(self: *const Primary, target_lsn: u64, policy: SyncPolicy) Counts {
+    fn evaluateFirst(self: *const Primary, target_lsn: u64, policy: SyncPolicy, control: ?read_control.Port) !Counts {
         var counts = Counts{
             .required_count = policy.required,
         };
         for (policy.standby_names) |name| {
-            const state = self.eligibleSlot(name) orelse continue;
+            const state = (try self.eligibleSlot(name, control)) orelse continue;
             counts.candidate_count += 1;
             counts.progress_lsn = counts.progressFloor(progressForMode(state, policy.mode));
             if (slotSatisfies(state, target_lsn, policy.mode)) counts.satisfied_count += 1;
@@ -532,12 +786,12 @@ pub const Primary = struct {
         return counts;
     }
 
-    fn evaluateAll(self: *const Primary, target_lsn: u64, policy: SyncPolicy) Counts {
+    fn evaluateAll(self: *const Primary, target_lsn: u64, policy: SyncPolicy, control: ?read_control.Port) !Counts {
         var counts = Counts{
             .required_count = policy.standby_names.len,
         };
         for (policy.standby_names) |name| {
-            const state = self.eligibleSlot(name) orelse continue;
+            const state = (try self.eligibleSlot(name, control)) orelse continue;
             counts.candidate_count += 1;
             counts.progress_lsn = counts.progressFloor(progressForMode(state, policy.mode));
             if (slotSatisfies(state, target_lsn, policy.mode)) counts.satisfied_count += 1;
@@ -545,8 +799,9 @@ pub const Primary = struct {
         return counts;
     }
 
-    fn eligibleSlot(self: *const Primary, name: []const u8) ?slot_store.SlotState {
-        const state = self.slots.get(name) orelse return null;
+    fn eligibleSlot(self: *const Primary, name: []const u8, control: ?read_control.Port) !?slot_store.SlotState {
+        if (control) |original| try original.checkpoint();
+        const state = (if (control) |original| try self.slots.getWithAdmission(name, original) else self.slots.get(name)) orelse return null;
         if (state.lifecycle == .seeding) return null;
         if (!state.active or state.reseed_required) return null;
         if (state.timeline_id != self.identity.timeline_id) return null;
@@ -717,7 +972,7 @@ pub const Primary = struct {
 /// so the last record is the current identity of the log. Used by
 /// `antfly ha --data-dir` to avoid typing identity flags.
 pub fn readPersistedIdentity(alloc: Allocator, log_path: [*:0]const u8, options: OpenOptions) !?Identity {
-    var log = try replication_log.ReplicationLog.open(log_path, options.replication_log_options);
+    var log = try replication_log.ReplicationLog.openWithAllocator(alloc, log_path, options.replication_log_options);
     defer log.close();
     const last_lsn = log.lastLsn();
     if (last_lsn == 0) return null;
@@ -1991,4 +2246,506 @@ test "storage.hot_standby primary pauses and resumes slot streaming across reope
         try std.testing.expectEqual(@as(usize, 1), entries.len);
         try std.testing.expectEqualStrings("one", entries[0].record.payload);
     }
+}
+
+test "primary recovery matching borrows WAL records with primary allocation refused" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "borrowed-recovery");
+    defer paths.deinit(alloc);
+    var primary = try Primary.open(alloc, paths.log.ptr, paths.slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "same" });
+    _ = try primary.append(.{ .kind = .metadata_mutation, .payload = "wanted" });
+    _ = try primary.append(.{ .table_id = 99, .payload = "wanted" });
+    _ = try primary.append(.{ .payload = "wanted" });
+    var denied = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    primary.alloc = denied.allocator();
+    defer primary.alloc = alloc;
+    try std.testing.expectEqual(@as(?u64, 4), try primary.findMatchingRecordFrom(1, .batch_mutation, "wanted", 10, 20));
+    try std.testing.expectEqual(@as(?u64, 2), try primary.findMatchingRecordFrom(1, .metadata_mutation, "wanted", 10, 20));
+    try std.testing.expectEqual(@as(?u64, null), try primary.findMatchingRecordFrom(1, .batch_mutation, "missing", 10, 20));
+    try std.testing.expectEqual(@as(?u64, null), try primary.findMatchingRecordFrom(5, .batch_mutation, "wanted", 10, 20));
+    try primary.log.truncate(1);
+    try std.testing.expectError(error.WalNoLongerRetained, primary.findMatchingRecordFrom(1, .batch_mutation, "wanted", 10, 20));
+    try std.testing.expectEqual(@as(?u64, 4), try primary.findMatchingRecordFrom(2, .batch_mutation, "wanted", 10, 20));
+    try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+}
+
+test "primary recovery matching controlled scans preserve exact matches and reject every original lifetime boundary" {
+    const read = read_control;
+    const State = struct {
+        checks: usize = 0,
+        reject_at: usize = 0,
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.reject_at) return self.cause;
+        }
+    };
+    const a = std.testing.allocator;
+    const paths = try testPaths(a, "controlled-recovery");
+    defer paths.deinit(a);
+    var primary = try Primary.open(a, paths.log.ptr, paths.slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    const bytes = try a.alloc(u8, 2 * 64 * 1024 + 17);
+    defer a.free(bytes);
+    @memset(bytes, 87);
+    _ = try primary.append(.{ .payload = "short" });
+    _ = try primary.append(.{ .kind = .metadata_mutation, .payload = bytes });
+    _ = try primary.append(.{ .table_id = 99, .payload = bytes });
+    bytes[bytes.len - 1] ^= 1;
+    _ = try primary.append(.{ .payload = bytes });
+    bytes[bytes.len - 1] ^= 1;
+    _ = try primary.append(.{ .payload = bytes });
+    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    primary.alloc = denied.allocator();
+    defer primary.alloc = a;
+    var state: State = .{};
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .check_lifetime = State.check } };
+    const control = read.Port.init(&payload);
+    try std.testing.expectEqual(@as(?u64, 5), try primary.findMatchingRecordFromWithAdmission(1, .batch_mutation, bytes, 10, 20, control));
+    const checks = state.checks;
+    try std.testing.expect(checks > 30);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        for (1..checks + 1) |reject_at| {
+            state = .{ .reject_at = reject_at, .cause = cause };
+            try std.testing.expectError(cause, primary.findMatchingRecordFromWithAdmission(1, .batch_mutation, bytes, 10, 20, control));
+            try std.testing.expectEqual(reject_at, state.checks);
+            try std.testing.expectEqual(@as(u64, 5), primary.lastLsn());
+        }
+    }
+    state = .{};
+    try primary.log.truncate(1);
+    try std.testing.expectError(error.WalNoLongerRetained, primary.findMatchingRecordFromWithAdmission(1, .batch_mutation, bytes, 10, 20, control));
+    try std.testing.expectEqual(@as(?u64, 5), try primary.findMatchingRecordFromWithAdmission(2, .batch_mutation, bytes, 10, 20, control));
+    try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+}
+
+test "primary recovery witness rejects a replaced absence proof and reuses the matching record" {
+    const a = std.testing.allocator;
+    const paths = try testPaths(a, "recovery-position");
+    defer paths.deinit(a);
+    var primary = try Primary.open(a, paths.log.ptr, paths.slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    const Check = struct {
+        fn run(_: *anyopaque) !void {}
+    };
+    var unused: u8 = 0;
+    const payload: read_control.Payload = .{ .ptr = &unused, .vtable = &.{ .checkpoint = Check.run } };
+    const control = read_control.Port.init(&payload);
+    _ = try primary.append(.{ .payload = "old" });
+    const scanned = try primary.findMatchingRecordForRecovery(1, .batch_mutation, "wanted", 10, 20, control);
+    const position = scanned.absent;
+    // Rewind and replace the scanned record without changing next_lsn.
+    try primary.log.truncateAfter(0);
+    _ = try primary.append(.{ .payload = "wanted" });
+    try std.testing.expectEqual(@as(RecoveryAppendResult, .changed), try primary.appendIfRecoveryPosition(position, .{ .payload = "wanted" }, control));
+    try std.testing.expectEqual(@as(u64, 1), (try primary.findMatchingRecordForRecovery(1, .batch_mutation, "wanted", 10, 20, control)).found);
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    const absent = (try primary.findMatchingRecordForRecovery(1, .metadata_mutation, "schema", 10, 20, control)).absent;
+    try std.testing.expectEqual(@as(u64, 2), (try primary.appendIfRecoveryPosition(absent, .{ .kind = .metadata_mutation, .payload = "schema" }, control)).appended);
+    var entry = (try primary.log.entryAt(a, 2)).?;
+    defer entry.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), entry.record.previous_lsn);
+    try std.testing.expectEqualStrings("schema", entry.record.payload);
+}
+
+fn drainRecoveryForTest(primary: *Primary, cursor: *RecoveryCursor, identity: RecoveryIdentity, from: u64, kind: replication_record.RecordKind, payload: []const u8, shard: u64, table: u64, control: read_control.Port) !RecoveryMatch {
+    for (0..10000) |_| {
+        const result = try primary.findMatchingRecordForRecoveryStep(cursor, identity, from, kind, payload, shard, table, control);
+        switch (result) {
+            .pending, .busy => {},
+            else => return result,
+        }
+    }
+    return error.RecoveryDidNotProgress;
+}
+
+test "primary recovery cursor resumes record quanta with fresh payload borrows and growing tail" {
+    const a = std.testing.allocator;
+    const paths = try testPaths(a, "cursor-progress");
+    defer paths.deinit(a);
+    var primary = try Primary.open(a, paths.log.ptr, paths.slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    for (0..3 * recovery_record_quantum) |_| _ = try primary.append(.{ .payload = "other!" });
+    const wanted_lsn = try primary.append(.{ .payload = "wanted" });
+    const Check = struct {
+        fn run(_: *anyopaque) !void {}
+    };
+    var unused: u8 = 0;
+    const lifetime: read_control.Payload = .{ .ptr = &unused, .vtable = &.{ .checkpoint = Check.run } };
+    const control = read_control.Port.init(&lifetime);
+    var cursor = RecoveryCursor.init(a);
+    defer cursor.reset();
+    var peer_cursor = RecoveryCursor.init(a);
+    defer peer_cursor.reset();
+    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    primary.alloc = denied.allocator();
+    defer primary.alloc = a;
+    const id: RecoveryIdentity = @splat(1);
+    try std.testing.expectEqual(@as(RecoveryMatch, .pending), try primary.findMatchingRecordForRecoveryStep(&cursor, id, 1, .batch_mutation, "wanted", 10, 20, control));
+    const progress = cursor.state.next_lsn;
+    primary.alloc = a;
+    _ = try primary.append(.{ .payload = "later!" });
+    primary.alloc = denied.allocator();
+    var found: u64 = 0;
+    for (0..1000) |_| {
+        const fresh = try a.dupe(u8, "wanted");
+        const result = primary.findMatchingRecordForRecoveryStep(&cursor, id, 1, .batch_mutation, fresh, 10, 20, control);
+        @memset(fresh, 0xDD);
+        a.free(fresh);
+        switch (try result) {
+            .found => |lsn| {
+                found = lsn;
+                break;
+            },
+            .pending => {},
+            else => return error.TestUnexpectedResult,
+        }
+        _ = try primary.findMatchingRecordForRecoveryStep(&peer_cursor, @splat(2), 1, .batch_mutation, "later!", 10, 20, control);
+        try std.testing.expect(cursor.state.next_lsn >= progress);
+    }
+    try std.testing.expectEqual(wanted_lsn, found);
+    try std.testing.expectEqual(wanted_lsn + 1, (try drainRecoveryForTest(&primary, &peer_cursor, @splat(2), 1, .batch_mutation, "later!", 10, 20, control)).found);
+    try std.testing.expectEqual(wanted_lsn, (try primary.findMatchingRecordForRecoveryStep(&cursor, id, 1, .batch_mutation, "wanted", 10, 20, control)).found);
+    try std.testing.expectEqual(@as(usize, 0), denied.alloc_index);
+    try std.testing.expectEqual(@as(usize, 0), primary.log.wal.store_owner.lsm.backend.active_readers);
+}
+
+test "primary recovery cursor isolates intents and namespaces and rejects destructive tail ABA" {
+    const a = std.testing.allocator;
+    const paths = try testPaths(a, "cursor-history");
+    defer paths.deinit(a);
+    var primary = try Primary.open(a, paths.log.ptr, paths.slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "second" });
+    _ = try primary.append(.{ .payload = "wanted", .table_id = 99 });
+    for (2..2 * recovery_record_quantum) |_| _ = try primary.append(.{ .payload = "other!" });
+    const Check = struct {
+        fn run(_: *anyopaque) !void {}
+    };
+    var unused: u8 = 0;
+    const lifetime: read_control.Payload = .{ .ptr = &unused, .vtable = &.{ .checkpoint = Check.run } };
+    const control = read_control.Port.init(&lifetime);
+    var cursor = RecoveryCursor.init(a);
+    defer cursor.reset();
+    try std.testing.expectEqual(@as(RecoveryMatch, .pending), try primary.findMatchingRecordForRecoveryStep(&cursor, @splat(1), 1, .batch_mutation, "wanted", 10, 20, control));
+    try std.testing.expectEqual(@as(u64, 1), (try drainRecoveryForTest(&primary, &cursor, @splat(2), 1, .batch_mutation, "second", 10, 20, control)).found);
+    try std.testing.expectEqual(@as(RecoveryMatch, .pending), try primary.findMatchingRecordForRecoveryStep(&cursor, @splat(3), 1, .batch_mutation, "wanted", 10, 20, control));
+    try std.testing.expectEqual(@as(u64, 2), (try drainRecoveryForTest(&primary, &cursor, @splat(3), 1, .batch_mutation, "wanted", 10, 99, control)).found);
+    try std.testing.expectEqual(@as(RecoveryMatch, .pending), try primary.findMatchingRecordForRecoveryStep(&cursor, @splat(4), 1, .batch_mutation, "wanted", 10, 20, control));
+    const old_tail = primary.nextLsn();
+    try primary.log.truncateAfter(0);
+    _ = try primary.append(.{ .payload = "wanted" });
+    for (1..2 * recovery_record_quantum) |_| _ = try primary.append(.{ .payload = "other!" });
+    try std.testing.expectEqual(old_tail, primary.nextLsn());
+    try std.testing.expectEqual(@as(u64, 1), (try drainRecoveryForTest(&primary, &cursor, @splat(4), 1, .batch_mutation, "wanted", 10, 20, control)).found);
+    try primary.log.truncate(1);
+    try std.testing.expectError(error.WalNoLongerRetained, drainRecoveryForTest(&primary, &cursor, @splat(4), 1, .batch_mutation, "wanted", 10, 20, control));
+}
+
+test "primary recovery cursor completes absence atomically and preserves original rejection and busy progress" {
+    const a = std.testing.allocator;
+    const paths = try testPaths(a, "cursor-absence");
+    defer paths.deinit(a);
+    var primary = try Primary.open(a, paths.log.ptr, paths.slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    for (0..2 * recovery_record_quantum + 1) |_| _ = try primary.append(.{ .payload = "other!" });
+    const State = struct {
+        reject: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.CatalogGenerationChanged;
+        }
+    };
+    var state: State = .{};
+    const lifetime: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+    const control = read_control.Port.init(&lifetime);
+    var cursor = RecoveryCursor.init(a);
+    defer cursor.reset();
+    const id: RecoveryIdentity = @splat(7);
+    try std.testing.expectEqual(@as(RecoveryMatch, .pending), try primary.findMatchingRecordForRecoveryStep(&cursor, id, 1, .batch_mutation, "wanted", 10, 20, control));
+    const absence = (try drainRecoveryForTest(&primary, &cursor, id, 1, .batch_mutation, "wanted", 10, 20, control)).absent;
+    const found = try primary.append(.{ .payload = "wanted" });
+    try std.testing.expectEqual(@as(RecoveryAppendResult, .changed), try primary.appendIfRecoveryPosition(absence, .{ .payload = "wanted" }, control));
+    try std.testing.expectEqual(found, (try drainRecoveryForTest(&primary, &cursor, id, 1, .batch_mutation, "wanted", 10, 20, control)).found);
+    try std.testing.expect(cursor.mutex.tryLock());
+    const busy = primary.findMatchingRecordForRecoveryStep(&cursor, id, 1, .batch_mutation, "wanted", 10, 20, control);
+    cursor.mutex.unlock();
+    try std.testing.expectEqual(@as(RecoveryMatch, .busy), try busy);
+    state.reject = true;
+    try std.testing.expectError(error.CatalogGenerationChanged, primary.findMatchingRecordForRecoveryStep(&cursor, id, 1, .batch_mutation, "wanted", 10, 20, control));
+    state.reject = false;
+    try std.testing.expectEqual(found, (try drainRecoveryForTest(&primary, &cursor, id, 1, .batch_mutation, "wanted", 10, 20, control)).found);
+    try primary.log.wal.injectCorruptEntryForTest(1);
+    try std.testing.expectError(error.CorruptWal, drainRecoveryForTest(&primary, &cursor, id, 1, .batch_mutation, "wanted", 10, 20, control));
+}
+
+test "WAL allocator owner Primary refuses an unfunded node root before opening storage" {
+    const resources = @import("antfly_local_sources").storage_resource_manager;
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1 }, .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var budget = resources.BudgetedAllocator.init(&manager, .lsm_in_memory_state, std.testing.allocator, 1);
+    defer budget.deinit();
+    try std.testing.expectError(error.OutOfMemory, Primary.open(budget.threadSafeAllocator(), "/unused-unfunded-primary", "/unused-unfunded-slots", .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1 }, .{}));
+    try std.testing.expectEqual(@as(u64, 0), budget.liveBytesThreadSafe());
+}
+
+test "WAL allocator owner HA slot fence standby and lifecycle logs inherit their caller root" {
+    const a = std.testing.allocator;
+    const wal_options: @import("../wal_runtime.zig").WalOptions = .{ .backend = .lsm_memory, .no_sync = true };
+    {
+        var slots = try slot_store.SlotStore.open(a, "/unused-rooted-slots", .{ .wal_options = wal_options });
+        defer slots.close();
+        try std.testing.expectEqual(a.ptr, slots.wal.allocator.ptr);
+    }
+    {
+        var fence = try @import("fencing.zig").Store.open(a, "/unused-rooted-fence", .{ .wal_options = wal_options });
+        defer fence.close();
+        try std.testing.expectEqual(a.ptr, fence.wal.allocator.ptr);
+    }
+    {
+        var standby = try standby_mod.Standby.open(a, "/unused-rooted-receive", "/unused-rooted-progress", .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1 }, .{ .receive_log_options = .{ .wal_options = wal_options }, .progress_wal_options = wal_options });
+        defer standby.close();
+        try std.testing.expectEqual(a.ptr, standby.receive_log.wal.allocator.ptr);
+        try std.testing.expectEqual(a.ptr, standby.progress_wal.allocator.ptr);
+    }
+    {
+        var ledger = try @import("lifecycle_receipt_ledger.zig").Ledger.open(a, "/unused-rooted-ledger", .{ .wal_options = wal_options });
+        defer ledger.close();
+        try std.testing.expectEqual(a.ptr, ledger.wal.allocator.ptr);
+    }
+}
+
+test "primary recovery cursor bounds large record work and retires pending reads across close and reopen" {
+    const a = std.testing.allocator;
+    const paths = try testPaths(a, "byte-close-reopen");
+    defer paths.deinit(a);
+    var primary = try Primary.open(a, paths.log.ptr, paths.slots.ptr, testIdentity(), .{});
+    var open = true;
+    defer if (open) primary.close();
+    const bytes = try a.alloc(u8, 512 * 1024 + 17);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i *% 79);
+    const lsn = try primary.append(.{ .payload = bytes });
+    var tracking = std.testing.FailingAllocator.init(a, .{});
+    var cursor = RecoveryCursor.init(tracking.allocator());
+    defer cursor.reset();
+    const Authority = struct {
+        active: bool = true,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.active) return error.ExpiredPrimaryStep;
+        }
+    };
+    var attempts: usize = 0;
+    var last_offset: usize = 0;
+    var observed_inner = false;
+    while (true) {
+        var authority: Authority = .{};
+        const control: read_control.Payload = .{ .ptr = &authority, .vtable = &.{ .checkpoint = Authority.check, .check_lifetime = Authority.check } };
+        const fresh = try a.dupe(u8, bytes);
+        const result = primary.findMatchingRecordForRecoveryStep(&cursor, @splat(9), 1, .batch_mutation, fresh, 10, 20, read_control.Port.init(&control));
+        authority.active = false;
+        @memset(fresh, 0xDD);
+        a.free(fresh);
+        attempts += 1;
+        switch (try result) {
+            .found => |found| {
+                try std.testing.expectEqual(lsn, found);
+                break;
+            },
+            .pending => {},
+            else => return error.TestUnexpectedResult,
+        }
+        const pending: *RecoveryRead = @ptrCast(@alignCast(cursor.pending.?.ptr));
+        try std.testing.expect(pending.matcher.offset >= last_offset);
+        try std.testing.expect(pending.matcher.offset - last_offset <= recovery_record_quantum * pending.buffer.len);
+        last_offset = pending.matcher.offset;
+        observed_inner = observed_inner or last_offset > 0;
+        try std.testing.expect(attempts < 1000);
+    }
+    try std.testing.expect(attempts > 16 and observed_inner and cursor.pending == null);
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+    var authority: Authority = .{};
+    const control: read_control.Payload = .{ .ptr = &authority, .vtable = &.{ .checkpoint = Authority.check, .check_lifetime = Authority.check } };
+    const port = read_control.Port.init(&control);
+    try std.testing.expectEqual(@as(RecoveryMatch, .pending), try primary.findMatchingRecordForRecoveryStep(&cursor, @splat(10), 1, .batch_mutation, bytes, 10, 20, port));
+    try std.testing.expect(cursor.pending != null);
+    primary.close();
+    open = false;
+    // The old native read is detached. Reopen changes the history owner and
+    // retires its independent metadata before capturing any new read.
+    primary = try Primary.open(a, paths.log.ptr, paths.slots.ptr, testIdentity(), .{});
+    open = true;
+    try std.testing.expectEqual(lsn, (try drainRecoveryForTest(&primary, &cursor, @splat(10), 1, .batch_mutation, bytes, 10, 20, port)).found);
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+    try std.testing.expectEqual(@as(RecoveryMatch, .pending), try primary.findMatchingRecordForRecoveryStep(&cursor, @splat(11), 1, .batch_mutation, bytes, 10, 20, port));
+    primary.close();
+    open = false;
+    cursor.reset();
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+}
+
+test "primary recovery cursor refuses unfunded state and unwinds allocation and partial checksum rejection" {
+    const a = std.testing.allocator;
+    const paths = try testPaths(a, "byte-reject");
+    defer paths.deinit(a);
+    var primary = try Primary.open(a, paths.log.ptr, paths.slots.ptr, testIdentity(), .{ .replication_log_options = .{ .wal_options = .{ .backend = .lsm_memory, .no_sync = true } } });
+    defer primary.close();
+    const bytes = try a.alloc(u8, 256 * 1024 + 19);
+    defer a.free(bytes);
+    @memset(bytes, 71);
+    _ = try primary.append(.{ .payload = bytes });
+    const State = struct {
+        reject: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.OriginalPrimaryReadRejection;
+        }
+    };
+    var state: State = .{};
+    const payload: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .check_lifetime = State.check } };
+    const control = read_control.Port.init(&payload);
+    var absent_root: RecoveryCursor = .{};
+    try std.testing.expectError(error.ExecutionWaitUnsupported, primary.findMatchingRecordForRecoveryStep(&absent_root, @splat(1), 1, .batch_mutation, bytes, 10, 20, control));
+    const Probe = struct {
+        fn run(allocator: Allocator, p: *Primary, expected: []const u8, port: read_control.Port) !void {
+            var cursor = RecoveryCursor.init(allocator);
+            defer cursor.reset();
+            _ = try drainRecoveryForTest(p, &cursor, @splat(1), 1, .batch_mutation, expected, 10, 20, port);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{ &primary, bytes, control });
+    var tracking = std.testing.FailingAllocator.init(a, .{});
+    var cursor = RecoveryCursor.init(tracking.allocator());
+    defer cursor.reset();
+    while (true) {
+        try std.testing.expectEqual(@as(RecoveryMatch, .pending), try primary.findMatchingRecordForRecoveryStep(&cursor, @splat(2), 1, .batch_mutation, bytes, 10, 20, control));
+        const pending: *RecoveryRead = @ptrCast(@alignCast(cursor.pending.?.ptr));
+        if (pending.matcher.offset > replication_record.header_size) break;
+    }
+    state.reject = true;
+    try std.testing.expectError(error.OriginalPrimaryReadRejection, primary.findMatchingRecordForRecoveryStep(&cursor, @splat(2), 1, .batch_mutation, bytes, 10, 20, control));
+    try std.testing.expect(cursor.pending == null and !cursor.state.active);
+    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+    try std.testing.expectEqual(@as(usize, 0), primary.log.wal.store_owner.lsm.backend.active_readers);
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+}
+
+test "primary recovery cursor retires sticky provider backpressure before retrying the current record" {
+    const a = std.testing.allocator;
+    const paths = try testPaths(a, "byte-backpressure");
+    defer paths.deinit(a);
+    var primary = try Primary.open(a, paths.log.ptr, paths.slots.ptr, testIdentity(), .{ .replication_log_options = .{ .wal_options = .{ .backend = .lsm_memory, .no_sync = true } } });
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "wanted" });
+    const erased = @import("antfly_local_sources").storage_backend_erased;
+    const Fixture = struct {
+        var original: erased.NamespaceStore = undefined;
+        var reject: bool = true;
+        var opened: usize = 0;
+        var closed: usize = 0;
+        const Box = struct { inner: erased.OwnedValueRead };
+        fn begin(allocator: Allocator, _: *anyopaque, namespace: @import("antfly_local_sources").storage_backend_types.Namespace, key: []const u8, port: read_control.Port) !erased.OwnedValueRead {
+            const box = try allocator.create(Box);
+            errdefer allocator.destroy(box);
+            box.* = .{ .inner = try original.beginOwnedValueRead(allocator, namespace, key, port) };
+            opened += 1;
+            return .{ .allocator = allocator, .ptr = box, .vtable = &.{ .deinit = deinit, .step = step, .take_output = take } };
+        }
+        fn deinit(allocator: Allocator, raw: *anyopaque) void {
+            const box: *Box = @ptrCast(@alignCast(raw));
+            box.inner.deinit();
+            allocator.destroy(box);
+            closed += 1;
+        }
+        fn step(raw: *anyopaque, quantum: usize, port: read_control.Port) !erased.OwnedValueRead.Status {
+            if (reject) {
+                reject = false;
+                return error.Backpressured;
+            }
+            const box: *Box = @ptrCast(@alignCast(raw));
+            return box.inner.step(quantum, port);
+        }
+        fn take(raw: *anyopaque) !erased.OwnedValue {
+            const box: *Box = @ptrCast(@alignCast(raw));
+            return box.inner.takeOutput();
+        }
+    };
+    Fixture.original = primary.log.wal.store;
+    Fixture.reject = true;
+    Fixture.opened = 0;
+    Fixture.closed = 0;
+    var table = Fixture.original.vtable.*;
+    table.begin_owned_value_read = Fixture.begin;
+    primary.log.wal.store.vtable = &table;
+    defer primary.log.wal.store = Fixture.original;
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var state: u8 = 0;
+    const payload: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = Check.check, .check_lifetime = Check.check } };
+    const control = read_control.Port.init(&payload);
+    var cursor = RecoveryCursor.init(a);
+    defer cursor.reset();
+    try std.testing.expectEqual(@as(RecoveryMatch, .busy), try primary.findMatchingRecordForRecoveryStep(&cursor, @splat(1), 1, .batch_mutation, "wanted", 10, 20, control));
+    try std.testing.expect(cursor.pending == null and cursor.state.next_lsn == 1);
+    try std.testing.expectEqual(@as(usize, 1), Fixture.closed);
+    try std.testing.expectEqual(@as(u64, 1), (try drainRecoveryForTest(&primary, &cursor, @splat(1), 1, .batch_mutation, "wanted", 10, 20, control)).found);
+    try std.testing.expectEqual(@as(usize, 2), Fixture.opened);
+    try std.testing.expectEqual(Fixture.opened, Fixture.closed);
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+}
+
+test "primary recovery cursor reports only runnable WAL progress and retires readiness on waits errors and reset" {
+    const a = std.testing.allocator;
+    const paths = try testPaths(a, "cursor-runnable-progress");
+    defer paths.deinit(a);
+    var primary = try Primary.open(a, paths.log.ptr, paths.slots.ptr, testIdentity(), .{});
+    defer primary.close();
+    for (0..3 * recovery_record_quantum) |_| _ = try primary.append(.{ .payload = "other!" });
+    const wanted = try primary.append(.{ .payload = "wanted" });
+    const Budget = struct {
+        reject: bool = false,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.reject) return error.TestRecoveryProgressOriginal;
+        }
+    };
+    var budget: Budget = .{};
+    const payload: read_control.Payload = .{ .ptr = &budget, .vtable = &.{ .checkpoint = Budget.check } };
+    const control = read_control.Port.init(&payload);
+    var cursor = RecoveryCursor.init(a);
+    defer cursor.reset();
+    const id: RecoveryIdentity = @splat(71);
+    const initial = cursor.progress();
+    try std.testing.expect(!initial.runnable);
+    try std.testing.expectEqual(@as(RecoveryMatch, .pending), try primary.findMatchingRecordForRecoveryStep(&cursor, id, 1, .batch_mutation, "wanted", 10, 20, control));
+    const advanced = cursor.progress();
+    try std.testing.expect(advanced.runnable and advanced.generation != initial.generation);
+    try std.testing.expect(cursor.mutex.tryLock());
+    const unknown = cursor.progress();
+    cursor.mutex.unlock();
+    try std.testing.expectEqual(advanced.generation, unknown.generation);
+    try std.testing.expect(!unknown.runnable);
+    try std.testing.expect(primary.log.wal.mutex.tryLock());
+    const busy = primary.findMatchingRecordForRecoveryStep(&cursor, id, 1, .batch_mutation, "wanted", 10, 20, control);
+    primary.log.wal.mutex.unlock(primary.log.wal.sync_io);
+    try std.testing.expectEqual(@as(RecoveryMatch, .busy), try busy);
+    try std.testing.expectEqual(advanced.generation, cursor.progress().generation);
+    try std.testing.expect(!cursor.progress().runnable);
+    try std.testing.expectEqual(@as(RecoveryMatch, .pending), try primary.findMatchingRecordForRecoveryStep(&cursor, id, 1, .batch_mutation, "wanted", 10, 20, control));
+    budget.reject = true;
+    try std.testing.expectError(error.TestRecoveryProgressOriginal, primary.findMatchingRecordForRecoveryStep(&cursor, id, 1, .batch_mutation, "wanted", 10, 20, control));
+    try std.testing.expect(!cursor.progress().runnable);
+    try std.testing.expect(cursor.pending == null);
+    budget.reject = false;
+    try std.testing.expectEqual(wanted, (try drainRecoveryForTest(&primary, &cursor, id, 1, .batch_mutation, "wanted", 10, 20, control)).found);
+    try std.testing.expect(!cursor.progress().runnable);
+    const generation = cursor.progress().generation;
+    cursor.reset();
+    try std.testing.expectEqual(generation, cursor.progress().generation);
+    try std.testing.expect(!cursor.progress().runnable);
 }

@@ -145,7 +145,7 @@ pub const Store = struct {
     pub fn open(alloc: Allocator, path: [*:0]const u8, options: OpenOptions) !Store {
         var store = Store{
             .alloc = alloc,
-            .wal = try wal_mod.WAL.open(path, options.wal_options),
+            .wal = try wal_mod.WAL.openWithAllocator(alloc, path, options.wal_options),
         };
         errdefer store.close();
         try store.replay();

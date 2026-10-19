@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Caller-owned failures stay local while layout-only callbacks signal failure.
 const std = @import("std");
@@ -45,6 +57,22 @@ pub const Output = struct {
     pub fn close(self: *Output, sink: http.StreamSink) !void {
         if (self.cause) |err| return err;
         try self.result((sink.close orelse return error.StreamingUnavailable)(sink.context));
+    }
+    pub fn startControlled(self: *Output, sink: http.StreamSink, status: u16, content_type: http.Bytes, headers: http.HeaderList, control: *const http.RequestControl) !void {
+        if (self.cause) |err| return err;
+        if (self.started) return error.StreamAlreadyStarted;
+        if (sink.write_controlled == null or sink.close_controlled == null) return error.StreamingUnavailable;
+        const callback = sink.start_controlled orelse return error.StreamingUnavailable;
+        self.started = true;
+        try self.result(callback(sink.context, status, content_type, headers, control));
+    }
+    pub fn writeControlled(self: *Output, sink: http.StreamSink, bytes: http.Bytes, control: *const http.RequestControl) !void {
+        if (self.cause) |err| return err;
+        try self.result((sink.write_controlled orelse return error.StreamingUnavailable)(sink.context, bytes, control));
+    }
+    pub fn closeControlled(self: *Output, sink: http.StreamSink, control: *const http.RequestControl) !void {
+        if (self.cause) |err| return err;
+        try self.result((sink.close_controlled orelse return error.StreamingUnavailable)(sink.context, control));
     }
 };
 

@@ -525,6 +525,11 @@ export default Client;
 
 export { ChatGPTConnectionError } from "./client.js";
 export * from "./models.js";
+export {
+  ClientCapacityError,
+  RequestAdmission,
+  type RequestAdmissionOptions,
+} from "./request-admission.js";
 export type {
   CatalogTablespaceBindingRequest,
   ChatGPTAccount,

@@ -13,6 +13,7 @@ import {
 } from "./index-maintenance.js";
 import { InferenceCapacityError, isTransientCapacityError } from "./inference-client.js";
 import type { paths } from "./public-api.js";
+import { RequestAdmission } from "./request-admission.js";
 import { parseSSEFrames } from "./sse.js";
 import type {
   AntflyAuth,
@@ -544,7 +545,7 @@ function parseJSON<T>(text: string): T {
 /** Resolves after `ms`, or rejects immediately/on abort when `signal` fires. */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) {
-    return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+    return Promise.reject(signal.reason);
   }
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -553,7 +554,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     }, ms);
     const onAbort = () => {
       clearTimeout(timer);
-      reject(signal?.reason instanceof Error ? signal.reason : new Error("aborted"));
+      reject(signal?.reason);
     };
     signal?.addEventListener("abort", onAbort, { once: true });
   });
@@ -562,13 +563,23 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 export class AntflyClient {
   private client: Client<paths>;
   private config: AntflyConfig;
+  private readonly admission: RequestAdmission;
 
   constructor(config: AntflyConfig) {
+    this.admission =
+      config.requestAdmission instanceof RequestAdmission
+        ? config.requestAdmission
+        : new RequestAdmission(config.requestAdmission);
     this.config = {
       ...config,
       baseUrl: normalizeBaseUrl(config.baseUrl),
     };
     this.client = this.buildClient();
+  }
+
+  /** Close the admission owner, waking queued work. Active bodies retain their slots. */
+  close(): void {
+    this.admission.close();
   }
 
   /** Typed access to every generated endpoint, including system catalog lifecycle routes. */
@@ -601,6 +612,7 @@ export class AntflyClient {
     return createClient<paths>({
       baseUrl: normalizeBaseUrl(this.config.baseUrl),
       headers,
+      fetch: this.admission.fetch,
       bodySerializer: (body) => {
         if (typeof body === "string") {
           return body;
@@ -672,7 +684,7 @@ export class AntflyClient {
     body?: unknown,
     signal?: AbortSignal
   ): Promise<T> {
-    const response = await fetch(this.url(path), {
+    const response = await this.admission.fetch(this.url(path), {
       method,
       headers: this.requestHeaders(),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -724,7 +736,7 @@ export class AntflyClient {
       }
     }
 
-    const response = await fetch(this.url(path), {
+    const response = await this.admission.fetch(this.url(path), {
       method,
       headers: this.requestHeaders(extraHeaders),
       body: encodedBody,
@@ -1113,7 +1125,7 @@ export class AntflyClient {
     Object.assign(headers, this.config.headers);
 
     const abortController = new AbortController();
-    const response = await fetch(
+    const response = await this.admission.fetch(
       `${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/retrieval`,
       {
         method: "POST",
@@ -1311,12 +1323,15 @@ export class AntflyClient {
           once: true,
         });
     }
-    const response = await fetch(`${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/research`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(request),
-      signal: abortController.signal,
-    });
+    const response = await this.admission.fetch(
+      `${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/research`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(request),
+        signal: abortController.signal,
+      }
+    );
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -1483,9 +1498,13 @@ export class AntflyClient {
    * Start a durable research job. The job advances one bounded phase at a
    * time via advanceResearchJob and survives server restarts.
    */
-  async startResearchJob(request: ResearchJobStartRequest): Promise<ResearchJob> {
+  async startResearchJob(
+    request: ResearchJobStartRequest,
+    options?: Pick<RunResearchJobOptions, "signal">
+  ): Promise<ResearchJob> {
     const { data, error } = await this.client.POST("/db/v1/agents/research/jobs", {
       body: request,
+      signal: options?.signal,
     });
     if (error) {
       throw new Error(`Failed to start research job: ${apiErrorMessage(error)}`);
@@ -1495,9 +1514,13 @@ export class AntflyClient {
   }
 
   /** Get a durable research job's current state and latest checkpointed result. */
-  async getResearchJob(jobId: string): Promise<ResearchJob> {
+  async getResearchJob(
+    jobId: string,
+    options?: Pick<RunResearchJobOptions, "signal">
+  ): Promise<ResearchJob> {
     const { data, error } = await this.client.GET("/db/v1/agents/research/jobs/{jobId}", {
       params: { path: { jobId } },
+      signal: options?.signal,
     });
     if (error) {
       throw new Error(`Failed to get research job: ${apiErrorMessage(error)}`);
@@ -1513,13 +1536,15 @@ export class AntflyClient {
    */
   async advanceResearchJob(
     jobId: string,
-    request?: ResearchJobAdvanceRequest
+    request?: ResearchJobAdvanceRequest,
+    options?: Pick<RunResearchJobOptions, "signal">
   ): Promise<ResearchJob> {
     const { data, error, response } = await this.client.POST(
       "/db/v1/agents/research/jobs/{jobId}/advance",
       {
         params: { path: { jobId } },
         body: request,
+        signal: options?.signal,
       }
     );
     if (error) {
@@ -1565,22 +1590,19 @@ export class AntflyClient {
         ? undefined
         : { max_phases: options.maxPhasesPerAdvance };
 
-    let job = await this.startResearchJob({ request });
+    options?.signal?.throwIfAborted();
+    let job = await this.startResearchJob({ request }, options);
     options?.onJob?.(job);
 
     while (job.state === "queued" || job.state === "running") {
-      if (options?.signal?.aborted) {
-        throw options.signal.reason instanceof Error
-          ? options.signal.reason
-          : new Error("runResearchJob aborted");
-      }
+      options?.signal?.throwIfAborted();
       try {
-        job = await this.advanceResearchJob(job.job_id, advanceRequest);
+        job = await this.advanceResearchJob(job.job_id, advanceRequest, options);
       } catch (error) {
         if (error instanceof ResearchJobAdvanceConflictError) {
           const delayMs = (error.retryAfterSeconds ?? 1) * 1000;
           await sleep(delayMs, options?.signal);
-          job = await this.getResearchJob(job.job_id);
+          job = await this.getResearchJob(job.job_id, options);
           options?.onJob?.(job);
           continue;
         }
@@ -1956,7 +1978,7 @@ export class AntflyClient {
         request: RelationalRowQueryRequest,
         signal?: AbortSignal
       ): Promise<string> => {
-        const response = await fetch(
+        const response = await this.admission.fetch(
           this.url(`/db/v1/tables/${encodeURIComponent(tableName)}/rows/query`),
           {
             method: "POST",
@@ -2351,18 +2373,22 @@ export class AntflyClient {
     /**
      * Scan keys in a table within a key range
      * Returns documents as an async iterable, streaming results as NDJSON.
+     * An optional signal cancels queue admission and pending response reads.
      * @param tableName - Name of the table
      * @param request - Scan request with optional key range, field projection, and filtering
      * @returns AsyncGenerator yielding documents with their keys
      */
     scan: (
       tableName: string,
-      request?: ScanKeysRequest
+      request?: ScanKeysRequest,
+      options?: QueryExecutionOptions
     ): AsyncGenerator<{ _id: string; [key: string]: unknown }> => {
       const config = this.config;
+      const fetchRequest = this.admission.fetch;
       const authHeader = this.getAuthHeader();
 
       async function* scanGenerator(): AsyncGenerator<{ _id: string; [key: string]: unknown }> {
+        options?.signal?.throwIfAborted();
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
           Accept: "application/x-ndjson",
@@ -2376,12 +2402,13 @@ export class AntflyClient {
         // Merge with any additional headers
         Object.assign(headers, config.headers);
 
-        const response = await fetch(
+        const response = await fetchRequest(
           `${normalizeBaseUrl(config.baseUrl)}/db/v1/tables/${tableName}/documents`,
           {
             method: "POST",
             headers,
             body: JSON.stringify(request || {}),
+            signal: options?.signal,
           }
         );
 
@@ -2398,24 +2425,38 @@ export class AntflyClient {
         const decoder = new TextDecoder();
         let buffer = "";
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+        try {
+          while (true) {
+            options?.signal?.throwIfAborted();
+            const { done, value } = await reader.read();
+            options?.signal?.throwIfAborted();
+            if (done) break;
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
 
-          for (const line of lines) {
-            if (line.trim()) {
-              yield JSON.parse(line);
+            for (const line of lines) {
+              if (line.trim()) {
+                options?.signal?.throwIfAborted();
+                yield JSON.parse(line);
+              }
             }
           }
-        }
 
-        // Handle any remaining content in buffer
-        if (buffer.trim()) {
-          yield JSON.parse(buffer);
+          // Handle any remaining content in buffer
+          if (buffer.trim()) {
+            options?.signal?.throwIfAborted();
+            yield JSON.parse(buffer);
+          }
+        } finally {
+          try {
+            await reader.cancel();
+          } catch {
+            // Preserve the original parse/read error when cancellation fails.
+          } finally {
+            reader.releaseLock();
+          }
         }
       }
 
@@ -2431,10 +2472,11 @@ export class AntflyClient {
      */
     scanAll: async (
       tableName: string,
-      request?: ScanKeysRequest
+      request?: ScanKeysRequest,
+      options?: QueryExecutionOptions
     ): Promise<Array<{ _id: string; [key: string]: unknown }>> => {
       const results: Array<{ _id: string; [key: string]: unknown }> = [];
-      for await (const doc of this.tables.scan(tableName, request)) {
+      for await (const doc of this.tables.scan(tableName, request, options)) {
         results.push(doc);
       }
       return results;

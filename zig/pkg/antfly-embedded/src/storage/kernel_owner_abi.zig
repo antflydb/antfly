@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 90;
+pub const abi_version: u32 = 101;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -86,6 +86,15 @@ pub const WalOpenRequest = extern struct {
     _reserved0: [5]u8 = @splat(0),
 };
 
+/// Additive open entry point. The callback descriptor is copied by the owner;
+/// its allocation context must remain alive until WAL close returns.
+pub const WalOpenAllocatorRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    options: ?*const WalOpenRequest = null,
+    allocator: ?*const @import("runtime_memory_abi").Allocator = null,
+};
+
 pub const WalOpenResult = extern struct {
     handle: ?*anyopaque = null,
     next_lsn: u64 = 1,
@@ -99,10 +108,77 @@ pub const WalAppendRequest = extern struct {
     data: BorrowedBytes = .{},
 };
 
+/// Volatile, in-process identity/position of one open WAL. Never persist this
+/// token or interpret its identity words as pointers.
+pub const WalRecoveryPosition = extern struct {
+    origin: u64 = 0,
+    owner: u64 = 0,
+    revision: u64 = 0,
+    next_lsn: u64 = 0,
+};
+
+pub const WalRecoveryPositionRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    port: ?*const anyopaque = null,
+};
+
+pub const WalRecoveryPositionResult = extern struct {
+    position: WalRecoveryPosition = .{},
+    busy: u8 = 0,
+    _reserved: [7]u8 = @splat(0),
+};
+
+pub const WalRecoveryAppendRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    expected: WalRecoveryPosition = .{},
+    data: BorrowedBytes = .{},
+    port: ?*const anyopaque = null,
+};
+
+pub const WalRecoveryAppendResult = extern struct {
+    // 0 = changed, 1 = busy, 2 = appended. Only appended carries an LSN.
+    outcome: u8 = 0,
+    _reserved: [7]u8 = @splat(0),
+    assigned_lsn: u64 = 0,
+    next_lsn: u64 = 0,
+};
+
+pub extern fn antfly_storage_wal_recovery_position(
+    wal: ?*anyopaque,
+    request: *const WalRecoveryPositionRequest,
+    out_result: *WalRecoveryPositionResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_append_if_recovery_position(
+    wal: ?*anyopaque,
+    request: *const WalRecoveryAppendRequest,
+    out_result: *WalRecoveryAppendResult,
+) callconv(.c) Status;
+
 pub const WalAppendResult = extern struct {
     assigned_lsn: u64 = 0,
     next_lsn: u64 = 1,
 };
+
+pub const WalPrepareAppendRequest = extern struct {
+    version: u32 = abi_version,
+    prefix_len: u32 = 0,
+    tail: BorrowedBytes = .{},
+    port: ?*const anyopaque = null,
+};
+pub const WalPrepareAppendResult = extern struct {
+    handle: ?*anyopaque = null,
+};
+pub const WalPreparedPublishRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    prefix: BorrowedBytes = .{},
+};
+pub extern fn antfly_storage_wal_prepare_append(wal: ?*anyopaque, request: *const WalPrepareAppendRequest, output: *WalPrepareAppendResult) callconv(.c) Status;
+pub extern fn antfly_storage_wal_prepared_publish(prepared: ?*anyopaque, request: *const WalPreparedPublishRequest, output: *WalAppendResult) callconv(.c) Status;
+pub extern fn antfly_storage_wal_prepared_destroy(prepared: ?*anyopaque) callconv(.c) void;
 
 pub const WalIdempotentAppendRequest = extern struct {
     version: u32 = abi_version,
@@ -130,6 +206,66 @@ pub const WalScanRequest = extern struct {
     from_lsn: u64 = 0,
     max_entries: u64 = 0,
     max_bytes: u64 = 0,
+};
+
+/// Reply allocation is a synchronous borrow. Returned bytes belong to this
+/// allocator and must be freed by its origin, never the legacy C destructor.
+pub const WalReadAllocatorRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    lsn: u64 = 0,
+    port: ?*const anyopaque = null,
+    allocator: ?*const @import("runtime_memory_abi").Allocator = null,
+};
+
+/// Detached operation metadata and results use this caller root. Its context
+/// must outlive read_destroy, independently of the WAL/open allocator. Ports
+/// and output windows are synchronous borrows only. Additive owner ABI 100.
+pub const WalOwnedReadBeginRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    lsn: u64 = 0,
+    allocator: ?*const @import("runtime_memory_abi").Allocator = null,
+    port: ?*const anyopaque = null,
+};
+pub const WalOwnedReadBeginResult = extern struct {
+    handle: ?*anyopaque = null,
+};
+pub const WalOwnedReadStepRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    quantum: u64 = 0,
+    port: ?*const anyopaque = null,
+};
+pub const WalOwnedReadStepResult = extern struct {
+    ready: u8 = 0,
+    _reserved: [7]u8 = @splat(0),
+};
+pub const WalOwnedReadChunkRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    offset: u64 = 0,
+    output: OwnedBytes = .{},
+    port: ?*const anyopaque = null,
+};
+pub const WalOwnedReadChunkResult = extern struct {
+    len: u64 = 0,
+    done: u8 = 0,
+    _reserved: [7]u8 = @splat(0),
+};
+
+pub extern fn antfly_storage_wal_owned_read_begin(wal: ?*anyopaque, request: *const WalOwnedReadBeginRequest, output: *WalOwnedReadBeginResult) callconv(.c) Status;
+pub extern fn antfly_storage_wal_owned_read_step(read: ?*anyopaque, request: *const WalOwnedReadStepRequest, output: *WalOwnedReadStepResult) callconv(.c) Status;
+pub extern fn antfly_storage_wal_owned_read_chunk(read: ?*anyopaque, request: *const WalOwnedReadChunkRequest, output: *WalOwnedReadChunkResult) callconv(.c) Status;
+/// Requires no execution grant. Join caller use before destroying its handle;
+/// concurrent WAL close is supported, including destruction after WAL close.
+pub extern fn antfly_storage_wal_owned_read_destroy(read: ?*anyopaque) callconv(.c) void;
+
+pub const WalScanAllocatorRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    options: ?*const WalScanRequest = null,
+    allocator: ?*const @import("runtime_memory_abi").Allocator = null,
 };
 
 pub const WalScanResult = extern struct {
@@ -2021,6 +2157,15 @@ pub extern fn antfly_storage_owner_batch_json(
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
+/// Original synchronous pre-decision authority. The port is checked and never
+/// retained; the existing batch request layout remains unchanged.
+pub extern fn antfly_storage_owner_batch_json_with_admission(
+    owner: ?*anyopaque,
+    request: *const BatchJsonOperationRequest,
+    admission_port: *const anyopaque,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_replicated_batch_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
@@ -2296,6 +2441,23 @@ pub extern fn antfly_storage_wal_open(
     out_result: *WalOpenResult,
 ) callconv(.c) Status;
 
+pub extern fn antfly_storage_wal_open_with_allocator(
+    request: *const WalOpenAllocatorRequest,
+    out_result: *WalOpenResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_read_with_allocator(
+    wal: ?*anyopaque,
+    request: *const WalReadAllocatorRequest,
+    out_result: *WalReadResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_iterate_with_allocator(
+    wal: ?*anyopaque,
+    request: *const WalScanAllocatorRequest,
+    out_result: *WalScanResult,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_wal_close(wal: ?*anyopaque) callconv(.c) void;
 
 pub extern fn antfly_storage_wal_append(
@@ -2332,6 +2494,21 @@ pub extern fn antfly_storage_wal_read(
     out_result: *WalReadResult,
 ) callconv(.c) Status;
 
+/// Additive controlled read operation; old position/read layouts are unchanged.
+pub const WalReadAdmissionRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    lsn: u64 = 0,
+    /// Checked synchronous common.read_admission.Port; never retained.
+    port: ?*const anyopaque = null,
+};
+
+pub extern fn antfly_storage_wal_read_with_admission(
+    wal: ?*anyopaque,
+    request: *const WalReadAdmissionRequest,
+    out_result: *WalReadResult,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_wal_stats_snapshot(
     wal: ?*anyopaque,
     out_stats: *WalStats,
@@ -2339,6 +2516,19 @@ pub extern fn antfly_storage_wal_stats_snapshot(
 
 pub extern fn antfly_storage_wal_last_lsn(
     wal: ?*anyopaque,
+    out_last_lsn: *u64,
+) callconv(.c) Status;
+
+pub const WalSnapshotAdmissionRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    /// Checked synchronous common.read_admission.Port; never retained.
+    port: ?*const anyopaque = null,
+};
+
+pub extern fn antfly_storage_wal_last_lsn_with_admission(
+    wal: ?*anyopaque,
+    request: *const WalSnapshotAdmissionRequest,
     out_last_lsn: *u64,
 ) callconv(.c) Status;
 

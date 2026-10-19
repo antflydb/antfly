@@ -1046,16 +1046,16 @@ pub const FuzzyFilter = struct {
         return fuzzyPrefixMatches(self.term, term, self.prefix_len);
     }
 
-    fn executeInternal(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+    fn executeInternal(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
         const original_stats = if (stats) |value| value.* else null;
-        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+        return self.executeAttempt(alloc, seg, collect_stats, stats, authority) catch |err| switch (err) {
             error.PatternProgramBudgetExceeded => blk: {
                 // The failed attempt has released its reader, iterator and
                 // execution lease before the private traversal starts.
                 var fallback = self;
                 fallback.control.pattern_programs = null;
                 if (stats) |value| value.* = original_stats.?;
-                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats, authority) catch |failure| switch (failure) {
                     error.PatternProgramBudgetExceeded => unreachable,
                     else => return failure,
                 };
@@ -1156,16 +1156,16 @@ pub const RegexpFilter = struct {
         return true;
     }
 
-    fn executeInternal(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+    fn executeInternal(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
         const original_stats = if (stats) |value| value.* else null;
-        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+        return self.executeAttempt(alloc, seg, collect_stats, stats, authority) catch |err| switch (err) {
             error.PatternProgramBudgetExceeded => blk: {
                 // The failed attempt has released its reader, iterator and
                 // execution lease before the private traversal starts.
                 var fallback = self;
                 fallback.control.pattern_programs = null;
                 if (stats) |value| value.* = original_stats.?;
-                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats, authority) catch |failure| switch (failure) {
                     error.PatternProgramBudgetExceeded => unreachable,
                     else => return failure,
                 };

@@ -398,3 +398,7 @@ test "embeddinggemma2 declarations compile" {
     _ = @import("architectures/embedding_gemma2_media_weights.zig");
     _ = server;
 }
+
+test "runnable execution HTTP native deadline discovers server contracts" {
+    std.testing.refAllDecls(server);
+}

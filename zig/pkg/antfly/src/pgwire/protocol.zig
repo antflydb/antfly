@@ -164,7 +164,10 @@ pub const Session = struct {
     cancel_key: i32 = 0,
     cancel_requested: std.atomic.Value(bool) = .init(false),
     executing: std.atomic.Value(bool) = .init(false),
-    // Listener watchdog uses the same owner clock as backend requests.
+    // Hard transport deadline, read by the listener watchdog. A shorter
+    // client SQL deadline must leave the socket available for its error reply.
+    // Both use the owner clock; only the session task reads the SQL deadline.
+    statement_deadline_ns: ?i64 = null,
     deadline_ns: std.atomic.Value(i64) = .init(0),
     deadline_changed: std.Io.Event = .unset,
     /// Listener-owned deadline service; borrowed until joined session cleanup.
@@ -307,9 +310,21 @@ pub const Session = struct {
 
     pub fn setDeadline(self: *Session, ms: u32) void {
         const now: i64 = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds);
+        self.statement_deadline_ns = null;
         self.deadline_ns.store(now +| @as(i64, ms) * std.time.ns_per_ms, .release);
         self.deadline_changed.set(self.io);
         if (self.deadline_wakeup) |event| event.set(self.io);
+    }
+
+    fn setStatementDeadline(self: *Session) void {
+        // Keep the configured hard cutoff independent of a client hint. This
+        // does not extend backend authority: every request still gets the
+        // original, earlier SQL deadline, including its admission wait.
+        self.setDeadline(self.limits.statement_timeout_ms);
+        const hard = self.deadline_ns.load(.acquire);
+        const timeout = self.statement_timeout orelse self.limits.statement_timeout_ms;
+        const effective = if (timeout == 0) self.limits.statement_timeout_ms else @min(timeout, self.limits.statement_timeout_ms);
+        self.statement_deadline_ns = hard - @as(i64, self.limits.statement_timeout_ms - effective) * std.time.ns_per_ms;
     }
 
     pub fn run(self: *Session) !void {
@@ -334,8 +349,7 @@ pub const Session = struct {
                 return;
             }
             if (self.skip_until_sync and tag != 'S') continue;
-            const timeout = self.statement_timeout orelse self.limits.statement_timeout_ms;
-            self.setDeadline(if (timeout == 0) self.limits.statement_timeout_ms else @min(timeout, self.limits.statement_timeout_ms));
+            self.setStatementDeadline();
             self.diagnostic = .{};
             self.mutation_ack_pending = false;
             self.dispatch(tag, payload) catch |err| {
@@ -518,7 +532,7 @@ pub const Session = struct {
             .setting_overlay = if (self.catalog_settings) |*state| state.values() else &.{},
             .limit = self.limits.result_rows,
             .io = self.io,
-            .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = self.deadline_ns.load(.acquire) } },
+            .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = self.statement_deadline_ns orelse self.deadline_ns.load(.acquire) } },
             .cancel_requested = &self.cancel_requested,
             .diagnostics = &self.diagnostic,
         };
@@ -986,7 +1000,7 @@ pub const Session = struct {
                     defer result.deinit();
                     if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
                     if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                    try self.dataResult(result, &.{});
+                    try self.dataResult(result, &.{}, statement);
                     try self.complete(result);
                     self.finishDiscardAll();
                 }
@@ -1199,7 +1213,7 @@ pub const Session = struct {
                 }
                 const count = if (requested == 0) result.rowCount() - portal.offset else @min(@as(usize, @intCast(requested)), result.rowCount() - portal.offset);
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                try self.dataResult(try result.view(portal.offset, count), portal.formats);
+                try self.dataResult(try result.view(portal.offset, count), portal.formats, portal.statement);
                 portal.offset += count;
                 if (portal.offset < result.rowCount()) try self.message('s', "") else try self.complete(result);
                 if (result.ddl_receipt_json != null and std.mem.eql(u8, result.command_tag, "DDL PENDING")) {
@@ -1298,7 +1312,7 @@ pub const Session = struct {
                 defer result.deinit();
                 if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                try self.dataResult(result, &.{});
+                try self.dataResult(result, &.{}, prepared.statement);
                 try self.complete(result);
                 return true;
             },
@@ -1451,7 +1465,7 @@ pub const Session = struct {
                 if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
                 if (page.result.rowCount() == 0 and !page.exhausted) return error.InvalidResult;
                 if (page.result.sql_nulls) |flags| if (flags.len != page.result.rowCount()) return error.InvalidResult;
-                if (!fetch.move) try self.dataResult(page.result, &.{});
+                if (!fetch.move) try self.dataResult(page.result, &.{}, cursor.statement);
                 cursor.fetched += page.result.rowCount();
                 remaining -= page.result.rowCount();
                 cursor.exhausted = page.exhausted;
@@ -1500,7 +1514,21 @@ pub const Session = struct {
                 defer page.result.deinit();
                 if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
                 if (page.result.rowCount() == 0 and !page.exhausted) return error.InvalidResult;
-                spool.append(page.result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
+                const RetainPage = struct {
+                    spool: *Spool,
+                    result: backend.Result,
+                    max_rows: usize,
+                    fn run(raw: *anyopaque, control: ?backend.ReadControl) !void {
+                        const work: *@This() = @ptrCast(@alignCast(raw));
+                        try work.spool.appendControlled(work.result, work.max_rows, control);
+                    }
+                };
+                var work: RetainPage = .{ .spool = spool, .result = page.result, .max_rows = self.limits.cursor_rows };
+                // The stream still owns this immutable page. Retire a separate
+                // consumer execution before advancing its lease or committing.
+                if (self.source.vtable.deliver_row) |deliver| {
+                    deliver(self.source.context, self.identity orelse return error.AuthenticationFailed, req, .{ .context = &work, .run = RetainPage.run }) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
+                } else RetainPage.run(&work, null) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
                 cursor.exhausted = page.exhausted;
             }
             if (cursor.exhausted) stream.detach.?(stream.context);
@@ -1532,8 +1560,6 @@ pub const Session = struct {
         var remaining: u64 = if (single) 1 else fetch.count;
         if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
         var emitted: u64 = 0;
-        var row_bytes = std.Io.Writer.Allocating.init(self.alloc);
-        defer row_bytes.deinit();
         while (remaining != 0) : (remaining -= 1) {
             try req.check();
             if (target > 0 and @as(u64, @intCast(target)) > spool.row_count and !cursor.exhausted) {
@@ -1548,12 +1574,14 @@ pub const Session = struct {
                 try self.validateSpooledCursor(cursor, validation.allocator(), req);
             }
             if (!fetch.move) {
-                row_bytes.writer.end = 0;
-                try row_bytes.writer.writeInt(u16, @intCast(cursor.description.columns.len), .big);
-                for (cursor.description.columns, 0..) |column, index| try self.appendDataCell(&row_bytes, self.alloc, column, 0, try spool.cell(@intCast(target - 1), index), cursor.description.columns.len - index);
-                if (row_bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
-                try self.message('D', row_bytes.written());
-                self.trimRowBuffer(&row_bytes);
+                const View = struct {
+                    fn cell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) !backend.Cell {
+                        const source: *Spool = @ptrCast(@alignCast(raw));
+                        return source.cell(row, column);
+                    }
+                };
+                const view: backend.Result = .{ .columns = cursor.description.columns, .command_tag = "FETCH", .cells = .{ .context = spool, .begin = @intCast(target - 1), .count = 1, .width = cursor.description.columns.len, .read = View.cell } };
+                try self.dataResult(view, &.{}, cursor.statement);
             }
             emitted += 1;
             if (emitted % 256 == 0) try self.writer.flush();
@@ -1696,7 +1724,7 @@ pub const Session = struct {
                 return error.InvalidResult;
             if (!page.exhausted and result.rowCount() == 0) return error.InvalidResult;
             if (result.sql_nulls) |flags| if (flags.len != result.rowCount()) return error.InvalidResult;
-            try self.dataResult(result, portal.formats);
+            try self.dataResult(result, portal.formats, portal.statement);
             remaining -= result.rowCount();
             portal.offset += result.rowCount();
             portal.stream_complete = page.exhausted;
@@ -1874,6 +1902,9 @@ pub const Session = struct {
         if (bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
     }
     fn appendDataCell(self: *Session, bytes: *std.Io.Writer.Allocating, scratch: std.mem.Allocator, column: backend.Column, format: u16, value: backend.Cell, remaining_columns: usize) !void {
+        return self.appendDataCellControlled(bytes, scratch, column, format, value, remaining_columns, null);
+    }
+    fn appendDataCellControlled(self: *Session, bytes: *std.Io.Writer.Allocating, scratch: std.mem.Allocator, column: backend.Column, format: u16, value: backend.Cell, remaining_columns: usize, control: ?backend.ReadControl) !void {
         const payload_limit = self.limits.frame_bytes -| 4;
         const remaining_headers = std.math.mul(usize, remaining_columns, 4) catch return error.ProgramLimitExceeded;
         if (bytes.written().len > payload_limit or remaining_headers > payload_limit - bytes.written().len) return error.ProgramLimitExceeded;
@@ -1885,27 +1916,50 @@ pub const Session = struct {
         }
         const position = bytes.written().len;
         try bytes.writer.writeInt(i32, 0, .big);
-        try values.encodeCellInto(scratch, &bytes.writer, column, format, value, cell_limit);
+        try values.encodeCellIntoControlled(scratch, &bytes.writer, column, format, value, cell_limit, control);
         const length = bytes.written().len - position - 4;
         if (length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
         std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
     }
-    fn dataResult(self: *Session, result: backend.Result, formats: []const u16) !void {
-        const cells = result.cells orelse return self.dataRows(result.columns, formats, result.rows, result.sql_nulls);
-        if (cells.width != result.columns.len or result.rows.len != 0 or result.sql_nulls != null) return error.InvalidResult;
+    fn dataResult(self: *Session, result: backend.Result, formats: []const u16, statement: []const u8) !void {
+        if (result.cells) |cells| {
+            if (cells.width != result.columns.len or result.rows.len != 0 or result.sql_nulls != null) return error.InvalidResult;
+        } else if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
         var bytes = std.Io.Writer.Allocating.init(self.alloc);
         defer bytes.deinit();
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
-        for (0..cells.count) |row| {
+        const Row = struct {
+            session: *Session,
+            result: backend.Result,
+            formats: []const u16,
+            row: usize,
+            bytes: *std.Io.Writer.Allocating,
+            scratch: std.mem.Allocator,
+            fn encode(raw: *anyopaque, control: ?backend.ReadControl) !void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                const result_ = self_.result;
+                if (result_.cells == null) {
+                    if (result_.rows[self_.row].len != result_.columns.len) return error.InvalidResult;
+                    if (result_.sql_nulls) |flags| if (flags[self_.row].len != result_.columns.len) return error.InvalidResult;
+                }
+                try self_.bytes.writer.writeInt(u16, @intCast(result_.columns.len), .big);
+                for (result_.columns, 0..) |column, index| {
+                    const value = try result_.cellControlled(self_.scratch, self_.row, index, control);
+                    try self_.session.appendDataCellControlled(self_.bytes, self_.scratch, column, formatAt(self_.formats, index), value, result_.columns.len - index, control);
+                }
+                if (self_.bytes.written().len > self_.session.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
+            }
+        };
+        for (0..result.rowCount()) |row| {
             if (!scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = scratch.reset(.free_all);
             bytes.writer.end = 0;
-            try bytes.writer.writeInt(u16, @intCast(result.columns.len), .big);
-            for (result.columns, 0..) |column, index| {
-                const value = try result.cell(scratch.allocator(), row, index);
-                try self.appendDataCell(&bytes, scratch.allocator(), column, formatAt(formats, index), value, result.columns.len - index);
-            }
-            if (bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
+            var work: Row = .{ .session = self, .result = result, .formats = formats, .row = row, .bytes = &bytes, .scratch = scratch.allocator() };
+            // Durable acknowledgments keep their existing completion path.
+            // Read delivery retires its consumer before any socket write.
+            if (result.mutation_outcome == null and self.source.vtable.deliver_row != null) {
+                try self.source.vtable.deliver_row.?(self.source.context, self.identity orelse return error.AuthenticationFailed, self.request(statement, &.{}, &.{}), .{ .context = &work, .run = Row.encode });
+            } else try Row.encode(&work, null);
             try self.message('D', bytes.written());
             self.trimRowBuffer(&bytes);
         }
@@ -2427,4 +2481,108 @@ test "pgwire stream request snapshot allocation failures preserve parent account
         .cancel_requested = &cancel,
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{request});
+}
+
+test "pgwire client statement deadline preserves hard transport cutoff and cannot extend authority" {
+    var session: Session = .{
+        .alloc = std.testing.allocator,
+        .io = std.testing.io,
+        .source = undefined,
+        .reader = undefined,
+        .writer = undefined,
+        .limits = .{ .statement_timeout_ms = 5000 },
+    };
+    session.statement_timeout = 100;
+    session.setStatementDeadline();
+    const hard = session.deadline_ns.load(.acquire);
+    try std.testing.expectEqual(hard - 4900 * std.time.ns_per_ms, session.statement_deadline_ns.?);
+    try std.testing.expectEqual(session.statement_deadline_ns.?, session.request("SELECT 1", &.{}, &.{}).deadline.raw.nanoseconds);
+    // Zero disables only the client hint; larger hints cannot exceed the cap.
+    for ([_]?u32{ null, 0, 5000, 6000, std.math.maxInt(u32) }) |timeout| {
+        session.statement_timeout = timeout;
+        session.setStatementDeadline();
+        try std.testing.expectEqual(session.deadline_ns.load(.acquire), session.statement_deadline_ns.?);
+    }
+    // Idle/startup deadlines do not retain the previous statement's hint.
+    session.setDeadline(60000);
+    try std.testing.expectEqual(@as(?i64, null), session.statement_deadline_ns);
+}
+
+test "pgwire consumer row delivery joins before socket output and cancels before partial frame publication" {
+    const Fixture = struct {
+        active: bool = false,
+        deliveries: usize = 0,
+        polls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        text: []const u8,
+        fn poll(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.active);
+            self.polls += 1;
+            if (self.polls >= self.stop) return error.OriginalDeliveryCanceled;
+        }
+        fn delivery(raw: *anyopaque, _: backend.Identity, request_: backend.Request, work: backend.DeliveryWork) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualStrings("SELECT body", request_.statement);
+            self.deliveries += 1;
+            self.active = true;
+            defer self.active = false;
+            try work.run(work.context, .{ .ptr = self, .checkpoint = poll });
+        }
+        fn oldCell(_: *anyopaque, _: std.mem.Allocator, _: usize, _: usize) !backend.Cell {
+            return error.UncontrolledCellRead;
+        }
+        fn cell(raw: *anyopaque, _: std.mem.Allocator, _: usize, _: usize, control: ?backend.ReadControl) !backend.Cell {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const owner = control orelse return error.MissingConsumer;
+            try owner.checkpoint(owner.ptr);
+            return .{ .value = .{ .string = self.text }, .sql_null = false };
+        }
+        fn auth(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !backend.Identity {
+            return error.UnexpectedAuthentication;
+        }
+        fn describe(_: *anyopaque, _: std.mem.Allocator, _: backend.Identity, _: backend.Request) !backend.Description {
+            return error.UnexpectedDescribe;
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: backend.Identity, _: backend.Request) !backend.Result {
+            return error.UnexpectedExecute;
+        }
+        fn release(_: *anyopaque, _: std.mem.Allocator) void {}
+        fn disconnect(_: *anyopaque, _: backend.Identity, _: ?[]const u8) void {}
+    };
+    const Sink = struct {
+        fixture: *Fixture,
+        output: std.Io.Writer.Allocating,
+        writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{}, .end = 0 },
+        fn drain(raw: *std.Io.Writer, bytes: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", raw));
+            if (self.fixture.active) return error.WriteFailed;
+            return self.output.writer.writeSplat(bytes, splat);
+        }
+    };
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, 32 * 1024);
+    defer a.free(text);
+    @memset(text, 'x');
+    var fixture: Fixture = .{ .text = text };
+    var sink: Sink = .{ .fixture = &fixture, .output = .init(a) };
+    defer sink.output.deinit();
+    var input = std.Io.Reader.fixed("");
+    var session: Session = .{ .alloc = a, .io = std.testing.io, .reader = &input, .writer = &sink.writer, .source = .{ .context = &fixture, .vtable = &.{ .authenticate = Fixture.auth, .describe = Fixture.describe, .execute = Fixture.execute, .disconnect = Fixture.disconnect, .deliver_row = Fixture.delivery } }, .identity = .{ .context = &fixture, .release = Fixture.release } };
+    defer session.deinit();
+    const result: backend.Result = .{ .columns = &.{.{ .name = "body", .type = .string }}, .command_tag = "SELECT", .cells = .{ .context = &fixture, .count = 1, .width = 1, .read = Fixture.oldCell, .read_controlled = Fixture.cell } };
+    try session.dataResult(result, &.{}, "SELECT body");
+    try std.testing.expectEqual(@as(u8, 'D'), sink.output.written()[0]);
+    try std.testing.expect(fixture.polls > 8 and !fixture.active);
+    sink.output.writer.end = 0;
+    fixture.polls = 0;
+    fixture.stop = 8;
+    try std.testing.expectError(error.OriginalDeliveryCanceled, session.dataResult(result, &.{}, "SELECT body"));
+    try std.testing.expectEqual(@as(usize, 0), sink.output.written().len);
+    try std.testing.expect(!fixture.active);
+    // Existing durable completion has no fresh fallible delivery admission.
+    const committed: backend.Result = .{ .columns = result.columns, .rows = &.{&.{.{ .string = "committed" }}}, .command_tag = "INSERT 0 1", .mutation_outcome = .committed };
+    const deliveries = fixture.deliveries;
+    try session.dataResult(committed, &.{}, "INSERT RETURNING body");
+    try std.testing.expectEqual(deliveries, fixture.deliveries);
 }

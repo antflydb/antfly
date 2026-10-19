@@ -1038,6 +1038,21 @@ pub const Reader = struct {
     }
     /// Prefetch failures are speculative. Required reads preserve their own
     /// errors; close cancels/joins before footer metadata or clients are freed.
+    /// Join every published prefetch and release its descriptor, preserving
+    /// the first worker failure after all borrowed readers have retired.
+    pub fn joinPrefetch(self: *Reader) !void {
+        const io = self.context.io orelse return;
+        var failure: ?anyerror = null;
+        for (&self.pending) |*pending| if (pending.*) |*active| {
+            active.task.await(io) catch |err| {
+                failure = failure orelse err;
+            };
+            self.prefetch_bytes -= active.bytes;
+            active.work.destroy();
+            pending.* = null;
+        };
+        if (failure) |err| return err;
+    }
     pub fn drain(self: *Reader, cancel: bool) void {
         self.drainExceptFooter(cancel, false);
     }

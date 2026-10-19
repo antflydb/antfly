@@ -48,6 +48,17 @@ pub fn participantIdForGroupScoped(alloc: std.mem.Allocator, table_name: []const
 }
 
 pub fn parseParticipantRef(participant: []const u8) ?ParticipantRef {
+    return parseParticipantRefInner(participant, null) catch unreachable;
+}
+
+pub fn parseParticipantRefWithAdmission(participant: []const u8, control: @import("../common/read_admission.zig").Port) !?ParticipantRef {
+    try control.checkpoint();
+    const result = try parseParticipantRefInner(participant, control);
+    try control.checkpoint();
+    return result;
+}
+
+fn parseParticipantRefInner(participant: []const u8, control: ?@import("../common/read_admission.zig").Port) !?ParticipantRef {
     if (std.mem.startsWith(u8, participant, table_participant_v3_prefix)) {
         const body = participant[table_participant_v3_prefix.len..];
         if (body.len < 9 or body[8] != ':') return null;
@@ -56,9 +67,9 @@ pub fn parseParticipantRef(participant: []const u8) ?ParticipantRef {
         const group_separator = 9 + @as(usize, table_name_len);
         if (group_separator >= body.len or body[group_separator] != ':') return null;
         const suffix = body[group_separator + 1 ..];
-        const group_end = std.mem.indexOfScalar(u8, suffix, ':') orelse return null;
+        const group_end = try participantIndexOf(suffix, ":", control) orelse return null;
         if (suffix.len - group_end != 1 + 32 + 1 + 64 or suffix[group_end + 33] != ':') return null;
-        const group_id = std.fmt.parseUnsigned(u64, suffix[0..group_end], 10) catch return null;
+        const group_id = (try participantGroupId(suffix[0..group_end], control)) orelse return null;
         if (group_id == 0) return null;
         var plan: [16]u8 = undefined;
         var scope: [32]u8 = undefined;
@@ -76,17 +87,46 @@ pub fn parseParticipantRef(participant: []const u8) ?ParticipantRef {
         if (body.len <= group_separator or body[group_separator] != ':') return null;
         const table_name = body[table_start..group_separator];
         if (table_name.len == 0) return null;
-        const group_id = std.fmt.parseUnsigned(u64, body[group_separator + 1 ..], 10) catch return null;
+        const group_id = (try participantGroupId(body[group_separator + 1 ..], control)) orelse return null;
         return .{ .table_name = table_name, .group_id = group_id };
     }
 
     if (!std.mem.startsWith(u8, participant, table_participant_prefix)) return null;
     const rest = participant[table_participant_prefix.len..];
-    const marker_index = std.mem.indexOf(u8, rest, group_participant_marker) orelse return null;
+    const marker_index = try participantIndexOf(rest, group_participant_marker, control) orelse return null;
     const table_name = rest[0..marker_index];
     if (table_name.len == 0) return null;
-    const group_id = std.fmt.parseUnsigned(u64, rest[marker_index + group_participant_marker.len ..], 10) catch return null;
+    const group_id = (try participantGroupId(rest[marker_index + group_participant_marker.len ..], control)) orelse return null;
     return .{ .table_name = table_name, .group_id = group_id };
+}
+
+fn participantIndexOf(text: []const u8, needle: []const u8, control: ?@import("../common/read_admission.zig").Port) !?usize {
+    if (control == null) return std.mem.indexOf(u8, text, needle);
+    var offset: usize = 0;
+    while (offset < text.len) {
+        try control.?.checkpoint();
+        const end = offset + @min(text.len - offset, 4096);
+        const overlap_end = end + @min(text.len - end, needle.len - 1);
+        if (std.mem.indexOf(u8, text[offset..overlap_end], needle)) |index| return offset + index;
+        offset = end;
+    }
+    return null;
+}
+
+// The existing decimal parseUnsigned grammar permits interior underscores and
+// arbitrarily many leading zeros. Retain it without an unbounded scalar loop.
+fn participantGroupId(text: []const u8, control: ?@import("../common/read_admission.zig").Port) !?u64 {
+    if (control == null) return std.fmt.parseUnsigned(u64, text, 10) catch null;
+    if (text.len == 0 or text[0] == '_' or text[text.len - 1] == '_') return null;
+    var value: u64 = 0;
+    for (text, 0..) |byte, index| {
+        if (index % 4096 == 0) try control.?.checkpoint();
+        if (byte == '_') continue;
+        if (byte < '0' or byte > '9') return null;
+        value = std.math.mul(u64, value, 10) catch return null;
+        value = std.math.add(u64, value, byte - '0') catch return null;
+    }
+    return value;
 }
 
 pub fn validateRestorePlan(scope: ?[32]u8, plan_id: ?[16]u8) !void {

@@ -42,12 +42,18 @@ pub const PhysicalStorageResources = struct {
     }
 
     pub fn initWithBudgets(alloc: std.mem.Allocator, budgets: memory_budget.SmartResourceBudgets) std.mem.Allocator.Error!PhysicalStorageResources {
+        return initWithBudgetsAndParent(alloc, budgets, null) catch return error.OutOfMemory;
+    }
+
+    /// Join the common process root before fixed cache metadata is admitted or
+    /// allocated. Moving this value does not move the borrowed parent context.
+    pub fn initWithBudgetsAndParent(alloc: std.mem.Allocator, budgets: memory_budget.SmartResourceBudgets, parent: ?resource_manager_mod.ResourceManager.MemoryParent) !PhysicalStorageResources {
         var manager = resource_manager_mod.ResourceManager.init(budgets.options);
         errdefer manager.deinit(alloc);
+        if (parent) |value| try manager.installMemoryParent(value);
         const metadata_bytes: u64 = @intCast(lsm_backend.Cache.fixedAllocationBytes());
-        // This private startup manager has no competing owner or parent yet.
-        // Admit the fixed local allocation before constructing any shard array.
-        var metadata = manager.reserveImmediate(.lsm_block_table_cache, metadata_bytes) catch return error.OutOfMemory;
+        // Admit through every ancestor before constructing any shard array.
+        var metadata = try manager.reserveImmediate(.lsm_block_table_cache, metadata_bytes);
         errdefer metadata.release();
         const cache = try lsm_backend.Cache.initFallible(alloc, budgets.lsm_cache_budget_bytes);
         return .{

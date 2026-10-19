@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const antfly = @import("cli_root.zig");
+const process_memory_budget = @import("antfly_local_sources").common_process_memory_budget;
 
 const serverless = antfly.serverless;
 const serverless_default_max_request_bytes: usize = antfly.public_api.http_server.public_api_max_request_body_bytes;
@@ -45,6 +46,7 @@ const CliConfig = struct {
     max_request_bytes: ?usize = null,
     max_connection_threads: ?u32 = null,
     graph_metric_max_parallelism: ?u8 = null,
+    process_memory_budget_mb: ?usize = null,
     role: ?[]const u8 = null,
     tick_ms: ?u64 = null,
     publish_enabled: ?bool = null,
@@ -156,7 +158,11 @@ pub fn runFromIterator(
         if (cfg.remote_content) |value| remote_content = value;
     }
 
+    const process_memory_resolution = try resolveProcessMemoryBudget(cli, init.environ_map);
     const bootstrap = serverless.BootstrapConfig{
+        .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
+        .max_request_memory_bytes = if (loaded_config) |*cfg| cfg.admission.max_request_memory_bytes else 256 << 20,
+        .max_retained_memory_bytes = if (loaded_config) |*cfg| cfg.admission.max_retained_memory_bytes else 256 << 20,
         .secret_store = if (secret_store) |*store| store else null,
         .node_config = if (loaded_config) |*cfg| cfg else null,
         .artifacts_uri = try resolveRequired(init.environ_map, cli.artifacts_uri, configured_uris.artifacts, "ANTFLY_SERVERLESS_ARTIFACTS_URI"),
@@ -188,7 +194,8 @@ pub fn runFromIterator(
         .enrichment_enabled = cli.enrichment_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_ENRICHMENT_ENABLED", true),
         .remote_content = if (remote_content) |*cfg| cfg else null,
         .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
-        .runnable_policy = if (loaded_config) |*cfg| cfg.admission.runnable else null,
+        .query_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else antfly.common.config.default_query_waiting,
+        .runnable_policy = if (loaded_config) |*cfg| cfg.admission.runnable else antfly.common.config.default_runnable_policy,
         .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
         .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
         .graph_metric_max_parallelism = cli.graph_metric_max_parallelism orelse try parseEnvIntOrDefault(
@@ -310,6 +317,10 @@ fn parseEnvOptionalInt(
     return std.fmt.parseInt(T, raw, 10) catch return invalidEnvironmentValue(env_name, raw, "an unsigned base-10 integer");
 }
 
+fn resolveProcessMemoryBudget(cli: CliConfig, env: *const std.process.Environ.Map) !process_memory_budget.EffectiveResolution {
+    return process_memory_budget.resolveSystemDetailed(cli.process_memory_budget_mb, env.get(process_memory_budget.canonical_env), env.get(process_memory_budget.inference_compat_env));
+}
+
 fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
     var cfg = CliConfig{};
     while (args.next()) |arg| {
@@ -395,6 +406,10 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--max-connection-threads")) {
             cfg.max_connection_threads = try std.fmt.parseInt(u32, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--process-memory-budget-mb")) {
+            cfg.process_memory_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--graph-metric-max-parallelism")) {
@@ -717,6 +732,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --health-port <port>
         \\  --max-request-bytes <bytes>
         \\  --max-connection-threads <count>
+        \\  --process-memory-budget-mb <MiB; 0 uses automatic detection>
         \\  --graph-metric-max-parallelism <1..16>
         \\  --role <combined|api|query|maintenance>
         \\  --tick-ms <milliseconds>
@@ -1023,3 +1039,36 @@ test "serverless main derives GCS lanes and configured credentials" {
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+test "serverless main process memory budget honors CLI and environment precedence" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put(process_memory_budget.canonical_env, "128");
+    try env.put(process_memory_budget.inference_compat_env, "256");
+    const inherited = try resolveProcessMemoryBudget(.{}, &env);
+    try std.testing.expectEqual(@as(usize, 128 << 20), inherited.configured_limit_bytes);
+    try std.testing.expectEqual(process_memory_budget.Source.canonical_environment, inherited.source);
+    const explicit = try resolveProcessMemoryBudget(.{ .process_memory_budget_mb = 64 }, &env);
+    try std.testing.expectEqual(@as(usize, 64 << 20), explicit.configured_limit_bytes);
+    try std.testing.expect(explicit.limit_bytes <= 64 << 20);
+    try std.testing.expectEqual(process_memory_budget.Source.cli, explicit.source);
+    try env.put(process_memory_budget.canonical_env, "invalid");
+    try std.testing.expectError(error.InvalidArguments, resolveProcessMemoryBudget(.{}, &env));
+    const automatic = try resolveProcessMemoryBudget(.{ .process_memory_budget_mb = 0 }, &env);
+    try std.testing.expectEqual(@as(usize, 0), automatic.configured_limit_bytes);
+    try std.testing.expectEqual(process_memory_budget.Source.cli, automatic.source);
+    var compat_env = std.process.Environ.Map.init(std.testing.allocator);
+    defer compat_env.deinit();
+    try compat_env.put(process_memory_budget.inference_compat_env, "256");
+    const compatibility = try resolveProcessMemoryBudget(.{}, &compat_env);
+    try std.testing.expectEqual(@as(usize, 256 << 20), compatibility.configured_limit_bytes);
+    try std.testing.expectEqual(process_memory_budget.Source.compatibility_environment, compatibility.source);
+    const argv: std.process.Args.Vector = if (@import("builtin").os.tag == .windows)
+        std.unicode.utf8ToUtf16LeStringLiteral("--process-memory-budget-mb 64")
+    else
+        &.{ "--process-memory-budget-mb", "64" };
+    var args = try std.process.Args.Iterator.initAllocator(.{ .vector = argv }, std.testing.allocator);
+    defer args.deinit();
+    const cli = try parseCli(&args);
+    try std.testing.expectEqual(@as(?usize, 64), cli.process_memory_budget_mb);
+}

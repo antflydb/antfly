@@ -706,11 +706,28 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         return try self.waitForAllWithVisibilityWait(sequence, .{});
     }
 
+    /// Caller owns the worker mutex on entry and on every return. Original
+    /// authority callbacks may inspect runtime state and must run unlocked.
+    fn checkVisibilityWaitUnlocked(self: *DerivedRuntime, io: Io, wait: runtime_types.VisibilityWait) !void {
+        self.mutex.unlock(io);
+        const result = wait.check();
+        self.mutex.lockUncancelable(io);
+        try result;
+    }
+
+    fn waitVisibilityProgressUnlocked(self: *DerivedRuntime, io: Io, wait: runtime_types.VisibilityWait, duration: Io.Duration) !void {
+        self.mutex.unlock(io);
+        const result = wait.waitForProgress(io, duration);
+        self.mutex.lockUncancelable(io);
+        try result;
+    }
+
     pub fn waitForAllWithVisibilityWait(
         self: *DerivedRuntime,
         sequence: u64,
         wait: runtime_types.VisibilityWait,
     ) !void {
+        try wait.check();
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -768,17 +785,11 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 }
                 self.mutex.lockUncancelable(io);
                 if (!all_persisted) {
-                    self.mutex.unlock(io);
-                    io.sleep(Io.Duration.zero, .awake) catch {};
-                    self.mutex.lockUncancelable(io);
-                    try wait.check();
+                    try self.waitVisibilityProgressUnlocked(io, wait, Io.Duration.zero);
                     continue;
                 }
                 if (self.truncates_in_flight != 0) {
-                    self.mutex.unlock(io);
-                    io.sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
-                    self.mutex.lockUncancelable(io);
-                    try wait.check();
+                    try self.waitVisibilityProgressUnlocked(io, wait, Io.Duration.fromMilliseconds(1));
                     continue;
                 }
                 const truncate_sequence = truncate: {
@@ -807,12 +818,11 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                     self.truncate_retry_backoff.reset();
                     self.cond.broadcast(io);
                 }
+                try self.checkVisibilityWaitUnlocked(io, wait);
                 return;
             }
-            try wait.check();
-            self.mutex.unlock(io);
-            io.sleep(Io.Duration.fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
-            self.mutex.lockUncancelable(io);
+            try self.checkVisibilityWaitUnlocked(io, wait);
+            try self.waitVisibilityProgressUnlocked(io, wait, Io.Duration.fromNanoseconds(std.time.ns_per_ms));
         }
     }
 
@@ -827,6 +837,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         wait: runtime_types.VisibilityWait,
     ) !void {
         if (index_names.len == 0) return;
+        try wait.check();
         const io = self.ioContext();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -889,17 +900,11 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 }
                 self.mutex.lockUncancelable(io);
                 if (!all_persisted) {
-                    self.mutex.unlock(io);
-                    io.sleep(Io.Duration.zero, .awake) catch {};
-                    self.mutex.lockUncancelable(io);
-                    try wait.check();
+                    try self.waitVisibilityProgressUnlocked(io, wait, Io.Duration.zero);
                     continue;
                 }
                 if (self.truncates_in_flight != 0) {
-                    self.mutex.unlock(io);
-                    io.sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
-                    self.mutex.lockUncancelable(io);
-                    try wait.check();
+                    try self.waitVisibilityProgressUnlocked(io, wait, Io.Duration.fromMilliseconds(1));
                     continue;
                 }
                 const truncate_sequence = truncate: {
@@ -928,12 +933,11 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                     self.truncate_retry_backoff.reset();
                     self.cond.broadcast(io);
                 }
+                try self.checkVisibilityWaitUnlocked(io, wait);
                 return;
             }
-            try wait.check();
-            self.mutex.unlock(io);
-            io.sleep(Io.Duration.fromNanoseconds(std.time.ns_per_ms), .awake) catch {};
-            self.mutex.lockUncancelable(io);
+            try self.checkVisibilityWaitUnlocked(io, wait);
+            try self.waitVisibilityProgressUnlocked(io, wait, Io.Duration.fromNanoseconds(std.time.ns_per_ms));
         }
     }
 
@@ -3008,4 +3012,163 @@ test "issue1015 idle cleanup persists a new watermark once" {
     try std.testing.expectEqual(@as(u64, 1), runtime.last_truncated_sequence);
     std.debug.print("LITE_IDLE_CLEANUP durable_sequence=1 dispatches=4 persist_calls={d} truncate_calls={d}\n", .{ probe.persist_calls, probe.truncate_calls });
     try std.testing.expectEqual(@as(usize, 1), probe.persist_calls);
+}
+
+test "controlled derived visibility callbacks run outside worker mutex and preserve original rejection" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        runtime: *DerivedRuntime,
+        calls: usize = 0,
+        mutex_was_free: bool = true,
+        cause: anyerror,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (!self.runtime.mutex.tryLock()) {
+                self.mutex_was_free = false;
+                return error.TestUnexpectedResult;
+            }
+            self.runtime.mutex.unlock(self.runtime.ioContext());
+            if (self.calls >= 2) return self.cause;
+        }
+    };
+    for ([_]bool{ false, true }) |selected| for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        var capture: TestThreadedRuntimeCapture = .{};
+        var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null);
+        defer runtime.deinit();
+        const worker = try alloc.create(Worker);
+        worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "held"), .kind = .{ .name = "held", .kind = .full_text }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 0, .paused = true };
+        try runtime.workers.append(alloc, worker);
+        var probe: Probe = .{ .runtime = &runtime, .cause = cause };
+        const wait: runtime_types.VisibilityWait = .{ .cancellation = .{ .ptr = &probe, .check_fn = Probe.check } };
+        if (selected)
+            try std.testing.expectError(cause, runtime.waitForIndexesWithVisibilityWait(1, &.{"held"}, wait))
+        else
+            try std.testing.expectError(cause, runtime.waitForAllWithVisibilityWait(1, wait));
+        try std.testing.expect(probe.mutex_was_free);
+        try std.testing.expectEqual(@as(usize, 2), probe.calls);
+        try std.testing.expect(runtime.mutex.tryLock());
+        runtime.mutex.unlock(runtime.ioContext());
+        try std.testing.expect(worker.paused and !worker.dispatch_active and worker.future == null);
+    };
+}
+
+test "controlled derived visibility ready completion rechecks authority outside worker mutex" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        runtime: *DerivedRuntime,
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (!self.runtime.mutex.tryLock()) return error.TestUnexpectedResult;
+            self.runtime.mutex.unlock(self.runtime.ioContext());
+            if (self.calls == 2) return error.DeadlineExceeded;
+        }
+    };
+    for ([_]bool{ false, true }) |selected| {
+        var capture: TestThreadedRuntimeCapture = .{};
+        var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null);
+        defer runtime.deinit();
+        var probe: Probe = .{ .runtime = &runtime };
+        const wait: runtime_types.VisibilityWait = .{ .cancellation = .{ .ptr = &probe, .check_fn = Probe.check } };
+        if (selected)
+            try std.testing.expectError(error.DeadlineExceeded, runtime.waitForIndexesWithVisibilityWait(1, &.{"ready"}, wait))
+        else
+            try std.testing.expectError(error.DeadlineExceeded, runtime.waitForAllWithVisibilityWait(1, wait));
+        try std.testing.expectEqual(@as(usize, 2), probe.calls);
+        try std.testing.expect(runtime.mutex.tryLock());
+        runtime.mutex.unlock(runtime.ioContext());
+        try std.testing.expectEqual(@as(usize, 0), runtime.workers.items.len);
+    }
+}
+
+test "controlled derived visibility polling lends CPU and fences original owner reentry" {
+    const native = @import("../../../common/runnable_scheduler.zig");
+    const Probe = struct {
+        runtime: *DerivedRuntime,
+        execution: *native.Execution,
+        scheduler: *native.Scheduler,
+        cause: ?anyerror,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn authority(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            try self.execution.checkLifetime();
+        }
+        fn fence(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cause) |cause| return cause;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            try std.testing.expect(self.runtime.mutex.tryLock());
+            self.runtime.mutex.unlock(self.runtime.ioContext());
+            try self.execution.park(.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 23), self.scheduler.stats().retained_bytes);
+            var peer: native.Execution = .{};
+            try peer.start(self.scheduler, .{ .io = std.testing.io, .retained_bytes = 17, .allow_wait = false }, .background);
+            defer peer.finish();
+            var health: native.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .retained_bytes = 5, .allow_wait = false }, .control);
+            defer health.finish();
+            try std.testing.expectEqual(@as(usize, 2), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 3), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 45), self.scheduler.stats().retained_bytes);
+            // Simulated worker advancement; no physical backend apply is claimed.
+            try std.testing.expect(self.runtime.mutex.tryLock());
+            for (self.runtime.workers.items) |worker| {
+                worker.paused = false;
+                worker.applied_sequence = 1;
+                worker.persisted_sequence = 1;
+            }
+            self.runtime.mutex.unlock(self.runtime.ioContext());
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            try std.testing.expect(self.runtime.mutex.tryLock());
+            self.runtime.mutex.unlock(self.runtime.ioContext());
+            try self.execution.enterWithCheck(.query, .{ .context = self, .check = fence });
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |selected| for ([_]?anyerror{ null, error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+        var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var execution: native.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+        defer execution.finish();
+        var capture: TestThreadedRuntimeCapture = .{};
+        var runtime = try DerivedRuntime.init(alloc, undefined, &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, null, null, null, null, null);
+        defer runtime.deinit();
+        const worker = try alloc.create(Worker);
+        worker.* = .{ .runtime = &runtime, .name = try alloc.dupe(u8, "held"), .kind = .{ .name = "held", .kind = .full_text }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 0, .paused = true };
+        try runtime.workers.append(alloc, worker);
+        var probe: Probe = .{ .runtime = &runtime, .execution = &execution, .scheduler = &scheduler, .cause = cause };
+        const controls: @import("../apply_rw_lock.zig").ApplyRwLock.Acquisition = .{
+            .lifetime = .{ .context = &probe, .check_fn = Probe.authority },
+            .execution_wait = .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end },
+        };
+        const wait: runtime_types.VisibilityWait = .{ .execution_wait = @import("../mutation_admission.zig").committedVisibilityBoundary(controls, .{}) };
+        const result = if (selected) runtime.waitForIndexesWithVisibilityWait(1, &.{"held"}, wait) else runtime.waitForAllWithVisibilityWait(1, wait);
+        if (cause) |err| {
+            try std.testing.expectError(err, result);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        } else {
+            try result;
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.begins);
+        try std.testing.expectEqual(@as(usize, 1), probe.ends);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        try std.testing.expect(runtime.mutex.tryLock());
+        runtime.mutex.unlock(runtime.ioContext());
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
 }

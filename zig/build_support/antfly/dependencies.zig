@@ -1289,6 +1289,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
     inference_engine_mod.addImport("engine_memory", antfly_imports.storage_boundary.memory);
+    runtime_abi_mod.addImport("runtime_memory_abi", antfly_imports.storage_boundary.memory);
     runtime_abi_mod.addImport("antfly_test_error_logs", antfly_imports.storage_boundary.test_error_logs);
     const ordinal_tests = b.addTest(.{ .name = "storage-ordinal-core-tests", .root_module = antfly_imports.storage_boundary.ordinals, .use_llvm = @import("../embedded/source_owner.zig").llvmBackend(target.result) });
     b.step("storage-ordinal-core-test", "Verify bulk storage operations through the configured implementation")
@@ -1306,6 +1307,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // SQL shape fixtures reach native schema and storage contracts, but do not
     // need the inference/API module graph of a full storage owner.
     antfly_imports.configureRuntimeContracts(usermgr_mod);
+    antfly_imports.configureRuntimeContracts(sql_test_mod);
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
     sql_test_mod.addImport("sql_parser", sql_parser_mod);
     sql_test_mod.addImport("antfly-json", json_mod);

@@ -2740,7 +2740,10 @@ fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBod
 }
 
 pub fn queryExecutionDeadlineNsFromBody(alloc: std.mem.Allocator, body: []const u8) !?u64 {
-    const started_ns = platform_time.monotonicNs();
+    return queryExecutionDeadlineNsFromBodyAt(alloc, body, platform_time.monotonicNs());
+}
+
+pub fn queryExecutionDeadlineNsFromBodyAt(alloc: std.mem.Allocator, body: []const u8, started_ns: u64) !?u64 {
     const timeout_ms = (try parseQueryTimeoutMs(alloc, body)) orelse return null;
     return started_ns +| timeout_ms *| std.time.ns_per_ms;
 }

@@ -364,6 +364,87 @@ def workload_snapshot(target, *, require_waiting=False):
     return snapshot
 
 
+# Version 1 of runtime_workload_abi.RunnableServiceStats. These are active
+# execution-lease wall slot-times, not thread CPU utilization or full coverage.
+SERVICE_CLASSES = (
+    "query_general",
+    "write",
+    "inference",
+    "background",
+    "query_bounded",
+    "query_analytical",
+)
+SERVICE_COUNTERS = (
+    "estimated_slot_ns",
+    "observed_slot_ns",
+    "unobserved_estimate_ns",
+    "refunded_slot_ns",
+    "debt_paid_slot_ns",
+    "clipped_adjustments",
+)
+
+
+def service_diagnostics(previous, current):
+    before, after = previous.get("service"), current.get("service")
+    if before is None and after is None:
+        return dict(available=False)
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise RuntimeError(
+            "runnable service telemetry disappeared during qualification"
+        )
+    for stats in (before, after):
+        if any(
+            type(stats.get(key)) is not int or stats[key] != value
+            for key, value in (
+                ("version", 1),
+                ("struct_size", 408),
+                ("measurement_model", 1),
+            )
+        ):
+            raise RuntimeError("unsupported runnable service telemetry contract")
+        if type(stats.get("available")) is not bool:
+            raise RuntimeError("invalid runnable service availability")
+    if before["available"] != after["available"]:
+        raise RuntimeError("runnable service availability changed during qualification")
+    if not after["available"]:
+        return dict(available=False)
+    for stats in (before, after):
+        quantum = stats.get("quantum_ns")
+        if type(quantum) is not int or not 0 < quantum <= 100_000_000:
+            raise RuntimeError("invalid runnable service quantum")
+        for field in (*SERVICE_COUNTERS, "debt_slot_ns", "rebate_slot_ns"):
+            values = stats.get(field)
+            if (
+                not isinstance(values, list)
+                or len(values) != len(SERVICE_CLASSES)
+                or any(
+                    type(value) is not int or not 0 <= value <= 2**64 - 1
+                    for value in values
+                )
+            ):
+                raise RuntimeError("invalid runnable service class telemetry")
+        for debt, rebate in zip(stats["debt_slot_ns"], stats["rebate_slot_ns"]):
+            if (debt and rebate) or max(debt, rebate) > 64 * quantum:
+                raise RuntimeError("invalid runnable service correction")
+    if before["quantum_ns"] != after["quantum_ns"]:
+        raise RuntimeError("runnable service quantum changed during qualification")
+    delta = {
+        field: [new - old for old, new in zip(before[field], after[field])]
+        for field in SERVICE_COUNTERS
+    }
+    if any(value < 0 for values in delta.values() for value in values):
+        raise RuntimeError("runnable service counters decreased during qualification")
+    return dict(
+        available=True,
+        measurement_model=1,
+        quantum_ns=after["quantum_ns"],
+        classes=list(SERVICE_CLASSES),
+        counters=delta,
+        debt_slot_ns=after["debt_slot_ns"],
+        rebate_slot_ns=after["rebate_slot_ns"],
+    )
+
+
 def runnable_diagnostics(before, after):
     if os.environ.get("ANTFLY_QUALIFICATION_POLICY") != "runnable":
         return None
@@ -389,10 +470,12 @@ def runnable_diagnostics(before, after):
     }
     if min(grants + list(delta.values())) < 0:
         raise RuntimeError("runnable counters decreased during qualification")
-    return dict(delta, grants=grants)
+    return dict(delta, grants=grants, service=service_diagnostics(previous, current))
 
 
-def runnable_evidence_failures(measured, policy, minimum_yields=0):
+def runnable_evidence_failures(
+    measured, policy, minimum_yields=0, minimum_observed_slot_ns=0
+):
     diagnostics = measured.get("runnable_diagnostics")
     stats = (measured.get("workload_after") or {}).get("runnable", {})
     if diagnostics is None or stats.get("enabled") is not True:
@@ -431,6 +514,12 @@ def runnable_evidence_failures(measured, policy, minimum_yields=0):
             )
     if diagnostics["yields"] < minimum_yields:
         failures.append("runnable yielding was not exercised")
+    if minimum_observed_slot_ns:
+        service = diagnostics.get("service") or {}
+        if not service.get("available"):
+            failures.append("runnable service observations were not measured")
+        elif sum(service["counters"]["observed_slot_ns"]) < minimum_observed_slot_ns:
+            failures.append("runnable observed service was below the declared minimum")
     return failures
 
 
@@ -569,6 +658,7 @@ def main():
                         measured,
                         manifest["runnable_policy"],
                         limits.get("runnable_yields_min", 0),
+                        limits.get("runnable_observed_slot_ns_min", 0),
                     )
                 )
             if (

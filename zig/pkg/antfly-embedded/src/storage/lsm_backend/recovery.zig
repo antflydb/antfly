@@ -103,10 +103,10 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         if (backend_options.storage) |storage| {
             backend.storage = storage;
         } else {
-            const owned = try std.heap.page_allocator.create(storage_io.NativeStorage);
-            errdefer std.heap.page_allocator.destroy(owned);
+            const owned = try backend.allocator.create(storage_io.NativeStorage);
+            errdefer backend.allocator.destroy(owned);
             owned.* = try storage_io.NativeStorage.initWithPool(
-                std.heap.page_allocator,
+                backend.allocator,
                 backend_options.io_runtime,
                 backend_options.native_storage_pool,
             );
@@ -418,7 +418,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (@hasField(BackendType, "storage_owner")) {
         if (backend.storage_owner) |owned| {
             owned.deinit();
-            std.heap.page_allocator.destroy(owned);
+            backend.allocator.destroy(owned);
         }
     }
     if (backend.root_dir) |root_dir| backend.allocator.free(root_dir);

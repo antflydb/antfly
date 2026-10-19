@@ -229,6 +229,130 @@ pub fn supported(program: *const scalar.Program) bool {
     }
     return true;
 }
+/// Prepared single-program numeric island. Preparation may allocate/coerce and
+/// call the input provider; run never does. The caller retains this scratch and
+/// its original operation owner through result handoff and physical retirement.
+/// Fixed work counts are not a measured non-yielding-time qualification.
+pub const PreparedNumeric = struct {
+    pub const max_instructions = 64;
+    pub const max_rows = 64;
+    pub const max_instruction_cells = max_instructions * max_rows;
+    pub const max_cell_steps = 2 * max_instruction_cells + max_rows;
+    /// One instruction plus its integer-width check, or final root output.
+    pub const max_step_cell_steps = 2 * max_rows;
+    pub const max_steps = max_instructions + 1;
+    pub const scratch_bytes = @sizeOf(PreparedNumeric);
+    allocator: A,
+    program: *const scalar.Program,
+    instruction_count: usize,
+    root: usize,
+    instructions: [max_instructions]scalar.Instruction = undefined,
+    payload: [max_instructions][max_rows]u64 = undefined,
+    states: [max_instructions][max_rows]State = undefined,
+    output: [max_rows]Datum = undefined,
+    count: usize = 0,
+    next_instruction: usize = 0,
+    phase: enum { empty, prepared, running, complete, failed } = .empty,
+
+    pub fn eligible(program: *const scalar.Program) !bool {
+        if (!supported(program) or program.instructions.len > max_instructions) return false;
+        for (program.instructions, 0..) |instruction, index| {
+            if (kind(instruction.type) == .string) return false;
+            if (instruction.operation == .literal) switch (instruction.operation.literal) {
+                .null, .integer, .float, .bool => {},
+                else => return false,
+            };
+            var operands: [2]u32 = undefined;
+            for (children(instruction, &operands)) |operand| if (operand >= index) return error.InvalidSqlBackendResponse;
+        }
+        return true;
+    }
+    pub fn init(a: A, program: *const scalar.Program) !?*PreparedNumeric {
+        if (!try eligible(program)) return null;
+        const self = try a.create(PreparedNumeric);
+        self.* = .{ .allocator = a, .program = program, .instruction_count = program.instructions.len, .root = program.root };
+        @memcpy(self.instructions[0..program.instructions.len], program.instructions);
+        return self;
+    }
+    pub fn deinit(self: *PreparedNumeric) void {
+        self.allocator.destroy(self);
+    }
+    fn vector(self: *PreparedNumeric, index: usize) Vector {
+        return .{ .kind = kind(self.instructions[index].type).?, .payload = self.payload[index][0..self.count], .states = self.states[index][0..self.count] };
+    }
+    /// Call only outside a CPU-loan/bounded interval. A failed prepare exposes
+    /// no partial chunk. Inputs become owned numeric values in fixed scratch.
+    pub fn prepare(self: *PreparedNumeric, input: anytype, parameters: []const std.json.Value) !void {
+        return self.prepareWithAllocator(self.allocator, input, parameters);
+    }
+    /// Fixed stage storage and preparation/coercion storage may have distinct
+    /// owners. The preparation allocator retains its original lifetime; values
+    /// are copied into the fixed numeric payload before the math stage runs.
+    pub fn prepareWithAllocator(self: *PreparedNumeric, preparation: A, input: anytype, parameters: []const std.json.Value) !void {
+        self.phase = .empty;
+        self.next_instruction = 0;
+        if (input.count > max_rows) return error.InvalidPreparedNumericRows;
+        self.count = input.count;
+        for (self.instructions[0..self.instruction_count], 0..) |instruction, index| {
+            const target = self.vector(index);
+            switch (instruction.operation) {
+                .literal => |value| for (0..self.count) |row| try target.set(row, Datum.fromJson(value)),
+                .parameter => {
+                    const value = try self.program.evaluateInstruction(preparation, @intCast(index), parameters);
+                    for (0..self.count) |row| try target.set(row, value);
+                },
+                .column => |ordinal| {
+                    const filled = if (comptime @hasDecl(@TypeOf(input), "fillTyped")) try input.fillTyped(preparation, ordinal, target) else false;
+                    if (!filled) for (0..self.count) |row| try target.set(row, try input.cell(preparation, row, ordinal));
+                },
+                .unary, .binary => {},
+                else => unreachable,
+            }
+        }
+        self.phase = .prepared;
+    }
+    /// Drain the same resumable math state without scheduling callbacks. Callers
+    /// needing execution boundaries use step() and retain this owner between
+    /// calls. This convenience method does not qualify an entire chunk for loans.
+    pub fn run(self: *PreparedNumeric) ![]const Datum {
+        while (true) if (try self.step()) |output| return output;
+    }
+    /// One fixed instruction (at most 64 evaluations plus 64 width checks), or
+    /// 64 final root visits. No allocation, provider, coercion, callback or IO.
+    /// Null retains a private continuation; only completion exposes output.
+    /// The returned slice borrows this owner and expires at the next prepare.
+    pub fn step(self: *PreparedNumeric) !?[]const Datum {
+        if (self.phase != .prepared and self.phase != .running) return error.InvalidRunnableTransition;
+        self.phase = .failed;
+        if (self.next_instruction < self.instruction_count) {
+            const index = self.next_instruction;
+            const instruction = self.instructions[index];
+            const target = self.vector(index);
+            switch (instruction.operation) {
+                .literal, .parameter, .column => {},
+                .unary => |u| for (0..self.count) |row| try target.set(row, try @import("vector_eval.zig").unary(u.op, self.vector(u.operand).get(row))),
+                .binary => |v| try binary(target, v.op, self.vector(v.left), self.vector(v.right)),
+                else => unreachable,
+            }
+            if (target.kind == .integer and instruction.operation != .literal) if (instruction.type.element_type) |element| {
+                if (element == .int16 or element == .int32) for (target.integers(), target.states) |value, state| {
+                    if (state == .value) _ = try @import("builtin_cast.zig").checkedInteger(value, element);
+                };
+            };
+            self.next_instruction += 1;
+            self.phase = .running;
+            return null;
+        }
+        const root = self.vector(self.root);
+        for (self.output[0..self.count], 0..) |*value, row| {
+            value.* = root.get(row);
+            try scalar.validateResult(value.*, .{});
+        }
+        self.phase = .complete;
+        return self.output[0..self.count];
+    }
+};
+
 fn equal(a: scalar.Instruction, b: scalar.Instruction) bool {
     if (!std.meta.eql(a.type, b.type) or std.meta.activeTag(a.operation) != std.meta.activeTag(b.operation)) return false;
     return switch (a.operation) {
@@ -578,4 +702,271 @@ test "SQL typed kernels round REAL inputs and intermediate nodes with scalar err
     for ([_]f64{ 1e-50, std.math.floatMax(f32) }) |value| {
         try std.testing.expectError(error.SqlNumericOutOfRange, evaluateEncoded(ca, &.{&program}, Input{ .value = value }, &.{}));
     }
+}
+
+test "SQL typed kernels preserve int4 overflow and decline float4 execution" {
+    const Input = struct {
+        count: usize = 2,
+        pub fn cell(_: @This(), _: A, _: usize, _: u32) !Datum {
+            return error.UnexpectedColumnAccess;
+        }
+    };
+    for ([_][]const u8{ "2147483646 + 1", "2147483647 + 1" }, 0..) |sql, index| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expect(supported(&program));
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        if (index == 1) {
+            try std.testing.expectError(error.SqlNumericOutOfRange, evaluate(arena.allocator(), &.{&program}, Input{}, &.{}));
+            try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{}, &.{}, .{}));
+        } else {
+            const result = (try evaluate(arena.allocator(), &.{&program}, Input{}, &.{})).?;
+            for (result[0]) |value| try std.testing.expectEqual(@as(i64, 2147483647), value.value.integer);
+        }
+    }
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "x + x", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(std.testing.allocator, compiled.expression, &.{.{ .name = "x", .type = .number, .element_type = .float32 }}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expect(!supported(&program));
+}
+
+const PreparedTestInput = struct {
+    count: usize,
+    rows: []const []const Datum,
+    calls: *usize,
+    pub fn cell(self: @This(), _: A, row: usize, ordinal: u32) !Datum {
+        self.calls.* += 1;
+        return self.rows[row][ordinal];
+    }
+};
+
+test "SQL prepared numeric scratch preserves exact arithmetic nulls and comparisons without evaluation allocation" {
+    const a = std.testing.allocator;
+    var cells: [64][1]Datum = undefined;
+    var rows: [64][]const Datum = undefined;
+    for (&cells, &rows, 0..) |*cell, *row, i| {
+        cell[0] = if (i % 16 < 12) Datum.json(.{ .integer = if (i % 2 == 0) 9007199254740993 else -3 }) else if (i % 2 == 0) .{} else Datum.json(.null);
+        row.* = cell;
+    }
+    for ([_][]const u8{ "n * 2 + 1", "n / 2", "n % 2", "n > 9007199254740992", "n IS NULL", "n IS DISTINCT FROM NULL", "-n" }) |text| {
+        var compiled = try @import("compiler.zig").compileScalar(a, text, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer }}, &.{}, .{});
+        defer program.deinit();
+        var allocations = std.testing.FailingAllocator.init(a, .{});
+        const stage = (try PreparedNumeric.init(allocations.allocator(), &program)).?;
+        defer stage.deinit();
+        var calls: usize = 0;
+        try stage.prepare(PreparedTestInput{ .count = rows.len, .rows = &rows, .calls = &calls }, &.{});
+        const prepared_calls = calls;
+        const prepared_allocations = allocations.alloc_index;
+        allocations.fail_index = prepared_allocations;
+        const original = cells[0][0];
+        cells[0][0] = Datum.json(.{ .string = "input is no longer numeric" });
+        const result = try stage.run();
+        cells[0][0] = original;
+        try std.testing.expectEqual(prepared_calls, calls);
+        try std.testing.expectEqual(prepared_allocations, allocations.alloc_index);
+        for (rows, result) |row, actual| try std.testing.expectEqualDeep(try program.evaluate(a, row, &.{}, .{}), actual);
+        try std.testing.expectError(error.InvalidRunnableTransition, stage.run());
+    }
+}
+
+test "SQL prepared numeric failed preparation invalidates previous chunk and bounds rows before input access" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "n + 1", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer }}, &.{}, .{});
+    defer program.deinit();
+    const stage = (try PreparedNumeric.init(a, &program)).?;
+    defer stage.deinit();
+    var calls: usize = 0;
+    const good = PreparedTestInput{ .count = 1, .rows = &.{&.{Datum.json(.{ .integer = 41 })}}, .calls = &calls };
+    try stage.prepare(good, &.{});
+    try std.testing.expectEqual(@as(i64, 42), (try stage.run())[0].value.integer);
+    var too_many = good;
+    too_many.count = 65;
+    try std.testing.expectError(error.InvalidPreparedNumericRows, stage.prepare(too_many, &.{}));
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectError(error.InvalidRunnableTransition, stage.run());
+    try std.testing.expectError(error.UnsupportedTypedKernel, stage.prepare(PreparedTestInput{ .count = 1, .rows = &.{&.{Datum.json(.{ .string = "unqualified" })}}, .calls = &calls }, &.{}));
+    try std.testing.expectError(error.InvalidRunnableTransition, stage.run());
+    try stage.prepare(good, &.{});
+    try std.testing.expectEqual(@as(i64, 42), (try stage.run())[0].value.integer);
+    var empty = good;
+    empty.count = 0;
+    try stage.prepare(empty, &.{});
+    try std.testing.expectEqual(@as(usize, 0), (try stage.run()).len);
+}
+
+test "SQL prepared numeric rejects strings lazy programs and allocation failure before publication" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "'unbounded string' = 'unbounded string'", "CASE WHEN TRUE THEN 7 ELSE 1 / 0 END" }) |text| {
+        var compiled = try @import("compiler.zig").compileScalar(a, text, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(a, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var unavailable = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        try std.testing.expect((try PreparedNumeric.init(unavailable.allocator(), &program)) == null);
+        try std.testing.expectEqual(@as(usize, 0), unavailable.alloc_index);
+    }
+    var compiled = try @import("compiler.zig").compileScalar(a, "1 + 2", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var unavailable = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, PreparedNumeric.init(unavailable.allocator(), &program));
+}
+
+test "SQL prepared numeric arithmetic errors retain scalar identities and never publish partial output" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "2147483647 + 1", "1 / 0", "-(-9223372036854775807 - 1)" }) |text| {
+        var compiled = try @import("compiler.zig").compileScalar(a, text, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(a, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        const stage = (try PreparedNumeric.init(a, &program)).?;
+        defer stage.deinit();
+        var calls: usize = 0;
+        try stage.prepare(PreparedTestInput{ .count = 1, .rows = &.{&.{}}, .calls = &calls }, &.{});
+        const expected = program.evaluate(a, &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectError(err, stage.run());
+            try std.testing.expectError(error.InvalidRunnableTransition, stage.run());
+            continue;
+        };
+        _ = expected;
+        return error.ExpectedScalarNumericFailure;
+    }
+}
+
+test "SQL prepared numeric coerces parameters before evaluation and preserves floating and boolean semantics" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "n + $1", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .number, .element_type = .float64 }}, &.{}, .{});
+    defer program.deinit();
+    var allocations = std.testing.FailingAllocator.init(a, .{});
+    const stage = (try PreparedNumeric.init(allocations.allocator(), &program)).?;
+    defer stage.deinit();
+    var calls: usize = 0;
+    const input = PreparedTestInput{ .count = 1, .rows = &.{&.{Datum.json(.{ .float = 1.25 })}}, .calls = &calls };
+    try stage.prepare(input, &.{.{ .float = 2.5 }});
+    allocations.fail_index = allocations.alloc_index;
+    try std.testing.expectEqualDeep(try program.evaluate(a, input.rows[0], &.{.{ .float = 2.5 }}, .{}), (try stage.run())[0]);
+    var boolean_compiled = try @import("compiler.zig").compileScalar(a, "NOT n", .{});
+    defer boolean_compiled.deinit();
+    var boolean = try scalar.bind(a, boolean_compiled.expression, &.{.{ .name = "n", .type = .boolean }}, &.{}, .{});
+    defer boolean.deinit();
+    const boolean_stage = (try PreparedNumeric.init(a, &boolean)).?;
+    defer boolean_stage.deinit();
+    try boolean_stage.prepare(PreparedTestInput{ .count = 1, .rows = &.{&.{Datum.json(.{ .bool = true })}}, .calls = &calls }, &.{});
+    try std.testing.expectEqual(false, (try boolean_stage.run())[0].value.bool);
+    try std.testing.expectEqual(@as(usize, 8256), PreparedNumeric.max_cell_steps);
+    try std.testing.expect(PreparedNumeric.scratch_bytes < 128 * 1024);
+}
+
+test "SQL prepared numeric retains bulk typed column preparation without per cell provider lookup" {
+    const a = std.testing.allocator;
+    const Input = struct {
+        count: usize = 4,
+        calls: *usize,
+        pub fn fillTyped(self: @This(), _: std.mem.Allocator, ordinal: u32, target: anytype) !bool {
+            if (ordinal != 0) return error.InvalidSqlBackendResponse;
+            self.calls.* += 1;
+            for (0..self.count) |row| try target.set(row, Datum.json(.{ .integer = @intCast(row + 40) }));
+            return true;
+        }
+        pub fn cell(_: @This(), _: A, _: usize, _: u32) !Datum {
+            return error.UnexpectedPerCellProviderLookup;
+        }
+    };
+    var compiled = try @import("compiler.zig").compileScalar(a, "n + 1", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer }}, &.{}, .{});
+    defer program.deinit();
+    const stage = (try PreparedNumeric.init(a, &program)).?;
+    defer stage.deinit();
+    var calls: usize = 0;
+    try stage.prepare(Input{ .calls = &calls }, &.{});
+    const values = try stage.run();
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    for (values, 0..) |value, row| try std.testing.expectEqual(@as(i64, @intCast(row + 41)), value.value.integer);
+}
+
+test "SQL prepared numeric steps retain a full fixed continuation without provider or allocation access" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "n", .{});
+    defer compiled.deinit();
+    var base = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer, .element_type = .int16 }}, &.{}, .{});
+    defer base.deinit();
+    var instructions: [PreparedNumeric.max_instructions]scalar.Instruction = undefined;
+    instructions[0] = .{ .type = base.output_type, .operation = .{ .column = 0 } };
+    for (instructions[1..], 1..) |*instruction, index| instruction.* = .{ .type = base.output_type, .operation = .{ .binary = .{ .op = .add, .left = @intCast(index - 1), .right = 0 } } };
+    var expanded = base;
+    expanded.instructions = &instructions;
+    expanded.root = instructions.len - 1;
+    var allocations = std.testing.FailingAllocator.init(a, .{});
+    const stage = (try PreparedNumeric.init(allocations.allocator(), &expanded)).?;
+    defer stage.deinit();
+    var cells: [64][1]Datum = undefined;
+    var rows: [64][]const Datum = undefined;
+    for (&cells, &rows, 0..) |*cell, *row, index| {
+        cell[0] = Datum.json(.{ .integer = @intCast(index + 1) });
+        row.* = cell;
+    }
+    var calls: usize = 0;
+    try stage.prepare(PreparedTestInput{ .count = rows.len, .rows = &rows, .calls = &calls }, &.{});
+    const prepared_calls = calls;
+    const prepared_allocations = allocations.alloc_index;
+    allocations.fail_index = prepared_allocations;
+    for (&cells) |*cell| cell[0] = Datum.json(.{ .string = "provider storage changed after preparation" });
+    for (0..instructions.len) |index| {
+        try std.testing.expect((try stage.step()) == null);
+        try std.testing.expectEqual(index + 1, stage.next_instruction);
+        try std.testing.expectEqual(prepared_calls, calls);
+        try std.testing.expectEqual(prepared_allocations, allocations.alloc_index);
+    }
+    const result = (try stage.step()).?;
+    for (result, 0..) |value, index| try std.testing.expectEqual(@as(i64, @intCast(64 * (index + 1))), value.value.integer);
+    try std.testing.expectEqual(@as(usize, 128), PreparedNumeric.max_step_cell_steps);
+    try std.testing.expectEqual(@as(usize, 65), PreparedNumeric.max_steps);
+    try std.testing.expectEqual(prepared_calls, calls);
+    try std.testing.expectEqual(prepared_allocations, allocations.alloc_index);
+    try std.testing.expectError(error.InvalidRunnableTransition, stage.step());
+}
+
+test "SQL prepared numeric step failure and reprepare never publish an old continuation" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "n", .{});
+    defer compiled.deinit();
+    var base = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer, .element_type = .int16 }}, &.{}, .{});
+    defer base.deinit();
+    const instructions = [_]scalar.Instruction{
+        .{ .type = base.output_type, .operation = .{ .column = 0 } },
+        .{ .type = base.output_type, .operation = .{ .literal = .{ .integer = 1 } } },
+        .{ .type = base.output_type, .operation = .{ .binary = .{ .op = .add, .left = 0, .right = 1 } } },
+    };
+    var expanded = base;
+    expanded.instructions = &instructions;
+    expanded.root = 2;
+    const stage = (try PreparedNumeric.init(a, &expanded)).?;
+    defer stage.deinit();
+    var calls: usize = 0;
+    try stage.prepare(PreparedTestInput{ .count = 1, .rows = &.{&.{Datum.json(.{ .integer = 32767 })}}, .calls = &calls }, &.{});
+    try std.testing.expect((try stage.step()) == null);
+    try std.testing.expect((try stage.step()) == null);
+    try std.testing.expectError(error.SqlNumericOutOfRange, stage.step());
+    try std.testing.expectError(error.InvalidRunnableTransition, stage.step());
+    try std.testing.expectError(error.InvalidRunnableTransition, stage.run());
+    const replacement = PreparedTestInput{ .count = 1, .rows = &.{&.{Datum.json(.{ .integer = 41 })}}, .calls = &calls };
+    try stage.prepare(replacement, &.{});
+    try std.testing.expect((try stage.step()) == null);
+    // Discard a suspended partial computation and start an independent chunk.
+    try stage.prepare(replacement, &.{});
+    try std.testing.expectEqual(@as(usize, 0), stage.next_instruction);
+    try std.testing.expectEqual(@as(i64, 42), (try stage.run())[0].value.integer);
 }

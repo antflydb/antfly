@@ -2226,7 +2226,11 @@ pub const DBCore = struct {
         );
     }
 
-    pub fn beginTransactionWithParticipantsCreatedAtRoleAndRetention(
+    pub fn beginTransactionWithParticipantsCreatedAtRoleAndRetention(self: *DBCore, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool) !transactions_mod.TxnId {
+        return self.beginTransactionWithParticipantsCreatedAtRoleAndRetentionWithAdmission(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, null);
+    }
+
+    pub fn beginTransactionWithParticipantsCreatedAtRoleAndRetentionWithAdmission(
         self: *DBCore,
         txn_id: transactions_mod.TxnId,
         timestamp_ns: u64,
@@ -2234,17 +2238,31 @@ pub const DBCore = struct {
         participants: []const []const u8,
         coordinator: bool,
         retain_terminal: bool,
+        control: ?@import("../../common/read_admission.zig").Port,
     ) !transactions_mod.TxnId {
+        if (control) |owner| try owner.checkpoint();
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetention(
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionWithAdmission(
             txn_id,
             timestamp_ns,
             created_at_ns,
             participants,
             coordinator,
             retain_terminal,
+            control,
         );
+        return txn_id;
+    }
+
+    /// The serving/replicated BEGIN adapter must hold the same apply fence as
+    /// ordinary transaction creation. extra_batch carries its ordered receipt.
+    pub fn beginTransactionRequiringPreparedEffects(self: *DBCore, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: @import("prepared_transaction_effects.zig").Requirement, extra_batch: transactions_mod.MutationExtraBatch, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.TxnId {
+        if (control) |owner| try owner.checkpoint();
+        try self.requirePreparedTransactionProtocol(control);
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.initTransactionRequiringPreparedEffects(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, requirement, extra_batch, control);
         return txn_id;
     }
 
@@ -2288,6 +2306,18 @@ pub const DBCore = struct {
         predicates: []const transactions_mod.VersionPredicate,
         extra_batch: transactions_mod.MutationExtraBatch,
     ) !void {
+        return self.writeIntentsExtraBatchWithAdmission(txn_id, intents, predicates, extra_batch, null);
+    }
+
+    pub fn writeIntentsExtraBatchWithAdmission(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+        predicates: []const transactions_mod.VersionPredicate,
+        extra_batch: transactions_mod.MutationExtraBatch,
+        control: ?@import("../../common/read_admission.zig").Port,
+    ) !void {
+        if (control) |owner| try owner.checkpoint();
         var manager = try transactions_mod.TxnManager.init(extra_batch.preparation_allocator orelse self.alloc, self.store);
         defer manager.deinit();
         var bound = extra_batch;
@@ -2295,7 +2325,7 @@ pub const DBCore = struct {
             bound.max_intent_admission_bytes = self.table_catalog.transaction_admission_bytes;
         if (bound.schema_binding == null)
             bound.schema_binding = .{ .version = if (self.schema) |schema| schema.version else null };
-        try manager.writeIntentsExtraBatch(txn_id, intents, predicates, bound);
+        try manager.writeIntentsExtraBatchWithAdmission(txn_id, intents, predicates, bound, control);
     }
 
     pub fn checkVersionPredicates(
@@ -2340,6 +2370,89 @@ pub const DBCore = struct {
     ) !transactions_mod.ResolutionOutcome {
         var manager = try self.initTxnManager();
         defer manager.deinit();
+        return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
+    }
+
+    /// Read durable eligibility under the caller's apply fence. Never infer
+    /// activation from native ABI compatibility or an accepted frame alone.
+    pub fn requirePreparedTransactionProtocol(self: *DBCore, original: ?@import("../../common/read_admission.zig").Port) !void {
+        const catalog = @import("catalog/resolver_catalog.zig");
+        var trace: transactions_mod.MutationAdmissionTrace = .{};
+        const control = trace.bind(original);
+        var read = if (control) |owner| try self.store.beginReadTxnWithAdmission(.retain, owner) else try self.store.beginReadTxn();
+        defer read.abort();
+        const minimum = catalog.readMinimumReaderVersion(&read, catalog.supported_reader_version) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| return cause;
+        if (minimum < catalog.prepared_transaction_reader_version) return error.PreparedTransactionProtocolDisabled;
+        const baseline = catalog.readAuthoritativeReaderVersion(&read, catalog.supported_reader_version) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| return cause;
+        if (baseline < catalog.prepared_transaction_reader_version) return error.InvalidPreparedTransactionProtocol;
+        const raw = read.get(@import("artifact_inventory.zig").resolver_key) catch |err| {
+            if (trace.failure) |cause| return cause;
+            if (err == error.NotFound) return error.InvalidPreparedTransactionProtocol;
+            return err;
+        };
+        if (try catalog.catalogReaderVersion(self.alloc, raw) < catalog.prepared_transaction_reader_version) return error.InvalidPreparedTransactionProtocol;
+        if (control) |owner| try owner.checkpoint();
+        if (trace.failure) |cause| return cause;
+    }
+
+    /// Caller holds apply ownership. Bind accepted output to the exact durable
+    /// catalog bytes and physical table/shard/range identity, across restart.
+    /// This validates a current catalog; durable generation retention remains
+    /// the prepare protocol's responsibility.
+    pub fn preparedEffectsCatalogDigest(self: *DBCore, original: ?@import("../../common/read_admission.zig").Port) ![32]u8 {
+        var trace: transactions_mod.MutationAdmissionTrace = .{};
+        const control = trace.bind(original);
+        var read = if (control) |owner| try self.store.beginReadTxnWithAdmission(.retain, owner) else try self.store.beginReadTxn();
+        defer read.abort();
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly-prepared-catalog-v1");
+        for ([_]u64{ self.identity_namespace.table_id, self.identity_namespace.shard_id, self.identity_namespace.range_id }) |id| {
+            var raw: [8]u8 = undefined;
+            std.mem.writeInt(u64, &raw, id, .little);
+            hash.update(&raw);
+        }
+        for ([_][]const u8{ self.byteRange().start, self.byteRange().end, "\x00\x00__metadata__:indexes", "\x00\x00__metadata__:enrichments", "\x00\x00__metadata__:resolvers" }, 0..) |key, index| {
+            const bytes = if (index < 2) key else read.get(key) catch |err| blk: {
+                if (trace.failure) |cause| return cause;
+                if (err != error.NotFound) return err;
+                break :blk "";
+            };
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, bytes.len, .little);
+            hash.update(&length);
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                if (control) |owner| try owner.checkpoint();
+                const end = offset + @min(@as(usize, 4096), bytes.len - offset);
+                hash.update(bytes[offset..end]);
+                offset = end;
+            }
+        }
+        if (trace.failure) |cause| return cause;
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+
+    /// Caller holds apply ownership and retained non-yielding controls. The
+    /// frame becomes the durable catalog lease in the same publication batch.
+    pub fn sealPreparedTransactionEffects(self: *DBCore, txn_id: transactions_mod.TxnId, frame: []const u8, mode: @import("prepared_transaction_effects.zig").Mode, control: ?@import("../../common/read_admission.zig").Port) !void {
+        const catalog = try self.preparedEffectsCatalogDigest(control);
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.sealPreparedEffects(txn_id, frame, catalog, mode, control);
+    }
+
+    pub fn resolveTransactionIntentsWithAcceptedEffects(self: *DBCore, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64, extra_batch: transactions_mod.ResolutionExtraBatch, accepted: ?*const transactions_mod.PreparedEffects, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.ResolutionOutcome {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        if (accepted) |plan| {
+            if (status != .committed) return error.PreparedEffectsMismatch;
+            if (!std.mem.eql(u8, &plan.decoded.plan.contract.catalog_digest, &try self.preparedEffectsCatalogDigest(control))) return error.PreparedGenerationChanged;
+            return try manager.resolvePreparedIntents(txn_id, commit_version, plan, extra_batch, control);
+        }
         return try manager.resolveIntentsWithExtraBatch(txn_id, status, commit_version, extra_batch);
     }
 
@@ -3063,7 +3176,10 @@ pub fn openCoreResourcesFromPrimaryStore(
     const store = try alloc.create(docstore_mod.DocStore);
     store.* = opened_primary.store;
     owned_store = store;
-    if (!read_only) try @import("../artifact_footprint.zig").initializeEmpty(store);
+    if (!read_only) {
+        try @import("../artifact_footprint.zig").initializeEmpty(store);
+        try @import("../artifact_replay_inventory.zig").initialize(store);
+    }
 
     const change_journal = try alloc.create(change_journal_mod.Journal);
     owned_change_journal = change_journal;
@@ -3253,7 +3369,7 @@ pub fn clearAllKeysFromStore(alloc: Allocator, store: *docstore_mod.DocStore) !v
     var deletes = std.ArrayListUnmanaged([]const u8).empty;
     defer deletes.deinit(alloc);
     for (keys) |item| {
-        if (@import("../artifact_footprint.zig").isKey(item.key)) continue;
+        if (@import("../artifact_footprint.zig").isKey(item.key) or std.mem.eql(u8, item.key, @import("../artifact_replay_inventory.zig").marker_key)) continue;
         try deletes.append(alloc, item.key);
     }
     try store.putBatch(&.{}, deletes.items);
@@ -3299,7 +3415,7 @@ pub fn importStoreSnapshotWithIo(
         defer alloc.free(writes);
         var count: usize = 0;
         for (decoded.entries[offset..end]) |entry| {
-            if (@import("../artifact_footprint.zig").isKey(entry.key)) continue;
+            if (@import("../artifact_footprint.zig").isKey(entry.key) or @import("../artifact_replay_inventory.zig").isMetadataKey(entry.key)) continue;
             writes[count] = .{
                 .key = entry.key,
                 .value = entry.value,
@@ -3576,7 +3692,7 @@ fn importStreamingStoreSnapshot(
         errdefer if (key_owned) alloc.free(key);
         if (try file.readPositionalAll(io, key, offset) != key.len) return error.InvalidTableFile;
         offset += key_len_u64;
-        if (@import("../artifact_footprint.zig").isKey(key)) {
+        if (@import("../artifact_footprint.zig").isKey(key) or @import("../artifact_replay_inventory.zig").isMetadataKey(key)) {
             // Never import source-local certification/cursors into a different
             // physical store. Actual imported family mutations update ours.
             alloc.free(key);

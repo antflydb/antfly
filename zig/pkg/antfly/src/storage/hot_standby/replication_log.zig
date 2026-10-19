@@ -42,12 +42,36 @@ pub const Entry = struct {
     }
 };
 
+/// A synchronous borrow, never an owned entry. Encoded and payload slices
+/// expire when the visiting callback returns.
+pub const EntryView = struct {
+    wal_lsn: u64,
+    encoded: []const u8,
+    record: replication_record.RecordView,
+};
+
+fn decodeEntry(wal_entry: wal_mod.WalEntry) !replication_record.RecordView {
+    return decodeEntryWithAdmission(wal_entry, null);
+}
+
+fn decodeEntryWithAdmission(wal_entry: wal_mod.WalEntry, control: ?@import("antfly_local_sources").common_read_admission.Port) !replication_record.RecordView {
+    const decoded = try replication_record.decodeWithAdmission(wal_entry.data, control);
+    if (decoded.lsn != wal_entry.lsn) return error.RecordWalLsnMismatch;
+    const next = std.math.add(u64, decoded.previous_lsn, 1) catch return error.RecordPreviousLsnMismatch;
+    if (next != decoded.lsn) return error.RecordPreviousLsnMismatch;
+    return decoded;
+}
+
 pub const ReplicationLog = struct {
     wal: wal_mod.WAL,
 
     pub fn open(path: [*:0]const u8, options: OpenOptions) !ReplicationLog {
+        return openWithAllocator(std.heap.page_allocator, path, options);
+    }
+
+    pub fn openWithAllocator(allocator: Allocator, path: [*:0]const u8, options: OpenOptions) !ReplicationLog {
         return .{
-            .wal = try wal_mod.WAL.open(path, options.wal_options),
+            .wal = try wal_mod.WAL.openWithAllocator(allocator, path, options.wal_options),
         };
     }
 
@@ -77,6 +101,30 @@ pub const ReplicationLog = struct {
         return wal_lsn;
     }
 
+    /// Both encoding buffers and tail CRC work were funded before commit.
+    /// Backend working memory and I/O admission remain independent resources.
+    pub fn appendPrepared(self: *ReplicationLog, prepared: *replication_record.Prepared, wal_entry: *wal_mod.WAL.PreparedAppend, metadata: replication_record.Record) !u64 {
+        const expected_lsn = self.nextLsn();
+        if (metadata.lsn != expected_lsn) return error.UnexpectedRecordLsn;
+        if (metadata.previous_lsn != expected_lsn - 1) return error.UnexpectedPreviousLsn;
+        const encoded = try prepared.seal(metadata);
+        const wal_lsn = try wal_entry.publish(encoded[0..replication_record.header_size]);
+        if (wal_lsn != metadata.lsn) return error.WalLsnMismatch;
+        return wal_lsn;
+    }
+
+    pub fn appendIfRecoveryPosition(self: *ReplicationLog, alloc: Allocator, position: wal_mod.RecoveryPosition, record: replication_record.Record, original: @import("antfly_local_sources").common_read_admission.Port) !wal_mod.RecoveryAppendResult {
+        var retained: @import("antfly_local_sources").common_read_admission.RetainedDependency = .{};
+        const control = retained.bind(original).?;
+        try control.checkpoint();
+        if (position.next_lsn == 0 or record.lsn != position.next_lsn) return error.UnexpectedRecordLsn;
+        if (record.previous_lsn != position.next_lsn - 1) return error.UnexpectedPreviousLsn;
+        const encoded = try replication_record.encodeAlloc(alloc, record);
+        defer alloc.free(encoded);
+        try control.checkpoint();
+        return self.wal.appendIfRecoveryPosition(position, encoded, control);
+    }
+
     pub fn bootstrapAt(self: *ReplicationLog, alloc: Allocator, record: replication_record.Record) !u64 {
         if (self.lastLsn() != 0) return error.ReplicationLogNotEmpty;
         if (record.lsn == 0) return error.InvalidBootstrapLsn;
@@ -101,9 +149,7 @@ pub const ReplicationLog = struct {
         }
 
         for (wal_entries) |wal_entry| {
-            const decoded = try replication_record.decode(wal_entry.data);
-            if (decoded.lsn != wal_entry.lsn) return error.RecordWalLsnMismatch;
-            if (decoded.previous_lsn + 1 != decoded.lsn) return error.RecordPreviousLsnMismatch;
+            _ = try decodeEntry(wal_entry);
 
             const owned = try alloc.dupe(u8, wal_entry.data);
             errdefer alloc.free(owned);
@@ -121,14 +167,34 @@ pub const ReplicationLog = struct {
     pub fn entryAt(self: *ReplicationLog, alloc: Allocator, lsn: u64) !?Entry {
         const wal_entry = (try self.wal.readAt(alloc, lsn)) orelse return null;
         errdefer alloc.free(wal_entry.data);
-        const decoded = try replication_record.decode(wal_entry.data);
-        if (decoded.lsn != wal_entry.lsn) return error.RecordWalLsnMismatch;
-        if (decoded.previous_lsn + 1 != decoded.lsn) return error.RecordPreviousLsnMismatch;
+        const decoded = try decodeEntry(wal_entry);
         return .{
             .wal_lsn = wal_entry.lsn,
             .encoded = wal_entry.data,
             .record = decoded,
         };
+    }
+
+    /// Decode and inspect an exact retained record while its WAL bytes remain
+    /// borrowed. This preserves entryAt's envelope/continuity validation while
+    /// removing the caller's payload-sized allocation from read-only matching.
+    pub fn withEntryAt(self: *ReplicationLog, lsn: u64, context: anytype, comptime callback: fn (@TypeOf(context), EntryView) anyerror!void) !bool {
+        return self.withEntryAtWithAdmission(lsn, null, context, callback);
+    }
+
+    pub fn withEntryAtWithAdmission(self: *ReplicationLog, lsn: u64, original: ?@import("antfly_local_sources").common_read_admission.Port, context: anytype, comptime callback: fn (@TypeOf(context), EntryView) anyerror!void) !bool {
+        var retained: @import("antfly_local_sources").common_read_admission.RetainedDependency = .{};
+        const control = retained.bind(original);
+        const Adapter = struct {
+            user: @TypeOf(context),
+            control: ?@import("antfly_local_sources").common_read_admission.Port,
+            fn visit(self_adapter: *@This(), entry: wal_mod.WalEntry) !void {
+                const decoded = try decodeEntryWithAdmission(entry, self_adapter.control);
+                try callback(self_adapter.user, .{ .wal_lsn = entry.lsn, .encoded = entry.data, .record = decoded });
+            }
+        };
+        var adapter: Adapter = .{ .user = context, .control = control };
+        return self.wal.withEntryAtWithAdmission(lsn, control, &adapter, Adapter.visit);
     }
 
     pub fn encodedByteCount(self: *ReplicationLog, from_lsn: u64, to_lsn: u64) !u64 {
@@ -169,18 +235,14 @@ const RetainedAgeContext = struct {
 
 fn countEncodedBytes(context: *EncodedByteCountContext, entry: wal_mod.WalEntry) !wal_mod.WAL.ScanAction {
     if (entry.lsn > context.to_lsn) return .stop;
-    const decoded = try replication_record.decode(entry.data);
-    if (decoded.lsn != entry.lsn) return error.RecordWalLsnMismatch;
-    if (decoded.previous_lsn + 1 != decoded.lsn) return error.RecordPreviousLsnMismatch;
+    _ = try decodeEntry(entry);
     context.total += @intCast(entry.data.len);
     return .@"continue";
 }
 
 fn scanRetainedAge(context: *RetainedAgeContext, entry: wal_mod.WalEntry) !wal_mod.WAL.ScanAction {
     if (entry.lsn > context.to_lsn) return .stop;
-    const decoded = try replication_record.decode(entry.data);
-    if (decoded.lsn != entry.lsn) return error.RecordWalLsnMismatch;
-    if (decoded.previous_lsn + 1 != decoded.lsn) return error.RecordPreviousLsnMismatch;
+    const decoded = try decodeEntry(entry);
     if (decoded.commit_timestamp_ns > 0) {
         context.has_timestamp = true;
         context.min_timestamp_ns = @min(context.min_timestamp_ns, decoded.commit_timestamp_ns);
@@ -448,4 +510,48 @@ test "storage.hot_standby replication log bootstraps an empty log at a checkpoin
         try std.testing.expectEqual(@as(u64, 10), entries[0].record.lsn);
         try std.testing.expectEqual(replication_record.RecordKind.checkpoint, entries[0].record.kind);
     }
+}
+
+test "WAL borrowed replication entry preserves envelope checks and callback failures" {
+    const alloc = std.testing.allocator;
+    const path = try testPath(alloc, "borrowed-entry");
+    defer alloc.free(path);
+    var log = try ReplicationLog.open(path.ptr, .{});
+    defer log.close();
+    _ = try log.append(alloc, baseRecord(1, "one"));
+    const Visit = struct {
+        calls: usize = 0,
+        reject: bool = false,
+        fn run(self: *@This(), entry: EntryView) !void {
+            try std.testing.expectEqual(@as(u64, 1), entry.wal_lsn);
+            try std.testing.expectEqualStrings("one", entry.record.payload);
+            try std.testing.expectEqualSlices(u8, entry.encoded[replication_record.header_size..], entry.record.payload);
+            self.calls += 1;
+            if (self.reject) return error.InjectedWalVisitRejection;
+        }
+    };
+    var visit: Visit = .{};
+    try std.testing.expect(try log.withEntryAt(1, &visit, Visit.run));
+    try std.testing.expect(!try log.withEntryAt(99, &visit, Visit.run));
+    visit.reject = true;
+    try std.testing.expectError(error.InjectedWalVisitRejection, log.withEntryAt(1, &visit, Visit.run));
+    try std.testing.expectEqual(@as(usize, 2), visit.calls);
+    // A valid outer WAL checksum cannot excuse a corrupt logical envelope.
+    const bad = try replication_record.encodeAlloc(alloc, baseRecord(2, "bad"));
+    defer alloc.free(bad);
+    bad[replication_record.header_size] ^= 1;
+    _ = try log.wal.append(bad);
+    try std.testing.expectError(error.PayloadCrcMismatch, log.withEntryAt(2, &visit, Visit.run));
+    // Overflowing predecessor metadata is a typed corruption error, not a trap.
+    var invalid = baseRecord(3, "invalid predecessor");
+    invalid.previous_lsn = std.math.maxInt(u64);
+    const overflow = try replication_record.encodeAlloc(alloc, invalid);
+    defer alloc.free(overflow);
+    _ = try log.wal.append(overflow);
+    try std.testing.expectError(error.RecordPreviousLsnMismatch, log.withEntryAt(3, &visit, Visit.run));
+    try std.testing.expectError(error.RecordPreviousLsnMismatch, log.entryAt(alloc, 3));
+    try std.testing.expectError(error.RecordPreviousLsnMismatch, log.iterateFrom(alloc, 3));
+    try std.testing.expectError(error.RecordPreviousLsnMismatch, log.encodedByteCount(3, 3));
+    try std.testing.expectError(error.RecordPreviousLsnMismatch, log.retainedAgeNs(3, 3));
+    try std.testing.expectEqual(@as(usize, 2), visit.calls);
 }

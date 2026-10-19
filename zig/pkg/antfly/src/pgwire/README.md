@@ -44,6 +44,11 @@ accept integer milliseconds or quoted `ms`, `s`, and `min` units. Session change
 inside a transaction commit/roll back with it; local changes expire at the
 transaction boundary; savepoint rollback restores both values. Zero disables
 the client-requested timeout but never the operator's hard statement deadline.
+A shorter client timeout bounds backend work, including admission waiting, while
+the socket watchdog retains the configured hard limit. This lets cooperative
+expiry return SQLSTATE `57014` and preserve the connection. The hard limit still
+shuts down transport; no client setting extends it or refreshes a retained
+snapshot's original deadline.
 `SET [SESSION|LOCAL] application_name`, `SHOW application_name`, and
 `RESET application_name` accept at most 128 bytes of UTF-8 text without
 control characters. Startup `application_name` obeys the same bound. Local and

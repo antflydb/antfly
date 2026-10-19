@@ -98,6 +98,36 @@ pub const MutationBarrier = struct {
             return lease;
         }
 
+        /// Only before a decision: a non-lending caller must not occupy the
+        /// resume capacity of a capture that has closed reader admission.
+        /// An already-held root borrows without reacquiring behind that capture.
+        pub fn borrowPhasePreDecisionControlled(self: *@This(), io: std.Io, controls: anytype) !SharedLease {
+            const opened = !self.held;
+            if (opened) {
+                if (self.borrowers.load(.acquire) != 0) return error.InvalidRunnableTransition;
+                self.* = try self.barrier.acquireSharedRootPreDecisionControlled(io, controls);
+            }
+            errdefer if (opened) self.retirePhase() catch unreachable;
+            var lease = try self.borrowControlled(controls);
+            lease.phase_owner = opened;
+            return lease;
+        }
+
+        /// Recovery may yield with its durable obligation intact. Open one
+        /// phase without waiting for capture; an already-held root only borrows
+        /// its reader and cannot get stuck behind a newly waiting writer.
+        pub fn tryBorrowPhase(self: *@This()) !?SharedLease {
+            const opened = !self.held;
+            if (opened) {
+                if (self.borrowers.load(.acquire) != 0) return error.InvalidRunnableTransition;
+                if (!self.barrier.tryLockShared()) return null;
+                self.held = true;
+            }
+            var lease = self.borrow();
+            lease.phase_owner = opened;
+            return lease;
+        }
+
         /// Mandatory legacy helpers retain their existing noncancelable wait.
         /// A retired root enters independently of unrelated thread-local leases.
         pub fn borrowPhase(self: *@This()) SharedLease {
@@ -169,6 +199,21 @@ pub const MutationBarrier = struct {
         return lease;
     }
 
+    /// Pre-decision acquisition preserves the caller's original scope. No
+    /// physical reader or thread-local nesting authority survives rejection.
+    pub fn acquireSharedRootPreDecisionControlled(self: *@This(), io: std.Io, controls: anytype) !RootSharedLease {
+        if (controls.executionBoundary() != null) return self.acquireSharedRootControlled(io, controls);
+        try controls.checkpoint();
+        if (!self.tryLockShared()) {
+            try controls.checkpoint();
+            return error.Backpressured;
+        }
+        var lease: RootSharedLease = .{ .barrier = self };
+        errdefer lease.release();
+        try controls.checkpoint();
+        return lease;
+    }
+
     pub const ExclusiveLease = struct {
         barrier: *MutationBarrier,
 
@@ -208,6 +253,21 @@ pub const MutationBarrier = struct {
         shared_barrier = self;
         shared_depth = 1;
         var lease: SharedLease = .{ .barrier = self };
+        errdefer lease.release();
+        try controls.checkpoint();
+        return lease;
+    }
+
+    /// Compatibility nesting still belongs to the caller's existing legacy
+    /// operation; fresh explicit roots must use the root acquisition above.
+    pub fn acquireSharedPreDecisionControlled(self: *@This(), io: std.Io, controls: anytype) !SharedLease {
+        if (controls.executionBoundary() != null) return self.acquireSharedControlled(io, controls);
+        try controls.checkpoint();
+        if (shared_barrier) |held| if (held != self) return error.InvalidArgument;
+        var lease = self.tryAcquireShared() orelse {
+            try controls.checkpoint();
+            return error.Backpressured;
+        };
         errdefer lease.release();
         try controls.checkpoint();
         return lease;

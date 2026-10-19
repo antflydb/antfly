@@ -89,6 +89,8 @@ pub const Stream = struct {
     data_buf: std.ArrayListUnmanaged(u8) = .empty,
     data_allocator: ?Allocator = null,
     protected_body_deadline_ms: ?i64 = null,
+    /// Original request lifetime, established once before handler publication.
+    request_deadline_ms: i64 = 0,
     /// Error from RST_STREAM or connection error, set by the receive loop.
     stream_error: ?anyerror = null,
     /// True once the receive loop has delivered HEADERS for this stream.

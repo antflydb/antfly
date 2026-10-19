@@ -393,6 +393,7 @@ pub const Directory = struct {
         errdefer allocator.destroy(payload);
         var owned = try repository.cloneRunCompactionSnapshot(allocator, run);
         errdefer owned.deinit(allocator);
+        try owned.ensureReadIdentity();
         try backend.retainRunSnapshotRef(&owned);
         const release = struct {
             fn call(ctx: *anyopaque, value: *Run) void {
@@ -528,8 +529,21 @@ pub const Directory = struct {
         visited: usize = 0,
 
         pub fn next(self: *@This()) ?Handle {
+            var budget: usize = std.math.maxInt(usize);
+            return self.nextWithBudget(&budget);
+        }
+
+        pub fn done(self: *const @This()) bool {
+            return self.descend == null and self.len == 0;
+        }
+
+        /// A null result can mean quantum exhaustion; consult done before
+        /// concluding absence. Both descents and pops spend metadata credits.
+        pub fn nextWithBudget(self: *@This(), budget: *usize) ?Handle {
             while (true) {
                 while (self.descend) |node| {
+                    if (budget.* == 0) return null;
+                    budget.* -= 1;
                     self.visited += 1;
                     const lower = node.summary.smallest.?;
                     const upper = node.summary.largest.?;
@@ -544,6 +558,8 @@ pub const Directory = struct {
                     self.descend = node.left;
                 }
                 if (self.len == 0) return null;
+                if (budget.* == 0) return null;
+                budget.* -= 1;
                 self.len -= 1;
                 const node = self.path[self.len];
                 self.descend = node.right;
@@ -1420,6 +1436,28 @@ test "directory direct point traversal matches overlap sort and preserves forked
                     try std.testing.expectEqual(expected.revision, actual.revision);
                 }
                 try std.testing.expect(direct.next() == null);
+                for ([_]usize{ 1, 2, 7, 64 }) |limit| {
+                    var bounded = source.readPoint(ns, key);
+                    var zero: usize = 0;
+                    try std.testing.expect(bounded.nextWithBudget(&zero) == null);
+                    try std.testing.expectEqual(@as(usize, 0), bounded.visited);
+                    var count: usize = 0;
+                    var steps: usize = 0;
+                    while (!bounded.done()) {
+                        var credits = limit;
+                        if (bounded.nextWithBudget(&credits)) |handle| {
+                            try std.testing.expect(count < selected.items.len);
+                            try std.testing.expectEqual(selected.items[count].run.id, handle.run.id);
+                            try std.testing.expectEqual(selected.items[count].revision, handle.revision);
+                            count += 1;
+                        }
+                        try std.testing.expect(credits < limit);
+                        steps += 1;
+                        try std.testing.expect(steps <= 2 * source.count() + 1);
+                    }
+                    try std.testing.expectEqual(selected.items.len, count);
+                    try std.testing.expectEqual(direct.visited, bounded.visited);
+                }
                 if (ns != null and (std.mem.eql(u8, ns.?, "other") or std.mem.eql(u8, ns.?, "docs") and std.mem.eql(u8, key, "zz"))) try std.testing.expectEqual(@as(usize, 1), direct.visited);
             }
         }

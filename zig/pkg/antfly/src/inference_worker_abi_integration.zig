@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Real private worker transport gate. The child enters the production archive
 //! through the process ABI; the parent uses the production worker client.
@@ -84,13 +96,14 @@ pub fn main(init: std.process.Init) !void {
     } else |err| if (err != error.InvalidRunnableDemand) return err;
     client.deinit();
     live = false;
-    if (budget.refs != 0 or budget.leases != 0) return error.WorkerOwnershipLeaked;
+    if (budget.refs != 0 or budget.leases != 0 or budget.transient_bytes != 0) return error.WorkerOwnershipLeaked;
 }
 
 const Budget = struct {
     refs: usize = 0,
     leases: usize = 0,
     next_lease: usize = 1,
+    transient_bytes: u64 = 0,
     fn retain(raw: *anyopaque) callconv(.c) u8 {
         const self: *Budget = @ptrCast(@alignCast(raw));
         self.refs += 1;
@@ -117,8 +130,14 @@ const Budget = struct {
     fn observe(_: *anyopaque, _: usize, _: u64, _: u64) callconv(.c) u8 {
         return 1;
     }
+    fn adjust(raw: *anyopaque, _: usize, previous: u64, next: u64) callconv(.c) u8 {
+        const self: *Budget = @ptrCast(@alignCast(raw));
+        if (self.transient_bytes != previous) return 0;
+        self.transient_bytes = next;
+        return 1;
+    }
     fn port(self: *Budget) bridge.ResourceBudget {
-        return .{ .abi_version = bridge.abi_version, .context = self, .retain_context = retain, .release_context = release, .reserve_admission = reserve, .retain_admission = retainLease, .release_admission = releaseLease, .observe_prompt_cache = observe, .observe_tokenizer_cache = observe };
+        return .{ .abi_version = bridge.abi_version, .context = self, .retain_context = retain, .release_context = release, .reserve_admission = reserve, .retain_admission = retainLease, .release_admission = releaseLease, .observe_prompt_cache = observe, .observe_tokenizer_cache = observe, .adjust_transient_host = adjust };
     }
 };
 

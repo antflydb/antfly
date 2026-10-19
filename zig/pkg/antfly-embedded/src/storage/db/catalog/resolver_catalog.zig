@@ -65,7 +65,9 @@ fn cloneLabels(alloc: Allocator, labels: []const []const u8) ![]const []const u8
 pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
 pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";
 pub const graph_expiration_namespace_reader_version: u32 = 4;
-pub const supported_reader_version: u32 = graph_expiration_namespace_reader_version;
+/// Permanent opt-in for durable required-preparation records and accepted effects.
+pub const prepared_transaction_reader_version: u32 = 5;
+pub const supported_reader_version: u32 = prepared_transaction_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
@@ -73,6 +75,7 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         2 => "2",
         3 => "3",
         4 => "4",
+        5 => "5",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }
@@ -917,12 +920,12 @@ test "graph ttl migration catalog epoch remains authoritative with replacement f
     defer a.free(fenced);
     try std.testing.expectEqual(@as(u32, 4), try catalogReaderVersion(a, fenced));
     try std.testing.expectEqualStrings("4", try readerVersionBytes(4));
-    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readerVersionBytes(5));
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, readerVersionBytes(6));
 }
 
 test "ordered artifact inventory resolver catalog serialization preserves explicit envelope" {
     const a = std.testing.allocator;
-    for ([_]u32{ 1, 2, 3, 4 }) |version| {
+    for ([_]u32{ 1, 2, 3, 4, 5 }) |version| {
         const encoded = try serializeCatalogWithMinimumVersion(a, &.{}, version);
         defer a.free(encoded);
         try std.testing.expectEqual(version, try catalogReaderVersion(a, encoded));
@@ -934,5 +937,5 @@ test "ordered artifact inventory resolver catalog serialization preserves explic
         try std.testing.expectEqualStrings(encoded, roundtrip);
     }
     try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 0));
-    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 5));
+    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 6));
 }

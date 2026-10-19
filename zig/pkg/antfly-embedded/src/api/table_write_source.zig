@@ -26,6 +26,40 @@ const backend_types = @import("../storage/backend_types.zig");
 const table_create_contract = @import("table_create_contract.zig");
 const backup_contract = @import("backup_contract.zig");
 const distributed_txn = @import("distributed_txn_contract.zig");
+
+test "controlled group batch context preserves aware dispatch and rejects legacy fence loss" {
+    const State = struct {
+        calls: usize = 0,
+        received: distributed_txn.PreDecisionContext = .{},
+        fn top(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnexpectedTopLevelBatch;
+        }
+        fn legacy(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            const scope: *@This() = @ptrCast(@alignCast(raw));
+            scope.calls += 1;
+            return {};
+        }
+        fn aware(raw: *anyopaque, _: std.mem.Allocator, group: u64, table: []const u8, _: db_mod.types.BatchRequest, context: distributed_txn.PreDecisionContext) !?void {
+            const scope: *@This() = @ptrCast(@alignCast(raw));
+            scope.calls += 1;
+            scope.received = context;
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqualStrings("rows", table);
+            return error.CatalogGenerationChanged;
+        }
+    };
+    var state: State = .{};
+    const aware_source: TableWriteSource = .{ .ptr = &state, .vtable = &.{ .batch = State.top, .batch_group_local = State.legacy, .batch_group_local_with_pre_decision_context = State.aware } };
+    const context: distributed_txn.PreDecisionContext = .{ .deadline_ns = 123, .restore_staging_scope = @splat(4), .restore_staging_plan_id = @splat(5) };
+    try std.testing.expectError(error.CatalogGenerationChanged, aware_source.batchGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "rows", .{}, context));
+    try std.testing.expectEqualDeep(context, state.received);
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    const legacy_source: TableWriteSource = .{ .ptr = &state, .vtable = &.{ .batch = State.top, .batch_group_local = State.legacy } };
+    try std.testing.expectError(error.UnsupportedOperation, legacy_source.batchGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "rows", .{}, context));
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    _ = try legacy_source.batchGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "rows", .{}, .{});
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+}
 const table_drop_contract = @import("table_drop_contract.zig");
 const metadata_api = @import("../metadata/catalog_mutation_stamp.zig");
 const runtime_status = @import("runtime_status.zig");
@@ -286,6 +320,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             req: db_mod.types.BatchRequest,
         ) anyerror!?void = null,
+        batch_group_local_with_pre_decision_context: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, db_mod.types.BatchRequest, distributed_txn.PreDecisionContext) anyerror!?void = null,
         txn_begin_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1130,6 +1165,14 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.batch_group_local orelse return null;
         return try BoundaryAbi.call("batch_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req });
+    }
+
+    pub fn batchGroupLocalWithPreDecisionContext(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest, context: distributed_txn.PreDecisionContext) !?void {
+        const callback = self.vtable.batch_group_local_with_pre_decision_context orelse {
+            if (context.requiresAwareCallback()) return error.UnsupportedOperation;
+            return self.batchGroupLocal(alloc, group_id, table_name, req);
+        };
+        return BoundaryAbi.call("batch_group_local_with_pre_decision_context", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, req, context });
     }
 
     pub fn txnBeginGroupLocal(

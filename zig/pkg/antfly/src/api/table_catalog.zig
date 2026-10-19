@@ -130,6 +130,7 @@ pub const CatalogSource = struct {
         /// Fresh route resolution used only to validate a previously selected
         /// capability after consistency barriers or structural admission.
         validate_route: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, deadline_ns: ?u64) anyerror!RouteResult = null,
+        validate_route_with_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, RouteQuery, RoutingBudget) anyerror!RouteResult = null,
         wait_for_routing_change: *const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, probe_interval_ns: u64) anyerror!CatalogChangeWaitResult = defaultWaitForRoutingChange,
         await_route: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, deadline_ns: u64, probe_interval_ns: u64) anyerror!AwaitRouteResult = null,
         /// Production sources must fail closed when either linearizable
@@ -226,6 +227,7 @@ pub const CatalogSource = struct {
                 .acquire_routing_generation = metadataServiceAcquireRoutingGeneration,
                 .routing_snapshot = metadataServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
+                .validate_route_with_admission = metadataServiceValidateRouteWithAdmission,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
@@ -250,6 +252,7 @@ pub const CatalogSource = struct {
                 .acquire_routing_generation = metadataHttpServiceAcquireRoutingGeneration,
                 .routing_snapshot = metadataHttpServiceRoutingSnapshot,
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
+                .validate_route_with_admission = metadataHttpServiceValidateRouteWithAdmission,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
@@ -274,6 +277,7 @@ pub const CatalogSource = struct {
                 .acquire_routing_generation = metadataServerAcquireRoutingGeneration,
                 .routing_snapshot = metadataServerRoutingSnapshot,
                 .table_routing_snapshot = metadataServerTableRoutingSnapshot,
+                .validate_route_with_admission = metadataServerValidateRouteWithAdmission,
                 .linearizable_routing_snapshot = metadataServerLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServerLinearizableTableRoutingSnapshot,
                 .free_routing_snapshot = metadataServerFreeRoutingSnapshot,
@@ -632,6 +636,7 @@ pub const RoutingSession = struct {
         .route_fence = routeFence,
         .resolve_route = resolvePinnedRoute,
         .validate_route = resolveObservedRoute,
+        .validate_route_with_admission = resolveObservedRouteWithAdmission,
         .wait_for_routing_change = waitForRoutingChange,
         .requires_linearizable_publication_fence = true,
         .validate_publication = validatePublication,
@@ -824,6 +829,17 @@ pub const RoutingSession = struct {
         // publication/structural validation retain their separate authority
         // paths through resolveCatalogRoute and publication contracts.
         return try resolveCatalogRoute(alloc, self.base, table_name, query, deadline_ns);
+    }
+
+    fn resolveObservedRouteWithAdmission(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !RouteResult {
+        const self = cast(ptr);
+        if (self.base.vtable.validate_route_with_admission != null)
+            return resolveCatalogRouteForValidationWithAdmission(alloc, self.base, table_name, query, budget);
+        try budget.checkpoint();
+        var result = try resolveObservedRoute(ptr, alloc, table_name, query, self.base.deadlineFrom(budget));
+        errdefer result.deinit(alloc);
+        try budget.checkpoint();
+        return result;
     }
 
     fn waitForRoutingChange(
@@ -2439,6 +2455,60 @@ fn resolveCatalogRouteForValidation(
     return try resolveCatalogRoute(alloc, catalog, table_name, query, deadline_ns);
 }
 
+fn resolveCatalogRouteForValidationWithAdmission(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, query: RouteQuery, input: RoutingBudget) !RouteResult {
+    const control = input.admission orelse return error.ExecutionWaitUnsupported;
+    try input.checkpoint();
+    var budget = catalog.budget(catalog.deadlineFrom(input));
+    budget.cancellation = input.cancellation;
+    budget.admission = control;
+    if (try control.deadlineNs()) |original| {
+        const translated = catalog.deadlineFrom(.{ .deadline_ns = original }).?;
+        budget.deadline_ns = @min(budget.deadline_ns orelse translated, translated);
+    }
+    var result = (if (catalog.vtable.validate_route_with_admission) |callback|
+        callback(catalog.ptr, alloc, table_name, query, budget)
+    else
+        resolveCatalogRouteForValidation(alloc, catalog, table_name, query, budget.deadline_ns)) catch |err| {
+        try control.checkLifetime();
+        return err;
+    };
+    errdefer result.deinit(alloc);
+    try budget.checkpoint();
+    return result;
+}
+
+/// The first-party point provider preserves eventual positives and confirms a
+/// miss through original read-index admission before returning absence. A clock
+/// and its deadline cross this boundary together; the service uses native time.
+pub fn metadataRouteWithAdmission(comptime Service: type, svc: *Service, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, input: RoutingBudget) !RouteResult {
+    const control = input.admission orelse return error.ExecutionWaitUnsupported;
+    var budget = input;
+    budget.deadline_ns = (RoutingBudget{}).deadlineFrom(input);
+    budget.io = null;
+    if (try control.deadlineNs()) |original| budget.deadline_ns = @min(budget.deadline_ns orelse original, original);
+    for ([_]bool{ false, true }) |authoritative| {
+        try budget.checkpoint();
+        if (authoritative) try svc.ensureLinearizableReadWithAdmission(.{ .deadline_ns = budget.deadline_ns, .cancellation = budget.cancellation }, control);
+        var snapshot = try svc.catalogTableRoutingSnapshot(table_name, budget.deadline_ns);
+        defer svc.freeCatalogRoutingSnapshot(&snapshot);
+        try budget.checkpoint();
+        if (try routePlanFromSnapshotWithBudget(alloc, snapshot, table_name, query, budget)) |plan| return .{ .found = plan };
+        if (authoritative) return .not_found;
+    }
+    unreachable;
+}
+
+fn metadataServiceValidateRouteWithAdmission(raw: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !RouteResult {
+    return metadataRouteWithAdmission(metadata_service.MetadataService, @ptrCast(@alignCast(raw)), alloc, table_name, query, budget);
+}
+fn metadataHttpServiceValidateRouteWithAdmission(raw: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !RouteResult {
+    return metadataRouteWithAdmission(metadata_service.MetadataHttpService, @ptrCast(@alignCast(raw)), alloc, table_name, query, budget);
+}
+fn metadataServerValidateRouteWithAdmission(raw: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query: RouteQuery, budget: RoutingBudget) !RouteResult {
+    const server: *metadata_server.MetadataServer = @ptrCast(@alignCast(raw));
+    return metadataRouteWithAdmission(metadata_service.MetadataHttpService, server.svc, alloc, table_name, query, budget);
+}
+
 /// Resolve one routing predicate from a compact projection. Eventual
 /// projections are sufficient for positive routes. Any miss is evaluated
 /// again after a compact linearizable barrier before it becomes authoritative.
@@ -2729,8 +2799,15 @@ pub fn validateCatalogRouteFenceUntil(
     fence: metadata_api.CatalogRouteFence,
     deadline_ns: ?u64,
 ) !void {
+    return validateCatalogRouteFenceControlled(alloc, catalog, table_name, fence, deadline_ns, null);
+}
+pub fn validateCatalogRouteFenceWithAdmission(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, fence: metadata_api.CatalogRouteFence, deadline_ns: ?u64, control: @import("antfly_local_sources").common_read_admission.Port) !void {
+    return validateCatalogRouteFenceControlled(alloc, catalog, table_name, fence, deadline_ns, control);
+}
+fn validateCatalogRouteFenceControlled(alloc: std.mem.Allocator, catalog: CatalogSource, table_name: []const u8, fence: metadata_api.CatalogRouteFence, deadline_ns: ?u64, control: ?@import("antfly_local_sources").common_read_admission.Port) !void {
+    if (control) |port| try port.checkpoint();
     try fence.validate();
-    var result = try resolveCatalogRouteForValidation(alloc, catalog, table_name, .{ .group = fence.route.group_id }, deadline_ns);
+    var result = if (control) |port| try resolveCatalogRouteForValidationWithAdmission(alloc, catalog, table_name, .{ .group = fence.route.group_id }, .{ .deadline_ns = deadline_ns, .io = catalog.io, .cancellation = fence.admission_cancellation, .admission = port }) else try resolveCatalogRouteForValidation(alloc, catalog, table_name, .{ .group = fence.route.group_id }, deadline_ns);
     defer result.deinit(alloc);
     const plan = switch (result) {
         .found => |value| value,
@@ -2746,6 +2823,7 @@ pub fn validateCatalogRouteFenceUntil(
     {
         return error.TopologyChanged;
     }
+    if (control) |port| try port.checkpoint();
 }
 
 /// Resolve a span and compute the routing epoch from one catalog snapshot.
@@ -4841,6 +4919,172 @@ fn consumerTests() type {
             var state = TestState{ .statuses = statuses[0..] };
             try validateDocIdentityReadyForTableStrict(std.testing.allocator, FakeCatalog.iface(&state), "docs");
             try validateResolvedDocFilterContextForGroups(std.testing.allocator, FakeCatalog.iface(&state), "docs", &.{ 7001, 7002 }, 7, 7001, 7001);
+        }
+        test "metadata route admission validates fresh ownership and bounds runtime waits" {
+            const a = std.testing.allocator;
+            const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+            const admission = @import("antfly_local_sources").common_read_admission;
+            const operation = @import("antfly_local_sources").api_operation;
+            const time = @import("antfly_platform").time;
+            const Mode = enum { hot, published, clock_domain, missing, owner_changed, canceled_mutex, canceled_acquired, canceled_quorum, expired_quorum, shutdown };
+            const Frame = struct {
+                execution: *native.Execution,
+                scheduler: *native.Scheduler,
+                mutex: *std.Io.Mutex,
+                mode: Mode,
+                deadline: u64,
+                initial_lock: bool = false,
+                after_wait: bool = false,
+                waits: usize = 0,
+                failure: ?anyerror = null,
+                pub fn checkLifetime(self: *@This()) !void {
+                    if (self.failure) |err| return err;
+                    try self.execution.checkLifetime();
+                }
+                pub fn checkpoint(self: *@This()) !void {
+                    try self.checkLifetime();
+                    try self.execution.checkpoint();
+                }
+                pub fn deadlineNs(self: *@This()) !?u64 {
+                    return self.deadline;
+                }
+                pub fn waitForProgress(_: *@This()) !void {
+                    return error.TestWrongProgressOwner;
+                }
+                pub fn executionBoundary(self: *@This()) ?@import("antfly_local_sources").common_execution_wait.Boundary {
+                    return .{ .ptr = self, .begin = begin, .end = end };
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.execution.park(.resource_blocked);
+                    try self.checkLifetime();
+                    self.waits += 1;
+                    try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+                    try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+                    try std.testing.expectEqual(@as(u64, 17), self.scheduler.stats().retained_bytes);
+                    var control: native.Execution = .{};
+                    try control.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                    if (self.initial_lock) {
+                        self.mutex.unlock(std.Options.debug_io);
+                        self.initial_lock = false;
+                    } else {
+                        // Quorum waits must not retain the runtime mutex.
+                        try std.testing.expect(self.mutex.tryLock());
+                        self.mutex.unlock(std.Options.debug_io);
+                    }
+                    control.finish();
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.after_wait = true;
+                    if (self.mode == .shutdown) self.scheduler.close();
+                    if (self.mode == .canceled_mutex or (self.mode == .canceled_quorum and self.waits == 2)) self.failure = error.Canceled;
+                    if (self.mode == .expired_quorum and self.waits == 2) self.failure = error.DeadlineExceeded;
+                    try self.checkLifetime();
+                    try self.execution.enter(.query);
+                }
+            };
+            const ProbeMutex = struct {
+                raw: std.Io.Mutex = .init,
+                frame: ?*Frame = null,
+                pub fn tryLock(self: *@This()) bool {
+                    if (!self.raw.tryLock()) return false;
+                    if (self.frame) |frame| if (frame.mode == .canceled_acquired and frame.after_wait) {
+                        frame.failure = error.Canceled;
+                    };
+                    return true;
+                }
+            };
+            const Service = struct {
+                runtime_mutex: ProbeMutex = .{},
+                frame: ?*Frame = null,
+                snapshots: usize = 0,
+                barriers: usize = 0,
+                pending: usize = 0,
+                barrier_done: bool = false,
+                tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "docs", .placement_role = "data", .indexes_json = "{}" }},
+                ranges: [1]metadata_table_manager.RangeRecord = .{.{ .group_id = 7001, .range_id = 7001, .table_id = 7, .start_key = "", .end_key = null }},
+                pub fn lockRuntime(self: *@This()) void {
+                    self.runtime_mutex.raw.lockUncancelable(std.Options.debug_io);
+                }
+                pub fn unlockRuntime(self: *@This()) void {
+                    self.runtime_mutex.raw.unlock(std.Options.debug_io);
+                }
+                pub fn ensureLinearizableReadWithAdmission(self: *@This(), request: operation.RequestContext, control: ?admission.Port) !void {
+                    self.barriers += 1;
+                    self.pending += 1;
+                    defer self.pending -= 1;
+                    try std.testing.expect(request.deadline_ns.? <= self.frame.?.deadline);
+                    try metadata_service.lockMetadataReadRuntime(@This(), self, request, control);
+                    self.unlockRuntime();
+                    try metadata_service.waitMetadataReadProgress(request, control);
+                    self.barrier_done = true;
+                }
+                fn adminSnapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const mode = if (self.frame) |frame| frame.mode else .hot;
+                    const absent = mode != .hot and (!self.barrier_done or mode == .missing);
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metadata_incarnation = if (mode == .owner_changed and self.barrier_done) "22222222222222222222222222222222".* else "11111111111111111111111111111111".*, .metrics = .{} },
+                        .tables = if (absent) &.{} else &self.tables,
+                        .ranges = if (absent) &.{} else &self.ranges,
+                        .stores = &.{},
+                        .placement_intents = &.{},
+                        .split_transitions = &.{},
+                        .merge_transitions = &.{},
+                    };
+                }
+                fn freeAdmin(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn snapshot(raw: *anyopaque, deadline: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.snapshots += 1;
+                    return TestAdminRoutingAdapter(adminSnapshot, freeAdmin).routingSnapshot(raw, deadline);
+                }
+                pub fn catalogTableRoutingSnapshot(self: *@This(), _: []const u8, deadline: ?u64) !metadata_api.CatalogRoutingSnapshot {
+                    return snapshot(self, deadline);
+                }
+                pub fn freeCatalogRoutingSnapshot(self: *@This(), value: *metadata_api.CatalogRoutingSnapshot) void {
+                    TestAdminRoutingAdapter(adminSnapshot, freeAdmin).freeRoutingSnapshot(self, value);
+                }
+                fn validate(raw: *anyopaque, alloc: std.mem.Allocator, table: []const u8, query: RouteQuery, budget: RoutingBudget) !RouteResult {
+                    return metadataRouteWithAdmission(@This(), @ptrCast(@alignCast(raw)), alloc, table, query, budget);
+                }
+            };
+            for ([_]Mode{ .hot, .published, .clock_domain, .missing, .owner_changed, .canceled_mutex, .canceled_acquired, .canceled_quorum, .expired_quorum, .shutdown }) |mode| {
+                var scheduling = try native.Scheduler.init(.{ .slots = 2 });
+                var execution: native.Execution = .{};
+                try execution.start(&scheduling, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+                defer execution.finish();
+                var service: Service = .{};
+                const source: CatalogSource = .{ .ptr = &service, .io = if (mode == .clock_domain) runtime_io_abi.Borrow.init(&std.testing.io) else null, .vtable = &.{ .admin_snapshot = Service.adminSnapshot, .free_admin_snapshot = Service.freeAdmin, .routing_snapshot = Service.snapshot, .linearizable_routing_snapshot = Service.snapshot, .free_routing_snapshot = TestAdminRoutingAdapter(Service.adminSnapshot, Service.freeAdmin).freeRoutingSnapshot, .validate_route_with_admission = Service.validate } };
+                var session = try RoutingSession.init(a, source, null);
+                defer session.deinit();
+                const catalog = session.catalog();
+                const fence = (try catalog.vtable.route_fence.?(catalog.ptr, 7001)).?;
+                service.snapshots = 0;
+                var frame: Frame = .{ .execution = &execution, .scheduler = &scheduling, .mutex = &service.runtime_mutex.raw, .mode = mode, .deadline = time.monotonicNs() + 5 * std.time.ns_per_s, .initial_lock = mode != .hot };
+                service.frame = &frame;
+                service.runtime_mutex.frame = &frame;
+                if (frame.initial_lock) try std.testing.expect(service.runtime_mutex.raw.tryLock());
+                var bridge: admission.Adapter(*Frame) = .{ .budget = &frame };
+                const payload = bridge.payload();
+                const result = validateCatalogRouteFenceWithAdmission(a, catalog, "docs", fence, catalog.deadlineFrom(.{ .deadline_ns = frame.deadline + std.time.ns_per_s }), .init(&payload));
+                if (mode == .hot or mode == .published or mode == .clock_domain) try result else try std.testing.expectError(switch (mode) {
+                    .missing, .owner_changed => error.TopologyChanged,
+                    .canceled_mutex, .canceled_acquired, .canceled_quorum => error.Canceled,
+                    .expired_quorum => error.DeadlineExceeded,
+                    .shutdown => error.SchedulerClosed,
+                    else => unreachable,
+                }, result);
+                try std.testing.expectEqual(@as(usize, 0), service.pending);
+                try std.testing.expectEqual(@as(usize, if (mode == .hot) 0 else 1), service.barriers);
+                try std.testing.expect(service.runtime_mutex.raw.tryLock());
+                service.runtime_mutex.raw.unlock(std.Options.debug_io);
+                try std.testing.expectEqual(@as(usize, if (mode == .hot) 0 else if (mode == .canceled_mutex or mode == .canceled_acquired or mode == .shutdown) 1 else 2), frame.waits);
+                execution.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduling.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduling.stats().retained_bytes);
+            }
         }
     };
     return Suite;

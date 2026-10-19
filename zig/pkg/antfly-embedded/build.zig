@@ -43,7 +43,10 @@ pub fn build(b: *std.Build) void {
         const step = composition.builder.top_level_steps.get(name) orelse @panic("missing composition step");
         b.step(name, step.description).dependOn(&step.step);
     }
-    for ([_][]const u8{ "antfly", "antfly-lite", "antfly_wasm" }) |name| {
+    // Mach-O uses a platform-owned link/install step rather than a Compile
+    // artifact. Preserve the existing artifact surface on other platforms.
+    if (target.result.ofmt != .macho) b.installArtifact(composition.artifact("antfly"));
+    for ([_][]const u8{ "antfly-lite", "antfly_wasm" }) |name| {
         b.installArtifact(composition.artifact(name));
     }
     // Importing a dependency never schedules its default step. Standalone

@@ -107,6 +107,8 @@ pub const TxnPreDecisionOutcome = enum {
 };
 
 pub const QueryResponse = struct {
+    /// Move the response's physical owner with its buffers, and release last.
+    retirement: @FieldType(http_common.HttpResponse, "retirement") = null,
     owner_allocator: ?std.mem.Allocator = null,
     content_type: ?[]u8 = null,
     identity_read_generation: ?u64 = null,
@@ -116,6 +118,7 @@ pub const QueryResponse = struct {
         const owner = self.owner_allocator orelse alloc;
         if (self.content_type) |content_type| owner.free(content_type);
         if (self.body.len > 0) owner.free(self.body);
+        if (self.retirement) |retained| retained.release(retained.ptr);
         self.* = undefined;
     }
 };
@@ -305,6 +308,7 @@ pub const ApiHttpClient = struct {
     /// Borrowed, scoped to one internal query/preflight client.
     prepared_query_routing: ?[]const u8 = null,
     execution_wait: ?@import("antfly_local_sources").common_execution_wait.Boundary = null,
+    execution_remote_query: ?http_common.RequestExecutor = null,
 
     pub fn init(alloc: std.mem.Allocator, executor: http_common.RequestExecutor) ApiHttpClient {
         return .{
@@ -1294,12 +1298,14 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         if (resp.status != 200) return error.UnexpectedHttpStatus;
         const response = QueryResponse{
+            .retirement = resp.retirement,
             .owner_allocator = resp.owner_allocator orelse self.alloc,
             .content_type = resp.content_type,
             .body = resp.body,
         };
         resp.content_type = null;
         resp.body = &.{};
+        resp.retirement = null;
         return response;
     }
 
@@ -1407,6 +1413,7 @@ pub const ApiHttpClient = struct {
             .body = body,
             .timeout_ms = timeout_ms,
             .cancellation = cancellation,
+            .execution_remote_query = self.execution_remote_query,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
@@ -1417,12 +1424,70 @@ pub const ApiHttpClient = struct {
             else => return error.UnexpectedHttpStatus,
         }
         const response = QueryResponse{
+            .retirement = resp.retirement,
             .owner_allocator = resp.owner_allocator orelse self.alloc,
             .identity_read_generation = try parseIdentityReadGenerationHeader(resp),
             .body = resp.body,
         };
         resp.body = &.{};
+        resp.retirement = null;
         return response;
+    }
+
+    pub const OwnedQueryDelivery = union(enum) {
+        response: struct { id: @import("../common/remote_attempts.zig").Id, value: QueryResponse },
+        uncertain: struct { id: @import("../common/remote_attempts.zig").Id, cause: anyerror },
+    };
+
+    /// The caller supplies trusted protocol/parent authority. Publication moves
+    /// the parent into the bounded outbox; HTTP success never proves retirement.
+    /// No legacy fallback or retry may replace an uncertain attempt identity.
+    pub fn fetchOwnedGroupQuery(
+        self: *ApiHttpClient,
+        protocol: *const @import("remote_attempt_client.zig").Client,
+        destination: usize,
+        operation: u128,
+        charged_bytes: usize,
+        deadline_ns: u64,
+        retained_parent: *?@import("../common/remote_attempts.zig").Retention,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        route_fence: ?[]const u8,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !OwnedQueryDelivery {
+        if (retained_parent.* == null) return error.InvalidRunnableTransition;
+        const table = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(table);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, table, routes.Routes.query_suffix });
+        defer self.alloc.free(path);
+        if (!@import("../internal/routes.zig").isOwnedGroupQuery(path)) return error.InvalidRemoteAttempt;
+        const envelope = try @import("owned_group_query.zig").encode(self.alloc, body, self.prepared_query_routing, route_fence);
+        defer self.alloc.free(envelope);
+        var scoped = protocol.*;
+        scoped.read_allocator = self.alloc;
+        const delivered = try scoped.dispatchReadRetained(destination, operation, charged_bytes, deadline_ns, .{ .method = .POST, .uri = path, .content_type = "application/json", .body = envelope, .cancellation = cancellation, .execution_wait = self.execution_wait }, retained_parent);
+        switch (delivered) {
+            .uncertain => |value| return .{ .uncertain = .{ .id = value.id, .cause = value.cause } },
+            .response => |value| {
+                var response = value.value;
+                defer response.deinit(self.alloc);
+                const failure: ?anyerror = switch (response.status) {
+                    200 => null,
+                    408, 504 => error.DeadlineExceeded,
+                    409 => remoteGroupConflictError(response.body),
+                    503 => remoteStorageReadUnavailableError(response.body),
+                    else => error.UnexpectedHttpStatus,
+                };
+                if (failure) |cause| return .{ .uncertain = .{ .id = value.id, .cause = cause } };
+                const generation = parseIdentityReadGenerationHeader(response) catch |cause| return .{ .uncertain = .{ .id = value.id, .cause = cause } };
+                if (generation == null) return .{ .uncertain = .{ .id = value.id, .cause = error.InvalidRemoteResponse } };
+                const result: QueryResponse = .{ .owner_allocator = response.owner_allocator orelse self.alloc, .body = response.body, .identity_read_generation = generation, .retirement = response.retirement };
+                response.body = &.{};
+                response.retirement = null;
+                return .{ .response = .{ .id = value.id, .value = result } };
+            },
+        }
     }
 
     pub fn fetchGroupQueryPreflight(
@@ -2082,8 +2147,9 @@ pub const ApiHttpClient = struct {
             503 => return remoteStorageReadUnavailableError(resp.body),
             else => return error.UnexpectedHttpStatus,
         }
-        const result: QueryResponse = .{ .body = resp.body, .owner_allocator = resp.owner_allocator orelse self.alloc };
+        const result: QueryResponse = .{ .body = resp.body, .owner_allocator = resp.owner_allocator orelse self.alloc, .retirement = resp.retirement };
         resp.body = &.{};
+        resp.retirement = null;
         return result;
     }
 
@@ -6584,4 +6650,215 @@ test "public graph metric borrowed wire edge batch endpoint capability" {
     var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
     try std.testing.expectError(error.GraphEdgesBatchUnsupported, client.fetchGroupGraphEdgesBatchWithControl("http://example.test", 7, "docs", "{}", null, null));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "internal query owner outbound group client binds routing and retains uncertain parents" {
+    const a = std.testing.allocator;
+    const attempts = @import("../common/remote_attempts.zig");
+    const protocol_mod = @import("remote_attempt_client.zig");
+    const Store = @import("../common/remote_fence_store.zig").Store;
+    const Mode = enum { success, loss, http_error, bad_generation, missing_generation };
+    const Probe = struct {
+        mode: Mode = .success,
+        calls: usize = 0,
+        releases: usize = 0,
+        response_releases: usize = 0,
+        waits: usize = 0,
+        resumes: usize = 0,
+        parent_deadline: u64 = 0,
+        response_budget: @import("../common/allocation_budget.zig").Shared,
+        fn release(raw: *anyopaque, _: usize, _: attempts.Id) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+        fn retireResponse(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.response_budget.stats().used_bytes == 0);
+            self.response_releases += 1;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waits += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.resumes += 1;
+        }
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(self.parent_deadline, request.cancellation.?.execution_deadline_ns.?);
+            try std.testing.expectEqualStrings("http://worker/internal/v1/groups/7/tables/docs%2Fpart/query", request.uri);
+            var credential = false;
+            for (request.headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, internal_service_auth.header_name)) credential = true;
+                try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, @import("prepared_query_routing.zig").header_name));
+                try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, route_metadata_api.catalog_route_fence_header));
+            }
+            try std.testing.expect(credential);
+            var envelope = try @import("owned_group_query.zig").decode(std.testing.allocator, request.body);
+            defer envelope.deinit();
+            try std.testing.expectEqualStrings("{\"limit\":1}", envelope.value.query);
+            try std.testing.expectEqualStrings("{\"index_name\":\"text_v2\"}", envelope.value.prepared_routing.?);
+            try std.testing.expectEqualStrings("{\"catalog_revision\":4}", envelope.value.route_fence.?);
+            const wait = request.execution_wait orelse return error.TestMissingRunnable;
+            try wait.beginWait();
+            defer wait.endWait() catch unreachable;
+            if (self.mode == .loss) return error.ConnectionResetByPeer;
+            const alloc = self.response_budget.allocator();
+            var result: http_common.HttpResponse = .{ .status = if (self.mode == .http_error) 503 else 200, .owner_allocator = alloc, .retirement = .{ .ptr = self, .release = retireResponse } };
+            errdefer result.deinit(alloc);
+            result.body = try alloc.dupe(u8, if (self.mode == .http_error) "ReadIndexTimeout" else "{\"responses\":[]}");
+            if (self.mode != .missing_generation) {
+                const name = try alloc.dupe(u8, query_response.QueryResponse.identity_read_generation_header);
+                errdefer alloc.free(name);
+                const value = try alloc.dupe(u8, if (self.mode == .bad_generation) "invalid" else "42");
+                errdefer alloc.free(value);
+                result.headers = try alloc.alloc(http_common.Header, 1);
+                result.headers[0] = .{ .name = name, .value = value };
+            }
+            return result;
+        }
+    };
+    var probe = Probe{ .response_budget = .{ .child = a, .limit = 65536 } };
+    const executor: http_common.RequestExecutor = .{ .ptr = &probe, .vtable = &.{ .execute = Probe.execute } };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try Store.create(a, std.testing.io, tmp.dir, 11, 2);
+    defer store.deinit();
+    var slots: [1]?attempts.Attempt = undefined;
+    var destinations = [_]attempts.Destination{.{ .worker_incarnation = 22, .max_attempts = 1, .max_bytes = 65536 }};
+    var ledger = try store.startCoordinator(7, 0, &slots, &destinations, 65536);
+    // Explicit trusted fixture proof. HTTP responses below never retire a slot.
+    try ledger.acknowledgeFence(0, .{ .coordinator = 7, .generation = ledger.generationState().generation, .worker_incarnation = 22 });
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
+    var targets = [_]protocol_mod.Target{.{ .base_uri = "http://worker", .authority = .{ .local = .{ .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .node_id = 9, .store_id = 13, .root_incarnation = 22, .reporter_incarnation = 17 }, .public_key = pair.public_key.toBytes() } }};
+    const protocol: protocol_mod.Client = .{ .ledger = &ledger, .store = &store, .targets = &targets, .signing = .{ .secret = "owned-query-client-service-secret-32-bytes", .issuer = "cluster" }, .read_allocator = a, .control_allocator = a, .read_executor = executor, .control_executor = executor };
+    var client = ApiHttpClient.init(a, executor);
+    client.prepared_query_routing = "{\"index_name\":\"text_v2\"}";
+    client.execution_wait = .{ .ptr = &probe, .begin = Probe.begin, .end = Probe.end };
+    const root: attempts.Id = .{ .coordinator = 7, .generation = 1, .operation = 99, .sequence = 1 };
+    const until = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    var unpublished: ?attempts.Retention = .{ .context = &probe, .index = 0, .id = root, .release_fn = Probe.release };
+    defer if (unpublished) |retained| retained.release();
+    try std.testing.expectError(error.UnsupportedRemoteAttemptProtocol, client.fetchOwnedGroupQuery(&protocol, 0, 71, 65536, until, &unpublished, 7, "docs/part", "{\"limit\":1}", "{\"catalog_revision\":4}", null));
+    try std.testing.expect(unpublished != null);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().attempts);
+    unpublished.?.release();
+    unpublished = null;
+    targets[0].owned_reads_v1 = true; // Trusted fixture activation only.
+    var missing: ?attempts.Retention = null;
+    try std.testing.expectError(error.InvalidRunnableTransition, client.fetchOwnedGroupQuery(&protocol, 0, 71, 65536, until, &missing, 7, "docs/part", "{\"limit\":1}", "{\"catalog_revision\":4}", null));
+    var expired: ?attempts.Retention = .{ .context = &probe, .index = 0, .id = root, .release_fn = Probe.release, .deadline_ns = 1 };
+    defer if (expired) |retained| retained.release();
+    try std.testing.expectError(error.DeadlineExceeded, client.fetchOwnedGroupQuery(&protocol, 0, 71, 65536, until, &expired, 7, "docs/part", "{\"limit\":1}", "{\"catalog_revision\":4}", null));
+    try std.testing.expect(expired != null);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), ledger.snapshot().attempts);
+    expired.?.release();
+    expired = null;
+    probe.parent_deadline = until - std.time.ns_per_s;
+    const caller_deadline: http_common.RequestCancellation = .{ .execution_deadline_ns = until };
+    for ([_]Mode{ .success, .loss, .http_error, .bad_generation, .missing_generation }) |mode| {
+        probe.mode = mode;
+        const releases = probe.releases;
+        const response_releases = probe.response_releases;
+        var parent: ?attempts.Retention = .{ .context = &probe, .index = 0, .id = root, .release_fn = Probe.release, .deadline_ns = probe.parent_deadline };
+        defer if (parent) |retained| retained.release();
+        var delivery = try client.fetchOwnedGroupQuery(&protocol, 0, 71, 65536, until, &parent, 7, "docs/part", "{\"limit\":1}", "{\"catalog_revision\":4}", &caller_deadline);
+        try std.testing.expect(parent == null);
+        const id = switch (delivery) {
+            .response => |*value| blk: {
+                defer value.value.deinit(a);
+                try std.testing.expectEqual(Mode.success, mode);
+                try std.testing.expectEqual(@as(?u64, 42), value.value.identity_read_generation);
+                try std.testing.expectEqualStrings("{\"responses\":[]}", value.value.body);
+                try std.testing.expectEqual(response_releases, probe.response_releases);
+                break :blk value.id;
+            },
+            .uncertain => |value| blk: {
+                try std.testing.expect(mode != .success);
+                try std.testing.expectEqual(@as(anyerror, switch (mode) {
+                    .loss => error.ConnectionResetByPeer,
+                    .http_error => error.ReadIndexTimeout,
+                    else => error.InvalidRemoteResponse,
+                }), value.cause);
+                break :blk value.id;
+            },
+        };
+        try std.testing.expectEqual(response_releases + @intFromBool(mode != .loss), probe.response_releases);
+        try std.testing.expectEqual(@as(usize, 0), probe.response_budget.stats().used_bytes);
+        try std.testing.expectEqual(releases, probe.releases);
+        try std.testing.expectEqual(@as(usize, 1), ledger.snapshot().attempts);
+        try std.testing.expectEqual(@as(usize, 65536), ledger.snapshot().bytes);
+        try std.testing.expectEqual(probe.waits, probe.resumes);
+        try std.testing.expect(probe.waits > 0);
+        // Model a subsequent independently verified terminal receipt.
+        try std.testing.expect(try ledger.terminal(id, 22));
+        try std.testing.expectEqual(releases + 1, probe.releases);
+        try std.testing.expect(!(try ledger.terminal(id, 22)));
+        try std.testing.expectEqual(releases + 1, probe.releases);
+    }
+}
+
+test "internal query owner legacy clients move response retirement after all borrowed buffers" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        budget: @import("../common/allocation_budget.zig").Shared,
+        releases: usize = 0,
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.budget.stats().used_bytes == 0);
+            self.releases += 1;
+        }
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const alloc = self.budget.allocator();
+            return .{ .status = 200, .body = try alloc.dupe(u8, "owned query output"), .owner_allocator = alloc, .retirement = .{ .ptr = self, .release = release } };
+        }
+    };
+    var probe = Probe{ .budget = .{ .child = a, .limit = 65536 } };
+    var client = ApiHttpClient.init(a, .{ .ptr = &probe, .vtable = &.{ .execute = Probe.execute } });
+    for (0..3) |case| {
+        var result = switch (case) {
+            0 => try client.fetchQuery("http://worker", "docs", "{}"),
+            1 => try client.fetchGroupQuery("http://worker", 7, "docs", "{}"),
+            else => try client.fetchGroupGraphEdgesBatchWithControl("http://worker", 7, "docs", "{}", null, null),
+        };
+        try std.testing.expectEqual(case, probe.releases);
+        try std.testing.expectEqualStrings("owned query output", result.body);
+        result.deinit(a);
+        try std.testing.expectEqual(case + 1, probe.releases);
+    }
+}
+
+test "internal query owner transport guards refuse unowned buffered and streaming sends" {
+    const a = std.testing.allocator;
+    const common = @import("antfly_local_sources").common_http_http_common;
+    const Probe = struct {
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.TestLegacyEscape;
+        }
+        fn stream(raw: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest, _: common.StreamWriter) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.TestLegacyEscape;
+        }
+    };
+    var probe: Probe = .{};
+    const executor: common.RequestExecutor = .{ .ptr = &probe, .vtable = &.{ .execute = Probe.execute, .execute_stream = Probe.stream } };
+    var tracker: common.RequestDeliveryTracker = .{};
+    tracker.markNotSent();
+    const request: common.HttpRequest = .{ .method = .POST, .uri = "http://worker/internal/v1/groups/7/tables/docs/query", .execution_remote_query = executor, .delivery_tracker = &tracker };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, executor.execute(a, request));
+    const writer: common.StreamWriter = .{ .ptr = &probe, .vtable = undefined };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, executor.executeStream(a, request, writer));
+    const streaming: common.StreamingRequestExecutor = .{ .ptr = &probe, .vtable = &.{ .execute = Probe.stream } };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, streaming.execute(a, request, writer));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try std.testing.expectEqual(common.RequestDeliveryTracker.State.not_sent, tracker.load());
 }

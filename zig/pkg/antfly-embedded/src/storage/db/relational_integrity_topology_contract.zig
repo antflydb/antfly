@@ -150,10 +150,21 @@ pub const GenerationHandoffInstall = struct {
     mappings: []const @import("restore_staging_contract.zig").GenerationAdmissionMapping,
 
     pub fn validate(self: @This()) !void {
+        return self.validateInner(null);
+    }
+
+    pub fn validateWithAdmission(self: @This(), control: @import("../../common/read_admission.zig").Port) !void {
+        try control.checkpoint();
+        try self.validateInner(control);
+        try control.checkpoint();
+    }
+
+    fn validateInner(self: @This(), control: ?@import("../../common/read_admission.zig").Port) !void {
         if (std.mem.allEqual(u8, &self.scope, 0) or std.mem.allEqual(u8, &self.source_summary_digest, 0) or
             std.mem.allEqual(u8, &self.retired_digest, 0) or self.mappings.len > 1024)
             return error.InvalidGenerationHandoff;
         for (self.mappings, 0..) |mapping, index| {
+            if (control) |original| if (index % 64 == 0) try original.checkpoint();
             try mapping.validate();
             if (mapping.source_generation == null or mapping.target_generation == null) return error.InvalidGenerationHandoff;
             if (index != 0) {

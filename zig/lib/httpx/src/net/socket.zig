@@ -90,6 +90,11 @@ pub const ControlledWriter = struct {
 /// The remaining timeout must derive from the original absolute deadline.
 pub const WriteControl = struct {
     pub const Error = error{ Canceled, Timeout };
+    /// Immutable absolute request ceiling, copied with the control value.
+    /// This composes with application callbacks without a stack-owned wrapper.
+    deadline_ns: ?u64 = null,
+    deadline_io: ?Io = null,
+
     ptr: ?*anyopaque = null,
     check_fn: ?*const fn (?*anyopaque) Error!void = null,
     remaining_ms_fn: ?*const fn (?*anyopaque) Error!?u64 = null,
@@ -100,6 +105,34 @@ pub const WriteControl = struct {
     wait_begin_fn: ?*const fn (?*anyopaque) anyerror!void = null,
     wait_end_fn: ?*const fn (?*anyopaque) anyerror!void = null,
 
+    pub fn withDeadline(self: WriteControl, io: Io, deadline_ns: u64) WriteControl {
+        var result = self;
+        var candidate = deadline_ns;
+        if (self.deadline_ns) |original| {
+            const authority = self.deadline_io.?;
+            if (authority.userdata != io.userdata or authority.vtable != io.vtable) {
+                const target_now = @as(u64, @intCast(@max(0, Io.Clock.now(.awake, authority).nanoseconds)));
+                const source_now = @as(u64, @intCast(@max(0, Io.Clock.now(.awake, io).nanoseconds)));
+                candidate = target_now +| (deadline_ns -| source_now);
+            }
+            result.deadline_ns = @min(original, candidate);
+        } else {
+            result.deadline_ns = deadline_ns;
+            result.deadline_io = io;
+        }
+        return result;
+    }
+
+    fn deadlineRemainingMs(self: WriteControl) Error!?u64 {
+        const deadline = self.deadline_ns orelse return null;
+        const now = @as(u64, @intCast(@max(0, Io.Clock.now(.awake, self.deadline_io.?).nanoseconds)));
+        if (now >= deadline) return error.Timeout;
+        // Round up so sub-millisecond budgets remain usable, without renewing
+        // the original nanosecond deadline at subsequent operations.
+        const remaining = deadline - now;
+        return (remaining - 1) / std.time.ns_per_ms + 1;
+    }
+
     pub const DeferredWait = struct {
         control: WriteControl,
         parked: bool = false,
@@ -109,8 +142,7 @@ pub const WriteControl = struct {
         }
         fn remaining(raw: ?*anyopaque) Error!?u64 {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            if (self.control.remaining_ms_fn) |callback| return callback(self.control.ptr);
-            return null;
+            return self.control.timeout(null);
         }
         fn begin(raw: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -196,11 +228,12 @@ pub const WriteControl = struct {
     }
 
     pub fn active(self: WriteControl) bool {
-        return self.check_fn != null or self.remaining_ms_fn != null;
+        return self.deadline_ns != null or self.check_fn != null or self.remaining_ms_fn != null;
     }
     pub fn check(self: WriteControl) !void {
         if (self.check_fn) |check_fn| try check_fn(self.ptr);
         if (self.remaining_ms_fn) |remaining| if (try remaining(self.ptr)) |ms| if (ms == 0) return error.Timeout;
+        _ = try self.deadlineRemainingMs();
     }
     pub fn lock(self: WriteControl, mutex: *Io.Mutex, io: Io) !void {
         if (!self.active() and self.wait_begin_fn == null and self.wait_end_fn == null) return mutex.lockUncancelable(io);
@@ -215,11 +248,13 @@ pub const WriteControl = struct {
     pub fn timeout(self: WriteControl, configured: ?u64) !?u64 {
         try self.check();
         const remaining = if (self.remaining_ms_fn) |remaining| try remaining(self.ptr) else null;
+        var limit = configured;
         if (remaining) |ms| {
             if (ms == 0) return error.Timeout;
-            return if (configured) |limit| @min(ms, limit) else ms;
+            limit = if (limit) |current| @min(ms, current) else ms;
         }
-        return configured;
+        if (try self.deadlineRemainingMs()) |ms| limit = if (limit) |current| @min(ms, current) else ms;
+        return limit;
     }
 };
 
@@ -689,13 +724,21 @@ pub const Socket = struct {
             // Keep a single receive and the original deadline. Polling with
             // competing read futures can consume then discard stream bytes.
             // The connection owner's watchdog interrupts semantic cancellation.
-            const timeout_ms = try control.timeout(wait.timeout_ms);
-            const received = self.netReadWithTimeout(buffer, timeout_ms) catch |err| {
+            const bounded_timeout_ms = try control.timeout(wait.timeout_ms);
+            // A native read returning EAGAIN consumed no bytes. Poll that same
+            // receive to observe borrowed cancellation without competing reads.
+            const poll_control = self.native_timeouts and !is_windows and control.active();
+            const timeout_ms = if (poll_control) @min(bounded_timeout_ms orelse 25, 25) else bounded_timeout_ms;
+            const received = self.netReadWithTimeout(buffer, timeout_ms, control) catch |err| {
                 try control.check();
                 if (err == error.Canceled) self.io.recancel();
                 try self.checkRequestCancellation();
                 if (err == error.Timeout or err == error.WouldBlock) {
                     try self.checkRequestDeadline();
+                    if (poll_control) {
+                        _ = try self.operationWait(operation_deadline_ms);
+                        continue;
+                    }
                     return error.Timeout;
                 }
                 return error.RecvFailed;
@@ -783,23 +826,44 @@ pub const Socket = struct {
         } }, io);
     }
 
-    fn netReadWithTimeout(self: *Self, buffer: []u8, timeout_ms: ?u64) !usize {
+    fn netReadWithTimeout(self: *Self, buffer: []u8, timeout_ms: ?u64, control: WriteControl) !usize {
         if (self.native_timeouts and !is_windows) {
-            if (timeout_ms) |timeout| try self.setNativeTimeout(posix.SO.RCVTIMEO, timeout);
+            if (timeout_ms) |timeout| self.setNativeTimeout(posix.SO.RCVTIMEO, timeout) catch |err| {
+                // Darwin may reject timeout changes after both FINs have
+                // completed. Preserve queued bytes and readable EOF rather
+                // than failing a valid half-closed response. A nonblocking
+                // peek distinguishes this from reset, invalid-descriptor and
+                // live-socket option failures.
+                if (comptime builtin.os.tag == .macos) {
+                    if (err == error.InvalidSocketOption) {
+                        var byte: [1]u8 = undefined;
+                        const count = posix.system.recvfrom(self.handle, &byte, byte.len, @intCast(posix.MSG.PEEK | posix.MSG.DONTWAIT), null, null);
+                        if (count == 0) return 0;
+                        if (count > 0) {
+                            // Both FINs can complete while response bytes are
+                            // still queued. Drain only bytes available now;
+                            // never block without the rejected timeout option.
+                            const received = posix.system.recvfrom(self.handle, buffer.ptr, buffer.len, @intCast(posix.MSG.DONTWAIT), null, null);
+                            if (received >= 0) return @intCast(received);
+                        }
+                    }
+                }
+                return err;
+            };
             return posix.read(self.handle, buffer) catch |err| switch (err) {
                 error.WouldBlock => error.Timeout,
                 else => err,
             };
         }
-        const timeout = timeout_ms orelse return self.netRead(buffer);
+        if (timeout_ms == null and !control.active()) return self.netRead(buffer);
         const Outcome = union(enum) {
             operation: void,
-            timer: Io.Cancelable!void,
+            timer: anyerror!void,
         };
         var operation_result: net.Stream.Reader.Error!usize = undefined;
         var outcomes: [2]Outcome = undefined;
         var select = Io.Select(Outcome).init(self.io, &outcomes);
-        try select.concurrent(.timer, timeoutTask, .{ self.io, timeout });
+        try select.concurrent(.timer, writeControlTimer, .{ self.io, timeout_ms, control });
         select.concurrent(.operation, netReadTask, .{ self, buffer, &operation_result }) catch |err| {
             select.cancelDiscard();
             return err;
@@ -2989,4 +3053,53 @@ test "Socket controlled resolver never retries an address after denied authority
     try std.testing.expect(rejected);
     try std.testing.expectEqual(@as(usize, 2), state.begins);
     try std.testing.expectEqual(@as(usize, 2), state.ends);
+}
+
+test "HTTP request lifetime composes intrinsic write deadlines with callback and phase limits" {
+    const Callback = struct {
+        fn remaining(_: ?*anyopaque) WriteControl.Error!?u64 {
+            return 100;
+        }
+    };
+    const io = std.testing.io;
+    const now = @as(u64, @intCast(@max(0, Io.Clock.now(.awake, io).nanoseconds)));
+    const original = (WriteControl{ .remaining_ms_fn = Callback.remaining }).withDeadline(io, now + 5 * std.time.ns_per_s);
+    try std.testing.expect(original.active());
+    try std.testing.expectEqual(@as(?u64, 100), try original.timeout(1000));
+    try std.testing.expectEqual(@as(?u64, 10), try original.timeout(10));
+    const unchanged = original.withDeadline(io, now + 10 * std.time.ns_per_s);
+    try std.testing.expectEqual(original.deadline_ns, unchanged.deadline_ns);
+    const expired = original.withDeadline(io, 0);
+    try std.testing.expectError(error.Timeout, expired.check());
+    var deferred: WriteControl.DeferredWait = .{ .control = expired };
+    try std.testing.expectError(error.Timeout, deferred.view().timeout(null));
+}
+
+test "HTTP request lifetime native receive preserves queued bytes after both FINs" {
+    if (builtin.os.tag != .macos) return;
+    const io = std.testing.io;
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var client = try Socket.connect(listener.getLocalAddress(), io);
+    defer client.close();
+    client.enableNativeTimeouts();
+    try client.setRecvTimeout(1000);
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    try client.shutdownWrite();
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try peer.socket.recv(&byte));
+    const payload = "queued response survives both FINs";
+    try peer.socket.sendAll(payload);
+    try peer.socket.shutdownWrite();
+    try io.sleep(.fromMilliseconds(5), .awake);
+    // Leave unread response bytes behind each receive, including after the
+    // peer's FIN has arrived, without changing their order or dropping EOF.
+    var actual: [payload.len]u8 = undefined;
+    for (&actual) |*value| {
+        try std.testing.expectEqual(@as(usize, 1), try client.recv(&byte));
+        value.* = byte[0];
+    }
+    try std.testing.expectEqualStrings(payload, &actual);
+    try std.testing.expectEqual(@as(usize, 0), try client.recv(&byte));
 }

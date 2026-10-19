@@ -100,6 +100,21 @@ pub const SnapshotAdmission = struct {
         return .{ .admission = self };
     }
 
+    /// Foreground, pre-decision acquisition only. A caller retaining other
+    /// service leases may not lend CPU. It must reject contention rather than
+    /// occupy capacity needed by the capture holder's original continuation.
+    /// Mandatory apply/resolution callers retain acquireMutationControlledIo.
+    pub fn acquireMutationPreDecisionControlledIo(self: *@This(), io: std.Io, acquisition: apply_rw_lock_mod.ApplyRwLock.Acquisition, retained: ?*const MutationLease) !MutationLease {
+        if (retained != null or acquisition.execution_wait != null)
+            return self.acquireMutationControlledIo(io, acquisition, retained);
+        try acquisition.lifetime.check();
+        if (!self.lock.tryLockShared()) return error.Backpressured;
+        var lease: MutationLease = .{ .admission = self };
+        errdefer lease.release();
+        try acquisition.lifetime.check();
+        return lease;
+    }
+
     pub fn acquireCaptureControlledIo(self: *@This(), io: std.Io, acquisition: apply_rw_lock_mod.ApplyRwLock.Acquisition) !CaptureLease {
         try self.lock.lockExclusiveControlledIo(io, acquisition);
         return .{ .admission = self };
@@ -415,5 +430,100 @@ test "storage.db snapshot admission controlled nested retain keeps the original 
         if (capture) |*lease| lease.release();
         try std.testing.expect(admission.lock.tryLockExclusive());
         admission.lock.unlockExclusive();
+    }
+}
+
+pub fn qualifyPreDecisionCapacityCycle() !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const native = @import("../../common/runnable_scheduler.zig");
+    const Mode = enum { reject_busy, can_wait, canceled, expired, closed, late_rejection, retained, mandatory };
+    const Fixture = struct {
+        capture: *SnapshotAdmission.CaptureLease,
+        execution: *native.Execution,
+        scheduler: *native.Scheduler,
+        mode: Mode,
+        checks: usize = 0,
+        parks: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            switch (self.mode) {
+                .canceled => return error.Canceled,
+                .expired => return error.DeadlineExceeded,
+                .closed => return error.SchedulerClosed,
+                .late_rejection => if (self.checks >= 2) return error.Canceled,
+                .mandatory => if (self.checks >= 2) self.capture.release(),
+                else => {},
+            }
+            try self.execution.checkLifetime();
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(Mode.can_wait, self.mode);
+            self.parks += 1;
+            try self.execution.park(.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 2), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 40), self.scheduler.stats().retained_bytes);
+            var health: native.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+            self.capture.release();
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enter(.write);
+        }
+    };
+    for ([_]Mode{ .reject_busy, .can_wait, .canceled, .expired, .closed, .late_rejection, .retained, .mandatory }) |mode| {
+        var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+        var reader: native.Execution = .{};
+        try reader.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+        defer reader.finish();
+        var admission: SnapshotAdmission = .{ .lock = .{ .io = std.testing.io } };
+        var capture = admission.tryAcquireCapture() orelse return error.TestCaptureUnavailable;
+        defer capture.release();
+        try reader.park(.resource_blocked);
+        var writer: native.Execution = .{};
+        try writer.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 23 }, .write);
+        defer writer.finish();
+        var fixture: Fixture = .{ .capture = &capture, .execution = &writer, .scheduler = &scheduler, .mode = mode };
+        const controls: apply_rw_lock_mod.ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &fixture, .check_fn = Fixture.check }, .execution_wait = if (mode == .can_wait) .{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end } else null };
+        var retained: ?SnapshotAdmission.MutationLease = if (mode == .retained) capture.borrowMutation() else null;
+        defer if (retained) |*lease| lease.release();
+        if (mode == .late_rejection) capture.release();
+        const result = if (mode == .mandatory)
+            admission.acquireMutationControlledIo(std.testing.io, controls, null)
+        else
+            admission.acquireMutationPreDecisionControlledIo(std.testing.io, controls, if (retained) |*lease| lease else null);
+        if (mode == .can_wait or mode == .retained or mode == .mandatory) {
+            var lease = try result;
+            lease.release();
+            if (mode == .retained) try std.testing.expect(capture.active);
+        } else {
+            try std.testing.expectError(switch (mode) {
+                .reject_busy => error.Backpressured,
+                .expired => error.DeadlineExceeded,
+                .closed => error.SchedulerClosed,
+                else => error.Canceled,
+            }, result);
+            if (mode != .late_rejection) try std.testing.expect(capture.active);
+        }
+        try std.testing.expectEqual(@as(usize, if (mode == .can_wait) 1 else 0), fixture.parks);
+        try std.testing.expectEqual(@as(u64, 0), admission.lock.shared_waiters.load(.acquire));
+        writer.finish();
+        // Returning the non-lending writer's CPU lets the original capture
+        // continuation resume without a fresh operation or extended lifetime.
+        try reader.enter(.query);
+        if (retained) |*lease| {
+            lease.release();
+            retained = null;
+        }
+        capture.release();
+        var next = admission.tryAcquireCapture() orelse return error.TestLeakedMutationLease;
+        next.release();
+        reader.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }
 }

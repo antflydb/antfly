@@ -20,7 +20,19 @@ const dependency = b.dependency("antfly_embedded", .{
 app.root_module.addImport("antfly-embedded", dependency.module("antfly-embedded"));
 app.root_module.addImport("antfly-inference", dependency.module("antfly-inference"));
 app.root_module.link_libc = true;
+app.zig_lib_dir = dependency.artifact("antfly-lite").zig_lib_dir;
+app.zig_lib_dir.?.addStepDependencies(&app.step);
 ```
+
+Builds require Python 3 and generate a cache-local Zig library overlay for
+joinable owned executors with caller-owned guarded pthread stack mappings. The installed toolchain is unchanged. Native Zig
+consumers must inherit `zig_lib_dir` as above (or pass it in `addExecutable` /
+`addTest` options), including its generation dependency. This keeps library and
+consumer I/O types consistent and lets database shutdown wait through thread-local
+destructors and unmap owned stacks before returning worker capacity. Shared SQL
+roles reserve their complete stack ceilings separately from executor heaps;
+undersized node memory parents are refused before executor construction. Other
+runtime memory and libc/TLS allocations still require separate accounting.
 
 The embedded module exports `db`, `api`, object storage, and `lake`. Local
 `.aflite` and directory storage and database-free native inference use the
@@ -31,10 +43,12 @@ and `blas-root` control CPU acceleration; `cuda-artifacts` selects the CUDA
 bundle format. These options are passed to the shared composition rather
 than requiring files to be added to the fetched package cache.
 
-The package also exposes the native `antfly` shared-library artifact
-(`libantfly`), `antfly-lite`, and `antfly_wasm`. The browser artifact contains
-both embedded database and inference APIs. Use `dependency.artifact(...)`
-with `b.addInstallArtifact` to install a selected product. Standalone source
+The package exposes `antfly-lite` and `antfly_wasm` compile artifacts. Its
+`capi` build step installs the native `libantfly` shared library, including the
+platform-specific link procedure. The browser artifact contains both embedded
+database and inference APIs. Use `dependency.artifact(...)` with
+`b.addInstallArtifact` for the compile artifacts. On non-Mach-O targets,
+`antfly` also remains available as a shared-library compile artifact. Standalone source
 package commands include `zig build lite`, `capi`, `wasm`, and `wasm-test`;
 the default builds native Lite and its C API. `zig build inference-wasm`
 builds database-free browser inference, with `-Dwasm-memory-model=wasm64`

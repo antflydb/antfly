@@ -2690,6 +2690,49 @@ test "storage.hot_standby row policy metadata publication replays with its exact
             .range_end = range.end,
         }).digest(),
     };
+    // Native frame funding must fail before closing the runtime policy gate
+    // or persisting the preparing marker for this committed owner command.
+    var empty: [0]u8 = .{};
+    var deny = std.heap.FixedBufferAllocator.init(&empty);
+    primary.alloc = deny.allocator();
+    defer primary.alloc = alloc;
+    try std.testing.expectError(error.OutOfMemory, owner.applyReplicatedRowPolicyPublication(bundle, request, .{ .term = 3, .index = 11 }));
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.disabled, owner.local_execution.row_policy_gate.currentPhase());
+    try std.testing.expectError(error.NotFound, owner.core.store.get(alloc, row_policy_bundle_mod.pending_key));
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    primary.alloc = alloc;
+    // A configured asynchronous publisher can fail after local policy commit.
+    // Its durable intent must survive until an actual append succeeds.
+    const AppendFailure = struct {
+        fn prepare(mirror: ReplicationAsyncEffectMirror, _: durable_outbox.Kind, _: []const u8, _: DocIdentityNamespace, _: ?@import("antfly_local_sources").common_read_admission.Port) !@import("antfly_local_sources").storage_db_replication_contract.PreparedPublication {
+            return .{ .ptr = mirror.publisher.ptr, .vtable = &.{ .publish = publish, .deinit = deinit } };
+        }
+        fn publish(_: *anyopaque) !u64 {
+            return error.OutOfMemory;
+        }
+        fn deinit(_: *anyopaque) void {}
+        // This injected provider is a different vtable identity; native
+        // telemetry callbacks deliberately reject foreign bindings.
+        fn noteFailure(_: ReplicationAsyncEffectMirror) void {}
+    };
+    const native_mirror = owner.local_execution.replication_async_metadata_mirror.?;
+    var failing_vtable = native_mirror.publisher.vtable.*;
+    failing_vtable.prepare = AppendFailure.prepare;
+    failing_vtable.note_failure = AppendFailure.noteFailure;
+    var failing_mirror = native_mirror;
+    failing_mirror.publisher.vtable = &failing_vtable;
+    owner.local_execution.replication_async_metadata_mirror = failing_mirror;
+    try std.testing.expectError(error.DurabilityOutcomeUnknown, owner.applyReplicatedRowPolicyPublication(bundle, request, .{ .term = 3, .index = 11 }));
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.preparing, owner.local_execution.row_policy_gate.currentPhase());
+    try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    {
+        var pending = try @import("antfly_local_sources").storage_db_durable_outbox_store.readPending(alloc, owner.core.store);
+        defer pending.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), pending.entries.len);
+        try std.testing.expectEqual(durable_outbox.Kind.row_policy, try durable_outbox.durableReplicationOutboxKindFromKey(pending.entries[0].key));
+    }
+    owner.local_execution.replication_async_metadata_mirror = native_mirror;
+    try engine.test_support.flushDurableReplicationOutboxes(&owner);
     try std.testing.expect((try owner.applyReplicatedRowPolicyPublication(bundle, request, .{ .term = 3, .index = 11 })) == null);
     try std.testing.expectEqual(@as(u64, 3), primary.lastLsn());
     var policy_entry = (try primary.log.entryAt(alloc, 3)) orelse return error.TestExpectedEqual;
@@ -2742,6 +2785,39 @@ test "storage.hot_standby row policy metadata publication replays with its exact
     try engine.test_support.ensureDurableReplicationStartupBarrier(&reopened);
     try std.testing.expectEqual(@as(u64, 4), primary.lastLsn());
     try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, outbox_key));
+
+    // Staging a successor while the old policy serves also consumes its
+    // transaction before HA publication. Failure must retain that candidate
+    // and its outbox without aborting the already committed transaction.
+    var successor = serving.value;
+    successor.phase = .pending_install;
+    successor.policy_generation = 2;
+    successor.catalog_epoch = 3;
+    const successor_bundle = try std.json.Stringify.valueAlloc(alloc, successor, .{});
+    defer alloc.free(successor_bundle);
+    request.expected_phase = .pending_install;
+    request.expected_generation = 2;
+    request.expected_catalog_epoch = 3;
+    const reopened_native_mirror = reopened.local_execution.replication_async_metadata_mirror.?;
+    reopened.local_execution.replication_async_metadata_mirror = failing_mirror;
+    try std.testing.expectError(error.DurabilityOutcomeUnknown, reopened.applyReplicatedRowPolicyPublication(successor_bundle, request, .{ .term = 3, .index = 13 }));
+    try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.active, reopened.local_execution.row_policy_gate.currentPhase());
+    try std.testing.expectEqual(@as(u64, 1), reopened.core.table_catalog.row_policy_generation);
+    try std.testing.expectEqual(@as(u64, 4), primary.lastLsn());
+    {
+        var pending = try @import("antfly_local_sources").storage_db_durable_outbox_store.readPending(alloc, reopened.core.store);
+        defer pending.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), pending.entries.len);
+        try std.testing.expectEqual(durable_outbox.Kind.row_policy, try durable_outbox.durableReplicationOutboxKindFromKey(pending.entries[0].key));
+    }
+    const candidate = try reopened.core.store.get(alloc, row_policy_bundle_mod.candidate_key);
+    defer alloc.free(candidate);
+    try std.testing.expectEqualSlices(u8, successor_bundle, candidate);
+    reopened.local_execution.replication_async_metadata_mirror = reopened_native_mirror;
+    try engine.test_support.flushDurableReplicationOutboxes(&reopened);
+    try std.testing.expectEqual(@as(u64, 5), primary.lastLsn());
+    try std.testing.expect((try reopened.applyReplicatedRowPolicyPublication(successor_bundle, request, .{ .term = 3, .index = 13 })) != null);
+    try std.testing.expectEqual(@as(u64, 5), primary.lastLsn());
 }
 
 test "storage.hot_standby db applies batch mutation records through replication session callback" {
@@ -3159,6 +3235,15 @@ test "db graph ttl HA carries primary effects and duplicate receipt across reope
     var clock = platform_clock.ManualClock{};
     clock.setRealtimeNs(candidate.deadline_ns + 1);
     var ttl = TtlCleanupContext{ .batch = engine.test_support.batchContext(&primary), .grace_period_ns = 0, .clock = clock.clock() };
+    var empty: [0]u8 = .{};
+    var deny = std.heap.FixedBufferAllocator.init(&empty);
+    const before_preparation = stream.lastLsn();
+    stream.alloc = deny.allocator();
+    defer stream.alloc = alloc;
+    try std.testing.expectError(error.OutOfMemory, expireGraphTtlCandidateContext(&ttl, candidate));
+    stream.alloc = alloc;
+    try GraphPrimaryPublicationTest.expectCount(&primary, 1);
+    try std.testing.expectEqual(before_preparation, stream.lastLsn());
     wait.fail = true;
     try std.testing.expectError(error.InjectedTtlHAWait, expireGraphTtlCandidateContext(&ttl, candidate));
     const pending = try primary.core.store.scanPrefix(alloc, replication_outbox_v2_prefix);

@@ -115,7 +115,7 @@ pub fn runPair(b: *std.Build, consumer: Artifact, implementation: *std.Build.Ste
 /// relocatable Mach-O test object loses its debug map. Cloning the import
 /// graph preserves shared module identity and leaves implementation suites
 /// untouched; each native module retains its own flags and include paths.
-fn splitNativeSources(
+pub fn splitNativeSources(
     b: *std.Build,
     original: *std.Build.Module,
     final: *std.Build.Module,

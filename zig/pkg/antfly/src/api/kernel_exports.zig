@@ -64,7 +64,7 @@ const RuntimeIoReceivers = struct {
             @field(self, field) = if (@field(borrows, field)) |borrow| try borrow.receive() else null;
         }
         self.sql_workers = if (borrows.sql_workers) |producer| blk: {
-            if (!abi.validContext(abi.SqlWorkerFactory, producer.version, producer.struct_size) or producer.capacity < 10)
+            if (!abi.validContext(abi.SqlWorkerFactory, producer.version, producer.struct_size) or producer.shared_capacity < 10)
                 return error.UnsupportedVersion;
             break :blk producer.*;
         } else null;
@@ -393,6 +393,45 @@ pub fn attachReplicatedRestoreStore(
     return .ok;
 }
 
+pub fn bootstrapRemoteAttempts(context: *const CallContext) callconv(.c) abi.Status {
+    const Bootstrap = @import("remote_attempt_owner.zig").Bootstrap;
+    if (validateCall(Bootstrap, void, context)) |failure| return failure;
+    serverState(context).server.bootstrapRemoteAttempts(input(Bootstrap, context).*) catch |err| return fail(switch (err) {
+        error.OutOfMemory, error.InvalidArgument, error.FileNotFound, error.UnsupportedVersion, error.Forbidden, error.Unavailable => err,
+        error.InvalidRemoteMembership, error.RemoteMembershipChanged, error.RemoteWorkerIdentityChanged, error.InvalidRemoteReplySignature => error.Forbidden,
+        error.TableTopologyProtocolUpgradeRequired => error.UnsupportedVersion,
+        error.InvalidStoreRootEnrollment, error.StoreRootEnrollmentChanged, error.RemoteInitializationChanged => error.Forbidden,
+        error.RemoteFenceStoreMissing => error.FileNotFound,
+        error.RemoteFenceStoreBusy, error.RemoteFenceStoreAlreadyExists => error.ResourceTemporarilyUnavailable,
+        else => error.Unavailable,
+    });
+    return .ok;
+}
+
+pub fn refreshRemoteAttemptPeers(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, void, context)) |failure| return failure;
+    serverState(context).server.refreshRemoteAttemptPeers() catch |err| return fail(switch (err) {
+        error.InvalidArgument, error.OutOfMemory, error.Unavailable, error.UnsupportedVersion => err,
+        error.InvalidRemoteMembership, error.RemoteMembershipChanged, error.RemoteWorkerIdentityChanged => error.Forbidden,
+        else => error.Unavailable,
+    });
+    return .ok;
+}
+
+pub fn pgwireBoundPort(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, u16, context)) |failure| return failure;
+    const server = &serverState(context).server;
+    output(u16, context).* = if (server.pgwire_listener) |listener| listener.server.address().getPort() else 0;
+    return .ok;
+}
+
+pub fn remoteAttemptOwnerStats(context: *const CallContext) callconv(.c) abi.Status {
+    const Stats = @import("remote_attempt_owner.zig").Stats;
+    if (validateCall(void, Stats, context)) |failure| return failure;
+    output(Stats, context).* = serverState(context).server.remoteAttemptOwnerStats() catch |err| return fail(err);
+    return .ok;
+}
+
 pub fn resumeRestoreJobs(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, void, context)) |failure| return failure;
     serverState(context).server.resumeRestoreJobsOnce() catch |err| return fail(err);
@@ -515,7 +554,8 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
         .query_quiescent = query.quiescent,
         .query_sql_waiting_enabled = query.sql_waiting_enabled orelse false,
         .runnable = handler.api_server.runnableSchedulingStats(),
-        .memory = .{ memoryAbi(memory.foreground), memoryAbi(memory.control), memoryAbi(memory.retained) },
+        .read_memory = handler.api_server.readMemoryStats(),
+        .memory = .{ memoryAbi(memory.foreground), memoryAbi(memory.controlWithCleanup()), memoryAbi(memory.retained) },
     };
     return .ok;
 }
@@ -585,6 +625,7 @@ fn exportHttpResponse(
 
 pub fn handlerAuthorizeInternalService(context: *const abi.InternalServiceAuthContext) callconv(.c) abi.Status {
     if (validateContext(abi.InternalServiceAuthContext, context.abi_version, context.struct_size)) |failure| return failure;
+    if (context.deadline.present > 1) return fail(error.InvalidArgument);
     var executor = context.executor.receive() catch |err| return fail(err);
     const io = executor.io();
     const state: *HandlerState = @ptrCast(@alignCast(context.handler_handle));
@@ -613,6 +654,10 @@ pub fn handlerAuthorizeInternalService(context: *const abi.InternalServiceAuthCo
         http_request.headers.append(header.name.slice(), header.value.slice()) catch |err| return fail(err);
 
     var http_context = httpx.Context.init(alloc, io, &http_request);
+    if (context.deadline.present != 0) {
+        http_context.application_deadline_ns = context.deadline.timestamp_ns;
+        http_context.application_deadline_io = io;
+    }
     defer http_context.deinit();
     var legacy_accepted = false;
     if (state.handler.authorizeHostInternalServiceRoute(&http_context, &legacy_accepted) catch |err| return fail(err)) |response| {
@@ -627,6 +672,7 @@ pub fn handlerAuthorizeInternalService(context: *const abi.InternalServiceAuthCo
 
 pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
     if (validateContext(abi.HttpHandleContext, context.abi_version, context.struct_size)) |failure| return failure;
+    if (context.deadline.present > 1) return fail(error.InvalidArgument);
     var executor = context.executor.receive() catch |err| return fail(err);
     const io = executor.io();
     const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
@@ -662,6 +708,10 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
     }
 
     var http_context = httpx.Context.init(alloc, io, &http_request);
+    if (context.deadline.present != 0) {
+        http_context.application_deadline_ns = context.deadline.timestamp_ns;
+        http_context.application_deadline_io = io;
+    }
     defer http_context.deinit();
     http_context.params = params;
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
@@ -699,7 +749,10 @@ const function_table: abi.FunctionTable = .{
         abi.Capability.inference_admission_stats |
         abi.Capability.internal_service_ingress |
         abi.Capability.node_runnable_owner |
-        abi.Capability.node_runnable_execution,
+        abi.Capability.node_runnable_execution |
+        abi.Capability.remote_attempt_owner |
+        abi.Capability.remote_peer_refresh |
+        abi.Capability.pgwire_bound_port,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
@@ -731,6 +784,10 @@ const function_table: abi.FunctionTable = .{
     .runnable_owner_close = &runnableOwnerClose,
     .runnable_owner_destroy = &runnableOwnerDestroy,
     .runnable_owner_execution_port = &runnableOwnerExecutionPort,
+    .bootstrap_remote_attempts = &bootstrapRemoteAttempts,
+    .remote_attempt_owner_stats = &remoteAttemptOwnerStats,
+    .refresh_remote_attempt_peers = &refreshRemoteAttemptPeers,
+    .pgwire_bound_port = &pgwireBoundPort,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {
@@ -782,6 +839,14 @@ fn ManifestServer(comptime prefix: []const u8) type {
         }
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
+            try self.register(.post, path, handler);
+        }
+
+        pub fn postWithBodyLimit(self: *const @This(), comptime path: []const u8, limit: usize, handler: httpx.Handler) !void {
+            // The host applies this canonical policy when consuming the opaque
+            // manifest. Reject an undeclared limit instead of dropping it.
+            const expected = @import("http_routes.zig").postBodyLimit(prefix ++ path) orelse return error.InvalidArgument;
+            if (limit != expected) return error.InvalidArgument;
             try self.register(.post, path, handler);
         }
 
@@ -1428,7 +1493,7 @@ test "API kernel create keeps SQL lanes owner-produced through saturation and sh
     try std.testing.expect(state.server.sql_cleanup_workers.?.native == null);
     try std.testing.expect(state.server.sql_cleanup_reaper_workers.?.native == null);
     try std.testing.expect(foreground.userdata != cleanup_io.userdata and foreground.userdata != control.userdata);
-    try std.testing.expectEqual(@as(usize, 25), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(@as(usize, 26), runtime.ptr().laneStats().reserved_workers);
     var foreground_gate: std.Io.Event = .unset;
     var cleanup_gate: std.Io.Event = .unset;
     var foreground_jobs: std.Io.Group = .init;
@@ -1459,4 +1524,97 @@ test "API kernel create keeps SQL lanes owner-produced through saturation and sh
     handle = null;
     try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
     try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().worker_active_leases);
+}
+
+test "API kernel HTTP original deadline reaches reconstructed request context" {
+    const alloc = std.testing.allocator;
+    var status_source: KernelIngressTestStatus = .{};
+    const server = try alloc.create(server_mod.ApiHttpServer);
+    defer alloc.destroy(server);
+    server.* = server_mod.ApiHttpServer.init(alloc, .{}, status_source.source(), null, null);
+    defer server.deinit();
+    var state: HandlerState = .{ .alloc = alloc, .handler = .{ .api_server = server }, .route_validator = httpx.Router.init(alloc) };
+    defer state.route_validator.deinit();
+    const Probe = struct {
+        expected: ?u64,
+        calls: usize = 0,
+        fn handle(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            try std.testing.expectEqual(self.expected, ctx.application_deadline_ns);
+            if (self.expected != null) {
+                try std.testing.expect(ctx.application_deadline_io != null);
+                try std.testing.expect(ctx.application_deadline_io.?.userdata == ctx.io.userdata);
+                try std.testing.expect(ctx.application_deadline_io.?.vtable == ctx.io.vtable);
+            }
+            self.calls += 1;
+            return httpx.Response.init(ctx.allocator, 200);
+        }
+    };
+    const request: abi.HttpRequestView = .{ .method = .get, .path = abi.Bytes.init("/deadline-probe") };
+    const io = std.testing.io;
+    for ([_]?u64{ null, 0, 1, 500 * std.time.ns_per_ms }) |deadline| {
+        var probe: Probe = .{ .expected = deadline };
+        var route: RouteState = .{ .owner = &state, .handler = httpx.Handler.bind(&probe, Probe.handle) };
+        var response_handle: ?*anyopaque = null;
+        var response: abi.HttpResponseView = undefined;
+        const result = handlerHandleHttp(&.{ .abi_version = abi.abi_version, .route_handle = &route, .request = &request, .executor = .init(&io), .out_response_handle = &response_handle, .out_response = &response, .deadline = .{ .present = @intFromBool(deadline != null), .timestamp_ns = deadline orelse 0 } });
+        if (response_handle) |handle| {
+            defer handlerDestroyHttpResponse(handle);
+            try std.testing.expect(result.isOk());
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+        } else try std.testing.expect(result.isOk());
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    }
+}
+
+test "API kernel HTTP original deadline validates presence before invoking opaque owners" {
+    const io = std.testing.io;
+    var response_handle: ?*anyopaque = null;
+    var response: abi.HttpResponseView = undefined;
+    var legacy: u8 = 0;
+    const request: abi.HttpRequestView = .{ .method = .get, .path = abi.Bytes.init("/") };
+    const opaque_owner: *anyopaque = @ptrFromInt(8);
+    const route_result = handlerHandleHttp(&.{ .abi_version = abi.abi_version, .route_handle = opaque_owner, .request = &request, .executor = .init(&io), .out_response_handle = &response_handle, .out_response = &response, .deadline = .{ .present = 2 } });
+    const auth_result = handlerAuthorizeInternalService(&.{ .abi_version = abi.abi_version, .handler_handle = opaque_owner, .request = &request, .executor = .init(&io), .out_response_handle = &response_handle, .out_response = &response, .out_legacy_accepted = &legacy, .deadline = .{ .present = 2 } });
+    try std.testing.expect(abi.errorFromStatus(route_result) == error.InvalidArgument);
+    try std.testing.expect(abi.errorFromStatus(auth_result) == error.InvalidArgument);
+    try std.testing.expect(response_handle == null);
+}
+
+test "runnable metrics service API export rejects older and truncated outputs before touching a poison owner" {
+    const Legacy = extern struct { bytes: [@offsetOf(abi.RunnableStats, "service")]u8 };
+    var legacy: Legacy = .{ .bytes = @splat(0xa5) };
+    var context: CallContext = .{ .abi_version = 49, .handle = @ptrFromInt(1), .output = &legacy, .output_contract = .of(Legacy) };
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(runnableSchedulingStats(&context)));
+    context.abi_version = abi.abi_version;
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(runnableSchedulingStats(&context)));
+    context.output_contract = .of(abi.RunnableStats);
+    context.struct_size -= 1;
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(runnableSchedulingStats(&context)));
+    for (legacy.bytes) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+}
+
+test "runnable metrics service API export projects the actual server owner counters" {
+    const Clock = struct {
+        var tick: u64 = 0;
+        fn now() u64 {
+            return tick;
+        }
+    };
+    Clock.tick = 0;
+    var state: ServerState = undefined;
+    state.server.runnable_owner = null;
+    state.server.runnable_scheduler = try server_mod.RunnableScheduler.Scheduler.init(.{ .slots = 2, .quantum_ms = 1 });
+    const scheduler = &state.server.runnable_scheduler.?;
+    var execution: server_mod.RunnableScheduler.Execution = .{};
+    defer execution.finish();
+    try execution.start(scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .query);
+    Clock.tick = 5 * std.time.ns_per_ms;
+    execution.finish();
+    var out: abi.RunnableStats = undefined;
+    const context: CallContext = .{ .abi_version = abi.abi_version, .handle = &state, .output = &out, .output_contract = .of(abi.RunnableStats) };
+    try std.testing.expect(runnableSchedulingStats(&context).isOk());
+    try std.testing.expect(out.enabled and out.service.available);
+    try std.testing.expectEqual(@as(u64, 5_000_000), out.service.observed_slot_ns[0]);
+    try std.testing.expectEqual(@as(u64, 4_000_000), out.service.debt_slot_ns[0]);
+    try std.testing.expectEqual(@as(u64, 0), out.operations);
 }

@@ -63,6 +63,13 @@ const ControlKind = enum(u8) {
 pub const default_replay_scratch_retained_cap_bytes: usize = replay_chunk_bytes + @max(record_header_len, replay_record_header_len);
 
 fn scratchAllocator(allocator: Allocator) Allocator {
+    // Preserve an explicitly supplied reclaimable root instead of escaping
+    // its process ceiling through libc. Unwrap result arenas so scratch frees
+    // remain independent, and never introduce reclaim callbacks under locks.
+    if (@import("../resource_manager.zig").BudgetedAllocator.fromAllocator(allocator)) |root| {
+        return root.threadSafeNoReclaimAllocator();
+    }
+    if (@import("runtime_memory_abi").Allocator.isStdAdapter(allocator)) return allocator;
     return if (builtin.link_libc) std.heap.c_allocator else allocator;
 }
 
@@ -2583,4 +2590,21 @@ test "lsm wal replays state and replay rows from shared wal segments" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(@as(u64, 1), entries[0].sequence);
     try std.testing.expectEqualStrings("first", entries[0].payload);
+}
+
+test "WAL allocator owner replay scratch preserves the physical root across ABI callbacks" {
+    var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 }, .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var budget = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .lsm_in_memory_state, std.testing.allocator, 1);
+    defer budget.deinit();
+    budget.credit_quantum = 1;
+    var root = budget.threadSafeNoReclaimAllocator();
+    const descriptor = @import("runtime_memory_abi").Allocator.fromStd(&root);
+    for ([_]Allocator{ scratchAllocator(root), scratchAllocator(descriptor.asStd()) }) |scratch| {
+        const bytes = try scratch.alloc(u8, 97);
+        try std.testing.expectEqual(@as(u64, 97), budget.liveBytesThreadSafe());
+        scratch.free(bytes);
+        try std.testing.expectError(error.OutOfMemory, scratch.alloc(u8, 2 * 1024 * 1024));
+        try std.testing.expectEqual(@as(u64, 0), budget.liveBytesThreadSafe());
+    }
 }

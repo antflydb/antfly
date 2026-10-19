@@ -290,6 +290,21 @@ pub const SessionManager = struct {
         model_path: []const u8,
         shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
     ) !Session {
+        return self.loadModelWithImportedOnnxContextAndDeviceBudget(model_path, shared_backend_ctx, null);
+    }
+
+    /// Borrow the capability only for construction. Metal sessions retain their
+    /// own reference before constructor-time qualification can create KV state.
+    pub fn loadModelWithDeviceMemoryBudget(self: *SessionManager, model_path: []const u8, budget: ?@import("../runtime/kv/device_memory.zig").Budget) !Session {
+        return self.loadModelWithImportedOnnxContextAndDeviceBudget(model_path, null, budget);
+    }
+
+    pub fn loadModelWithImportedOnnxContextAndDeviceBudget(
+        self: *SessionManager,
+        model_path: []const u8,
+        shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
+        device_memory_budget: ?@import("../runtime/kv/device_memory.zig").Budget,
+    ) !Session {
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
         var effective_buf: [backend_order_capacity]BackendType = undefined;
@@ -391,12 +406,13 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_metal)
-                    session_factory.createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
+                    session_factory.createMetalSessionWithKernelJitAndLoadContextAndDeviceBudget(
                         self.allocator,
                         model_path,
                         self.kernel_jit,
                         self.kernel_jit_load_context,
                         self.a4b_inference_request,
+                        device_memory_budget,
                     ) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return err;
