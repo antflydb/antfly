@@ -20,7 +20,8 @@ const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
 // Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
-pub const abi_version: u32 = 110;
+// Backend batches can atomically reserve prepared replay credit with seals.
+pub const abi_version: u32 = 111;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

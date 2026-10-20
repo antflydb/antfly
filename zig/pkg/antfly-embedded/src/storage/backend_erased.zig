@@ -1056,6 +1056,15 @@ pub const NamespaceWriteTxn = struct {
     }
 };
 
+/// Borrowed scalar/key plan derived by the trusted preparation owner. The
+/// backend validates its frame binding and funds it in the open writer batch.
+pub const PreparedReplayReservation = struct {
+    txn_id: [16]u8,
+    frame: [32]u8,
+    base: @import("replay_record_shape.zig").Record,
+    roots: []const []const u8,
+};
+
 pub const Batch = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -1076,8 +1085,21 @@ pub const Batch = struct {
         set_replay_opaque: ?*const fn (*anyopaque, u64, []const u8) anyerror!void = null,
         set_commit_participant: ?*const fn (*anyopaque, @import("commit_participant.zig").Participant) anyerror!void = null,
         contains_many_sorted: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
+        reserve_prepared_replay: ?*const fn (*anyopaque, PreparedReplayReservation, ?read_admission.Port) anyerror!void = null,
+        cancel_prepared_replay: ?*const fn (*anyopaque, [16]u8) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
+    pub fn cancelPreparedReplay(self: *Batch, id: [16]u8) !void {
+        const cancel = self.vtable.cancel_prepared_replay orelse return error.Unsupported;
+        try BoundaryAbi.call("cancel_prepared_replay", self.boundary_dispatch, cancel, .{ self.ptr, id });
+    }
+
+    pub fn reservePreparedReplay(self: *Batch, plan: PreparedReplayReservation, original: ?read_admission.Port) !void {
+        const reserve = self.vtable.reserve_prepared_replay orelse return error.Unsupported;
+        if (original) |port| try port.checkpoint();
+        try BoundaryAbi.call("reserve_prepared_replay", self.boundary_dispatch, reserve, .{ self.ptr, plan, original });
+    }
 
     pub fn abort(self: *Batch) void {
         const gate = self.write_gate;
@@ -2553,6 +2575,14 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             return error.Unsupported;
         }
 
+        pub fn cancelPreparedReplay(ptr: *anyopaque, id: [16]u8) anyerror!void {
+            try unbox(ptr).handle.cancelPreparedReplayCredit(id);
+        }
+
+        pub fn reservePreparedReplay(ptr: *anyopaque, plan: PreparedReplayReservation, original: ?read_admission.Port) anyerror!void {
+            try unbox(ptr).handle.reservePreparedReplayCredit(plan.txn_id, plan.frame, plan.base, plan.roots, original);
+        }
+
         pub fn setCommitParticipant(ptr: *anyopaque, participant: @import("commit_participant.zig").Participant) anyerror!void {
             return unbox(ptr).handle.setCommitParticipant(participant);
         }
@@ -2574,6 +2604,8 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .set_replay_opaque = if (@hasDecl(Handle, "setReplayOpaque")) vt.setReplayOpaque else null,
             .set_commit_participant = if (@hasDecl(Handle, "setCommitParticipant")) vt.setCommitParticipant else null,
             .contains_many_sorted = if (@hasDecl(Handle, "containsManySorted")) vt.containsManySorted else null,
+            .reserve_prepared_replay = if (@hasDecl(Handle, "reservePreparedReplayCredit")) vt.reservePreparedReplay else null,
+            .cancel_prepared_replay = if (@hasDecl(Handle, "cancelPreparedReplayCredit")) vt.cancelPreparedReplay else null,
         },
     };
 }

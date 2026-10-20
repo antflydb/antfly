@@ -1315,7 +1315,7 @@ pub const TxnManager = struct {
             if (status == .aborted and try self.hasPreparedEffects(txn_id)) try completion_deletes.append(self.alloc, &prepared_key);
             if (status == .aborted and try self.hasPreparationRequirement(txn_id)) try completion_deletes.append(self.alloc, &requirement_key);
             if (completion_writes.items.len != 0 or completion_deletes.items.len != 0) {
-                try self.applyBatchWithAdmission(completion_writes.items, completion_deletes.items, null, control);
+                try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, null, null, control, if (status == .aborted) txn_id else null);
             }
             return .{
                 .applied = false,
@@ -1379,7 +1379,7 @@ pub const TxnManager = struct {
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             try completion_deletes.appendSlice(self.alloc, indexed_deletes.items);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-            try self.applyBatchWithParticipantAndAdmission(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, control);
+            try self.applyResolutionResourceBatch(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, null, control, if (status == .aborted) txn_id else null);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -1519,7 +1519,7 @@ pub const TxnManager = struct {
         try deletes.appendSlice(self.alloc, indexed_deletes.items);
 
         const admission = try self.loadIntentAdmission(self.alloc, txn_id);
-        try self.applyBatchWithParticipantAndAdmission(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control);
+        try self.applyResolutionResourceBatch(writes.items, deletes.items, extra_batch.replay, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 }, if (status == .committed) extra_batch.commit_participant else null, control, if (status == .aborted) txn_id else null);
 
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
@@ -1687,11 +1687,20 @@ pub const TxnManager = struct {
 
     pub fn sealBoundPreparedEffectsWithExtraBatch(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, binding: ?prepared_effects.Binding, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
         var trace: MutationAdmissionTrace = .{};
-        self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, binding, extra_batch, trace.bind(original)) catch |err| return trace.failure orelse err;
+        self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, binding, extra_batch, null, trace.bind(original)) catch |err| return trace.failure orelse err;
         if (trace.failure) |cause| return cause;
     }
 
-    fn sealPreparedEffectsInner(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, binding: ?prepared_effects.Binding, extra_batch: MutationExtraBatch, control: ?read_control.Port) !void {
+    /// Trusted canonical request only: the caller must bind all request and
+    /// auxiliary effects to the authoritative input/catalog/route witness. This
+    /// funds HA replay retention, not derived-log or executable recovery work.
+    pub fn sealPreparedEffectsAndReplayPlan(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, binding: ?prepared_effects.Binding, request: @import("db/derived/derived_types.zig").DerivedBatch, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
+        var trace: MutationAdmissionTrace = .{};
+        self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, binding, extra_batch, request, trace.bind(original)) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| return cause;
+    }
+
+    fn sealPreparedEffectsInner(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, binding: ?prepared_effects.Binding, extra_batch: MutationExtraBatch, request: ?@import("db/derived/derived_types.zig").DerivedBatch, control: ?read_control.Port) !void {
         const key = makePreparedEffectsKey(txn_id);
         const requirement_key = makePreparationRequirementKey(txn_id);
         const record_key = makeRecordKey(txn_id);
@@ -1710,6 +1719,18 @@ pub const TxnManager = struct {
         const inspection = try prepared_effects.inspect(frame, control);
         const expected = try self.preparedEffectsContractInner(txn_id, catalog_digest, mode, control);
         if (!std.meta.eql(expected, inspection.contract)) return error.PreparedEffectsMismatch;
+        var replay_plan: ?@import("prepared_replay_plan.zig").Plan = if (request) |canonical| blk: {
+            var decoded = try prepared_effects.decode(self.alloc, frame, expected, control);
+            defer decoded.deinit();
+            break :blk try @import("prepared_replay_plan.zig").derive(self.alloc, canonical, decoded.plan.effects, control);
+        } else null;
+        defer if (replay_plan) |*plan| plan.deinit();
+        const reservation: ?backend_erased.PreparedReplayReservation = if (replay_plan) |plan| .{
+            .txn_id = txn_id,
+            .frame = inspection.fingerprint,
+            .base = plan.base,
+            .roots = plan.roots,
+        } else null;
         const previous = self.getAllocWithAdmission(self.alloc, &key, control) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -1726,14 +1747,14 @@ pub const TxnManager = struct {
                 if (!std.mem.eql(u8, bytes[offset..end], frame[offset..end])) return error.PreparedEffectsConflict;
                 offset = end;
             }
-            try self.applyMutationExtraBatchWithAdmission(extra_batch, control);
+            try self.applyPreparedSealBatch(extra_batch.writes, extra_batch.deletes, reservation, control);
             return;
         }
         var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
         defer writes.deinit(self.alloc);
         try writes.append(self.alloc, .{ .key = &key, .value = frame });
         try writes.appendSlice(self.alloc, extra_batch.writes);
-        try self.applyBatchWithAdmission(writes.items, extra_batch.deletes, null, control);
+        try self.applyPreparedSealBatch(writes.items, extra_batch.deletes, reservation, control);
     }
 
     /// Reopen/recovery owns both this decoded slab and any separately staged
@@ -3462,10 +3483,38 @@ pub const TxnManager = struct {
         return self.applyBatchWithParticipantAndAdmission(writes, deletes, replay, reservation, participant, null);
     }
 
-    fn applyBatchWithParticipantAndAdmission(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port) !void {
+    fn applyPreparedSealBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, reservation: ?backend_erased.PreparedReplayReservation, control: ?read_control.Port) !void {
+        const plan = reservation orelse return self.applyBatchWithAdmission(writes, deletes, null, control);
         if (control) |owner| try owner.checkpoint();
         var batch = if (control) |owner| try self.store.beginBatchWithAdmission(owner) else try self.store.beginBatch();
         errdefer batch.abort();
+        try @import("transaction_batch_admission.zig").stage(&batch, writes, deletes, @as(?ReplayAppend, null), control);
+        try batch.reservePreparedReplay(plan, control);
+        if (control) |owner| try owner.checkpoint();
+        try batch.commit();
+    }
+
+    fn applyBatchWithParticipantAndAdmission(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port) !void {
+        return self.applyResolutionResourceBatch(writes, deletes, replay, reservation, participant, control, null);
+    }
+
+    fn applyResolutionResourceBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port, aborted: ?TxnId) !void {
+        if (control) |owner| try owner.checkpoint();
+        var batch = if (control) |owner| try self.store.beginBatchWithAdmission(owner) else try self.store.beginBatch();
+        errdefer batch.abort();
+        if (aborted) |id| {
+            // The authoritative decision was checked before this writer opened.
+            // Release claims before deleting their frame, in this same batch.
+            const grant_key = @import("prepared_replay_credit.zig").grantKey(id);
+            const has_grant = present: {
+                _ = batch.get(&grant_key) catch |err| {
+                    if (err == error.NotFound) break :present false;
+                    return err;
+                };
+                break :present true;
+            };
+            if (has_grant) try batch.cancelPreparedReplay(id);
+        }
         if (participant) |observer| try batch.setCommitParticipant(observer);
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);
         try @import("transaction_batch_admission.zig").apply(&batch, writes, deletes, replay, control);
@@ -7737,4 +7786,220 @@ test "prepared transaction effects paired resolution unwinds allocations and eve
     try manager.saveTransactionRecord(makeRecordKey(id), record);
     try std.testing.expectError(error.PreparedEffectsMismatch, manager.loadPreparedEffectsWithInputs(a, id, null));
     try std.testing.expect(try manager.hasPreparedEffects(id));
+}
+
+const PreparedReplaySealFixture = struct {
+    native: lsm_backend.Backend = undefined,
+    store: DocStore = undefined,
+    manager: TxnManager = undefined,
+    const id: TxnId = @splat(156);
+    const catalog: [32]u8 = @splat(5);
+    const credit = @import("prepared_replay_credit.zig");
+    const backlog = @import("publication_backlog.zig");
+    fn init(self: *@This()) !void {
+        const a = std.testing.allocator;
+        self.native = lsm_backend.Backend.init(a, .{});
+        errdefer self.native.close();
+        self.store = try DocStore.openRuntime(a, try self.native.runtimeStore(a, .{}));
+        errdefer self.store.close();
+        try @import("artifact_footprint.zig").initializeEmpty(&self.store);
+        try @import("artifact_replay_inventory.zig").initialize(&self.store);
+        try self.store.put(@import("db/catalog/reader_versions.zig").minimum_reader_key, "11");
+        try self.store.put(@import("db/catalog/reader_versions.zig").replacement_reader_base_key, "11");
+        self.manager = try TxnManager.init(a, &self.store);
+        errdefer self.manager.deinit();
+        try self.manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+        try self.manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+    }
+    fn deinit(self: *@This()) void {
+        self.manager.deinit();
+        self.store.close();
+        self.native.close();
+    }
+    fn frame(self: *@This()) ![]u8 {
+        const contract = try self.manager.preparedEffectsContract(id, catalog, .deferred, null);
+        return prepared_effects.encode(std.testing.allocator, .{ .contract = contract, .effects = .{} }, null);
+    }
+    fn seal(self: *@This(), raw: []const u8, key: []const u8, receipt: []const u8, original: ?read_control.Port) !void {
+        return self.manager.sealPreparedEffectsAndReplayPlan(id, raw, catalog, .deferred, null, .{ .documents = &.{.{ .key = key }} }, .{ .writes = &.{.{ .key = "seal-receipt", .value = receipt }} }, original);
+    }
+    fn debt(self: *@This()) !backlog.State {
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        return (try backlog.load(&read)) orelse .{};
+    }
+    fn noSeal(self: *@This()) !void {
+        const a = std.testing.allocator;
+        try std.testing.expect(!try self.manager.hasPreparedEffects(id));
+        try std.testing.expectError(error.NotFound, self.store.get(a, "seal-receipt"));
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try credit.load(&read, id)) == null);
+    }
+};
+
+test "prepared transaction effects replay seal publishes frame grant and receipt atomically" {
+    const a = std.testing.allocator;
+    const F = PreparedReplaySealFixture;
+    var f: F = .{};
+    try f.init();
+    defer f.deinit();
+    const frame = try f.frame();
+    defer a.free(frame);
+    try f.seal(frame, "row", "accepted", null);
+    const debt = try f.debt();
+    {
+        var read = try f.store.beginReadTxn();
+        defer read.abort();
+        const grant = (try F.credit.load(&read, F.id)).?;
+        try std.testing.expectEqual(F.credit.Phase.prepared, grant.phase);
+        try std.testing.expectEqual(@as(u64, 1), grant.root_count);
+        try std.testing.expectEqualDeep((try prepared_effects.inspect(frame, null)).fingerprint, grant.frame);
+    }
+    try f.seal(frame, "row", "accepted", null);
+    try std.testing.expectEqualDeep(debt, try f.debt());
+    try std.testing.expectError(error.PreparedEffectsConflict, f.seal(frame, "different-root", "replaced", null));
+    const receipt = try f.store.get(a, "seal-receipt");
+    defer a.free(receipt);
+    try std.testing.expectEqualStrings("accepted", receipt);
+    try std.testing.expectEqualDeep(debt, try f.debt());
+    try f.manager.resolveIntents(F.id, .aborted, 2);
+    try std.testing.expect(!try f.manager.hasPreparedEffects(F.id));
+    var read = try f.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect((try F.credit.load(&read, F.id)) == null);
+    try std.testing.expectEqual(@as(u64, 0), (try f.debt()).bytes);
+}
+
+test "prepared transaction effects replay seal refuses exhausted capacity without freezing inputs" {
+    const a = std.testing.allocator;
+    const F = PreparedReplaySealFixture;
+    var f: F = .{};
+    try f.init();
+    defer f.deinit();
+    const frame = try f.frame();
+    defer a.free(frame);
+    const initial = try f.debt();
+    const filler = F.backlog.transactionCreditKey(@splat(254));
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, F.backlog.default_max_bytes - initial.bytes - filler.len, .little);
+    try f.store.put(&filler, &raw);
+    try std.testing.expectError(error.Backpressured, f.seal(frame, "row", "refused", null));
+    try f.noSeal();
+    try f.manager.writeIntents(F.id, &.{.{ .key = "row", .value = "[]" }}, &.{});
+    try f.store.delete(&filler);
+    const retry = try f.frame();
+    defer a.free(retry);
+    try f.seal(retry, "row", "accepted", null);
+}
+
+test "prepared transaction effects replay seal rolls back each allocation and original rejection" {
+    const F = PreparedReplaySealFixture;
+    const Checks = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.DeadlineExceeded;
+        }
+        fn run(allocator: Allocator, checks: ?*@This()) !void {
+            const a = std.testing.allocator;
+            var f: F = .{};
+            try f.init();
+            defer f.deinit();
+            const frame = try f.frame();
+            defer a.free(frame);
+            var payload: read_control.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            f.manager.alloc = allocator;
+            const outcome = f.seal(frame, "row", "accepted", if (checks != null) read_control.Port.init(&payload) else null);
+            f.manager.alloc = a;
+            if (outcome) |_| {
+                try std.testing.expect(try f.manager.hasPreparedEffects(F.id));
+                var read = try f.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expect((try F.credit.load(&read, F.id)) != null);
+            } else |err| {
+                try f.noSeal();
+                return err;
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Checks.run, .{@as(?*Checks, null)});
+    var baseline: Checks = .{};
+    try Checks.run(std.testing.allocator, &baseline);
+    try std.testing.expect(baseline.calls > 10);
+    for (1..baseline.calls + 1) |fail_at| {
+        var checks: Checks = .{ .fail_at = fail_at };
+        const outcome = Checks.run(std.testing.allocator, &checks);
+        if (checks.calls >= fail_at) try std.testing.expectError(error.DeadlineExceeded, outcome) else try outcome;
+    }
+}
+
+test "prepared transaction effects replay seal fails closed on unsupported raw backends" {
+    const a = std.testing.allocator;
+    var native = mem_backend.Backend.init(a, .{});
+    defer native.close();
+    var runtime = try native.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(157);
+    try manager.initTransaction(id, 1);
+    try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+    const contract = try manager.preparedEffectsContract(id, @splat(5), .deferred, null);
+    const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(frame);
+    try std.testing.expectError(error.Unsupported, manager.sealPreparedEffectsAndReplayPlan(id, frame, @splat(5), .deferred, null, .{}, .{}, null));
+    try std.testing.expect(!try manager.hasPreparedEffects(id));
+}
+
+test "prepared transaction effects replay abort preserves grant and frame on every refusal" {
+    const F = PreparedReplaySealFixture;
+    const Checks = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.DeadlineExceeded;
+        }
+        fn run(allocator: Allocator, checks: ?*@This()) !void {
+            const a = std.testing.allocator;
+            var f: F = .{};
+            try f.init();
+            defer f.deinit();
+            const frame = try f.frame();
+            defer a.free(frame);
+            try f.seal(frame, "row", "accepted", null);
+            const debt = try f.debt();
+            var payload: read_control.Payload = .{ .ptr = checks orelse undefined, .vtable = &.{ .checkpoint = check } };
+            f.manager.alloc = allocator;
+            const outcome = f.manager.resolveIntentsWithPreparedEffects(F.id, .aborted, 2, .{}, null, if (checks != null) read_control.Port.init(&payload) else null);
+            f.manager.alloc = a;
+            if (outcome) |_| {
+                try std.testing.expect(!try f.manager.hasPreparedEffects(F.id));
+                var read = try f.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expect((try F.credit.load(&read, F.id)) == null);
+                try std.testing.expectEqual(@as(u64, 0), (try f.debt()).bytes);
+            } else |err| {
+                try std.testing.expect(try f.manager.hasPreparedEffects(F.id));
+                try std.testing.expectEqualDeep(debt, try f.debt());
+                var read = try f.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expect((try F.credit.load(&read, F.id)) != null);
+                return err;
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Checks.run, .{@as(?*Checks, null)});
+    var baseline: Checks = .{};
+    try Checks.run(std.testing.allocator, &baseline);
+    try std.testing.expect(baseline.calls > 10);
+    for (1..baseline.calls + 1) |fail_at| {
+        var checks: Checks = .{ .fail_at = fail_at };
+        const outcome = Checks.run(std.testing.allocator, &checks);
+        if (checks.calls >= fail_at) try std.testing.expectError(error.DeadlineExceeded, outcome) else try outcome;
+    }
 }

@@ -18,6 +18,13 @@ const admission = @import("../common/read_admission.zig");
 /// The caller aborts its owned batch on rejection. Every check precedes commit;
 /// backend callback internals and accepted commit retain their existing policy.
 pub fn apply(batch: anytype, writes: anytype, deletes: anytype, replay: anytype, control: ?admission.Port) !void {
+    try stage(batch, writes, deletes, replay, control);
+    try batch.commit();
+}
+
+/// Stage only, allowing the owner to attach resource grants in this same batch.
+/// A failed grant must abort the batch; it must never publish these writes alone.
+pub fn stage(batch: anytype, writes: anytype, deletes: anytype, replay: anytype, control: ?admission.Port) !void {
     if (control) |owner| try owner.checkpoint();
     for (deletes) |key| {
         if (control) |owner| try owner.checkpoint();
@@ -35,5 +42,4 @@ pub fn apply(batch: anytype, writes: anytype, deletes: anytype, replay: anytype,
         try batch.setReplayOpaque(entry.sequence, entry.payload);
     }
     if (control) |owner| try owner.checkpoint();
-    try batch.commit();
 }

@@ -80,7 +80,8 @@ const builtin = @import("builtin");
 // Tokenizer vtables include additive token-byte decoding. Reject older
 // native handles before interpreting the added callback slot.
 // Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
-pub const abi_version: u32 = 52;
+// Backend batches can atomically reserve prepared replay credit with seals.
+pub const abi_version: u32 = 53;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
