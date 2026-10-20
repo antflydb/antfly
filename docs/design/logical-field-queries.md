@@ -245,7 +245,7 @@ MCP raw-query discovery exposes the same `value_search_execution` budgets and
 `remote_snapshot` cursor control as REST. Sequential `hierarchy.children`
 traversal accepts its retained snapshot token and rejects value-search policy,
 because that mode performs no relevance/filter verification phase.
- Declared named search-as-you-type roots retain their configured
+Declared named search-as-you-type roots retain their configured
 analyzers; shorthand mappings may additionally resolve declared generated shingle
 representations. Conflicting roots are rejected rather than selected arbitrarily.
 

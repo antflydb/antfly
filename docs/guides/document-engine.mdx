@@ -98,12 +98,12 @@ Identifier-heavy fields such as SKUs, file paths, hostnames, and code symbols of
 
 Explicit mappings are exact, table-wide physical declarations. Present values must be encodable by the mapping (a `date` mapping accepts an RFC 3339 date string or a non-negative nanosecond timestamp), and invalid writes are rejected before indexing. An `allOf` may contribute an exact mapping. Every alternative of an `anyOf` or `oneOf` must contribute the same normalized mapping; conditional or dynamically named mappings are rejected because they cannot guarantee one stable physical type for the dotted path.
 
-Field capabilities report what the planner can safely do with a concrete field:
+Field capabilities group each logical source with its available representations:
 
-- `query_modes` lists modes such as `full_text`, `exact`, `range`, `geo`, `autocomplete`, and `substring`.
-- `sortable` says the field is declared sortable.
-- `sort_lifecycle_state` reports cached physical evidence. `queryable` and `accelerated` are already validated; `declared` or `indexed` can be validated by the first exact-sort request; `unsupported` is not sortable.
-- `index_sort_position` and `index_sort_order` identify fields in the table's physical index sort.
+- `field` names the source used in queries; `value_operations` lists its supported original-value operations.
+- `sortable` reports whether that source resolves to one compatible sortable representation. `sort_requires_scoring` identifies conditional score ordering.
+- `sort_lifecycle_state` reports cached evidence for the resolved sort. `queryable` and `accelerated` are already validated; `declared` or `indexed` can be validated by the first exact-sort request; `unsupported` is not sortable.
+- `representations` contains concrete names, types, analyzers, index-relative `query_modes`, coverage, and physical index-sort positions. These describe configured views; callers can use the logical source without selecting a companion.
 
 ### Logical string operations
 
@@ -132,8 +132,8 @@ Index candidates are verified before counts, ordering and pagination. Unindexed
 fallback requires `value_search_execution.allow_scan`; defaults cap verification
 at 100,000 documents and 64 MiB per shard request. Exhaustion is an error, never
 a successful partial answer. `profile.value_search` explains selected candidate
-fields, fallback reasons and actual verification work. Each capability entry
-names one public `field` and its `value_operations`. Concrete types, analyzers,
+fields, fallback reasons and actual verification work. Source capability entries
+name one public `field` and its `value_operations`. Concrete types, analyzers,
 index-relative query modes, and coverage live in nested `representations`.
 Operations describe semantics rather than permission to scan. `kind` distinguishes
 source, reserved, computed, template, and unassociated entries. `_score` is computed
