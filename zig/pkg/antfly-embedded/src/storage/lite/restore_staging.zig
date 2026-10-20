@@ -2265,6 +2265,58 @@ test "backup preflight Lite and portable inspect all records without changing so
     }
 }
 
+test "backup preflight Lite and portable preserve resolver and model media dependencies" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const lite_path = try std.fs.path.join(a, &.{ root, "dependencies.aflite" });
+    defer a.free(lite_path);
+    const portable_path = try std.fs.path.join(a, &.{ root, "dependencies.afb2" });
+    defer a.free(portable_path);
+    const policy =
+        \\{"decider":{"provider":"antfly","model":"fixture","api_key":"private-key"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+    ;
+    const resolvers = @import("../db/catalog/resolver_catalog.zig");
+    const cfg: resolvers.ResolverConfig = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .scorer_json = "{\"comparisons\":[]}", .adjudicate_json = policy };
+    try cfg.validate();
+    const resolver_json = try resolvers.serializeCatalog(a, &.{cfg});
+    defer a.free(resolver_json);
+    const producers = @import("../db/catalog/enrichment_catalog.zig");
+    const enrichment_json = try producers.serializeCatalog(a, &.{.{ .name = "chunks", .kind = .chunk, .source_field = "body", .chunker_json = "{\"provider\":\"antfly\",\"embedding\":{\"model\":\"media-model\",\"dimensions\":3}}" }});
+    defer a.free(enrichment_json);
+    {
+        var lite = try LiteDb.createWithOptions(a, lite_path, true, .{ .fsync = false });
+        defer lite.close();
+        try lite.db.core.store.put("\x00\x00__metadata__:resolvers", resolver_json);
+        try lite.db.core.store.put("\x00\x00__metadata__:enrichments", enrichment_json);
+        const key = try internal_keys.documentKeyAlloc(a, "clip");
+        defer a.free(key);
+        try lite.db.core.store.put(key, "{\"body\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"immutable-v1\",\"version_kind\":\"s3_version_id\",\"length\":419430400}}");
+        var file = try tmp.dir.createFile(io, "dependencies.afb2", .{});
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try portable_backup.exportPortableToWriter(a, lite.db.core.store, &writer.interface);
+        try writer.end();
+    }
+    for ([_][]const u8{ lite_path, portable_path }) |path| {
+        const json = try inspectInputJsonAlloc(a, path, "{\"version\":1,\"configuration_id\":\"empty-destination\"}", .{});
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"producer_model\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"model\"") != null);
+        // The connection inventory contains both the frozen model credential
+        // and the source bucket; neither raw value may escape into the report.
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"field\":\"body\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"verdict\":\"unknown\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "private-key") == null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "s3://bucket") == null);
+    }
+}
+
 test "backup preflight native multishard scans later shards and table producers" {
     const a = std.testing.allocator;
     const io = std.testing.io;

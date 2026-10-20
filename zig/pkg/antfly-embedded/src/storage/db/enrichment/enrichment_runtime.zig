@@ -32149,49 +32149,38 @@ fn extractModelChunkSource(a: Allocator, config: Config, raw: []const u8, reques
         if (unit != .object) return .{};
         break :blk unit.object.get("text") orelse return .{};
     } else parsed.value.object.get(request.source_field) orelse return .{};
-    if (field == .null) return .{};
-    if (field == .string) {
-        const text = try a.dupe(u8, field.string);
-        return .{ .input = .{ .text = text }, .bytes = text };
+    const source = try @import("../../../chunking/chunk.zig").modelSourceFromValue(field);
+    switch (source) {
+        .none => return .{},
+        .text => |value| {
+            const text = try a.dupe(u8, value);
+            return .{ .input = .{ .text = text }, .bytes = text };
+        },
+        .source => |borrowed| {
+            var reference = borrowed;
+            var result = ModelChunkSource{};
+            errdefer result.deinit(a);
+            result.uri = try a.dupe(u8, reference.uri);
+            result.mime_type = try a.dupe(u8, reference.mime_type);
+            result.version = try a.dupe(u8, reference.version);
+            reference.uri = result.uri.?;
+            reference.mime_type = result.mime_type.?;
+            reference.version = result.version.?;
+            result.input = .{ .source = reference };
+            return result;
+        },
+        .media => |media| {
+            // Decode binary media only on the execution path. Offline source
+            // inspection uses the same borrowed descriptor without this work.
+            const size = std.base64.standard.Decoder.calcSizeForSlice(media.data) catch return error.InvalidChunkSource;
+            if (size > document_extraction_mod.effectiveRemoteContentMaxDownloadSize(config.remote_content)) return error.SourceTooLarge;
+            const bytes = try a.alloc(u8, size);
+            errdefer a.free(bytes);
+            std.base64.standard.Decoder.decode(bytes, media.data) catch return error.InvalidChunkSource;
+            const owned_mime = try a.dupe(u8, media.mime_type);
+            return .{ .input = .{ .binary = .{ .mime_type = owned_mime, .data = bytes } }, .bytes = bytes, .mime_type = owned_mime };
+        },
     }
-    if (field != .object) return error.InvalidChunkSource;
-    const kind = field.object.get("type") orelse return error.InvalidChunkSource;
-    if (kind == .string and std.mem.eql(u8, kind.string, "source")) {
-        const C = @import("inference_chunker");
-        const uri = field.object.get("uri") orelse return error.InvalidChunkSource;
-        const mime = field.object.get("mime_type") orelse return error.InvalidChunkSource;
-        const version = field.object.get("version") orelse return error.InvalidChunkSource;
-        const length = field.object.get("length") orelse return error.InvalidChunkSource;
-        if (uri != .string or mime != .string or version != .string or length != .integer or length.integer <= 0 or mime.string.len == 0) return error.InvalidChunkSource;
-        var reference = C.SourceReference{ .uri = uri.string, .mime_type = mime.string, .version = version.string, .length = @intCast(length.integer) };
-        if (field.object.get("version_kind")) |value| {
-            if (value != .string) return error.InvalidChunkSource;
-            reference.version_kind = std.meta.stringToEnum(@TypeOf(reference.version_kind), value.string) orelse return error.InvalidChunkSource;
-        }
-        var result = ModelChunkSource{};
-        errdefer result.deinit(a);
-        result.uri = try a.dupe(u8, uri.string);
-        result.mime_type = try a.dupe(u8, mime.string);
-        result.version = try a.dupe(u8, version.string);
-        reference.uri = result.uri.?;
-        reference.mime_type = result.mime_type.?;
-        reference.version = result.version.?;
-        result.input = .{ .source = reference };
-        return result;
-    }
-    if (kind != .string or !std.mem.eql(u8, kind.string, "media")) return error.InvalidChunkSource;
-    const mime = field.object.get("mime_type") orelse return error.InvalidChunkSource;
-    const data = field.object.get("data") orelse return error.InvalidChunkSource;
-    if (mime != .string or data != .string or mime.string.len == 0) return error.InvalidChunkSource;
-    // Inline media is versioned with the document. Remote assets first pass
-    // through the existing authorized asset materialization/retention path.
-    const size = std.base64.standard.Decoder.calcSizeForSlice(data.string) catch return error.InvalidChunkSource;
-    if (size > document_extraction_mod.effectiveRemoteContentMaxDownloadSize(config.remote_content)) return error.SourceTooLarge;
-    const bytes = try a.alloc(u8, size);
-    errdefer a.free(bytes);
-    std.base64.standard.Decoder.decode(bytes, data.string) catch return error.InvalidChunkSource;
-    const owned_mime = try a.dupe(u8, mime.string);
-    return .{ .input = .{ .binary = .{ .mime_type = owned_mime, .data = bytes } }, .bytes = bytes, .mime_type = owned_mime };
 }
 
 fn extractSourceText(

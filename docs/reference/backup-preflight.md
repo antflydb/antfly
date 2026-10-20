@@ -74,6 +74,19 @@ asset/chunk input stream. Core validation also covers artifact envelopes and
 retained provenance; a historical source string is not by itself an active
 fetch requirement.
 
+Model-aware chunking uses the execution path's source-input parser. Immutable
+source references contribute their URI's access requirements; inline media
+remains embedded. Its model requirement binds the enclosing chunk definition,
+including the source selector, chunk policy, embedding target and dimensions.
+Unrecognized or incomplete structured inputs remain unresolved.
+
+Active resolver catalogs include frozen adjudication models and credentials.
+Their model evidence binds the complete resolver policy. A resolver's
+`name_embedding` reference into another table does not establish that table's
+model revision or preprocessing contract and remains `model_contract_unknown`.
+Retired resolver identities retain historical state without executing it and
+do not contribute active dependencies.
+
 Simple field paths, simple substitutions and static `media`, `remoteMedia`,
 `remoteText` and `remotePDF` URL arguments are analyzed without execution.
 Unsupported helper syntax, composed locators and custom loaders are reported as

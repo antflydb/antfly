@@ -23,6 +23,8 @@ const portable = @import("../portable_backup.zig");
 const artifact_ids = @import("../db/artifact_ids.zig");
 const canonical = @import("../db/document_content_hash.zig");
 const staging = @import("restore_staging.zig");
+const resolver_catalog = @import("../db/catalog/resolver_catalog.zig");
+const chunking_types = @import("../../chunking/types.zig");
 
 pub const report_version = 1;
 pub const inspector_version = "antfly-backup-preflight/1";
@@ -288,7 +290,7 @@ fn modelBackedProducer(producer: Value) bool {
     return str(get(config, "model")).len > 0 or eq(provider, "antfly") or eq(provider, "openai") or eq(provider, "vertex") or eq(provider, "apple");
 }
 
-const Selector = struct { field: []const u8, template: []const u8, artifact: []const u8, locator: bool, dynamic: bool };
+const Selector = struct { field: []const u8, template: []const u8, artifact: []const u8, locator: bool, model_chunk: bool, dynamic: bool };
 pub const Inspector = struct {
     allocator: Allocator,
     report: *Report,
@@ -408,6 +410,30 @@ pub const Inspector = struct {
             return;
         }
         if (value != .object) return;
+        // Resolver execution has its own typed catalog and interpolation
+        // language. Frozen adjudication JSON is executable configuration;
+        // retired resolver identities and their retained policies are inert.
+        if (get(value, "source_artifact") != .null and get(value, "resolution_artifact") != .null and get(value, "key_template") != .null) {
+            const parsed = try resolver_catalog.ResolverConfig.parseValue(self.allocator, value);
+            defer parsed.deinit();
+            const cfg = parsed.value;
+            if (cfg.retired) return;
+            const identity = try canonical.canonicalJsonValueAlloc(self.allocator, value);
+            defer self.allocator.free(identity);
+            if (cfg.name_embedding.len > 0) {
+                // This is a reference into another table's embedding catalog,
+                // not a complete model/preprocessing contract. Dimensions and
+                // a model name alone must never certify compatibility.
+                try self.report.add(self.options, .model, identity, "", "name_embedding", 0);
+            }
+            if (cfg.adjudicate_json.len > 0) {
+                const policy = try @import("antfly_resolver").adjudication.Config.parse(self.allocator, cfg.adjudicate_json);
+                defer policy.deinit();
+                try self.report.add(self.options, .producer_model, identity, "", "adjudicate", 0);
+                try self.config(policy.value.decider, depth + 1, "decider");
+            }
+            return;
+        }
         // Only executable catalog positions enter this walker. Document values
         // are examined later solely through these source selectors.
         const kind = str(get(value, "kind"));
@@ -427,13 +453,26 @@ pub const Inspector = struct {
             break :blk if (t.len > 0) t else str(get(value, "template"));
         };
         const artifact = str(get(value, "source_artifact_name"));
+        var model_chunk = false;
+        const chunker_json = str(get(value, "chunker_json"));
+        if (eq(kind, "chunk") and chunker_json.len > 0) {
+            var chunk_config = try chunking_types.parseConfigFromSlice(self.allocator, chunker_json);
+            defer chunk_config.deinit(self.allocator);
+            if (chunk_config.embedding) |target| {
+                model_chunk = true;
+                const identity = try canonical.canonicalJsonValueAlloc(self.allocator, value);
+                defer self.allocator.free(identity);
+                const dims: u32 = if (target.dimensions) |d| if (d > 0 and d <= std.math.maxInt(u32)) @intCast(d) else 0 else 0;
+                try self.report.add(self.options, .model, identity, "", field, dims);
+            }
+        }
         const is_embedding = eq(kind, "embedding") or eq(kind, "dense_vector") or eq(kind, "sparse_vector") or eq(typ, "embeddings") or get(value, "embedder") != .null or get(value, "semantic_producer") != .null;
         const is_definition = is_embedding or producer != .null or eq(kind, "asset") or eq(kind, "chunk") or get(value, "transcriber") != .null;
         const known = producer_type.len == 0 or eq(producer_type, "copy") or eq(producer_type, "reader") or eq(producer_type, "transcriber") or eq(producer_type, "document_extraction") or eq(producer_type, "generator") or eq(producer_type, "extractor");
         if (!known) try self.report.add(self.options, .dynamic_loader, "producer", "", field, 0);
         if (is_definition and (field.len > 0 or template.len > 0 or artifact.len > 0)) {
             const locator_mode = eq(producer_type, "reader") or eq(producer_type, "transcriber") or eq(producer_type, "document_extraction") or eq(str(get(value, "embedding_input")), "pdf_page_images") or eq(str(get(value, "input")), "pdf_page_images") or eq(str(get(value, "embedding_input")), "image") or eq(str(get(value, "embedding_input")), "audio") or eq(str(get(value, "embedding_input")), "video") or get(value, "transcriber") != .null;
-            try self.selector(field, template, artifact, locator_mode, !known or (field.len > 0 and !simplePath(field)));
+            try self.selector(field, template, artifact, locator_mode, model_chunk, !known or (field.len > 0 and !simplePath(field)));
         }
         if (is_embedding) {
             const name = if (str(get(value, "name")).len > 0) str(get(value, "name")) else catalog_name;
@@ -527,9 +566,9 @@ pub const Inspector = struct {
         return false;
     }
 
-    fn selector(self: *@This(), field: []const u8, template: []const u8, artifact: []const u8, locator_mode: bool, dynamic: bool) !void {
+    fn selector(self: *@This(), field: []const u8, template: []const u8, artifact: []const u8, locator_mode: bool, model_chunk: bool, dynamic: bool) !void {
         if (self.definitions.items.len >= self.options.max_definitions or field.len + template.len + artifact.len > self.options.max_metadata_bytes -| self.definition_bytes) return error.PreflightLimitExceeded;
-        for (self.definitions.items) |prior| if (eq(prior.field, field) and eq(prior.template, template) and eq(prior.artifact, artifact) and prior.locator == locator_mode and prior.dynamic == dynamic) return;
+        for (self.definitions.items) |prior| if (eq(prior.field, field) and eq(prior.template, template) and eq(prior.artifact, artifact) and prior.locator == locator_mode and prior.model_chunk == model_chunk and prior.dynamic == dynamic) return;
         const a = self.allocator;
         const f = try a.dupe(u8, field);
         errdefer a.free(f);
@@ -537,7 +576,7 @@ pub const Inspector = struct {
         errdefer a.free(t);
         const ar = try a.dupe(u8, artifact);
         errdefer a.free(ar);
-        try self.definitions.append(a, .{ .field = f, .template = t, .artifact = ar, .locator = locator_mode, .dynamic = dynamic });
+        try self.definitions.append(a, .{ .field = f, .template = t, .artifact = ar, .locator = locator_mode, .model_chunk = model_chunk, .dynamic = dynamic });
         self.definition_bytes += field.len + template.len + artifact.len;
         // Empty tables still carry a future-ingestion dependency.
         if (dynamic) try self.report.add(self.options, .dynamic_loader, "loader", "", field, 0);
@@ -573,7 +612,23 @@ pub const Inspector = struct {
                     defer self.allocator.free(text);
                     try self.consumeValue(.{ .string = text }, id, s.field, s.locator, 0);
                 }
-            } else try self.consumeValue(if (s.field.len == 0) parsed.value else try self.selectedField(parsed.value, s.field, id), id, s.field, s.locator, 0);
+            } else {
+                const selected = if (s.field.len == 0) parsed.value else try self.selectedField(parsed.value, s.field, id);
+                if (s.model_chunk) try self.modelChunkSource(selected, id, s.field) else try self.consumeValue(selected, id, s.field, s.locator, 0);
+            }
+        }
+    }
+
+    fn modelChunkSource(self: *@This(), value: Value, doc: []const u8, field: []const u8) !void {
+        const source = @import("../../chunking/chunk.zig").modelSourceFromValue(value) catch {
+            try self.report.add(self.options, .source_unresolved, "model_chunk_source", doc, field, 0);
+            return;
+        };
+        switch (source) {
+            .none => {},
+            .text => |text| try self.directives(text, doc, field),
+            .source => |reference| try self.locator(reference.uri, doc, field),
+            .media => try self.report.add(self.options, .embedded, "inline", doc, field, 0),
         }
     }
 
@@ -706,7 +761,6 @@ pub const Inspector = struct {
             return;
         }
         const host = if (uri.host) |h| std.mem.trimEnd(u8, try std.ascii.allocLowerString(a, try h.toRawMaybeAlloc(a)), ".") else "";
-        if (isLocalHost(host)) try self.report.add(self.options, .source_local, "local_gateway", doc, field, 0);
         if (uri.user != null or uri.password != null) try self.report.add(self.options, .source_expiring, "embedded_credentials", doc, field, 0);
         if (uri.query) |q| {
             const query = try std.ascii.allocLowerString(a, try q.toRawMaybeAlloc(a));
@@ -726,6 +780,10 @@ pub const Inspector = struct {
                 try self.report.add(self.options, .source_unresolved, "missing_host", doc, field, 0);
                 return;
             }
+            // Object-storage authorities name buckets, not network gateways.
+            // A valid single-label S3/GCS bucket must not be classified as a
+            // local HTTP host merely because it has no dot.
+            if (isLocalHost(host)) try self.report.add(self.options, .source_local, "local_gateway", doc, field, 0);
             // Origin scope is deliberately hashed; no path, query, userinfo or
             // credential value is ever included in an example or log.
             const origin = try std.fmt.allocPrint(a, "{s}://{s}:{d}", .{ uri.scheme, host, uri.port orelse if (eq(uri.scheme, "https")) @as(u16, 443) else @as(u16, 80) });
@@ -758,6 +816,122 @@ fn count(report: Report, kind: Kind) u64 {
         n += r.count;
     };
     return n;
+}
+
+test "backup preflight resolver frozen policies and referenced embeddings require evidence" {
+    const a = std.testing.allocator;
+    const policy =
+        \\{"decider":{"provider":"antfly","model":"fixture","api_key":"private-key"},"template":"{{m.text}} / {{c.canonical_name}}","question":{"type":"choice","name":"same","instructions":"Are these the same entity?","choices":[{"value":"same"},{"value":"different"}]},"accept":{"choice":"same","min_probability":0.9}}
+    ;
+    var cfg: resolver_catalog.ResolverConfig = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .scorer_json = "{\"comparisons\":[]}", .adjudicate_json = policy };
+    try cfg.validate();
+    var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    const catalog = try resolver_catalog.serializeCatalog(a, &.{cfg});
+    defer a.free(catalog);
+    try inspector.metadataJson(catalog);
+    try std.testing.expect(count(report, .producer_model) > 0);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
+    const json = try report.jsonAlloc("{\"version\":1,\"configuration_id\":\"empty-destination\"}");
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"verdict\":\"unknown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "private-key") == null);
+    const caps = try a.alloc(Capability, report.requirements.items.len);
+    defer a.free(caps);
+    for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .future_ingestion = true, .model_revision_verified = true };
+    const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "verified-policy", .requirements = caps }, .{});
+    defer a.free(evidence);
+    const verified = try report.jsonAlloc(evidence);
+    defer a.free(verified);
+    try std.testing.expect(std.mem.indexOf(u8, verified, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+
+    // Bind the complete resolver policy, including its input template, rather
+    // than accepting evidence for an isolated model name or provider block.
+    const original_count = count(report, .producer_model);
+    const original_groups = report.requirements.items.len;
+    cfg.key_template = "entity/{{_entity.text}}";
+    const changed = try resolver_catalog.serializeCatalog(a, &.{cfg});
+    defer a.free(changed);
+    try inspector.metadataJson(changed);
+    try std.testing.expectEqual(original_count + 2, count(report, .producer_model));
+    try std.testing.expectEqual(original_groups + 1, report.requirements.items.len);
+
+    cfg.adjudicate_json = "";
+    cfg.name_embedding = "other-table-embedder";
+    cfg.name_embedding_dims = 3;
+    const embedding = try resolver_catalog.serializeCatalog(a, &.{cfg});
+    defer a.free(embedding);
+    try inspector.metadataJson(embedding);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .model));
+    for (report.requirements.items) |*r| if (r.kind == .model) {
+        const embedding_caps = [_]Capability{.{ .requirement_sha256 = &r.sha256, .supported = true, .query_embedding = true, .future_ingestion = true, .model_revision_verified = true, .preprocessing_verified = true, .vector_space_verified = true, .dimensions = 3 }};
+        const e = evaluate(r, .{ .version = 1, .configuration_id = "destination", .requirements = &embedding_caps });
+        try std.testing.expectEqualStrings("model_contract_unknown", e.reason_code);
+    };
+}
+
+test "backup preflight retired resolver policies and deterministic resolvers are inert" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    var cfg: resolver_catalog.ResolverConfig = .{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}" };
+    const deterministic = try resolver_catalog.serializeCatalog(a, &.{cfg});
+    defer a.free(deterministic);
+    try inspector.metadataJson(deterministic);
+    cfg.retired = true;
+    cfg.inline_managed = true;
+    cfg.name_embedding = "retired-model";
+    const retired = try resolver_catalog.serializeCatalog(a, &.{cfg});
+    defer a.free(retired);
+    try inspector.metadataJson(retired);
+    try std.testing.expectEqual(@as(usize, 0), report.requirements.items.len);
+}
+
+test "backup preflight model chunker source references and inline media share runtime parsing" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(
+        \\[{"name":"chunks","kind":"chunk","source_field":"body","chunker_json":"{\"provider\":\"antfly\",\"embedding\":{\"model\":\"media-model\",\"dimensions\":3}}"}]
+    );
+    try std.testing.expectEqual(@as(u64, 1), count(report, .model));
+    try std.testing.expectEqual(@as(u32, 3), report.requirements.items[0].dimensions);
+    try inspector.document("doc", "{\"body\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"v1\",\"version_kind\":\"s3_version_id\",\"length\":419430400}}", "");
+    try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+    try inspector.document("local", "{\"body\":{\"type\":\"source\",\"uri\":\"file:///private/clip.mp4\",\"mime_type\":\"video/mp4\",\"version\":\"v1\",\"length\":419430400}}", "");
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
+    try inspector.document("inline", "{\"body\":{\"type\":\"media\",\"mime_type\":\"image/png\",\"data\":\"AQID\"}}", "");
+    try std.testing.expectEqual(@as(u64, 1), count(report, .embedded));
+    try std.testing.expect(report.analysis_complete);
+    // Incomplete references cannot silently disappear from the inventory.
+    try inspector.document("invalid", "{\"body\":{\"type\":\"source\",\"uri\":\"s3://bucket/clip.mp4\"}}", "");
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_unresolved));
+    try std.testing.expect(!report.analysis_complete);
+}
+
+test "backup preflight bucket authorities are not local HTTP gateways" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    for ([_][]const u8{ "s3://bucket/object", "gs://bucket/object", "gcs://bucket.local/object" }) |uri| try inspector.locator(uri, "d", "media");
+    try std.testing.expectEqual(@as(u64, 3), count(report, .connection));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+    for (report.requirements.items) |*r| {
+        const caps = [_]Capability{.{ .requirement_sha256 = &r.sha256, .supported = true }};
+        try std.testing.expectEqual(Verdict.compatible, evaluate(r, .{ .version = 1, .configuration_id = "configured-bucket", .requirements = &caps }).verdict);
+    }
+    try inspector.locator("http://gateway/object", "d", "media");
+    try inspector.locator("https://127.0.0.1/object", "d", "media");
+    try std.testing.expectEqual(@as(u64, 2), count(report, .source_local));
 }
 
 test "backup preflight active sources incidental text and bounded examples" {
