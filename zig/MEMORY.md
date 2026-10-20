@@ -145,6 +145,21 @@ audit view; current recall excludes stale dependencies and historical guidance.
 Structural enumeration and ranked recall share lifecycle and validity filtering.
 An explicit `valid_at` can select a superseded version in its original interval;
 it never requires `include_history` merely to reconstruct that valid state.
+Dependency applicability is evaluated against the same valid and recorded times at
+every depth, including during reconciliation. Ordinary supersession, dispute, or
+retraction of a premise never rewrites dependent facts to globally `stale` during
+maintenance. Thus historical reads and authority decisions are independent of
+whether maintenance has run. Explicitly restoring a retained premise can make its
+still-active dependents applicable again; it does not restore dependents that
+were themselves retracted or superseded.
+
+`stale` represents explicit semantic invalidation of an opaque derived artifact,
+such as a summary or procedure invalidated by an ontology, policy, or identity
+change. Such artifacts require regeneration under a new immutable ID. This
+invalidation is versioned and historical reads still select the recorded artifact
+revision; it is distinct from temporary or time-qualified support applicability.
+Queued identity invalidation is fenced to its originating revision, so processing
+an older event cannot invalidate an artifact regenerated after that change.
 
 HTTP routes live under `/memory/v1/spaces/{space}`. Use
 `X-Antfly-Database` and `X-Antfly-Namespace` for catalog scope (defaults:
@@ -224,6 +239,13 @@ Context is disambiguation evidence, not another authoritative extraction stream.
 Generated assertions must cite a current observation as well as any prior support they use.
 `support_sets` represents independent alternative support; each individual set is
 conjunctive. Losing one set must not remove a claim with another retained set.
+The durable dependency queue propagates irreversible retention loss as a bounded
+retirement frontier. Only loss of all complete retained support branches retires a
+fact: fence its immutable ID, remove its primary payload and generation metadata,
+and enqueue descendants. Physical cleanup scrubs affected history and projections.
+Retraction, dispute, supersession, and explicit artifact invalidation preserve
+retained audit history. Forgetting and expiry fence every time-qualified read
+immediately, even before retirement reaches deep descendants.
 Dependency admission and all read/retention traversals share a maximum of 32
 assertion levels, counting the new root. Every proposed support branch reserves
 that root level while validating its parents, including alternative branches hidden

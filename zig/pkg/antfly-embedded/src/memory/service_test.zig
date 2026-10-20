@@ -1511,3 +1511,146 @@ test "memory source authority evaluates historical premises at overlapping busin
         try std.testing.expectEqual(if (mode == 0) m.types.Lifecycle.disputed else .active, (try authorityNewFact(&store, if (mode == 1) 400 else 200)).lifecycle);
     }
 }
+
+fn temporalDependencySetup(store: *Store, kind: m.types.Kind) !void {
+    const a = store.arena.allocator();
+    try authoritySources(store, false);
+    const parent: m.types.Assertion = .{ .id = "parent", .subject = "premise", .predicate = "status", .value = "old", .statement = "Old premise", .valid_from = 100, .evidence = &.{.{ .id = "low" }} };
+    _ = try store.service("alice", true, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{parent} }, .{}), "parent");
+    const old: m.types.Assertion = .{ .id = "old", .subject = "production", .predicate = "deploys_with", .kind = kind, .value = "Helm", .statement = "Helm", .valid_from = 100, .evidence = &.{.{ .id = "high" }}, .depends_on = &.{"parent"} };
+    _ = try store.service("alice", true, 4).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{old} }, .{}), "old");
+    var leaf = old;
+    leaf.id = "leaf";
+    leaf.subject = "leaf";
+    leaf.predicate = "observation";
+    leaf.kind = .semantic;
+    leaf.depends_on = &.{"old"};
+    _ = try store.service("alice", true, 4).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{leaf} }, .{}), "leaf");
+    var next = parent;
+    next.id = "parent-next";
+    next.value = "new";
+    next.statement = "New premise";
+    next.valid_from = 300;
+    next.supersedes = &.{"parent"};
+    _ = try store.service("alice", true, 5).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{next} }, .{}), "next");
+}
+fn temporalReadCount(store: *Store, action: m.Action, subject: []const u8, valid: i64, known: ?i64) !usize {
+    const a = store.arena.allocator();
+    const raw = try store.service("alice", true, 49).execute(a, action, "", try std.json.Stringify.valueAlloc(a, .{ .subject = subject, .valid_at = valid, .known_at = known, .token_budget = @as(u32, 8192) }, .{}), "");
+    return (try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{})).object.get("items").?.array.items.len;
+}
+test "memory temporal dependency maintenance preserves history and reconciliation at every depth" {
+    for ([_]m.types.Kind{ .semantic, .summary, .procedural }) |kind| for ([_]bool{ false, true }) |maintain| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try temporalDependencySetup(&store, kind);
+        if (maintain) for (0..16) |step| {
+            _ = try store.service("alice", true, @intCast(step + 10)).execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "maintenance-{d}", .{step}));
+        };
+        for ([_]m.Action{ .list, .recall }) |action| for ([_][]const u8{ "production", "leaf" }) |subject| {
+            try std.testing.expectEqual(@as(usize, 1), try temporalReadCount(&store, action, subject, 200, null));
+            try std.testing.expectEqual(@as(usize, 1), try temporalReadCount(&store, action, subject, 200, 49));
+            try std.testing.expectEqual(@as(usize, 1), try temporalReadCount(&store, action, subject, 200, 4));
+            try std.testing.expectEqual(@as(usize, 0), try temporalReadCount(&store, action, subject, 400, null));
+        };
+        try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 49).execute(a, .get, "old", "{}", ""));
+        const audit = try std.json.parseFromSliceLeaky(m.types.RecordPage, a, try store.service("alice", true, 49).execute(a, .history, "old", "{}", ""), .{});
+        try std.testing.expectEqual(@as(usize, 1), audit.items.len);
+        try std.testing.expect(!audit.items[0].stale);
+        try std.testing.expectEqual(m.types.Lifecycle.disputed, (try authorityNewFact(&store, 200)).lifecycle);
+    };
+}
+
+fn advanceTemporalMaintenance(store: *Store, prefix: []const u8) !void {
+    const a = store.arena.allocator();
+    for (0..24) |step| _ = try store.service("alice", true, @intCast(step + 10)).execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "{s}-{d}", .{ prefix, step }));
+}
+test "memory maintenance preserves recorded retractions and active dependency restoration until hard retirement" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try temporalDependencySetup(&store, .semantic);
+    for ([_]m.types.Lifecycle{ .retracted, .active }) |lifecycle| {
+        const current = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 6).execute(a, .get, "parent", "{}", ""), .{});
+        const correction: m.types.Correction = .{ .id = "parent", .expected_revision = current.revision, .lifecycle = lifecycle, .reason = "Verified premise disposition", .evidence = &.{.{ .id = "low" }} };
+        _ = try store.service("alice", true, if (lifecycle == .retracted) 7 else 40).execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, correction, .{}), @tagName(lifecycle));
+        for ([_]bool{ false, true }) |maintain| {
+            if (maintain) try advanceTemporalMaintenance(&store, @tagName(lifecycle));
+            for ([_]m.Action{ .list, .recall }) |action| for ([_][]const u8{ "production", "leaf" }) |subject| {
+                try std.testing.expectEqual(@as(usize, 1), try temporalReadCount(&store, action, subject, 200, 4));
+                try std.testing.expectEqual(@as(usize, 0), try temporalReadCount(&store, action, subject, 200, 8));
+                try std.testing.expectEqual(@as(usize, if (lifecycle == .active) 1 else 0), try temporalReadCount(&store, action, subject, 200, null));
+            };
+        }
+    }
+    _ = try store.service("alice", true, 45).execute(a, .forget, "", "{\"assertion_ids\":[\"parent\"]}", "forget-parent");
+    for ([_]bool{ false, true }) |maintain| {
+        if (maintain) try advanceTemporalMaintenance(&store, "forget");
+        for ([_]m.Action{ .list, .recall }) |action| for ([_][]const u8{ "production", "leaf" }) |subject| {
+            try std.testing.expectEqual(@as(usize, 0), try temporalReadCount(&store, action, subject, 200, 4));
+            try std.testing.expectEqual(@as(usize, 0), try temporalReadCount(&store, action, subject, 200, null));
+        };
+    }
+    var rows = store.values.iterator();
+    while (rows.next()) |row| if (std.mem.startsWith(u8, row.key_ptr.*, "assertion/") or std.mem.startsWith(u8, row.key_ptr.*, "history/")) {
+        const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, row.value_ptr.*, .{});
+        try std.testing.expect(!std.mem.eql(u8, record.assertion.id, "old"));
+        try std.testing.expect(!std.mem.eql(u8, record.assertion.id, "leaf"));
+    };
+}
+
+test "memory explicit semantic artifact invalidation remains independent of temporal maintenance" {
+    for ([_]m.types.Kind{ .summary, .procedural }) |kind| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try temporalDependencySetup(&store, kind);
+        const inspected = try std.json.parseFromSliceLeaky(m.types.Inspection, a, try store.service("alice", true, 6).execute(a, .inspect, "", "{}", ""), .{});
+        var config = inspected.state.config;
+        config.policy_version = "v2";
+        _ = try store.service("alice", true, 7).execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = inspected.state.revision, .config = config }, .{}), "policy");
+        for ([_]bool{ false, true }) |maintain| {
+            if (maintain) try advanceTemporalMaintenance(&store, "policy");
+            for ([_]m.Action{ .list, .recall }) |action| for ([_][]const u8{ "production", "leaf" }) |subject| {
+                try std.testing.expectEqual(@as(usize, 0), try temporalReadCount(&store, action, subject, 200, null));
+                try std.testing.expectEqual(@as(usize, 1), try temporalReadCount(&store, action, subject, 200, 4));
+            };
+            const audit = try std.json.parseFromSliceLeaky(m.types.RecordPage, a, try store.service("alice", true, 49).execute(a, .history, "old", "{}", ""), .{});
+            var stale_count: usize = 0;
+            for (audit.items) |record| if (record.stale) {
+                stale_count += 1;
+            };
+            try std.testing.expectEqual(@as(usize, 1), stale_count);
+        }
+    }
+}
+
+test "memory delayed identity invalidation preserves artifacts regenerated after the identity revision" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try authoritySources(&store, false);
+    const entities = [_]m.types.Entity{
+        .{ .id = "left", .name = "Left", .evidence = &.{.{ .id = "low" }} },
+        .{ .id = "right", .name = "Right", .evidence = &.{.{ .id = "low" }} },
+    };
+    _ = try store.service("alice", true, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &[_]m.types.Evidence{.{ .id = "low", .source_id = "low", .source_version = "1", .text = "Helm" }}, .entities = &entities }, .{}), "entities");
+    const old: m.types.Assertion = .{ .id = "old", .subject = "left", .predicate = "guidance", .kind = .summary, .value = "old", .statement = "Old summary", .evidence = &.{.{ .id = "low" }} };
+    _ = try store.service("alice", true, 4).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{old} }, .{}), "old");
+    const inspected = try std.json.parseFromSliceLeaky(m.types.Inspection, a, try store.service("alice", true, 5).execute(a, .inspect, "", "{}", ""), .{});
+    _ = try store.service("alice", true, 6).execute(a, .curate_entity, "", try std.json.Stringify.valueAlloc(a, .{ .action = "merge", .from = "left", .to = "right", .expected_revision = inspected.state.revision }, .{}), "merge");
+    var fresh = old;
+    fresh.id = "fresh";
+    fresh.value = "fresh";
+    fresh.statement = "Regenerated summary";
+    _ = try store.service("alice", true, 7).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{fresh} }, .{}), "fresh");
+    for ([_]bool{ false, true }) |maintain| {
+        if (maintain) try advanceTemporalMaintenance(&store, "identity");
+        const raw = try store.service("alice", true, 49).execute(a, .list, "", "{}", "");
+        const page = try std.json.parseFromSliceLeaky(m.types.RecordPage, a, raw, .{});
+        try std.testing.expectEqual(@as(usize, 1), page.items.len);
+        try std.testing.expectEqualStrings("fresh", page.items[0].assertion.id);
+        try std.testing.expect(!page.items[0].stale);
+    }
+}

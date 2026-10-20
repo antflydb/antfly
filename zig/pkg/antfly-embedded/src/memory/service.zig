@@ -1313,9 +1313,7 @@ const Run = struct {
         for (request.assertion_ids) |id| {
             const record = (try self.assertion(id)) orelse return error.MemoryNotFound;
             try self.authorize(record.owner, .private);
-            try self.remove(try key(self.a, "assertion", id));
-            try self.put(try key(self.a, "forgotten-assertion", id), true);
-            try self.invalidate("assertion", id);
+            try self.retireAssertion(id);
         }
         // Cleanup is bounded and resumable. Recall checks the durable fences
         // immediately, before asynchronous physical cleanup has completed.
@@ -1525,14 +1523,23 @@ const Run = struct {
         receipt.assertions_ready = pending.assertions_ready;
         try self.put(path, pending.*);
     }
+    fn retireAssertion(self: *Run, id: []const u8) !void {
+        // Retirement is irreversible physical cleanup, not a belief revision.
+        // Fence identity reuse before dropping payload and generation metadata.
+        try self.put(try key(self.a, "forgotten-assertion", id), true);
+        try self.remove(try self.generationKey("assertion", id));
+        try self.remove(try key(self.a, "assertion", id));
+        try self.invalidate("assertion", id);
+    }
     fn maintenance(self: *Run) !void {
         if (!self.service.context.admin) return error.Forbidden;
         if (self.state.next_expiry_at) |time| if (time <= self.service.context.now_ms) {
             try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
             self.state.next_expiry_at = null;
         };
-        // One dependency page per transaction. Newly enqueued children form
-        // a durable frontier; restart never loses invalidation debt.
+        // One dependency page per transaction. Retention loss propagates a
+        // durable retirement frontier. Current inapplicability is evaluated by
+        // the shared temporal support traversal; it is never global staleness.
         const work = try self.service.backend.scan(self.service.backend.ptr, self.a, "dependency/work/", null, 1);
         if (work.rows.len > 0) {
             const item = try parse(struct { kind: []const u8, id: []const u8, revision: u64, cursor: ?[]const u8 = null }, self.a, work.rows[0].json);
@@ -1542,7 +1549,12 @@ const Run = struct {
                 const child = try parse(struct { child: []const u8 }, self.a, row.json);
                 if (try self.assertion(child.child)) |value| {
                     var record = value;
-                    if (!record.stale and (eql(u8, item.kind, "entity") or !try self.evidenceVisible(record))) {
+                    if (!try self.retained(record, 0)) {
+                        try self.retireAssertion(child.child);
+                    } else if (!record.stale and record.revision <= item.revision and eql(u8, item.kind, "entity")) {
+                        // Identity changes invalidate opaque derived artifacts;
+                        // ordinary support changes do not rewrite factual history.
+                        // A delayed event cannot invalidate a regenerated artifact.
                         record.stale = true;
                         record.revision = self.state.revision;
                         try self.putAssertion(record);
@@ -1602,13 +1614,7 @@ const Run = struct {
                 } else if (std.mem.startsWith(u8, row.key, "assertion/") or std.mem.startsWith(u8, row.key, "history/")) {
                     const record = (try self.read(t.StoredAssertion, row.key)) orelse continue;
                     if (!try self.retained(record, 0)) {
-                        if (std.mem.startsWith(u8, row.key, "assertion/")) {
-                            // Retire the immutable identity before removing its payload.
-                            // Reverse/group indexes can never resolve to a reused ID.
-                            try self.put(try key(self.a, "forgotten-assertion", record.assertion.id), true);
-                            try self.remove(try self.generationKey("assertion", record.assertion.id));
-                        }
-                        try self.remove(row.key);
+                        if (std.mem.startsWith(u8, row.key, "assertion/")) try self.retireAssertion(record.assertion.id) else try self.remove(row.key);
                     } else try self.put(row.key, try self.publicRecord(record));
                 }
             }

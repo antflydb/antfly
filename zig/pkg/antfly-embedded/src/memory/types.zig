@@ -236,6 +236,8 @@ pub const StoredAssertion = struct {
     recorded_at: i64 = 0,
     revision: u64,
     lifecycle: Lifecycle = .active,
+    // Explicit semantic invalidation of a derived artifact. Time-qualified
+    // dependency applicability is evaluated at read/reconciliation time.
     stale: bool = false,
     reason: ?[]const u8 = null,
     conflicts_with: []const []const u8 = &.{},
