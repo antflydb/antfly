@@ -3329,10 +3329,37 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-preparation-status-owner-check", "Analyze resident status leases and quorum admission without the full storage archive")
         .dependOn(&preparation_status_owner_check.step);
+    const online_owner_queue_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/owner_preparation_queue.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const online_owner_queue_tests = b.addTest(.{
+        .root_module = online_owner_queue_root,
+        .filters = &.{"online owner preparation queue"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const online_owner_queue_run = b.addRunArtifact(online_owner_queue_tests);
+    online_owner_queue_run.has_side_effects = true;
+    online_owner_queue_run.addArg("--require-no-skips");
+    b.step("antfly-online-owner-preparation-test", "Verify bounded online owner preparation metadata, expiry, coalescing and adaptive workspace")
+        .dependOn(&online_owner_queue_run.step);
+    const online_owner_source_tests = b.addTest(.{
+        .root_module = owner_preflight_context_root,
+        .filters = &.{"online owner preparation source"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const online_owner_source_run = b.addRunArtifact(online_owner_source_tests);
+    online_owner_source_run.has_side_effects = true;
+    online_owner_source_run.addArg("--require-no-skips");
+    b.step("antfly-online-owner-preparation-source-test", "Exercise actual source scheduling, pending admission and controlled descriptor confirmation")
+        .dependOn(&online_owner_source_run.step);
     const owner_control_funding_check = b.addTest(.{
         .name = "owner-control-funding-check",
         .root_module = owner_preflight_context_root,
-        .filters = &.{ "committed owner apply never opens or closes storage under the raft apply lock", "funded owner control startup" },
+        .filters = &.{ "committed owner apply never opens or closes storage under the raft apply lock", "funded owner control startup", "online owner preparation admission" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-owner-control-funding-check", "Analyze production cold apply opening with independently funded execution")

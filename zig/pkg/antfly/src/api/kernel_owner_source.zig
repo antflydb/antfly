@@ -313,6 +313,8 @@ pub const ProvisionedKernelOwnerSource = struct {
     apply_open_wake: std.Io.Event = .unset,
     apply_control_pending: std.ArrayListUnmanaged(*ApplyOpen) = .empty,
     apply_control_active: ?*ApplyOpen = null,
+    online_open_queue: @import("owner_preparation_queue.zig").Queue = .{},
+    apply_open_debt: std.atomic.Value(usize) = .init(0),
     apply_control_stopping: bool = false,
     apply_ready_wake: ?ApplyReadyWake = null,
     apply_ready_wake_inflight: usize = 0,
@@ -479,6 +481,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         /// reconciliation. The next ordinary acquisition must reopen against
         /// the catalog, even when the descriptor bytes happen to match.
         opened_for_historical_apply: bool = false,
+        online_preparation_pending: bool = false,
         // Exact descriptor/target proof, owned by this physical generation.
         // Shared repair steps may reuse it until a structural follow-up is due.
         repair_target: ?[]u8 = null,
@@ -648,6 +651,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         for (self.apply_control_pending.items) |pending| pending.deinit(self.alloc);
         self.apply_control_pending.deinit(self.alloc);
         self.apply_control_pending = .empty;
+        self.apply_open_debt.store(0, .release);
+        self.online_open_queue = .{};
     }
 
     fn applyControlMain(self: *ProvisionedKernelOwnerSource) void {
@@ -685,6 +690,24 @@ pub const ProvisionedKernelOwnerSource = struct {
                 self.mutex.unlock();
                 return;
             }
+            // Online quorum certification can depend on committed apply.
+            // Never put that dependency behind optional online warming.
+            if (self.apply_control_pending.items.len == 0) {
+                if (self.online_open_queue.take(platform_time.monotonicNs())) |request| {
+                    self.mutex.unlock();
+                    const outcome = self.openOnlineControlRequest(&request, io) catch |err| switch (err) {
+                        error.TableNotFound, error.NotLeader, error.RestoreStagingScopeChanged, error.PreparedTransactionProtocolUnavailable, error.Canceled, error.Timeout => OnlineOpenOutcome.discard,
+                        else => OnlineOpenOutcome.retry,
+                    };
+                    lock(&self.mutex);
+                    const retry = !self.apply_control_stopping and (outcome == .retry or outcome == .grow);
+                    self.online_open_queue.finish(retry, outcome == .grow, platform_time.monotonicNs());
+                    self.mutex.unlock();
+                    if (retry and self.apply_open_debt.load(.acquire) == 0)
+                        io.sleep(.fromMilliseconds(request.retry_delay_ms), .awake) catch {};
+                    continue;
+                }
+            }
             const pending: ?*ApplyOpen = if (self.apply_control_pending.items.len != 0)
                 self.apply_control_pending.orderedRemove(0)
             else
@@ -719,6 +742,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (opened) {
                 lock(&self.mutex);
                 self.apply_control_active = null;
+                const debt = self.apply_open_debt.fetchSub(1, .acq_rel);
+                std.debug.assert(debt != 0);
                 const wake = self.apply_ready_wake;
                 if (wake != null) self.apply_ready_wake_inflight += 1;
                 self.mutex.unlock();
@@ -734,6 +759,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             lock(&self.mutex);
             self.apply_control_active = null;
             if (self.apply_control_stopping) {
+                const debt = self.apply_open_debt.fetchSub(1, .acq_rel);
+                std.debug.assert(debt != 0);
                 self.mutex.unlock();
                 request.deinit(self.alloc);
                 return;
@@ -788,6 +815,168 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
         defer lease.deinit();
         try pass.check();
+    }
+
+    fn scheduleOnlinePreparation(self: *ProvisionedKernelOwnerSource, group: u64, table: []const u8, control: @import("antfly_local_sources").common_read_admission.Port) !void {
+        try control.checkpoint();
+        if (!self.mutex.tryLock()) return error.StorageReadTemporarilyUnavailable;
+        if (self.quiescing or self.apply_control_stopping or !self.apply_control_started.load(.acquire)) {
+            self.mutex.unlock();
+            return error.StorageReadTemporarilyUnavailable;
+        }
+        const pushed = self.online_open_queue.push(group, table, platform_time.monotonicNs() +| 30 * std.time.ns_per_s) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
+        if (pushed) self.apply_open_wake.set(self.apply_control_io.?);
+        try control.checkpoint();
+    }
+
+    const OnlinePreparationControls = struct {
+        require_checked_reentry: bool = true,
+        pass: *@import("runnable_status_refresh.zig").Pass,
+        execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+        fn check(value: @This()) !void {
+            try value.pass.checkLifetime();
+            if (value.execution_runnable) |borrow| {
+                const status = borrow.checkpoint(borrow.context);
+                if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+            }
+            try value.pass.checkLifetime();
+        }
+    };
+    const OnlinePreparationBudget = @import("antfly_local_sources").common_read_execution_budget.Budget(OnlinePreparationControls, OnlinePreparationControls.check);
+    const OnlineOpenOutcome = enum { ready, discard, retry, grow };
+    const OnlinePreparationAttempt = struct {
+        source: *ProvisionedKernelOwnerSource,
+        yield_to_apply: std.atomic.Value(bool) = .init(true),
+        fn canceled(raw: ?*const anyopaque) callconv(.c) u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return @intFromBool(!self.source.apply_control_started.load(.acquire) or
+                (self.yield_to_apply.load(.acquire) and self.source.apply_open_debt.load(.acquire) != 0));
+        }
+    };
+    fn openOnlineControlRequest(self: *ProvisionedKernelOwnerSource, request: *const @import("owner_preparation_queue.zig").Request, io: std.Io) !OnlineOpenOutcome {
+        var attempt: OnlinePreparationAttempt = .{ .source = self };
+        return self.openOnlineControlAttempt(request, io, &attempt) catch |err| {
+            if (err == error.Canceled and self.apply_control_started.load(.acquire) and self.apply_open_debt.load(.acquire) != 0)
+                return .retry;
+            return err;
+        };
+    }
+    fn openOnlineControlAttempt(self: *ProvisionedKernelOwnerSource, request: *const @import("owner_preparation_queue.zig").Request, io: std.Io, attempt: *OnlinePreparationAttempt) !OnlineOpenOutcome {
+        const execution = @import("runnable_status_refresh.zig");
+        const read = @import("antfly_local_sources").common_read_admission;
+        const retained = try std.math.add(u64, @sizeOf(Entry) + @sizeOf(@TypeOf(request.*)), try std.math.mul(u64, request.workspace_bytes, 3));
+        var pass = try execution.Pass.initWithOptions(
+            if (self.close_execution_owner) |lease| lease.owner else null,
+            &io,
+            request.deadline_ns,
+            .{ .context = attempt, .is_cancelled = OnlinePreparationAttempt.canceled },
+            .{ .retained_bytes = retained },
+        );
+        defer pass.deinit();
+        var budget: OnlinePreparationBudget = .{ .controls = .{ .pass = &pass, .execution_runnable = pass.borrow }, .io = io };
+        var adapter: read.Adapter(*OnlinePreparationBudget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = read.Port.init(&payload);
+        const Lifetime = struct {
+            fn check(raw: *const anyopaque) !void {
+                const original: *const execution.Pass = @ptrCast(@alignCast(raw));
+                try original.checkLifetime();
+            }
+        };
+        const cancellation: db_types.CancellationToken = .{ .ptr = &pass, .check_fn = Lifetime.check };
+        const barrier = self.read_safety_barrier;
+        const proof = if (self.online_source_authority == .raft) block: {
+            if (barrier.vtable.capture_frozen == null or barrier.vtable.validate_frozen_with_admission == null or barrier.vtable.validate_retained_snapshot == null)
+                return error.PreparedTransactionProtocolUnavailable;
+            const frozen = try barrier.captureFrozen(request.group_id);
+            try barrier.validateFrozenWithAdmission(request.group_id, frozen, pass.deadline_ns, cancellation, control);
+            break :block frozen;
+        } else null;
+        // Certification has crossed the apply dependency. A physical open
+        // already admitted below must now finish before another open starts.
+        attempt.yield_to_apply.store(false, .release);
+        const bytes = try self.alloc.alloc(u8, request.workspace_bytes);
+        defer self.alloc.free(bytes);
+        var workspace = std.heap.FixedBufferAllocator.init(bytes);
+        var catalog_budget = self.catalog.budget(self.catalog.deadlineFrom(.{ .deadline_ns = pass.deadline_ns }));
+        catalog_budget.cancellation = cancellation;
+        catalog_budget.admission = control;
+        var lease = block: {
+            var descriptor = self.loadDescriptorWithBudget(workspace.allocator(), request.group_id, request.table(), catalog_budget) catch |err| {
+                if (err == error.OutOfMemory) return .grow;
+                return err;
+            };
+            defer descriptor.deinit(workspace.allocator());
+            break :block self.acquireDescriptorOnce(request.group_id, request.table(), descriptor.path, descriptor.view(), .shared, .resident, .{
+                .execution_runnable = pass.borrow,
+                .retain_cpu = true,
+                .execution_deadline_ns = pass.deadline_ns,
+                .cancellation = cancellation,
+                .online_preparation = true,
+            }) catch |err| {
+                try pass.check();
+                return err;
+            };
+        };
+        defer lease.deinit();
+        try control.checkpoint();
+        // Reuse the funded workspace only after native open and all borrowed
+        // descriptor arguments returned. The owner owns its installed copies.
+        workspace.reset();
+        var confirmation = self.loadDescriptorWithBudget(workspace.allocator(), request.group_id, request.table(), catalog_budget) catch |err| {
+            if (err == error.OutOfMemory) return .grow;
+            return err;
+        };
+        defer confirmation.deinit(workspace.allocator());
+        if (!try onlineDescriptorMatches(lease.entry, confirmation.view(), control)) return .retry;
+        if (proof) |frozen| try barrier.validateRetainedSnapshotWithAdmission(request.group_id, frozen, pass.deadline_ns, cancellation, control);
+        const generation = self.visibleRootGeneration(request.group_id);
+        try control.checkpoint();
+        if (!self.mutex.tryLock()) return .retry;
+        defer self.mutex.unlock();
+        const entry = lease.entry;
+        if (self.quiescing or self.apply_control_stopping or self.publicationPendingLocked(request.group_id, request.table()) or
+            entry.retired or entry.closing or entry.catalog_deferred or entry.opened_for_historical_apply or entry.generation != generation)
+            return .retry;
+        entry.online_preparation_pending = false;
+        return .ready;
+    }
+
+    fn onlineDescriptorMatches(entry: *const Entry, descriptor: descriptor_contract.Descriptor, control: @import("antfly_local_sources").common_read_admission.Port) !bool {
+        try control.checkpoint();
+        if (entry.generation != descriptor.lsm_root_generation or !entry.identity.eql(descriptor.identity) or
+            entry.restore_cancel_recovery != descriptor.restore_cancel_recovery or entry.restore_ha_replay != descriptor.restore_ha_replay or
+            !std.meta.eql(entry.table_storage, descriptor.table_storage) or (entry.restore == null) != (descriptor.restore == null) or
+            (entry.initial_range == null) != (descriptor.initial_range == null)) return false;
+        inline for (.{ "schema_json", "indexes_json", "restore_bootstrap_json", "initial_child_bootstrap_json" }) |field|
+            if (!try onlineBytesEqual(@field(entry, field), @field(descriptor, field), control)) return false;
+        if (entry.restore) |actual| {
+            const expected = descriptor.restore.?;
+            if (actual.native_manifest_size_bytes != expected.native_manifest_size_bytes) return false;
+            inline for (.{ "backup_id", "location", "snapshot_path", "artifact_sha256", "native_manifest_sha256" }) |field|
+                if (!try onlineBytesEqual(@field(actual, field), @field(expected, field), control)) return false;
+        }
+        if (entry.initial_range) |range| {
+            if (!try onlineBytesEqual(range.start, descriptor.initial_range.?.start, control) or !try onlineBytesEqual(range.end, descriptor.initial_range.?.end, control)) return false;
+        }
+        try control.checkpoint();
+        return true;
+    }
+    fn onlineBytesEqual(a: []const u8, b: []const u8, control: @import("antfly_local_sources").common_read_admission.Port) !bool {
+        if (a.len != b.len) return false;
+        var pos: usize = 0;
+        while (pos < a.len) {
+            try control.checkpoint();
+            const end = @min(a.len, pos + 4096);
+            if (!std.mem.eql(u8, a[pos..end], b[pos..end])) return false;
+            pos = end;
+        }
+        try control.checkpoint();
+        return true;
     }
 
     pub fn withGroupVisibleRootGeneration(
@@ -3190,6 +3379,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
         historical_raft_apply: bool = false,
+        online_preparation: bool = false,
         allow_deferred_catalog: bool = false,
 
         fn from(req: anytype) ReadControls {
@@ -4124,6 +4314,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.apply_control_pending.items.len + @as(usize, @intFromBool(self.apply_control_active != null)) >= apply_control_max_pending)
             return error.RaftApplyWriterUnavailable;
         self.apply_control_pending.appendAssumeCapacity(pending);
+        _ = self.apply_open_debt.fetchAdd(1, .acq_rel);
         pending_owned = false;
         self.apply_open_wake.set(self.apply_control_io.?);
         return error.RaftApplyWriterUnavailable;
@@ -4184,6 +4375,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         var stale_index: ?usize = null;
         for (self.entries.items, 0..) |entry, index| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
+            // Check under the same lock as acquisition: a public preparation
+            // cannot retire or inherit a racing privately admitted restore.
+            if (controls.online_preparation and entry.restore_bootstrap_json.len != 0)
+                return error.RestoreStagingScopeChanged;
             // A cached owner opened before restore intent must drain as well.
             // Compare the admitted binding in memory; warm hits need no marker I/O.
             // Ordinary descriptor acquisition may inherit an admitted restore
@@ -4234,7 +4429,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                     // Periodic inspection yields without retiring readers.
                     // Historical Raft apply may need the old schema after the
                     // current owner's leases drain.
-                    if (admission != .exclusive_if_idle and
+                    if (admission != .exclusive_if_idle and !controls.online_preparation and
                         (controls.historical_raft_apply or !schemaVersionRegresses(entry.schema_json, descriptor.schema_json))) entry.retired = true;
                     return error.StorageKernelOwnerTransitionRequired;
                 }
@@ -4357,6 +4552,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .restore = owned_restore,
             .owner = owner,
             .opened_for_historical_apply = controls.historical_raft_apply,
+            .online_preparation_pending = controls.online_preparation,
             .catalog_deferred = catalog_deferred != 0,
             .active_users = 1,
             .resident = residency == .resident,
@@ -6142,10 +6338,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (self.apply_control_stopping) return error.StorageReadTemporarilyUnavailable;
         if (self.publicationPendingLocked(group, table)) return error.StorageReadTemporarilyUnavailable;
         for (self.entries.items, 0..) |entry, index| {
-            if (index % 64 == 0) try control.checkpoint();
+            if (index % 64 == 0) try control.checkLifetime();
             if (entry.group_id != group or !std.mem.eql(u8, entry.table_name, table)) continue;
             if (entry.retired or entry.closing or !entry.resident or entry.catalog_deferred or
-                entry.opened_for_historical_apply or entry.generation != generation or
+                entry.opened_for_historical_apply or entry.online_preparation_pending or entry.generation != generation or
                 (if (identity) |expected| !entry.identity.eql(expected) else false)) return error.StorageReadTemporarilyUnavailable;
             const released = entry.pending_apply_releases.swap(0, .acq_rel);
             std.debug.assert(released <= entry.active_users);
@@ -6192,7 +6388,16 @@ pub const ProvisionedKernelOwnerSource = struct {
             catalog_budget.admission = control;
             var descriptor = try self.loadDescriptorWithBudget(alloc, group, table, catalog_budget);
             defer descriptor.deinit(alloc);
-            break :block try self.borrowPreparationStatusResident(group, table, descriptor.generation, descriptor.identity, control);
+            // A failed observation is never absence. On a genuine resident
+            // miss, schedule only bounded metadata for a separately funded
+            // producer; no descriptor or foreground execution is retained.
+            var trace: read.RejectionTrace = .{};
+            const resident_control = trace.bind(control).?;
+            break :block self.borrowPreparationStatusResident(group, table, descriptor.generation, descriptor.identity, resident_control) catch |err| {
+                if (trace.failure) |cause| return cause;
+                if (err == error.StorageReadTemporarilyUnavailable) try self.scheduleOnlinePreparation(group, table, control);
+                return err;
+            };
         };
         defer owner.deinit();
         if (req.restore_staging_scope) |scope| {
@@ -8431,4 +8636,273 @@ test "funded owner control startup rolls back when its second bounded worker is 
     try std.testing.expect(source.apply_control_io == null);
     try std.testing.expect(!source.apply_control_started.load(.acquire));
     try std.testing.expectError(error.Canceled, source.startApplyControl(threaded.io()));
+}
+
+const OnlinePreparationTestControl = struct {
+    calls: usize = 0,
+    fail_at: usize = std.math.maxInt(usize),
+    cause: anyerror = error.TxnNotFound,
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const index = self.calls;
+        self.calls += 1;
+        if (index == self.fail_at) return self.cause;
+    }
+};
+
+test "online owner preparation source scheduling preserves original failures without opening or allocating" {
+    const read = @import("antfly_local_sources").common_read_admission;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var source = ProvisionedKernelOwnerSource.init(failing.allocator(), "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    source.apply_control_started.store(true, .release);
+    source.apply_control_io = std.testing.io;
+    var state: OnlinePreparationTestControl = .{};
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = OnlinePreparationTestControl.check } };
+    const control = read.Port.init(&payload);
+    try source.scheduleOnlinePreparation(7, "docs", control);
+    try std.testing.expectEqual(@as(usize, 1), source.online_open_queue.len);
+    const original_deadline = source.online_open_queue.items[0].deadline_ns;
+    try source.scheduleOnlinePreparation(7, "docs", control);
+    try std.testing.expectEqual(original_deadline, source.online_open_queue.items[0].deadline_ns);
+    try std.testing.expectEqual(@as(usize, 1), source.online_open_queue.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.expect(source.context.handle == null and source.entries.items.len == 0);
+    for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.MemoryLimitExceeded }) |cause| for (0..2) |index| {
+        source.online_open_queue = .{};
+        state = .{ .cause = cause, .fail_at = index };
+        try std.testing.expectError(cause, source.scheduleOnlinePreparation(7, "docs", control));
+        try std.testing.expectEqual(index, source.online_open_queue.len);
+        try std.testing.expect(source.context.handle == null);
+    };
+    state = .{};
+    ProvisionedKernelOwnerSource.lock(&source.mutex);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.scheduleOnlinePreparation(7, "docs", control));
+    source.mutex.unlock();
+    source.apply_control_started.store(false, .release);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.scheduleOnlinePreparation(7, "docs", control));
+}
+
+fn onlinePreparationTestEntry() ProvisionedKernelOwnerSource.Entry {
+    return .{
+        .group_id = 7,
+        .table_name = @constCast("docs"),
+        .generation = 2,
+        .identity = .{ .table_id = 4, .shard_id = 7, .range_id = 8 },
+        .schema_json = @constCast("{}"),
+        .indexes_json = @constCast("{}"),
+        .restore_bootstrap_json = @constCast(""),
+        .initial_child_bootstrap_json = @constCast(""),
+        .owner = .{ .handle = null },
+        .resident = true,
+    };
+}
+
+test "online owner preparation source rejects pending residency before native status access" {
+    const read = @import("antfly_local_sources").common_read_admission;
+    var state: OnlinePreparationTestControl = .{};
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = OnlinePreparationTestControl.check } };
+    const control = read.Port.init(&payload);
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    var entry = onlinePreparationTestEntry();
+    entry.online_preparation_pending = true;
+    try source.entries.append(std.testing.allocator, &entry);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 2, entry.identity, control));
+    try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+    try std.testing.expect(source.context.handle == null);
+}
+
+test "online owner preparation source confirmation checks physical identity and original fences through large descriptors" {
+    const read = @import("antfly_local_sources").common_read_admission;
+    var state: OnlinePreparationTestControl = .{};
+    const payload: read.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = OnlinePreparationTestControl.check } };
+    const control = read.Port.init(&payload);
+    var entry = onlinePreparationTestEntry();
+    var large: [12000]u8 = @splat('x');
+    entry.schema_json = &large;
+    const descriptor: descriptor_contract.Descriptor = .{ .lsm_root_generation = 2, .identity = entry.identity, .schema_json = &large, .indexes_json = "{}" };
+    try std.testing.expect(try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, descriptor, control));
+    const checks = state.calls;
+    try std.testing.expect(checks > 6);
+    for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.MemoryLimitExceeded }) |cause| for (0..checks) |index| {
+        state = .{ .cause = cause, .fail_at = index };
+        try std.testing.expectError(cause, ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, descriptor, control));
+    };
+    state = .{};
+    var changed = descriptor;
+    changed.lsm_root_generation = 3;
+    try std.testing.expect(!try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, changed, control));
+    changed = descriptor;
+    changed.identity.range_id = 9;
+    try std.testing.expect(!try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, changed, control));
+    changed = descriptor;
+    changed.indexes_json = "[]";
+    try std.testing.expect(!try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, changed, control));
+    changed = descriptor;
+    changed.restore_bootstrap_json = "private";
+    try std.testing.expect(!try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, changed, control));
+    changed = descriptor;
+    changed.initial_range = .{ .start = "a", .end = "z" };
+    try std.testing.expect(!try ProvisionedKernelOwnerSource.onlineDescriptorMatches(&entry, changed, control));
+}
+
+test "online owner preparation admission never retires a private restore owner" {
+    const a = std.testing.allocator;
+    var source = ProvisionedKernelOwnerSource.init(a, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.entries.deinit(a);
+    var entry = onlinePreparationTestEntry();
+    entry.restore_bootstrap_json = @constCast("private authenticated scope");
+    try source.entries.append(a, &entry);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, source.acquireDescriptorOnce(7, "docs", "unused", .{
+        .lsm_root_generation = 2,
+        .identity = entry.identity,
+        .schema_json = "{\"version\":1}",
+    }, .shared, .resident, .{ .online_preparation = true }));
+    try std.testing.expect(!entry.retired and !entry.closing and entry.active_users == 0);
+    try std.testing.expect(source.context.handle == null);
+}
+
+test "online owner preparation source lifetime validation never reacquires CPU in the registry" {
+    const runtime = @import("antfly_runtime_abi");
+    const read = @import("antfly_local_sources").common_read_admission;
+    const Probe = struct {
+        cpu_calls: usize = 0,
+        lifetime_calls: usize = 0,
+        cause: ?anyerror = null,
+        fn cpu(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cpu_calls += 1;
+            return .ok;
+        }
+        fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.lifetime_calls += 1;
+            return .ok;
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            @panic("lifetime validation attempted CPU transition");
+        }
+        const Self = @This();
+        const Controls = struct {
+            probe: *Self,
+            execution_runnable: ?runtime.runnable_abi.Borrowed,
+        };
+        fn check(controls: Controls) !void {
+            if (controls.execution_runnable) |borrow| {
+                const status = borrow.checkpoint(borrow.context);
+                if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+            }
+            if (controls.probe.cause) |cause| return cause;
+        }
+    };
+    var probe: Probe = .{};
+    const borrow: runtime.runnable_abi.Borrowed = .{ .context = &probe, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.query), .checkpoint = Probe.cpu, .park = Probe.transition, .enter = Probe.transition, .check_lifetime = Probe.lifetime };
+    const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Probe.Controls, Probe.check);
+    var budget: Budget = .{ .controls = .{ .probe = &probe, .execution_runnable = borrow }, .io = std.testing.io };
+    var adapter: read.Adapter(*Budget) = .{ .budget = &budget };
+    const payload = adapter.payload();
+    const control = read.Port.init(&payload);
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    var entry = onlinePreparationTestEntry();
+    entry.online_preparation_pending = true;
+    try source.entries.append(std.testing.allocator, &entry);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 2, entry.identity, control));
+    // One CPU checkpoint occurs before acquisition; the locked registry scan
+    // performs only lifetime validation of the original borrower.
+    try std.testing.expectEqual(@as(usize, 1), probe.cpu_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.lifetime_calls);
+    for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.MemoryLimitExceeded }) |cause| {
+        budget.rejection = null;
+        probe.cause = cause;
+        try std.testing.expectError(cause, control.checkLifetime());
+        probe.cause = null;
+        try std.testing.expectError(cause, control.checkpoint());
+        try std.testing.expectEqual(@as(usize, 1), probe.cpu_calls);
+    }
+}
+
+test "online owner preparation source independent budget loans background CPU with original reentry checks" {
+    const runtime = @import("antfly_runtime_abi");
+    const read = @import("antfly_local_sources").common_read_admission;
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const execution = @import("runnable_status_refresh.zig");
+    const Cancel = struct {
+        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+            const value: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
+            return @intFromBool(value.load(.acquire));
+        }
+    };
+    for ([_]bool{ false, true }) |cancel_during_wait| {
+        var state: @import("runnable_owner_execution.zig").State = .{
+            .owner_alloc = std.testing.allocator,
+            .owner = try native.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 }),
+            .native_now_ns = platform_time.monotonicNs,
+        };
+        defer state.owner.deinit();
+        var canceled = std.atomic.Value(bool).init(false);
+        const io = std.testing.io;
+        const port = state.port();
+        var pass = try execution.Pass.initWithOptions(port, &io, platform_time.monotonicNs() + std.time.ns_per_s, .{ .context = &canceled, .is_cancelled = Cancel.requested }, .{ .retained_bytes = 4096 });
+        defer pass.deinit();
+        var budget: ProvisionedKernelOwnerSource.OnlinePreparationBudget = .{ .controls = .{ .pass = &pass, .execution_runnable = pass.borrow }, .io = io };
+        var adapter: read.Adapter(*@TypeOf(budget)) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = read.Port.init(&payload);
+        const boundary = (try control.executionWait()).?;
+        const retained = state.owner.scheduler.stats().retained_bytes;
+        try boundary.beginWait();
+        try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().runnable_slots);
+        try control.checkLifetime();
+        const borrowed_io = runtime.native_abi.IoBorrow.init(&io);
+        var foreground: ?*anyopaque = null;
+        try std.testing.expect(port.start(port.context, &.{ .io = &borrowed_io, .class = @backingInt(runtime.runnable_abi.Class.query), .allow_wait = 0, .out_handle = &foreground }).isOk());
+        port.finish(foreground.?);
+        if (cancel_during_wait) {
+            canceled.store(true, .release);
+            try std.testing.expectError(error.Canceled, boundary.endWait());
+            try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().runnable_slots);
+        } else {
+            try boundary.endWait();
+            try std.testing.expectEqual(runtime.runnable_abi.Class.background, try pass.borrow.?.currentClass());
+            try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().runnable_slots);
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().operations);
+        try std.testing.expectEqual(retained, state.owner.scheduler.stats().retained_bytes);
+        pass.deinit();
+        try std.testing.expectEqual(@as(usize, 0), state.owner.scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), state.owner.scheduler.stats().retained_bytes);
+    }
+}
+
+test "online owner preparation source yields queued admission to committed apply without interrupting physical open" {
+    const Source = ProvisionedKernelOwnerSource;
+    var source = Source.init(std.testing.allocator, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    source.apply_control_started.store(true, .release);
+    var attempt: Source.OnlinePreparationAttempt = .{ .source = &source };
+    try std.testing.expectEqual(@as(u8, 0), Source.OnlinePreparationAttempt.canceled(&attempt));
+    source.apply_open_debt.store(1, .release);
+    try std.testing.expectEqual(@as(u8, 1), Source.OnlinePreparationAttempt.canceled(&attempt));
+    attempt.yield_to_apply.store(false, .release);
+    try std.testing.expectEqual(@as(u8, 0), Source.OnlinePreparationAttempt.canceled(&attempt));
+    source.apply_control_started.store(false, .release);
+    try std.testing.expectEqual(@as(u8, 1), Source.OnlinePreparationAttempt.canceled(&attempt));
+}
+
+test "online owner preparation admission yields to active historical apply without retiring its owner" {
+    const a = std.testing.allocator;
+    var source = ProvisionedKernelOwnerSource.init(a, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.entries.deinit(a);
+    var entry = onlinePreparationTestEntry();
+    entry.opened_for_historical_apply = true;
+    entry.active_users = 1;
+    try source.entries.append(a, &entry);
+    try std.testing.expectError(error.StorageKernelOwnerTransitionRequired, source.acquireDescriptorOnce(7, "docs", "unused", .{
+        .lsm_root_generation = 2,
+        .identity = entry.identity,
+        .schema_json = "{}",
+        .indexes_json = "{}",
+    }, .shared, .resident, .{ .online_preparation = true }));
+    try std.testing.expect(!entry.retired and !entry.closing and entry.active_users == 1);
+    try std.testing.expect(source.context.handle == null);
 }
