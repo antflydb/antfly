@@ -67,8 +67,22 @@ def lake_metric_deltas(before, after):
 
 
 def lake_phase_profile(delta, elapsed_ms):
-    text_phases = ("text_directory", "text_inventory", "text_opening", "text_term_plan", "text_navigation", "text_postings", "text_cursor", "cursor_retention", "result_delivery")
-    text_values = {phase + "_ms": delta[f"antfly_lake_query_{phase}_nanoseconds_total"] / 1_000_000 for phase in text_phases if f"antfly_lake_query_{phase}_nanoseconds_total" in delta}
+    text_phases = (
+        "text_directory",
+        "text_inventory",
+        "text_opening",
+        "text_term_plan",
+        "text_navigation",
+        "text_postings",
+        "text_cursor",
+        "cursor_retention",
+        "result_delivery",
+    )
+    text_values = {
+        phase + "_ms": delta[f"antfly_lake_query_{phase}_nanoseconds_total"] / 1_000_000
+        for phase in text_phases
+        if f"antfly_lake_query_{phase}_nanoseconds_total" in delta
+    }
     text_scope = "Text phases are inclusive and can overlap through bounded prefetch. Opening includes reader validation and collection setup on corpus-cache misses. Postings includes nested acquisition callbacks. Do not sum nested phases."
     keys = {
         phase: f'antfly_lake_query_phase_nanoseconds_total{{phase="{phase}"}}'
@@ -76,11 +90,32 @@ def lake_phase_profile(delta, elapsed_ms):
     }
     if not all(key in delta for key in keys.values()):
         # Native-only metrics expose inclusive scopes without phase labels.
-        if not all(f"antfly_lake_query_{phase}_nanoseconds_total" in delta for phase in ("total", "ranking")):
+        if not all(
+            f"antfly_lake_query_{phase}_nanoseconds_total" in delta
+            for phase in ("total", "ranking")
+        ):
             return None
-        phases = ("total", "source", "publication", "index", "ranking", "hydration", "highlight")
-        values = {phase + "_ms": delta[f"antfly_lake_query_{phase}_nanoseconds_total"] / 1_000_000 for phase in phases if f"antfly_lake_query_{phase}_nanoseconds_total" in delta}
-        return {**values, **text_values, "outside_lake_ms": round(elapsed_ms - values["total_ms"], 3), "scope": "Serial process counter interval. " + text_scope}
+        phases = (
+            "total",
+            "source",
+            "publication",
+            "index",
+            "ranking",
+            "hydration",
+            "highlight",
+        )
+        values = {
+            phase + "_ms": delta[f"antfly_lake_query_{phase}_nanoseconds_total"]
+            / 1_000_000
+            for phase in phases
+            if f"antfly_lake_query_{phase}_nanoseconds_total" in delta
+        }
+        return {
+            **values,
+            **text_values,
+            "outside_lake_ms": round(elapsed_ms - values["total_ms"], 3),
+            "scope": "Serial process counter interval. " + text_scope,
+        }
     values = {phase: delta[key] / 1_000_000 for phase, key in keys.items()}
     return {
         **text_values,
@@ -90,7 +125,8 @@ def lake_phase_profile(delta, elapsed_ms):
         "post_search_ms": values["delivery"],
         "hydration_ms": values["hydration"],
         "outside_lake_ms": round(elapsed_ms - values["total"], 3),
-        "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative." + (" " + text_scope if text_values else ""),
+        "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+        + (" " + text_scope if text_values else ""),
     }
 
 
@@ -384,10 +420,17 @@ def main():
         action="store_true",
         help="Stop after publication, remove this state's cache, then measure",
     )
-    parser.add_argument("--process-memory-budget-mb", type=int, default=0,
-                        help="Fixed native process envelope; 0 preserves auto-detection")
-    parser.add_argument("--immediate-first-query", action="store_true",
-                        help="Skip pre-query metric-refresh sleeps for the first archive query")
+    parser.add_argument(
+        "--process-memory-budget-mb",
+        type=int,
+        default=0,
+        help="Fixed native process envelope; 0 preserves auto-detection",
+    )
+    parser.add_argument(
+        "--immediate-first-query",
+        action="store_true",
+        help="Skip pre-query metric-refresh sleeps for the first archive query",
+    )
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--workload-terms", nargs="+", default=[])
@@ -570,7 +613,9 @@ def main():
             str(args.state / "empty-models"),
         ]
         if args.process_memory_budget_mb:
-            command.extend(["--process-memory-budget-mb", str(args.process_memory_budget_mb)])
+            command.extend(
+                ["--process-memory-budget-mb", str(args.process_memory_budget_mb)]
+            )
         if args.docker:
             container = "hn-comparison-" + uuid.uuid4().hex
             command[0] = "/app/antfly"

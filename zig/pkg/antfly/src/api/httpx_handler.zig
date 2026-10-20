@@ -1004,6 +1004,7 @@ pub const AntflyApiHandler = struct {
         establishInternalTxnPreDecisionDeadline(ctx);
         establishInternalTxnStatusDeadline(ctx);
         establishInternalBackupDeadline(ctx);
+        establishInternalOnlineMergeDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
         const response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
         try self.api_server.reachRequestLifecycle(.response_ready, null);
@@ -1095,6 +1096,27 @@ pub const AntflyApiHandler = struct {
         }
         ctx.application_deadline_ns = platform_time.monotonicNs() +|
             @as(u64, budget_ms) *| std.time.ns_per_ms;
+    }
+
+    fn establishInternalOnlineMergeDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_invalid) return;
+        const contract = @import("online_merge_io.zig").contract;
+        const path = ctx.request.uri.path;
+        if (!std.mem.startsWith(u8, path, routes.internal_groups_prefix) or
+            !std.mem.endsWith(u8, path, routes.online_merge_io_suffix)) return;
+        const raw = ctx.header(contract.remaining_ms_header) orelse return;
+        const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        if (budget_ms == 0 or budget_ms > contract.max_server_budget_ms) {
+            ctx.application_deadline_invalid = true;
+            return;
+        }
+        const deadline = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
+            @as(u64, budget_ms) * std.time.ns_per_ms;
+        ctx.application_deadline_io = ctx.io;
+        ctx.application_deadline_ns = @min(ctx.application_deadline_ns orelse deadline, deadline);
     }
 
     fn establishInternalBackupDeadline(ctx: *httpx.Context) void {
@@ -11061,6 +11083,45 @@ test "internal read-index absence response requires typed native proof" {
             try std.testing.expect(response.headers.get(metadata_api.read_index_absence_header) == null);
         }
     }
+}
+
+test "online merge ingress bounds owner work using the transport clock" {
+    const contract = @import("online_merge_io.zig").contract;
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    for ([_][]const u8{ "250", "0", "5001", "invalid" }) |value| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/internal/v1/groups/7/tables/docs/online-merge-io");
+        defer request.deinit();
+        try request.setHeader(contract.remaining_ms_header, value);
+        var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+        defer ctx.deinit();
+        AntflyApiHandler.establishInternalOnlineMergeDeadline(&ctx);
+        if (!std.mem.eql(u8, value, "250")) {
+            try std.testing.expect(ctx.application_deadline_invalid);
+            try std.testing.expect(ctx.application_deadline_ns == null);
+            continue;
+        }
+        const control = AntflyApiHandler.operationContext(&ctx, null);
+        try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), control.deadline_ns.?);
+        try control.ensureActive();
+        sim.monotonic_ns = 250 * std.time.ns_per_ms;
+        try std.testing.expectError(error.DeadlineExceeded, control.ensureActive());
+        sim.monotonic_ns = 0;
+        // An already-admitted shorter budget must survive middleware unchanged.
+        ctx.application_deadline_ns = 100 * std.time.ns_per_ms;
+        AntflyApiHandler.establishInternalOnlineMergeDeadline(&ctx);
+        try std.testing.expectEqual(@as(?u64, 100 * std.time.ns_per_ms), ctx.application_deadline_ns);
+        ctx.application_deadline_ns = 1000 * std.time.ns_per_ms;
+        AntflyApiHandler.establishInternalOnlineMergeDeadline(&ctx);
+        try std.testing.expectEqual(@as(?u64, 250 * std.time.ns_per_ms), ctx.application_deadline_ns);
+    }
+    var public_request = try httpx.Request.init(std.testing.allocator, .GET, "http://node/tables/docs");
+    defer public_request.deinit();
+    try public_request.setHeader(contract.remaining_ms_header, "250");
+    var public_ctx = httpx.Context.init(std.testing.allocator, sim.io(), &public_request);
+    defer public_ctx.deinit();
+    AntflyApiHandler.establishInternalOnlineMergeDeadline(&public_ctx);
+    try std.testing.expect(public_ctx.application_deadline_ns == null);
 }
 
 test "internal transaction ingress establishes and validates pre-decision deadline" {
