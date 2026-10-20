@@ -26,6 +26,7 @@ pub const Row = struct {
     // Logical work is charged on original size, never on projected payload.
     original_bytes: u64,
     projected: bool = false,
+    repair_authority: bool = false,
 };
 
 /// Stable-order deduplicating metadata/full-body fetch. Scope owns all bytes.
@@ -65,6 +66,7 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
     }
     if (ids.len == 0) return result;
     var proofs: [64]?revision.Content = @splat(null);
+    var repair: [64]bool = @splat(false);
     var timestamps: [64]u64 = undefined;
     // Without storage authentication a directory is not authority to omit bytes.
     if (authenticated and roots.len != 0) try revision.loadWindow(scope, scratch, physical, ids, proofs[0..ids.len], timestamps[0..ids.len]);
@@ -101,7 +103,14 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
             continue;
         }
         const proof = proofs[i].?;
-        const directory = (try projection.Directory.open(scratch, encoded orelse continue, proof)) orelse continue;
+        const encoded_directory = encoded orelse {
+            repair[i] = true;
+            continue;
+        };
+        const directory = (try projection.Directory.open(scratch, encoded_directory, proof)) orelse {
+            repair[i] = !try projection.isCurrent(scratch, encoded_directory, proof);
+            continue;
+        };
         var selected: std.ArrayList(projection.Field) = .empty;
         var bytes: u64 = 0;
         for (roots) |name| if (directory.find(name)) |field| {
@@ -153,7 +162,7 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
     };
     if (count != 0) try many(scope, keys[0..count], raw[0..count]);
     for (indices[0..count], raw[0..count]) |i, value| {
-        result[i] = .{ .bytes = if (value) |v| try a.dupe(u8, v) else null, .original_bytes = if (value) |v| v.len else 0 };
+        result[i] = .{ .bytes = if (value) |v| try a.dupe(u8, v) else null, .original_bytes = if (value) |v| v.len else 0, .repair_authority = repair[i] or (authenticated and proofs[i] == null and (if (value) |v| v.len >= projection.minimum_bytes else false)) };
     }
     return result;
 }
@@ -232,12 +241,15 @@ test "logical value stored ranges bind revisions preserve arrays and reject corr
     std.mem.writeInt(u64, &mutation, 8, .little);
     const stale = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, wanted, true);
     try std.testing.expect(!stale[0].projected);
+    try std.testing.expect(stale[0].repair_authority);
     try std.testing.expectEqualStrings(body, stale[0].bytes.?);
     std.mem.writeInt(u64, &mutation, 7, .little);
     mock.directory = null;
     const legacy = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, wanted, true);
     try std.testing.expect(!legacy[0].projected);
+    try std.testing.expect(legacy[0].repair_authority);
     mock.directory = directory;
     const untrusted = try load(temp, temp, &mock, &.{physical}, &.{"doc"}, wanted, false);
     try std.testing.expect(!untrusted[0].projected);
+    try std.testing.expect(!untrusted[0].repair_authority);
 }

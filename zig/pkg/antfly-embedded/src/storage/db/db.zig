@@ -131718,6 +131718,7 @@ const StoredLogicalSources = struct {
     db: *DB,
     view: ?schema_registry_mod.SchemaView,
     txn: docstore_mod.DocStore.Txn,
+    repair_requested: bool = false,
     fn close(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         self.txn.abort();
@@ -131735,7 +131736,17 @@ const StoredLogicalSources = struct {
         for (ids, keys[0..ids.len]) |id, *key| key.* = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, id, self.view);
         var scope = try self.txn.openReadScope(a);
         defer scope.close();
-        return @import("../logical_source.zig").load(alloc, a, &scope, keys[0..ids.len], ids, roots, self.db.core.store.valuesAreAuthenticated());
+        const rows = try @import("../logical_source.zig").load(alloc, a, &scope, keys[0..ids.len], ids, roots, self.db.core.store.valuesAreAuthenticated());
+        if (!self.repair_requested and !openModeRequiresReadOnlyBackends(self.db.open_mode)) {
+            for (rows) |row| if (row.repair_authority) {
+                self.repair_requested = true;
+                // Wake the existing bounded authority migration; the read path
+                // never repairs storage or bypasses leader/apply ownership.
+                self.db.document_authority_backfill_requested.store(true, .release);
+                break;
+            };
+        }
+        return rows;
     }
 };
 fn openStoredLogicalSourcesCallback(ctx: ?*anyopaque, a: Allocator) anyerror!?db_query_search.LogicalSourceReader {
