@@ -9149,3 +9149,82 @@ test "capi native memory persists receipts and forgetting across reopen" {
     try std.testing.expect(reused != .ok);
     try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "MemoryForgotten") != null);
 }
+
+test "capi native memory decision explanation provenance survives reopen and scrubbing" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-decision-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var id: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+    defer if (id != null) antfly_db_close(id);
+    const Calls = struct {
+        fn validate(_: *anyopaque, _: @import("../memory/service.zig").types.Config) !void {}
+        fn decide(_: *anyopaque, alloc: Allocator, _: @import("../memory/service.zig").types.Config, _: @import("../memory/service.zig").types.Assertion, prior: []const @import("../memory/service.zig").types.StoredAssertion) !@import("../memory/service.zig").types.ReconciliationDecision {
+            return .{ .supersedes = try alloc.dupe([]const u8, &.{prior[0].assertion.id}), .reason = try std.fmt.allocPrint(alloc, "Replaces {s}", .{prior[0].assertion.statement}) };
+        }
+        fn call(handle: ?*anyopaque, body: []const u8) ![]u8 {
+            var output: capi.Buffer = .{};
+            const code = antfly_db_memory_json(handle, .fromSlice("personal"), .fromSlice(body), &output);
+            if (code != .ok) std.debug.print("memory C ABI: {s}\n", .{std.mem.span(capi.lastErrorDetail())});
+            try std.testing.expectEqual(capi.ErrorCode.ok, code);
+            defer std.heap.c_allocator.free(output.ptr.?[0..output.len]);
+            return std.testing.allocator.dupe(u8, output.ptr.?[0..output.len]);
+        }
+    };
+    {
+        // Inject the test decider only; persistence and subsequent public reads
+        // use the real native table adapter and C ABI across fresh handles.
+        const guard = enterHandle(id, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        try std.testing.expect(guard.entry_error == null);
+        const owner = guard.handle.parent_handle orelse guard.handle;
+        try @import("tables.zig").create(owner, "memory_personal", "{}", true);
+        const engine = @import("../memory/engine.zig");
+        const context: engine.service.Context = .{ .space = "personal", .principal = "embedded", .admin = true, .now_ms = 1 };
+        var adapter: engine.Native(db_mod.DB) = .{ .db = try @import("tables.zig").get(owner, "memory_personal"), .context = context };
+        var backend = adapter.backend();
+        backend.decide = Calls.decide;
+        backend.validate_models = Calls.validate;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var service: engine.service.Service = .{ .backend = backend, .context = context };
+        _ = try service.execute(alloc, .create, "", "{\"features\":{\"reconciliation\":\"model\"},\"models\":{\"decider\":{\"provider\":\"fixture\",\"model\":\"decider\",\"revision\":\"v1\"}},\"predicates\":[{\"name\":\"credential\",\"cardinality\":\"one\"}]}", "create");
+        service.context.now_ms = 2;
+        _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"old-source\",\"source_id\":\"old\",\"source_version\":\"1\",\"text\":\"Retired secret\"},{\"id\":\"new-source\",\"source_id\":\"new\",\"source_version\":\"1\",\"text\":\"Rotated\"}]}", "evidence");
+        service.context.now_ms = 3;
+        _ = try service.execute(alloc, .assertions, "", "{\"assertions\":[{\"id\":\"old\",\"subject\":\"production\",\"predicate\":\"credential\",\"value\":\"old\",\"statement\":\"Retired secret\",\"evidence\":[{\"id\":\"old-source\"}]}]}", "old");
+        service.context.now_ms = 4;
+        _ = try service.execute(alloc, .assertions, "", "{\"assertions\":[{\"id\":\"new\",\"subject\":\"production\",\"predicate\":\"credential\",\"value\":\"new\",\"statement\":\"Rotated\",\"evidence\":[{\"id\":\"new-source\"}]}]}", "new");
+    }
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const before = try Calls.call(id, "{\"action\":\"get\",\"id\":\"new\"}");
+    defer a.free(before);
+    try std.testing.expect(std.mem.indexOf(u8, before, "Retired secret") != null);
+    const forgotten = try Calls.call(id, "{\"action\":\"forget\",\"idempotency_key\":\"forget\",\"body\":{\"evidence_ids\":[\"old-source\"]}}");
+    a.free(forgotten);
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    for (0..12) |i| {
+        const body = try std.fmt.allocPrint(a, "{{\"action\":\"advance\",\"idempotency_key\":\"scrub-{d}\"}}", .{i});
+        defer a.free(body);
+        const output = try Calls.call(id, body);
+        a.free(output);
+    }
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const after = try Calls.call(id, "{\"action\":\"get\",\"id\":\"new\"}");
+    defer a.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "Retired secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "Rotated") != null);
+    const history = try Calls.call(id, "{\"action\":\"history\",\"id\":\"new\"}");
+    defer a.free(history);
+    try std.testing.expect(std.mem.indexOf(u8, history, "Retired secret") == null);
+}

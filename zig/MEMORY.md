@@ -73,6 +73,12 @@ a value, so enabling object typing does not lose old facts during later merges.
 These semantic transitions admit at most 256 retained assertions; larger or
 incompatible changes reject atomically before publishing a configuration or
 starting a vector build. Vector-only changes use bounded asynchronous backfill.
+Belief projection dispatches the admitted reconciliation strategy on both ingestion
+and rebuild: explicit mode preserves client decisions without automatic disputes;
+deterministic mode applies its temporal/authority rules; model mode invokes the
+qualified decider on eligible active canonical groups. Model rebuilds preserve
+private owner partitions even when an administrator curates another owner's
+identities. A failed decider rolls back the whole identity/configuration change.
 Typed links connect evidence, decisions, rationale, rejected
 alternatives, episodes and procedures. Alias/name matches never authorize a
 canonical identity merge. Explicit distinct IDs must remain distinct. Merge
@@ -92,6 +98,17 @@ correction cannot cite private evidence. Forgotten or expired correction support
 redacts its reason and provenance references from point reads, history, enumeration
 and recall, and physical cleanup scrubs those payloads. The lifecycle decision
 survives that redaction; losing justification never implicitly reactivates a fact.
+Model decision explanations have separate versioned internal provenance artifacts.
+They retain the producing principal/configuration, incoming evidence, exact premise
+revisions and previously supplied explanation artifacts, without duplicating model
+input text. Each assertion/history revision binds its assertion explanation and
+explicit disposition explanation independently. Forgetting or expiry of an input
+redacts affected explanations across point reads, history, enumeration and recall;
+cleanup scrubs the stored text while preserving the supported fact and accepted
+lifecycle decision. New inference receives only authorized, already redacted
+candidate explanations. A manual correction replaces disposition provenance without
+removing the original assertion explanation's fences. Lifecycle edits inherit
+bindings; recomputation publishes a new artifact instead of rewriting old history.
 Entity cleanup retains a durable identity tombstone. A retired entity ID cannot
 become an untyped raw ID or be reused for a different entity after its payload is
 removed; typed identity dependencies remain fenced through cleanup and restart.
@@ -195,6 +212,14 @@ by currently visible primary support. Admission memoizes the full immutable DAG
 and visits at most 4096 distinct ancestors per operation.
 A deeper graph is rejected before committing any assertion or receipt; bounded
 batch imports have the same limit and roll back atomically on rejection.
+Actual visibility/retention/decision traversals also memoize shared subgraphs;
+diamond-shaped support must not expand exponentially. Memo keys include premise
+revision, temporal selectors, depth, configuration and principal. Writes invalidate
+view/history caches, and an operation-local row cache observes overlay writes first;
+its final control-row revision/CAS still rejects concurrent changes. Historical
+premise selection is cached per ID/recorded-time selector. Each operation admits at
+most 65,536 support evaluation, edge, evidence and history-row work units. Exhaustion
+returns `MemoryWorkLimit`, never a partial truth or a partially committed import.
 
 Model revisions are qualified provider capability digests (`sha256:<64 hex>`),
 not arbitrary descriptive labels. Admission and invocation reject a missing or

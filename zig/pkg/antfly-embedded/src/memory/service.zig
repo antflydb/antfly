@@ -23,6 +23,10 @@ const A = std.mem.Allocator;
 const eql = std.mem.eql;
 const curation = @import("antfly_resolver").curation;
 const max_dependency_depth: u8 = 32;
+const max_support_work = 65536;
+const ReasonBindings = struct { assertion: ?[]const u8 = null, disposition: ?[]const u8 = null };
+const DecisionInput = struct { id: []const u8, revision: u64, reasons: ReasonBindings, correction_evidence: []const t.EvidenceRef = &.{} };
+const DecisionProvenance = struct { principal: []const u8, recorded_at: i64, config_generation: u64, assertion_id: []const u8, evidence_ids: []const []const u8, inputs: []const DecisionInput };
 // Causal inference inputs are conjunctive retention/authorization dependencies,
 // independent of the alternative factual support selected by a producer.
 const GenerationProvenance = struct { operation_id: []const u8, config_generation: u64, evidence_ids: []const []const u8 };
@@ -250,11 +254,17 @@ const Run = struct {
     suppression_index: ?curation.Index = null,
     dependency_depths: std.StringHashMapUnmanaged(u8) = .empty,
     dependency_visits: usize = 0,
+    support_work: usize = 0,
+    views: std.StringHashMapUnmanaged(bool) = .empty,
+    backend_rows: std.StringHashMapUnmanaged(?[]const u8) = .empty,
+    historical: std.StringHashMapUnmanaged(?t.StoredAssertion) = .empty,
 
     fn encode(self: *Run, value: anytype) ![]const u8 {
         return std.json.Stringify.valueAlloc(self.a, value, .{});
     }
     fn put(self: *Run, path: []const u8, value: anytype) !void {
+        self.views.clearRetainingCapacity();
+        self.historical.clearRetainingCapacity();
         const json = try self.encode(value);
         for (self.changes.items) |*change| if (eql(u8, change.key, path)) {
             change.json = json;
@@ -263,6 +273,8 @@ const Run = struct {
         try self.changes.append(self.a, .{ .key = path, .json = json });
     }
     fn remove(self: *Run, path: []const u8) !void {
+        self.views.clearRetainingCapacity();
+        self.historical.clearRetainingCapacity();
         for (self.changes.items) |*change| if (eql(u8, change.key, path)) {
             change.json = null;
             return;
@@ -271,8 +283,11 @@ const Run = struct {
     }
     fn read(self: *Run, comptime T: type, path: []const u8) !?T {
         for (self.changes.items) |change| if (eql(u8, change.key, path)) return if (change.json) |json| try parse(T, self.a, json) else null;
-        const row = (try self.service.backend.get(self.service.backend.ptr, self.a, path)) orelse return null;
-        return try parse(T, self.a, row.json);
+        if (self.backend_rows.getEntry(path)) |entry| return if (entry.value_ptr.*) |json| try parse(T, self.a, json) else null;
+        const row = try self.service.backend.get(self.service.backend.ptr, self.a, path);
+        const json = if (row) |value| value.json else null;
+        try self.backend_rows.put(self.a, try self.a.dupe(u8, path), json);
+        return if (json) |value| try parse(T, self.a, value) else null;
     }
     fn requireAdmin(self: *Run) !void {
         try self.service.context.requireGrant(.admin);
@@ -289,8 +304,83 @@ const Run = struct {
         }
         return actionGrant(action);
     }
+    fn reasonKey(self: *Run, id: []const u8, revision: u64) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "reason-binding/{s}/{d:0>20}", .{ try hash(self.a, id), revision });
+    }
+    fn reasonBindings(self: *Run, record: t.StoredAssertion) !ReasonBindings {
+        return (try self.read(ReasonBindings, try self.reasonKey(record.assertion.id, record.revision))) orelse ReasonBindings{};
+    }
+    fn decisionVisible(self: *Run, path: []const u8, depth: u8) anyerror!bool {
+        if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
+        const cache_key = try self.viewKey("decision", path, 0, null, null, depth);
+        if (self.views.get(cache_key)) |result| return result;
+        try self.supportStep();
+        const result = try self.decisionVisibleInner(path, depth);
+        try self.views.put(self.a, cache_key, result);
+        return result;
+    }
+    fn decisionVisibleInner(self: *Run, path: []const u8, depth: u8) anyerror!bool {
+        const decision = (try self.read(DecisionProvenance, path)) orelse return false;
+        if (try self.read(bool, try key(self.a, "forgotten-assertion", decision.assertion_id)) != null) return false;
+        if (!try self.generationVisible("assertion", decision.assertion_id)) return false;
+        for (decision.evidence_ids) |id| if (!try self.supportVisible(&.{.{ .id = id }}, &.{}, 0)) return false;
+        for (decision.inputs) |input| {
+            try self.supportStep();
+            const record = (try self.read(t.StoredAssertion, try historyKey(self.a, input.id, input.revision))) orelse return false;
+            self.authorize(record.owner, record.assertion.visibility) catch return false;
+            if (!try self.retained(record, 0) or !try self.identityVisible(record.assertion)) return false;
+            if (input.reasons.assertion) |parent| if (!try self.decisionVisible(parent, depth + 1)) return false;
+            if (input.reasons.disposition) |parent| if (!try self.decisionVisible(parent, depth + 1)) return false;
+            if (input.correction_evidence.len > 0 and !try self.supportVisible(input.correction_evidence, &.{}, 0)) return false;
+        }
+        return true;
+    }
+    fn storeDecision(self: *Run, claim: t.Assertion, prior: []const t.StoredAssertion) ![]const u8 {
+        var evidence_ids: std.StringHashMapUnmanaged(void) = .empty;
+        for (claim.evidence) |ref| try evidence_ids.put(self.a, ref.id, {});
+        for (claim.support_sets) |support| for (support.evidence) |ref| {
+            try self.supportStep();
+            try evidence_ids.put(self.a, ref.id, {});
+        };
+        const ids = try self.a.alloc([]const u8, evidence_ids.count());
+        var evidence_iterator = evidence_ids.keyIterator();
+        var count: usize = 0;
+        while (evidence_iterator.next()) |id| : (count += 1) ids[count] = id.*;
+        var inputs: std.ArrayList(DecisionInput) = .empty;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (prior) |record| {
+            var reasons = try self.reasonBindings(record);
+            if (record.assertion.reconciliation_reason == null) reasons.assertion = null;
+            const correction_reason = if (record.explicit_disposition) |baseline| baseline.reason != null else false;
+            if (record.reason == null and !correction_reason) reasons.disposition = null;
+            const correction_evidence = if (correction_reason) record.explicit_disposition.?.provenance else null;
+            try inputs.append(self.a, .{ .id = record.assertion.id, .revision = record.revision, .reasons = reasons, .correction_evidence = if (correction_evidence) |provenance| provenance.evidence else &.{} });
+            try seen.put(self.a, record.assertion.id, {});
+        }
+        var parents: std.ArrayList([]const u8) = .empty;
+        try parents.appendSlice(self.a, claim.depends_on);
+        for (claim.support_sets) |support| try parents.appendSlice(self.a, support.depends_on);
+        for (parents.items) |id| {
+            try self.supportStep();
+            if (seen.contains(id)) continue;
+            const record = (try self.assertion(id)) orelse return error.MemoryDependencyMissing;
+            try inputs.append(self.a, .{ .id = id, .revision = record.revision, .reasons = .{} });
+            try seen.put(self.a, id, {});
+        }
+        const path = try std.fmt.allocPrint(self.a, "decision/{s}/{d:0>20}", .{ try hash(self.a, claim.id), self.state.revision });
+        try self.put(path, DecisionProvenance{ .principal = self.service.context.principal, .recorded_at = self.service.context.now_ms, .config_generation = self.state.config.generation, .assertion_id = claim.id, .evidence_ids = ids, .inputs = inputs.items });
+        return path;
+    }
     fn publicRecord(self: *Run, value: t.StoredAssertion) !t.StoredAssertion {
         var record = value;
+        const reasons = try self.reasonBindings(record);
+        if (reasons.assertion) |path| if (!try self.decisionVisible(path, 0)) {
+            record.assertion.reconciliation_reason = null;
+        };
+        if (reasons.disposition) |path| if (!try self.decisionVisible(path, 0)) {
+            record.reason = null;
+            if (record.explicit_disposition) |*baseline| baseline.reason = null;
+        };
         if (record.explicit_disposition) |baseline| if (baseline.provenance) |provenance| {
             if (provenance.forgotten or (provenance.evidence.len > 0 and !try self.supportVisible(provenance.evidence, &.{}, 0))) {
                 var redacted = baseline;
@@ -342,7 +432,24 @@ const Run = struct {
     }
     // Physical retention is independent of current belief/lifecycle. A
     // superseded premise can still support an auditable historical revision.
+    fn supportStep(self: *Run) !void {
+        try self.service.context.check();
+        if (self.support_work >= max_support_work) return error.MemoryWorkLimit;
+        self.support_work += 1;
+    }
+    fn viewKey(self: *Run, kind: []const u8, id: []const u8, revision: u64, known: ?i64, valid: ?i64, depth: u8) ![]const u8 {
+        return hash(self.a, .{ kind, id, revision, known, valid, depth, self.state.config.generation, self.service.context.principal, self.service.context.admin });
+    }
     fn retained(self: *Run, record: t.StoredAssertion, depth: u8) anyerror!bool {
+        if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
+        const cache_key = try self.viewKey("retention", record.assertion.id, record.revision, null, null, depth);
+        if (self.views.get(cache_key)) |result| return result;
+        try self.supportStep();
+        const result = try self.retainedInner(record, depth);
+        try self.views.put(self.a, cache_key, result);
+        return result;
+    }
+    fn retainedInner(self: *Run, record: t.StoredAssertion, depth: u8) anyerror!bool {
         if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
         if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-assertion", record.assertion.id)) != null) return false;
         if (!try self.generationVisible("assertion", record.assertion.id)) return false;
@@ -353,11 +460,13 @@ const Run = struct {
     fn retainedSupport(self: *Run, refs: []const t.EvidenceRef, parents: []const []const u8, depth: u8) anyerror!bool {
         if (refs.len == 0) return false;
         for (refs) |ref| {
+            try self.supportStep();
             const source = (try self.evidence(ref.id)) orelse return false;
             if (source.forgotten or self.isExpired(source) or try self.read(bool, try key(self.a, "forgotten-source", source.evidence.source_id)) != null) return false;
             self.authorize(source.owner, source.evidence.visibility) catch return false;
         }
         for (parents) |id| {
+            try self.supportStep();
             const parent = (try self.assertion(id)) orelse return false;
             self.authorize(parent.owner, parent.assertion.visibility) catch return false;
             if (!try self.retained(parent, depth + 1)) return false;
@@ -368,6 +477,8 @@ const Run = struct {
         return self.evidenceVisibleDepth(record, 0);
     }
     fn asOf(self: *Run, id: []const u8, known: i64) !?t.StoredAssertion {
+        const cache_key = try hash(self.a, .{ id, known });
+        if (self.historical.getEntry(cache_key)) |entry| return entry.value_ptr.*;
         const prefix = try std.fmt.allocPrint(self.a, "history/{s}/", .{try hash(self.a, id)});
         var after: ?[]const u8 = null;
         var selected: ?t.StoredAssertion = null;
@@ -375,19 +486,32 @@ const Run = struct {
         while (true) {
             const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, after, 128);
             for (page.rows) |row| {
+                try self.supportStep();
                 count += 1;
                 if (count > 4096) return error.MemoryWorkLimit;
                 const version = try parse(t.StoredAssertion, self.a, row.json);
                 if (version.recorded_at <= known and (selected == null or version.revision > selected.?.revision)) selected = version;
             }
             after = page.next;
-            if (after == null) return selected;
+            if (after == null) {
+                try self.historical.put(self.a, cache_key, selected);
+                return selected;
+            }
         }
     }
     fn evidenceVisibleDepth(self: *Run, record: t.StoredAssertion, depth: u8) anyerror!bool {
         return self.evidenceVisibleTime(record, null, null, depth);
     }
     fn evidenceVisibleTime(self: *Run, record: t.StoredAssertion, known: ?i64, valid: ?i64, depth: u8) anyerror!bool {
+        if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
+        const cache_key = try self.viewKey("visibility", record.assertion.id, record.revision, known, valid, depth);
+        if (self.views.get(cache_key)) |result| return result;
+        try self.supportStep();
+        const result = try self.evidenceVisibleTimeInner(record, known, valid, depth);
+        try self.views.put(self.a, cache_key, result);
+        return result;
+    }
+    fn evidenceVisibleTimeInner(self: *Run, record: t.StoredAssertion, known: ?i64, valid: ?i64, depth: u8) anyerror!bool {
         if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
         if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-assertion", record.assertion.id)) != null) return false;
         if (!try self.generationVisible("assertion", record.assertion.id)) return false;
@@ -403,12 +527,14 @@ const Run = struct {
         if (try self.read(bool, "forgotten-all") != null) return false;
         if (refs.len == 0) return false;
         for (refs) |ref| {
+            try self.supportStep();
             const source = (try self.evidence(ref.id)) orelse return false;
             if (source.forgotten or self.isExpired(source)) return false;
             if (try self.read(bool, try key(self.a, "forgotten-source", source.evidence.source_id)) != null) return false;
             self.authorize(source.owner, source.evidence.visibility) catch return false;
         }
         for (dependencies) |dependency| {
+            try self.supportStep();
             const parent = (if (known) |time| try self.asOf(dependency, time) else try self.assertion(dependency)) orelse return false;
             self.authorize(parent.owner, parent.assertion.visibility) catch return false;
             if (parent.stale or parent.lifecycle == .retracted or parent.lifecycle == .disputed or parent.conflicts_with.len > 0) return false;
@@ -545,6 +671,7 @@ const Run = struct {
         if (claim.valid_from != null and claim.valid_to != null and claim.valid_from.? >= claim.valid_to.?) return error.InvalidMemoryAssertion;
         if (try self.read(bool, try key(self.a, "forgotten-assertion", claim.id)) != null) return error.MemoryForgotten;
         for (claim.evidence) |ref| {
+            try self.supportStep();
             const source = (try self.evidence(ref.id)) orelse return error.MemoryEvidenceRequired;
             try self.authorize(source.owner, source.evidence.visibility);
             if (source.forgotten or self.isExpired(source)) return error.MemoryForgotten;
@@ -554,6 +681,7 @@ const Run = struct {
             }
         }
         for (claim.depends_on) |dependency| {
+            try self.supportStep();
             if (eql(u8, dependency, claim.id)) return error.MemoryDependencyCycle;
             const parent = (try self.assertion(dependency)) orelse return error.MemoryDependencyMissing;
             try self.authorize(parent.owner, parent.assertion.visibility);
@@ -619,29 +747,12 @@ const Run = struct {
                 claim.embedding_model = self.state.config.models.embedder;
             }
             try self.validateAssertion(claim);
-            if (self.state.config.features.reconciliation == .model and self.singlePredicate(claim.predicate) and claim.modality == .actual and claim.role != .hypothesized and claim.stability == .settled) {
-                const decide = self.service.backend.decide orelse return error.MemoryCapabilityUnavailable;
-                const prior = try self.candidates(claim);
-                if (prior.len > 0) {
-                    const decision = try decide(self.service.backend.ptr, self.a, self.state.config, claim, prior);
-                    if (decision.reason.len == 0 or decision.reason.len > t.max_text_bytes) return error.MemoryUngroundedOutput;
-                    for (decision.supersedes) |target| {
-                        var found = false;
-                        for (prior) |candidate| if (eql(u8, candidate.assertion.id, target)) {
-                            found = true;
-                            break;
-                        };
-                        if (!found) return error.MemoryUngroundedOutput;
-                    }
-                    claim.supersedes = decision.supersedes;
-                    claim.reconciliation_reason = decision.reason;
-                }
-            }
+            const model_decision = if (self.state.config.features.reconciliation == .model) try self.decideClaim(&claim, self.service.context.principal) else null;
             if (claim.embedding) |embedding| try self.putVector(self.state.config, claim, embedding);
             claim.embedding = null;
             claim.embedding_model = null;
             const record: t.StoredAssertion = .{ .assertion = claim, .input_hash = input_hash, .asserted_valid_to = claim.valid_to, .owner = self.service.context.principal, .recorded_from = self.service.context.now_ms, .revision = self.state.revision, .config_generation = self.state.config.generation };
-            try self.putAssertion(record);
+            try self.putAssertionWithReasons(record, .{ .assertion = model_decision });
             if (claim.kind == .summary or claim.kind == .procedural) try self.put(try dependencyKey(self.a, "entity", claim.subject, claim.id), .{ .child = claim.id });
             for (claim.evidence) |ref| try self.put(try dependencyKey(self.a, "evidence", ref.id, claim.id), .{ .child = claim.id });
             for (claim.depends_on) |parent| try self.put(try dependencyKey(self.a, "assertion", parent, claim.id), .{ .child = claim.id });
@@ -649,37 +760,85 @@ const Run = struct {
                 for (support.evidence) |ref| try self.put(try dependencyKey(self.a, "evidence", ref.id, claim.id), .{ .child = claim.id });
                 for (support.depends_on) |parent| try self.put(try dependencyKey(self.a, "assertion", parent, claim.id), .{ .child = claim.id });
             }
-            for (claim.supersedes) |previous| {
-                if (eql(u8, previous, claim.id)) return error.MemoryInvalidSupersession;
-                var old = (try self.assertion(previous)) orelse return error.MemoryNotFound;
-                try self.authorize(old.owner, old.assertion.visibility);
-                if (claim.visibility == .private and !eql(u8, old.owner, self.service.context.principal)) return error.MemoryVisibilityConflict;
-                if (!try self.sameCanonicalGroup(claim, old.assertion) or claim.modality != .actual or claim.role == .hypothesized or claim.stability != .settled) return error.MemoryInvalidSupersession;
-                old.lifecycle = .superseded;
-                old.superseded_by = claim.id;
-                if (claim.valid_from) |start| {
-                    if (old.assertion.valid_from) |previous_start| if (start < previous_start) return error.MemoryInvalidSupersession;
-                    if (old.assertion.valid_to == null or old.assertion.valid_to.? > start) old.assertion.valid_to = start;
-                }
-                old.recorded_to = self.service.context.now_ms;
-                old.reason = claim.reconciliation_reason;
-                old.explicit_disposition = explicitDisposition(old);
-                old.explicit_disposition.?.provenance = .{ .principal = self.service.context.principal, .recorded_at = self.service.context.now_ms, .evidence = claim.evidence };
-                old.revision = self.state.revision;
-                try self.putAssertion(old);
-                try self.invalidate("assertion", previous);
-            }
+            try self.applySupersessions(claim, self.service.context.principal, model_decision);
             if (self.state.config.features.reconciliation == .deterministic) try self.reconcile(record);
         }
     }
-    fn candidates(self: *Run, claim: t.Assertion) ![]const t.StoredAssertion {
+    fn applySupersessions(self: *Run, claim: t.Assertion, owner: []const u8, model_decision: ?[]const u8) !void {
+        for (claim.supersedes) |previous| {
+            if (eql(u8, previous, claim.id)) return error.MemoryInvalidSupersession;
+            var old = (try self.assertion(previous)) orelse return error.MemoryNotFound;
+            try self.authorize(old.owner, old.assertion.visibility);
+            if (claim.visibility == .private and !eql(u8, old.owner, owner)) return error.MemoryVisibilityConflict;
+            if (!try self.sameCanonicalGroup(claim, old.assertion) or claim.modality != .actual or claim.role == .hypothesized or claim.stability != .settled) return error.MemoryInvalidSupersession;
+            old.lifecycle = .superseded;
+            old.superseded_by = claim.id;
+            if (claim.valid_from) |start| {
+                if (old.assertion.valid_from) |previous_start| if (start < previous_start) return error.MemoryInvalidSupersession;
+                if (old.assertion.valid_to == null or old.assertion.valid_to.? > start) old.assertion.valid_to = start;
+            }
+            old.recorded_to = self.service.context.now_ms;
+            old.reason = claim.reconciliation_reason;
+            old.explicit_disposition = explicitDisposition(old);
+            old.explicit_disposition.?.provenance = .{ .principal = self.service.context.principal, .recorded_at = self.service.context.now_ms, .evidence = claim.evidence };
+            old.revision = self.state.revision;
+            var reasons = try self.reasonBindings((try self.assertion(previous)).?);
+            reasons.disposition = model_decision;
+            try self.putAssertionWithReasons(old, reasons);
+            try self.invalidate("assertion", previous);
+        }
+    }
+    fn decideClaim(self: *Run, claim: *t.Assertion, owner: []const u8) !?[]const u8 {
+        if (!self.singlePredicate(claim.predicate) or claim.modality != .actual or claim.role == .hypothesized or claim.stability != .settled) return null;
+        const decide = self.service.backend.decide orelse return error.MemoryCapabilityUnavailable;
+        const prior = try self.candidates(claim.*, owner);
+        if (prior.len == 0) return null;
+        const decision = try decide(self.service.backend.ptr, self.a, self.state.config, claim.*, prior);
+        if (decision.reason.len == 0 or decision.reason.len > t.max_text_bytes) return error.MemoryUngroundedOutput;
+        for (decision.supersedes) |target| {
+            var found = false;
+            for (prior) |candidate| if (eql(u8, candidate.assertion.id, target)) {
+                found = true;
+                break;
+            };
+            if (!found) return error.MemoryUngroundedOutput;
+        }
+        claim.supersedes = decision.supersedes;
+        claim.reconciliation_reason = decision.reason;
+        return try self.storeDecision(claim.*, prior);
+    }
+    fn reconcileModel(self: *Run, incoming: t.StoredAssertion) !void {
+        if (incoming.lifecycle != .active or incoming.stale or !try self.evidenceVisible(incoming)) return;
+        var record = incoming;
+        const previous_links = record.assertion.supersedes;
+        const decision = (try self.decideClaim(&record.assertion, record.owner)) orelse return;
+        // Apply only the new verdict; retain already accepted relationship links.
+        try self.applySupersessions(record.assertion, record.owner, decision);
+        var links: std.ArrayList([]const u8) = .empty;
+        for (previous_links) |id| try links.append(self.a, id);
+        for (record.assertion.supersedes) |id| {
+            var present = false;
+            for (links.items) |old| if (eql(u8, id, old)) {
+                present = true;
+                break;
+            };
+            if (!present) try links.append(self.a, id);
+        }
+        if (links.items.len > t.max_items) return error.MemoryWorkLimit;
+        record.assertion.supersedes = links.items;
+        record.revision = self.state.revision;
+        var reasons = try self.reasonBindings(incoming);
+        reasons.assertion = decision;
+        try self.putAssertionWithReasons(record, reasons);
+    }
+    fn candidates(self: *Run, claim: t.Assertion, owner: []const u8) ![]const t.StoredAssertion {
         var result: std.ArrayList(t.StoredAssertion) = .empty;
-        for (try self.canonicalGroup(claim, self.service.context.principal)) |old| {
+        for (try self.canonicalGroup(claim, owner)) |old| {
             if (eql(u8, old.assertion.id, claim.id) or old.lifecycle != .active or old.stale or old.assertion.modality != .actual or old.assertion.role == .hypothesized or old.assertion.stability != .settled) continue;
             self.authorize(old.owner, old.assertion.visibility) catch continue;
             if (!try self.evidenceVisible(old)) continue;
             if (result.items.len >= t.max_items) return error.MemoryWorkLimit;
-            try result.append(self.a, old);
+            try result.append(self.a, try self.publicRecord(old));
         }
         return result.items;
     }
@@ -803,7 +962,11 @@ const Run = struct {
             try self.putAssertion(record);
         }
         values = affected.valueIterator();
-        while (values.next()) |value| if (try self.assertion(value.assertion.id)) |record| try self.reconcile(record);
+        while (values.next()) |value| if (try self.assertion(value.assertion.id)) |record| switch (self.state.config.features.reconciliation) {
+            .explicit => {},
+            .deterministic => try self.reconcile(record),
+            .model => try self.reconcileModel(record),
+        };
     }
     fn identityVisible(self: *Run, claim: t.Assertion) anyerror!bool {
         if (try self.canonical(claim.subject) == null) return false;
@@ -956,6 +1119,14 @@ const Run = struct {
         try self.put(path, .{ .entity = value, .owner = self.service.context.principal });
     }
     fn putAssertion(self: *Run, value: t.StoredAssertion) !void {
+        return self.putAssertionWithReasons(value, null);
+    }
+    fn putAssertionWithReasons(self: *Run, value: t.StoredAssertion, override: ?ReasonBindings) !void {
+        const reasons = override orelse (try self.read(ReasonBindings, try self.reasonKey(value.assertion.id, value.revision))) orelse inherit: {
+            const previous = (try self.assertion(value.assertion.id)) orelse break :inherit ReasonBindings{};
+            break :inherit try self.reasonBindings(previous);
+        };
+        try self.put(try self.reasonKey(value.assertion.id, value.revision), reasons);
         var record = try self.publicRecord(value);
         record.recorded_at = self.service.context.now_ms;
         try self.put(try key(self.a, "assertion", record.assertion.id), record);
@@ -1086,7 +1257,9 @@ const Run = struct {
         if (request.lifecycle == .retracted) record.recorded_to = self.service.context.now_ms;
         record.explicit_disposition = explicitDisposition(record);
         record.explicit_disposition.?.provenance = .{ .principal = self.service.context.principal, .recorded_at = self.service.context.now_ms, .evidence = request.evidence };
-        try self.putAssertion(record);
+        var reasons = try self.reasonBindings((try self.assertion(request.id)).?);
+        reasons.disposition = null;
+        try self.putAssertionWithReasons(record, reasons);
         if (self.state.config.features.reconciliation == .deterministic and record.lifecycle == .active) try self.reconcile(record);
         try self.invalidate("assertion", request.id);
     }
@@ -1375,6 +1548,14 @@ const Run = struct {
                         try self.remove(try self.generationKey("entity", stored.entity.id));
                         try self.remove(row.key);
                     }
+                } else if (std.mem.startsWith(u8, row.key, "decision/")) {
+                    const decision = try parse(DecisionProvenance, self.a, row.json);
+                    if (try self.assertion(decision.assertion_id) == null) try self.remove(row.key);
+                } else if (std.mem.startsWith(u8, row.key, "reason-binding/")) {
+                    var parts = std.mem.splitScalar(u8, row.key, '/');
+                    _ = parts.next();
+                    const id_hash = parts.next() orelse return error.MemoryCorruptState;
+                    if (try self.read(std.json.Value, try std.fmt.allocPrint(self.a, "assertion/{s}", .{id_hash})) == null) try self.remove(row.key);
                 } else if (std.mem.startsWith(u8, row.key, "generation-input/")) {
                     const owner_key = row.key["generation-input/".len..];
                     if (try self.read(std.json.Value, owner_key) == null) try self.remove(row.key);
