@@ -180,6 +180,19 @@ scoped by subject, predicate, scope, environment, task and visibility. Private
 belief groups additionally include the authenticated owner; one principal's private
 evidence cannot silently supersede another principal's state. Source authority rules
 bind to authenticated principals; a client-supplied producer label is not a grant.
+Authority is recomputed from the strongest complete, eligible support branch,
+independently of primary/alternative ordering. Each rule must match the evidence's
+persisted owner and its optional producer restriction, including after policy
+changes; mismatched legacy evidence remains untrusted rather than acquiring the
+new principal's authority. A complete untrusted branch has rank zero; absent
+support has no rank and cannot participate in reconciliation. Competing claims
+are evaluated at the start of their overlapping business interval, preserving
+historically applicable superseded premises while excluding retracted premises.
+Authorization, forgetting and expiry checks use the same support traversal as
+reads. A surviving branch cannot borrow authority from an unavailable branch.
+Source authority changes at logical forgetting/expiry boundaries, independently
+of physical source cleanup and restart. Source-rule changes rebuild retained
+belief groups atomically under these rules.
 
 The implementation bounds assertion/evidence batches at 256, text at 64 KiB,
 individual requests at the admitted space budget (at most 4 MiB), dependency

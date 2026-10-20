@@ -1403,3 +1403,111 @@ test "memory rebuilt incoming explanations preserve provenance across forgetting
         }
     }
 }
+
+test "memory source authority rules bind persisted principals and producers across policy changes" {
+    for (0..3) |mode| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try setup(&store);
+        const owner = if (mode == 0) "alice" else "bob";
+        const bad_source: m.types.Evidence = .{ .id = "legacy", .source_id = "future-trusted", .source_version = "1", .text = "Legacy deployment", .producer = if (mode == 1) "untrusted" else "connector", .visibility = .team };
+        const good_source: m.types.Evidence = .{ .id = "verified", .source_id = "verified", .source_version = "1", .text = "Verified deployment", .producer = "connector", .visibility = .team };
+        _ = try store.service(owner, false, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{bad_source} }, .{}), "legacy");
+        _ = try store.service("bob", false, 4).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{good_source} }, .{}), "verified");
+        const old: m.types.Assertion = .{ .id = "old", .subject = "production", .predicate = "deploys_with", .value = "Legacy", .statement = "Legacy deployment", .visibility = .team, .valid_from = 100, .evidence = &.{.{ .id = "legacy" }} };
+        const new: m.types.Assertion = .{ .id = "new", .subject = "production", .predicate = "deploys_with", .value = "Verified", .statement = "Verified deployment", .visibility = .team, .valid_from = 200, .evidence = &.{.{ .id = "verified" }} };
+        _ = try store.service(owner, false, 5).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{old} }, .{}), "old");
+        _ = try store.service("bob", false, 6).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{new} }, .{}), "new");
+        const inspected = try std.json.parseFromSliceLeaky(m.types.Inspection, a, try store.service("alice", true, 7).execute(a, .inspect, "", "{}", ""), .{});
+        var config = inspected.state.config;
+        config.source_rules = &.{ .{ .source_id = "future-trusted", .principal = "bob", .producer = "connector", .authority = 100 }, .{ .source_id = "verified", .principal = "bob", .producer = "connector", .authority = 10 } };
+        _ = try store.service("alice", true, 8).execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = inspected.state.revision, .config = config }, .{}), "policy");
+        const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("bob", false, 9).execute(a, .get, "new", "{}", ""), .{});
+        try std.testing.expectEqual(if (mode == 2) m.types.Lifecycle.disputed else .active, record.lifecycle);
+    }
+}
+
+fn sourceAuthorityConfig() m.types.Config {
+    return .{ .features = .{ .reconciliation = .deterministic }, .predicates = &.{.{ .name = "deploys_with", .cardinality = .one }}, .source_rules = &.{ .{ .source_id = "high", .principal = "alice", .authority = 100 }, .{ .source_id = "new", .principal = "alice", .authority = 10 } } };
+}
+fn authoritySources(store: *Store, expiry: bool) !void {
+    const a = store.arena.allocator();
+    _ = try store.service("alice", true, 1).execute(a, .create, "", try std.json.Stringify.valueAlloc(a, sourceAuthorityConfig(), .{}), "create");
+    const sources = [_]m.types.Evidence{
+        .{ .id = "high", .source_id = "high", .source_version = "1", .text = "Helm", .expires_at = if (expiry) 10 else null },
+        .{ .id = "low", .source_id = "low", .source_version = "1", .text = "Helm" },
+        .{ .id = "new", .source_id = "new", .source_version = "1", .text = "Terraform" },
+    };
+    _ = try store.service("alice", true, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &sources }, .{}), "evidence");
+}
+fn authorityNewFact(store: *Store, valid: i64) !m.types.StoredAssertion {
+    const a = store.arena.allocator();
+    const claim: m.types.Assertion = .{ .id = "new", .subject = "production", .predicate = "deploys_with", .value = "Terraform", .statement = "Terraform", .valid_from = valid, .evidence = &.{.{ .id = "new" }} };
+    _ = try store.service("alice", true, 50).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{claim} }, .{}), "new");
+    return std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 51).execute(a, .get, "new", "{}", ""), .{});
+}
+test "memory source authority forget and expiry fences apply before and after physical cleanup" {
+    for (0..3) |mode| for ([_]bool{ false, true }) |cleanup| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try authoritySources(&store, mode == 2);
+        const old: m.types.Assertion = .{ .id = "old", .subject = "production", .predicate = "deploys_with", .value = "Helm", .statement = "Helm", .valid_from = 100, .evidence = &.{.{ .id = "high" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "low" }} }} };
+        _ = try store.service("alice", true, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{old} }, .{}), "old");
+        if (mode != 2) _ = try store.service("alice", true, 4).execute(a, .forget, "", if (mode == 0) "{\"source_ids\":[\"high\"]}" else "{\"evidence_ids\":[\"high\"]}", "forget");
+        if (cleanup) for (0..16) |i| {
+            _ = try store.service("alice", true, @intCast(12 + i)).execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}));
+        };
+        try std.testing.expectEqual(m.types.Lifecycle.active, (try authorityNewFact(&store, 200)).lifecycle);
+    };
+}
+
+test "memory source authority uses complete alternative branches independently of branch order" {
+    for (0..3) |mode| for ([_]bool{ false, true }) |high_primary| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try authoritySources(&store, false);
+        const parent: m.types.Assertion = .{ .id = "parent", .subject = "evidence", .predicate = "support", .value = "gate", .statement = "Supporting premise", .evidence = &.{.{ .id = "low" }} };
+        _ = try store.service("alice", true, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{parent} }, .{}), "parent");
+        const high: m.types.Support = .{ .evidence = &.{.{ .id = "high" }}, .depends_on = &.{"parent"} };
+        const low: m.types.Support = .{ .evidence = &.{.{ .id = "low" }} };
+        const primary = if (high_primary) high else low;
+        const alternative = if (high_primary) low else high;
+        const old: m.types.Assertion = .{ .id = "old", .subject = "production", .predicate = "deploys_with", .value = "Helm", .statement = "Helm", .valid_from = 100, .evidence = primary.evidence, .depends_on = primary.depends_on, .support_sets = &.{alternative} };
+        _ = try store.service("alice", true, 4).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{old} }, .{}), "old");
+        if (mode == 1) {
+            const current = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 5).execute(a, .get, "parent", "{}", ""), .{});
+            const correction: m.types.Correction = .{ .id = "parent", .expected_revision = current.revision, .lifecycle = .retracted, .reason = "Premise withdrawn", .evidence = &.{.{ .id = "low" }} };
+            _ = try store.service("alice", true, 6).execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, correction, .{}), "retract");
+        } else if (mode == 2) _ = try store.service("alice", true, 6).execute(a, .forget, "", "{\"assertion_ids\":[\"parent\"]}", "forget-parent");
+        try std.testing.expectEqual(if (mode == 0) m.types.Lifecycle.disputed else .active, (try authorityNewFact(&store, 200)).lifecycle);
+    };
+}
+
+test "memory source authority evaluates historical premises at overlapping business time" {
+    for (0..3) |mode| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try authoritySources(&store, false);
+        const parent: m.types.Assertion = .{ .id = "parent", .subject = "premise", .predicate = "status", .value = "old", .statement = "Old premise", .valid_from = 100, .evidence = &.{.{ .id = "low" }} };
+        _ = try store.service("alice", true, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{parent} }, .{}), "parent");
+        const old: m.types.Assertion = .{ .id = "old", .subject = "production", .predicate = "deploys_with", .value = "Helm", .statement = "Helm", .valid_from = 100, .evidence = &.{.{ .id = "high" }}, .depends_on = &.{"parent"} };
+        _ = try store.service("alice", true, 4).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{old} }, .{}), "old");
+        var next = parent;
+        next.id = "parent-next";
+        next.value = "new";
+        next.statement = "New premise";
+        next.valid_from = 300;
+        next.supersedes = &.{"parent"};
+        _ = try store.service("alice", true, 5).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{next} }, .{}), "next");
+        if (mode == 2) {
+            const current = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 6).execute(a, .get, "parent", "{}", ""), .{});
+            const correction: m.types.Correction = .{ .id = "parent", .expected_revision = current.revision, .lifecycle = .retracted, .reason = "Premise withdrawn", .evidence = &.{.{ .id = "low" }} };
+            _ = try store.service("alice", true, 7).execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, correction, .{}), "retract");
+        }
+        try std.testing.expectEqual(if (mode == 0) m.types.Lifecycle.disputed else .active, (try authorityNewFact(&store, if (mode == 1) 400 else 200)).lifecycle);
+    }
+}

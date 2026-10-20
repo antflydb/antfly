@@ -1159,11 +1159,24 @@ const Run = struct {
         }
         return .{ .rows = rows.items, .next = page.next };
     }
-    fn authority(self: *Run, claim: t.Assertion) !u16 {
+    // A complete live branch can justify authority; an unavailable branch
+    // cannot lend its strongest citation to an independently supported fact.
+    // Null means no eligible support, distinct from untrusted support at rank 0.
+    fn authority(self: *Run, claim: t.Assertion, valid: ?i64) !?u16 {
+        var rank = try self.supportAuthority(claim.evidence, claim.depends_on, valid);
+        for (claim.support_sets) |support| if (try self.supportAuthority(support.evidence, support.depends_on, valid)) |candidate| {
+            rank = @max(rank orelse 0, candidate);
+        };
+        return rank;
+    }
+    fn supportAuthority(self: *Run, refs: []const t.EvidenceRef, parents: []const []const u8, valid: ?i64) !?u16 {
+        if (!try self.supportVisibleTime(refs, parents, null, valid, 0)) return null;
         var rank: u16 = 0;
-        for (claim.evidence) |ref| {
-            const source = (try self.evidence(ref.id)) orelse continue;
+        for (refs) |ref| {
+            const source = (try self.evidence(ref.id)) orelse return error.MemoryCorruptState;
             for (self.state.config.source_rules) |rule| if (eql(u8, rule.source_id, source.evidence.source_id)) {
+                if (rule.principal) |principal| if (!eql(u8, principal, source.owner)) continue;
+                if (rule.producer) |producer| if (!eql(u8, producer, source.evidence.producer)) continue;
                 rank = @max(rank, rule.authority);
             };
         }
@@ -1198,6 +1211,7 @@ const Run = struct {
         if (try self.canonical(claim.subject) == null) return;
         if (self.objectTyped(claim.predicate) and try self.canonical(claim.value) == null) return;
         if (incoming.lifecycle != .active or incoming.stale or claim.modality != .actual or claim.role == .hypothesized or claim.stability != .settled or !self.singlePredicate(claim.predicate)) return;
+        if (!try self.retained(incoming, 0)) return;
         for (try self.canonicalGroup(claim, incoming.owner)) |candidate| {
             try self.service.context.check();
             if (eql(u8, candidate.assertion.id, claim.id)) continue;
@@ -1210,13 +1224,20 @@ const Run = struct {
             if (!try self.sameCanonicalGroup(claim, old.assertion)) return error.MemoryCorruptState;
             self.authorize(old.owner, old.assertion.visibility) catch continue;
             if (try self.sameCanonicalValue(claim, old.assertion) or !intervalsOverlap(claim, old.assertion)) continue;
+            // Evaluate both supports at the start of their overlapping business
+            // interval. Historical superseded premises remain eligible there;
+            // retracted, forgotten or expired premises never confer authority.
+            var valid = claim.valid_from;
+            if (old.assertion.valid_from) |start| if (valid == null or start > valid.?) {
+                valid = start;
+            };
+            const incoming_authority = (try self.authority(claim, valid)) orelse continue;
+            const previous_authority = (try self.authority(old.assertion, valid)) orelse continue;
             // Unknown business validity is never inferred from ingestion
             // order. Competing unknown/simultaneous assertions are disputed.
             var current = (try self.assertion(claim.id)).?;
             if (self.state.config.features.reconciliation == .deterministic and claim.valid_from != null and old.assertion.valid_from != null and claim.valid_from.? != old.assertion.valid_from.?) {
                 const newer = claim.valid_from.? > old.assertion.valid_from.?;
-                const incoming_authority = try self.authority(claim);
-                const previous_authority = try self.authority(old.assertion);
                 if ((newer and incoming_authority < previous_authority) or (!newer and previous_authority < incoming_authority)) {
                     try self.conflict(&old, claim.id, "Overlapping assertions have conflicting source authority");
                     try self.conflict(&current, old.assertion.id, "Overlapping assertions have conflicting source authority");

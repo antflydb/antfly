@@ -9241,3 +9241,61 @@ test "capi native memory decision explanation provenance survives reopen and scr
     defer a.free(history);
     try std.testing.expect(std.mem.indexOf(u8, history, "Retired secret") == null);
 }
+
+test "capi native memory source authority preserves identity and forget fences across reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-memory-authority-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const memory = @import("../memory/service.zig");
+    const Calls = struct {
+        fn call(handle: ?*anyopaque, alloc: Allocator, principal: []const u8, action: @import("../memory/service.zig").Action, body: anytype, token: []const u8, name: []const u8) ![]const u8 {
+            const request = try std.json.Stringify.valueAlloc(alloc, .{ .action = action, .principal = principal, .id = name, .body = body, .idempotency_key = token }, .{});
+            var output: capi.Buffer = .{};
+            const code = antfly_db_memory_json(handle, .fromSlice("personal"), .fromSlice(request), &output);
+            if (code != .ok) std.debug.print("memory C ABI: {s}\n", .{std.mem.span(capi.lastErrorDetail())});
+            try std.testing.expectEqual(capi.ErrorCode.ok, code);
+            defer std.heap.c_allocator.free(output.ptr.?[0..output.len]);
+            return alloc.dupe(u8, output.ptr.?[0..output.len]);
+        }
+    };
+    for (0..3) |mode| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/db-{d}.aflite", .{ directory.path(), mode }, 0);
+        var id: ?*anyopaque = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &id));
+        defer if (id != null) antfly_db_close(id);
+        const rules = [_]memory.types.SourceRule{ .{ .source_id = "high", .principal = if (mode == 0) "bob" else "alice", .producer = "connector", .authority = 100 }, .{ .source_id = "new", .principal = "bob", .producer = "connector", .authority = 10 } };
+        var config: memory.types.Config = .{ .features = .{ .reconciliation = .deterministic }, .predicates = &.{.{ .name = "deployment", .cardinality = .one }}, .source_rules = if (mode == 0) &.{} else &rules };
+        _ = try Calls.call(id, alloc, "alice", .create, config, "create", "");
+        const sources = [_]memory.types.Evidence{
+            .{ .id = "high", .source_id = "high", .source_version = "1", .producer = "connector", .text = "Helm", .visibility = .team },
+            .{ .id = "low", .source_id = "low", .source_version = "1", .text = "Helm", .visibility = .team },
+        };
+        _ = try Calls.call(id, alloc, "alice", .observe, .{ .evidence = &sources }, "old-sources", "");
+        const new_source: memory.types.Evidence = .{ .id = "new", .source_id = "new", .source_version = "1", .producer = "connector", .text = "Terraform", .visibility = .team };
+        _ = try Calls.call(id, alloc, "bob", .observe, .{ .evidence = &.{new_source} }, "new-source", "");
+        const old: memory.types.Assertion = .{ .id = "old", .subject = "production", .predicate = "deployment", .value = "Helm", .statement = "Helm", .visibility = .team, .valid_from = 100, .evidence = &.{.{ .id = "high" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "low" }} }} };
+        _ = try Calls.call(id, alloc, "alice", .assertions, .{ .assertions = &.{old} }, "old", "");
+        if (mode != 0) _ = try Calls.call(id, alloc, "alice", .forget, .{ .source_ids = &[_][]const u8{"high"} }, "forget", "");
+        antfly_db_close(id);
+        id = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        if (mode == 0) {
+            const inspected = try std.json.parseFromSliceLeaky(memory.types.Inspection, alloc, try Calls.call(id, alloc, "alice", .inspect, .{}, "", ""), .{});
+            config.source_rules = &rules;
+            _ = try Calls.call(id, alloc, "alice", .configure, .{ .expected_revision = inspected.state.revision, .config = config }, "policy", "");
+        } else if (mode == 2) {
+            for (0..16) |step| _ = try Calls.call(id, alloc, "alice", .advance, .{}, try std.fmt.allocPrint(alloc, "cleanup-{d}", .{step}), "");
+            antfly_db_close(id);
+            id = null;
+            try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+        }
+        const new: memory.types.Assertion = .{ .id = "new", .subject = "production", .predicate = "deployment", .value = "Terraform", .statement = "Terraform", .visibility = .team, .valid_from = 200, .evidence = &.{.{ .id = "new" }} };
+        _ = try Calls.call(id, alloc, "bob", .assertions, .{ .assertions = &.{new} }, "new", "");
+        const result = try std.json.parseFromSliceLeaky(memory.types.StoredAssertion, alloc, try Calls.call(id, alloc, "bob", .get, .{}, "", "new"), .{});
+        try std.testing.expectEqual(memory.types.Lifecycle.active, result.lifecycle);
+    }
+}
