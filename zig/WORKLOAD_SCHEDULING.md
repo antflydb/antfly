@@ -25,6 +25,14 @@ cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
 
+Source `65194cc0a474e11f500a5b7c64737322de64f69e` derives a conservative retirement wire shape from
+known physical artifact inventory and shares canonical CJ2 sizing with the live
+encoder. It covers both deletion/artifact copies and graph owner/endpoint hints,
+with checked arithmetic and a real DB-deletion fixture. The 45-case wire and
+14-case inventory suites pass. This is only the current-inventory contribution;
+request/new effects, persistence envelopes, durable grants and recovery resource
+ownership remain separate. See the implementation ledger for exact scope.
+
 Source `5e48b391853a4a1069ce0370b5de70c88d531bff` validates the complete binary replay envelope before
 allocating decoder metadata and exposes checked decoded-allocation payload sizes.
 The 147-case replay-allocation suite and 43-case wire suite pass, including all

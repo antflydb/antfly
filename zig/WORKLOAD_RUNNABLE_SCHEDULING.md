@@ -19,6 +19,54 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Inventory-backed retirement wire bounds (2026-10-20)
+
+Source `65194cc0a474e11f500a5b7c64737322de64f69e` adds a low-level canonical CJ2 shape model and uses it
+in the live encoder's exact sizing pass. Each present list costs its four-byte
+count, four bytes per key length and the key bytes; one record costs a 16-byte
+header including the hint mask. Shape merges combine list totals without
+repeating headers. Counts, lengths and sums reject wire-limit overflow before
+allocation. Existing CJ2 bytes and all private/durable ABI versions are unchanged.
+
+For known physical inventory with `N` keys and `B` key bytes, retirement can
+conservatively contribute these list totals:
+
+| List | Key count bound | Key bytes bound |
+| --- | --- | --- |
+| Changed documents | `3N` | `B` |
+| Deleted documents | `N` | `B` |
+| Changed artifacts | `N` | `B` |
+
+Thin replay copies removal
+keys into both deletion and artifact lanes. Materialized graph removals can also
+name owner/source/target; their distinct decoded bytes fit in the encoded
+relationship keys, with aliases deduplicated by the canonical builders. Charging
+all physical families for these lanes conservatively includes non-graph keys.
+For representable nonempty inventory the wire bound is `28 + 20*N + 3*B`; an empty shape costs
+16 bytes. Request effects, new generated effects and persistence envelope/key
+charges must be added separately. Missing or invalidated inventory remains
+unknown and must be reconciled before a prepare can rely on it.
+
+The 69-step focused run passes 45 wire cases plus a boundary companion and
+14 inventory cases. A real DB deletion covers escaped owner/source/target IDs,
+legacy and explicit graph relationships, asset/chunk/vector artifacts, unchanged
+inventory on value replacement, physical removal and endpoint notifications.
+The same fact bounds explicit thin and materialized encoder inputs. Fixture
+seeding publishes the normal owner's artifact-presence marker before deletion;
+raw physical writes alone do not refresh the DB's cached presence witness.
+Checked overflow and additive growth tests accompany existing inventory lifecycle
+and byte-for-byte wire checks.
+
+`inventory-replay-shape-verified.json` binds 5270 native inputs,
+4552 matching immutable public sources and 25/25 ReleaseSafe
+consumer build steps. The public consumer checks module composition only; full
+archive/cold-source runtime remain unqualified and the full Linux sweep is waived.
+This is a wire-cost calculation, not durable credit or working RAM/CPU/I/O
+ownership. Durable reservations before PREPARE, atomic background credit RMW,
+minimum recovery bundles, required-provider orchestration and remaining broader
+scheduling integration remain unfinished. Required-mode providers remain disabled
+and the full design remains incomplete.
+
 ## Replay decoder validation before allocation (2026-10-20)
 
 Source `5e48b391853a4a1069ce0370b5de70c88d531bff` validates the complete CJ2 envelope before owned, borrowed
