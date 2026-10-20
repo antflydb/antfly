@@ -152,6 +152,8 @@ pub const VisionWorkspace = struct {
     owner: tape.Plan = .{ .host_bytes = @sizeOf(VisionWorkspace), .metadata_bytes = @sizeOf(VisionWorkspace) },
     spec: ops.EmbeddingVisionSpec,
     capacity_rows: usize,
+    arena_bytes: usize,
+    /// Maximum tile for the currently packed layout, not the initial geometry.
     tile_capacity: usize,
     stamp: u64,
     tile: usize,

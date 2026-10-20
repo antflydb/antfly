@@ -944,7 +944,13 @@ Tiles above 512 rows use power-of-two widths, leaving small remainders to a
 separate iteration rather than widening every GEMM. Tile scratch fits inside
 that same 256 MiB ceiling. Shared-cache or device-allocation pressure can reduce
 tiles to 512 rows without reducing the existing cohort capacity; smaller
-logical shapes reuse the retained tile storage without reallocating it.
+logical shapes repack activation and FFN views inside the retained allocation.
+Repacking occurs only with no active or submitted frame and publishes all
+validated ranges together. Unused activation capacity can fund wider FFN tiles:
+a six-frame 576x528 arena uses 512-row tiles, rebinds four frames with 2048-row
+tiles, then restores six frames without allocation, upload or admission growth.
+Every region remains disjoint and within the originally admitted byte budget;
+the unchanged capacity charge persists through smaller logical shapes.
 `ANTFLY_EMBEDDINGGEMMA2_BENCH_VISION_TILES=1` enables completed-command comparisons
 of 512/1024/2048-row tiles in the Metal vision workspace regression, with rotating
 execution order, warm samples and output parity checks.

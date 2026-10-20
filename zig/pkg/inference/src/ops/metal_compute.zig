@@ -16765,24 +16765,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         p.embedding_vision_workspaces[victim] = fresh;
         self.embedding_vision_workspace = fresh;
     }
-    /// Rebind only at a completed phase boundary. Each range retains its
-    /// original capacity/offset; smaller logical shapes never overlap peers.
+    /// Repack only at a completed phase boundary. Physical storage and its
+    /// admission stay fixed; unused activation rows become wider FFN scratch.
     fn bindVisionWorkspace(workspace: *@import("metal_embedding_bindings.zig").VisionWorkspace, spec: ops.EmbeddingVisionSpec) !void {
         if (std.meta.eql(workspace.spec, spec)) return;
         std.debug.assert(spec.rows <= workspace.capacity_rows);
-        const tile = @import("embedding_vision_plan.zig").tileRows(spec.rows, workspace.tile_capacity);
-        for (workspace.views[0..11], 0..) |ct, i| {
-            const rows = if (i == 8 or i == 9) tile else spec.rows;
-            const width = if (i == 4) 3 * spec.hidden else if (i == 8) 2 * spec.intermediate else if (i == 9) spec.intermediate else spec.hidden;
+        const layout = try @import("embedding_vision_plan.zig").layoutWithin(spec.rows, spec.hidden, spec.intermediate, workspace.arena_bytes);
+        // Region zero always starts at the allocation origin. Retain a full
+        // storage view before replacing any descriptor; no root allocation or
+        // additional device-buffer metadata survives the rebind.
+        var storage = try toBuf(workspace.views[0].?).metal_tensor.?.retainedStorageView(0, workspace.arena_bytes, &.{@intCast(workspace.arena_bytes / 4)});
+        defer storage.deinit();
+        var views: [11]MetalTensor = undefined;
+        var made: usize = 0;
+        errdefer for (views[0..made]) |*view| view.deinit();
+        for (layout.regions, 0..) |region, i| {
+            views[i] = try storage.retainedView(region.offset, region.bytes(), &.{ @intCast(region.rows), @intCast(region.width) });
+            made += 1;
+        }
+        // All checked ranges exist before publishing any changed offset.
+        for (workspace.views[0..11], layout.regions, 0..) |ct, region, i| {
             const buf = toBuf(ct.?);
-            const view = try buf.metal_tensor.?.retainedStorageView(0, rows * width * 4, &.{ @intCast(rows), @intCast(width) });
             buf.metal_tensor.?.deinit();
-            buf.metal_tensor = view;
-            buf.logical_shape.?[0] = @intCast(rows);
-            buf.logical_shape.?[1] = @intCast(width);
+            buf.metal_tensor = views[i];
+            buf.logical_shape.?[0] = @intCast(region.rows);
+            buf.logical_shape.?[1] = @intCast(region.width);
         }
         workspace.spec = spec;
-        workspace.tile = tile;
+        workspace.tile = layout.tile;
+        workspace.tile_capacity = layout.tile;
     }
     fn prepareVisionWorkspace(self: *MetalCompute, spec: ops.EmbeddingVisionSpec, clock: u64) !*@import("metal_embedding_bindings.zig").VisionWorkspace {
         const Workspace = @import("metal_embedding_bindings.zig").VisionWorkspace;
@@ -16804,7 +16815,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.data.prefetch.unlock();
             return err;
         };
-        workspace.* = .{ .spec = spec, .capacity_rows = spec.rows, .tile_capacity = tile, .stamp = clock, .tile = tile };
+        workspace.* = .{ .spec = spec, .capacity_rows = spec.rows, .arena_bytes = 0, .tile_capacity = tile, .stamp = clock, .tile = tile };
         workspace.owner.outputs = workspace.views[0..11];
         errdefer {
             self.dropVisionWorkspace(workspace);
@@ -16828,12 +16839,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer storage.deinit();
         workspace.tile = tile;
         workspace.tile_capacity = tile;
-        var offset: usize = 0;
-        for (workspace.views[0..11], 0..) |*dest, i| {
-            const rows = if (i == 8 or i == 9) tile else spec.rows;
-            const width = if (i == 4) 3 * spec.hidden else if (i == 8) 2 * spec.intermediate else if (i == 9) spec.intermediate else spec.hidden;
-            var view = try storage.retainedView(offset, rows * width * 4, &.{ @intCast(rows), @intCast(width) });
-            offset += rows * width * 4;
+        const layout = try plan.layoutForTile(spec.rows, spec.hidden, spec.intermediate, tile);
+        workspace.arena_bytes = layout.bytes;
+        for (workspace.views[0..11], layout.regions) |*dest, region| {
+            var view = try storage.retainedView(region.offset, region.bytes(), &.{ @intCast(region.rows), @intCast(region.width) });
             const ct = self.audioPersistentCt(&workspace.owner, view) catch |err| {
                 view.deinit();
                 return err;
@@ -47585,6 +47594,70 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
             compute.provider_impl.raw_linear_slots_prepared[slot] = true;
             compute.provider_impl.raw_linear_slot_in_dims[slot] = n_in;
             compute.provider_impl.raw_linear_slot_out_dims[slot] = n_out;
+        }
+        {
+            const plan = @import("embedding_vision_plan.zig");
+            const rows = 7128;
+            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = rows, .hidden = h, .intermediate = intermediate });
+            const workspace = compute.embedding_vision_workspace.?;
+            workspace.slots[0][1] = 0;
+            workspace.slots[0][2] = 1;
+            const handle = MetalCompute.denseDeviceF32(workspace.views[0].?).?.deviceHandle();
+            const builds = compute.provider_impl.embedding_vision_workspace_builds;
+            const charge = store.tier_cache.?.backend_bytes;
+            const host_charge = store.tier_cache.?.host_bytes;
+            const coefficients = workspace.views[11];
+            const values = try a.alloc(f32, rows * h);
+            defer a.free(values);
+            for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i % 8192)) * 0.017);
+            const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(values, &.{ rows, h }));
+            defer cb.free(input);
+            // Busy frames must never repack descriptors visible to an encoder.
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = 4752, .hidden = h, .intermediate = intermediate });
+            try std.testing.expect(compute.embedding_vision_workspace == null);
+            try std.testing.expectEqual(@as(usize, rows), workspace.spec.rows);
+            try cb.decoderRuntimeSubmitFrame();
+            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = 4752, .hidden = h, .intermediate = intermediate });
+            try std.testing.expect(compute.embedding_vision_workspace == null);
+            try std.testing.expectEqual(@as(usize, rows), workspace.spec.rows);
+            try cb.decoderRuntimeWaitSubmittedFrame();
+            var reference: ?[]f32 = null;
+            defer if (reference) |v| a.free(v);
+            for ([_]usize{ 7128, 4752, 7128, 1188, 4752, 7128 }) |active_rows| {
+                var no_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                compute.allocator = no_allocations.allocator();
+                cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = active_rows, .hidden = h, .intermediate = intermediate }) catch |err| {
+                    compute.allocator = a;
+                    return err;
+                };
+                compute.allocator = a;
+                try std.testing.expectEqual(@as(usize, 0), no_allocations.alloc_index);
+                try std.testing.expectEqual(workspace, compute.embedding_vision_workspace.?);
+                try std.testing.expectEqual(builds, compute.provider_impl.embedding_vision_workspace_builds);
+                try std.testing.expectEqual(charge, store.tier_cache.?.backend_bytes);
+                try std.testing.expectEqual(host_charge, store.tier_cache.?.host_bytes);
+                try std.testing.expectEqual(coefficients, workspace.views[11]);
+                const layout = try plan.layoutWithin(active_rows, h, intermediate, workspace.arena_bytes);
+                try std.testing.expectEqual(layout.tile, workspace.tile);
+                for (workspace.views[0..11], layout.regions) |ct, region| {
+                    const view = MetalCompute.denseDeviceF32(ct.?).?;
+                    try std.testing.expectEqual(handle, view.deviceHandle());
+                    try std.testing.expectEqual(region.offset, view.deviceByteOffset());
+                    try std.testing.expectEqual(region.bytes(), view.deviceByteLen());
+                }
+                const source = try cb.sliceRows2D(a, input, 0, active_rows, h);
+                defer cb.free(source);
+                try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+                _ = (try cb.vtable.embeddingVisionFFN.?(cb.ptr, source, 0)).?;
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                const actual = try cb.toFloat32(workspace.views[10].?, a);
+                defer a.free(actual);
+                if (reference) |want| {
+                    for (want[0..actual.len], actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
+                } else reference = try a.dupe(f32, actual);
+            }
+            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, null);
         }
         const benchmark = getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_VISION_TILES");
         for ([_]usize{ 513, 2049, 4752 }) |rows| {
