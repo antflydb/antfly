@@ -183,10 +183,10 @@ pub const RemoteContentConfig = struct {
 
     pub const RemoteContentRuntime = struct {
         context: *anyopaque,
-        acquire_fn: *const fn (*anyopaque) ?Snapshot,
+        acquire_fn: *const fn (*anyopaque) anyerror!Snapshot,
         health_fn: ?*const fn (*anyopaque) RuntimeHealth = null,
 
-        pub fn acquire(self: RemoteContentRuntime) ?Snapshot {
+        pub fn acquire(self: RemoteContentRuntime) !Snapshot {
             return self.acquire_fn(self.context);
         }
 
@@ -195,8 +195,9 @@ pub const RemoteContentConfig = struct {
         }
     };
 
-    pub fn acquire(self: *const RemoteContentConfig) Snapshot {
-        if (self.runtime) |runtime| return runtime.acquire() orelse .{ .config = self };
+    /// Acquisition failures propagate without fetching with a fallback policy.
+    pub fn acquire(self: *const RemoteContentConfig) !Snapshot {
+        if (self.runtime) |runtime| return runtime.acquire();
         return .{ .config = self };
     }
 

@@ -1540,7 +1540,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const cleaned = (if (request.source_template.len > 0) try extracted[row_index].logicalJson() else try extracted[row_index].logicalJsonForField(request.source_field)) orelse continue;
                     const source_text = if (request.source_template.len > 0)
                         renderSourceTemplateText(memo.alloc, self, request.source_template, cleaned) catch |err| switch (err) {
-                            error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                             else => null,
                         }
                     else
@@ -1673,7 +1673,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const cleaned = (if (request.source_template.len > 0) try extracted[row_index].logicalJson() else try extracted[row_index].logicalJsonForField(request.source_field)) orelse continue;
                     const source_text = if (request.source_template.len > 0)
                         renderSourceTemplateText(memo.alloc, self, request.source_template, cleaned) catch |err| switch (err) {
-                            error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                             else => null,
                         }
                     else

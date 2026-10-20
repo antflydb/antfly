@@ -145,7 +145,7 @@ pub const StorageOwnerContext = struct {
     inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
     remote_content_source: ?kernel_runtime_services.RemoteContentSource = null,
     remote_content_security: ?std.json.Parsed(scraping.ContentSecurityConfig) = null,
-    // Snapshot acquisition failures must deny destinations, including revoked paths.
+    // An unconfigured facade denies destinations; acquisition errors propagate.
     remote_content: scraping.RemoteContentConfig = .{ .security = .{ .allowed_hosts = &.{}, .allowed_paths = &.{} } },
     secret_store: ?*common_secrets.FileStore = null,
     lite_backend: ?lite_backend.Handle = null,
@@ -914,17 +914,23 @@ const RemoteContentSnapshot = struct {
     }
 };
 
-fn acquireRemoteContent(raw: *anyopaque) ?scraping.RemoteContentConfig.Snapshot {
+fn acquireRemoteContent(raw: *anyopaque) anyerror!scraping.RemoteContentConfig.Snapshot {
     const owner: *StorageOwnerContext = @ptrCast(@alignCast(raw));
     const source = owner.remote_content_source.?;
     var bytes: kernel_owner_abi.OwnedBytes = .{};
-    if (source.acquire(source.context, &bytes) != .ok) return null;
+    switch (source.acquire(source.context, &bytes)) {
+        .ok => {},
+        .out_of_memory => return error.OutOfMemory,
+        .timeout => return error.Timeout,
+        .cancelled => return error.Canceled,
+        else => return error.ResourceTemporarilyUnavailable,
+    }
     defer source.release(source.context, bytes);
     const alloc = std.heap.smp_allocator;
-    const snapshot = alloc.create(RemoteContentSnapshot) catch return null;
-    const parsed = std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, bytes.slice(), .{ .allocate = .alloc_always }) catch {
+    const snapshot = try alloc.create(RemoteContentSnapshot);
+    const parsed = std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, bytes.slice(), .{ .allocate = .alloc_always }) catch |err| {
         alloc.destroy(snapshot);
-        return null;
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.ResourceTemporarilyUnavailable;
     };
     snapshot.* = .{ .parsed = parsed, .config = .{ .security = parsed.value } };
     return .{ .config = &snapshot.config, .context = snapshot, .release_fn = RemoteContentSnapshot.release };

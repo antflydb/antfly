@@ -90,7 +90,12 @@ pub const Context = struct {
         const Adapter = struct {
             fn acquire(raw: *anyopaque, out: *abi.OwnedBytes) callconv(.c) abi.Status {
                 const facade: *const @import("antfly_scraping").RemoteContentConfig = @ptrCast(@alignCast(raw));
-                const bytes = @import("antfly_local_sources").common_config.remoteContentSecurityJsonAlloc(std.heap.smp_allocator, facade) catch return .out_of_memory;
+                const bytes = @import("antfly_local_sources").common_config.remoteContentSecurityJsonAlloc(std.heap.smp_allocator, facade) catch |err| return switch (err) {
+                    error.OutOfMemory => .out_of_memory,
+                    error.Timeout => .timeout,
+                    error.Canceled => .cancelled,
+                    else => .resource_temporarily_unavailable,
+                };
                 out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
                 return .ok;
             }

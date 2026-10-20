@@ -7111,10 +7111,14 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
 test "storage owner remote content source refreshes policy and retains in-flight snapshots (#1221)" {
     const Source = struct {
         policy: []const u8 = "{\"allowed_paths\":[\"/first\"]}",
-        failed: bool = false,
+        failure: ?kernel_owner_abi.Status = null,
+        successful_acquires_before_failure: usize = 0,
         fn acquire(raw: *anyopaque, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.failed) return .out_of_memory;
+            if (self.failure) |failure| {
+                if (self.successful_acquires_before_failure == 0) return failure;
+                self.successful_acquires_before_failure -= 1;
+            }
             out.* = .{ .ptr = @constCast(self.policy.ptr), .len = self.policy.len };
             return .ok;
         }
@@ -7130,10 +7134,10 @@ test "storage owner remote content source refreshes policy and retains in-flight
     owner.acquire();
     defer owner.release();
     const facade = owner.remoteContent().?;
-    var before = facade.acquire();
+    var before = try facade.acquire();
     defer before.deinit();
     source.policy = "{\"allowed_paths\":[\"/second\"]}";
-    var after = facade.acquire();
+    var after = try facade.acquire();
     defer after.deinit();
     try std.testing.expectEqualStrings("/first", before.config.security.?.allowed_paths.?[0]);
     try std.testing.expectEqualStrings("/second", after.config.security.?.allowed_paths.?[0]);
@@ -7161,9 +7165,24 @@ test "storage owner remote content source refreshes policy and retains in-flight
     try std.testing.expect(std.mem.indexOf(u8, rendered, "image/png") != null);
     source.policy = "{\"allowed_paths\":[]}";
     try std.testing.expectError(error.PermanentPromptFailure, remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config));
-    source.failed = true;
-    var denied = facade.acquire();
-    defer denied.deinit();
-    try std.testing.expectEqual(@as(usize, 0), denied.config.security.?.allowed_paths.?.len);
-    try std.testing.expectEqual(@as(usize, 0), denied.config.security.?.allowed_hosts.?.len);
+    // A failed snapshot must never become a permanent permission denial.
+    // Test both the initial render budget snapshot and the fetch snapshot.
+    source.policy = allowed;
+    source.failure = .out_of_memory;
+    try std.testing.expectError(error.OutOfMemory, facade.acquire());
+    try std.testing.expectError(error.OutOfMemory, remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config));
+    source.successful_acquires_before_failure = 1;
+    try std.testing.expectError(error.OutOfMemory, remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config));
+    source.failure = .resource_temporarily_unavailable;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, facade.acquire());
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config));
+    source.successful_acquires_before_failure = 1;
+    try std.testing.expectError(error.TransientPromptFailure, remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config));
+    source.failure = null;
+    source.policy = "invalid JSON";
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, facade.acquire());
+    source.policy = allowed;
+    const recovered = try remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config);
+    defer alloc.free(recovered);
+    try std.testing.expect(std.mem.indexOf(u8, recovered, "image/png") != null);
 }
