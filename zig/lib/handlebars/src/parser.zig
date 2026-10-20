@@ -690,7 +690,8 @@ pub const Parser = struct {
 
     fn parseNumberLiteral(self: *Parser) ParseError!*ast.Node {
         const tok = self.consume();
-        // Integers outside i64 are kept as floats, as JavaScript would.
+        // Retain the source token for exact evaluation. The approximate value
+        // and integer flag are also used by syntax-level option validation.
         const is_int = std.mem.indexOfScalar(u8, tok.value, '.') == null and
             if (std.fmt.parseInt(i64, tok.value, 10)) |_| true else |_| false;
         const value = std.fmt.parseFloat(f64, tok.value) catch 0;

@@ -248,7 +248,7 @@ test "public enrichment validation rejects invalid execution and producer config
 }
 
 test "public enrichment validation bounds neighbor context to text-consuming asset producers" {
-    const generator_producer = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\"}}";
+    const generator_producer = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}";
     // A well-formed neighbor context on a generator producer is admitted.
     try validatePublicConfig(std.testing.allocator, .{
         .name = "conceptualize_v1",

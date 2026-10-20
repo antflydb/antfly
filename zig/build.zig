@@ -464,6 +464,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_httpx_transport_regression_tests = b.addRunArtifact(httpx_transport_regression_tests);
 
     const group_source_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/group_sources.zig"), .target = target, .optimize = optimize }) });
+    group_source_tests.root_module.addImport("antfly-json", json_mod);
     const run_group_source_tests = b.addRunArtifact(group_source_tests);
     b.step("group-sources-test", "Run durable grouped-source membership and fencing tests").dependOn(&run_group_source_tests.step);
     const structured_test_module = b.createModule(.{ .root_source_file = b.path("lib/structured/root.zig"), .target = target, .optimize = optimize });

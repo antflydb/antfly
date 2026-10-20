@@ -118,6 +118,7 @@ pub fn array(a: Allocator, entries: []const Json) !Json {
 /// Admit only the schema vocabulary enforced by the common validator. Unknown
 /// keywords are rejected rather than silently weakening a producer contract.
 pub fn validateSchema(schema: Json) !void {
+    schema_validator.validateSchemaComplexity(schema) catch return error.InvalidConstrainedSchema;
     var nodes: usize = 0;
     try validateSchemaAt(schema, 0, &nodes);
 }
@@ -681,4 +682,21 @@ test "constrained wire precision repairs only genuinely invalid numeric values" 
     try std.testing.expect(result.failures[0] == null and result.failures[1] == null);
     try std.testing.expectEqualStrings("1e-400", result.values[1].?.object.get("value").?.number_string);
     try std.testing.expectEqualStrings("0.12345678901234567890123456789", result.values[0].?.object.get("value").?.number_string);
+}
+
+test "constrained admission bounds nested const and enum literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "const", "enum" }) |keyword| {
+        var raw: std.ArrayList(u8) = .empty;
+        try raw.appendSlice(a, "{\"");
+        try raw.appendSlice(a, keyword);
+        try raw.appendSlice(a, "\":");
+        try raw.appendNTimes(a, '[', 100000);
+        try raw.append(a, '0');
+        try raw.appendNTimes(a, ']', 100000);
+        try raw.append(a, '}');
+        try std.testing.expectError(error.InvalidConstrainedSchema, validateSchema(try parseReply(a, raw.items)));
+    }
 }

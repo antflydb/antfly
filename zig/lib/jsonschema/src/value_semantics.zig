@@ -126,73 +126,119 @@ pub fn unsignedInteger(a: A, value: V, maximum: u64) !u64 {
     return if (result <= maximum) result else error.InvalidBatchRequest;
 }
 
-pub fn equal(a: A, left: V, right: V) anyerror!bool {
+pub fn equal(a: A, left: V, right: V) !bool {
+    // Preserve allocation-free validation for the common scalar enum/const
+    // case; containers alone need a work stack.
     if (isNumber(left) and isNumber(right)) return try numberOrder(a, left, right) == .eq;
     if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
-    return switch (left) {
-        .null => true,
-        .bool => left.bool == right.bool,
-        .string => std.mem.eql(u8, left.string, right.string),
-        .array => blk: {
-            if (left.array.items.len != right.array.items.len) break :blk false;
-            for (left.array.items, right.array.items) |l, r| if (!try equal(a, l, r)) break :blk false;
-            break :blk true;
-        },
-        .object => blk: {
-            if (left.object.count() != right.object.count()) break :blk false;
-            for (left.object.keys(), left.object.values()) |key, l| {
-                if (!try equal(a, l, right.object.get(key) orelse break :blk false)) break :blk false;
-            }
-            break :blk true;
-        },
+    switch (left) {
+        .null => return true,
+        .bool => return left.bool == right.bool,
+        .string => return std.mem.eql(u8, left.string, right.string),
+        .array, .object => {},
         else => unreachable,
-    };
+    }
+    const Pair = struct { left: V, right: V };
+    var pending: std.ArrayList(Pair) = .empty;
+    defer pending.deinit(a);
+    try pending.append(a, .{ .left = left, .right = right });
+    while (pending.pop()) |pair| {
+        const l = pair.left;
+        const r = pair.right;
+        if (isNumber(l) and isNumber(r)) {
+            if (try numberOrder(a, l, r) != .eq) return false;
+            continue;
+        }
+        if (std.meta.activeTag(l) != std.meta.activeTag(r)) return false;
+        switch (l) {
+            .null => {},
+            .bool => if (l.bool != r.bool) return false,
+            .string => if (!std.mem.eql(u8, l.string, r.string)) return false,
+            .array => {
+                if (l.array.items.len != r.array.items.len) return false;
+                for (l.array.items, r.array.items) |lv, rv| try pending.append(a, .{ .left = lv, .right = rv });
+            },
+            .object => {
+                if (l.object.count() != r.object.count()) return false;
+                for (l.object.keys(), l.object.values()) |key, lv| try pending.append(a, .{ .left = lv, .right = r.object.get(key) orelse return false });
+            },
+            else => unreachable,
+        }
+    }
+    return true;
 }
 
-/// Canonical semantic hash, followed by equality checks on collisions. This
-/// keeps uniqueItems linear in input size rather than comparing every pair.
-pub fn fingerprint(a: A, value: V) anyerror![32]u8 {
+fn hashSize(hash: *std.crypto.hash.Blake3, size: usize) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, @intCast(size), .little);
+    hash.update(&bytes);
+}
+
+/// Canonical semantic hash, followed by equality checks on collisions. An
+/// explicit work stack handles arbitrary instance depth without using the call
+/// stack. Length framing distinguishes keys, scalar payloads and containers.
+pub fn fingerprint(a: A, value: V) ![32]u8 {
+    const Event = union(enum) { value: V, key: []const u8 };
+    var pending: std.ArrayList(Event) = .empty;
+    defer pending.deinit(a);
+    try pending.append(a, .{ .value = value });
     var hash = std.crypto.hash.Blake3.init(.{});
-    if (isNumber(value)) {
-        hash.update("number");
-        var decimal = try Decimal.init(a, value);
-        defer decimal.deinit(a);
-        hash.update(&.{@intFromBool(decimal.negative)});
-        hash.update(decimal.digits);
-        hash.update("e");
-        const exponent = try decimal.order.toString(a, 10, .lower);
-        defer a.free(exponent);
-        hash.update(exponent);
-    } else switch (value) {
-        .null => hash.update("null"),
-        .bool => hash.update(if (value.bool) "true" else "false"),
-        .string => {
-            hash.update("string");
-            hash.update(value.string);
-        },
-        .array => {
-            hash.update("array");
-            for (value.array.items) |item| hash.update(&try fingerprint(a, item));
-        },
-        .object => {
-            hash.update("object");
-            // Map order has no meaning in JSON equality. Sort borrowed keys,
-            // without modifying the caller's value or serializing its payload.
-            const keys = try a.dupe([]const u8, value.object.keys());
-            defer a.free(keys);
-            std.mem.sort([]const u8, keys, {}, struct {
-                fn less(_: void, l: []const u8, r: []const u8) bool {
-                    return std.mem.order(u8, l, r) == .lt;
+    while (pending.pop()) |event| {
+        if (event == .key) {
+            hash.update("key");
+            hashSize(&hash, event.key.len);
+            hash.update(event.key);
+            continue;
+        }
+        const next = event.value;
+        if (isNumber(next)) {
+            hash.update("number");
+            var decimal = try Decimal.init(a, next);
+            defer decimal.deinit(a);
+            hash.update(&.{@intFromBool(decimal.negative)});
+            hashSize(&hash, decimal.digits.len);
+            hash.update(decimal.digits);
+            const exponent = try decimal.order.toString(a, 10, .lower);
+            defer a.free(exponent);
+            hashSize(&hash, exponent.len);
+            hash.update(exponent);
+        } else switch (next) {
+            .null => hash.update("null"),
+            .bool => hash.update(if (next.bool) "true" else "false"),
+            .string => {
+                hash.update("string");
+                hashSize(&hash, next.string.len);
+                hash.update(next.string);
+            },
+            .array => {
+                hash.update("array");
+                hashSize(&hash, next.array.items.len);
+                var index = next.array.items.len;
+                while (index > 0) {
+                    index -= 1;
+                    try pending.append(a, .{ .value = next.array.items[index] });
                 }
-            }.less);
-            for (keys) |key| {
-                var key_hash: [32]u8 = undefined;
-                std.crypto.hash.Blake3.hash(key, &key_hash, .{});
-                hash.update(&key_hash);
-                hash.update(&try fingerprint(a, value.object.get(key).?));
-            }
-        },
-        else => unreachable,
+            },
+            .object => {
+                hash.update("object");
+                hashSize(&hash, next.object.count());
+                const keys = try a.dupe([]const u8, next.object.keys());
+                defer a.free(keys);
+                std.mem.sort([]const u8, keys, {}, struct {
+                    fn less(_: void, l: []const u8, r: []const u8) bool {
+                        return std.mem.order(u8, l, r) == .lt;
+                    }
+                }.less);
+                var index = keys.len;
+                while (index > 0) {
+                    index -= 1;
+                    const key = keys[index];
+                    try pending.append(a, .{ .value = next.object.get(key).? });
+                    try pending.append(a, .{ .key = key });
+                }
+            },
+            else => unreachable,
+        }
     }
     var digest: [32]u8 = undefined;
     hash.final(&digest);
