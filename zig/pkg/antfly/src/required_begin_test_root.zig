@@ -55,7 +55,7 @@ test "required replicated begin preserves mode through Raft encoding apply reope
         var legacy = req;
         legacy.transaction.?.begin.preparation_requirement = null;
         try @import("data/runtime.zig").DataServer.ensurePreparedTransactionProposalSupported(legacy);
-        try std.testing.expectEqual(@as(u16, 23), @import("data/runtime.zig").DataServer.requiredRaftBatchProtocolVersion(req));
+        try std.testing.expectEqual(@as(u16, 26), @import("data/runtime.zig").DataServer.requiredRaftBatchProtocolVersion(req));
         const id = req.transaction.?.begin.txn_id;
         const encoded = try raft_batch.encode(a, "docs", req);
         defer a.free(encoded);
@@ -75,7 +75,9 @@ test "required replicated begin preserves mode through Raft encoding apply reope
             try std.testing.expectEqual(mode, (try manager.getPreparationDecision(id, null)).requirement.?.mode);
             // A replay must not need fresh catalog admission after its marker
             // is durable. A new entry still has to pass the witness gate.
-            try db.core.store.put(sources.storage_db_artifact_inventory.resolver_key, "{\"version\":7,\"resolvers\":[]}");
+            const catalog_json = try std.fmt.allocPrint(a, "{{\"version\":{d},\"resolvers\":[]}}", .{sources.storage_db_catalog_resolver_catalog.prepared_transaction_reader_version});
+            defer a.free(catalog_json);
+            try db.core.store.put(sources.storage_db_artifact_inventory.resolver_key, catalog_json);
             try dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &db, "docs", 7, decoded.batch.req, .{ .term = 1, .index = 1 });
             try std.testing.expectError(error.InvalidPreparedTransactionProtocol, dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &db, "docs", 7, decoded.batch.req, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(@as(u64, 1), (try sources.storage_db_apply_receipts.readOrderedApplyReceipt(a, db.core.store)).?.index);
@@ -92,6 +94,30 @@ test "required replicated begin preserves mode through Raft encoding apply reope
         changed.transaction.?.begin.preparation_requirement = .{ .mode = mode };
         try dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &reopened, "docs", 7, changed, .{ .term = 1, .index = 2 });
         try std.testing.expectEqual(@as(u64, 2), (try sources.storage_db_apply_receipts.readOrderedApplyReceipt(a, reopened.core.store)).?.index);
+    }
+}
+
+test "required replicated begin rejects stale catalog epochs after reopen without advancing its receipt" {
+    const a = std.testing.allocator;
+    for (std.meta.tags(codec.Mode)) |mode| {
+        var directory = try sources.common_test_directory.TestDirectory.init("required-raft-stale-epoch");
+        defer directory.cleanup();
+        {
+            var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+            defer db.close();
+            try db.enablePreparedTransactionProtocol();
+            const stale = try std.fmt.allocPrint(a, "{{\"version\":{d},\"resolvers\":[]}}", .{sources.storage_db_catalog_resolver_catalog.prepared_transaction_reader_version - 1});
+            defer a.free(stale);
+            try db.core.store.put(sources.storage_db_artifact_inventory.resolver_key, stale);
+        }
+        var reopened = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+        defer reopened.close();
+        const req = request(mode);
+        try std.testing.expectError(error.InvalidPreparedTransactionProtocol, dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &reopened, "docs", 7, req, .{ .term = 1, .index = 1 }));
+        var manager = try reopened.core.initTxnManager();
+        defer manager.deinit();
+        try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(req.transaction.?.begin.txn_id));
+        try std.testing.expect((try sources.storage_db_apply_receipts.readOrderedApplyReceipt(a, reopened.core.store)) == null);
     }
 }
 
@@ -119,14 +145,20 @@ test "required replicated begin codec rejects stripped phase missing mode and pu
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
-    try std.testing.expectEqual(@as(u16, 23), @import("common/data_raft_protocol.zig").batch_required_preparation_protocol_version);
-    try std.testing.expect(raft_batch.protocol_version >= 23);
-    const barrier = try raft_batch.encodeProtocolBarrier(std.testing.allocator, "docs", 23);
+    try std.testing.expectEqual(@as(u16, 26), @import("common/data_raft_protocol.zig").batch_required_preparation_protocol_version);
+    try std.testing.expect(raft_batch.protocol_version >= 26);
+    const barrier = try raft_batch.encodeProtocolBarrier(std.testing.allocator, "docs", 26);
     defer std.testing.allocator.free(barrier);
     var decoded = try raft_batch.decode(std.testing.allocator, barrier);
     defer decoded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(?u16, 23), decoded.protocol_barrier_version);
-    try std.testing.expectError(error.UnsupportedRaftBatchProtocolVersion, raft_batch.decode(std.testing.allocator, "{\"table\":\"docs\",\"protocol_barrier\":26,\"batch\":null}"));
+    try std.testing.expectEqual(@as(?u16, 26), decoded.protocol_barrier_version);
+    const unsupported = try std.fmt.allocPrint(std.testing.allocator, "{{\"table\":\"docs\",\"protocol_barrier\":{d},\"batch\":null}}", .{raft_batch.protocol_version + 1});
+    defer std.testing.allocator.free(unsupported);
+    if (raft_batch.decode(std.testing.allocator, unsupported)) |value| {
+        var unexpected = value;
+        defer unexpected.deinit(std.testing.allocator);
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.UnsupportedRaftBatchProtocolVersion, err);
 }
 
 test "required replicated begin prepare and final seal persist accepted effects before decision" {
@@ -152,7 +184,7 @@ test "required replicated begin prepare and final seal persist accepted effects 
             defer a.free(bytes);
             var parsed = try raft_batch.decode(a, bytes);
             defer parsed.deinit(a);
-            try std.testing.expectEqual(@as(u16, 24), @import("data/runtime.zig").DataServer.requiredRaftBatchProtocolVersion(parsed.batch.req));
+            try std.testing.expectEqual(@as(u16, 27), @import("data/runtime.zig").DataServer.requiredRaftBatchProtocolVersion(parsed.batch.req));
             try std.testing.expectError(error.PreparedTransactionMigrationRequired, @import("data/runtime.zig").DataServer.ensurePreparedTransactionProposalSupported(parsed.batch.req));
             try dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &db, "docs", 7, parsed.batch.req, .{ .term = 1, .index = 2 });
             var manager = try db.core.initTxnManager();
@@ -285,7 +317,7 @@ test "required replicated begin bound seal receipts survive restart and reject r
             defer a.free(bytes);
             var parsed = try raft_batch.decode(a, bytes);
             defer parsed.deinit(a);
-            try std.testing.expectEqual(@as(u16, 25), @import("data/runtime.zig").DataServer.requiredRaftBatchProtocolVersion(parsed.batch.req));
+            try std.testing.expectEqual(@as(u16, 28), @import("data/runtime.zig").DataServer.requiredRaftBatchProtocolVersion(parsed.batch.req));
             try std.testing.expectError(error.Canceled, dispatch.applyReplicatedTransactionMutationInternalWithExecution(a, &db, "docs", 7, parsed.batch.req, .none, null, expired));
             try dispatch.applyReplicatedTransactionMutationInternalWithExecution(a, &db, "docs", 7, parsed.batch.req, .none, .{ .term = 1, .index = 1 }, expired);
             const prepare: db_mod.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 3, .preparation_requirement = .{ .mode = mode }, .preparation_binding = binding } } };

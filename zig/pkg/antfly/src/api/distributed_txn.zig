@@ -8652,9 +8652,9 @@ const PreparedCoordinatorFixture = struct {
         .protocol = 1,
         .requirement_format = 1,
         .effects_format = 1,
-        .minimum_reader = 7,
-        .permanent_reader = 7,
-        .catalog_envelope = 7,
+        .minimum_reader = preparation_protocol.minimum_reader_version,
+        .permanent_reader = preparation_protocol.minimum_reader_version,
+        .catalog_envelope = preparation_protocol.minimum_reader_version,
         .durable_begin = true,
         .durable_seal = true,
         .recovery_consumes_effects = true,
@@ -8675,6 +8675,7 @@ const PreparedCoordinatorFixture = struct {
     commits: usize = 0,
     aborts: usize = 0,
     blocked: u64 = 0,
+    capabilities_override: ?preparation_protocol.Capabilities = null,
     race_legacy_after_begin: bool = false,
     fail_prepare: u64 = 0,
     fail_seal: u64 = 0,
@@ -8730,7 +8731,7 @@ const PreparedCoordinatorFixture = struct {
         const self = cast(raw);
         self.event(.capability);
         if (group == self.blocked) return .{ .protocol = 1 };
-        return ready;
+        return self.capabilities_override orelse ready;
     }
     fn beginLegacy(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
         return error.TestLegacyFallback;
@@ -8863,6 +8864,31 @@ test "distributed txn prepared protocol refuses codec-only peers before begin" {
     try std.testing.expectEqual(@as(usize, 0), fixture.commits);
 }
 
+test "distributed txn prepared protocol rejects stale durable epochs before contacting begin" {
+    const catalog = @import("antfly_local_sources").storage_db_catalog_resolver_catalog;
+    try std.testing.expectEqual(catalog.prepared_transaction_reader_version, preparation_protocol.minimum_reader_version);
+    for ([_]preparation_protocol.Mode{ .deferred, .synchronous }) |mode| {
+        inline for (.{ "minimum_reader", "permanent_reader", "catalog_envelope" }) |field| {
+            for (0..preparation_protocol.minimum_reader_version) |old_epoch| {
+                var capabilities = PreparedCoordinatorFixture.ready;
+                @field(capabilities, field) = @intCast(old_epoch);
+                var fixture: PreparedCoordinatorFixture = .{ .mode = mode, .capabilities_override = capabilities };
+                try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, fixture.run(if (mode == .deferred) .write else .full_index, false));
+                try std.testing.expect(fixture.count > 0);
+                for (fixture.events[0..fixture.count]) |event| try std.testing.expectEqual(PreparedCoordinatorFixture.Event.capability, event);
+                try std.testing.expectEqual(@as(usize, 0), fixture.begins);
+                try std.testing.expectEqual(@as(usize, 0), fixture.prepares);
+                try std.testing.expectEqual(@as(usize, 0), fixture.seals);
+                try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+                try std.testing.expectEqual(@as(usize, 0), fixture.aborts);
+            }
+            var capabilities = PreparedCoordinatorFixture.ready;
+            @field(capabilities, field) = preparation_protocol.minimum_reader_version + 1;
+            try capabilities.require(.{ .mode = mode });
+        }
+    }
+}
+
 test "distributed txn prepared protocol producer seal failure and stale receipt precede decision" {
     for (0..3) |failure| {
         var fixture: PreparedCoordinatorFixture = .{ .fail_prepare = if (failure == 0) 7002 else 0, .fail_seal = if (failure == 1) 7002 else 0, .mismatch_seal = failure == 2 };
@@ -8990,7 +9016,7 @@ test "distributed txn prepared protocol requires each migration and durable capa
     }
     inline for (.{ "minimum_reader", "permanent_reader", "catalog_envelope" }) |field| {
         var capabilities = PreparedCoordinatorFixture.ready;
-        @field(capabilities, field) = 6;
+        @field(capabilities, field) = preparation_protocol.minimum_reader_version - 1;
         try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, capabilities.require(.{ .mode = .synchronous }));
     }
 }

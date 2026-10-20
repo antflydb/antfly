@@ -20,6 +20,8 @@ const admission = @import("../common/read_admission.zig");
 pub const Requirement = @import("../storage/db/prepared_transaction_effects.zig").Requirement;
 pub const Mode = @import("../storage/db/prepared_transaction_effects.zig").Mode;
 pub const wire_version: u16 = 1;
+/// Readiness must name the same durable feature epoch as local BEGIN admission.
+pub const minimum_reader_version = @import("../storage/db/catalog/reader_versions.zig").prepared_transaction_reader_version;
 pub const Phase = enum(u8) { capabilities = 0, begin = 1, prepare = 2, seal = 3, sealed = 4, status = 5, decision = 6 };
 pub const max_payload_bytes = 64 * 1024 * 1024 + 4096;
 const header_bytes = 16;
@@ -52,7 +54,7 @@ pub const Capabilities = struct {
 
     pub fn require(self: @This(), requirement: Requirement) !void {
         if (self.protocol != wire_version or self.requirement_format != 1 or self.effects_format != 1 or
-            self.minimum_reader < 7 or self.permanent_reader < 7 or self.catalog_envelope < 7 or
+            self.minimum_reader < minimum_reader_version or self.permanent_reader < minimum_reader_version or self.catalog_envelope < minimum_reader_version or
             !self.durable_begin or !self.durable_seal or !self.recovery_consumes_effects or !self.retained_contract or
             !self.bound_retained_contract or !self.catalog_migration_complete or !self.import_policy_fenced or
             !(if (requirement.mode == .deferred) self.deferred else self.synchronous))

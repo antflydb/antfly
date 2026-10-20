@@ -64,15 +64,15 @@ fn cloneLabels(alloc: Allocator, labels: []const []const u8) ![]const []const u8
 /// Monotonic feature epoch, published with catalog mutations and checked before parsing.
 pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
 pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";
-pub const graph_expiration_namespace_reader_version: u32 = 4;
-pub const adjudication_reader_version: u32 = 5;
-pub const curation_reader_version: u32 = 6;
-pub const generated_producers_reader_version: u32 = 7;
-pub const grouped_sources_reader_version: u32 = 8;
-pub const namespace_curation_reader_version: u32 = 9;
-/// Required preparation retains exact participant and route bindings.
-pub const prepared_transaction_reader_version: u32 = 10;
-pub const supported_reader_version: u32 = prepared_transaction_reader_version;
+const reader_versions = @import("reader_versions.zig");
+pub const graph_expiration_namespace_reader_version = reader_versions.graph_expiration_namespace_reader_version;
+pub const adjudication_reader_version = reader_versions.adjudication_reader_version;
+pub const curation_reader_version = reader_versions.curation_reader_version;
+pub const generated_producers_reader_version = reader_versions.generated_producers_reader_version;
+pub const grouped_sources_reader_version = reader_versions.grouped_sources_reader_version;
+pub const namespace_curation_reader_version = reader_versions.namespace_curation_reader_version;
+pub const prepared_transaction_reader_version = reader_versions.prepared_transaction_reader_version;
+pub const supported_reader_version = reader_versions.supported_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
