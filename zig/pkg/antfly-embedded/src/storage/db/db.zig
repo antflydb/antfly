@@ -124592,7 +124592,9 @@ test "db prepared transaction effects required protocol preserves every admissio
     };
     var directory = try TestDirectory.init("prepared-protocol-control");
     defer directory.cleanup();
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    // Exhaustive checkpoint ordinals need a primary with no asynchronous LSM
+    // mutex owner. Persistent activation/reopen cases above exercise LSM.
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .mem = .{} } });
     defer db.close();
     for ([_]bool{ false, true }) |enabled| {
         if (enabled) try db.enablePreparedTransactionProtocol();
