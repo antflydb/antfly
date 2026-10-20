@@ -27,11 +27,29 @@ pub const chunk_bytes = 256 * 1024;
 pub const max_chunks = 65536;
 pub const max_root_bytes = 16 * 1024 * 1024;
 const native_directory = @import("lake_index_native_directory.zig");
+/// Attempt-local proof of the descriptor a native producer actually opened.
+/// It is never serialized or accepted from a persisted directory record.
+pub const Origin = struct {
+    directory: native_directory.tree.Ref,
+    domain: [32]u8,
+    path: [32]u8,
+    bytes: u64,
+    chunk_root: ?native_directory.tree.Ref,
+    pub fn matches(self: Origin, root: Root, path: []const u8) bool {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(path, &digest, .{});
+        return root.directory != null and root.directory.?.eql(self.directory) and std.mem.eql(u8, &root.domain, &self.domain) and std.mem.eql(u8, &digest, &self.path);
+    }
+};
 pub const File = struct {
     path: []const u8,
     bytes: u64,
     chunks: []const artifacts.ChunkRef = &.{},
     chunk_root: ?native_directory.tree.Ref = null,
+    origin: ?Origin = null,
+    pub fn jsonStringify(self: File, writer: anytype) !void {
+        return writer.write(.{ .path = self.path, .bytes = self.bytes, .chunks = self.chunks, .chunk_root = self.chunk_root });
+    }
     pub fn validate(self: File, domain: [32]u8) !void {
         if (!validPath(self.path)) return error.InvalidNativeLakeFiles;
         const expected = self.bytes / chunk_bytes + @intFromBool(self.bytes % chunk_bytes != 0);
@@ -105,6 +123,7 @@ fn validPath(path: []const u8) bool {
 pub const Reuse = struct {
     root: Root,
     prefix: []const u8 = "",
+    navigation: ?*native_directory.Navigation = null,
     pub fn find(self: Reuse, path: []const u8) ?File {
         var buffer: [4096]u8 = undefined;
         if (self.prefix.len + path.len > buffer.len) return null;
@@ -117,7 +136,13 @@ pub const Reuse = struct {
         if (self.prefix.len + path.len > buffer.len) return null;
         @memcpy(buffer[0..self.prefix.len], self.prefix);
         @memcpy(buffer[self.prefix.len..][0..path.len], path);
-        var file = (try native_directory.lookup(self.root, store, buffer[0 .. self.prefix.len + path.len], token, null)) orelse return null;
+        const name = buffer[0 .. self.prefix.len + path.len];
+        var file = (if (self.navigation) |navigation| try navigation.lookup(self.root, store, name, token, null) else try native_directory.lookup(self.root, store, name, token, null)) orelse return null;
+        if (self.root.directory) |directory| {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(name, &digest, .{});
+            file.origin = .{ .directory = directory, .domain = self.root.domain, .path = digest, .bytes = file.bytes, .chunk_root = file.chunk_root };
+        }
         file.path = path;
         return file;
     }
@@ -126,6 +151,7 @@ pub const Reuse = struct {
         if (!std.mem.eql(u8, &scope.domain, &self.root.domain)) return error.InvalidNativeLakeFiles;
         const file = (try self.lookup(store.*, path, token)) orelse return null;
         if (ordinal >= file.bytes / chunk_bytes + @intFromBool(file.bytes % chunk_bytes != 0)) return null;
+        if (self.navigation) |navigation| return (try navigation.chunks(a, self.root, store.*, file, ordinal, 1, token, null))[0];
         var access: native_directory.Access = undefined;
         access.init(store.*, self.root.domain, token, null);
         return try native_directory.chunk(a, &access, file, ordinal);
@@ -167,7 +193,7 @@ pub fn publishBytes(out: A, path: []const u8, bytes: []const u8, store: *stores.
         const first = ordinal * chunk_bytes;
         chunk.* = try putChunk(out, path, ordinal, bytes[first..@min(first + chunk_bytes, bytes.len)], store, cancellation, reuse, budget);
     }
-    return .{ .path = try out.dupe(u8, path), .bytes = bytes.len, .chunks = chunks };
+    return .{ .path = try out.dupe(u8, path), .bytes = bytes.len, .chunks = chunks, .origin = if (reuse) |old| if (try old.lookup(store.*, path, cancellation)) |prior| prior.origin else null else null };
 }
 /// Mutable native WALs are captured only through their retained committed tip.
 pub fn publishPrefix(a: A, out: A, source: Storage, physical: []const u8, relative: []const u8, size: u64, store: *stores.ArtifactStore, cancellation: Cancellation, output_budget: anytype, reuse: ?Reuse) !File {
@@ -209,7 +235,7 @@ pub fn publishCheckpoint(a: A, out: A, checkpoint: *const local.storage_lsm_back
         const first = ordinal * chunk_bytes;
         chunk.* = try putChunk(out, "manifest.bin", ordinal, manifest[first..@min(first + chunk_bytes, manifest.len)], store, cancellation, reuse, budget);
     }
-    files[0] = .{ .path = try out.dupe(u8, "manifest.bin"), .bytes = manifest.len, .chunks = chunks };
+    files[0] = .{ .path = try out.dupe(u8, "manifest.bin"), .bytes = manifest.len, .chunks = chunks, .origin = if (reuse) |old| if (try old.lookup(store.*, "manifest.bin", cancellation)) |prior| prior.origin else null else null };
     for (checkpoint.run_paths, checkpoint.run_ids, files[1..]) |physical, id, *file| {
         const relative = try std.fmt.allocPrint(out, "runs/{d}.tbl", .{id});
         const size = try checkpoint.storage.fileSize(physical);
@@ -271,6 +297,7 @@ pub const Reader = struct {
     context: local.serverless_query_lake_read_context.Context,
     cancellation: Cancellation = .none,
     cache: ?artifacts.CachedRead = null,
+    navigation: native_directory.Navigation = .{},
     scratch: A,
     // Disabled for short-lived readers; pooled runtimes retain bounded leases.
     max_block_bytes: usize = 0,
@@ -295,6 +322,7 @@ pub const Reader = struct {
         }
     };
     pub fn deinit(self: *Reader) void {
+        self.navigation.deinit();
         // Native owners join all workers before closing this reader.
         for (&self.blocks) |*slot| if (slot.*) |block| {
             std.debug.assert(block.refs.load(.acquire) == 1);
@@ -408,16 +436,18 @@ pub const Reader = struct {
     fn file(self: *Reader, path: []const u8) !File {
         try self.check();
         if (!std.mem.startsWith(u8, path, self.prefix) or path.len <= self.prefix.len or path[self.prefix.len] != '/') return error.FileNotFound;
-        return (try native_directory.lookup(self.root, self.store, path[self.prefix.len + 1 ..], self.cancellation, self.cache)) orelse error.FileNotFound;
+        return (try self.navigation.lookup(self.root, self.store, path[self.prefix.len + 1 ..], self.cancellation, self.cache)) orelse error.FileNotFound;
     }
     fn readInto(raw: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
         const self = from(raw);
         const entry = try self.file(path);
-        var metadata = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var metadata = std.heap.ArenaAllocator.init(self.scratch);
         defer metadata.deinit();
-        var access: native_directory.Access = undefined;
-        access.init(self.store, self.root.domain, self.cancellation, self.cache);
         if (offset > entry.bytes or out.len > entry.bytes - offset) return error.EndOfStream;
+        if (out.len == 0) return;
+        const first: usize = @intCast(offset / chunk_bytes);
+        const last: usize = @intCast((offset + out.len - 1) / chunk_bytes);
+        const refs = try self.navigation.chunks(metadata.allocator(), self.root, self.store, entry, first, last - first + 1, self.cancellation, self.cache);
         // Start at most two requested successor chunks, and join them before
         // returning so no task can outlive this request's reader/context.
         var tasks: [2]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
@@ -425,23 +455,18 @@ pub const Reader = struct {
             _ = future.cancel(self.context.io.?) catch {};
         };
         if (out.len != 0 and self.max_block_bytes != 0) if (self.context.io) |io| {
-            const first: usize = @intCast(offset / chunk_bytes);
-            const last: usize = @intCast((offset + out.len - 1) / chunk_bytes);
             for (0..@min(2, last - first)) |slot| {
-                const ref = try native_directory.chunk(metadata.allocator(), &access, entry, first + slot + 1);
+                const ref = refs[slot + 1];
                 tasks[slot] = local.sql_parallel_scheduler.global().submitTransient(io, @intCast(ref.byte_len), prefetch, .{ self, ref });
             }
         };
-        var chunk_metadata = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer chunk_metadata.deinit();
         var copied: usize = 0;
         while (copied < out.len) {
-            _ = chunk_metadata.reset(.free_all);
             try self.check();
             const position = offset + copied;
             const ordinal: usize = @intCast(position / chunk_bytes);
             const inside: usize = @intCast(position % chunk_bytes);
-            const block = try self.acquireBlock(try native_directory.chunk(chunk_metadata.allocator(), &access, entry, ordinal));
+            const block = try self.acquireBlock(refs[ordinal - first]);
             defer block.release();
             const bytes = block.data.bytes();
             const n = @min(out.len - copied, bytes.len - inside);
@@ -491,7 +516,21 @@ pub const Reader = struct {
         try self.check();
         return a.dupe(u8, self.prefix);
     }
-    const vtable: Storage.VTable = .{ .create_dir_path = create, .read_file_alloc = readAll, .read_file_range_alloc = readRange, .read_file_range_into = readInto, .file_size = size, .write_file_absolute = write, .rename_absolute = rename, .delete_file_absolute = erase, .delete_tree = erase, .now_ns = now, .root_identity_alloc = identity };
+    fn list(raw: *anyopaque, a: A, path: []const u8) ![][]u8 {
+        return listKind(raw, a, path, false);
+    }
+    fn directories(raw: *anyopaque, a: A, path: []const u8) ![][]u8 {
+        return listKind(raw, a, path, true);
+    }
+    fn listKind(raw: *anyopaque, a: A, path: []const u8, dirs: bool) ![][]u8 {
+        const self = from(raw);
+        try self.check();
+        if (!std.mem.startsWith(u8, path, self.prefix) or (path.len != self.prefix.len and path[self.prefix.len] != '/')) return error.FileNotFound;
+        const relative = if (path.len == self.prefix.len) "" else path[self.prefix.len + 1 ..];
+        if (relative.len != 0 and !validPath(relative)) return error.FileNotFound;
+        return native_directory.names(a, self.root, self.store, relative, dirs, self.cancellation, self.cache);
+    }
+    const vtable: Storage.VTable = .{ .list_file_names_alloc = list, .list_directory_names_alloc = directories, .create_dir_path = create, .read_file_alloc = readAll, .read_file_range_alloc = readRange, .read_file_range_into = readInto, .file_size = size, .write_file_absolute = write, .rename_absolute = rename, .delete_file_absolute = erase, .delete_tree = erase, .now_ns = now, .root_identity_alloc = identity };
 };
 
 /// Restore a private mutable candidate through authenticated bounded reads.
@@ -719,7 +758,7 @@ pub const Overlay = struct {
         try root.validate();
         const self = try a.create(Overlay);
         errdefer a.destroy(self);
-        self.* = .{ .allocator = a, .native = try .init(a, .threaded), .base = .{ .root = root, .prefix = path, .store = store, .context = context, .cancellation = cancellation, .scratch = a, .max_block_bytes = 8 * 1024 * 1024 } };
+        self.* = .{ .allocator = a, .native = try .init(a, .threaded), .base = .{ .root = root, .prefix = path, .store = store, .context = context, .cancellation = cancellation, .scratch = a, .navigation = .{ .allocator = a }, .max_block_bytes = 8 * 1024 * 1024 } };
         return self;
     }
     pub fn release(self: *Overlay) void {
@@ -865,7 +904,10 @@ pub const Overlay = struct {
         defer self.mutex.unlock();
         try self.check(path);
         try self.tombstone(path);
-        try self.native.storage().deleteTree(path);
+        self.native.storage().deleteTree(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
     }
     fn syncContents(raw: *anyopaque, path: []const u8) !void {
         const self = from(raw);
@@ -890,11 +932,20 @@ pub const Overlay = struct {
         return self.native.storage().beginAtomicWrite(a, path);
     }
     fn list(raw: *anyopaque, a: A, path: []const u8) ![][]u8 {
+        return listKind(raw, a, path, false);
+    }
+    fn directories(raw: *anyopaque, a: A, path: []const u8) ![][]u8 {
+        return listKind(raw, a, path, true);
+    }
+    fn listKind(raw: *anyopaque, a: A, path: []const u8, dirs: bool) ![][]u8 {
         const self = from(raw);
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         try self.check(path);
-        const local_names = try self.native.storage().listFileNamesAlloc(a, path);
+        const local_names = (if (dirs) self.native.storage().listDirectoryNamesAlloc(a, path) else self.native.storage().listFileNamesAlloc(a, path)) catch |err| switch (err) {
+            error.FileNotFound => try a.alloc([]u8, 0),
+            else => return err,
+        };
         defer Storage.freeFileNames(a, local_names);
         var names: std.StringHashMapUnmanaged(void) = .empty;
         defer names.deinit(a);
@@ -911,15 +962,11 @@ pub const Overlay = struct {
             };
             try names.put(a, copy_name, {});
         }
-        const relative = if (path.len == self.base.prefix.len) "" else path[self.base.prefix.len + 1 ..];
-        var metadata = std.heap.ArenaAllocator.init(a);
-        defer metadata.deinit();
-        for (try native_directory.entries(metadata.allocator(), self.base.root, self.base.store, self.base.cancellation)) |file_entry| {
-            const parent = std.fs.path.dirname(file_entry.path) orelse "";
-            if (!std.mem.eql(u8, relative, parent)) continue;
-            const name = std.fs.path.basename(file_entry.path);
+        const base_names = try Reader.listKind(&self.base, a, path, dirs);
+        defer Storage.freeFileNames(a, base_names);
+        for (base_names) |name| {
             if (names.contains(name)) continue;
-            const full = try std.fmt.allocPrint(a, "{s}/{s}", .{ self.base.prefix, file_entry.path });
+            const full = try std.fmt.allocPrint(a, "{s}/{s}", .{ path, name });
             defer a.free(full);
             if (self.hidden(full)) continue;
             const copy_name = try a.dupe(u8, name);
@@ -939,7 +986,7 @@ pub const Overlay = struct {
     fn now(raw: *anyopaque) u64 {
         return from(raw).native.storage().nowNs();
     }
-    const vtable: Storage.VTable = .{ .begin_atomic_write = atomicWrite, .list_file_names_alloc = list, .acquire_lease = acquire, .create_dir_path = createDir, .read_file_alloc = readAll, .read_file_range_alloc = readRange, .read_file_range_into = readInto, .file_size = size, .write_file_absolute = write, .append_file_absolute = append, .rename_absolute = rename, .delete_file_absolute = erase, .delete_tree = eraseTree, .sync_contents_absolute = syncContents, .sync_parent_absolute = syncParent, .root_identity_alloc = identity, .now_ns = now, .rename_is_atomic = true, .supports_native_path_locks = true };
+    const vtable: Storage.VTable = .{ .begin_atomic_write = atomicWrite, .list_file_names_alloc = list, .list_directory_names_alloc = directories, .acquire_lease = acquire, .create_dir_path = createDir, .read_file_alloc = readAll, .read_file_range_alloc = readRange, .read_file_range_into = readInto, .file_size = size, .write_file_absolute = write, .append_file_absolute = append, .rename_absolute = rename, .delete_file_absolute = erase, .delete_tree = eraseTree, .sync_contents_absolute = syncContents, .sync_parent_absolute = syncParent, .root_identity_alloc = identity, .now_ns = now, .rename_is_atomic = true, .supports_native_path_locks = true };
 };
 
 test "external lake native chunk flights overlap distinct loads and share identical loads" {

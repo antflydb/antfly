@@ -1340,3 +1340,44 @@ small result pulls, so source page limits are independent of result framing.
 Unordered explicit LIMIT/OFFSET stops consumption after HAVING accepts enough rows.
 Aggregate FILTERs, filtered global aggregates, ordered evaluation and independent
 cohorts preserve their existing fallback behavior.
+
+Protocol 62 adds authenticated aggregate key fences. Blocks and radix children
+carry conservative 64-byte lower/exclusive-upper prefixes of the existing native
+scalar tuple encoding, including exact NUMERIC keys. Truncation widens a fence;
+it never excludes a matching group. Legacy roots without fences retain the
+ordinary partial/read path and their original cohort commitments.
+
+Finalized aggregate admission treats the complete materialization cardinality as
+an upper bound, rather than charging every stored group before selection. The
+statement still limits actual visited groups, provider pages, delivered groups
+and response bytes. Exactly typed equality prefixes and the next range component
+can prune children and blocks; SQL evaluates the complete residual predicate.
+
+Compatible grouping-key ORDER BY prefixes use bounded best-first result pages.
+The reader prioritizes authenticated fences, admits possible winners into the
+shared native TopK, and stops opening branches when their fences cannot improve
+the page. Wider retained candidates use the statement-owned spill manager.
+Continuation uses the complete native grouping key in either direction.
+SQL may stop after OFFSET/LIMIT and HAVING have accepted enough rows. Uniform
+ascending/descending key order and matching NULL placement are proven explicitly;
+aggregate-value ordering, mixed directions, incompatible NULL placement and old
+unfenced roots keep ordinary SQL evaluation. Broad ranges and long common key
+prefixes may still require scanning many blocks: fences are pruning metadata,
+not an exact ordered predicate index. The internal frontier charges the real
+payload work to the statement's scan limits.
+
+Native generation readers own a bounded navigation cache independently of the
+payload cache. File and chunk descriptors are fenced by directory identity and namespace;
+adjacent chunks use one tree cursor, and warm payload reads require no additional
+artifact navigation reads. Producers reuse the same navigation within checkpoint
+publication. Attempt-local descriptor origins authenticate retained file names
+without reopening the previous directory during finalization. Structural subtree
+retention removes omitted files and path-copies explicit descriptor edits; exact
+file/chunk counts update with explicit mutations and are checked against the pinned checkpoint. Origin hints are never
+serialized. Audit and resumable GC continue to trace the resulting immutable maps.
+
+Native virtual file/directory listings use a bounded prefix cursor and support
+the storage port's recursive byte accounting. Writable overlays merge local and
+virtual children and honor subtree tombstones, including unmaterialized base
+directories. Navigation allocations participate in native runtime memory quotas;
+pooled readers drop request authority while retaining only immutable data.

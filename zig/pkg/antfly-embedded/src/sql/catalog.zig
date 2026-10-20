@@ -761,8 +761,18 @@ pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed,
 /// Keys and versioned aggregate cells borrow the supplied page allocator until the next pull.
 /// A provider must return null before opening if it cannot prove equivalence;
 /// errors after selection abort execution rather than mixing source snapshots.
+pub const GroupSelection = struct {
+    spill: ?*@import("spill.zig").Manager = null,
+    memory_bytes: usize = 8 * 1024 * 1024,
+    row_limit: usize = std.math.maxInt(usize),
+    page_limit: usize = std.math.maxInt(usize),
+    conditions: []const Condition = &.{},
+    order: []const Scan.Order = &.{},
+};
 pub const FinalGroupRequest = struct {
     page_limit: usize,
+    row_limit: usize = std.math.maxInt(usize),
+    selection: GroupSelection = .{},
     /// Input batch size is independent of the requested result fragment.
     batch_rows: u32 = 4096,
     /// Complete, exactly typed grouping key for native hash/range pruning.
@@ -777,6 +787,7 @@ pub const AggregatePartialCursor = struct {
     /// Providers may prove a unique complete cohort before the first pull.
     /// Slots refer to the requested recipe, independent of physical order.
     final_group_proof: ?struct { count: u64, slots: []const u16 } = null,
+    select_keys: ?*const fn (*anyopaque, GroupSelection) anyerror!bool = null,
     select_point: ?*const fn (*anyopaque, []const @import("scalar.zig").Datum) anyerror!void = null,
     /// Transfer the cursor's ownership into an empty result operator. False
     /// preserves the ordinary partial path; a successful transfer is streamed.

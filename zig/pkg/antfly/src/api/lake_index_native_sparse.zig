@@ -211,7 +211,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer checkpoint.deinit();
         var output_remaining: u64 = 1024 * 1024 * 1024;
         const output_bytes: files.OutputBudget = .{ .generation = &output_remaining, .work = if (provider.resume_work) |work| &work.native_output_left else null };
-        const staging_generation = try files.publishCheckpoint(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation } else null);
+        var navigation: @import("lake_index_native_directory.zig").Navigation = .{ .allocator = a };
+        defer navigation.deinit();
+        const staging_generation = try files.publishCheckpoint(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .navigation = &navigation } else null);
         const generation = try @import("lake_index_native_directory.zig").persist(a, ca, store, staging_generation, if (seed) |root| root.generation else null, cancellation, if (provider.resume_work) |work| &work.native_output_left else null);
         const root: Root = .{ .binding = binding, .config_json = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{}), .generation = generation, .recipe = recipe, .file_states = if (!plan.isPaged()) plan.files else &.{}, .file_directory = if (plan.isPaged()) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});

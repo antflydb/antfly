@@ -2855,3 +2855,50 @@ numeric aggregates, 33-index cold publication over nine files, 521-key routing,
 dense/sparse search, incremental artifact reuse and source-loss restart reads.
 The stripped Debug build, CLI smoke test, generated catalogs, source/control
 boundary, licensing, formatting and quickstart documentation checks pass.
+
+### Native navigation and selective aggregate result frontiers
+
+The reader, rather than the remote artifact store, owns bounded immutable
+navigation state. It retains up to 32 file descriptors and 4 MiB of navigation
+pages, checks current authority on each operation, and binds descriptor hits to
+the complete generation directory and namespace. A range of chunk descriptors
+uses one cursor. This applies to writable incremental overlays as well as serving
+readers; a warm one-byte paged read is qualified to make zero artifact reads.
+
+Native checkpoint producers attach in-memory origin proofs to descriptors they
+opened. These bind the prior directory, namespace, full logical path, byte count
+and chunk root, and are omitted from serialization. Finalization authenticates
+retained names through those proofs (or a point lookup for older callers), invokes
+structural subtree retention to remove omissions, and applies only changed file
+records. It no longer materializes the complete previous file directory. Logical
+counts remain exact from the bounded pinned checkpoint independently of physical
+new-write budgets.
+
+Protocol 62 carries optional conservative group-key fences in aggregate block and
+partition descriptors. The codec is the native relational scalar tuple codec,
+including exact NUMERIC identity. A lower prefix and exclusive upper prefix retain
+64 bytes each; truncation only widens the interval. Cohort commitments authenticate
+these fields. Absent fields preserve the old canonical serialization and physical
+identities, so legacy cohort validation and incremental reuse remain valid. GC
+follows the existing blocks/children: fences introduce no additional artifact edges.
+
+SQL passes typed equality-prefix/range conditions into the reader while retaining
+the complete residual predicate. Grouped-result adoption admits complete state
+without charging its entire stored cardinality. Provider pages and actually
+visited groups are charged across all pulls, and delivered groups retain their
+own limit. This allows a bounded point query or early LIMIT against a much larger
+materialization without removing statement resource ceilings.
+
+A compatible grouping-key ORDER BY prefix is an explicit request and provider
+attestation. Uniform direction and NULL placement must agree with the native key
+codec. The reader visits directory/block fences in priority order and uses the
+existing bounded native TopK for a page of at most 256 possible winners. Candidates
+that exceed the retained memory allowance use the statement-owned spill manager.
+Branches that cannot improve an in-memory page remain unopened. Complete grouping keys provide
+ascending/reverse continuation; SQL applies HAVING and OFFSET/LIMIT above this
+stream. The internal frontier charges every decoded block and examined row,
+including discarded candidates and repeated boundary work, to scan limits.
+Aggregate-value order, mixed directions, unmatched NULL placement and unfenced
+legacy roots preserve the ordinary SQL path. Wide common prefixes or broad ranges
+can still require broad scans; this change does not claim an exact persistent
+ordered group-key index.

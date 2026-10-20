@@ -1489,6 +1489,7 @@ pub const Grouped = struct {
         ptr: *anyopaque,
         count: usize,
         exact_count: bool = true,
+        ordered: bool = false,
         next: *const fn (*anyopaque, Allocator, usize, bool) anyerror!?GroupBatch,
         close: *const fn (*anyopaque) void,
     };
@@ -1526,7 +1527,6 @@ pub const Grouped = struct {
     }
     pub fn adoptFinalized(self: *Grouped, source: Finalized, page_limit: usize) !void {
         if (self.failed or self.finished or self.finalized != null or self.external != null or self.reducers != null or self.rows_seen != 0 or self.groups.items.len > 1 or (self.groups.items.len == 1 and self.key_count != 0)) return error.InvalidSqlBackendResponse;
-        if (source.count > self.limits.groups) return error.SqlProgramLimitExceeded;
         self.clearGroups(); // Retire the initial empty global group, if present.
         self.finalized = source;
         self.finalized_page_limit = page_limit;
@@ -1538,7 +1538,7 @@ pub const Grouped = struct {
         if (result) |batch| {
             if (batch.ordinals.len == 0 or batch.ordinals.len > maximum or batch.keys.len() != batch.ordinals.len or batch.aggregates.len() != batch.ordinals.len or batch.aggregates.width() != self.specs.len) return error.InvalidSqlBackendResponse;
             self.finalized_pages += 1;
-            if (self.finalized_pages > self.finalized_page_limit or batch.ordinals.len > source.count -| self.output_count) return error.SqlProgramLimitExceeded;
+            if (self.finalized_pages > self.finalized_page_limit or batch.ordinals.len > source.count -| self.output_count or batch.ordinals.len > self.limits.groups -| self.output_count) return error.SqlProgramLimitExceeded;
             self.output_count += batch.ordinals.len;
         } else if (source.exact_count and self.output_count != source.count) return error.InvalidSqlBackendResponse;
         return result;
@@ -5380,9 +5380,8 @@ test "SQL finalized aggregate streams bypass hash retention and fence ownership 
         const group = try Grouped.create(a, &.{.{ .kind = .count }}, .{ .groups = 10, .bytes = 16 * 1024 });
         defer group.deinit();
         try group.ensureGlobalGroup();
-        try std.testing.expectError(error.SqlProgramLimitExceeded, group.adoptFinalized(.{ .ptr = &source, .count = 11, .next = Source.next, .close = Source.close }, 1));
         try std.testing.expectEqual(@as(usize, 0), source.closes);
-        try group.adoptFinalized(.{ .ptr = &source, .count = 10, .next = Source.next, .close = Source.close }, 1);
+        try group.adoptFinalized(.{ .ptr = &source, .count = 50_000_000, .exact_count = false, .next = Source.next, .close = Source.close }, 1);
         var page = std.heap.ArenaAllocator.init(a);
         defer page.deinit();
         _ = try group.nextResultBatch(page.allocator(), 2, false);

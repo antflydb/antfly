@@ -257,10 +257,12 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer checkpoint.deinit();
         var output_remaining: u64 = 1024 * 1024 * 1024;
         const output_bytes: files.OutputBudget = .{ .generation = &output_remaining, .work = if (provider.resume_work) |work| &work.native_output_left else null };
-        const posting_generation = try publishGeneration(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation } else null);
+        var navigation: @import("lake_index_native_directory.zig").Navigation = .{ .allocator = a };
+        defer navigation.deinit();
+        const posting_generation = try publishGeneration(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .navigation = &navigation } else null);
         var vector_checkpoint = try vectors.pinNativeCheckpoint();
         defer vector_checkpoint.deinit();
-        const vector_generation = try files.publishCheckpoint(a, ca, &vector_checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .prefix = "vectors/" } else null);
+        const vector_generation = try files.publishCheckpoint(a, ca, &vector_checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .prefix = "vectors/", .navigation = &navigation } else null);
         const staging_generation = try combineVectors(ca, posting_generation, vector_generation);
         const generation = try @import("lake_index_native_directory.zig").persist(a, ca, store, staging_generation, if (seed) |root| root.generation else null, cancellation, if (provider.resume_work) |work| &work.native_output_left else null);
         const root: Root = .{ .binding = binding, .config_json = config.config_json, .dims = dims, .metric = metric, .generation = generation, .recipe = recipe, .file_states = if (!plan.isPaged()) plan.files else &.{}, .file_directory = if (plan.isPaged()) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };

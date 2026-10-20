@@ -989,7 +989,7 @@ const Reduction = struct {
                 retained.artifact_id = try a.dupe(u8, ref.artifact_id);
                 retained.checksum = try a.dupe(u8, ref.checksum);
                 retained.name = try a.dupe(u8, ref.name);
-                try list.append(a, .{ .bucket = @intCast(bucket), .artifact = retained, .groups = count, .proof = proof });
+                try list.append(a, .{ .bucket = @intCast(bucket), .artifact = retained, .groups = count, .proof = proof, .bounds = proof.?.bounds });
             }
         }
         if (known != null) return self.out.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, 0);

@@ -255,7 +255,17 @@ fn materializedPoint(a: std.mem.Allocator, recipe: @import("aggregate_materializ
     return keys;
 }
 
-fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner: **operators.Grouped, table: catalog.Table, conditions: []const catalog.Condition) !bool {
+fn materializedOrder(a: std.mem.Allocator, bound: *const binding.Bound, recipe: @import("aggregate_materialization.zig").Recipe, requested: []const ast.Order) ![]const catalog.Scan.Order {
+    if (requested.len == 0 or requested.len > recipe.keys.len or requested.len != bound.orders.len) return &.{};
+    const result = try a.alloc(catalog.Scan.Order, requested.len);
+    for (result, requested, bound.orders, 0..) |*order, source, program, index| {
+        if (program.instructions.len != 1 or program.root != 0 or program.instructions[0].operation != .column or program.instructions[0].operation.column != index) return &.{};
+        order.* = .{ .column = recipe.keys[index].path, .descending = source.descending, .nulls_first = source.nulls_first orelse source.descending };
+    }
+    return result;
+}
+
+fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner: **operators.Grouped, table: catalog.Table, conditions: []const catalog.Condition, ordering: []const ast.Order) !bool {
     const open = context.backend.vtable.aggregate_partials orelse return false;
     const reuse = (try @import("aggregate_materialization.zig").reuseFromBound(context.arena, table, bound.*)) orelse return false;
     const recipe = reuse.recipe;
@@ -278,7 +288,7 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner
                     return self.bound.input.matchesWithLimits(a, cells, self.context.parameters, self.context.backend.decision_provider, @import("decision_eval.zig").limitsFor(self.context.backend));
                 }
             };
-            var request: catalog.FinalGroupRequest = .{ .page_limit = context.limits.scan_pages, .batch_rows = context.limits.executionRows() };
+            var request: catalog.FinalGroupRequest = .{ .page_limit = context.limits.scan_pages, .row_limit = context.limits.scan_rows, .batch_rows = context.limits.executionRows(), .selection = .{ .conditions = conditions, .order = try materializedOrder(context.arena, bound, recipe, ordering), .spill = context.spill, .memory_bytes = context.limits.retained_bytes / 4 } };
             if (bound.input.predicate != null) {
                 const predicate = try context.arena.create(Predicate);
                 predicate.* = .{ .context = context, .bound = bound, .columns = reuse.key_columns };
@@ -400,7 +410,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         var pages: usize = 0;
         var visited: usize = 0;
         var native_quota: @import("native_scan_quota.zig").Quota = .{ .capacity = context.limits.executionRows(), .row_limit = context.limits.scan_rows, .page_limit = context.limits.scan_pages };
-        var aggregate_loaded = if (!predicates.empty) try loadMaterialized(context, bound, &grouped, table, predicates.terms.items) else false;
+        var aggregate_loaded = if (!predicates.empty) try loadMaterialized(context, bound, &grouped, table, predicates.terms.items, statement.order_by) else false;
         collector.grouped = grouped;
         const count_only = bound.group_count == 0 and bound.input.predicate == null and predicates.terms.items.len == 0 and predicates.primary_key == null and for (bound.specs, bound.inputs, bound.filters) |spec, input, filter| {
             if (spec.kind != .count or spec.distinct or input != null or filter != null) break false;
@@ -478,7 +488,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         try addGroupedDecisionPages(context, bound, &collector, &top, projection);
         return projection.finish(context, &top, offset, limit, statement.limit == null);
     }
-    const early_limit = grouped.finalized != null and bound.ordered.len == 0 and statement.order_by.len == 0 and statement.limit != null;
+    const early_limit = grouped.finalized != null and bound.ordered.len == 0 and (statement.order_by.len == 0 or grouped.finalized.?.ordered) and statement.limit != null;
     var delivered: usize = 0;
     result_pages: while (true) {
         try context.checkpoint();

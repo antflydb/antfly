@@ -6614,6 +6614,16 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
                 {"statement": f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts WHERE {predicate} GROUP BY k LIMIT 1"},
             )["rows"]
             assert selective == [[str(last), str(expected[last][0]), str(expected[last][1])]]
+        # The source payloads are corrupt after restart. Ordered native
+        # frontiers must preserve SQL bounds, HAVING and result pagination.
+        for ordering, nulls in (("ASC", "NULLS LAST"), ("DESC", "NULLS FIRST")):
+            for predicate in ("TRUE", "k >= 3", "k >= 3 AND k < 12"):
+                keys = [k for k in sorted(expected, reverse=ordering == "DESC") if predicate == "TRUE" or (k >= 3 and ("< 12" not in predicate or k < 12))]
+                ordered = call(
+                    "POST", "/sql",
+                    {"statement": f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts WHERE {predicate} GROUP BY k HAVING COUNT(*) > 0 ORDER BY k {ordering} {nulls} LIMIT 3 OFFSET 2"},
+                )["rows"]
+                assert ordered == [[str(k), str(expected[k][0]), str(expected[k][1])] for k in keys[2:5]]
         limited = call(
             "POST", "/sql",
             {"statement": "SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k LIMIT 3 OFFSET 2"},

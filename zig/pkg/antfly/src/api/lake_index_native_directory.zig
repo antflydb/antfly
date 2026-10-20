@@ -52,6 +52,138 @@ fn key(ordinal: usize) [8]u8 {
     std.mem.writeInt(u64, &result, ordinal, .big);
     return result;
 }
+/// Reader/build-owned immutable navigation. Page identities are content bound;
+/// file descriptors are additionally bound to the exact generation directory.
+/// No request authority is retained: callers check their live context first.
+pub const Navigation = struct {
+    allocator: A = std.heap.page_allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    access: Access = undefined,
+    pages: ?tree.Cache = null,
+    generation: ?tree.Ref = null,
+    domain: [32]u8 = @splat(0),
+    descriptors: [32]?files.File = @splat(null),
+    next_file: usize = 0,
+    chunk_descriptors: [64]?struct { root: tree.Ref, domain: [32]u8, ordinal: usize, ref: artifacts.ChunkRef } = @splat(null),
+    next_chunk: usize = 0,
+    pub fn deinit(self: *Navigation) void {
+        if (self.pages) |*pages| pages.deinit();
+        self.clearFiles();
+        for (&self.chunk_descriptors) |*entry| if (entry.*) |value| {
+            self.allocator.free(value.ref.artifact_id);
+            self.allocator.free(value.ref.checksum);
+            entry.* = null;
+        };
+        self.pages = null;
+    }
+    /// Pooled readers release request authority while retaining immutable data.
+    pub fn detach(self: *Navigation) void {
+        if (self.pages == null) return;
+        self.access.cached = null;
+        self.access.token = .none;
+        self.access.pages.cancellation = .none;
+        self.access.pages.read_cache = null;
+    }
+    fn clearFiles(self: *Navigation) void {
+        for (&self.descriptors) |*entry| if (entry.*) |file| {
+            self.allocator.free(file.path);
+            entry.* = null;
+        };
+    }
+    fn backing(self: *Navigation, store: stores.ArtifactStore, domain: [32]u8, token: Token, cached: ?artifacts.CachedRead) tree.Store {
+        self.access.init(store, domain, token, cached);
+        const underlying = self.access.backing();
+        if (self.pages == null) self.pages = .{ .alloc = self.allocator, .underlying = underlying, .max_bytes = 4 * 1024 * 1024 };
+        self.pages.?.underlying = underlying;
+        return self.pages.?.store();
+    }
+    pub fn lookup(self: *Navigation, root: files.Root, store: stores.ArtifactStore, path: []const u8, token: Token, cached: ?artifacts.CachedRead) !?files.File {
+        try token.check();
+        if (cached) |value| try value.context.ensureActive();
+        if (root.directory == null) return root.find(path);
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.generation == null or !self.generation.?.eql(root.directory.?) or !std.mem.eql(u8, &self.domain, &root.domain)) {
+            self.clearFiles();
+            self.generation = root.directory;
+            self.domain = root.domain;
+        }
+        for (self.descriptors) |entry| if (entry) |file| if (std.mem.eql(u8, file.path, path)) {
+            var result = file;
+            result.path = path;
+            return result;
+        };
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        var cursor = try tree.Cursor.init(arena.allocator(), self.backing(store, root.domain, token, cached), root.directory, path, null);
+        defer cursor.deinit();
+        const row = (try cursor.next()) orelse return null;
+        if (!std.mem.eql(u8, row.key, path)) return null;
+        var file = try decodeFile(arena.allocator(), row.key, row.value, root.domain);
+        file.path = try self.allocator.dupe(u8, path);
+        const slot = self.next_file % self.descriptors.len;
+        if (self.descriptors[slot]) |old| self.allocator.free(old.path);
+        self.descriptors[slot] = file;
+        self.next_file +%= 1;
+        file.path = path;
+        return file;
+    }
+    /// A single seek walks adjacent chunk descriptors, including cross-page
+    /// ranges. Returned identities are owned by the operation arena.
+    pub fn chunks(self: *Navigation, a: A, root: files.Root, store: stores.ArtifactStore, file: files.File, first: usize, count: usize, token: Token, cached: ?artifacts.CachedRead) ![]const artifacts.ChunkRef {
+        try token.check();
+        if (cached) |value| try value.context.ensureActive();
+        const total = file.bytes / files.chunk_bytes + @intFromBool(file.bytes % files.chunk_bytes != 0);
+        if (first > total or count > total - first) return error.InvalidNativeLakeFiles;
+        const result = try a.alloc(artifacts.ChunkRef, count);
+        if (count == 0) return result;
+        if (file.chunk_root == null) {
+            @memcpy(result, file.chunks[first..][0..count]);
+            return result;
+        }
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (count <= self.chunk_descriptors.len) {
+            const hits = for (result, first..) |*ref, ordinal| {
+                const found = for (self.chunk_descriptors) |entry| {
+                    if (entry) |value| if (value.root.eql(file.chunk_root.?) and value.ordinal == ordinal and std.mem.eql(u8, &value.domain, &root.domain)) break value.ref;
+                } else break false;
+                if (found.byte_len != @min(files.chunk_bytes, file.bytes - @as(u64, @intCast(ordinal)) * files.chunk_bytes)) return error.InvalidNativeLakeFiles;
+                ref.* = found;
+            } else true;
+            if (hits) {
+                // Cache entries are private; operation-owned IDs survive later
+                // cache eviction and concurrent payload prefetch.
+                for (result) |*ref| {
+                    ref.artifact_id = try a.dupe(u8, ref.artifact_id);
+                    ref.checksum = try a.dupe(u8, ref.checksum);
+                }
+                return result;
+            }
+        }
+        var cursor = try tree.Cursor.init(a, self.backing(store, root.domain, token, cached), file.chunk_root, &key(first), null);
+        defer cursor.deinit();
+        for (result, first..) |*ref, ordinal| {
+            const row = (try cursor.next()) orelse return error.InvalidNativeLakeFiles;
+            if (!std.mem.eql(u8, row.key, &key(ordinal))) return error.InvalidNativeLakeFiles;
+            ref.* = try decodeChunk(a, row.value, root.domain);
+            if (ref.byte_len != @min(files.chunk_bytes, file.bytes - @as(u64, @intCast(ordinal)) * files.chunk_bytes)) return error.InvalidNativeLakeFiles;
+            if (count <= self.chunk_descriptors.len) {
+                const id = try self.allocator.dupe(u8, ref.artifact_id);
+                errdefer self.allocator.free(id);
+                const checksum = try self.allocator.dupe(u8, ref.checksum);
+                const slot = self.next_chunk % self.chunk_descriptors.len;
+                if (self.chunk_descriptors[slot]) |old| {
+                    self.allocator.free(old.ref.artifact_id);
+                    self.allocator.free(old.ref.checksum);
+                }
+                self.chunk_descriptors[slot] = .{ .root = file.chunk_root.?, .domain = root.domain, .ordinal = ordinal, .ref = .{ .artifact_id = id, .checksum = checksum, .byte_len = ref.byte_len } };
+                self.next_chunk +%= 1;
+            }
+        }
+        return result;
+    }
+};
 pub fn chunk(a: A, access: *Access, file: files.File, ordinal: usize) !artifacts.ChunkRef {
     const expected = file.bytes / files.chunk_bytes + @intFromBool(file.bytes % files.chunk_bytes != 0);
     if (ordinal >= expected) return error.InvalidNativeLakeFiles;
@@ -73,7 +205,7 @@ pub fn decodeChunk(a: A, bytes: []const u8, domain: [32]u8) !artifacts.ChunkRef 
 }
 pub fn decodeFile(a: A, path: []const u8, bytes: []const u8, domain: [32]u8) !files.File {
     const file = try std.json.parseFromSliceLeaky(files.File, a, bytes, .{ .allocate = .alloc_always });
-    if (!std.mem.eql(u8, path, file.path) or file.chunks.len != 0) return error.InvalidNativeLakeFiles;
+    if (!std.mem.eql(u8, path, file.path) or file.chunks.len != 0 or file.origin != null) return error.InvalidNativeLakeFiles;
     try file.validate(domain);
     return file;
 }
@@ -111,6 +243,58 @@ pub fn entries(a: A, root: files.Root, store: stores.ArtifactStore, token: Token
     if (index != result.len) return error.InvalidNativeLakeFiles;
     return result;
 }
+/// Immediate virtual children. Seek only the requested directory prefix and
+/// inspect keys; listing never decodes every native file/chunk descriptor.
+pub fn names(a: A, root: files.Root, store: stores.ArtifactStore, relative: []const u8, directories: bool, token: Token, cached: ?artifacts.CachedRead) ![][]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const prefix = if (relative.len == 0) "" else try std.fmt.allocPrint(arena.allocator(), "{s}/", .{relative});
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(a);
+    var result: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (result.items) |name| a.free(name);
+        result.deinit(a);
+    }
+    const Collect = struct {
+        fn add(alloc: A, output: *std.ArrayList([]u8), found: *std.StringHashMapUnmanaged(void), stem: []const u8, path: []const u8, dirs: bool) !void {
+            if (!std.mem.startsWith(u8, path, stem)) return;
+            const rest = path[stem.len..];
+            const slash = std.mem.indexOfScalar(u8, rest, '/');
+            if (dirs != (slash != null) or rest.len == 0) return;
+            const name = if (slash) |end| rest[0..end] else rest;
+            if (found.contains(name)) return;
+            const copy = try alloc.dupe(u8, name);
+            output.append(alloc, copy) catch |err| {
+                alloc.free(copy);
+                return err;
+            };
+            try found.put(alloc, copy, {});
+        }
+    };
+    if (root.directory) |directory| {
+        var access: Access = undefined;
+        access.init(store, root.domain, token, cached);
+        const upper = if (prefix.len == 0) null else bound: {
+            const bytes = try arena.allocator().dupe(u8, prefix);
+            bytes[bytes.len - 1] += 1;
+            break :bound bytes;
+        };
+        var cursor = try tree.Cursor.init(arena.allocator(), access.backing(), directory, prefix, upper);
+        defer cursor.deinit();
+        while (try cursor.next()) |row| try Collect.add(a, &result, &seen, prefix, row.key, directories);
+    } else for (root.files) |file| {
+        try token.check();
+        try Collect.add(a, &result, &seen, prefix, file.path, directories);
+    }
+    std.mem.sort([]u8, result.items, {}, struct {
+        fn less(_: void, left: []u8, right: []u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.less);
+    return result.toOwnedSlice(a);
+}
+
 /// The chunk tree keeps immutable prefixes by reference. Only a partial tail
 /// and appended blocks are read/uploaded; page edits are flushed in bounded waves.
 pub fn publishPrefix(a: A, out: A, source: local.storage_lsm_backend.Storage, physical: []const u8, relative: []const u8, size: u64, store: *stores.ArtifactStore, token: Token, budget: files.OutputBudget, reuse: ?files.Reuse) !files.File {
@@ -139,7 +323,7 @@ pub fn publishPrefix(a: A, out: A, source: local.storage_lsm_backend.Storage, ph
         const length = @min(files.chunk_bytes, size - offset);
         const ref = if (old) |prior| retained: {
             if (offset >= prior.bytes) break :retained null;
-            const previous = try chunk(arena.allocator(), &access, prior, ordinal);
+            const previous = if (reuse.?.navigation) |navigation| (try navigation.chunks(arena.allocator(), reuse.?.root, store.*, prior, ordinal, 1, token, null))[0] else try chunk(arena.allocator(), &access, prior, ordinal);
             break :retained if (previous.byte_len == length) previous else null;
         } else null;
         const retained = ref orelse upload: {
@@ -158,8 +342,51 @@ pub fn publishPrefix(a: A, out: A, source: local.storage_lsm_backend.Storage, ph
             pending = .empty;
         }
     }
-    return .{ .path = try out.dupe(u8, relative), .bytes = size, .chunk_root = root };
+    return .{ .path = try out.dupe(u8, relative), .bytes = size, .chunk_root = root, .origin = if (old) |prior| prior.origin else null };
 }
+pub const FileChange = struct { path: []const u8, file: ?files.File };
+/// Apply explicit, sorted file mutations. Counters change with the touched
+/// descriptors; no complete predecessor directory is read or materialized.
+pub fn applyChanges(a: A, store: *stores.ArtifactStore, prior: files.Root, changes: []const FileChange, token: Token, work: ?*u64) !files.Root {
+    try prior.validate();
+    if (prior.version != 2) return error.InvalidNativeLakeFiles;
+    const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
+    if (!std.mem.eql(u8, &scope.domain, &prior.domain)) return error.InvalidNativeLakeFiles;
+    if (changes.len == 0) return prior;
+    var navigation: Navigation = .{ .allocator = a };
+    defer navigation.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const edits = try arena.allocator().alloc(tree.Mutation, changes.len);
+    var result = prior;
+    for (changes, edits, 0..) |change, *edit, index| {
+        try token.check();
+        if (index != 0 and std.mem.order(u8, changes[index - 1].path, change.path) != .lt) return error.InvalidNativeLakeFiles;
+        const old = existing: {
+            if (change.file) |file| if (file.origin) |origin| if (origin.matches(prior, change.path)) break :existing @as(?files.File, .{ .path = change.path, .bytes = origin.bytes, .chunk_root = origin.chunk_root });
+            break :existing try navigation.lookup(prior, store.*, change.path, token, null);
+        };
+        if (old) |file| {
+            result.file_count = std.math.sub(u32, result.file_count, 1) catch return error.InvalidNativeLakeFiles;
+            result.chunk_count = std.math.sub(u64, result.chunk_count, file.bytes / files.chunk_bytes + @intFromBool(file.bytes % files.chunk_bytes != 0)) catch return error.InvalidNativeLakeFiles;
+        }
+        edit.* = .{ .key = change.path, .value = null };
+        if (change.file) |file| {
+            if (!std.mem.eql(u8, change.path, file.path) or file.chunks.len != 0) return error.InvalidNativeLakeFiles;
+            try file.validate(prior.domain);
+            result.file_count = std.math.add(u32, result.file_count, 1) catch return error.NativeLakeFilesTooLarge;
+            result.chunk_count = std.math.add(u64, result.chunk_count, file.bytes / files.chunk_bytes + @intFromBool(file.bytes % files.chunk_bytes != 0)) catch return error.NativeLakeFilesTooLarge;
+            edit.value = try std.json.Stringify.valueAlloc(arena.allocator(), file, .{});
+        }
+    }
+    var access: Access = undefined;
+    access.init(store.*, prior.domain, token, null);
+    access.work = work;
+    result.directory = try tree.apply(a, access.backing(), prior.directory, edits);
+    try result.validate();
+    return result;
+}
+
 /// File descriptors are small; unchanged descriptors produce no page writes.
 /// Legacy inline chunks migrate once, while current generations path-copy only
 /// changed files and retain unchanged chunk-map subtrees across checkpoints.
@@ -174,47 +401,52 @@ pub fn persist(a: A, out: A, store: *stores.ArtifactStore, staging: files.Root, 
     var root = if (previous) |old| old.directory else null;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const prior = if (previous) |old| try entries(arena.allocator(), old, store.*, token) else &.{};
+    var navigation: Navigation = .{ .allocator = a };
+    defer navigation.deinit();
+    var known: std.ArrayList([]const u8) = .empty;
     var total: u64 = 0;
-    var edits: std.ArrayList(tree.Mutation) = .empty;
+    var edits: std.ArrayList(FileChange) = .empty;
+    var retained_chunks: u64 = 0;
     for (staging.files) |input| {
         try token.check();
         var file = input;
         total += file.bytes / files.chunk_bytes + @intFromBool(file.bytes % files.chunk_bytes != 0);
         if (total > files.max_chunks) return error.NativeLakeFilesTooLarge;
-        if (file.chunk_root == null and file.chunks.len != 0) {
-            const prior_file = (files.Root{ .domain = staging.domain, .files = prior }).find(file.path);
-            if (prior_file) |old| if (old.bytes == file.bytes and old.chunk_root != null) {
+        const old = if (previous) |prior| authenticated: {
+            if (file.origin) |origin| if (origin.matches(prior, file.path)) break :authenticated files.File{ .path = file.path, .bytes = origin.bytes, .chunk_root = origin.chunk_root };
+            break :authenticated try navigation.lookup(prior, store.*, file.path, token, null);
+        } else null;
+        if (root != null) if (old) |value| {
+            try known.append(arena.allocator(), file.path);
+            retained_chunks += value.bytes / files.chunk_bytes + @intFromBool(value.bytes % files.chunk_bytes != 0);
+        };
+        if (file.chunk_root == null and file.chunks.len != 0) if (old) |prior| {
+            if (prior.bytes == file.bytes and prior.chunk_root != null) {
                 var scratch = std.heap.ArenaAllocator.init(a);
                 defer scratch.deinit();
-                const same = for (file.chunks, 0..) |ref, ordinal| {
-                    _ = scratch.reset(.retain_capacity);
-                    const previous_ref = try chunk(scratch.allocator(), &access, old, ordinal);
+                const refs = try navigation.chunks(scratch.allocator(), previous.?, store.*, prior, 0, file.chunks.len, token, null);
+                const same = for (file.chunks, refs) |ref, previous_ref| {
                     if (ref.byte_len != previous_ref.byte_len or !std.mem.eql(u8, ref.artifact_id, previous_ref.artifact_id) or !std.mem.eql(u8, ref.checksum, previous_ref.checksum)) break false;
                 } else true;
-                if (same) file.chunk_root = old.chunk_root;
-            };
-        }
+                if (same) file.chunk_root = prior.chunk_root;
+            }
+        };
         if (file.chunk_root == null and file.chunks.len != 0) {
             const changes = try arena.allocator().alloc(tree.Mutation, file.chunks.len);
             for (file.chunks, changes, 0..) |ref, *change, ordinal| change.* = .{ .key = try arena.allocator().dupe(u8, &key(ordinal)), .value = try std.json.Stringify.valueAlloc(arena.allocator(), ref, .{}) };
             file.chunk_root = try tree.apply(a, access.backing(), null, changes);
         }
         file.chunks = &.{};
-        const old = (files.Root{ .domain = staging.domain, .files = prior }).find(file.path);
-        if (old) |value| if (value.bytes == file.bytes and value.chunk_root != null and file.chunk_root != null and value.chunk_root.?.eql(file.chunk_root.?)) continue;
-        const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), file, .{});
-        try edits.append(arena.allocator(), .{ .key = file.path, .value = encoded });
+        if (root != null) if (old) |value| if (value.bytes == file.bytes and ((value.chunk_root == null and file.chunk_root == null) or (value.chunk_root != null and file.chunk_root != null and value.chunk_root.?.eql(file.chunk_root.?)))) continue;
+        try edits.append(arena.allocator(), .{ .path = file.path, .file = file });
     }
-    for (prior) |old| if (staging.find(old.path) == null) try edits.append(arena.allocator(), .{ .key = old.path, .value = null });
-    std.mem.sort(tree.Mutation, edits.items, {}, struct {
-        fn less(_: void, l: tree.Mutation, r: tree.Mutation) bool {
-            return std.mem.lessThan(u8, l.key, r.key);
-        }
-    }.less);
-    if (edits.items.len != 0) root = try tree.apply(a, access.backing(), root, edits.items);
-    const result: files.Root = .{ .version = 2, .domain = staging.domain, .directory = root, .file_count = @intCast(staging.files.len), .chunk_count = total };
-    try result.validate();
+    // Every retained name was authenticated by its point lookup above. Counts
+    // preserve complete old subtrees without fetching or decoding descendants;
+    // omitted files disappear through this structural retain operation.
+    root = try tree.retainKnown(a, access.backing(), root, if (root != null) known.items else &.{});
+    const retained: files.Root = .{ .version = 2, .domain = staging.domain, .directory = root, .file_count = @intCast(known.items.len), .chunk_count = retained_chunks };
+    const result = try applyChanges(a, store, retained, edits.items, token, work);
+    if (result.file_count != staging.files.len or result.chunk_count != total) return error.InvalidNativeLakeFiles;
     _ = out;
     return result;
 }
@@ -242,11 +474,27 @@ test "external lake paged native generations retain chunk prefixes without repea
     try std.testing.expectEqual(@as(usize, 0), paged.files.len);
     try std.testing.expectEqual(@as(u64, 1024), paged.chunk_count);
     try std.testing.expect((try std.json.Stringify.valueAlloc(out, paged, .{})).len < 1024);
+    const Counter = struct {
+        var original: stores.ArtifactStore = undefined;
+        var calls: usize = 0;
+        fn read(_: *anyopaque, alloc: A, id: []const u8, offset: u64, len: usize, token: Token) ![]u8 {
+            calls += 1;
+            return original.getRangeAllocWithCancellationUsingAllocator(alloc, id, offset, len, token);
+        }
+    };
+    Counter.original = store;
+    Counter.calls = 0;
+    var counted_vtable = store.vtable.*;
+    counted_vtable.get_range_alloc_with_cancellation = Counter.read;
+    store.vtable = &counted_vtable;
     var work: u64 = 0;
     for (0..8) |_| {
         var generation = length;
         const same = try files.publishPrefix(a, out, undefined, "unread", "run", length, &store, .none, files.OutputBudget{ .generation = &generation, .work = &work }, .{ .root = paged });
+        const before_finalize = Counter.calls;
         const next = try persist(a, out, &store, .{ .domain = legacy.domain, .files = &.{same} }, paged, .none, &work);
+        try std.testing.expectEqual(before_finalize, Counter.calls);
+        try std.testing.expect(std.mem.indexOf(u8, try std.json.Stringify.valueAlloc(out, same, .{}), "origin") == null);
         try std.testing.expect(next.directory.?.eql(paged.directory.?));
         try std.testing.expectEqual(@as(u64, 0), work);
         try std.testing.expectEqual(@as(u64, 0), generation);
@@ -274,9 +522,48 @@ test "external lake paged native generations retain chunk prefixes without repea
     defer a.free(bytes);
     try std.testing.expectEqualStrings("z", bytes);
     var again: [1]u8 = undefined;
+    const warm_calls = Counter.calls;
     try reader.storage().readFileRangeInto(a, "/persisted/run", length, &again);
+    try std.testing.expectEqual(warm_calls, Counter.calls);
+    // One navigation cache can be reused by a producer across checkpoints.
+    // The same path in a changed generation must acquire a new descriptor.
+    var navigation: Navigation = .{};
+    defer navigation.deinit();
+    try std.testing.expectEqual(length, (try navigation.lookup(paged, store, "run", .none, null)).?.bytes);
+    try std.testing.expectEqual(length + 1, (try navigation.lookup(next, store, "run", .none, null)).?.bytes);
     try std.testing.expectEqualStrings("z", &again);
+    const erased = try applyChanges(a, &store, next, &.{.{ .path = "run", .file = null }}, .none, null);
+    try std.testing.expect(erased.directory == null and erased.file_count == 0 and erased.chunk_count == 0);
     const retired = try persist(a, out, &store, .{ .domain = legacy.domain }, next, .none, null);
     try std.testing.expect(retired.directory == null);
     try std.testing.expect((try lookup(next, store, "run", .none, null)) != null);
+    try std.testing.checkAllAllocationFailures(a, navigationFaultScenario, .{ store, next, length });
+    const nested = try persist(a, out, &store, .{ .domain = legacy.domain, .files = &.{
+        .{ .path = "nested/manifest.bin", .bytes = 0 },
+        .{ .path = "nested/runs/5.tbl", .bytes = new_file.bytes, .chunk_root = new_file.chunk_root },
+        new_file,
+    } }, next, .none, null);
+    var virtual: files.Reader = .{ .root = nested, .prefix = "/virtual", .store = store, .context = .{}, .scratch = a, .navigation = .{ .allocator = a } };
+    defer virtual.deinit();
+    try std.testing.expectEqual(2 * (length + 1), try virtual.storage().treeBytes(a, "/virtual"));
+    const candidate_path = try std.fs.path.join(a, &.{ temporary.path(), "candidate" });
+    defer a.free(candidate_path);
+    const overlay = try files.Overlay.create(a, nested, store, candidate_path, .{}, .none);
+    defer overlay.release();
+    try std.testing.expectEqual(2 * (length + 1), try overlay.storage().treeBytes(a, candidate_path));
+    const subtree = try std.fs.path.join(a, &.{ candidate_path, "nested" });
+    defer a.free(subtree);
+    try overlay.storage().deleteTree(subtree);
+    try std.testing.expectEqual(length + 1, try overlay.storage().treeBytes(a, candidate_path));
+}
+
+fn navigationFaultScenario(a: A, source: stores.ArtifactStore, root: files.Root, offset: u64) !void {
+    var reader: files.Reader = .{ .root = root, .prefix = "/fault", .store = source, .context = .{}, .scratch = a, .navigation = .{ .allocator = a }, .max_block_bytes = 1024 * 1024 };
+    defer reader.deinit();
+    const bytes = try reader.storage().readFileRangeAlloc(a, "/fault/run", offset, 1);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("z", bytes);
+    var store = source;
+    const erased = try applyChanges(a, &store, root, &.{.{ .path = "run", .file = null }}, .none, null);
+    try std.testing.expect(erased.directory == null);
 }

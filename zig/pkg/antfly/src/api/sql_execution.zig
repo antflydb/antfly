@@ -960,6 +960,8 @@ pub const Adapter = struct {
         final_positions: []const usize = &.{},
         final_position: usize = 0,
         visited_pages: usize = 0,
+        visited_groups: usize = 0,
+        final_ordered: bool = false,
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             self.adapter.context.ensureActive() catch return true;
@@ -995,8 +997,13 @@ pub const Adapter = struct {
             for (grouped.specs, self.recipe.inputs) |spec, input| if (!std.meta.eql(spec, input.spec)) return error.InvalidSqlBackendResponse;
             try self.adapter.verify(self.a, self.table);
             if (request.point) |point| if (first.select_point) |select| try select(first.ptr, point);
+            var selection = request.selection;
+            selection.row_limit = request.row_limit;
+            selection.page_limit = request.page_limit;
+            const ordered = if (first.select_keys) |select| try select(first.ptr, selection) else false;
+            self.final_ordered = ordered;
             self.final_request = request;
-            try grouped.adoptFinalized(.{ .ptr = self, .count = std.math.cast(usize, proof.count) orelse return error.SqlProgramLimitExceeded, .exact_count = request.predicate == null and request.point == null, .next = nextFinal, .close = close }, request.page_limit);
+            try grouped.adoptFinalized(.{ .ptr = self, .count = std.math.cast(usize, proof.count) orelse return error.SqlProgramLimitExceeded, .exact_count = request.predicate == null and request.point == null and !ordered, .ordered = ordered, .next = nextFinal, .close = close }, request.page_limit);
             self.transferred = true;
             return true;
         }
@@ -1011,9 +1018,10 @@ pub const Adapter = struct {
             while (self.final_position == self.final_positions.len) {
                 _ = self.final_page.reset(.free_all);
                 const pa = self.final_page.allocator();
-                const rows = (try next(raw, pa, request.batch_rows)) orelse return null;
+                const rows = (try next(raw, pa, if (self.final_ordered) @intCast(@min(maximum, request.batch_rows)) else request.batch_rows)) orelse return null;
                 self.visited_pages += 1;
-                if (self.visited_pages > request.page_limit) return error.SqlProgramLimitExceeded;
+                if (self.visited_pages > request.page_limit or rows.len > request.row_limit -| self.visited_groups) return error.SqlProgramLimitExceeded;
+                self.visited_groups += rows.len;
                 const positions = try pa.alloc(usize, rows.len);
                 var accepted: usize = 0;
                 for (rows, 0..) |row, index| {
@@ -1165,6 +1173,8 @@ pub const Adapter = struct {
         owner.final_positions = &.{};
         owner.final_position = 0;
         owner.visited_pages = 0;
+        owner.visited_groups = 0;
+        owner.final_ordered = false;
         owner.a = a;
         owner.adapter = self;
         owner.table = table;
