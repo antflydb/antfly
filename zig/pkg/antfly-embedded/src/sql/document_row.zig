@@ -891,7 +891,12 @@ test "SQL projected document directory validates ranges identities corruption an
 }
 
 test "SQL document scanner scratch remains bounded across large sibling objects" {
-    const a = std.testing.allocator;
+    // This fixture measures retained scratch over hundreds of thousands of
+    // escaped keys. Keep safety/leak checks without unwinding every arena
+    // resize; ANTFLY_TEST_ALLOCATOR_TRACES restores allocation backtraces.
+    var checked: @import("../storage/test_allocator.zig").TestAllocator = .{};
+    defer checked.deinit();
+    const a = checked.allocator();
     for ([_]usize{ 4, 32 }) |siblings| {
         var input: std.Io.Writer.Allocating = .init(a);
         defer input.deinit();

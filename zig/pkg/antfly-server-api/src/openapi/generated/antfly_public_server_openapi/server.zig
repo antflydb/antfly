@@ -5,6 +5,7 @@ const std = @import("std");
 const types = @import("antfly_public_openapi");
 const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
+const antfly_resolvers_openapi = @import("antfly_resolvers_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
 
 /// --- Extractors (framework-agnostic) ---
@@ -552,6 +553,66 @@ pub const LookupNamespaceTableDocumentParams = struct {
     consistency: ?[]const u8 = null,
 };
 
+/// list entity resolver state
+pub const NamespaceListEntityResolverStatePathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// merge entity
+pub const NamespaceMergeEntityPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespaceMergeEntity.
+pub fn parseNamespaceMergeEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntityMergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntityMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// suppress entity
+pub const NamespaceSuppressEntityPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespaceSuppressEntity.
+pub fn parseNamespaceSuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unmerge entity
+pub const NamespaceUnmergeEntityPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespaceUnmergeEntity.
+pub fn parseNamespaceUnmergeEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unsuppress entity
+pub const NamespaceUnsuppressEntityPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespaceUnsuppressEntity.
+pub fn parseNamespaceUnsuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// List indexes for an explicit namespace table
 pub const ListNamespaceTableIndexesPathParams = struct {
     /// Database name
@@ -678,6 +739,169 @@ pub const RenameNamespaceTablePathParams = struct {
 /// Parse the JSON request body for renameNamespaceTable.
 pub fn parseRenameNamespaceTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RenameCatalogResourceRequest) {
     return std.json.parseFromSlice(types.RenameCatalogResourceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolvers
+pub const NamespaceListResolversPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// get resolver
+pub const NamespaceGetResolverPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// drop resolver identity
+pub const NamespaceDropResolverIdentityPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// list resolver redirects
+pub const NamespaceListResolverRedirectsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// merge resolver keys
+pub const NamespaceMergeResolverKeysPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceMergeResolverKeys.
+pub fn parseNamespaceMergeResolverKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverMergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unmerge resolver key
+pub const NamespaceUnmergeResolverKeyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+    key: []const u8,
+};
+
+pub const NamespaceUnmergeResolverKeyParams = struct {
+    pin_distinct: ?[]const u8 = null,
+};
+
+/// Parse the JSON request body for namespaceUnmergeResolverKey.
+pub fn parseNamespaceUnmergeResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolver reviews
+pub const NamespaceListResolverReviewsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+pub const NamespaceListResolverReviewsParams = struct {
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// review resolver mention
+pub const NamespaceReviewResolverMentionPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+    review_id: []const u8,
+};
+
+/// Parse the JSON request body for namespaceReviewResolverMention.
+pub fn parseNamespaceReviewResolverMentionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverReviewDecision) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverReviewDecision, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolver suppressions
+pub const NamespaceListResolverSuppressionsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// suppress resolver keys
+pub const NamespaceSuppressResolverKeysPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceSuppressResolverKeys.
+pub fn parseNamespaceSuppressResolverKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverSuppressionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverSuppressionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unsuppress resolver key
+pub const NamespaceUnsuppressResolverKeyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespaceUnsuppressResolverKey.
+pub fn parseNamespaceUnsuppressResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// set resolver namespace
+pub const NamespaceSetResolverNamespacePathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceSetResolverNamespace.
+pub fn parseNamespaceSetResolverNamespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverNamespaceRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverNamespaceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// render resolver key
+pub const NamespaceRenderResolverKeyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceRenderResolverKey.
+pub fn parseNamespaceRenderResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverRenderRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverRenderRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// resolve resolver query
+pub const NamespaceResolveResolverQueryPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceResolveResolverQuery.
+pub fn parseNamespaceResolveResolverQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverResolveRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverResolveRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Restore an explicit namespace table from backup
@@ -1184,6 +1408,56 @@ pub const ReprocessDocumentArtifactPathParams = struct {
     artifact_name: []const u8,
 };
 
+/// list entity resolver state
+pub const ListEntityResolverStatePathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// merge entity
+pub const MergeEntityPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for mergeEntity.
+pub fn parseMergeEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntityMergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntityMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// suppress entity
+pub const SuppressEntityPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for suppressEntity.
+pub fn parseSuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unmerge entity
+pub const UnmergeEntityPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for unmergeEntity.
+pub fn parseUnmergeEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unsuppress entity
+pub const UnsuppressEntityPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for unsuppressEntity.
+pub fn parseUnsuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// List all indexes for a table
 pub const ListIndexesPathParams = struct {
     /// Name of the table
@@ -1402,6 +1676,141 @@ pub const RunTableRepairPathParams = struct {
 /// Parse the JSON request body for runTableRepair.
 pub fn parseRunTableRepairBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairRunRequest) {
     return std.json.parseFromSlice(types.RepairRunRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolvers
+pub const ListResolversPathParams = struct {
+    table_name: []const u8,
+};
+
+/// get resolver
+pub const GetResolverPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// drop resolver identity
+pub const DropResolverIdentityPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// list resolver redirects
+pub const ListResolverRedirectsPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// merge resolver keys
+pub const MergeResolverKeysPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for mergeResolverKeys.
+pub fn parseMergeResolverKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverMergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unmerge resolver key
+pub const UnmergeResolverKeyPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+    key: []const u8,
+};
+
+pub const UnmergeResolverKeyParams = struct {
+    pin_distinct: ?[]const u8 = null,
+};
+
+/// Parse the JSON request body for unmergeResolverKey.
+pub fn parseUnmergeResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolver reviews
+pub const ListResolverReviewsPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+pub const ListResolverReviewsParams = struct {
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// review resolver mention
+pub const ReviewResolverMentionPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+    review_id: []const u8,
+};
+
+/// Parse the JSON request body for reviewResolverMention.
+pub fn parseReviewResolverMentionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverReviewDecision) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverReviewDecision, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// list resolver suppressions
+pub const ListResolverSuppressionsPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// suppress resolver keys
+pub const SuppressResolverKeysPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for suppressResolverKeys.
+pub fn parseSuppressResolverKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverSuppressionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverSuppressionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// unsuppress resolver key
+pub const UnsuppressResolverKeyPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for unsuppressResolverKey.
+pub fn parseUnsuppressResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// set resolver namespace
+pub const SetResolverNamespacePathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for setResolverNamespace.
+pub fn parseSetResolverNamespaceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverNamespaceRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverNamespaceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// render resolver key
+pub const RenderResolverKeyPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for renderResolverKey.
+pub fn parseRenderResolverKeyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverRenderRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverRenderRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// resolve resolver query
+pub const ResolveResolverQueryPathParams = struct {
+    table_name: []const u8,
+    resolver_name: []const u8,
+};
+
+/// Parse the JSON request body for resolveResolverQuery.
+pub fn parseResolveResolverQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverResolveRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverResolveRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Restore a table from backup
@@ -1685,6 +2094,11 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry", .operation_id = "retryNamespaceRelationalConstraints", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status", .operation_id = "getNamespaceRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}", .operation_id = "lookupNamespaceTableDocument", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects", .operation_id = "namespaceListEntityResolverState", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge", .operation_id = "namespaceMergeEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress", .operation_id = "namespaceSuppressEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unmerge", .operation_id = "namespaceUnmergeEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unsuppress", .operation_id = "namespaceUnsuppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes", .operation_id = "listNamespaceTableIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "getNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
@@ -1695,6 +2109,20 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename", .operation_id = "renameNamespaceTable", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers", .operation_id = "namespaceListResolvers", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}", .operation_id = "namespaceGetResolver", .request_body = .none, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}", .operation_id = "namespaceDropResolverIdentity", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects", .operation_id = "namespaceListResolverRedirects", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects", .operation_id = "namespaceMergeResolverKeys", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects/{key}", .operation_id = "namespaceUnmergeResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews", .operation_id = "namespaceListResolverReviews", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}", .operation_id = "namespaceReviewResolverMention", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions", .operation_id = "namespaceListResolverSuppressions", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions", .operation_id = "namespaceSuppressResolverKeys", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}", .operation_id = "namespaceUnsuppressResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:namespace", .operation_id = "namespaceSetResolverNamespace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:render", .operation_id = "namespaceRenderResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:resolve", .operation_id = "namespaceResolveResolverQuery", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore", .operation_id = "restoreNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate", .operation_id = "mutateNamespaceRelationalRows", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query", .operation_id = "queryNamespaceRelationalRows", .request_body = .buffered, .streaming_response = true },
@@ -1754,6 +2182,11 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/redirects", .operation_id = "listEntityResolverState", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:merge", .operation_id = "mergeEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:suppress", .operation_id = "suppressEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:unmerge", .operation_id = "unmergeEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:unsuppress", .operation_id = "unsuppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
@@ -1777,6 +2210,20 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/advance", .operation_id = "advanceTableRepairJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/cancel", .operation_id = "cancelTableRepairJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/resolvers", .operation_id = "listResolvers", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/resolvers/{resolverName}", .operation_id = "getResolver", .request_body = .none, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/resolvers/{resolverName}", .operation_id = "dropResolverIdentity", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/resolvers/{resolverName}/redirects", .operation_id = "listResolverRedirects", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}/redirects", .operation_id = "mergeResolverKeys", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/resolvers/{resolverName}/redirects/{key}", .operation_id = "unmergeResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/resolvers/{resolverName}/reviews", .operation_id = "listResolverReviews", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}", .operation_id = "reviewResolverMention", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/resolvers/{resolverName}/suppressions", .operation_id = "listResolverSuppressions", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}/suppressions", .operation_id = "suppressResolverKeys", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}", .operation_id = "unsuppressResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}:namespace", .operation_id = "setResolverNamespace", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}:render", .operation_id = "renderResolverKey", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/resolvers/{resolverName}:resolve", .operation_id = "resolveResolverQuery", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/rows/mutate", .operation_id = "mutateRelationalRows", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/rows/query", .operation_id = "queryRelationalRows", .request_body = .buffered, .streaming_response = true },
@@ -1868,6 +2315,11 @@ pub const routes = [_]Route{
 //   fn retryNamespaceRelationalConstraints(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn getNamespaceRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn lookupNamespaceTableDocument(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !httpx.Response
+//   fn namespaceListEntityResolverState(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespaceMergeEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespaceSuppressEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespaceUnmergeEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespaceUnsuppressEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn listNamespaceTableIndexes(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn getNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
@@ -1878,6 +2330,20 @@ pub const routes = [_]Route{
 //   fn retryNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn renameNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn namespaceListResolvers(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn namespaceGetResolver(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceDropResolverIdentity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceListResolverRedirects(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceMergeResolverKeys(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceUnmergeResolverKey(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, key: []const u8, params: NamespaceUnmergeResolverKeyParams) !httpx.Response
+//   fn namespaceListResolverReviews(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, params: NamespaceListResolverReviewsParams) !httpx.Response
+//   fn namespaceReviewResolverMention(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, review_id: []const u8) !httpx.Response
+//   fn namespaceListResolverSuppressions(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceSuppressResolverKeys(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceUnsuppressResolverKey(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespaceSetResolverNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceRenderResolverKey(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn namespaceResolveResolverQuery(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response
 //   fn restoreNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn mutateNamespaceRelationalRows(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn queryNamespaceRelationalRows(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
@@ -1937,6 +2403,11 @@ pub const routes = [_]Route{
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn listEntityResolverState(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn mergeEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn suppressEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn unmergeEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn unsuppressEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
@@ -1960,6 +2431,20 @@ pub const routes = [_]Route{
 //   fn advanceTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn cancelTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listResolvers(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getResolver(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn dropResolverIdentity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn listResolverRedirects(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn mergeResolverKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn unmergeResolverKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, key: []const u8, params: UnmergeResolverKeyParams) !httpx.Response
+//   fn listResolverReviews(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, params: ListResolverReviewsParams) !httpx.Response
+//   fn reviewResolverMention(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, review_id: []const u8) !httpx.Response
+//   fn listResolverSuppressions(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn suppressResolverKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn unsuppressResolverKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, key: []const u8) !httpx.Response
+//   fn setResolverNamespace(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn renderResolverKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
+//   fn resolveResolverQuery(self: *Impl, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response
 //   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn mutateRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn queryRelationalRows(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

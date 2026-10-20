@@ -2553,7 +2553,7 @@ test "group state range scan is allocation-failure safe" {
             try std.testing.expectEqual(@as(usize, 2), state.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{&store});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{&store});
 }
 
 fn allocPreparedSplitState(

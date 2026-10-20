@@ -720,7 +720,7 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !LookupResponse {
-        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", "", null, null, false);
+        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", "", "", null, null, false);
     }
 
     pub fn fetchGroupLookupWithMode(
@@ -739,6 +739,7 @@ pub const ApiHttpClient = struct {
         relational_activation_json: []const u8,
         relational_index_status_json: []const u8,
         relational_topology_json: []const u8,
+        group_source_query_json: []const u8,
         restore_staging_scope: ?[32]u8,
         restore_staging_plan_id: ?[16]u8,
         include_primary_digest: bool,
@@ -751,7 +752,7 @@ pub const ApiHttpClient = struct {
         // value even when they contain URI delimiters.
         const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(encoded_table_name);
-        const special = relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
+        const special = group_source_query_json.len != 0 or relational_integrity_catalog or relational_integrity_action or relational_integrity_jobs_json.len != 0 or relational_activation_json.len != 0 or relational_topology_json.len != 0 or relational_index_status_json.len != 0;
         // Routing uses the actual logical key, including empty first-range
         // boundaries. Only the already-routed HTTP path needs a placeholder.
         const encoded_key = try percentEncodePathComponent(self.alloc, if (special and key.len == 0) "\x00relational_control" else key);
@@ -804,7 +805,11 @@ pub const ApiHttpClient = struct {
         defer if (index_status.len != 0) self.alloc.free(index_status);
         const index_path = if (index_status.len != 0) try std.fmt.allocPrint(self.alloc, "{s}&_relational_index_status={s}", .{ observation_path orelse path, index_status }) else null;
         defer if (index_path) |value| self.alloc.free(value);
-        const uri = try self.joinRoute(base_uri, index_path orelse observation_path orelse path);
+        const group_source = if (group_source_query_json.len != 0) try percentEncodePathComponent(self.alloc, group_source_query_json) else "";
+        defer if (group_source.len != 0) self.alloc.free(group_source);
+        const group_path = if (group_source.len != 0) try std.fmt.allocPrint(self.alloc, "{s}&_group_source={s}", .{ index_path orelse observation_path orelse path, group_source }) else null;
+        defer if (group_path) |value| self.alloc.free(value);
+        const uri = try self.joinRoute(base_uri, group_path orelse index_path orelse observation_path orelse path);
         defer self.alloc.free(uri);
 
         var resp = try self.executeRequest(.{
@@ -2406,6 +2411,71 @@ pub const ApiHttpClient = struct {
             404 => return error.UnknownGroup,
             405 => return error.UnsupportedOperation,
             409 => return remoteGroupConflictError(resp.body),
+            503 => return error.LeaderUnavailable,
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
+    pub fn fetchGroupResolverOperation(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        return self.fetchGroupResolverOperationWithCancellation(base_uri, group_id, table_name, body, null);
+    }
+
+    pub fn fetchGroupResolverOperationWithCancellation(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
+        return self.fetchGroupResolverOperationWithControl(base_uri, group_id, table_name, body, null, cancellation);
+    }
+
+    pub fn fetchGroupResolverOperationWithControl(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.resolver_operation_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeRequest(.{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+            .cancellation = cancellation,
+            .timeout_ms = timeout_ms,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            400 => return error.InvalidResolverCurationRequest,
+            403 => return error.Forbidden,
+            404 => return error.UnknownGroup,
+            405 => return error.UnsupportedOperation,
+            409 => return error.ResolverCurationConflict,
+            408, 504 => return error.Timeout,
+            429 => return error.Busy,
             503 => return error.LeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }

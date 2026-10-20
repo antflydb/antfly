@@ -673,6 +673,10 @@ pub const Owner = struct {
                 const stats = runtime.stats();
                 if (stats.applied_sequence < @max(target, stats.target_sequence)) return true;
             } else if (try state.loadAppliedSequence(alloc, database.core.store, "promotion") < target) return true;
+            // Catalog backfills also advance durable cursors without adding
+            // replay records. Inspect both keys in one committed view only
+            // after the cheap watermark checks have ruled out other debt.
+            if (try @import("../storage/db/resolution_runtime.zig").hasDurableReresolveBacklog(database.core.store)) return true;
         }
         return false;
     }

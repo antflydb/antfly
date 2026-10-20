@@ -68,7 +68,15 @@ pub const ObjectRange = struct {
     }
     pub fn range(self: *ObjectRange) !source.Range {
         try self.validateVersion();
-        return .{ .context = self, .read_at = readAt, .length = self.length };
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-object-snapshot-v1");
+        hash.update(&.{@backingInt(self.version_kind)});
+        for ([_][]const u8{ self.object, self.version }) |value| {
+            hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, value.len)));
+            hash.update(value);
+        }
+        hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, self.length)));
+        return .{ .context = self, .read_at = readAt, .length = self.length, .immutable_binding = hash.finalResult() };
     }
     pub fn readAt(context: *anyopaque, offset: u64, out: []u8, control: source.Control) !usize {
         const self: *ObjectRange = @ptrCast(@alignCast(context));
@@ -108,7 +116,7 @@ pub const ReadAhead = struct {
     reads: usize = 0,
     hits: usize = 0,
     pub fn range(self: *ReadAhead) source.Range {
-        return .{ .context = self, .read_at = readAt, .length = self.upstream.length };
+        return .{ .context = self, .read_at = readAt, .length = self.upstream.length, .immutable_binding = self.upstream.immutable_binding };
     }
     pub fn deinit(self: *ReadAhead) void {
         if (self.buffer) |bytes| self.allocator.free(bytes);
@@ -272,4 +280,24 @@ test "range budgets bound fetched bytes independently of large object length" {
     try std.testing.expectError(error.RemoteReadBudgetExceeded, ReadAhead.readAt(&cache, 2000, &out, .{}));
     cache.max_bytes = 100;
     try std.testing.expectError(error.RemoteRequestBudgetExceeded, ReadAhead.readAt(&cache, 2000, &out, .{}));
+}
+
+test "immutable snapshot bindings separate object version kind and length through read ahead" {
+    var marker: u8 = 0;
+    var object = ObjectRange{ .transport = .{ .context = &marker, .get = undefined }, .object = "s3://bucket/key", .version = "\"v1\"", .length = 16 };
+    const initial = (try object.range()).immutable_binding.?;
+    var read_ahead = ReadAhead{ .allocator = std.testing.allocator, .upstream = try object.range() };
+    defer read_ahead.deinit();
+    try std.testing.expectEqual(initial, read_ahead.range().immutable_binding.?);
+    object.version = "\"v2\"";
+    try std.testing.expect(!std.mem.eql(u8, &initial, &(try object.range()).immutable_binding.?));
+    object.version = "\"v1\"";
+    object.object = "s3://other/key";
+    try std.testing.expect(!std.mem.eql(u8, &initial, &(try object.range()).immutable_binding.?));
+    object.object = "s3://bucket/key";
+    object.length += 1;
+    try std.testing.expect(!std.mem.eql(u8, &initial, &(try object.range()).immutable_binding.?));
+    object.length = 16;
+    object.version_kind = .s3_version_id;
+    try std.testing.expect(!std.mem.eql(u8, &initial, &(try object.range()).immutable_binding.?));
 }

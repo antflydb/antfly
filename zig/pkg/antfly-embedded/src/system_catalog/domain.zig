@@ -1262,7 +1262,7 @@ pub fn httpStatus(err: anyerror) u16 {
         error.CatalogPublicationProofPending => 503,
         error.Forbidden => 403,
         error.InvalidInitialFkRetirementSignature, error.InitialFkRetirementSigningKeyUnavailable => 403,
-        error.StoreRootEnrollmentChanged, error.IndexOwnerReceiptChanged => 409,
+        error.StoreRootEnrollmentChanged, error.ResolverCurationConflict, error.IndexOwnerReceiptChanged => 409,
         error.InvalidIndexOwnerReceipt => 400,
         error.InvalidStoreRootEnrollment, error.InvalidInitialFkRetirementAck => 400,
         error.InitialChildRootReceiptChanged, error.InitialFkRetirementReporterChanged, error.InitialFkRetirementWorkChanged, error.InitialFkRetirementPublicationChanged, error.InitialFkRetirementReservationChanged => 409,

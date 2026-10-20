@@ -771,9 +771,9 @@ def test_index_upgrade_and_retired_identity_management(tmp_path, storage, order)
         db.merge_resolver_keys("concepts", "entity/ada", "entity/canonical")
         db.run_until_idle()
         reader_version = db.capabilities()["minimum_reader_version"]
-        # Inline graph resolver ownership uses the epoch-3 format; the fence
+        # Durable curation uses the epoch-6 format; the fence
         # must survive upgrades, retirement and reopening without weakening.
-        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 3
+        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 6
         with pytest.raises(antfly_embedded.InvalidArgumentError, match="retire"):
             db.drop_resolver_identity("concepts")
         upgraded = json.loads(json.dumps(config))
@@ -1459,7 +1459,8 @@ def test_inline_resolver_background_work_settles_after_writes(aflite_path, promo
                     and graph_name in {index["name"] for index in docs.list_indexes()}
                 ):
                     break
-                assert time.monotonic() < deadline, stats
+                if time.monotonic() >= deadline:
+                    pytest.fail(f"background resolver work did not settle: {json.dumps(stats, sort_keys=True)}")
                 time.sleep(0.1)
             assert docs.edges(graph_name, "d0", "about", antfly_embedded.GraphDirection.OUT)
             sequence = stats["derived_target_sequence"]

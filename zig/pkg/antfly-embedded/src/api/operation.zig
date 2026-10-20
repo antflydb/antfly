@@ -157,6 +157,9 @@ pub const RequestContext = struct {
     /// admission (for example FK cascades). Adapters retain the admitted
     /// credential scopes; a username alone cannot reconstruct API-key rights.
     table_write_authorization: ?TableWriteAuthorization = null,
+    /// Admitted credential scopes for source tables discovered by read fanout.
+    /// Authorize public logical names after catalog reverse binding.
+    table_read_authorization: ?TableReadAuthorization = null,
     /// Borrowed authenticated ingress credential, never serialized or
     /// reconstructed from `principal`. Only ApiHttpServer may interpret this
     /// opaque capability when minting a table-scoped RLS write proof.
@@ -187,6 +190,17 @@ pub const RequestContext = struct {
         }
     }
 
+    /// Remaining request budget for transports with relative millisecond timeouts.
+    /// Round up so a live sub-millisecond budget never becomes an unbounded zero.
+    pub fn remainingTimeoutMs(self: RequestContext) !?u32 {
+        const normalized = try self.platformDeadline();
+        const deadline = normalized.deadline_ns orelse return null;
+        const now = platform_time.monotonicNs();
+        if (now >= deadline) return error.DeadlineExceeded;
+        const millis = std.math.divCeil(u64, deadline - now, std.time.ns_per_ms) catch unreachable;
+        return @intCast(@min(millis, std.math.maxInt(u32)));
+    }
+
     /// Preserve remaining time when entering native owners or HTTP timeout
     /// APIs, whose absolute clock is platform monotonic rather than Io awake.
     pub fn platformDeadline(self: RequestContext) !RequestContext {
@@ -203,6 +217,8 @@ pub const RequestContext = struct {
         return normalized;
     }
 };
+
+pub const TableReadAuthorization = TableWriteAuthorization;
 
 pub const TableWriteAuthorization = struct {
     ptr: *const anyopaque,

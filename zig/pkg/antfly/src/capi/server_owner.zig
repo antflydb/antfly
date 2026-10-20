@@ -579,7 +579,9 @@ pub const StorageOwnerRuntimeHooks = struct {
         }
     };
 
-    pub fn candidateSource(self: *StorageOwnerRuntimeHooks) ?db_mod.CandidateSource {
+    pub fn candidateSource(self: *StorageOwnerRuntimeHooks) !?db_mod.CandidateSource {
+        const config = self.config.resolution_candidates;
+        if (try db_mod.CandidateSource.receiveNative(config.native_view.slice(), config.native_view_contract.slice())) |source| return source;
         if (self.config.resolution_candidates.get_fn == null) return null;
         return .{ .ptr = self, .vtable = &candidate_vtable };
     }
@@ -2157,6 +2159,43 @@ pub fn metadataApplyStoreProjection(
             defer handle.store.freeRanges(alloc, value.ranges);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .resolver_catalog_read => blk: {
+            const Read = @import("../metadata/resolver_catalog_read.zig").Request;
+            var parsed = std.json.parseFromSlice(Read, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            const value = handle.store.resolverCatalogRead(alloc, request.group_id, parsed.value) catch |err| break :blk storageOwnerStatusFromError(err);
+            out_json.* = .{ .ptr = value.ptr, .len = @intCast(value.len) };
+            break :blk .ok;
+        },
+        .resolver_projection_valid => blk: {
+            var parsed = std.json.parseFromSlice(metadata_table_manager.TableRecord, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            const value = handle.store.resolverProjectionValid(alloc, request.group_id, parsed.value) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .resolver_namespace_work => blk: {
+            if (request.arg0 == 2) {
+                const value = handle.store.pendingResolverNamespaceDrop(alloc, request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                break :blk metadataProjectionJson(alloc, out_json, value);
+            }
+            if (request.arg0 == 1) {
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                const value = handle.store.pendingResolverNamespaceSources(arena.allocator(), request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                break :blk metadataProjectionJson(alloc, out_json, value);
+            }
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const value = handle.store.pendingResolverNamespaceTable(arena.allocator(), request.group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .resolver_namespace_replacement_matches => blk: {
+            const Input = struct { current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, term: u64 = 0, index: u64 = 0 };
+            var parsed = std.json.parseFromSlice(Input, alloc, request.key.slice(), .{}) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer parsed.deinit();
+            const value = (if (request.arg0 == 1) handle.store.resolverNamespaceReplacementRejected(alloc, request.group_id, parsed.value.term, parsed.value.index, parsed.value.current, parsed.value.replacement) else handle.store.resolverNamespaceReplacementMatches(alloc, request.group_id, parsed.value.current, parsed.value.replacement)) catch |err| break :blk storageOwnerStatusFromError(err);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .catalog_cursor => blk: {
             const value = handle.store.captureCatalogCursor(request.group_id) catch |err|
                 break :blk storageOwnerStatusFromError(err);
@@ -3349,7 +3388,7 @@ pub fn storageOwnerOpen(
     if ((runtime_hooks_config.artifact_publication_ctx == null) != (runtime_hooks_config.artifact_publication_enqueue_fn == null)) return .invalid_argument;
     if ((runtime_hooks_config.coordinated_ttl_ctx == null) != (runtime_hooks_config.coordinated_ttl_enqueue_fn == null))
         return .invalid_argument;
-    const candidate_configured = runtime_hooks_config.resolution_candidates.get_fn != null or
+    const candidate_configured = runtime_hooks_config.resolution_candidates.native_view.len != 0 or runtime_hooks_config.resolution_candidates.native_view_contract.len != 0 or runtime_hooks_config.resolution_candidates.get_fn != null or
         runtime_hooks_config.resolution_candidates.scan_prefix_fn != null or
         runtime_hooks_config.resolution_candidates.nearest_fn != null;
     if (candidate_configured and
@@ -3435,7 +3474,7 @@ pub fn storageOwnerOpen(
         .initial_child_bootstrap = if (initial_child_bootstrap) |value| value.value else null,
         .prefer_existing_identity_namespace = !durable_catalog and identity_namespace != null,
         .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
-        .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() else null,
+        .resolution_candidate_source = if (runtime_hooks) |value| value.candidateSource() catch |err| return storageOwnerStatusFromError(err) else null,
         .artifact_publication_dispatcher = if (runtime_hooks) |value| value.artifactPublicationDispatcher() else null,
         .entity_sink = if (runtime_hooks) |value| value.entitySink() else null,
         .promotion_owner = if (runtime_hooks) |value| value.promotionOwner() else null,
@@ -3688,12 +3727,21 @@ pub fn storageOwnerReconcile(
 
 pub fn storageOwnerPreflightWriteAdmission(
     owner: ?*anyopaque,
-    request: *const kernel_owner_abi.TableRequest,
+    request: *const kernel_owner_abi.WriteAdmissionRequest,
+    out_has_groups: *u8,
 ) callconv(.c) kernel_owner_abi.Status {
+    out_has_groups.* = 0;
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
-    return if (handle.db.denseRepairWriteBackpressured()) .dense_repair_backpressure else .ok;
+    if (handle.db.denseRepairWriteBackpressured()) return .dense_repair_backpressure;
+    if (!handle.db.core.index_manager.hasGroupSources()) return .ok;
+    out_has_groups.* = 1;
+    if (request.request_json.len == 0) return .ok;
+    var batch = batch_api.parseInternalBatchRequest(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer batch.deinit(handle.alloc);
+    local_write.validateGroupedSourceBatch(handle.alloc, &handle.db, batch.req.writes, batch.req.deletes, batch.req.transforms) catch |err| return storageOwnerStatusFromError(err);
+    return .ok;
 }
 
 pub fn storageOwnerFindMedianKey(
@@ -5180,7 +5228,19 @@ pub fn storageOwnerWaitForSync(
             return callback(req.cancellation_ctx) != 0;
         }
     };
-    handle.db.waitForCurrentSyncLevelWithCancellation(sync_level, .{ .ptr = request, .is_cancelled_fn = Adapter.cancelled }) catch |err| return storageOwnerStatusFromError(err);
+    const cancellation = db_mod.types.CancellationToken{ .ptr = request, .is_cancelled_fn = Adapter.cancelled };
+    if (request.target) |target| {
+        const root = handle.db.durableRootIncarnation() catch |err| return storageOwnerStatusFromError(err);
+        if (target.captured == 0) {
+            std.mem.writeInt(u128, &target.root_incarnation_le, root, .little);
+            target.sequence = handle.db.core.nextDerivedSequence();
+            const timeout_ms = if (handle.db.enrichment_runtime) |runtime| runtime.syncWaitTimeoutMs() else 5 * std.time.ms_per_min;
+            target.deadline_ns = antfly.platform_time.monotonicNs() +| (std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64));
+            target.captured = 1;
+        } else if ((target.captured != 1 and target.captured != 2) or std.mem.readInt(u128, &target.root_incarnation_le, .little) != root) return storageOwnerStatusFromError(error.StorageKernelOwnerStaleDescriptor);
+        if (antfly.platform_time.monotonicNs() >= target.deadline_ns) return storageOwnerStatusFromError(error.Timeout);
+        handle.db.waitForResolvedTransactionSyncTargetWithCancellation(sync_level, &target.sequence, &target.captured, cancellation) catch |err| return storageOwnerStatusFromError(err);
+    } else handle.db.waitForCurrentSyncLevelWithCancellation(sync_level, cancellation) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
 
@@ -6374,6 +6434,28 @@ pub fn storageOwnerGraphMetricMaintenanceJson(
     _ = storageOwnerOperationTableName(handle, request) orelse
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
     const response = local_write.runGraphMetricMaintenanceOrActionJsonAlloc(handle.alloc, &handle.db, request.request_json.slice()) catch |err|
+        return storageOwnerQueryFailure(err, .graph_metric_maintenance, out_failure);
+    defer handle.alloc.free(response);
+    const owned = dupBytes(response) catch return storageOwnerQueryFailure(error.OutOfMemory, .encode_internal_response, out_failure);
+    out_response.* = .{ .ptr = owned.ptr, .len = @intCast(owned.len) };
+    return .ok;
+}
+
+pub fn storageOwnerResolverOperationJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.JsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    _ = storageOwnerOperationTableName(handle, request) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const response = handle.db.resolverReviewsJsonAlloc(handle.alloc, request.request_json.slice()) catch |err|
         return storageOwnerQueryFailure(err, .graph_metric_maintenance, out_failure);
     defer handle.alloc.free(response);
     const owned = dupBytes(response) catch return storageOwnerQueryFailure(error.OutOfMemory, .encode_internal_response, out_failure);

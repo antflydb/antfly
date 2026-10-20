@@ -393,3 +393,54 @@ def test_chunk_embedding_stream_preserves_provenance_and_requires_terminal(termi
             with pytest.raises(AntflyException, match="before terminal coverage"):
                 next(results)
     assert stream.closed
+
+
+@pytest.mark.parametrize("extraction", [False, True])
+def test_generated_request_models_preserve_nested_configuration(extraction: bool) -> None:
+    from antfly.client_generated.models import GeneratedDecideRequest, GeneratedExtractionRequest
+
+    config = {"provider": "antfly", "model": "registered"}
+    body = (
+        {
+            "method": "generated",
+            "generator": config,
+            "probabilities": "verdict_only",
+            "inputs": [{"content": "source"}],
+            "schema": {"entities": ["person"]},
+        }
+        if extraction
+        else {
+            "decision_method": "generated",
+            "generator": config,
+            "probabilities": "verdict_only",
+            "input": "source",
+            "questions": [{"name": "answer", "type": "predicate", "instructions": "Is it present?"}],
+        }
+    )
+    request_model = GeneratedExtractionRequest if extraction else GeneratedDecideRequest
+    request = request_model.from_dict(body)
+    encoded = request.to_dict()
+    assert "model" not in encoded
+    assert encoded["generator"] == config
+
+    def handle(incoming: httpx.Request) -> httpx.Response:
+        assert incoming.url.path == ("/ai/v1/extract" if extraction else "/ai/v1/decisions")
+        assert json.loads(incoming.read()) == encoded
+        return httpx.Response(
+            200,
+            json=(
+                {"object": "extraction", "model": "registered", "data": []}
+                if extraction
+                else {"model": "registered", "answers": [], "usage": {"input_tokens": 0, "output_tokens": 0}}
+            ),
+        )
+
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(handle))
+    if extraction:
+        assert isinstance(request, GeneratedExtractionRequest)
+        result = client.extract(request)
+    else:
+        assert isinstance(request, GeneratedDecideRequest)
+        result = client.decide(request)
+    assert result.model == "registered"

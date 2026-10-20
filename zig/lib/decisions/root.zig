@@ -16,6 +16,7 @@
 //! Public named-array decision contract. The model adapters retain their
 //! private typed-classification representation behind this boundary.
 const std = @import("std");
+pub const generated = @import("generated.zig");
 pub const legacy = @import("trained.zig");
 pub const scoring = @import("embedding.zig");
 const V = std.json.Value;
@@ -173,7 +174,7 @@ pub fn internalQuestions(a: A, questions: V) !V {
     try root.put(a, "model", str("contract-validation"));
     try root.put(a, "input", str("validation"));
     try root.put(a, "questions", questions);
-    const parsed = try parse(a, try std.json.Stringify.valueAlloc(a, V{ .object = root }, .{}));
+    const parsed = try parseValue(a, V{ .object = root });
     var out = std.json.ObjectMap{};
     for (parsed.inner.questions, parsed.policies, questions.array.items) |question, policy, raw| {
         var q = std.json.ObjectMap{};
@@ -294,6 +295,11 @@ pub fn publicResponse(a: A, response: V) !V {
 pub fn parse(a: A, bytes: []const u8) !Request {
     if (bytes.len > 16 * 1024 * 1024) return error.DecideRequestLimitExceeded;
     const value = std.json.parseFromSliceLeaky(V, a, bytes, .{ .duplicate_field_behavior = .@"error" }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidDecideRequest;
+    return parseValue(a, value);
+}
+/// Shared parsed-envelope entrypoint avoids reparsing when a route selects
+/// trained or generated execution from the same authenticated request.
+pub fn parseValue(a: A, value: V) !Request {
     const root = try object(value);
     try keys(root, &.{ "model", "model_identity", "input", "inputs", "questions", "embedding_options", "long_document" });
     const model = try text(root.get("model") orelse return error.InvalidDecideRequest);
@@ -614,4 +620,8 @@ test "decisions public rejects duplicate questions and extraction decision alias
         "{\"inputs\":[{\"schema\":{\"classifications\":[{\"similarity_thresholds\":0.4}]}}]}",
     }) |json| try std.testing.expectError(error.UnsupportedExtractionFeature, validateExtractionBoundary(try std.json.parseFromSliceLeaky(V, a, json, .{})));
     try validateExtractionBoundary(try std.json.parseFromSliceLeaky(V, a, "{\"schema\":{\"entities\":[\"person\"],\"classifications\":[{\"mode\":\"multi\",\"labels\":[\"a\",\"b\"]}]}}", .{}));
+}
+
+test {
+    _ = generated;
 }

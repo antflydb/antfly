@@ -5167,6 +5167,9 @@ fn cloneResolverReplayDiagnostics(alloc: std.mem.Allocator, stats: db_mod.types.
         errdefer alloc.free(resolution_artifact);
         resolvers[i] = .{
             .name = name,
+            .config_generation = resolver.config_generation,
+            .effective_generation = resolver.effective_generation,
+            .curation_revision = resolver.curation_revision,
             .table = table,
             .source_artifact = source_artifact,
             .resolution_artifact = resolution_artifact,
@@ -5175,6 +5178,7 @@ fn cloneResolverReplayDiagnostics(alloc: std.mem.Allocator, stats: db_mod.types.
     }
 
     return .{
+        .reresolve_pending = stats.reresolve_pending,
         .resolver_count = stats.resolver_count,
         .resolution_runtime_present = stats.resolution_runtime_present,
         .resolution_worker_started = stats.resolution_worker_started,

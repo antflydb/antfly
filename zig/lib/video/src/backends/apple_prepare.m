@@ -20,6 +20,94 @@
 #include <math.h>
 // Embedded by the Zig build as a generated header, never loaded from cwd.
 #include "video_prepare_shader.h"
+// Model-owned, bounded immutable storage. Preparers/commands retain borrowed
+// entries independently, so replacement never invalidates an in-flight buffer.
+@interface AVPreparationCacheEntry : NSObject
+@property(nonatomic, strong) NSData *key;
+@property(nonatomic, strong) id value;
+@property(nonatomic) size_t bytes;
+@property(nonatomic) size_t logicalBytes;
+@end
+@implementation AVPreparationCacheEntry
+@end
+@interface AVPreparationCache : NSObject
+@property(nonatomic, strong) id<MTLDevice> device;
+@property(nonatomic, strong) NSLock *lock;
+@property(nonatomic, strong) NSMutableArray<AVPreparationCacheEntry *> *entries;
+@property(nonatomic) size_t limit;
+@property(nonatomic) size_t bytes;
+@property(nonatomic) uint64_t hits;
+@property(nonatomic) uint64_t inserts;
+@end
+@implementation AVPreparationCache
+@end
+static NSData *preparationKey(uint32_t kind, const uint32_t *key, size_t count) {
+    if (count > 5) return nil;
+    uint32_t words[6] = {kind, 0, 0, 0, 0, 0};
+    memcpy(words + 1, key, count * sizeof(uint32_t));
+    return [NSData dataWithBytes:words length:(count + 1) * sizeof(uint32_t)];
+}
+static id preparationLookup(AVPreparationCache *cache, id<MTLDevice> device, NSData *key, size_t *bytes) {
+    if (!cache || cache.device != device || !key) return nil;
+    [cache.lock lock];
+    @try {
+        for (NSUInteger i = 0; i < cache.entries.count; ++i) {
+            AVPreparationCacheEntry *entry = cache.entries[i];
+            if ([entry.key isEqual:key]) {
+                [cache.entries removeObjectAtIndex:i]; [cache.entries addObject:entry];
+                ++cache.hits; if (bytes) *bytes = entry.logicalBytes;
+                return entry.value;
+            }
+        }
+        return nil;
+    } @finally { [cache.lock unlock]; }
+}
+static void preparationStore(AVPreparationCache *cache, id<MTLDevice> device, NSData *key, id value, size_t bytes, size_t logicalBytes) {
+    if (!cache || cache.device != device || !key || !value || !bytes) return;
+    [cache.lock lock];
+    @try {
+        if (bytes > cache.limit) return;
+        for (AVPreparationCacheEntry *entry in cache.entries) if ([entry.key isEqual:key]) return;
+        while (cache.entries.count && (cache.entries.count >= 8 || bytes > cache.limit - cache.bytes)) {
+            cache.bytes -= cache.entries[0].bytes; [cache.entries removeObjectAtIndex:0];
+        }
+        AVPreparationCacheEntry *entry = [AVPreparationCacheEntry new];
+        entry.key = key; entry.value = value; entry.bytes = bytes; entry.logicalBytes = logicalBytes;
+        [cache.entries addObject:entry]; cache.bytes += bytes; ++cache.inserts;
+    } @finally { [cache.lock unlock]; }
+}
+int32_t av_preparation_cache_create(void *device, size_t limit, void **out) {
+    *out = NULL;
+    if (!device || !limit || limit > 16 * 1024 * 1024) return -1;
+    @autoreleasepool {
+        AVPreparationCache *cache = [AVPreparationCache new];
+        cache.device = (__bridge id<MTLDevice>)device; cache.limit = limit;
+        cache.lock = [NSLock new]; cache.entries = [NSMutableArray new];
+        *out = (__bridge_retained void *)cache; return 0;
+    }
+}
+void av_preparation_cache_destroy(void *p) { if (p) { id cache = (__bridge_transfer id)p; (void)cache; } }
+// Disable publication before dropping entries. Existing preparers/commands
+// retain their own pins under request admission and may continue privately.
+void av_preparation_cache_suspend(void *p) {
+    @autoreleasepool {
+        AVPreparationCache *cache = (__bridge AVPreparationCache *)p;
+        [cache.lock lock];
+        cache.limit = 0; [cache.entries removeAllObjects]; cache.bytes = 0;
+        [cache.lock unlock];
+    }
+}
+int32_t av_preparation_cache_resume(void *p, size_t limit) {
+    if (!limit || limit > 16 * 1024 * 1024) return -1;
+    AVPreparationCache *cache = (__bridge AVPreparationCache *)p;
+    [cache.lock lock]; cache.limit = limit; [cache.lock unlock]; return 0;
+}
+void av_preparation_cache_stats(void *p, uint64_t *out) {
+    AVPreparationCache *cache = (__bridge AVPreparationCache *)p;
+    [cache.lock lock];
+    out[0] = cache.hits; out[1] = cache.inserts; out[2] = cache.bytes; out[3] = cache.entries.count;
+    [cache.lock unlock];
+}
 @interface AVPreparer : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
@@ -30,6 +118,11 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> chromaNative;
 @property(nonatomic, strong) id<MTLComputePipelineState> chromaFloat;
 @property(nonatomic) void *cache;
+@property(nonatomic, strong) AVPreparationCache *coefficientsCache;
+// Single producer, append-only; never overwrite a span observed by inference.
+@property(nonatomic, strong) id<MTLBuffer> outputSlab;
+@property(nonatomic) size_t outputCapacity;
+@property(nonatomic) size_t outputUsed;
 @property(nonatomic, strong) id<MTLBuffer> pqLUT;
 @property(nonatomic, strong) id<MTLBuffer> hlgLUT;
 @end
@@ -39,16 +132,53 @@
 @interface AVPrepared : NSObject
 @property(nonatomic, strong) id<MTLCommandBuffer> command;
 @property(nonatomic, strong) id<MTLBuffer> output;
+@property(nonatomic) size_t outputOffset;
+@property(nonatomic) size_t outputBytes;
 @property(nonatomic) void *imported;
 @property(nonatomic, strong) id<MTLBuffer> rgba;
 @property(nonatomic, strong) id<MTLTexture> nativeY;
 @property(nonatomic, strong) id<MTLTexture> nativeUV;
+@property(nonatomic, strong) dispatch_semaphore_t completion;
 @property(nonatomic) BOOL completed;
 @property(nonatomic) double gpuSeconds;
 @end
 @implementation AVPrepared
 - (void)dealloc { if (_command.status >= MTLCommandBufferStatusCommitted) [_command waitUntilCompleted]; av_metal_import_release(_imported); }
 @end
+// One bounded device entry; request queues, texture imports, slabs and LUTs
+// stay request-owned. Publication and compilation share a lock, preventing
+// concurrent cold requests from compiling identical pipelines twice.
+static BOOL preparationPipelines(AVPreparer *p) {
+    static NSLock *lock;
+    static AVPreparer *cached;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSLock new]; });
+    [lock lock];
+    @try {
+        if (cached.device == p.device) {
+            p.horizontal = cached.horizontal; p.vertical = cached.vertical;
+            p.horizontalRGBA = cached.horizontalRGBA; p.horizontalNative = cached.horizontalNative;
+            p.chromaNative = cached.chromaNative; p.chromaFloat = cached.chromaFloat;
+            return YES;
+        }
+        NSError *error = nil;
+        id<MTLLibrary> library = [p.device newLibraryWithSource:@VIDEO_PREPARE_SHADER options:nil error:&error];
+        if (!library) return NO;
+        p.horizontal = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal"] error:&error];
+        p.vertical = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"vertical_patch"] error:&error];
+        p.horizontalRGBA = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal_rgba"] error:&error];
+        p.horizontalNative = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal_native"] error:&error];
+        p.chromaNative = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"chroma_horizontal_native"] error:&error];
+        p.chromaFloat = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"chroma_horizontal_float"] error:&error];
+        if (!p.horizontal || !p.vertical || !p.horizontalRGBA || !p.horizontalNative || !p.chromaNative || !p.chromaFloat) return NO;
+        AVPreparer *entry = [AVPreparer new]; entry.device = p.device;
+        entry.horizontal = p.horizontal; entry.vertical = p.vertical;
+        entry.horizontalRGBA = p.horizontalRGBA; entry.horizontalNative = p.horizontalNative;
+        entry.chromaNative = p.chromaNative; entry.chromaFloat = p.chromaFloat;
+        cached = entry;
+        return YES;
+    } @finally { [lock unlock]; }
+}
 int32_t av_preparer_create(void *device, void **out) {
     *out = NULL;
     if (!device) return -1;
@@ -58,16 +188,7 @@ int32_t av_preparer_create(void *device, void **out) {
         void *cache = NULL;
         if (!p.queue || av_metal_create(device, &cache)) return -1;
         p.cache = cache;
-        NSError *error = nil;
-        id<MTLLibrary> library = [p.device newLibraryWithSource:@VIDEO_PREPARE_SHADER options:nil error:&error];
-        if (!library) return -1;
-        p.horizontal = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal"] error:&error];
-        p.vertical = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"vertical_patch"] error:&error];
-        p.horizontalRGBA = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal_rgba"] error:&error];
-        p.horizontalNative = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal_native"] error:&error];
-        p.chromaNative = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"chroma_horizontal_native"] error:&error];
-        p.chromaFloat = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"chroma_horizontal_float"] error:&error];
-        if (!p.horizontal || !p.vertical || !p.horizontalRGBA || !p.horizontalNative || !p.chromaNative || !p.chromaFloat) return -1;
+        if (!preparationPipelines(p)) return -1;
         *out = (__bridge_retained void *)p; return 0;
     }
 }
@@ -78,6 +199,29 @@ void av_preparer_destroy(void *p) {
         // Fence all earlier submissions before releasing shared cache admission.
         id<MTLCommandBuffer> fence = [owner.queue commandBuffer];
         [fence commit]; [fence waitUntilCompleted];
+    }
+}
+int32_t av_preparer_output_slab(void *handle, size_t bytes) {
+    @autoreleasepool {
+        AVPreparer *p = (__bridge AVPreparer *)handle;
+        if (!bytes || bytes % sizeof(float) || p.outputCapacity) return -1;
+        p.outputSlab = [p.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!p.outputSlab) return -1;
+        p.outputCapacity = bytes;
+        return 0;
+    }
+}
+void av_preparer_set_cache(void *handle, void *cache) {
+    AVPreparer *p = (__bridge AVPreparer *)handle;
+    p.coefficientsCache = (__bridge AVPreparationCache *)cache;
+}
+int32_t av_preparation_cache_get(void *handle, uint32_t kind, const uint32_t *key, size_t count, void **out, size_t *bytes) {
+    *out = NULL; *bytes = 0;
+    @autoreleasepool {
+        AVPreparer *p = (__bridge AVPreparer *)handle;
+        id entry = preparationLookup(p.coefficientsCache, p.device, preparationKey(kind, key, count), bytes);
+        if (!entry) return 0;
+        *out = (__bridge_retained void *)entry; return 1;
     }
 }
 static id<MTLBuffer> upload(id<MTLDevice> device, const void *bytes, size_t length) {
@@ -92,7 +236,7 @@ static id<MTLBuffer> upload(id<MTLDevice> device, const void *bytes, size_t leng
 @implementation AVCoefficients
 @end
 int32_t av_coefficients_create(void *handle, const uint32_t *xaxis, size_t xsize, const int32_t *xweights, size_t xcount,
-    const uint32_t *yaxis, size_t ysize, const int32_t *yweights, size_t ycount, void **out) {
+    const uint32_t *yaxis, size_t ysize, const int32_t *yweights, size_t ycount, const uint32_t *key, void **out) {
     *out = NULL;
     @autoreleasepool {
         AVPreparer *p = (__bridge AVPreparer *)handle;
@@ -102,6 +246,9 @@ int32_t av_coefficients_create(void *handle, const uint32_t *xaxis, size_t xsize
         c.yb = upload(p.device, yaxis, ysize * sizeof(uint32_t));
         c.yw = upload(p.device, yweights, ycount * sizeof(int32_t));
         if (!c.xb || !c.xw || !c.yb || !c.yw) return -1;
+        preparationStore(p.coefficientsCache, p.device, preparationKey(0, key, 5), c,
+            c.xb.allocatedSize + c.xw.allocatedSize + c.yb.allocatedSize + c.yw.allocatedSize,
+            c.xb.length + c.xw.length + c.yb.length + c.yw.length);
         *out = (__bridge_retained void *)c; return 0;
     }
 }
@@ -114,28 +261,32 @@ _Static_assert(sizeof(AVChromaTap) == 44, "Metal chroma coefficient ABI changed"
 @end
 @implementation AVChromaCoefficients
 @end
-int32_t av_chroma_create(void *handle, const void *x, size_t xcount, const void *y, size_t ycount, void **out) {
+int32_t av_chroma_create(void *handle, const void *x, size_t xcount, const void *y, size_t ycount, const uint32_t *key, void **out) {
     *out = NULL;
     @autoreleasepool {
         AVPreparer *p = (__bridge AVPreparer *)handle;
         AVChromaCoefficients *c = [AVChromaCoefficients new];
         c.x = upload(p.device, x, xcount * sizeof(AVChromaTap)); c.y = upload(p.device, y, ycount * sizeof(AVChromaTap));
         if (!c.x || !c.y) return -1;
+        preparationStore(p.coefficientsCache, p.device, preparationKey(1, key, 3), c, c.x.allocatedSize + c.y.allocatedSize, c.x.length + c.y.length);
         *out = (__bridge_retained void *)c; return 0;
     }
 }
 void av_chroma_destroy(void *p) { if (p) { id object = (__bridge_transfer id)p; (void)object; } }
 // Shared dispatch keeps resize/patch packing identical for both input formats.
 static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t rgba_size, const uint32_t *params,
-    void *coefficients, void *chromaCoefficients, void **out, id<MTLTexture> nativeY, id<MTLTexture> nativeUV) {
+    void *coefficients, void *chromaCoefficients, void **out, id<MTLTexture> nativeY, id<MTLTexture> nativeUV, id<MTLBuffer> destination, size_t destinationOffset) {
     *out = NULL;
     @autoreleasepool {
         AVPreparer *p = (__bridge AVPreparer *)handle;
         AVCoefficients *c = (__bridge AVCoefficients *)coefficients;
         AVPrepared *result = [AVPrepared new];
         if (params[8] < 8 || params[8] > 14 || params[11] > 16 - params[8] || (params[8] == 8 && params[11] != 0)) return -1;
-        if ((params[5] == 3 && !rgba && (params[9] != 3 || !params[6] || params[12])) || params[5] > 3 || params[12] > 2 || (params[5] == 2 && params[12] == 0) || (rgba && params[12] != 0)) return -1;
+        if ((!rgba && ((params[5] == 3 && (params[9] != 3 || !params[6] || params[12])) || params[5] > 3 || (params[5] == 2 && params[12] == 0))) || params[12] > 2 || (rgba && params[12] != 0)) return -1;
         id<MTLBuffer> toneLUT = params[12] == 1 ? p.pqLUT : p.hlgLUT;
+        if (params[12] && !toneLUT) {
+            toneLUT = preparationLookup(p.coefficientsCache, p.device, preparationKey(2, params + 12, 1), NULL);
+        }
         if (params[12] && !toneLUT) {
             float table[16385];
             for (size_t i = 0; i <= 16384; ++i) {
@@ -148,8 +299,9 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
             }
             toneLUT = upload(p.device, table, sizeof(table));
             if (!toneLUT) return -1;
-            if (params[12] == 1) p.pqLUT = toneLUT; else p.hlgLUT = toneLUT;
+            preparationStore(p.coefficientsCache, p.device, preparationKey(2, params + 12, 1), toneLUT, toneLUT.allocatedSize, toneLUT.length);
         }
+        if (params[12]) { if (params[12] == 1) p.pqLUT = toneLUT; else p.hlgLUT = toneLUT; }
         id<MTLTexture> y = nil, uv = nil;
         if (nativeY) {
             if (params[8] < 8 || params[8] > 14 || params[9] > 3 || ((nativeUV == nil) != (params[9] == 0))) return -1;
@@ -171,8 +323,11 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
             }
             result.nativeY = y = nativeY; result.nativeUV = uv = nativeUV;
         } else if (rgba) {
-            if (rgba_size != (size_t)params[0] * params[1] * 4) return -1;
-            // Copies before returning; the producer can immediately free RGBA.
+            size_t channels = params[5], stride = params[6];
+            if ((channels != 3 && channels != 4) || !params[0] || !params[1] ||
+                stride < (size_t)params[0] * channels ||
+                rgba_size != stride * (params[1] - 1) + (size_t)params[0] * channels) return -1;
+            // Copies before returning; the producer can immediately free RGB/RGBA.
             result.rgba = upload(p.device, rgba, rgba_size);
             if (!result.rgba) return -1;
         } else {
@@ -184,7 +339,17 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         }
         size_t height = (params[4] & 1) ? params[0] - params[13] - params[15] : params[1] - params[14] - params[16];
         id<MTLBuffer> temp = [p.device newBufferWithLength:(size_t)params[2] * height * 3 options:MTLResourceStorageModePrivate];
-        result.output = [p.device newBufferWithLength:(size_t)params[2] * params[3] * 3 * sizeof(float) options:MTLResourceStorageModeShared];
+        size_t outputBytes = (size_t)params[2] * params[3] * 3 * sizeof(float);
+        BOOL slab = !destination && p.outputCapacity;
+        if (slab) {
+            if (p.outputUsed > p.outputCapacity || outputBytes > p.outputCapacity - p.outputUsed) return -1;
+            destination = p.outputSlab;
+            destinationOffset = p.outputUsed;
+        }
+        if (destination && (destination.device != p.device || destinationOffset % sizeof(float) || destinationOffset > destination.length || outputBytes > destination.length-destinationOffset)) return -1;
+        result.output = destination ?: [p.device newBufferWithLength:outputBytes options:MTLResourceStorageModeShared];
+        result.outputOffset = destination ? destinationOffset : 0;
+        result.outputBytes = outputBytes;
         result.command = [p.queue commandBuffer];
         if (!temp || !result.output || !c.xb || !c.xw || !c.yb || !c.yw || !result.command) return -1;
         AVChromaCoefficients *chroma = (__bridge AVChromaCoefficients *)chromaCoefficients;
@@ -214,24 +379,44 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         if (!rgba) { [encoder setBuffer:reconstruct ? chromaHorizontal : c.xw offset:0 atIndex:6]; [encoder setBuffer:reconstruct ? chroma.y : c.xw offset:0 atIndex:7]; }
         [encoder dispatchThreads:MTLSizeMake(params[2], height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         encoder = [result.command computeCommandEncoder]; if (!encoder) return -1;
-        [encoder setComputePipelineState:p.vertical]; [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBuffer:result.output offset:0 atIndex:1];
+        [encoder setComputePipelineState:p.vertical]; [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBuffer:result.output offset:result.outputOffset atIndex:1];
         [encoder setBytes:params length:68 atIndex:2]; [encoder setBuffer:c.yb offset:0 atIndex:3]; [encoder setBuffer:c.yw offset:0 atIndex:4];
         [encoder dispatchThreads:MTLSizeMake(params[2], params[3], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
-        [result.command commit]; *out = (__bridge_retained void *)result; return 0;
+        result.completion = dispatch_semaphore_create(0);
+        dispatch_semaphore_t completion = result.completion;
+        [result.command addCompletedHandler:^(id<MTLCommandBuffer> command) {
+            (void)command; dispatch_semaphore_signal(completion);
+        }];
+        [result.command commit];
+        if (slab) p.outputUsed += outputBytes;
+        *out = (__bridge_retained void *)result; return 0;
     }
 }
 int32_t av_prepare_submit(void *handle, void *surface, const uint32_t *params, void *coefficients, void *chromaCoefficients, void **out) {
-    return prepare(handle, surface, NULL, 0, params, coefficients, chromaCoefficients, out, nil, nil);
+    return prepare(handle, surface, NULL, 0, params, coefficients, chromaCoefficients, out, nil, nil, nil, 0);
 }
 int32_t av_prepare_rgba_submit(void *handle, const uint8_t *rgba, size_t size, const uint32_t *params, void *coefficients, void **out) {
     if (!rgba) { *out = NULL; return -1; }
-    return prepare(handle, NULL, rgba, size, params, coefficients, NULL, out, nil, nil);
+    return prepare(handle, NULL, rgba, size, params, coefficients, NULL, out, nil, nil, nil, 0);
+}
+int32_t av_prepare_rgba_into_submit(void *handle, const uint8_t *rgba, size_t size, const uint32_t *params, void *coefficients, void *destination, size_t offset, void **out) {
+    if (!rgba || !destination) { *out = NULL; return -1; }
+    return prepare(handle, NULL, rgba, size, params, coefficients, NULL, out, nil, nil, (__bridge id<MTLBuffer>)destination, offset);
 }
 int av_prepared_poll(void *p) {
     AVPrepared *result = (__bridge AVPrepared *)p;
     if (result.completed) return 1;
     MTLCommandBufferStatus status = result.command.status;
     return status == MTLCommandBufferStatusCompleted ? 1 : status == MTLCommandBufferStatusError ? -1 : 0;
+}
+// Completion wakes immediately; the timeout bounds cancellation/deadline checks
+// in the Zig caller, rather than imposing a sleep on the successful fast path.
+int av_prepared_wait(void *p, uint64_t timeout_ns) {
+    int status = av_prepared_poll(p);
+    if (status) return status;
+    AVPrepared *result = (__bridge AVPrepared *)p;
+    dispatch_semaphore_wait(result.completion, dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeout_ns));
+    return av_prepared_poll(p);
 }
 int av_prepared_release_source(void *p) {
     if (av_prepared_poll(p) != 1) return -1;
@@ -243,11 +428,26 @@ int av_prepared_release_source(void *p) {
     result.rgba = nil; result.nativeY = nil; result.nativeUV = nil;
     return 0;
 }
+size_t av_prepared_offset(void *p) { return ((__bridge AVPrepared *)p).outputOffset; }
 void *av_prepared_buffer(void *p) { return (__bridge void *)((__bridge AVPrepared *)p).output; }
 int32_t av_prepared_copy(void *p, float *out, size_t count) {
     AVPrepared *result = (__bridge AVPrepared *)p;
-    if (av_prepared_poll(p) != 1 || count > result.output.length / sizeof(float)) return -1;
-    memcpy(out, result.output.contents, count * sizeof(float)); return 0;
+    if (av_prepared_poll(p) != 1 || count > result.outputBytes / sizeof(float)) return -1;
+    id<MTLBuffer> readable = result.output;
+    size_t offset = result.outputOffset, bytes = count * sizeof(float);
+    if (readable.storageMode == MTLStorageModePrivate) {
+        id<MTLCommandQueue> queue = [readable.device newCommandQueue];
+        id<MTLBuffer> staging = [readable.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
+        if (!staging || !command || !encoder) return -1;
+        [encoder copyFromBuffer:readable sourceOffset:offset toBuffer:staging destinationOffset:0 size:bytes];
+        [encoder endEncoding]; [command commit]; [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted) return -1;
+        readable = staging; offset = 0;
+    }
+    if (!readable.contents) return -1;
+    memcpy(out, (const uint8_t *)readable.contents+offset, bytes); return 0;
 }
 void av_prepared_destroy(void *p) {
     if (p) {
@@ -266,7 +466,7 @@ double av_prepared_gpu_seconds(void *p) {
 uint64_t av_preparer_device_bytes(void *p) { return ((__bridge AVPreparer *)p).device.currentAllocatedSize; }
 
 int32_t av_prepare_native_submit(void *handle, void *y, void *uv, const uint32_t *params, void *coefficients, void *chromaCoefficients, void **out) {
-    return prepare(handle, NULL, NULL, 0, params, coefficients, chromaCoefficients, out, (__bridge id<MTLTexture>)y, (__bridge id<MTLTexture>)uv);
+    return prepare(handle, NULL, NULL, 0, params, coefficients, chromaCoefficients, out, (__bridge id<MTLTexture>)y, (__bridge id<MTLTexture>)uv, nil, 0);
 }
 int32_t av_prepare_host_submit(void *handle, const uint8_t *yb, size_t ys, const uint8_t *uvb, size_t uvs, const uint32_t *params, void *coefficients, void *chromaCoefficients, void **out) {
     *out = NULL;
@@ -282,11 +482,16 @@ int32_t av_prepare_host_submit(void *handle, const uint8_t *yb, size_t ys, const
         if (!y || (params[9] != 0 && !uv)) return -1;
         [y replaceRegion:MTLRegionMake2D(0, 0, params[0], params[1]) mipmapLevel:0 withBytes:yb bytesPerRow:ys];
         if (params[9] != 0) [uv replaceRegion:MTLRegionMake2D(0, 0, cw, ch) mipmapLevel:0 withBytes:uvb bytesPerRow:uvs];
-        return prepare(handle, NULL, NULL, 0, params, coefficients, chromaCoefficients, out, y, uv);
+        return prepare(handle, NULL, NULL, 0, params, coefficients, chromaCoefficients, out, y, uv, nil, 0);
     }
 }
 
-uint32_t av_preparer_tone_mask(void *handle) {
-    AVPreparer *p = (__bridge AVPreparer *)handle;
-    return (p.pqLUT ? 1u : 0u) | (p.hlgLUT ? 2u : 0u);
+uint32_t av_preparer_tone_mask(void *handle, uint32_t requested) {
+    @autoreleasepool {
+        AVPreparer *p = (__bridge AVPreparer *)handle;
+        const uint32_t pq = 1, hlg = 2;
+        if ((requested & 1u) && !p.pqLUT) p.pqLUT = preparationLookup(p.coefficientsCache, p.device, preparationKey(2, &pq, 1), NULL);
+        if ((requested & 2u) && !p.hlgLUT) p.hlgLUT = preparationLookup(p.coefficientsCache, p.device, preparationKey(2, &hlg, 1), NULL);
+        return (p.pqLUT ? 1u : 0u) | (p.hlgLUT ? 2u : 0u);
+    }
 }

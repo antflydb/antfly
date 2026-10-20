@@ -1357,7 +1357,9 @@ pub const MetadataHttpClient = struct {
                 error.ExtensionOwnedObject
             else
                 error.TableTopologyProtocolUpgradeRequired,
-            409 => if ((input == .store_root_enroll or input == .store_root_enrollment_status) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
+            409 => if (std.mem.eql(u8, response.body, "ResolverCurationConflict"))
+                error.ResolverCurationConflict
+            else if ((input == .store_root_enroll or input == .store_root_enrollment_status) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
                 error.StoreRootEnrollmentChanged
             else
                 error.CatalogGenerationChanged,
@@ -1508,11 +1510,15 @@ pub const MetadataHttpClient = struct {
                 .group_ids = try self.alloc.alloc(u64, 0),
             };
         }
+        // Status text alone cannot certify rejection after possible admission.
+        if (outcome != .not_proposed) return error.MetadataMutationOutcomeUnknown;
         return switch (resp.status) {
             400 => if (kind == .create_table) error.InvalidCreateTableRequest else error.InvalidTableName,
             404 => error.TableNotFound,
             405 => error.UnsupportedOperation,
-            409 => if (kind == .create_table)
+            409 => if (std.mem.eql(u8, resp.body, "ResolverCurationConflict"))
+                error.ResolverCurationConflict
+            else if (kind == .create_table)
                 error.TableAlreadyExists
             else if (responseHeader(resp, routes.Routes.table_mutation_error_header)) |value|
                 if (std.mem.eql(u8, value, routes.Routes.table_mutation_error_extension_owned))
@@ -3521,6 +3527,7 @@ fn consumerTests() type {
                 header_value: []const u8,
                 outcome_value: []const u8,
                 status: u16 = 503,
+                response_body: []const u8 = "metadata authority unavailable",
                 attempts: usize = 0,
 
                 fn ownedHeader(
@@ -3557,7 +3564,7 @@ fn consumerTests() type {
                         self.outcome_value,
                     );
                     initialized += 1;
-                    const body = try alloc.dupe(u8, "metadata authority unavailable");
+                    const body = try alloc.dupe(u8, self.response_body);
                     return .{ .status = self.status, .headers = headers, .body = body };
                 }
             };
@@ -3614,6 +3621,21 @@ fn consumerTests() type {
                 topology_too_large_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
             );
             try std.testing.expectEqual(@as(usize, 1), topology_too_large.attempts);
+            for ([_][]const u8{ routes.Routes.raft_mutation_outcome_not_proposed, routes.Routes.raft_mutation_outcome_unknown, routes.Routes.raft_mutation_outcome_committed }) |outcome| {
+                var conflict = RejectingExecutor{
+                    .header_name = "Retry-After",
+                    .header_value = "0",
+                    .outcome_value = outcome,
+                    .status = 409,
+                    .response_body = "ResolverCurationConflict",
+                };
+                var conflict_client = MetadataHttpClient.init(std.testing.allocator, conflict.executor());
+                try std.testing.expectError(
+                    if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) error.ResolverCurationConflict else error.MetadataMutationOutcomeUnknown,
+                    conflict_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+                );
+                try std.testing.expectEqual(@as(usize, 1), conflict.attempts);
+            }
             // The new proof is distinct from non-admission. Incompatible status or
             // unknown outcomes must not authorize a replay, including a success code.
             for ([_]u16{ 200, 409, 500, 503 }) |status| {
@@ -4878,17 +4900,19 @@ test "system catalog relation replacement preserves private grants and definitiv
     const authority = @import("../system_catalog/setting_authority.zig");
     const Executor = struct {
         outcome: []const u8 = routes.Routes.raft_mutation_outcome_not_proposed,
+        response_status: u16 = 405,
+        response_body: []const u8 = "ExtensionOwnedObject",
         fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try authority.verify("relation-admin-secret", "relation-admin-issuer", .admin, request.body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
-            const body = try a.dupe(u8, "ExtensionOwnedObject");
+            const body = try a.dupe(u8, self.response_body);
             errdefer a.free(body);
             const headers = try a.alloc(http_common.Header, 1);
             errdefer a.free(headers);
             const name = try a.dupe(u8, routes.Routes.raft_mutation_outcome_header);
             errdefer a.free(name);
             headers[0] = .{ .name = name, .value = try a.dupe(u8, self.outcome) };
-            return .{ .status = 405, .body = body, .headers = headers };
+            return .{ .status = self.response_status, .body = body, .headers = headers };
         }
     };
     var executor: Executor = .{};
@@ -4906,6 +4930,13 @@ test "system catalog relation replacement preserves private grants and definitiv
     try std.testing.expectError(error.ExtensionOwnedObject, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, true));
     executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, true));
+    executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;
+    executor.response_status = 409;
+    executor.response_body = "ResolverCurationConflict";
+    try std.testing.expectError(error.ResolverCurationConflict, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, true));
+    executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalog("http://metadata.invalid", call, forwarding, true));
+    try std.testing.expectEqual(@as(u16, 409), system_catalog.httpStatus(error.ResolverCurationConflict));
     try std.testing.expectEqual(@as(u16, 405), system_catalog.httpStatus(error.ExtensionOwnedObject));
     try std.testing.expectEqual(@as(u16, 426), system_catalog.httpStatus(error.TableTopologyUpgradeRequired));
     try std.testing.expectEqual(@as(u16, 503), system_catalog.httpStatus(error.CatalogPublicationProofPending));

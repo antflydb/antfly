@@ -1253,7 +1253,7 @@ pub const Membership = struct {
                     initialized = false;
                 }
                 try index.grow(work, hashes, initialized);
-                var at = hash & (index.slots.len - 1);
+                var at: usize = @intCast(hash & (index.slots.len - 1));
                 while (index.slots[at] != empty) {
                     try work.consume(1);
                     at = (at + 1) & (index.slots.len - 1);
@@ -1284,7 +1284,7 @@ pub const Membership = struct {
                 break :cached hashes[ordinal];
             } else try hashElement(self.value.element_type, self.value.flatCell(ordinal), work);
             if (ordinal < hashes.len) hashes[ordinal] = hash;
-            var bucket = hash & (slots.len - 1);
+            var bucket: usize = @intCast(hash & (slots.len - 1));
             while (slots[bucket] != empty) {
                 try work.consume(1);
                 bucket = (bucket + 1) & (slots.len - 1);
@@ -1309,7 +1309,7 @@ pub const Membership = struct {
     const Search = struct { bucket: usize = 0, found: bool = false };
     fn searchSlot(self: *const Membership, element: Element, hash: u64, work: *Budget) !Search {
         if (self.slots.len == 0) return .{};
-        var bucket = hash & (self.slots.len - 1);
+        var bucket: usize = @intCast(hash & (self.slots.len - 1));
         while (self.slots[bucket] != empty) {
             if (self.tags[bucket] == @as(u8, @truncate(hash >> 56))) {
                 // Equality already charges this occupied bucket's visit.
@@ -2083,7 +2083,7 @@ test "SQL membership construction compares legacy probes and bounded hash reuse"
                 const hash = try hashElement(index.value.element_type, element, work);
                 if (try index.findSlot(element, hash, work) != null) continue;
                 if (index.count >= index.slots.len / 2) try index.grow(work, &.{}, true);
-                var bucket = hash & (index.slots.len - 1);
+                var bucket: usize = @intCast(hash & (index.slots.len - 1));
                 while (index.slots[bucket] != Membership.empty) {
                     try work.consume(1);
                     bucket = (bucket + 1) & (index.slots.len - 1);

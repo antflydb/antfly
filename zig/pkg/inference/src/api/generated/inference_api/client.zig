@@ -4,6 +4,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const types = @import("types.zig");
+const antfly_decision_openapi = @import("antfly_decision_openapi");
 const antfly_extraction_openapi = @import("antfly_extraction_openapi");
 
 pub fn ApiResponse(comptime T: type) type {
@@ -130,7 +131,7 @@ pub const Client = struct {
 
     /// Answer named decision questions
     /// POST /decisions
-    pub fn decide(self: *@This(), body: types.DecideRequest) !ApiResponse(types.DecideResponse) {
+    pub fn decide(self: *@This(), body: antfly_decision_openapi.DecisionRequest) !ApiResponse(types.DecideResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/decisions", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
@@ -183,7 +184,7 @@ pub const Client = struct {
 
     /// Extract entities, relations, classifications, and structures
     /// POST /extract
-    pub fn extract(self: *@This(), body: antfly_extraction_openapi.ExtractionRequest) !ApiResponse(antfly_extraction_openapi.ExtractionResponse) {
+    pub fn extract(self: *@This(), body: antfly_extraction_openapi.ExtractionInputRequest) !ApiResponse(antfly_extraction_openapi.ExtractionResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/extract", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);

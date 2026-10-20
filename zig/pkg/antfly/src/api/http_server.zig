@@ -2014,6 +2014,7 @@ pub const StatusSource = struct {
         supports_sql_views: bool = false,
         /// Hosting requires native existence, definition CAS and policy authority.
         supports_object_tables: bool = false,
+        supports_resolver_catalog_read: bool = false,
         acquire_join_planning: ?*const fn (*anyopaque, table_router.RouteBudget) anyerror!?*join_planning.Generation = null,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 = null,
 
@@ -2739,6 +2740,7 @@ pub const StatusSource = struct {
             .supports_query_definitions = true,
             .supports_sql_views = true,
             .supports_object_tables = true,
+            .supports_resolver_catalog_read = true,
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
             .control_snapshot = if (@hasDecl(T, "controlSnapshot")) Gen.controlSnapshot else null,
@@ -6811,7 +6813,7 @@ pub const ApiHttpServer = struct {
         return try self.localTableRuntimeStatusesWithSnapshot(table_name, null);
     }
 
-    fn localTableRuntimeStatusesWithSnapshot(
+    pub fn localTableRuntimeStatusesWithSnapshot(
         self: *ApiHttpServer,
         table_name: []const u8,
         snapshot: ?*const metadata_api.AdminSnapshot,
@@ -13560,6 +13562,49 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    /// Resolve the ingress credential's row predicate for a discovered public
+    /// table, preserving API-key scope and checking live permission revocation.
+    /// Only this server boundary interprets the borrowed credential capability.
+    pub fn authorizedReadFilter(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, logical: []const u8) ![]const u8 {
+        try context.ensureActive();
+        if (self.cfg.auth_enabled or context.principal != null) {
+            const authority = context.table_read_authorization orelse return error.Forbidden;
+            if (!authority.allows(authority.ptr, logical)) return error.Forbidden;
+        }
+        const admitted: ?*const ?AuthenticatedIdentity = if (context.row_policy_credential) |ptr| @ptrCast(@alignCast(ptr)) else null;
+        const identity = if (admitted) |ptr| ptr.* else null;
+        if (context.principal != null and identity == null) return error.Forbidden;
+        if (!try tablePermissionCurrentlyAllowed(identity, logical, .read)) return error.Forbidden;
+        return (try resolveEffectiveRowFilterJson(alloc, identity, logical)) orelse "";
+    }
+
+    /// Authorize discovered read participants using the admitted credential,
+    /// never physical storage IDs. Reverse bindings are bounded and share a
+    /// catalog revision so a rename cannot mix authorization namespaces.
+    pub fn authorizeTableReads(self: *ApiHttpServer, alloc: std.mem.Allocator, request: api_operation.RequestContext, names: []const []const u8) !void {
+        if (!self.cfg.auth_enabled and request.principal == null) return;
+        const authority = request.table_read_authorization orelse return error.Forbidden;
+        if (self.source.vtable.system_catalog == null) {
+            for (names) |name| if (!authority.allows(authority.ptr, name)) return error.Forbidden;
+            return;
+        }
+        var revision: ?u64 = null;
+        var offset: usize = 0;
+        while (offset < names.len) {
+            try request.ensureActive();
+            const chunk = names[offset..@min(names.len, offset + 256)];
+            const reply = try self.source.systemCatalog(alloc, request, .{ .resolve_many = .{ .storage_names = chunk, .expected_revision = revision } });
+            const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, reply, .{});
+            if (resolved.logical_names.len != chunk.len) return error.UnsupportedOperation;
+            revision = resolved.revision;
+            for (chunk, resolved.logical_names) |physical, logical| {
+                const name = logical orelse if (std.mem.startsWith(u8, physical, "table:")) return error.TableNotFound else physical;
+                if (!authority.allows(authority.ptr, name)) return error.Forbidden;
+            }
+            offset += chunk.len;
+        }
+    }
+
     /// Authorize the logical resources actually mutated by FK expansion.
     /// Reverse bindings are point-indexed and revision-fenced across chunks;
     /// physical identifiers never become public authorization resources.
@@ -16265,6 +16310,15 @@ pub const ApiHttpServer = struct {
         prepared: *PreparedIndexInstallation,
         enqueue_if_absent: bool,
     ) bool {
+        return self.activatePreparedIndexInstallationWithReplacement(prepared, enqueue_if_absent, true);
+    }
+
+    fn activatePreparedIndexInstallationWithReplacement(
+        self: *ApiHttpServer,
+        prepared: *PreparedIndexInstallation,
+        enqueue_if_absent: bool,
+        replace_existing: bool,
+    ) bool {
         const runtime = self.cfg.backend_runtime orelse return false;
         if (!prepared.reservation_active or !prepared.owns_payload) return false;
 
@@ -16281,6 +16335,7 @@ pub const ApiHttpServer = struct {
             }
         }
         if (existing == null and !enqueue_if_absent) return false;
+        if (existing != null and !replace_existing) return true;
 
         const generation = self.index_installation_next_generation;
         self.index_installation_next_generation +%= 1;
@@ -16367,6 +16422,15 @@ pub const ApiHttpServer = struct {
         var prepared = (try self.prepareLakeCommit(table_name)) orelse return;
         defer prepared.deinit(self);
         self.activateLakeCommit(&prepared);
+    }
+
+    /// Read-side freshness checks can observe an external commit before the
+    /// periodic inventory sweep. Coalesce that hint without resetting an active
+    /// build's generation, failure count, or retry deadline on every poll.
+    pub fn requestLakePublication(self: *ApiHttpServer, table_name: []const u8) !void {
+        var prepared = (try self.prepareLakeCommit(table_name)) orelse return;
+        defer prepared.deinit(self);
+        _ = self.activatePreparedIndexInstallationWithReplacement(&prepared, true, false);
     }
 
     fn resumeNativeLakeIndexPublication(self: *ApiHttpServer) !void {
@@ -19774,6 +19838,70 @@ pub const ApiHttpServer = struct {
         return count;
     }
 
+    pub fn executeResolverOperation(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, body: []const u8, input_context: api_operation.RequestContext) ![]u8 {
+        const context = try input_context.platformDeadline();
+        try context.ensureActive();
+        if (self.cfg.deployment_mode == .standalone) return (try (self.table_writes orelse return error.UnsupportedOperation).resolverOperationGroupLocal(alloc, group_id, table_name, body)) orelse return error.UnknownGroup;
+        var fallback = table_router.CatalogBackedGroupRouter.init(self.catalogSource(), self.localSessionNodeId());
+        const router = (self.cfg.session_router orelse fallback.router()).withBudget(.{ .clock = .{ .deadline_ns = context.deadline_ns }, .cancellation = context.cancellation });
+        var route = (table_router.resolveGroupRoute(alloc, self.catalogSource(), router, group_id, .prefer_leader) catch |err| {
+            try context.ensureActive();
+            return err;
+        }) orelse {
+            try context.ensureActive();
+            return error.GroupLeaderUnavailable;
+        };
+        defer route.deinit(alloc);
+        try context.ensureActive();
+        switch (route) {
+            .local => return self.executeResolverOperationLocal(alloc, table_name, group_id, body, context),
+            .remote => |remote| {
+                var client = @import("http_client.zig").ApiHttpClient.init(alloc, self.cfg.session_executor orelse return error.HttpExecutorUnavailable);
+                _ = client.withInternalServiceAuth(self.cfg.internal_service_secret, self.cfg.internal_service_issuer);
+                var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+                var reply = client.fetchGroupResolverOperationWithControl(remote.base_uri, group_id, table_name, body, try context.remainingTimeoutMs(), &cancellation) catch |err| {
+                    // Classify an exhausted request budget separately from an
+                    // unrelated transport timeout, including after acceptance.
+                    try context.ensureActive();
+                    return err;
+                };
+                defer reply.deinit(alloc);
+                try context.ensureActive();
+                return alloc.dupe(u8, reply.body);
+            },
+        }
+    }
+
+    fn executeResolverOperationLocal(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, body: []const u8, context: api_operation.RequestContext) ![]u8 {
+        const curation = @import("antfly_local_sources").storage_db_resolver_curation;
+        const writes = self.table_writes orelse return error.UnsupportedOperation;
+        var parsed = try std.json.parseFromSlice(curation.ReviewRequest, alloc, body, .{});
+        defer parsed.deinit();
+        var request = parsed.value;
+        if (request.operation == .prepare_review or request.operation == .review_status) return error.InvalidResolverCurationRequest;
+        if (request.operation != .review) return (try writes.resolverOperationGroupLocal(alloc, group_id, table_name, body)) orelse error.UnknownGroup;
+        request.operation = .prepare_review;
+        const prepared_body = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(prepared_body);
+        const prepared = (try writes.resolverOperationGroupLocal(alloc, group_id, table_name, prepared_body)) orelse return error.UnknownGroup;
+        defer alloc.free(prepared);
+        const Command = @typeInfo(@TypeOf(request.command)).optional.child;
+        var command = try std.json.parseFromSlice(Command, alloc, prepared, .{});
+        defer command.deinit();
+        var routing = (try table_catalog.tableRoutingSnapshotForWrite(alloc, self.catalogSource(), table_name, context.deadline_ns)) orelse return error.UnknownTable;
+        defer routing.deinit(alloc);
+        const document = try command.value.ownerDocumentAlloc(alloc);
+        defer alloc.free(document);
+        const route = routing.resolveRouteForKey(document) orelse return error.GroupLeaderUnavailable;
+        if (route.group_id != group_id) return error.ResolverCurationConflict;
+        const writer = self.cfg.routed_raft_batch_writer orelse return error.UnsupportedOperation;
+        const forwarding = @import("internal_batch_forwarding.zig");
+        _ = (try writer.write(alloc, .{ .catalog = routing.fenceForRoute(route) }, group_id, table_name, .{ .resolver_review = command.value, .sync_level = .write }, .{ .remaining_ms = @min((try context.remainingTimeoutMs()) orelse forwarding.max_remaining_ms, forwarding.max_remaining_ms), .forwards_remaining = forwarding.max_forwards, .campaign_allowed = false }, context)) orelse return error.UnknownGroup;
+        const status_body = try std.json.Stringify.valueAlloc(alloc, curation.ReviewRequest{ .operation = .review_status, .command = command.value }, .{});
+        defer alloc.free(status_body);
+        return (try writes.resolverOperationGroupLocal(alloc, group_id, table_name, status_body)) orelse error.UnknownGroup;
+    }
+
     pub fn executeRestoreOwner(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("restore_owner.zig").Request, context: api_operation.RequestContext) !@import("restore_owner.zig").Response {
         try context.ensureActive();
         // Standalone has no replicated placement catalog. The local owner
@@ -21438,6 +21566,7 @@ pub const ApiHttpServer = struct {
         request.indexes_json = derived_indexes_json;
         @import("antfly_local_sources").api_local_tables.validateLakeIndexCapacity(self.alloc, supported_schema, derived_indexes_json) catch return contextualJsonErrorResponse(self.alloc, 400, "lake index declaration limit exceeded");
         self.createNativeOrLegacyTable(logical_name, table_name, request, authenticated_identity) catch |err| return switch (err) {
+            error.ResolverCurationConflict => try contextual_operations.textAlloc(self.alloc, 409, "resolver configuration conflicts with the destination namespace"),
             error.ForeignKeyPartialSupportIndexRequired, error.ForeignKeyPartialSupportIndexConflict => contextualWitnessDDLError(self.alloc, err),
             error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.InvalidCatalogName, error.InvalidCatalogMutation, error.CatalogCommandTooLarge, error.Forbidden => try contextualJsonErrorResponse(self.alloc, system_catalog.httpStatus(err), @errorName(err)),
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
@@ -27502,7 +27631,10 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
             .table => .table,
             .tablespace => .tablespace,
         };
-        const permission: usermgr.PermissionType = if (method == .GET or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate"))) .write else .admin;
+        const resolver_route = if (route.kind == .table) @import("resolvers.zig").matchSuffix(route.suffix) else null;
+        const resolver_read = if (resolver_route) |r| @import("resolvers.zig").readOnly(r.op) else false;
+        const resolver_write = if (resolver_route) |r| r.op != .namespace else false;
+        const permission: usermgr.PermissionType = if (method == .GET or resolver_read or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (resolver_write or (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate")))) .write else .admin;
         return .{ .resource_type = resource_type, .resource = try system_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
     }
 
@@ -27607,6 +27739,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchTableBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
     if (routes.Routes.matchTableMerge(path)) |merge| return try tablePermission(alloc, merge.table_name, .write);
     if (routes.Routes.matchTableSchema(path)) |schema| return try tablePermission(alloc, schema.table_name, .admin);
+    if (@import("resolvers.zig").matchTablePath(path)) |r| return try tablePermission(alloc, r.table_name, if (method == .GET or @import("resolvers.zig").readOnly(r.op)) .read else if (r.op == .namespace) .admin else .write);
     if (routes.Routes.matchTableGraphMetricAction(path)) |metric_action| return switch (method) {
         .POST => try tablePermission(alloc, metric_action.table_name, .admin),
         .GET, .PUT, .DELETE => null,
@@ -58027,6 +58160,450 @@ test "api http server serves status using control metadata without diagnostic tr
     try std.testing.expectEqual(@as(usize, 0), fake.diagnostic_reads);
 }
 
+test "resolver curation HTTP resources share atomic metadata revisions and retired identity lifecycle" {
+    const alloc = std.testing.allocator;
+    const resources = @import("resolvers.zig");
+    const Source = struct {
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 1, .name = "source", .indexes_json = "{}", .placement_role = "data" },
+            .{ .table_id = 2, .name = "entities", .indexes_json = "{}", .placement_role = "data" },
+        },
+        owned: [2]?[]u8 = .{ null, null },
+        commits: u64 = 0,
+        expire_wait: bool = false,
+        narrow_reads: usize = 0,
+        forbid_snapshot: bool = false,
+        observation_failure: ?anyerror = null,
+        fail_after_commit: ?anyerror = null,
+        stress_pages: usize = 0,
+        stress_width: usize = 1,
+        reverse_read_batches: usize = 0,
+        stress_reads: usize = 0,
+        incompatible_last_page: bool = false,
+        destination_cut_changed: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(ptr: *anyopaque, context: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.forbid_snapshot) return error.UnexpectedFullCatalogRead;
+            if (self.expire_wait and context.deadline_ns != null) {
+                const remaining = (try context.remainingTimeoutMs()).?;
+                try std.testing.io.sleep(.fromMilliseconds(@as(i64, remaining) + 1), .awake);
+                try context.ensureActive();
+            }
+            if (self.observation_failure) |err| return err;
+            const tables = try std.testing.allocator.dupe(metadata_table_manager.TableRecord, &self.tables);
+            for (tables) |*table| table.indexes_json = try std.testing.allocator.dupe(u8, table.indexes_json);
+            return .{ .status = try status(ptr), .tables = tables, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn freeSnapshot(_: *anyopaque, snapshot_value: *metadata_api.AdminSnapshot) void {
+            for (snapshot_value.tables) |table| std.testing.allocator.free(table.indexes_json);
+            std.testing.allocator.free(snapshot_value.tables);
+        }
+        fn replace(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !?metadata_api.CatalogMutationStamp {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const slot: usize = if (expected.table_id == 1) 0 else 1;
+            if (!std.mem.eql(u8, expected.indexes_json, self.tables[slot].indexes_json)) return error.Conflict;
+            const bytes = try std.testing.allocator.dupe(u8, replacement.indexes_json);
+            if (self.owned[slot]) |old| std.testing.allocator.free(old);
+            self.owned[slot] = bytes;
+            self.tables[slot].indexes_json = bytes;
+            self.commits += 1;
+            self.observation_failure = self.fail_after_commit;
+            return .{ .metadata_group_id = 1, .metadata_incarnation = @splat(1), .term = 1, .index = self.commits };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            if (call == .resolve_many) {
+                const input = call.resolve_many;
+                if (input.storage_names.len != 0) {
+                    self.reverse_read_batches += 1;
+                    if (input.expected_revision) |revision| try std.testing.expectEqual(self.commits, revision);
+                    const logical = try a.alloc(?[]const u8, input.storage_names.len);
+                    for (input.storage_names, logical) |name, *out| out.* = name;
+                    return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = self.commits, .tables = &.{}, .logical_names = logical }, .{});
+                }
+                try std.testing.expectEqual(@as(?u64, null), input.expected_revision);
+                try std.testing.expectEqual(@as(usize, 1), input.targets.len);
+                return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = self.commits, .tables = &.{.{ .table_id = 2, .name = "entities" }} }, .{});
+            }
+            if (call != .resolver_catalog_read) return error.UnexpectedCatalogRead;
+            self.narrow_reads += 1;
+            const input = call.resolver_catalog_read;
+            if (input.expected_revision) |revision| try std.testing.expectEqual(self.commits, revision);
+            if (self.destination_cut_changed and input.mode == .table and std.mem.eql(u8, input.table_name, "entities")) return error.CatalogGenerationChanged;
+            const wire = @import("../metadata/resolver_catalog_read.zig");
+            if (input.mode == .table and std.mem.eql(u8, input.table_name, "source")) {
+                if (self.observation_failure) |err| return err;
+            }
+            if (input.mode == .consumers and self.stress_pages > 0) {
+                const page_index = if (input.cursor) |cursor| try std.fmt.parseInt(usize, cursor, 10) else 0;
+                try std.testing.expectEqual(@as(?u64, self.commits), input.expected_revision);
+                self.stress_reads += 1;
+                var consumer = self.tables[0];
+                consumer.table_id = 100 + page_index * self.stress_width;
+                if (self.incompatible_last_page and page_index + 1 == self.stress_pages) consumer.indexes_json =
+                    \\{"knowledge":{"name":"knowledge","type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","promote":false,"aliases":[{"key":"concept/cycle-target","target":"concept/cycle-source"}]}]}}
+                ;
+                consumer.schema_json = try a.alloc(u8, 512 * 1024);
+                @memset(@constCast(consumer.schema_json), 'x');
+                const consumers = try a.alloc(wire.Consumer, self.stress_width);
+                for (consumers, 0..) |*out, ordinal| {
+                    out.* = .{ .table = consumer, .names = &.{"concepts"} };
+                    out.table.table_id += ordinal;
+                }
+                return std.json.Stringify.valueAlloc(a, wire.Page{
+                    .version = 1,
+                    .revision = self.commits,
+                    .table = self.tables[1],
+                    .consumers = consumers,
+                    .next_cursor = if (page_index + 1 < self.stress_pages) try std.fmt.allocPrint(a, "{d}", .{page_index + 1}) else null,
+                    .indexed = true,
+                }, .{});
+            }
+            const table = if (std.mem.eql(u8, input.table_name, "entities")) self.tables[1] else self.tables[0];
+            return std.json.Stringify.valueAlloc(a, wire.Page{
+                .version = 1,
+                .revision = self.commits,
+                .table = table,
+                .consumers = if (input.mode == .consumers) &.{.{ .table = self.tables[0], .names = &.{"concepts"} }} else &.{},
+                .next_cursor = if (input.mode == .consumers and input.cursor == null) "next" else null,
+                .indexed = true,
+            }, .{});
+        }
+        fn narrowIface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .replace_table_definition_stamped = replace, .system_catalog = catalog, .supports_resolver_catalog_read = true } };
+        }
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{ .status = status, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .replace_table_definition_stamped = replace } };
+        }
+    };
+    var source: Source = .{};
+    defer for (source.owned) |owned| if (owned) |bytes| alloc.free(bytes);
+    source.tables[0].indexes_json =
+        \\{"knowledge":{"name":"knowledge","type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","promote":false}]}}
+    ;
+    var server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, source.iface(), null, null);
+    defer server.deinit();
+    const Run = struct {
+        fn call(owner: *ApiHttpServer, op: resources.Operation, table: []const u8, name: []const u8, key: []const u8, body: []const u8, expected: u16) !void {
+            var result = try resources.handle(owner, std.testing.allocator, op, table, name, key, body, "", .{});
+            defer result.deinit(std.testing.allocator);
+            if (result.status != expected) std.debug.print("curation response {d}: {s}\n", .{ result.status, result.body });
+            try std.testing.expectEqual(expected, result.status);
+        }
+    };
+    source.forbid_snapshot = true;
+    server.source = source.narrowIface();
+    // A destination policy read must be fenced to the source cut. Losing that
+    // cut rejects before publication, without falling back to a full snapshot.
+    source.destination_cut_changed = true;
+    try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/race\",\"to\":\"concept/target\"}", 409);
+    try std.testing.expectEqual(@as(u64, 0), source.commits);
+    source.destination_cut_changed = false;
+    try Run.call(&server, .list, "source", "", "", "", 200);
+    try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
+    try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
+    try std.testing.expectEqual(@as(u64, 1), source.commits);
+    try Run.call(&server, .suppress, "source", "concepts", "", "{\"keys\":[\"concept/b\"]}", 400);
+    try std.testing.expectEqual(@as(u64, 1), source.commits);
+    try Run.call(&server, .unmerge, "source", "concepts", "concept/a", "{\"pin_distinct\":true}", 202);
+    try Run.call(&server, .suppress, "source", "concepts", "", "{\"texts\":[\"private source text\"]}", 202);
+    source.fail_after_commit = error.TableNotFound;
+    const before_source_failure = source.commits;
+    var accepted_source = try resources.handle(&server, alloc, .suppress, "source", "concepts", "", "{\"texts\":[\"post-commit source failure\"]}", "", .{});
+    defer accepted_source.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), accepted_source.status);
+    try std.testing.expectEqual(before_source_failure + 1, source.commits);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_source.body, "metadata_commit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, accepted_source.body, "TableNotFound") != null);
+    source.fail_after_commit = null;
+    source.observation_failure = null;
+    // Legacy policy still belongs to each source until destination adoption.
+    // Both catalog capabilities must retain narrowed API-key read scopes.
+    {
+        const DestinationOnly = struct {
+            fn allows(_: *const anyopaque, name: []const u8) bool {
+                return std.mem.eql(u8, name, "entities");
+            }
+        };
+        var read_context: u8 = 0;
+        source.forbid_snapshot = false;
+        for ([_]StatusSource{ source.iface(), source.narrowIface() }) |iface| {
+            server.source = iface;
+            var denied_legacy = try resources.handle(&server, alloc, .entity_redirects, "entities", "", "concept/noise", "", "", .{ .principal = .{ .kind = .user, .subject = "destination-only" }, .table_read_authorization = .{ .ptr = &read_context, .allows = DestinationOnly.allows } });
+            defer denied_legacy.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 403), denied_legacy.status);
+            try std.testing.expect(std.mem.indexOf(u8, denied_legacy.body, "private source text") == null);
+        }
+        source.forbid_snapshot = true;
+    }
+    // Multiple consumers on one page share one reverse-binding authorization
+    // batch. Destination authorization remains a separate admitted resource.
+    {
+        const AllowAll = struct {
+            fn allows(_: *const anyopaque, _: []const u8) bool {
+                return true;
+            }
+        };
+        var read_context: u8 = 0;
+        source.stress_pages = 2;
+        source.stress_width = 2;
+        source.reverse_read_batches = 0;
+        var legacy = try resources.handle(&server, alloc, .entity_redirects, "entities", "", "concept/noise", "", "", .{ .principal = .{ .kind = .user, .subject = "all-sources" }, .table_read_authorization = .{ .ptr = &read_context, .allows = AllowAll.allows } });
+        defer legacy.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), legacy.status);
+        try std.testing.expectEqual(@as(usize, 3), source.reverse_read_batches);
+        source.stress_pages = 0;
+        source.stress_width = 1;
+        source.stress_reads = 0;
+    }
+    // Initial adoption folds borrowed legacy policy from independent page arenas.
+    server.source = source.narrowIface();
+    source.stress_pages = 2;
+    try Run.call(&server, .entity_merge, "entities", "", "concept/a", "{\"into\":\"concept/b\"}", 400);
+    try Run.call(&server, .entity_suppress, "entities", "", "concept/noise", "{}", 202);
+    source.stress_pages = 0;
+    source.stress_reads = 0;
+    server.source = source.iface();
+    source.forbid_snapshot = false;
+    const Denied = struct {
+        fn allows(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+    };
+    var authority_context: u8 = 0;
+    const before_denial = source.commits;
+    var denied = try resources.handle(&server, alloc, .entity_suppress, "entities", "", "concept/private", "{}", "", .{ .principal = .{ .kind = .user, .subject = "limited" }, .table_write_authorization = .{ .ptr = &authority_context, .allows = Denied.allows } });
+    defer denied.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+    try std.testing.expectEqual(before_denial, source.commits);
+    var denied_read = try resources.handle(&server, alloc, .entity_redirects, "entities", "", "concept/noise", "", "", .{ .principal = .{ .kind = .user, .subject = "limited" }, .table_read_authorization = .{ .ptr = &authority_context, .allows = Denied.allows } });
+    defer denied_read.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), denied_read.status);
+    try std.testing.expect(std.mem.indexOf(u8, denied_read.body, "private source text") == null);
+    const ReadSource = struct {
+        fn allows(_: *const anyopaque, name: []const u8) bool {
+            return std.mem.eql(u8, name, "entities");
+        }
+    };
+    var allowed_read = try resources.handle(&server, alloc, .entity_redirects, "entities", "", "concept/noise", "", "", .{ .principal = .{ .kind = .user, .subject = "source-reader" }, .table_read_authorization = .{ .ptr = &authority_context, .allows = ReadSource.allows } });
+    defer allowed_read.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), allowed_read.status);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_read.body, "private source text") == null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_read.body, "concept/a") == null);
+    const scoped = try std.json.parseFromSlice(std.json.Value, alloc, allowed_read.body, .{});
+    defer scoped.deinit();
+    const keys = scoped.value.object.get("results").?.array.items[0].object.get("curation").?.object.get("suppress").?.object.get("keys").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), keys.len);
+    try std.testing.expectEqualStrings("concept/noise", keys[0].string);
+    // The production read path never clones the catalog, even while polling
+    // consumer progress. Duplicate source edges across pages are folded once.
+    source.forbid_snapshot = true;
+    server.source = source.narrowIface();
+    try Run.call(&server, .entity_suppress, "entities", "", "concept/scoped", "{}", 202);
+    try Run.call(&server, .entity_redirects, "entities", "", "concept/scoped", "", 200);
+    try std.testing.expect(source.narrow_reads >= 7);
+    try Run.call(&server, .list, "source", "", "", "", 200);
+    try Run.call(&server, .get, "source", "concepts", "", "", 200);
+    try Run.call(&server, .redirects, "source", "concepts", "", "", 200);
+    try Run.call(&server, .suppressions, "source", "concepts", "", "", 200);
+    try Run.call(&server, .reviews, "source", "concepts", "", "", 503);
+    try Run.call(&server, .render, "source", "concepts", "", "{\"text\":\"A\",\"label\":\"concept\"}", 200);
+    // Source corrections stay views after namespace ownership, even through
+    // the scoped path. Never bypass this guard by dropping other tables.
+    try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/guard\",\"to\":\"concept/target\"}", 409);
+
+    // Every admitted mutation keeps its commit receipt even if observation
+    // sees a deleted consumer, a new catalog cut, or request cancellation.
+    for ([_]anyerror{ error.TableNotFound, error.CatalogGenerationChanged, error.Canceled, error.DeadlineExceeded }) |failure| {
+        source.fail_after_commit = failure;
+        const before_failure = source.commits;
+        const key = try std.fmt.allocPrint(alloc, "concept/observation-{s}", .{@errorName(failure)});
+        defer alloc.free(key);
+        var accepted = try resources.handle(&server, alloc, .entity_suppress, "entities", "", key, "{}", "", .{});
+        defer accepted.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), accepted.status);
+        try std.testing.expectEqual(before_failure + 1, source.commits);
+        try std.testing.expect(std.mem.indexOf(u8, source.tables[1].indexes_json, key) != null);
+        const receipt = try std.json.parseFromSlice(std.json.Value, alloc, accepted.body, .{});
+        defer receipt.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(source.commits)), receipt.value.object.get("metadata_commit").?.object.get("index").?.integer);
+        const result = receipt.value.object.get("results").?.array.items[0].object;
+        try std.testing.expect(result.get("accepted").?.bool);
+        try std.testing.expect(!result.get("applied").?.bool);
+        try std.testing.expectEqualStrings(@errorName(failure), result.get("error").?.string);
+        source.fail_after_commit = null;
+        source.observation_failure = null;
+    }
+    // 32 MiB of schemas traversed twice must fit a 16 MiB request budget.
+    // Only compact progress identities may grow with the consumer count.
+    const Budget = struct {
+        live: usize = 0,
+        peak: usize = 0,
+        fn allocate(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (len > 16 * 1024 * 1024 -| self.live) return null;
+            const result = std.testing.allocator.rawAlloc(len, alignment, ra) orelse return null;
+            self.live += len;
+            self.peak = @max(self.peak, self.live);
+            return result;
+        }
+        fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.live -= bytes.len;
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+        }
+    };
+    var budget: Budget = .{};
+    source.stress_pages = 64;
+    var bounded = try resources.handle(&server, budget.allocator(), .entity_suppress, "entities", "", "concept/bounded", "{}", "", .{});
+    try std.testing.expectEqual(@as(u16, 202), bounded.status);
+    try std.testing.expectEqual(@as(usize, 128), source.stress_reads);
+    const bounded_result = try std.json.parseFromSlice(std.json.Value, alloc, bounded.body, .{});
+    defer bounded_result.deinit();
+    try std.testing.expectEqual(@as(usize, 64), bounded_result.value.object.get("results").?.array.items.len);
+    bounded.deinit(budget.allocator());
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    var bounded_get = try resources.handle(&server, budget.allocator(), .entity_redirects, "entities", "", "concept/bounded", "", "", .{});
+    try std.testing.expectEqual(@as(u16, 200), bounded_get.status);
+    bounded_get.deinit(budget.allocator());
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    // A policy conflict in the final page must be found by the validation pass
+    // before any authoritative namespace CAS, even when earlier pages are valid.
+    source.stress_pages = 2;
+    source.incompatible_last_page = true;
+    const before_cycle = source.commits;
+    var cycle = try resources.handle(&server, alloc, .entity_merge, "entities", "", "concept/cycle-source", "{\"into\":\"concept/cycle-target\"}", "", .{});
+    defer cycle.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), cycle.status);
+    try std.testing.expectEqual(before_cycle, source.commits);
+    source.incompatible_last_page = false;
+    source.stress_pages = 0;
+    server.source = source.iface();
+    source.forbid_snapshot = false;
+    // The authoritative CAS succeeds before the clipped observation expires.
+    source.expire_wait = true;
+    const before_wait = source.commits;
+    var timed_out = try resources.handle(&server, alloc, .entity_merge, "entities", "", "concept/wait", "{\"into\":\"concept/target\",\"wait\":{\"timeout_ms\":1}}", "", .{});
+    defer timed_out.deinit(alloc);
+    source.expire_wait = false;
+    try std.testing.expectEqual(@as(u16, 202), timed_out.status);
+    try std.testing.expectEqual(before_wait + 1, source.commits);
+    try std.testing.expect(std.mem.indexOf(u8, timed_out.body, "\"changed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, timed_out.body, "\"applied\":false") != null);
+    try Run.call(&server, .get, "source", "concepts", "", "", 200);
+    const retired = (try indexes_api.removeIndexFromTableIndexesJson(alloc, source.tables[0].indexes_json, "knowledge")).?;
+    defer alloc.free(retired);
+    _ = try Source.replace(&source, source.tables[0], blk: {
+        var replacement = source.tables[0];
+        replacement.indexes_json = retired;
+        break :blk replacement;
+    });
+    server.source = source.narrowIface();
+    source.forbid_snapshot = true;
+    try Run.call(&server, .get, "source", "concepts", "", "", 200);
+    try Run.call(&server, .drop, "source", "concepts", "", "", 202);
+    try Run.call(&server, .drop, "source", "concepts", "", "", 202);
+    try Run.call(&server, .get, "source", "concepts", "", "", 404);
+}
+
+test "resolver curation HTTP source reads reverse bind logical names in fenced batches" {
+    const Fixture = struct {
+        calls: usize = 0,
+        checked: usize = 0,
+        reject: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn call(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const batch = input.resolve_many;
+            try std.testing.expect(batch.storage_names.len <= 256);
+            try std.testing.expectEqual(if (self.calls == 0) @as(?u64, null) else @as(?u64, 7), batch.expected_revision);
+            self.calls += 1;
+            const logical = try a.alloc(?[]const u8, batch.storage_names.len);
+            for (logical) |*name| name.* = "private-db/namespace/source";
+            return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &.{}, .logical_names = logical }, .{});
+        }
+        fn allows(ptr: *const anyopaque, name: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.checked += 1;
+            return !self.reject and std.mem.eql(u8, name, "private-db/namespace/source");
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .auth_enabled = true }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.call } }, null, null);
+    defer server.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const names: [257][]const u8 = @splat("table:physical-id");
+    const request: api_operation.RequestContext = .{ .principal = .{ .kind = .user, .subject = "key-user" }, .table_read_authorization = .{ .ptr = &fixture, .allows = Fixture.allows } };
+    try server.authorizeTableReads(arena.allocator(), request, &names);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 257), fixture.checked);
+    fixture.calls = 0;
+    fixture.reject = true;
+    try std.testing.expectError(error.Forbidden, server.authorizeTableReads(arena.allocator(), request, &names));
+    try std.testing.expectError(error.Forbidden, server.authorizeTableReads(arena.allocator(), .{}, &names));
+}
+
+test "resolver curation HTTP remote owner calls retain deadlines and cancellation" {
+    const Fixture = struct {
+        calls: usize = 0,
+        timeout: bool = false,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn localNode(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+        fn leader(_: *anyopaque, _: u64) ?u64 {
+            return 2;
+        }
+        fn uri(_: *anyopaque, a: std.mem.Allocator, _: u64) !?[]u8 {
+            return try a.dupe(u8, "http://owner:8080");
+        }
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const budget = request.timeout_ms orelse return error.MissingTimeout;
+            try std.testing.expect(budget > 0 and budget <= 1000);
+            try std.testing.expect(request.cancellation != null);
+            try std.testing.expect(!request.cancellation.?.isCancelled());
+            if (self.timeout) {
+                try std.testing.io.sleep(.fromMilliseconds(@as(i64, budget) + 1), .awake);
+                return error.Timeout;
+            }
+            return .{ .status = 200, .body = try a.dupe(u8, "{\"resolvers\":[]}") };
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.localNode, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_base_uri = Fixture.uri } },
+        .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } },
+    }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
+    defer server.deinit();
+    const clock = @import("antfly_platform").time;
+    const body = "{\"operation\":\"progress\"}";
+    const response = try server.executeResolverOperation(std.testing.allocator, "source", 7, body, .{ .deadline_ns = clock.monotonicNs() + std.time.ns_per_s });
+    std.testing.allocator.free(response);
+    fixture.timeout = true;
+    try std.testing.expectError(error.DeadlineExceeded, server.executeResolverOperation(std.testing.allocator, "source", 7, body, .{ .deadline_ns = clock.monotonicNs() + 5 * std.time.ns_per_ms }));
+    try std.testing.expectError(error.DeadlineExceeded, server.executeResolverOperation(std.testing.allocator, "source", 7, body, .{ .deadline_ns = 0 }));
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, server.executeResolverOperation(std.testing.allocator, "source", 7, body, .{ .cancellation = CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
 test "external lake native server resumes bounded collection across maintenance passes" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -58097,4 +58674,85 @@ test "external lake native server resumes bounded collection across maintenance 
     try std.testing.expect(turns > 30);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, expired, .{}));
     try cut.validate(a, io, source, request, namespace, .none);
+}
+
+test "resolver curation HTTP routing carries deadlines and in-flight cancellation" {
+    const Fixture = struct {
+        canceled: std.atomic.Value(bool) = .init(false),
+        cancel_during_route: bool = false,
+        calls: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn node(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn absent(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+        fn uri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return error.UnexpectedTransport;
+        }
+        fn routes(ptr: *anyopaque, _: std.mem.Allocator, _: []const u64, _: table_router.RoutePolicy, budget: table_router.RouteBudget) !?[]table_router.GroupRoute {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(budget.clock.deadline_ns != null);
+            try std.testing.expect(budget.cancellation != null);
+            if (self.cancel_during_route) {
+                self.canceled.store(true, .release);
+            } else {
+                const remaining = (try budget.remainingTimeoutMs()).?;
+                try std.testing.expect(remaining <= 20);
+                try std.testing.io.sleep(.fromMilliseconds(@as(i64, remaining) + 1), .awake);
+            }
+            try budget.check();
+            return error.RequestBudgetNotObserved;
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.node, .local_status = Fixture.absent, .node_base_uri = Fixture.uri, .resolve_group_routes = Fixture.routes } },
+    }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
+    defer server.deinit();
+    const context: api_operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 20 * std.time.ns_per_ms, .cancellation = CancellationToken.fromAtomic(&fixture.canceled) };
+    try std.testing.expectError(error.DeadlineExceeded, server.executeResolverOperation(std.testing.allocator, "source", 7, "{\"operation\":\"progress\"}", context));
+    fixture.cancel_during_route = true;
+    try std.testing.expectError(error.Canceled, server.executeResolverOperation(std.testing.allocator, "source", 7, "{\"operation\":\"progress\"}", .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s, .cancellation = CancellationToken.fromAtomic(&fixture.canceled) }));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "external lake read refresh hints coalesce without superseding active publication work" {
+    const a = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    const Source = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var raw: u8 = 0;
+    var server = ApiHttpServer.init(a, .{ .backend_runtime = &runtime }, .{ .ptr = &raw, .vtable = &.{ .status = Source.status } }, null, null);
+    defer server.deinit();
+    // Hold execution so the test can inspect the authoritative keyed wakeup
+    // and its retry state independently of worker scheduling.
+    server.index_installation_worker_in_flight.store(true, .release);
+    defer server.index_installation_worker_in_flight.store(false, .release);
+    try server.requestLakePublication("docs");
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+    const generation = server.index_installation_queue.items[0].generation;
+    server.index_installation_queue.items[0].failures = 3;
+    server.index_installation_queue.items[0].retry_after_ns = 987654321;
+    for (0..20) |_| try server.requestLakePublication("docs");
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+    try std.testing.expectEqual(generation, server.index_installation_queue.items[0].generation);
+    try std.testing.expectEqual(@as(u8, 3), server.index_installation_queue.items[0].failures);
+    try std.testing.expectEqual(@as(u64, 987654321), server.index_installation_queue.items[0].retry_after_ns);
+    try std.testing.expectEqual(@as(usize, 0), server.index_installation_reserved_slots);
+    // An actual commit still supersedes the hint so work that raced the commit
+    // cannot complete and discard the new generation's wakeup.
+    try server.notifyLakeCommit("docs");
+    try std.testing.expectEqual(@as(usize, 1), server.index_installation_queue.items.len);
+    try std.testing.expect(server.index_installation_queue.items[0].generation != generation);
+    try std.testing.expectEqual(@as(u8, 0), server.index_installation_queue.items[0].failures);
+    try std.testing.expectEqual(@as(u64, 0), server.index_installation_queue.items[0].retry_after_ns);
 }

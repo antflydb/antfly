@@ -656,6 +656,76 @@ unsafe extern "C" {
         resolver_name: antfly_slice,
         merge_json: antfly_slice,
     ) -> antfly_error_code;
+    pub fn antfly_db_unmerge_resolver_key_json(
+        db: *mut antfly_db,
+        resolver_name: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_suppress_resolver_keys_json(
+        db: *mut antfly_db,
+        resolver_name: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_unsuppress_resolver_key_json(
+        db: *mut antfly_db,
+        resolver_name: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_resolver_reviews_json(
+        db: *mut antfly_db,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_curate_entity_json(
+        db: *mut antfly_db,
+        entity_table: antfly_slice,
+        entity_key: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_entity_merge_json(
+        db: *mut antfly_db,
+        entity_table: antfly_slice,
+        entity_key: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_entity_unmerge_json(
+        db: *mut antfly_db,
+        entity_table: antfly_slice,
+        entity_key: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_entity_suppress_json(
+        db: *mut antfly_db,
+        entity_table: antfly_slice,
+        entity_key: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_entity_unsuppress_json(
+        db: *mut antfly_db,
+        entity_table: antfly_slice,
+        entity_key: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_entity_redirects_json(
+        db: *mut antfly_db,
+        entity_table: antfly_slice,
+        entity_key: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_resolver_curation_json(
+        db: *mut antfly_db,
+        resolver_name: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
     pub fn antfly_db_list_resolver_identities_json(
         db: *mut antfly_db,
         out: *mut antfly_buffer,

@@ -6,29 +6,62 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="GraphArtifactProducerConfigProducer")
+from ..types import UNSET, Unset
+
+T = TypeVar("T", bound="ResolverResolvedEntityDocRef")
 
 
 @_attrs_define
-class GraphArtifactProducerConfigProducer:
-    """Write-only producer configuration. Cannot be combined with producer_json."""
+class ResolverResolvedEntityDocRef:
+    """
+    Attributes:
+        table (str):
+        key (str):
+        storage_table (str | Unset):
+    """
 
+    table: str
+    key: str
+    storage_table: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        table = self.table
+
+        key = self.key
+
+        storage_table = self.storage_table
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
+        field_dict.update(
+            {
+                "table": table,
+                "key": key,
+            }
+        )
+        if storage_table is not UNSET:
+            field_dict["storage_table"] = storage_table
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        graph_artifact_producer_config_producer = cls()
+        table = d.pop("table")
 
-        graph_artifact_producer_config_producer.additional_properties = d
-        return graph_artifact_producer_config_producer
+        key = d.pop("key")
+
+        storage_table = d.pop("storage_table", UNSET)
+
+        resolver_resolved_entity_doc_ref = cls(
+            table=table,
+            key=key,
+            storage_table=storage_table,
+        )
+
+        resolver_resolved_entity_doc_ref.additional_properties = d
+        return resolver_resolved_entity_doc_ref
 
     @property
     def additional_keys(self) -> list[str]:
