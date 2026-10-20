@@ -12434,9 +12434,9 @@ pub const DB = struct {
                 continue;
             }
             const separator = std.mem.indexOfScalar(u8, candidate, '/') orelse return error.InvalidRepairCandidatePath;
-            const shadow_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
+            const shadow_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.index_manager.base_path, candidate[0..separator] });
             defer alloc.free(shadow_root);
-            if (self.primary_lsm_storage) |storage| {
+            if (self.core.index_manager.generation_storage orelse self.primary_lsm_storage) |storage| {
                 try storage.deleteTree(shadow_root);
             } else if (comptime builtin.os.tag == .freestanding) {
                 return error.UnsupportedPlatform;
@@ -14194,15 +14194,15 @@ pub const DB = struct {
             return error.RepairCandidateAlreadyActive;
         }
         const separator = std.mem.indexOfScalar(u8, candidate, '/') orelse return error.InvalidRepairCandidatePath;
-        const shadow_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
+        const shadow_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.index_manager.base_path, candidate[0..separator] });
         defer alloc.free(shadow_root);
         if (entry.intent.kind == .algebraic) {
             // Algebraic generations live in the primary store and may be much
             // larger than a scheduler turn. The directory is their durable
             // namespace marker: clear only the writer marker here, detach the
             // intent below, then let paged orphan collection drain the keys.
-            try index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_root);
-        } else if (self.primary_lsm_storage) |storage| {
+            try self.core.index_manager.clearRepairShadow(alloc, shadow_root);
+        } else if (self.core.index_manager.generation_storage orelse self.primary_lsm_storage) |storage| {
             try storage.deleteTree(shadow_root);
         } else if (comptime builtin.os.tag == .freestanding) {
             return error.UnsupportedPlatform;
@@ -14329,9 +14329,10 @@ pub const DB = struct {
             return .not_active;
         }
 
-        const candidate_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate });
+        const candidate_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.index_manager.base_path, candidate });
         defer alloc.free(candidate_path);
-        const certification = try index_generation_manifest.certifyReady(
+        const certification = try index_generation_manifest.certifyReadyWithStorage(
+            self.core.index_manager.generation_storage,
             alloc,
             candidate_path,
             repair_id,
@@ -14870,6 +14871,7 @@ pub const DB = struct {
         admitted_total_bytes: u64,
         headroom_bytes: u64,
         candidate_root: ?[]const u8 = null,
+        algebraic_index_name: ?[]const u8 = null,
 
         fn bindCandidateRoot(ptr: *anyopaque, candidate_root: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -14904,7 +14906,12 @@ pub const DB = struct {
             // final revalidation record a real denial only if it still fails.
             if (try self.reservation.fits(observation, monotonicTimeNs())) return;
             if (self.candidate_root) |candidate_root| {
-                return try RepairCapacityGuard.reconcile(self, try directoryUsageBytes(self.alloc, candidate_root));
+                const candidate_bytes = if (self.algebraic_index_name) |name| blk: {
+                    const namespace = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ std.fs.path.basename(candidate_root), name });
+                    defer self.alloc.free(namespace);
+                    break :blk try self.db.core.index_manager.algebraicStorageNamespaceBytes(namespace);
+                } else try self.db.core.index_manager.generationStorageBytes(candidate_root);
+                return try RepairCapacityGuard.reconcile(self, candidate_bytes);
             }
             try self.reservation.revalidate(observation, monotonicTimeNs());
         }
@@ -15561,9 +15568,9 @@ pub const DB = struct {
                 defer alloc.free(storage_namespace);
                 candidate_bytes = self.core.index_manager.algebraicStorageNamespaceBytes(storage_namespace) catch 0;
             } else {
-                const candidate_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
+                const candidate_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.index_manager.base_path, candidate[0..separator] });
                 defer alloc.free(candidate_root);
-                candidate_bytes = directoryUsageBytes(alloc, candidate_root) catch 0;
+                candidate_bytes = self.core.index_manager.generationStorageBytes(candidate_root) catch 0;
             }
         }
         const remaining_disk_claim = planned_disk_bytes -| @min(planned_disk_bytes, candidate_bytes);
@@ -15612,6 +15619,7 @@ pub const DB = struct {
             .options = effective_options,
             .admitted_total_bytes = planned_disk_bytes,
             .headroom_bytes = cleanup_and_replay_headroom,
+            .algebraic_index_name = if (entry.intent.kind == .algebraic) entry.intent.index_name else null,
         };
 
         const attempt_count = entry.intent.attempt_count +| 1;
@@ -16657,7 +16665,7 @@ pub const DB = struct {
                 const candidate = entry.intent.candidate_relative_path.?;
                 try index_repair_state.validateCandidateRelativePath(cfg.name, candidate);
                 const separator = std.mem.indexOfScalar(u8, candidate, '/') orelse return error.InvalidRepairCandidatePath;
-                shadow_base = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
+                shadow_base = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.index_manager.base_path, candidate[0..separator] });
                 resume_candidate = true;
                 resume_building = entry.intent.phase == .building;
                 resume_requires_ready_manifest = entry.intent.phase == .ready or entry.intent.phase == .waiting_for_convergence;
@@ -16666,12 +16674,12 @@ pub const DB = struct {
                 build_resume_key = if (entry.intent.build_resume_key) |key| try alloc.dupe(u8, key) else null;
             } else {
                 try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
-                shadow_base = try createUniqueRepairShadowBase(alloc, self.core.path);
+                shadow_base = try createUniqueRepairShadowBaseWithStorage(alloc, self.core.index_manager.base_path, self.core.index_manager.generation_storage);
             }
         } else {
-            shadow_base = try createUniqueRepairShadowBase(alloc, self.core.path);
+            shadow_base = try createUniqueRepairShadowBaseWithStorage(alloc, self.core.index_manager.base_path, self.core.index_manager.generation_storage);
         }
-        if (!resume_candidate) try index_manager_mod.IndexManager.writeRepairShadowInProgressMarker(alloc, shadow_base);
+        if (!resume_candidate) try self.core.index_manager.markRepairShadow(alloc, shadow_base);
         var shadow_installed = false;
         var candidate_reopenable = resume_candidate;
         defer {
@@ -16682,30 +16690,34 @@ pub const DB = struct {
                     // Leave the index directory as a durable namespace marker.
                     // Once the in-progress marker is cleared, paged orphan
                     // cleanup can resume after failure or process restart.
-                    index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
+                    self.core.index_manager.clearRepairShadow(alloc, shadow_base) catch {};
                     self.scheduleInactiveRepairShadowCleanup();
                 } else {
-                    index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
-                    std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
+                    self.core.index_manager.clearRepairShadow(alloc, shadow_base) catch {};
+                    if (self.core.index_manager.generation_storage) |storage|
+                        storage.deleteTree(shadow_base) catch {}
+                    else
+                        std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
                 }
             }
             alloc.free(shadow_base);
         }
         const shadow_indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{shadow_base});
         defer alloc.free(shadow_indexes_path);
-        if (!resume_candidate) try ensureDirPath(shadow_indexes_path);
+        if (!resume_candidate) try self.core.index_manager.createGenerationDirectory(shadow_indexes_path);
 
         const shadow_index_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_indexes_path, cfg.name });
         defer alloc.free(shadow_index_path);
         // Generation manifests belong to the repair owner. Storage backends
         // may keep index data in a separate namespace and need not create
         // this filesystem directory as a side effect of opening an index.
-        try ensureDirPath(shadow_index_path);
+        try self.core.index_manager.createGenerationDirectory(shadow_index_path);
         const shadow_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/applied-sequences", .{shadow_base});
         defer alloc.free(shadow_checkpoint_path);
         if (options.capacity_check) |check| try check.bindCandidateRoot(shadow_base);
         if (resume_requires_ready_manifest) {
-            _ = index_generation_manifest.validateReady(
+            _ = index_generation_manifest.validateReadyWithStorage(
+                self.core.index_manager.generation_storage,
                 alloc,
                 shadow_index_path,
                 generation_id,
@@ -16811,7 +16823,8 @@ pub const DB = struct {
         var build_floor_sequence: u64 = if (resume_building)
             persisted_build_floor_sequence
         else if (resume_candidate)
-            try apply_state.loadAppliedSequenceWithCheckpoint(
+            try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
+                shadow_manager.generation_storage,
                 alloc,
                 shadow_manager.checkpointIo(),
                 self.core.store,
@@ -16861,7 +16874,7 @@ pub const DB = struct {
                         const count: u64 = persisted_build_reprocessed +| @as(u64, @intCast(slice.rebuilt));
                         if (!slice.complete()) {
                             if (options.capacity_check) |check| {
-                                try check.current(try directoryUsageBytes(alloc, shadow_base));
+                                try check.current(try shadow_manager.generationStorageBytes(shadow_base));
                             }
                             if (durable_repair_id) |repair_id| {
                                 try self.updateIndexRepairIntent(alloc, repair_id, .{
@@ -17077,7 +17090,8 @@ pub const DB = struct {
             true,
             false,
         );
-        try index_generation_manifest.writeReadyForPhysicalFormat(
+        try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
+            self.core.index_manager.generation_storage,
             alloc,
             shadow_index_path,
             generation_id,
@@ -17160,7 +17174,8 @@ pub const DB = struct {
                 false,
                 false,
             );
-            try index_generation_manifest.writeReadyForPhysicalFormat(
+            try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
+                self.core.index_manager.generation_storage,
                 alloc,
                 shadow_index_path,
                 generation_id,
@@ -17200,7 +17215,8 @@ pub const DB = struct {
             true,
             true,
         );
-        try index_generation_manifest.writeReadyForPhysicalFormat(
+        try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
+            self.core.index_manager.generation_storage,
             alloc,
             shadow_index_path,
             generation_id,
@@ -17209,7 +17225,8 @@ pub const DB = struct {
             converged_sequence,
             try shadowIndexPhysicalFormat(&shadow_manager, index_ref),
         );
-        const ready_sequence = try index_generation_manifest.validateReady(
+        const ready_sequence = try index_generation_manifest.validateReadyWithStorage(
+            self.core.index_manager.generation_storage,
             alloc,
             shadow_index_path,
             generation_id,
@@ -17386,7 +17403,8 @@ pub const DB = struct {
             });
             try ensureRepairActivationDeadline(activation_deadline_ns);
         };
-        try index_generation_manifest.writeReadyForPhysicalFormat(
+        try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
+            self.core.index_manager.generation_storage,
             alloc,
             shadow_index_path,
             generation_id,
@@ -17396,7 +17414,8 @@ pub const DB = struct {
             try shadowIndexPhysicalFormat(&shadow_manager, index_ref),
         );
         try ensureRepairActivationDeadline(activation_deadline_ns);
-        const manifest_sequence = try index_generation_manifest.validateReady(
+        const manifest_sequence = try index_generation_manifest.validateReadyWithStorage(
+            self.core.index_manager.generation_storage,
             alloc,
             shadow_index_path,
             generation_id,
@@ -17436,7 +17455,7 @@ pub const DB = struct {
             .candidate_applied_sequence = final_target,
             .target_sequence = final_target,
         });
-        index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch |err| {
+        self.core.index_manager.clearRepairShadow(alloc, shadow_base) catch |err| {
             std.log.warn("failed to clear repair shadow in-progress marker index={s} err={s}", .{ cfg.name, @errorName(err) });
         };
         const prior_checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
@@ -17551,7 +17570,8 @@ pub const DB = struct {
         batch_ctx.async_context = null;
         batch_ctx.dense_bulk_session_scope = .external;
 
-        var applied = try apply_state.loadAppliedSequenceWithCheckpoint(
+        var applied = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
+            shadow_manager.generation_storage,
             alloc,
             shadow_manager.checkpointIo(),
             self.core.store,
@@ -17696,7 +17716,8 @@ pub const DB = struct {
         const updates = [_]apply_state.AppliedSequenceUpdate{update};
         try savePhysicalProjectionMetadataForAppliedSequenceUpdates(shadow_manager, &updates);
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(shadow_manager, &updates);
-        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
+        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
+            shadow_manager.generation_storage,
             alloc,
             shadow_manager.checkpointIo(),
             self.core.store,
@@ -33482,7 +33503,7 @@ pub const DB = struct {
         // them without populating the new generation.
         // Table-owned sources can predate even an ordinary ANN admission,
         // including after its last consumer was dropped. Bootstrap them too.
-        if (disposition == .managed_rebuild or (self.local_execution.source_vectors.load(.acquire) != null and try self.externalCoverageHasStoredArtifacts(cfg))) {
+        if (disposition == .managed_rebuild or try self.externalCoverageHasStoredArtifacts(cfg)) {
             try self.deleteDenseArtifactCounterMetadata(cfg.name);
             return;
         }
@@ -53520,7 +53541,8 @@ fn saveAppliedSequencesBatchLockedContext(
         // snapshot.
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
         try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-        try apply_state.saveAppliedSequencesWithCheckpoint(
+        try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
+            ctx.index_manager.generation_storage,
             ctx.alloc,
             ctx.index_manager.checkpointIo(),
             ctx.store,
@@ -53543,7 +53565,8 @@ fn saveAppliedSequencesBatchLockedContext(
     }
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
     try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-    try apply_state.saveAppliedSequencesWithCheckpoint(
+    try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
+        ctx.index_manager.generation_storage,
         ctx.alloc,
         ctx.index_manager.checkpointIo(),
         ctx.store,
@@ -57487,25 +57510,6 @@ fn publishSnapshotStaging(io: Io, parent: []const u8, staging: []const u8, desti
     try fs_paths.syncDirPortable(io, parent);
 }
 
-fn directoryUsageBytes(alloc: Allocator, path: []const u8) !u64 {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    var dir = std.Io.Dir.cwd().openDir(io_impl.io(), path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return 0,
-        else => return err,
-    };
-    defer dir.close(io_impl.io());
-    var total: u64 = 0;
-    var walker = try dir.walk(alloc);
-    defer walker.deinit();
-    while (try walker.next(io_impl.io())) |entry| {
-        if (entry.kind != .file) continue;
-        const stat = try dir.statFile(io_impl.io(), entry.path, .{});
-        total +|= stat.size;
-    }
-    return total;
-}
-
 fn repairCandidateStorageBytes(
     alloc: Allocator,
     cfg: types.IndexConfig,
@@ -57513,7 +57517,19 @@ fn repairCandidateStorageBytes(
     shadow_base: []const u8,
 ) !u64 {
     if (cfg.kind == .algebraic) return try manager.activeIndexStorageBytes(cfg.name);
-    return try directoryUsageBytes(alloc, shadow_base);
+    _ = alloc;
+    return try manager.generationStorageBytes(shadow_base);
+}
+
+fn createUniqueRepairShadowBaseWithStorage(alloc: Allocator, base_path: []const u8, storage: ?lsm_backend_mod.Storage) ![]u8 {
+    const files = storage orelse return createUniqueRepairShadowBase(alloc, base_path);
+    // The random repair identity reserves a namespace without relying on host
+    // directory existence or process-local counters surviving a restart.
+    const identity = try index_repair_state.newRepairId(alloc);
+    const candidate = try std.fmt.allocPrint(alloc, "{s}/.repair-shadow-{x}", .{ base_path, identity });
+    errdefer alloc.free(candidate);
+    try files.createDirPath(candidate);
+    return candidate;
 }
 
 fn createUniqueRepairShadowBase(alloc: Allocator, base_path: []const u8) ![]u8 {
@@ -59218,7 +59234,8 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         .published_count = serving_count,
     };
     try ctx.index_manager.saveDenseProjectionCheckpointMetadata(index_name, clean_checkpoint);
-    try apply_state.saveProjectionCheckpointWithSidecar(
+    try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
+        ctx.index_manager.generation_storage,
         ctx.alloc,
         ctx.index_manager.checkpointIo(),
         ctx.store,
@@ -59433,7 +59450,8 @@ fn flushFinishedDenseAppliedSequenceLocked(
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
             projection_metadata_ns +|= elapsedSince(metadata_started);
             const checkpoint_started = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpoint(
+            try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
+                ctx.index_manager.generation_storage,
                 ctx.alloc,
                 ctx.index_manager.checkpointIo(),
                 ctx.store,
@@ -59521,7 +59539,8 @@ fn flushPendingAppliedSequencesLocked(
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
             projection_metadata_ns +|= elapsedSince(metadata_started);
             const checkpoint_started = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpoint(
+            try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
+                ctx.index_manager.generation_storage,
                 ctx.alloc,
                 ctx.index_manager.checkpointIo(),
                 ctx.store,
@@ -140619,4 +140638,224 @@ test "public graph metric borrowed wire document scan producers preserve project
     visitor = .{ .fail = true };
     try std.testing.expectError(error.Canceled, db.scanVisit(a, "", "", opts, .{ .context = &visitor, .visit = Visitor.visit, .borrow_documents = true }));
     try std.testing.expectEqual(@as(usize, 1), visitor.count);
+}
+
+test "lite external dense backfills artifacts before admission (#1210)" {
+    try testLiteExternalDenseLifecycle(false);
+}
+
+test "lite external dense recreates and catches up later writes (#1210)" {
+    try testLiteExternalDenseLifecycle(true);
+}
+
+fn testLiteExternalDenseLifecycle(recreate: bool) !void {
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/external.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = recreate, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    var db = try DB.open(a, path, opts);
+    db.run_until_idle_no_progress_timeout_ns = 5 * std.time.ns_per_s;
+    defer db.close();
+    const cfg: types.IndexConfig = .{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}" };
+    if (recreate) _ = try db.admitManagedIndex(cfg);
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"body\":\"alpha\",\"_embeddings\":{\"img\":[1,0,0]}}" },
+        .{ .key = "b", .value = "{\"body\":\"beta\"}" },
+    } });
+    if (recreate) {
+        try db.runUntilIdle();
+        try std.testing.expect(try db.deleteIndex("img"));
+        // Writes continue while the retired physical generation is reclaimed.
+        try db.batch(.{ .writes = &.{.{ .key = "c", .value = "{\"body\":\"gap write\",\"_embeddings\":{\"img\":[0,1,0]}}" }} });
+        var pages: usize = 0;
+        while (try db.advanceGeneratedArtifactCleanupPage("img") != .idle) : (pages += 1) {
+            try std.testing.expect(pages < 10_000);
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    const Hook = struct {
+        called: bool = false,
+        fn afterSnapshot(ptr: *anyopaque, database: *DB, _: []const u8, _: u64) !void {
+            const hook: *@This() = @ptrCast(@alignCast(ptr));
+            if (hook.called) return;
+            hook.called = true;
+            try database.batch(.{ .writes = &.{.{ .key = "during", .value = "{\"body\":\"during repair\",\"_embeddings\":{\"img\":[0,0,1]}}" }} });
+        }
+    };
+    var hook: Hook = .{};
+    if (recreate) db.shadow_index_repair_hook = .{ .ptr = &hook, .after_snapshot_build = Hook.afterSnapshot };
+    const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.ExpectedBackfill;
+    var complete = false;
+    for (0..20) |_| {
+        const step = try db.advanceIndexRepairIntent(a, repair_id, repair_completion_test_options);
+        if (step.repaired) {
+            complete = true;
+            break;
+        }
+    }
+    if (!complete) {
+        var pending = try db.loadIndexRepairEntryById(a, repair_id);
+        defer pending.deinit(a);
+        std.debug.print("repair phase={s} error={s}\n", .{ @tagName(pending.intent.phase), pending.intent.last_error orelse "none" });
+    }
+    try std.testing.expect(complete);
+    db.shadow_index_repair_hook = null;
+    if (recreate) try std.testing.expect(hook.called);
+    try db.runUntilIdle();
+    const expected: u64 = if (recreate) 3 else 1;
+    try std.testing.expectEqual(@as(?u64, expected), try DB.loadDenseArtifactTargetCounter(a, db.core.store, "img"));
+    var result = try db.search(a, .{ .index_name = "img", .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } }, .limit = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("a", result.hits[0].id);
+    db.close();
+    handle.deinit();
+    handle = try lite.Handle.open(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    opts = .{ .start_index_workers = recreate, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    db = try DB.open(a, path, opts);
+    db.run_until_idle_no_progress_timeout_ns = 5 * std.time.ns_per_s;
+    try db.batch(.{ .writes = &.{.{ .key = "later", .value = "{\"body\":\"later write\",\"_embeddings\":{\"img\":[0.6,0.8,0]}}" }} });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(?u64, expected + 1), try DB.loadDenseArtifactTargetCounter(a, db.core.store, "img"));
+    try std.testing.expectEqual(expected + 1, db.core.index_manager.denseIndex("img").?.index.stats().active_count);
+    const checkpoint = try db.core.loadProjectionCheckpoint(a, "img");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expectEqual(try db.core.loadAppliedSequence(a, "img"), db.core.nextDerivedSequence());
+    var later = try db.search(a, .{ .index_name = "img", .query = .{ .dense_knn = .{ .vector = &.{ 0.6, 0.8, 0 }, .k = 8 } }, .limit = 8 });
+    defer later.deinit();
+    try std.testing.expectEqual(@as(u32, @intCast(expected + 1)), later.total_hits);
+    var found_later = false;
+    for (later.hits) |hit| {
+        if (std.mem.eql(u8, hit.id, "later")) found_later = true;
+    }
+    try std.testing.expect(found_later);
+    // Logical generation paths must never create host-side shadow directories.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, db.core.index_manager.base_path, .{}));
+}
+
+test "lite generation cleanup and capacity accounting survive reopen (#1210)" {
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/maintenance.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    // Isolate explicit collector turns from the one-shot cleanup scheduled by open.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    const base = try a.dupe(u8, db.core.index_manager.base_path);
+    defer a.free(base);
+    const orphan = try std.fs.path.join(a, &.{ base, ".repair-shadow-orphan" });
+    defer a.free(orphan);
+    const orphan_file = try std.fs.path.join(a, &.{ orphan, "indexes/img/payload" });
+    defer a.free(orphan_file);
+    const active_file = try std.fs.path.join(a, &.{ base, ".repair-shadow-active/indexes/img/payload" });
+    defer a.free(active_file);
+    const active_pointer = try std.fs.path.join(a, &.{ base, "indexes/img/.antfly-active-index-root" });
+    defer a.free(active_pointer);
+    const stale = try std.fs.path.join(a, &.{ base, ".repair-shadow-stale/.antfly-repair-shadow-in-progress" });
+    defer a.free(stale);
+    const pending = try std.fs.path.join(a, &.{ base, ".repair-shadow-pending" });
+    defer a.free(pending);
+    const pending_file = try std.fs.path.join(a, &.{ pending, "indexes/img/payload" });
+    defer a.free(pending_file);
+    const corrupt_file = try std.fs.path.join(a, &.{ base, ".repair-shadow-corrupt/indexes/broken/payload" });
+    defer a.free(corrupt_file);
+    const corrupt_pointer = try std.fs.path.join(a, &.{ base, "indexes/broken/.antfly-active-index-root" });
+    defer a.free(corrupt_pointer);
+    const algebraic_path = try std.fs.path.join(a, &.{ base, ".repair-shadow-algebraic/indexes/alg" });
+    defer a.free(algebraic_path);
+    const algebraic_marker = try std.fs.path.join(a, &.{ algebraic_path, ".antfly-generation-directory" });
+    defer a.free(algebraic_marker);
+    const fact_prefix = try algebraic_mod.index.storagePrefixAlloc(a, ".repair-shadow-algebraic/alg");
+    defer a.free(fact_prefix);
+    const fact_key = try std.fmt.allocPrint(a, "{s}|8:orphan", .{fact_prefix});
+    defer a.free(fact_key);
+    const payload = "0123456789012345678901234567890123456789";
+    {
+        const manager = db.core.index_manager;
+        const storage = manager.generation_storage.?;
+        try storage.writeFileAbsolute(orphan_file, payload);
+        try storage.writeFileAbsolute(stale, "antfly-repair-shadow-in-progress-v1\npid=2147483647\n");
+        try storage.writeFileAbsolute(active_file, payload);
+        // The collector must honor pointers even without a loaded catalog row.
+        try storage.writeFileAbsolute(active_pointer, "antfly-active-index-root-v1\n.repair-shadow-active/indexes/img\n");
+        try manager.markRepairShadow(a, pending);
+        try storage.writeFileAbsolute(pending_file, payload);
+        try storage.writeFileAbsolute(corrupt_file, payload);
+        try storage.writeFileAbsolute(corrupt_pointer, "corrupt");
+        try manager.createGenerationDirectory(algebraic_path);
+        try db.core.store.put(fact_key, "fact");
+
+        try std.testing.expectEqual(@as(u64, 40), try manager.activeIndexStorageBytes("img"));
+        const cfg: types.IndexConfig = .{ .name = "img", .kind = .dense_vector, .config_json = "{}" };
+        try std.testing.expectEqual(@as(u64, 40), try repairCandidateStorageBytes(a, cfg, manager, orphan));
+        const Capacity = struct {
+            available: u64 = 100,
+            fn observe(ptr: *anyopaque) anyerror!resource_manager_mod.CapacityObservation {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return .{ .available_bytes = self.available, .capacity_bytes = 100, .observed_at_ns = monotonicTimeNs(), .valid_for_ns = 5 * std.time.ns_per_s };
+            }
+        };
+        var capacity: Capacity = .{};
+        var resources = resource_manager_mod.ResourceManager.init(.{ .disk_safety_floor_bytes = 0, .disk_safety_floor_divisor = 0 });
+        defer resources.deinit(a);
+        var reservation = try resources.reserveCapacity(a, 9, 80, try Capacity.observe(&capacity), monotonicTimeNs());
+        defer reservation.release();
+        var guard: DB.RepairCapacityGuard = .{
+            .reservation = &reservation,
+            .db = &db,
+            .alloc = a,
+            .repair_id = 0,
+            .options = .{ .capacity_source = .{ .ptr = &capacity, .domain_id = 9, .observe = Capacity.observe } },
+            .admitted_total_bytes = 80,
+            .headroom_bytes = 0,
+        };
+        try DB.RepairCapacityGuard.bindCandidateRoot(&guard, orphan);
+        capacity.available = 60;
+        try DB.RepairCapacityGuard.revalidate(&guard);
+        try std.testing.expectEqual(@as(u64, 40), resources.capacityStats().reserved_bytes);
+        try std.testing.expectEqual(@as(u64, 0), resources.capacityStats().denials);
+        // One bounded deletion page removes the fact, leaving its durable
+        // generation marker for the next collector instance to finish.
+        try std.testing.expect(try manager.cleanupInactiveRepairShadowRootsPage());
+        try std.testing.expectEqual(@as(u64, 0), try storage.fileSize(algebraic_marker));
+    }
+    db.close();
+    handle.deinit();
+    handle = try lite.Handle.open(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    opts = .{ .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    db = try DB.open(a, path, opts);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    const manager = db.core.index_manager;
+    const storage = manager.generation_storage.?;
+    var pages: usize = 0;
+    while (try manager.cleanupInactiveRepairShadowRootsPage()) : (pages += 1) try std.testing.expect(pages < 20);
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(orphan_file));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(stale));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(algebraic_marker));
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, fact_key));
+    try std.testing.expectEqual(@as(u64, 40), try storage.fileSize(active_file));
+    try std.testing.expectEqual(@as(u64, 40), try storage.fileSize(pending_file));
+    try std.testing.expectEqual(@as(u64, 40), try storage.fileSize(corrupt_file));
+    try manager.clearRepairShadow(a, pending);
+    try storage.deleteFileAbsolute(corrupt_pointer);
+    while (try manager.cleanupInactiveRepairShadowRootsPage()) {}
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(pending_file));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(corrupt_file));
+    try std.testing.expectEqual(@as(u64, 40), try storage.fileSize(active_file));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, base, .{}));
 }
