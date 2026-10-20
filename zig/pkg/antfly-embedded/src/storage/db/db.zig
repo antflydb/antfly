@@ -124516,10 +124516,10 @@ test "db prepared transaction effects required protocol activation is durable an
         try std.testing.expect(try db.removeResolver("identity"));
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        try std.testing.expectEqual(@as(u32, 5), try catalog.readAuthoritativeReaderVersion(&read, catalog.supported_reader_version));
-        try std.testing.expectEqual(@as(u32, 5), try catalog.catalogReaderVersion(a, try read.get(inventory.resolver_key)));
+        try std.testing.expectEqual(@as(u32, 6), try catalog.readAuthoritativeReaderVersion(&read, catalog.supported_reader_version));
+        try std.testing.expectEqual(@as(u32, 6), try catalog.catalogReaderVersion(a, try read.get(inventory.resolver_key)));
         // Exercise the exact version predicate used by the previous reader.
-        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, catalog.readMinimumReaderVersion(&read, 4));
+        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, catalog.readMinimumReaderVersion(&read, 5));
     }
     var reopened = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
     defer reopened.close();
@@ -124556,8 +124556,8 @@ test "db prepared transaction effects required protocol activation rejects unfen
     try db.enablePreparedTransactionProtocol();
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
-    try std.testing.expectEqualStrings("5", try read.get(catalog.replacement_reader_base_key));
-    try std.testing.expectEqualStrings("5", try read.get(catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings("6", try read.get(catalog.replacement_reader_base_key));
+    try std.testing.expectEqualStrings("6", try read.get(catalog.minimum_reader_key));
 }
 
 test "db prepared transaction effects required protocol rejects incomplete activation" {
@@ -124567,10 +124567,10 @@ test "db prepared transaction effects required protocol rejects incomplete activ
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
     defer db.close();
-    try db.core.store.put(catalog.minimum_reader_key, "5");
+    try db.core.store.put(catalog.minimum_reader_key, "6");
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.enablePreparedTransactionProtocol());
-    try db.core.store.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":5,\"resolvers\":[]}");
+    try db.core.store.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":6,\"resolvers\":[]}");
     try db.core.store.put(catalog.replacement_reader_base_key, "4");
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
 }
@@ -124685,15 +124685,15 @@ test "db prepared transaction effects required catalog raw transaction batch app
                 .transaction_put, .transaction_delete => {
                     var txn = try db.core.store.beginWriteTxn();
                     errdefer txn.abort();
-                    if (mode == .transaction_put) try txn.put(key, "{\"version\":5,\"resolvers\":[]}") else try txn.delete(key);
+                    if (mode == .transaction_put) try txn.put(key, "{\"version\":6,\"resolvers\":[]}") else try txn.delete(key);
                     try txn.commit();
                 },
                 .batch_put, .batch_append, .batch_delete => {
                     var batch = try db.core.store.beginWriteBatch();
                     errdefer batch.abort();
                     switch (mode) {
-                        .batch_put => try batch.put(key, "{\"version\":5,\"resolvers\":[]}"),
-                        .batch_append => try batch.asTxn().appendPut(key, "{\"version\":5,\"resolvers\":[]}"),
+                        .batch_put => try batch.put(key, "{\"version\":6,\"resolvers\":[]}"),
+                        .batch_append => try batch.asTxn().appendPut(key, "{\"version\":6,\"resolvers\":[]}"),
                         .batch_delete => try batch.delete(key),
                         else => unreachable,
                     }
@@ -124767,7 +124767,7 @@ test "db prepared transaction effects required catalog ambiguous commit invalida
         defer batch.abort();
         var fault: Fault = .{ .inner = batch.runtime.?, .publish = publish, .revision = &db.core.store.resolver_catalog_revision };
         batch.runtime = .{ .allocator = a, .ptr = &fault, .vtable = &Fault.vtable };
-        try batch.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":5,\"resolvers\":[]}");
+        try batch.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":6,\"resolvers\":[]}");
         try std.testing.expectError(error.TestCommitReplyLost, batch.commit());
         try std.testing.expectEqual(publish, fault.committed);
         try std.testing.expect(db.core.store.resolver_catalog_revision.read() != null);
@@ -124799,10 +124799,10 @@ test "db prepared transaction effects required catalog partial reload cannot pub
     try db.enablePreparedTransactionProtocol();
     // The header is supported, but the resolver definition cannot be loaded.
     // Publishing the cached version before deserialization is insufficient.
-    try db.core.store.put(key, "{\"version\":5,\"resolvers\":[{}]}");
+    try db.core.store.put(key, "{\"version\":6,\"resolvers\":[{}]}");
     try std.testing.expectError(error.MissingField, db.core.loadIndexCatalogOnly());
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
-    try db.core.store.put(key, "{\"version\":5,\"resolvers\":[]}");
+    try db.core.store.put(key, "{\"version\":6,\"resolvers\":[]}");
     try db.core.loadIndexCatalogOnly();
     try db.core.requirePreparedTransactionProtocol(null);
 }
@@ -124833,8 +124833,8 @@ test "db prepared transaction effects required catalog attestation belongs to it
     defer second.close();
     try first.enablePreparedTransactionProtocol();
     // Equal numeric revisions and floors do not prove that another store has
-    // a validated version-5 envelope. Model rebinding before a loader succeeds.
-    try second.core.store.put(@import("catalog/resolver_catalog.zig").minimum_reader_key, "5");
+    // a validated version-6 envelope. Model rebinding before a loader succeeds.
+    try second.core.store.put(@import("catalog/resolver_catalog.zig").minimum_reader_key, "6");
     try second.core.store.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":4,\"resolvers\":[]}");
     try std.testing.expectEqual(first.core.store.resolver_catalog_revision.read(), second.core.store.resolver_catalog_revision.read());
     const manager = first.core.index_manager;
@@ -124911,12 +124911,12 @@ test "db prepared transaction effects required recovery defers accepted plans" {
         defer a.free(frame);
         try manager.sealPreparedEffects(id, frame, catalogs, .synchronous, null);
         // Model a learned durable coordinator decision without pretending its
-        // participant effects were materialized. Keep the actual v6 revision,
+        // participant effects were materialized. Keep the actual v7 revision,
         // lease and row intent; changing that wire format must update this fixture.
         const key = transactions_mod.records_prefix.* ++ id;
         const raw = try db.core.store.get(a, &key);
         defer a.free(raw);
-        try std.testing.expectEqual(@as(usize, 53), raw.len);
+        try std.testing.expectEqual(@as(usize, 54), raw.len);
         raw[0] = @backingInt(transactions_mod.TxnStatus.committed);
         std.mem.writeInt(u64, raw[9..17], 2, .little);
         std.mem.writeInt(u64, raw[25..33], 2, .little);
@@ -125112,7 +125112,7 @@ test "db prepared transaction effects required recovery consumes accepted plan w
         const record_key = transactions_mod.records_prefix.* ++ id;
         const raw = try db.core.store.get(a, &record_key);
         defer a.free(raw);
-        try std.testing.expectEqual(@as(usize, 53), raw.len);
+        try std.testing.expectEqual(@as(usize, 54), raw.len);
         raw[0] = @backingInt(transactions_mod.TxnStatus.committed);
         std.mem.writeInt(u64, raw[9..17], 2, .little);
         std.mem.writeInt(u64, raw[25..33], 2, .little);
@@ -142933,4 +142933,82 @@ test "publication recovery step owned capture reserved lane refuses legacy bytes
     vtable.recover_with_admission = null;
     db.local_execution.replication_async_effect_mirror.?.publisher.vtable = &vtable;
     try std.testing.expectError(error.PublicationRecoveryNeedsMaintenance, DB.outboxRecoveryReservedDrain(&db));
+}
+
+test "db prepared transaction effects required retained contract survives resolution reopen retry and expiry" {
+    const a = std.testing.allocator;
+    const codec = @import("prepared_transaction_effects.zig");
+    for (std.meta.tags(codec.Mode)) |mode| {
+        var directory = try TestDirectory.init("prepared-retained-contract");
+        defer directory.cleanup();
+        const id: types.TxnId = @splat(0xe3);
+        {
+            var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+            defer db.close();
+            try db.enablePreparedTransactionProtocol();
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            _ = try db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, true, .{ .mode = mode }, .{}, null);
+            var manager = try db.core.initTxnManager();
+            defer manager.deinit();
+            try manager.writeIntents(id, &.{}, &.{});
+            const contract = try manager.preparedEffectsContract(id, @splat(1), mode, null);
+            const frame = try codec.encode(a, .{ .contract = contract, .effects = .{} }, null);
+            defer a.free(frame);
+            try manager.sealPreparedEffects(id, frame, @splat(1), mode, null);
+            var plan = (try manager.loadPreparedEffects(a, id, null)).?;
+            defer plan.deinit();
+            // The caller may lose this successful reply. The record and effect
+            // retirement must remain sufficient for a fresh owner after reopen.
+            _ = try manager.resolvePreparedIntents(id, 10, &plan, .{}, null);
+            try std.testing.expect(!try manager.hasPreparationRequirement(id));
+            try std.testing.expect(!try manager.hasPreparedEffects(id));
+            try std.testing.expectEqual(mode, (try manager.getPreparationDecision(id, null)).requirement.?.mode);
+        }
+        var reopened = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+        defer reopened.close();
+        var manager = try reopened.core.initTxnManager();
+        defer manager.deinit();
+        const accepted = try manager.getPreparationDecision(id, null);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, accepted.status);
+        try std.testing.expectEqual(mode, accepted.requirement.?.mode);
+        try manager.resolveIntents(id, .committed, 999);
+        try std.testing.expectEqual(mode, (try manager.getPreparationDecision(id, null)).requirement.?.mode);
+        try std.testing.expect(!try manager.cleanupTransactionMetadataIfEligible(id, 100, 10));
+        try std.testing.expect(try manager.cleanupTransactionMetadataIfEligible(id, 100, 11));
+        try std.testing.expectError(error.TxnNotFound, manager.getPreparationDecision(id, null));
+        var read = try reopened.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 0), (try @import("../publication_backlog.zig").load(&read)).?.records);
+        const catalog = @import("catalog/resolver_catalog.zig");
+        try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, catalog.readMinimumReaderVersion(&read, 5));
+    }
+}
+
+test "db prepared transaction effects required reader five migration refuses active contracts before upgrading" {
+    const a = std.testing.allocator;
+    const catalog = @import("catalog/resolver_catalog.zig");
+    var directory = try TestDirectory.init("prepared-contract-reader-upgrade");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.core.store.put(catalog.minimum_reader_key, "5");
+    try db.core.store.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":5,\"resolvers\":[]}");
+    try db.core.loadIndexCatalogOnly();
+    try std.testing.expectError(error.PreparedTransactionProtocolDisabled, db.core.requirePreparedTransactionProtocol(null));
+    var manager = try db.core.initTxnManager();
+    defer manager.deinit();
+    const id: types.TxnId = @splat(0xe4);
+    try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, true, .{ .mode = .deferred }, .{}, null);
+    // Exact previous encoding: there is no retained agreement in the record.
+    const key = transactions_mod.records_prefix.* ++ id;
+    const raw = try db.core.store.get(a, &key);
+    defer a.free(raw);
+    try db.core.store.put(&key, raw[0..53]);
+    try std.testing.expect((try manager.getPreparationDecision(id, null)).requirement == null);
+    try std.testing.expectError(error.PreparedTransactionMigrationRequired, db.enablePreparedTransactionProtocol());
+    try manager.resolveIntents(id, .aborted, 10);
+    try db.enablePreparedTransactionProtocol();
+    try db.core.requirePreparedTransactionProtocol(null);
+    try std.testing.expect((try manager.getPreparationDecision(id, null)).requirement == null);
 }

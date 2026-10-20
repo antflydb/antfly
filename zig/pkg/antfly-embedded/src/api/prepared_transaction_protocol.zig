@@ -51,7 +51,7 @@ pub const Capabilities = struct {
 
     pub fn require(self: @This(), requirement: Requirement) !void {
         if (self.protocol != wire_version or self.requirement_format != 1 or self.effects_format != 1 or
-            self.minimum_reader < 5 or self.permanent_reader < 5 or self.catalog_envelope < 5 or
+            self.minimum_reader < 6 or self.permanent_reader < 6 or self.catalog_envelope < 6 or
             !self.durable_begin or !self.durable_seal or !self.recovery_consumes_effects or !self.retained_contract or
             !self.catalog_migration_complete or !self.import_policy_fenced or
             !(if (requirement.mode == .deferred) self.deferred else self.synchronous))
