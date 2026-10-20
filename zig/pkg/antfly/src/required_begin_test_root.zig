@@ -498,6 +498,7 @@ fn assertPreparationOwnerStatus(db: *db_mod.DB, txn_id: [16]u8) !void {
 comptime {
     @export(&@import("capi/server_owner.zig").storageOwnerTransactionBeginWithAdmission, .{ .name = "antfly_storage_owner_transaction_begin_with_admission" });
     @export(&@import("capi/server_owner.zig").storageOwnerTransactionPrepareWithAdmission, .{ .name = "antfly_storage_owner_transaction_prepare_with_admission" });
+    @export(&@import("capi/server_owner.zig").storageOwnerTransactionAcknowledgeWithAdmission, .{ .name = "antfly_storage_owner_transaction_acknowledge_with_admission" });
     @export(&@import("capi/server_owner.zig").storageOwnerTransactionResolveWithAdmission, .{ .name = "antfly_storage_owner_transaction_resolve_with_admission" });
 }
 
@@ -718,6 +719,9 @@ test "required replicated begin native workspace denies quota before backing all
     defer directory.cleanup();
     var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
     defer db.close();
+    const ack_id: [16]u8 = @splat(0x93);
+    _ = try db.beginTransactionScoped(ack_id, 1, 2, &.{"table2:00000004:docs:7"}, true, true, null);
+    try db.resolveTransactionIntents(ack_id, .committed, 3);
     const previous = db.core.index_manager.resource_manager;
     db.core.index_manager.resource_manager = &quota;
     defer db.core.index_manager.resource_manager = previous;
@@ -745,6 +749,7 @@ test "required replicated begin native workspace denies quota before backing all
     try std.testing.expectError(error.ResourceBudgetExceeded, client.transactionBeginWithAdmission(failing.allocator(), "docs", id, 1, 2, &.{"table2:00000004:docs:7"}, true, null, null, &port));
     try std.testing.expectError(error.ResourceBudgetExceeded, client.transactionResolveWithAdmission("docs", id, .aborted, 3, .write, &port));
     handle.db.alloc = failing.allocator();
+    try std.testing.expectError(error.ResourceBudgetExceeded, client.transactionAcknowledgeWithAdmission("docs", ack_id, &.{"table2:00000004:docs:7"}, &port));
     try std.testing.expectError(error.ResourceBudgetExceeded, client.transactionPrepareWithAdmission("docs", id, .{ .writes = &.{.{ .key = "quota", .value = "{}" }} }, &port));
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(u64, 0), quota.sliceStats(.relational_preparation_working_set).used_bytes);
@@ -1144,4 +1149,124 @@ test "required replicated begin typed relational PREPARE retains one original wo
     _ = try db.beginTransactionScoped(rejected_id, 1, 2, &.{}, true, true, null);
     try std.testing.expectError(error.InvalidBatchRequest, client.transactionPrepareWithAdmission("docs", rejected_id, .{ .writes = &.{.{ .key = "bad", .value = "{\"id\":\"bad\",\"payload\":\"x\"}" }} }, &port));
     try std.testing.expect(!try manager.hasIntents(rejected_id));
+}
+
+test "required replicated begin controlled native acknowledgements preserve rejection atomic membership and restart" {
+    const a = std.testing.allocator;
+    const admission = sources.common_read_admission;
+    const cohort = [_][]const u8{ "table2:00000004:docs:7", "table2:00000004:docs:8", "table2:00000004:docs:9" };
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ordinal = self.calls;
+            self.calls += 1;
+            if (ordinal == self.fail_at) return self.cause;
+        }
+        fn acknowledge(client: *@import("storage/kernel_owner_client.zig").Owner, txn_id: [16]u8, participants: []const []const u8, port: *const admission.Port) !void {
+            const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (true) {
+                client.transactionAcknowledgeWithAdmission("docs", txn_id, participants, port) catch |err| {
+                    if (err != error.CommitCompletionPending or @import("antfly_platform").time.monotonicNs() >= deadline) return err;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                };
+                return;
+            }
+        }
+        fn forbidden(_: *anyopaque) !void {
+            return error.UnexpectedCpuLoan;
+        }
+    };
+    var directory = try sources.common_test_directory.TestDirectory.init("controlled-native-ack");
+    defer directory.cleanup();
+    const accepted: [16]u8 = @splat(0xe1);
+    {
+        var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        var handle: sources.capi_handles.Handle = .{ .alloc = a, .db = db, .storage_owner_table_name = @constCast("docs"), .storage_owner_group_id = 7 };
+        const registry = sources.capi_handles.handleRegistry();
+        const registered = try registry.register(&handle);
+        defer {
+            _, const index = registry.beginClose(registered).?;
+            registry.finishClose(index);
+        }
+        var client: @import("storage/kernel_owner_client.zig").Owner = .{ .handle = registered };
+        var control: Control = .{};
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check }, .execution_wait = .{ .ptr = &control, .begin = Control.forbidden, .end = Control.forbidden } };
+        const port = admission.Port.init(&payload);
+        _ = try db.beginTransactionScoped(accepted, 1, 2, &cohort, true, true, null);
+        try client.transactionResolveWithAdmission("docs", accepted, .committed, 3, .write, &port);
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        {
+            const resolved = try manager.getResolvedParticipants(a, accepted);
+            defer sources.storage_transactions.freeParticipantList(a, resolved);
+            try std.testing.expectEqual(@as(usize, 0), resolved.len);
+        }
+        control = .{};
+        try Control.acknowledge(&client, accepted, cohort[0..2], &port);
+        const checkpoints = control.calls;
+        try std.testing.expect(checkpoints > 10);
+        for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.DeadlineExceeded, error.MemoryLimitExceeded, error.Backpressured, error.UnsupportedOperation }, 0..) |cause, cause_index| for (0..checkpoints) |ordinal| {
+            var attempt: [16]u8 = @splat(0xe2);
+            std.mem.writeInt(u64, attempt[0..8], @intCast(ordinal), .little);
+            attempt[8] = @intCast(cause_index);
+            _ = try db.beginTransactionScoped(attempt, 1, 2, &cohort, true, true, null);
+            try db.resolveTransactionIntents(attempt, .committed, 3);
+            control = .{ .fail_at = ordinal, .cause = cause };
+            const result = client.transactionAcknowledgeWithAdmission("docs", attempt, cohort[0..2], &port);
+            const resolved = try manager.getResolvedParticipants(a, attempt);
+            defer sources.storage_transactions.freeParticipantList(a, resolved);
+            if (control.calls > ordinal) {
+                try std.testing.expectError(cause, result);
+                try std.testing.expectEqual(@as(usize, 0), resolved.len);
+            } else if (result) |_| {
+                try std.testing.expectEqual(@as(usize, 2), resolved.len);
+            } else |err| {
+                // Independent index workers may briefly own apply. A bounded
+                // retry refusal must still leave the entire ACK set absent.
+                try std.testing.expectEqual(error.CommitCompletionPending, err);
+                try std.testing.expectEqual(@as(usize, 0), resolved.len);
+            }
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try manager.getTransactionStatus(attempt));
+        };
+        control = .{};
+        db.core.lockApplyExclusive();
+        const busy = client.transactionAcknowledgeWithAdmission("docs", accepted, cohort[2..], &port);
+        db.core.unlockApplyExclusive();
+        try std.testing.expectError(error.CommitCompletionPending, busy);
+        try std.testing.expectError(error.InvalidParticipant, Control.acknowledge(&client, accepted, &.{ cohort[2], "not-enlisted" }, &port));
+        {
+            const resolved = try manager.getResolvedParticipants(a, accepted);
+            defer sources.storage_transactions.freeParticipantList(a, resolved);
+            try std.testing.expectEqual(@as(usize, 2), resolved.len);
+        }
+        try Control.acknowledge(&client, accepted, &.{ cohort[0], cohort[1], cohort[1] }, &port);
+        handle.db.local_execution.restore_staging_required.store(true, .release);
+        const hidden = client.transactionAcknowledgeWithAdmission("docs", accepted, cohort[2..], &port);
+        handle.db.local_execution.restore_staging_required.store(false, .release);
+        try std.testing.expectError(error.UnsupportedOperation, hidden);
+        const arrays = sources.api_transaction_begin_admission;
+        var marker: u8 = 0;
+        const bad: arrays.Port = .{ .contract = @import("antfly_runtime_abi").native_abi.TypeContract.of(u8), .payload = &marker };
+        const raw: @import("kernel_owner_abi").TransactionAcknowledgeRequest = .{ .table_name = .fromSlice("docs"), .txn_id = .{ .bytes = accepted }, .participants = &bad, .port = &port };
+        try std.testing.expectEqual(@import("kernel_owner_abi").Status.invalid_abi, @import("capi/server_owner.zig").storageOwnerTransactionAcknowledgeWithAdmission(null, &raw));
+        try Control.acknowledge(&client, accepted, cohort[2..], &port);
+        const missing: [16]u8 = @splat(0xef);
+        try Control.acknowledge(&client, missing, cohort[0..1], &port);
+        try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(missing));
+        control = .{ .fail_at = 2, .cause = error.TxnNotFound };
+        try std.testing.expectError(error.TxnNotFound, client.transactionAcknowledgeWithAdmission("docs", missing, cohort[0..1], &port));
+    }
+    var reopened = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer reopened.close();
+    var manager = try reopened.core.initTxnManager();
+    defer manager.deinit();
+    const resolved = try manager.getResolvedParticipants(a, accepted);
+    defer sources.storage_transactions.freeParticipantList(a, resolved);
+    try std.testing.expectEqual(@as(usize, 3), resolved.len);
+    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try manager.getTransactionStatus(accepted));
 }

@@ -2150,32 +2150,44 @@ pub const TxnManager = struct {
     }
 
     pub fn markParticipantsResolvedExtraBatch(self: *TxnManager, txn_id: TxnId, acknowledgements: []const []const u8, extra_batch: MutationExtraBatch) !void {
+        return self.markParticipantsResolvedExtraBatchWithAdmission(txn_id, acknowledgements, extra_batch, null);
+    }
+
+    pub fn markParticipantsResolvedExtraBatchWithAdmission(self: *TxnManager, txn_id: TxnId, acknowledgements: []const []const u8, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
+        var trace: read_control.RejectionTrace = .{};
+        const control = trace.bind(original);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
         var writes: std.ArrayListUnmanaged(docstore.KVPair) = .empty;
         var deletes: std.ArrayListUnmanaged([]const u8) = .empty;
-        try self.stageParticipantResolutions(txn_id, acknowledgements, scratch, &writes, &deletes);
+        self.stageParticipantResolutionsWithAdmission(txn_id, acknowledgements, scratch, &writes, &deletes, control) catch |err| return trace.failure orelse err;
         try writes.appendSlice(scratch, extra_batch.writes);
         try deletes.appendSlice(scratch, extra_batch.deletes);
-        try self.applyBatch(writes.items, deletes.items, null);
+        self.applyBatchWithAdmission(writes.items, deletes.items, null, control) catch |err| return trace.failure orelse err;
     }
 
     /// Stage indexed acknowledgements into the caller's atomic mutation batch.
     /// Every key/value added here lives in scratch until that batch finishes.
     fn stageParticipantResolutions(self: *TxnManager, txn_id: TxnId, acknowledgements: []const []const u8, scratch: Allocator, writes: *std.ArrayListUnmanaged(docstore.KVPair), deletes: *std.ArrayListUnmanaged([]const u8)) !void {
+        return self.stageParticipantResolutionsWithAdmission(txn_id, acknowledgements, scratch, writes, deletes, null);
+    }
+
+    fn stageParticipantResolutionsWithAdmission(self: *TxnManager, txn_id: TxnId, acknowledgements: []const []const u8, scratch: Allocator, writes: *std.ArrayListUnmanaged(docstore.KVPair), deletes: *std.ArrayListUnmanaged([]const u8), control: ?read_control.Port) !void {
+        if (control) |owner| try owner.checkpoint();
         if (acknowledgements.len == 0 or acknowledgements.len > 64) return error.InvalidParticipant;
-        _ = try self.loadTransactionRecord(txn_id);
+        _ = try self.loadTransactionRecordWithAdmission(txn_id, control);
         const index_key = makeSidecarKey(participant_index_prefix, txn_id);
-        const raw = self.getAlloc(scratch, &index_key) catch |err| switch (err) {
+        const raw = self.getAllocWithAdmission(scratch, &index_key, control) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
         var indexed = if (raw) |bytes| try ParticipantIndex.decode(bytes) else ParticipantIndex{};
         var enlisted: std.StringHashMapUnmanaged(void) = .empty;
         if (raw == null) {
-            const participants = try self.getParticipants(scratch, txn_id);
+            const participants = try self.loadParticipantSetWithAdmission(scratch, participants_prefix, txn_id, control);
             for (participants) |participant| {
+                if (control) |owner| try owner.checkpoint();
                 const member = try enlisted.getOrPut(scratch, participant);
                 if (member.found_existing) continue;
                 indexed.enlisted += 1;
@@ -2186,11 +2198,12 @@ pub const TxnManager = struct {
         // Validate every member before any mutation. The immutable membership
         // index replaces repeated cohort-sized decode and membership scans.
         for (acknowledgements) |participant| {
+            if (control) |owner| try owner.checkpoint();
             if (raw == null) {
                 if (!enlisted.contains(participant)) return error.InvalidParticipant;
             } else {
                 const key = makeParticipantIndexKey(participant_index_prefix, txn_id, participant);
-                const member = self.getAlloc(scratch, &key) catch |err| switch (err) {
+                const member = self.getAllocWithAdmission(scratch, &key, control) catch |err| switch (err) {
                     error.NotFound => return error.InvalidParticipant,
                     else => return err,
                 };
@@ -2201,13 +2214,14 @@ pub const TxnManager = struct {
         // A local resolution may atomically have used the legacy sidecar.
         // Absorb it once, preserving all independently durable evidence.
         const legacy_key = makeSidecarKey(resolved_participants_prefix, txn_id);
-        const legacy_members = try self.loadParticipantSet(scratch, resolved_participants_prefix, txn_id);
+        const legacy_members = try self.loadParticipantSetWithAdmission(scratch, resolved_participants_prefix, txn_id, control);
         for (legacy_members) |participant| {
+            if (control) |owner| try owner.checkpoint();
             if (raw == null) {
                 if (!enlisted.contains(participant)) return error.InvalidTxnRecord;
             } else {
                 const member_key = makeParticipantIndexKey(participant_index_prefix, txn_id, participant);
-                const member = self.getAlloc(scratch, &member_key) catch |err| switch (err) {
+                const member = self.getAllocWithAdmission(scratch, &member_key, control) catch |err| switch (err) {
                     error.NotFound => return error.InvalidTxnRecord,
                     else => return err,
                 };
@@ -2215,11 +2229,15 @@ pub const TxnManager = struct {
             }
             try resolved.put(scratch, participant, {});
         }
-        for (acknowledgements) |participant| try resolved.put(scratch, participant, {});
+        for (acknowledgements) |participant| {
+            if (control) |owner| try owner.checkpoint();
+            try resolved.put(scratch, participant, {});
+        }
         var members = resolved.keyIterator();
         while (members.next()) |participant| {
+            if (control) |owner| try owner.checkpoint();
             const key = makeParticipantIndexKey(resolved_index_prefix, txn_id, participant.*);
-            const existing = self.getAlloc(scratch, &key) catch |err| switch (err) {
+            const existing = self.getAllocWithAdmission(scratch, &key, control) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
@@ -3366,7 +3384,7 @@ pub const TxnManager = struct {
 
     fn applyBatchWithParticipantAndAdmission(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend, reservation: ?ReservationChange, participant: ?@import("commit_participant.zig").Participant, control: ?read_control.Port) !void {
         if (control) |owner| try owner.checkpoint();
-        var batch = try self.store.beginBatch();
+        var batch = if (control) |owner| try self.store.beginBatchWithAdmission(owner) else try self.store.beginBatch();
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
         if (reservation) |change| try retained_effects.replaceReservation(&batch, change.previous, change.next);

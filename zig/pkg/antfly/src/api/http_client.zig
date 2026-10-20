@@ -3468,6 +3468,12 @@ pub const ApiHttpClient = struct {
         return fetchInternalPostEmpty(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_suffix, body, timeout_ms, null);
     }
 
+    /// Only a definite response is capability information. Executor and
+    /// original-control errors remain errors even when their names coincide.
+    pub fn fetchGroupTxnAcknowledgeManyDelivery(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32) !AcknowledgementDelivery {
+        return self.fetchInternalPostDeliveryWithCapabilities(base_uri, group_id, table_name, routes.Routes.txn_acknowledge_many_suffix, body, timeout_ms, null, true);
+    }
+
     pub fn fetchGroupTxnAcknowledgeManyWithTimeout(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: u32) !EmptyResponse {
         return fetchInternalPostEmptyWithCapabilities(self, base_uri, group_id, table_name, routes.Routes.txn_acknowledge_many_suffix, body, timeout_ms, null, true);
     }
@@ -3682,6 +3688,22 @@ pub const ApiHttpClient = struct {
         cancellation: ?*const http_common.RequestCancellation,
         unsupported_route: bool,
     ) !EmptyResponse {
+        const delivered = try self.fetchInternalPostDeliveryWithCapabilities(base_uri, group_id, table_name, suffix_name, body, timeout_ms, cancellation, unsupported_route);
+        if (delivered == .unsupported) return error.UnsupportedOperation;
+        return .{};
+    }
+
+    fn fetchInternalPostDeliveryWithCapabilities(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        suffix_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+        cancellation: ?*const http_common.RequestCancellation,
+        unsupported_route: bool,
+    ) !AcknowledgementDelivery {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -3706,7 +3728,7 @@ pub const ApiHttpClient = struct {
             if (std.mem.eql(u8, outcome, internal_batch_forwarding.outcome_unknown_v1)) return error.RaftBatchWriteOutcomeUnknown;
         };
         switch (resp.status) {
-            200 => return .{},
+            200 => return .delivered,
             202 => {
                 if (std.mem.eql(u8, resp.body, "committed_repair_required"))
                     return error.EnrichmentWorkerFailed;
@@ -3714,8 +3736,8 @@ pub const ApiHttpClient = struct {
                     return error.CommitVisibilityNotSatisfied;
                 return error.UnexpectedHttpStatus;
             },
-            404 => return if (unsupported_route) error.UnsupportedOperation else error.UnknownGroup,
-            405 => return error.UnsupportedOperation,
+            404 => return if (unsupported_route) .unsupported else error.UnknownGroup,
+            405 => return .unsupported,
             409 => return remoteGroupTxnResolveConflictError(resp.body),
             503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
@@ -6941,3 +6963,6 @@ test "internal query owner transport guards refuse unowned buffered and streamin
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
     try std.testing.expectEqual(common.RequestDeliveryTracker.State.not_sent, tracker.load());
 }
+
+/// A validated transport response, never inferred from a callback error name.
+pub const AcknowledgementDelivery = enum { delivered, unsupported };

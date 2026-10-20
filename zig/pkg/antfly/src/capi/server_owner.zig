@@ -4162,6 +4162,35 @@ pub fn storageOwnerTransactionPrepareWithAdmission(owner: ?*anyopaque, request: 
     return .ok;
 }
 
+/// Acknowledgement is independently retryable after the durable response.
+/// Missing native transactions are safe no-ops; original rejection is not.
+pub fn storageOwnerTransactionAcknowledgeWithAdmission(owner: ?*anyopaque, request: *const kernel_owner_abi.TransactionAcknowledgeRequest) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const read = @import("antfly_local_sources").common_read_admission;
+    const raw = request.port orelse return .invalid_argument;
+    if (@intFromPtr(raw) % @alignOf(read.Port) != 0) return .invalid_argument;
+    const control: *const read.Port = @ptrCast(@alignCast(raw));
+    control.checkpoint() catch |err| return storageOwnerStatusFromError(err);
+    if (request._reserved != 0 or (request.table_name.len != 0 and request.table_name.ptr == null) or std.math.cast(usize, request.table_name.len) == null) return .invalid_argument;
+    const participants = @import("antfly_local_sources").api_transaction_begin_admission.Port.read(request.participants orelse return .invalid_argument) catch |err| return if (err == error.UnsupportedVersion) .invalid_abi else .invalid_argument;
+    if (participants.len == 0 or participants.len > 64) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    if (handle.db.local_execution.restore_staging_required.load(.acquire) or handle.db.local_execution.initial_child_hidden.load(.acquire)) return storageOwnerStatusFromError(error.UnsupportedOperation);
+    const Check = struct {
+        fn lifetime(ptr: *const anyopaque) !void {
+            const original: *const read.Port = @ptrCast(@alignCast(ptr));
+            try original.checkLifetime();
+        }
+    };
+    const wait = control.executionWaitAfterLifetime() catch |err| return storageOwnerStatusFromError(err);
+    handle.db.markTransactionParticipantsResolvedWithAdmissionControls(request.txn_id.bytes, participants, .{ .lifetime = .{ .context = control, .check_fn = Check.lifetime }, .execution_wait = wait }) catch |err| switch (err) {
+        error.TxnNotFound => return .ok,
+        else => return storageOwnerStatusFromError(if (err == error.Backpressured) error.CommitCompletionPending else err),
+    };
+    return .ok;
+}
+
 /// Completion borrows its existing owner; it neither mints a new deadline nor
 /// turns a visibility rejection into permission to change a durable decision.
 pub fn storageOwnerTransactionResolveWithAdmission(owner: ?*anyopaque, request: *const kernel_owner_abi.TransactionResolveRequest) callconv(.c) kernel_owner_abi.Status {

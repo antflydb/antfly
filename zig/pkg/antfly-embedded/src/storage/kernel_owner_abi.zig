@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 107;
+pub const abi_version: u32 = 108;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1598,6 +1598,18 @@ pub const TransactionResolveRequest = extern struct {
     port: ?*const anyopaque = null,
 };
 pub extern fn antfly_storage_owner_transaction_resolve_with_admission(owner: ?*anyopaque, request: *const TransactionResolveRequest) callconv(.c) Status;
+
+/// Bounded, synchronous acknowledgement of an enlisted cohort subset.
+/// The checked participant slice and original admission cannot escape.
+pub const TransactionAcknowledgeRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    txn_id: TxnId = .{},
+    participants: ?*const anyopaque = null,
+    port: ?*const anyopaque = null,
+};
+pub extern fn antfly_storage_owner_transaction_acknowledge_with_admission(owner: ?*anyopaque, request: *const TransactionAcknowledgeRequest) callconv(.c) Status;
 
 pub const TransactionStatusRequest = extern struct {
     version: u32 = abi_version,

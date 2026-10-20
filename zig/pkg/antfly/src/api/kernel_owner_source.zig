@@ -5590,6 +5590,10 @@ pub const ProvisionedKernelOwnerSource = struct {
     fn batchGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, context: @import("antfly_local_sources").api_local_transaction_contract.PreDecisionContext) !?void {
         const original: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
         try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(original, context.execution_runnable);
+        if (req.transaction) |transaction| switch (transaction) {
+            .acknowledge, .acknowledge_many => return acknowledgeTransactionGroupLocalWithContext(ptr, alloc, group_id, table_name, req, context),
+            else => return error.UnsupportedOperation,
+        };
         if (context.route_fence != null) return error.CatalogRouteFenceUnsupported;
         if (context.restore_staging_scope) |scope| if (req.restore_staging_scope == null or !std.mem.eql(u8, &scope, &req.restore_staging_scope.?)) return error.RestoreStagingScopeChanged;
         if (context.restore_staging_plan_id) |plan| if (req.restore_staging_plan_id == null or !std.mem.eql(u8, &plan, &req.restore_staging_plan_id.?)) return error.RestoreStagingScopeChanged;
@@ -6587,6 +6591,65 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (confirmation.entry != owner.entry) return error.StorageReadTemporarilyUnavailable;
         try control.checkpoint();
         return try @import("antfly_local_sources").api_prepared_transaction_protocol.observationFromOwner(result);
+    }
+
+    fn acknowledgeTransactionGroupLocalWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, context: @import("antfly_local_sources").api_local_transaction_contract.PreDecisionContext) !?void {
+        const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
+        try original.checkOriginal(active, context.execution_runnable);
+        if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
+        if (context.restore_staging_scope != null or context.restore_staging_plan_id != null or req.restore_staging_scope != null or req.restore_staging_plan_id != null) return error.UnsupportedOperation;
+
+        const transaction = req.transaction orelse return error.InvalidBatchRequest;
+        var single: [1][]const u8 = undefined;
+        const txn_id = switch (transaction) {
+            .acknowledge => |ack| ack.txn_id,
+            .acknowledge_many => |ack| ack.txn_id,
+            else => return error.InvalidBatchRequest,
+        };
+        const participants: []const []const u8 = switch (transaction) {
+            .acknowledge => |ack| blk: {
+                single[0] = ack.participant;
+                break :blk &single;
+            },
+            .acknowledge_many => |ack| ack.participants,
+            else => unreachable,
+        };
+        if (participants.len == 0 or participants.len > 64) return error.InvalidBatchRequest;
+        // A control acknowledgement cannot silently drop another mutation.
+        var remaining = req;
+        remaining.transaction = null;
+        remaining.sync_level = (db_types.BatchRequest{}).sync_level;
+        remaining.timestamp_ns = 0;
+        const empty: db_types.BatchRequest = .{};
+        inline for (@typeInfo(db_types.BatchRequest).@"struct".field_names) |name| {
+            const value = @field(remaining, name);
+            if (comptime @typeInfo(@TypeOf(value)) == .pointer and @typeInfo(@TypeOf(value)).pointer.size == .slice) {
+                if (value.len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(value, @field(empty, name))) return error.InvalidBatchRequest;
+        }
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var receiver = if (context.deadline_io) |borrow| try borrow.receive() else null;
+        const io = if (receiver) |*received| received.io() else if (self.context_runtime) |runtime| runtime.io() orelse return error.BackendRuntimeIoUnavailable else return error.BackendRuntimeIoUnavailable;
+        const Controls = NativeTransactionControls;
+        const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
+        const admission = @import("antfly_local_sources").common_read_admission;
+        var budget: Budget = .{ .controls = .{ .context = active, .route = context.route_fence, .execution_runnable = context.execution_runnable }, .io = io };
+        var adapter: admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = admission.Port.init(&payload);
+        if (context.route_fence) |fence| {
+            try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
+        }
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
+        defer lease.deinit();
+        if (lease.entry.restore_bootstrap_json.len != 0) return error.UnsupportedOperation;
+        if (context.route_fence) |fence| {
+            const identity = fence.route.identity_namespace;
+            if (identity.table_id != lease.entry.identity.table_id or identity.shard_id != lease.entry.identity.shard_id or identity.range_id != lease.entry.identity.range_id) return error.TopologyChanged;
+        }
+        try lease.owner().transactionAcknowledgeWithAdmission(table_name, txn_id, participants, &control);
+        return {};
     }
 
     fn txnAcknowledgeGroupLocal(
@@ -9131,4 +9194,25 @@ test "controlled native PREPARE source preserves original rejection before sourc
 test "controlled native PREPARE source analyzes real typed intent preparation" {
     var source: ProvisionedKernelOwnerSource = undefined;
     _ = source.writeSource().txnPrepareGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", @splat(1), 3, .{}, .{ .deadline_ns = 10 }) catch {};
+}
+
+test "controlled native ACK source rejects original authority before source access" {
+    const Reject = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.MemoryLimitExceeded;
+        }
+    };
+    var marker: u8 = 0;
+    var source: ProvisionedKernelOwnerSource = undefined;
+    try std.testing.expectError(error.MemoryLimitExceeded, ProvisionedKernelOwnerSource.batchGroupLocalWithPreDecisionContext(&source, std.testing.allocator, 7, "docs", .{ .transaction = .{ .acknowledge = .{ .txn_id = @splat(1), .participant = "member" } } }, .{ .cancellation = .{ .ptr = &marker, .check_fn = Reject.check } }));
+}
+
+test "controlled native ACK source analyzes typed cohort acknowledgement" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    _ = source.writeSource().batchGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", .{ .transaction = .{ .acknowledge_many = .{ .txn_id = @splat(1), .participants = &.{"member"} } } }, .{ .deadline_ns = 10 }) catch {};
+}
+
+test "controlled native ACK source rejects silently discarded mutation fields" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    try std.testing.expectError(error.InvalidBatchRequest, ProvisionedKernelOwnerSource.batchGroupLocalWithPreDecisionContext(&source, std.testing.allocator, 7, "docs", .{ .writes = &.{.{ .key = "drop", .value = "{}" }}, .transaction = .{ .acknowledge_many = .{ .txn_id = @splat(1), .participants = &.{"member"} } } }, .{}));
 }

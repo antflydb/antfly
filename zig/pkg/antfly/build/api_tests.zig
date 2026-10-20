@@ -3358,7 +3358,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&online_owner_source_run.step);
     const native_begin_source_check = b.addTest(.{
         .root_module = owner_preflight_context_root,
-        .filters = &.{ "controlled native BEGIN source", "controlled native completion source", "controlled native PREPARE source" },
+        .filters = &.{ "controlled native BEGIN source", "controlled native completion source", "controlled native PREPARE source", "controlled native ACK source" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-native-begin-source-check", "Analyze controlled native BEGIN and completion owner acquisition")

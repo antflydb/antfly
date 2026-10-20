@@ -142,23 +142,30 @@ pub const TxnAcknowledgeManyRequest = struct {
 };
 
 pub fn acknowledgeGroupLocalWithRequest(writes: table_writes.TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest, cancellation: db_mod.types.CancellationToken) !?void {
+    return acknowledgeGroupLocalWithContext(writes, alloc, group_id, table_name, req, .{ .cancellation = cancellation });
+}
+
+fn acknowledgeGroupLocalWithContext(writes: table_writes.TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest, supplied: PreDecisionContext) !?void {
     try validateRestorePlan(req.restore_staging_scope, req.restore_staging_plan_id);
-    if (req.restore_staging_scope != null) {
-        if (req.restore_staging_plan_id == null) return error.InvalidTxnRequest;
-        try cancellation.check();
-        const result = try writes.batchGroupLocal(alloc, group_id, table_name, .{
-            .restore_staging_scope = req.restore_staging_scope,
-            .restore_staging_plan_id = req.restore_staging_plan_id,
-            .sync_level = .write,
-            .transaction = .{ .acknowledge = .{ .txn_id = req.txn_id, .participant = req.participant } },
-        });
-        try cancellation.check();
-        return result;
-    }
-    try cancellation.check();
-    const result = try writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant);
-    try cancellation.check();
-    return result;
+    if (req.restore_staging_scope != null and req.restore_staging_plan_id == null) return error.InvalidTxnRequest;
+    try supplied.cancellation.check();
+    if (supplied.execution_runnable) |borrow| try borrow.checkLifetime();
+    var context = supplied;
+    context.restore_staging_scope = req.restore_staging_scope;
+    context.restore_staging_plan_id = req.restore_staging_plan_id;
+    if (supplied.requiresAwareCallback()) return writes.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
+        .restore_staging_scope = req.restore_staging_scope,
+        .restore_staging_plan_id = req.restore_staging_plan_id,
+        .sync_level = .write,
+        .transaction = .{ .acknowledge = .{ .txn_id = req.txn_id, .participant = req.participant } },
+    }, context);
+    if (req.restore_staging_scope != null) return writes.batchGroupLocal(alloc, group_id, table_name, .{
+        .restore_staging_scope = req.restore_staging_scope,
+        .restore_staging_plan_id = req.restore_staging_plan_id,
+        .sync_level = .write,
+        .transaction = .{ .acknowledge = .{ .txn_id = req.txn_id, .participant = req.participant } },
+    });
+    return writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant);
 }
 
 fn validateAcknowledgementMany(req: TxnAcknowledgeManyRequest) !void {
@@ -169,16 +176,24 @@ fn validateAcknowledgementMany(req: TxnAcknowledgeManyRequest) !void {
 }
 
 pub fn acknowledgeManyGroupLocalWithRequest(writes: table_writes.TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest, cancellation: db_mod.types.CancellationToken) !?void {
+    return acknowledgeManyGroupLocalWithContext(writes, alloc, group_id, table_name, req, .{ .cancellation = cancellation });
+}
+
+fn acknowledgeManyGroupLocalWithContext(writes: table_writes.TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest, supplied: PreDecisionContext) !?void {
     try validateAcknowledgementMany(req);
-    try cancellation.check();
-    const result = try writes.batchGroupLocal(alloc, group_id, table_name, .{
+    try supplied.cancellation.check();
+    if (supplied.execution_runnable) |borrow| try borrow.checkLifetime();
+    var context = supplied;
+    context.restore_staging_scope = req.restore_staging_scope;
+    context.restore_staging_plan_id = req.restore_staging_plan_id;
+    const request: db_mod.types.BatchRequest = .{
         .restore_staging_scope = req.restore_staging_scope,
         .restore_staging_plan_id = req.restore_staging_plan_id,
         .sync_level = .write,
         .transaction = .{ .acknowledge_many = .{ .txn_id = req.txn_id, .participants = req.participants } },
-    });
-    try cancellation.check();
-    return result;
+    };
+    if (supplied.requiresAwareCallback()) return writes.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, request, context);
+    return writes.batchGroupLocal(alloc, group_id, table_name, request);
 }
 
 /// Hidden owner resolution retains its authenticated descriptor lookup identity
@@ -240,7 +255,7 @@ pub const ParticipantWorker = struct {
         status_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnStatusRequest, ?u64, runnable_abi.Borrowed) anyerror!db_mod.types.TxnStatus = null,
         resolve_group_until_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnResolveRequest, u64, runnable_abi.Borrowed) anyerror!void = null,
         acknowledge_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnAcknowledgeRequest, runnable_abi.Borrowed) anyerror!void = null,
-        acknowledge_many_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnAcknowledgeManyRequest, runnable_abi.Borrowed) anyerror!void = null,
+        acknowledge_many_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnAcknowledgeManyRequest, runnable_abi.Borrowed) anyerror!http_client_mod.AcknowledgementDelivery = null,
         begin_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnBeginRequest, runnable_abi.Borrowed) anyerror!void = null,
         prepare_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnPrepareRequest, runnable_abi.Borrowed) anyerror!void = null,
         resolve_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnResolveRequest, db_mod.types.CancellationToken, runnable_abi.Borrowed) anyerror!void = null,
@@ -470,14 +485,9 @@ pub const ParticipantWorker = struct {
         if (req.participants.len == 0 or req.participants.len > 64) return error.InvalidTxnRequest;
         if (self.execution_runnable) |borrow| {
             if (self.vtable.acknowledge_many_group_with_execution) |callback| {
-                const delivered = delivered: {
-                    callback(self.ptr, alloc, group_id, table_name, req, borrow) catch |err| switch (err) {
-                        error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion => break :delivered false,
-                        else => return err,
-                    };
-                    break :delivered true;
-                };
-                if (delivered) return;
+                // Fallback needs explicit provider evidence. Original control
+                // errors are never capability information, even if names match.
+                if (try callback(self.ptr, alloc, group_id, table_name, req, borrow) == .delivered) return;
             }
         } else if (self.vtable.acknowledge_many_group) |callback| {
             const delivered = delivered: {
@@ -565,6 +575,7 @@ pub const HostedParticipantWorker = struct {
     pre_decision_attempt_timeout_ms: u32 = default_pre_decision_attempt_timeout_ms,
     execution_wait: ?@import("antfly_local_sources").common_execution_wait.Boundary = null,
     execution_deadline_ns: ?u64 = null,
+    acknowledgement_runnable: ?runnable_abi.Borrowed = null,
 
     pub fn init(
         catalog: table_catalog.CatalogSource,
@@ -722,19 +733,19 @@ pub const HostedParticipantWorker = struct {
         var view = self.*;
         var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
         view.execution_wait = wait.boundary();
+        view.acknowledgement_runnable = borrow;
         view.execution_deadline_ns = try completionDeadline(borrow, null);
         try acknowledgeGroup(&view, alloc, group_id, table_name, req);
-        try borrow.checkLifetime();
     }
 
-    fn acknowledgeManyGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest, borrow: runnable_abi.Borrowed) !void {
+    fn acknowledgeManyGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest, borrow: runnable_abi.Borrowed) !http_client_mod.AcknowledgementDelivery {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         var view = self.*;
         var wait: runnable_fanout.RemoteWait = .{ .borrow = borrow };
         view.execution_wait = wait.boundary();
+        view.acknowledgement_runnable = borrow;
         view.execution_deadline_ns = try completionDeadline(borrow, null);
-        try acknowledgeManyGroup(&view, alloc, group_id, table_name, req);
-        try borrow.checkLifetime();
+        return acknowledgeManyGroupWithDelivery(&view, alloc, group_id, table_name, req);
     }
 
     fn beginGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest, borrow: runnable_abi.Borrowed) !void {
@@ -1211,6 +1222,10 @@ pub const HostedParticipantWorker = struct {
     }
 
     fn acknowledgeManyGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) !void {
+        if (try acknowledgeManyGroupWithDelivery(ptr, alloc, group_id, table_name, req) == .unsupported) return error.UnsupportedOperation;
+    }
+
+    fn acknowledgeManyGroupWithDelivery(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) !http_client_mod.AcknowledgementDelivery {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         try validateAcknowledgementMany(req);
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
@@ -1219,16 +1234,15 @@ pub const HostedParticipantWorker = struct {
         const cancellation = if (self.execution_deadline_ns != null) deadline_control.token() else db_mod.types.CancellationToken.none;
         try cancellation.check();
         switch (route) {
-            .local => _ = (try acknowledgeManyGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, cancellation)) orelse return error.UnknownGroup,
+            .local => {
+                _ = (try acknowledgeManyGroupLocalWithContext(self.writes, alloc, group_id, table_name, req, .{ .deadline_ns = self.execution_deadline_ns, .cancellation = cancellation, .execution_runnable = self.acknowledgement_runnable })) orelse return error.UnknownGroup;
+                return .delivered;
+            },
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeManyRequest(alloc, req);
                 defer alloc.free(body);
-                var response = if (self.execution_deadline_ns) |deadline|
-                    try client.fetchGroupTxnAcknowledgeManyWithTimeout(remote.base_uri, group_id, table_name, body, try remainingDeadlineTimeoutMs(deadline))
-                else
-                    try client.fetchGroupTxnAcknowledgeMany(remote.base_uri, group_id, table_name, body);
-                response.deinit(alloc);
+                return client.fetchGroupTxnAcknowledgeManyDelivery(remote.base_uri, group_id, table_name, body, if (self.execution_deadline_ns) |deadline| try remainingDeadlineTimeoutMs(deadline) else null);
             },
         }
     }
@@ -1241,7 +1255,7 @@ pub const HostedParticipantWorker = struct {
         const cancellation = if (self.execution_deadline_ns != null) deadline_control.token() else db_mod.types.CancellationToken.none;
         try cancellation.check();
         switch (route) {
-            .local => _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, cancellation)) orelse return error.UnknownGroup,
+            .local => _ = (try acknowledgeGroupLocalWithContext(self.writes, alloc, group_id, table_name, req, .{ .deadline_ns = self.execution_deadline_ns, .cancellation = cancellation, .execution_runnable = self.acknowledgement_runnable })) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeRequest(alloc, req);
@@ -1402,6 +1416,8 @@ pub const LocalTableWriteParticipantWorker = struct {
                 .status_group_with_execution = statusGroupWithExecution,
                 .resolve_group_until_with_execution = resolveGroupUntilWithExecution,
                 .acknowledge_group_with_execution = acknowledgeGroupWithExecution,
+                .acknowledge_many_group_with_execution = acknowledgeManyGroupWithExecution,
+                .acknowledge_many_group = acknowledgeManyGroup,
                 .begin_group_with_execution = beginGroupWithExecution,
                 .prepare_group_with_execution = prepareGroupWithExecution,
                 .resolve_group_with_execution = resolveGroupWithExecution,
@@ -1446,9 +1462,18 @@ pub const LocalTableWriteParticipantWorker = struct {
 
     fn acknowledgeGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeRequest, borrow: runnable_abi.Borrowed) !void {
         const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
-        var control: CompletionCancellation = .{ .borrow = borrow, .foreground = .none };
-        _ = (try acknowledgeGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .{ .ptr = &control, .check_fn = CompletionCancellation.check })) orelse return error.UnknownGroup;
-        try borrow.checkLifetime();
+        _ = (try acknowledgeGroupLocalWithContext(self.writes, alloc, group_id, table_name, req, .{ .execution_runnable = borrow })) orelse return error.UnknownGroup;
+    }
+
+    fn acknowledgeManyGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest, borrow: runnable_abi.Borrowed) !http_client_mod.AcknowledgementDelivery {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        _ = (try acknowledgeManyGroupLocalWithContext(self.writes, alloc, group_id, table_name, req, .{ .execution_runnable = borrow })) orelse return error.UnknownGroup;
+        return .delivered;
+    }
+
+    fn acknowledgeManyGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnAcknowledgeManyRequest) !void {
+        const self: *LocalTableWriteParticipantWorker = @ptrCast(@alignCast(ptr));
+        _ = (try acknowledgeManyGroupLocalWithRequest(self.writes, alloc, group_id, table_name, req, .none)) orelse return error.UnknownGroup;
     }
 
     fn beginGroupWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest, borrow: runnable_abi.Borrowed) !void {
@@ -8209,9 +8234,32 @@ test "distributed txn independently scheduled local worker preserves call author
     const Fake = struct {
         child_context: ?*anyopaque = null,
         calls: usize = 0,
+        rejection: ?anyerror = null,
+        hosted: bool = false,
         expected: PreDecisionContext = .{},
         fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
             return error.TestUnexpectedLegacyMutation;
+        }
+        fn acknowledge(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: db_mod.types.BatchRequest, context: PreDecisionContext) !?void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(self.child_context, context.execution_runnable.?.context);
+            try std.testing.expect(context.deadline_io == null);
+            if (self.hosted) {
+                try std.testing.expect(context.deadline_ns != null);
+                try context.cancellation.check();
+            } else {
+                try std.testing.expect(context.deadline_ns == null);
+                try std.testing.expectEqualDeep(db_mod.types.CancellationToken.none, context.cancellation);
+            }
+            try std.testing.expectEqual(@as(usize, 0), req.writes.len);
+            try std.testing.expect(req.transaction.? == .acknowledge or req.transaction.? == .acknowledge_many);
+            try context.execution_runnable.?.checkLifetime();
+            if (self.rejection) |cause| {
+                self.rejection = null;
+                return cause;
+            }
+            return {};
         }
         fn begin(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8, context: PreDecisionContext) !?void {
             return check(raw, context);
@@ -8258,17 +8306,49 @@ test "distributed txn independently scheduled local worker preserves call author
     try child.activate();
     var canceled: std.atomic.Value(bool) = .init(false);
     var fake: Fake = .{ .child_context = child.borrow.context, .expected = .{ .deadline_ns = @as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)) + 5 * std.time.ns_per_s, .deadline_io = io_borrow, .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) } };
-    var local: LocalTableWriteParticipantWorker = .{ .writes = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .txn_begin_group_local_with_pre_decision_context = Fake.begin, .txn_prepare_group_local_with_pre_decision_context = Fake.prepare, .txn_resolve_group_local_with_execution = Fake.resolve } }, .pre_decision_context = fake.expected };
+    var local: LocalTableWriteParticipantWorker = .{ .writes = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .batch_group_local_with_pre_decision_context = Fake.acknowledge, .txn_begin_group_local_with_pre_decision_context = Fake.begin, .txn_prepare_group_local_with_pre_decision_context = Fake.prepare, .txn_resolve_group_local_with_execution = Fake.resolve } }, .pre_decision_context = fake.expected };
     var worker = local.worker();
     worker.execution_runnable = child.borrow;
     try worker.beginGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .begin_timestamp = 1, .participants = &.{} });
     try worker.prepareGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .req = .{} });
     try worker.resolveGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 });
-    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    try worker.acknowledgeGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participant = "table2:00000004:docs:7" });
+    try worker.acknowledgeManyGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participants = &.{"table2:00000004:docs:7"} });
+    try std.testing.expectEqual(@as(usize, 5), fake.calls);
     try std.testing.expect(local.pre_decision_context.execution_runnable == null);
     canceled.store(true, .release);
     try std.testing.expectError(error.Canceled, worker.beginGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .begin_timestamp = 1, .participants = &.{} }));
-    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    try std.testing.expectEqual(@as(usize, 5), fake.calls);
+    // Mandatory completion uses its own child even after foreground expiry.
+    try worker.acknowledgeGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participant = "table2:00000004:docs:7" });
+    fake.rejection = error.UnsupportedOperation;
+    try std.testing.expectError(error.UnsupportedOperation, worker.acknowledgeManyGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participants = &.{"table2:00000004:docs:7"} }));
+    // A one-shot original failure must not be retried as scalar success.
+    try std.testing.expectEqual(@as(usize, 7), fake.calls);
+    const Router = struct {
+        fn localId(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn status(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .active;
+        }
+        fn leader(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+        fn uri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return error.TestUnexpectedRemoteRouting;
+        }
+    };
+    const router: table_router.HostedGroupRouter = .{ .ptr = undefined, .vtable = &.{ .local_node_id = Router.localId, .local_status = Router.status, .group_leader_node_id = Router.leader, .node_base_uri = Router.uri } };
+    var hosted = HostedParticipantWorker.init(undefined, router, local.writes, undefined);
+    hosted.pre_decision_context = fake.expected; // already canceled foreground
+    fake.hosted = true;
+    var hosted_worker = hosted.worker();
+    hosted_worker.execution_runnable = child.borrow;
+    try hosted_worker.acknowledgeGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participant = "table2:00000004:docs:7" });
+    try hosted_worker.acknowledgeManyGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participants = &.{"table2:00000004:docs:7"} });
+    try std.testing.expectEqual(@as(usize, 9), fake.calls);
+    try std.testing.expect(hosted.acknowledgement_runnable == null);
 }
 
 test "distributed txn independently scheduled hosted worker rejects stopped coordinator before routing" {
@@ -8497,12 +8577,14 @@ test "distributed txn independently scheduled hosted coordinator waits preserve 
         many: usize = 0,
         fail_resume: bool = false,
         uncertain_many: bool = false,
+        original_rejection: bool = false,
         fn iface(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
         }
         fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
+            if (self.original_rejection) return error.UnsupportedOperation;
             const timeout = request.timeout_ms orelse return error.TestMissingTimeout;
             try std.testing.expect(timeout > 0 and timeout <= self.ceiling_ms);
             const wait = request.execution_wait orelse return error.TestMissingExecutionWait;
@@ -8549,10 +8631,15 @@ test "distributed txn independently scheduled hosted coordinator waits preserve 
     try worker.acknowledgeManyGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participants = &.{ "table2:00000004:docs:7002", "table2:00000004:docs:7003" } });
     try std.testing.expectEqual(@as(usize, 1), executor.many);
     try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    executor.original_rejection = true;
+    try std.testing.expectError(error.UnsupportedOperation, worker.acknowledgeManyGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participants = &.{"table2:00000004:docs:7002"} }));
+    try std.testing.expectEqual(@as(usize, 5), executor.calls);
+    try std.testing.expectEqual(@as(usize, 1), executor.many);
+    executor.original_rejection = false;
     executor.uncertain_many = true;
     try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, worker.acknowledgeManyGroup(std.testing.allocator, 7001, "docs", .{ .txn_id = @splat(1), .participants = &.{"table2:00000004:docs:7002"} }));
     // An uncertain batch cannot be converted into claimed per-participant ACKs.
-    try std.testing.expectEqual(@as(usize, 5), executor.calls);
+    try std.testing.expectEqual(@as(usize, 6), executor.calls);
     executor.uncertain_many = false;
     const retry_limit = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
     executor.ceiling_ms = 2000;

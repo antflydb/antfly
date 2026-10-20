@@ -1463,6 +1463,21 @@ pub const Store = struct {
         return batch;
     }
 
+    /// Controlled mutations retain their CPU and must not wait behind the
+    /// store's serialization gate. The caller owns any retry of this batch.
+    pub fn beginBatchWithAdmission(self: *Store, control: read_admission.Port) !Batch {
+        try control.checkLifetime();
+        if (self.write_gate) |mutex| if (!mutex.tryLock()) {
+            try control.checkLifetime();
+            return error.Backpressured;
+        };
+        errdefer if (self.write_gate) |mutex| mutex.unlock();
+        var batch = try BoundaryAbi.call("begin_batch", self.boundary_dispatch, self.vtable.begin_batch, .{ self.allocator, self.ptr });
+        // Abort owns gate release after the batch is returned to its caller.
+        batch.write_gate = self.write_gate;
+        return batch;
+    }
+
     pub fn beginBatchWithOptions(self: *Store, options: backend_types.BatchOptions) !Batch {
         if (self.vtable.begin_batch_with_options) |begin_batch_with_options| {
             if (self.write_gate) |mutex| platform.sync.lockYielding(mutex);

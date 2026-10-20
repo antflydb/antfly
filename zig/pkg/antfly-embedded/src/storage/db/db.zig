@@ -27596,6 +27596,7 @@ pub const DB = struct {
     }
 
     fn markTransactionParticipantResolvedWithOptionalAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+        if (controls != null) return self.markTransactionParticipantsResolvedWithOptionalAdmissionControls(txn_id, &.{participant}, controls);
         if (controls) |original| try original.lifetime.check();
         const admission = @import("mutation_admission.zig");
         var replication_mutation = try admission.acquireReplicationMutationShared(self, controls);
@@ -27621,9 +27622,18 @@ pub const DB = struct {
         var replication_mutation = try admission.acquireReplicationMutationShared(self, controls);
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try admission.lockApply(self, if (replication_mutation != null) admission.retainedLeaseControls(controls) else controls);
+        try admission.lockApplyForCompletion(self, admission.retainedLeaseControls(controls));
         defer self.core.unlockApply();
-        try self.core.markTransactionParticipantsResolvedExtraBatch(txn_id, participants, .{});
+        if (controls) |_| {
+            var preparation: RequestPreparationContext = undefined;
+            preparation.init(self);
+            defer preparation.deinit();
+            var manager = transactions_mod.TxnManager.init(preparation.guard.allocator(), self.core.store) catch |err| return preparation.mapError(err);
+            defer manager.deinit();
+            var collection: admission.IntentCollection = .{};
+            const original = collection.bindPreDecisionBeforeMutation(admission.retainedLeaseControls(controls), self.core.apply_mutex.io, null);
+            manager.markParticipantsResolvedExtraBatchWithAdmission(txn_id, participants, .{}, original) catch |err| return preparation.mapError(err);
+        } else try self.core.markTransactionParticipantsResolvedExtraBatch(txn_id, participants, .{});
     }
 
     pub fn markReplicatedTransactionParticipantResolvedAtOrderedReceipt(
@@ -144162,4 +144172,42 @@ test "required replicated begin controlled row preparation retains the original 
     try db.prepareTransactionRowsWithAuthority(scratch.guard.allocator(), &intents, schema, .{ .context = &control, .check_fn = Control.check });
     try std.testing.expect(control.calls >= 2 * intents.len);
     for (intents) |intent| try std.testing.expect(intent.prepared_row != null);
+}
+
+test "required replicated begin controlled acknowledgement refuses the retained store gate without partial mutation" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("controlled-ack-store-gate");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const id: [16]u8 = @splat(0xe7);
+    const cohort = [_][]const u8{ "first", "second" };
+    _ = try db.beginTransactionScoped(id, 1, 2, &cohort, true, true, null);
+    try db.resolveTransactionIntents(id, .committed, 3);
+    var manager = try db.core.initTxnManager();
+    defer manager.deinit();
+    var gate: std.atomic.Mutex = .unlocked;
+    manager.store.write_gate = &gate;
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    const read = @import("../../common/read_admission.zig");
+    const payload: read.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check } };
+    const port = read.Port.init(&payload);
+    try std.testing.expect(gate.tryLock());
+    const busy = manager.markParticipantsResolvedExtraBatchWithAdmission(id, &cohort, .{}, port);
+    gate.unlock();
+    try std.testing.expectError(error.Backpressured, busy);
+    {
+        const resolved = try manager.getResolvedParticipants(a, id);
+        defer transactions_mod.freeParticipantList(a, resolved);
+        try std.testing.expectEqual(@as(usize, 0), resolved.len);
+    }
+    try manager.markParticipantsResolvedExtraBatchWithAdmission(id, &cohort, .{}, port);
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    const resolved = try manager.getResolvedParticipants(a, id);
+    defer transactions_mod.freeParticipantList(a, resolved);
+    try std.testing.expectEqual(@as(usize, 2), resolved.len);
 }

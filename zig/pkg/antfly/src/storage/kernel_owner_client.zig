@@ -547,6 +547,18 @@ pub const Owner = struct {
         try statusToError(status);
     }
 
+    pub fn transactionAcknowledgeWithAdmission(self: *Owner, table: []const u8, txn_id: [16]u8, participants: []const []const u8, port: *const @import("antfly_local_sources").common_read_admission.Port) !void {
+        try port.checkpoint();
+        const arrays = @import("antfly_local_sources").api_transaction_begin_admission;
+        const payload: arrays.Payload = .{ .participants = participants };
+        const borrowed = arrays.Port.init(&payload);
+        var trace: @import("antfly_local_sources").common_read_admission.RejectionTrace = .{};
+        const original = trace.bind(port.*).?;
+        const status = abi.antfly_storage_owner_transaction_acknowledge_with_admission(self.handle, &.{ .table_name = .fromSlice(table), .txn_id = .{ .bytes = txn_id }, .participants = &borrowed, .port = &original });
+        if (trace.failure) |cause| return cause;
+        try statusToError(status);
+    }
+
     pub fn transactionResolveWithAdmission(self: *Owner, table: []const u8, txn_id: [16]u8, status: abi.TxnStatus, commit_version: u64, sync_level: abi.SyncLevel, port: *const @import("antfly_local_sources").common_read_admission.Port) !void {
         try port.checkpoint();
         var trace: @import("antfly_local_sources").common_read_admission.RejectionTrace = .{};
