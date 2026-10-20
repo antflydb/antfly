@@ -428,12 +428,22 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
         private_index.roots.clearRetainingCapacity();
         var nav_arena = std.heap.ArenaAllocator.init(a);
         defer nav_arena.deinit();
-        for (parent.inventory.files[file..end]) |input| {
-            _ = nav_arena.reset(.retain_capacity);
-            const key = local.storage_rowsource_identity.navigationDigest(public.identity_version, public.source, public.snapshot, input.file_id);
-            public.root = try @import("../serverless/graph_segment/page_tree.zig").apply(nav_arena.allocator(), navigation_pages.store(), public.root, &.{.{ .key = &key, .value = input.file_id }});
-            public.count += 1;
+        // No consumer observes an intermediate root within this admitted
+        // window. Rewrite every touched navigation subtree once per window.
+        const tree = @import("../serverless/graph_segment/page_tree.zig");
+        const mutations = try nav_arena.allocator().alloc(tree.Mutation, end - file);
+        const keys = try nav_arena.allocator().alloc([32]u8, mutations.len);
+        for (parent.inventory.files[file..end], mutations, keys) |input, *mutation, *key| {
+            key.* = local.storage_rowsource_identity.navigationDigest(public.identity_version, public.source, public.snapshot, input.file_id);
+            mutation.* = .{ .key = key, .value = input.file_id };
         }
+        std.mem.sort(tree.Mutation, mutations, {}, struct {
+            fn less(_: void, left: tree.Mutation, right: tree.Mutation) bool {
+                return std.mem.lessThan(u8, left.key, right.key);
+            }
+        }.less);
+        public.root = try tree.apply(nav_arena.allocator(), navigation_pages.store(), public.root, mutations);
+        public.count += @intCast(mutations.len);
         var view = try parent.parallelView(a);
         defer view.closeParallelView(parent);
         view.inventory.files = parent.inventory.files[0..end];

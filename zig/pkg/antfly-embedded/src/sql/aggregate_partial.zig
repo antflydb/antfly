@@ -44,7 +44,11 @@ pub fn read(a: A, group: operators.GroupResult, index: usize, spec: operators.Ag
 /// result memo or allocate through a shared cache owner's allocator.
 pub fn finishBorrowed(a: A, state: operators.Aggregate) !Datum {
     if (state.numeric) |numeric| {
-        var owned = try numeric.clone(a);
+        // The caller often uses a result arena. Clone and finalize in private
+        // reclaimable scratch so only the immutable result survives this call.
+        var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
+        defer scratch.deinit();
+        var owned = try numeric.clone(scratch.allocator());
         defer owned.deinit();
         const value = (try owned.finish(state.kind == .avg)) orelse return .{};
         return operators.cloneDatum(a, Datum.typedNumeric(value));
@@ -928,22 +932,32 @@ test "SQL exact NUMERIC checkpoint lanes validate full signatures and truncated 
     }
 }
 
-test "SQL borrowed numeric aggregate finalization leaves shared memo immutable" {
+test "SQL borrowed NUMERIC cached finalization reclaims scratch and leaves shared memo immutable" {
     const a = std.testing.allocator;
-    var source = try operators.Aggregate.initTyped(a, .sum, .number, .numeric);
-    defer source.deinit();
     const numeric = @import("numeric_value.zig");
     var context: numeric.Context = .{ .alloc = a };
     var value = try numeric.parse(&context, "9007199254740993.1200");
     defer value.deinit();
-    try source.update(Datum.typedNumeric(&value.value));
-    for (0..2) |_| {
-        var page = std.heap.ArenaAllocator.init(a);
+    for ([_]operators.Aggregate.Kind{ .sum, .avg }) |kind| {
+        var source = try operators.Aggregate.initTyped(a, kind, .number, .numeric);
+        defer source.deinit();
+        try source.update(Datum.typedNumeric(&value.value));
+        const group: operators.GroupResult = .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &.{source}, .ordinal = 0 };
+        const spec: operators.AggregateSpec = .{ .kind = kind, .input_type = .number, .input_element = .numeric };
+        var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 4 * 1024 * 1024 };
+        var page = std.heap.ArenaAllocator.init(budget.allocator());
         defer page.deinit();
-        const result = try finishBorrowed(page.allocator(), source);
-        try std.testing.expect(result.numeric != null);
-        try std.testing.expectEqual(std.math.Order.eq, try numeric.order(&context, result.numeric.?.*, value.value));
-        try std.testing.expect(source.numeric.?.result == null);
+        var read_scratch = std.heap.ArenaAllocator.init(a);
+        defer read_scratch.deinit();
+        // A wide cached result previously failed after 10,057 SUM outputs:
+        // temporary reducer coefficients accumulated in the output page.
+        for (0..16384) |_| {
+            const result = try finish(page.allocator(), read_scratch.allocator(), group, 0, spec);
+            try std.testing.expectEqual(std.math.Order.eq, try numeric.order(&context, result.numeric.?.*, value.value));
+            try std.testing.expect(source.numeric.?.result == null);
+        }
+        try std.testing.expect(budget.peak < 2 * 1024 * 1024);
+        std.debug.print("borrowed NUMERIC {t}: finalized=16384 peak={}\n", .{ kind, budget.peak });
     }
 }
 

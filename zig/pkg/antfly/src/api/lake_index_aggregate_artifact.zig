@@ -1275,6 +1275,12 @@ pub const Reader = struct {
             const range = self.key_range orelse if (self.point_key) |point| group_keys.Range{ .lower = point, .upper = try group_keys.successor(ca, point) } else group_keys.Range{};
             self.tree_cursor = if (self.reverse) try state_tree.tree.Cursor.initReverse(local.sql_memory_budget.reclaimingAllocator(self.a), access.backing(), index.page, range.lower, range.upper) else try state_tree.tree.Cursor.init(local.sql_memory_budget.reclaimingAllocator(self.a), access.backing(), index.page, range.lower, range.upper);
         }
+        // Rows borrow their bounded frame until the next pull. Prefetch owns a
+        // separate frame and never invalidates the one being consumed.
+        if (self.tree_frame) |frame| if (self.tree_frame_position == frame.records.len) {
+            frame.destroy();
+            self.tree_frame = null;
+        };
         if (self.tree_frame == null) {
             const frame = if (self.tree_prefetch) |*task| try task.await(self.cached.?.context.io.?) else try self.fetchTreeFrame();
             self.tree_prefetch = null;
@@ -1315,12 +1321,14 @@ pub const Reader = struct {
             self.tree_frame_position += 1;
             if (self.selection_rows_left == 0) return error.SqlProgramLimitExceeded;
             self.selection_rows_left -= 1;
-            const bytes = try a.dupe(u8, record.value);
-            const value = try state_tree.view(a, bytes, self.root.state_recipe.?, index.layout, self.tree_record_layout);
+            const value = try state_tree.view(a, record.value, self.root.state_recipe.?, index.layout, self.tree_record_layout);
             self.blocks_decoded += 1;
             const input = try state_tree.row(a, value, self.root.state_recipe.?, slots, self.output_slots, self.emitted);
             if (!group_keys.compatible(self.root.state_recipe.?, input.keys)) return error.InvalidNativeAggregateArtifact;
-            if (!std.mem.eql(u8, record.key, try group_keys.encode(a, input.keys))) return error.InvalidNativeAggregateArtifact;
+            // Validation bytes are transient, not part of the returned page.
+            var validation = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+            defer validation.deinit();
+            if (!std.mem.eql(u8, record.key, try group_keys.encode(validation.allocator(), input.keys))) return error.InvalidNativeAggregateArtifact;
             result[n] = input;
             self.emitted += 1;
             n += 1;
@@ -1330,10 +1338,6 @@ pub const Reader = struct {
             return null;
         }
         try self.selection_quota.admit(n, false);
-        if (self.tree_frame_position == self.tree_frame.?.records.len) {
-            self.tree_frame.?.destroy();
-            self.tree_frame = null;
-        }
         return result[0..n];
     }
     const PhysicalRow = struct {
@@ -2945,4 +2949,61 @@ test "external lake aggregate compact trees read historical columnar records and
     try collector.markArtifact(out, old_refs[0]);
     try collector.markArtifact(out, refs[0]);
     try std.testing.expect(collector.marked.count() >= 4);
+}
+
+test "external lake aggregate tree frames lend wide unselected states until next pull" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("aggregate-borrowed-frames");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(9), .attempt = @splat(1) };
+    const count: operators.AggregateSpec = .{ .kind = .count };
+    const minimum: operators.AggregateSpec = .{ .kind = .min, .input_type = .string };
+    const recipe: recipes.Recipe = .{ .keys = &.{.{ .path = "k", .type = .integer, .nullable = false }}, .inputs = &.{ .{ .spec = count, .column = null }, .{ .spec = minimum, .column = .{ .path = "v", .type = .string, .nullable = false } } } };
+    const group = try operators.Grouped.create(a, &.{ count, minimum }, .{ .bytes = 8 * 1024 * 1024 });
+    defer group.deinit();
+    const text: [8192]u8 = @splat('x');
+    for (0..512) |i| try group.add(&.{local.sql_scalar.Datum.json(.{ .integer = @intCast(i) })}, &.{ local.sql_scalar.Datum.json(.{ .integer = 1 }), local.sql_scalar.Datum.json(.{ .string = &text }) });
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    const refs = try publishKeyed(a, out, &store, &.{ "stats.count", "stats.min" }, group, recipe, &manager, .none);
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const reader = try Reader.openWithCache(a, store, refs[0], .{ .keys = recipe.keys, .inputs = recipe.inputs[0..1] }, .none, .{ .cache = &cache, .scope = @splat(3), .context = .{ .io = std.testing.io } });
+    defer reader.cursor().close(reader);
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 512 * 1024 };
+    var page = std.heap.ArenaAllocator.init(budget.allocator());
+    defer page.deinit();
+    const retained_minimum = retained: {
+        const selected = try Reader.open(a, store, refs[1], .{ .keys = recipe.keys, .inputs = recipe.inputs[1..2] }, .none);
+        defer selected.cursor().close(selected);
+        const rows = (try selected.cursor().next(selected, page.allocator(), 1)).?;
+        break :retained try native_partial.finish(out, page.allocator(), rows[0], 0, minimum);
+    };
+    var delivered: usize = 0;
+    while (true) {
+        _ = page.reset(.free_all);
+        const rows = (try reader.cursor().next(reader, page.allocator(), 256)) orelse break;
+        // The full record has an 8 KiB MIN value which COUNT never reads.
+        // Returning it must not duplicate this payload into the result arena.
+        try std.testing.expect(reader.tree_frame != null);
+        for (rows) |row| {
+            try std.testing.expectEqual(@as(i64, @intCast(delivered)), row.keys[0].value.integer);
+            try std.testing.expectEqual(@as(i64, 1), (try native_partial.finish(page.allocator(), page.allocator(), row, 0, count)).value.integer);
+            delivered += 1;
+        }
+    }
+    try std.testing.expectEqualStrings(&text, retained_minimum.value.string);
+    try std.testing.expectEqual(@as(usize, 512), delivered);
+    try std.testing.expect(budget.peak < 256 * 1024);
+    try std.testing.expect(reader.tree_prefetches > 0);
+    std.debug.print("borrowed aggregate frames: groups={} output_peak={}\n", .{ delivered, budget.peak });
 }

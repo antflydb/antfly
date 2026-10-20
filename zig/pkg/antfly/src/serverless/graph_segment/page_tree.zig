@@ -56,7 +56,8 @@ pub const Ref = struct {
 };
 
 /// Borrowed, operation-scoped capabilities. get must bound its allocation by
-/// ref.bytes. The tree independently verifies every returned page digest.
+/// ref.bytes. The tree authenticates untrusted bytes; decoded leases may reuse
+/// an earlier complete validation under the exact reference and domain.
 /// put must durably persist exactly these bytes before returning. check is also
 /// called between CPU batches, so cancellation is not dependent on storage I/O.
 pub const Store = struct {
@@ -66,6 +67,13 @@ pub const Store = struct {
     attempt: [16]u8 = @splat(0),
     ptr: *anyopaque,
     get: *const fn (*anyopaque, Allocator, Ref) anyerror![]u8,
+    /// Optional immutable decoded-page lease. The provider must authenticate
+    /// domain, full reference and structure using readPage on a plain store.
+    /// Authority and per-operation read admission must be checked on every hit.
+    decoded_page: ?struct {
+        ptr: *anyopaque,
+        read: *const fn (*anyopaque, Allocator, Ref) anyerror!Page,
+    } = null,
     put: *const fn (*anyopaque, Ref, []const u8) anyerror!void,
     /// Persist the entire bounded batch before returning. On failure no root
     /// escapes the private sorted builder; scoped orphans remain collectible.
@@ -171,14 +179,23 @@ pub const Entry = struct {
 };
 
 pub const Page = struct {
-    bytes: []u8,
-    entries: []Entry,
+    bytes: []const u8,
+    entries: []const Entry,
     ref: Ref,
     aggregate: []const u8 = "",
+    lease: ?struct {
+        owner: *anyopaque,
+        item: *anyopaque,
+        release: *const fn (*anyopaque, *anyopaque) void,
+    } = null,
 
     pub fn deinit(self: *Page, alloc: Allocator) void {
-        alloc.free(self.entries);
-        alloc.free(self.bytes);
+        if (self.lease) |lease| {
+            lease.release(lease.owner, lease.item);
+        } else {
+            alloc.free(self.entries);
+            alloc.free(self.bytes);
+        }
         self.* = undefined;
     }
 };
@@ -238,6 +255,7 @@ pub fn readPage(alloc: Allocator, store: Store, ref: Ref) !Page {
 fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
     try store.check(store.ptr);
     try ref.validate();
+    if (store.decoded_page) |cache| return cache.read(cache.ptr, alloc, ref);
     const bytes = try store.get(store.ptr, alloc, ref);
     errdefer alloc.free(bytes);
     if (bytes.len != ref.bytes) return error.InvalidGraphPage;
@@ -510,6 +528,72 @@ fn edit(alloc: Allocator, store: Store, prior: Ref, changes: []const Mutation, o
     const entries = try childEntries(alloc, children.items);
     defer alloc.free(entries);
     try packAt(alloc, store, entries, prior.height, out, packingTarget(prior.bytes));
+}
+
+/// Join strictly disjoint key ranges by rewriting only their boundary spines.
+/// Overlapping ranges decline without writes so a reducer can merge equal keys.
+/// Descendants retain their original attempt identities and GC reachability.
+pub fn joinDisjoint(alloc: Allocator, store: Store, left: Ref, right: Ref) !?Ref {
+    var lf = try Cursor.init(alloc, store, left, "", null);
+    defer lf.deinit();
+    var rl = try Cursor.initReverse(alloc, store, right, "", null);
+    defer rl.deinit();
+    const first_left = (try lf.next()) orelse return error.InvalidGraphPage;
+    const last_right = (try rl.next()) orelse return error.InvalidGraphPage;
+    const reversed = less(last_right.key, first_left.key);
+    if (!reversed) {
+        var ll = try Cursor.initReverse(alloc, store, left, "", null);
+        defer ll.deinit();
+        var rf = try Cursor.init(alloc, store, right, "", null);
+        defer rf.deinit();
+        const last_left = (try ll.next()) orelse return error.InvalidGraphPage;
+        const first_right = (try rf.next()) orelse return error.InvalidGraphPage;
+        if (!less(last_left.key, first_right.key)) return null;
+    }
+    var children: Children = .empty;
+    defer freeChildren(alloc, &children);
+    try joinBoundary(alloc, store, if (reversed) right else left, if (reversed) left else right, &children);
+    while (children.items.len > 1) {
+        const height = children.items[0].ref.height + 1;
+        if (height > max_height) return error.GraphPageTreeTooDeep;
+        const entries = try childEntries(alloc, children.items);
+        defer alloc.free(entries);
+        var parents: Children = .empty;
+        errdefer freeChildren(alloc, &parents);
+        try pack(alloc, store, entries, height, &parents);
+        freeChildren(alloc, &children);
+        children = parents;
+    }
+    return children.items[0].ref;
+}
+fn joinBoundary(alloc: Allocator, store: Store, left: Ref, right: Ref, out: *Children) anyerror!void {
+    var lp = try load(alloc, store, left);
+    defer lp.deinit(alloc);
+    var rp = try load(alloc, store, right);
+    defer rp.deinit(alloc);
+    var boundary: Children = .empty;
+    defer freeChildren(alloc, &boundary);
+    var entries: []Entry = undefined;
+    const height = @max(left.height, right.height);
+    if (left.height == right.height) {
+        entries = try alloc.alloc(Entry, lp.entries.len + rp.entries.len);
+        @memcpy(entries[0..lp.entries.len], lp.entries);
+        @memcpy(entries[lp.entries.len..], rp.entries);
+    } else if (left.height > right.height) {
+        try joinBoundary(alloc, store, lp.entries[lp.entries.len - 1].child.?, right, &boundary);
+        entries = try alloc.alloc(Entry, lp.entries.len - 1 + boundary.items.len);
+        @memcpy(entries[0 .. lp.entries.len - 1], lp.entries[0 .. lp.entries.len - 1]);
+        for (boundary.items, entries[lp.entries.len - 1 ..]) |child, *entry| entry.* = .{ .key = child.first, .child = child.ref, .aggregate = child.aggregate };
+    } else {
+        try joinBoundary(alloc, store, left, rp.entries[0].child.?, &boundary);
+        entries = try alloc.alloc(Entry, boundary.items.len + rp.entries.len - 1);
+        for (boundary.items, entries[0..boundary.items.len]) |child, *entry| entry.* = .{ .key = child.first, .child = child.ref, .aggregate = child.aggregate };
+        @memcpy(entries[boundary.items.len..], rp.entries[1..]);
+    }
+    defer alloc.free(entries);
+    // Equal-height roots adopt their descendants without decoding row values;
+    // unequal heights splice only the shared-height boundary and its ancestors.
+    try packAt(alloc, store, entries, height, out, @max(packingTarget(left.bytes), packingTarget(right.bytes)));
 }
 
 /// Mutations must have strictly increasing, unique keys. Validate the entire
@@ -2227,4 +2311,117 @@ test "serverless graph value updates retain unrelated short tails and deletion r
         try std.testing.expectEqual(@as(u64, @intCast(expected)), std.mem.readInt(u64, record.key[0..8], .big));
     }
     try std.testing.expect((try cursor.next()) == null);
+}
+
+test "serverless graph window navigation batches bound publication write amplification" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const changes = try out.alloc(Mutation, 1024);
+    const value: [64]u8 = @splat('f');
+    for (changes, 0..) |*change, i| {
+        var input: [8]u8 = undefined;
+        std.mem.writeInt(u64, &input, i, .little);
+        const key = try out.create([32]u8);
+        std.crypto.hash.sha2.Sha256.hash(&input, key, .{});
+        change.* = .{ .key = key, .value = &value };
+    }
+    var writes: [2]usize = undefined;
+    var bytes: [2]u64 = undefined;
+    for ([_]usize{ 1, 64 }, 0..) |batch_size, run| {
+        var memory: TestStore = .{ .alloc = a };
+        defer memory.deinit();
+        var root: ?Ref = null;
+        var begin: usize = 0;
+        while (begin < changes.len) : (begin += 64) {
+            const window = changes[begin..][0..64];
+            std.mem.sort(Mutation, window, {}, struct {
+                fn less(_: void, left: Mutation, right: Mutation) bool {
+                    return std.mem.lessThan(u8, left.key, right.key);
+                }
+            }.less);
+            var pos: usize = 0;
+            while (pos < window.len) : (pos += batch_size) root = try apply(a, memory.store(), root, window[pos..][0..batch_size]);
+        }
+        try std.testing.expectEqual(@as(u64, 1024), root.?.records);
+        var cursor = try Cursor.init(a, memory.store(), root, "", null);
+        defer cursor.deinit();
+        var count: usize = 0;
+        while (try cursor.next()) |record| {
+            try std.testing.expectEqualSlices(u8, &value, record.value);
+            count += 1;
+        }
+        try std.testing.expectEqual(changes.len, count);
+        writes[run] = memory.writes;
+        bytes[run] = memory.written_bytes;
+        std.debug.print("navigation batch={} writes={} bytes={}\n", .{ batch_size, writes[run], bytes[run] });
+    }
+    try std.testing.expect(writes[1] * 16 < writes[0]);
+    try std.testing.expect(bytes[1] * 16 < bytes[0]);
+}
+
+test "serverless graph disjoint joins preserve descendants overlap fallback and unequal heights" {
+    const a = std.testing.allocator;
+    var memory: TestStore = .{ .alloc = a };
+    defer memory.deinit();
+    const Source = struct {
+        position: u64,
+        end: u64,
+        key: [8]u8 = undefined,
+        value: [128]u8 = @splat(7),
+        pub fn next(self: *@This()) !?Cursor.Record {
+            if (self.position == self.end) return null;
+            std.mem.writeInt(u64, &self.key, self.position, .big);
+            self.position += 1;
+            return .{ .key = &self.key, .value = &self.value };
+        }
+    };
+    var left_source: Source = .{ .position = 0, .end = 12000 };
+    var right_source: Source = .{ .position = 12001, .end = 24001 };
+    var middle_source: Source = .{ .position = 12000, .end = 12001 };
+    var backing = memory.store();
+    backing.attempt = @splat(1);
+    const left = (try buildSorted(a, backing, &left_source)).?;
+    backing.attempt = @splat(2);
+    const right = (try buildSorted(a, backing, &right_source)).?;
+    const middle = (try buildSorted(a, backing, &middle_source)).?;
+    backing.attempt = @splat(3);
+    try std.testing.expect(left.height > middle.height);
+    const written = memory.written_bytes;
+    const reads = memory.reads;
+    const joined = (try joinDisjoint(a, backing, right, left)).?;
+    const bytes = memory.written_bytes - written;
+    const loaded = memory.reads - reads;
+    try std.testing.expectEqual(@as(u64, 24000), joined.records);
+    try std.testing.expect(bytes < 64 * 1024);
+    try std.testing.expect(loaded < 20);
+    // The new routing root still references both original attempts.
+    var page = try readPage(a, backing, joined);
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(u8, 1), page.entries[0].child.?.attempt[0]);
+    try std.testing.expectEqual(@as(u8, 2), page.entries[page.entries.len - 1].child.?.attempt[0]);
+    const before_overlap = memory.writes;
+    try std.testing.expect((try joinDisjoint(a, backing, joined, middle)) == null);
+    try std.testing.expectEqual(before_overlap, memory.writes);
+    const prefix = (try joinDisjoint(a, backing, left, middle)).?;
+    const suffix = (try joinDisjoint(a, backing, middle, right)).?;
+    try std.testing.expectEqual(@as(u64, 12001), prefix.records);
+    try std.testing.expectEqual(@as(u64, 12001), suffix.records);
+    const full = (try joinDisjoint(a, backing, prefix, right)).?;
+    var cursor = try Cursor.init(a, backing, full, "", null);
+    defer cursor.deinit();
+    var count: u64 = 0;
+    while (try cursor.next()) |record| {
+        try std.testing.expectEqual(count, std.mem.readInt(u64, record.key[0..8], .big));
+        try std.testing.expectEqualSlices(u8, &left_source.value, record.value);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(u64, 24001), count);
+    try std.testing.checkAllAllocationFailures(a, disjointJoinFaultScenario, .{ backing, left, middle });
+    std.debug.print("disjoint tree join: records=24000 written_bytes={} page_reads={}\n", .{ bytes, loaded });
+}
+fn disjointJoinFaultScenario(a: Allocator, store: Store, left: Ref, right: Ref) !void {
+    const root = (try joinDisjoint(a, store, left, right)).?;
+    try std.testing.expectEqual(left.records + right.records, root.records);
 }

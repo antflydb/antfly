@@ -39,13 +39,23 @@ pub const Access = struct {
     }
     pub fn backing(self: *Access) tree.Store {
         self.pages = .{ .domain = self.domain, .attempt = if (self.store.upload_scope) |scope| scope.attempt else @splat(0), .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = self.work orelse &self.writes, .read_cache = if (self.cached != null or self.navigation != null) .{ .ptr = self, .read = readPage } else null };
-        return self.pages.store();
+        var result = self.pages.store();
+        if (self.navigation != null) result.decoded_page = .{ .ptr = self, .read = acquirePage };
+        return result;
+    }
+    fn acquirePage(raw: *anyopaque, a: A, ref: tree.Ref) !tree.Page {
+        const self: *Access = @ptrCast(@alignCast(raw));
+        try self.token.check();
+        if (self.cached) |cached| try cached.context.ensureActive();
+        // Hits consume the same logical read quota as misses. The independent
+        // loader below must not charge this operation a second time.
+        try stores.chargeReadBudget(&self.reads, ref.bytes);
+        return self.navigation.?.acquirePage(a, self, ref);
     }
     fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, len: usize, _: [32]u8, token: Token, remaining: *u64) ![]u8 {
         const self: *Access = @ptrCast(@alignCast(raw));
         if (offset != 0 or len != ref.byte_len) return error.InvalidNativeLakeFiles;
         try stores.chargeReadBudget(remaining, ref.byte_len);
-        if (self.navigation) |navigation| return navigation.readPage(a, store.*, ref, token, self.cached);
         return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
     }
 };
@@ -59,7 +69,7 @@ pub fn key(ordinal: usize) [8]u8 {
 /// No request authority is retained: callers check their live context first.
 pub const Navigation = struct {
     const Cache = local.serverless_query_lake_decoded_cache.Cache;
-    const RawPage = struct { bytes: []const u8 };
+    const DecodedPage = struct { page: tree.Page };
     allocator: A = std.heap.page_allocator,
     mutex: std.atomic.Mutex = .unlocked,
     pages: ?*Cache = null,
@@ -83,7 +93,7 @@ pub const Navigation = struct {
         };
         self.pages = null;
     }
-    /// Cached items contain only immutable bytes. Operation-owned access bridges
+    /// Cached items contain only immutable decoded pages. Operation-owned access bridges
     /// carry all authority, so there is no request context to detach here.
     pub fn detach(_: *Navigation) void {}
     fn pageCache(self: *Navigation) !*Cache {
@@ -96,7 +106,7 @@ pub const Navigation = struct {
         }
         return self.pages.?;
     }
-    fn readPage(self: *Navigation, a: A, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: Token, cached: ?artifacts.CachedRead) ![]u8 {
+    fn acquirePage(self: *Navigation, a: A, access: *Access, ref: tree.Ref) !tree.Page {
         const Check = struct {
             token: Token,
             parent: local.serverless_query_lake_read_context.Context,
@@ -106,45 +116,62 @@ pub const Navigation = struct {
                 try value.parent.ensureActive();
             }
         };
-        var check: Check = .{ .token = token, .parent = if (cached) |value| value.context else .{} };
+        var check: Check = .{ .token = access.token, .parent = if (access.cached) |value| value.context else .{} };
         try Check.check(&check);
         var context = check.parent;
         context.checkpoint = .{ .ptr = &check, .check = Check.check };
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("native-navigation-page-v1");
-        hash.update(ref.artifact_id);
-        hash.update(ref.checksum);
-        var size: [8]u8 = undefined;
-        std.mem.writeInt(u64, &size, ref.byte_len, .little);
-        hash.update(&size);
+        hash.update("native-navigation-decoded-page-v2");
+        hash.update(&access.domain);
+        hash.update(&ref.digest);
+        hash.update(&ref.attempt);
+        var shape: [13]u8 = undefined;
+        std.mem.writeInt(u32, shape[0..4], ref.bytes, .little);
+        shape[4] = ref.height;
+        std.mem.writeInt(u64, shape[5..13], ref.records, .little);
+        hash.update(&shape);
         const Loader = struct {
-            store: stores.ArtifactStore,
-            ref: local.serverless_manifest_artifact_ref.ArtifactRef,
-            token: Token,
-            cached: ?artifacts.CachedRead,
+            access: *Access,
+            ref: tree.Ref,
             fn load(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
                 const loader: *@This() = @ptrCast(@alignCast(raw));
                 const out = item.arena.allocator();
-                const page = try out.create(RawPage);
-                page.* = .{ .bytes = try artifacts.readArtifact(out, loader.store, .{ .artifact_id = loader.ref.artifact_id, .checksum = loader.ref.checksum, .byte_len = loader.ref.byte_len }, loader.token, loader.cached) };
+                const page = out.create(DecodedPage) catch |err| {
+                    if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
+                    return err;
+                };
+                page.* = .{ .page = tree.readPage(out, loader.access.backing(), loader.ref) catch |err| {
+                    if (err == error.OutOfMemory and item.budget.isLocallyExhausted()) return error.SqlMemoryLimitExceeded;
+                    return err;
+                } };
                 item.payload = .{ .extension = page };
             }
+            fn release(owner: *anyopaque, item: *anyopaque) void {
+                const lease: local.serverless_query_lake_decoded_cache.Lease = .{ .cache = @ptrCast(@alignCast(owner)), .item = @ptrCast(@alignCast(item)) };
+                lease.release();
+            }
         };
-        var loader: Loader = .{ .store = store, .ref = ref, .token = token, .cached = cached };
+        // This loader is operation-scoped and deliberately has no navigation
+        // hook, avoiding recursive flights. All verified buffers and entry views
+        // belong to the bounded cache item, with no request allocator retained.
+        var underlying: Access = undefined;
+        underlying.init(access.store, access.domain, access.token, access.cached);
+        var loader: Loader = .{ .access = &underlying, .ref = ref };
         const pages = try self.pageCache();
         var digest: [32]u8 = undefined;
         hash.final(&digest);
-        const lease = pages.acquire(digest, 2 * tree.max_page_bytes, context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
-            // A synchronous caller cannot join an I/O flight. Optional cache
-            // pressure never prevents an independently admitted required read.
+        const lease = pages.acquire(digest, pages.max_loading_bytes, context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
+            // Optional cache pressure must not prevent an admitted required read.
             if (err != error.SqlMemoryLimitExceeded) return err;
             try Check.check(&check);
-            return artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
+            return tree.readPage(a, underlying.backing(), ref);
         };
-        defer lease.release();
+        errdefer lease.release();
         try Check.check(&check);
-        const page: *const RawPage = @ptrCast(@alignCast(lease.item.payload.extension));
-        return a.dupe(u8, page.bytes);
+        const decoded: *const DecodedPage = @ptrCast(@alignCast(lease.item.payload.extension));
+        var page = decoded.page;
+        page.lease = .{ .owner = lease.cache, .item = lease.item, .release = Loader.release };
+        return page;
     }
     fn backing(self: *Navigation, access: *Access, store: stores.ArtifactStore, domain: [32]u8, token: Token, cached: ?artifacts.CachedRead) tree.Store {
         access.init(store, domain, token, cached);
@@ -737,4 +764,54 @@ test "external lake native navigation overlaps cold pages shares flights and che
     try worker.run(store, roots[0], paths[0], false);
     try std.testing.expectEqual(@as(usize, 2), worker.calls.load(.acquire));
     std.debug.print("native navigation cold pages: overlapping=2 shared_readers=3 provider_reads={}\n", .{worker.calls.load(.acquire)});
+}
+
+test "external lake native decoded navigation leases avoid warm copies preserve quotas and authenticate shape" {
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("native-navigation-leases");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const root = try persist(a, arena.allocator(), &store, .{ .domain = @splat(7), .files = &.{.{ .path = "file", .bytes = 0 }} }, null, .none, null);
+    var navigation: Navigation = .{ .allocator = a };
+    defer navigation.deinit();
+    var access: Access = undefined;
+    const backing = navigation.backing(&access, store, root.domain, .none, null);
+    var cold = try tree.readPage(a, backing, root.directory.?);
+    defer cold.deinit(a);
+    try std.testing.expect(cold.lease != null);
+    // Warm immutable views require no request allocation or repeated parse.
+    var failed = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const before = access.reads;
+    var warm = try tree.readPage(failed.allocator(), backing, root.directory.?);
+    defer warm.deinit(failed.allocator());
+    try std.testing.expect(cold.bytes.ptr == warm.bytes.ptr);
+    try std.testing.expect(cold.entries.ptr == warm.entries.ptr);
+    try std.testing.expectEqual(before - root.directory.?.bytes, access.reads);
+    access.reads = 0;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, tree.readPage(a, backing, root.directory.?));
+    access.reads = 512 * 1024 * 1024;
+    var wrong = root.directory.?;
+    wrong.records += 1;
+    try std.testing.expectError(error.InvalidGraphPage, tree.readPage(a, backing, wrong));
+    access.domain = @splat(8);
+    try std.testing.expectError(error.FileNotFound, tree.readPage(a, access.backing(), root.directory.?));
+    // Optional residency pressure cannot invalidate already pinned views.
+    const cache = try navigation.pageCache();
+    cache.max_entries = 0;
+    try std.testing.expectEqualStrings("file", warm.entries[0].key);
+    // Declined cache workspace preserves the required, admitted uncached read.
+    var pressure: Navigation = .{ .allocator = a };
+    defer pressure.deinit();
+    (try pressure.pageCache()).max_loading_bytes = 1;
+    var uncached_access: Access = undefined;
+    var uncached = try tree.readPage(a, pressure.backing(&uncached_access, store, root.domain, .none, null), root.directory.?);
+    defer uncached.deinit(a);
+    try std.testing.expect(uncached.lease == null);
+    try std.testing.expectEqualStrings("file", uncached.entries[0].key);
+    try std.testing.expectEqual(512 * 1024 * 1024 - @as(u64, root.directory.?.bytes), uncached_access.reads);
 }

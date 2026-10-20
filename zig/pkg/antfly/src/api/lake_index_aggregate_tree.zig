@@ -213,6 +213,10 @@ pub fn merge(a: A, store: *stores.ArtifactStore, recipe: Recipe, left: Index, ri
         m.written_bytes = before_writes - access.writes;
     };
     if (previous) |prior| if (left.layout == 2 and right.layout == 2 and prior.parent.layout == 2 and (prior.left == null or prior.left.?.layout == 2) and (prior.right == null or prior.right.?.layout == 2)) if (try incremental(a, backing, recipe, left, right, prior, metrics, &layout)) |result| return result;
+    // Distinct grouping-key ranges need no reducer work. Keep their immutable
+    // descendants and rewrite only the connecting boundary, in either order.
+    // Historical layouts still pass through the normal one-time upgrade.
+    if (left.layout == 2 and right.layout == 2) if (try tree.joinDisjoint(a, backing, left.page.?, right.page.?)) |page| return .{ .domain = scope.domain, .layout = 2, .page = page };
     var builder: tree.SortedBuilder = .{ .alloc = a, .store = backing };
     defer builder.deinit();
     var lc = try tree.Cursor.init(a, backing, left.page, "", null);

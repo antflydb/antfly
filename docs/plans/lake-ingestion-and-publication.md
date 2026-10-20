@@ -3053,7 +3053,7 @@ splitting a 256 KiB page into ordinary 32 KiB pages on a small edit. Ordinary
 packing and unrelated-tail retention keep their existing locality policy.
 
 Native generation navigation no longer holds its descriptor lock across storage
-reads. An immutable single-flight cache owns verified page bytes, with 4 MiB
+reads. An immutable single-flight cache owns verified decoded pages, with 4 MiB
 residency, 128 entries and up to four loaders within 8 MiB active allocation.
 Tree cursors, read quotas and cancellation belong to the operation; every warm
 hit and waiter checks current authority. Equal misses share work while disjoint
@@ -3106,3 +3106,49 @@ The RC1/DuckDB measurements in PR #1196 are diagnostic baselines, not measuremen
 of this head. Neither the aggregate layout nor the new timings establish cold
 BM25 parity. Real-provider retention qualification remains deferred; the local
 runner performs no cloud writes or retention policy changes.
+
+### Bounded navigation publication and leased aggregate serving
+
+File-major publication sorts the already admitted file window's public-ID edits
+and applies one tree mutation batch before exposing that window's root to native
+builders. Intermediate roots are not published or consumed. This removes repeated
+copy-on-write uploads without expanding replay admission or publishing navigation
+for files outside the completed window. A deterministic 1,024-file fixture with
+64-file windows drops from 4,367 writes / 60,064,754 encoded bytes to 121 writes /
+1,817,317 bytes. These are tree-level publication observations, not HN query
+latency measurements.
+
+Native file/chunk navigation now leases authenticated immutable decoded pages.
+Cache keys include the reclamation domain and complete physical reference,
+including attempt, height, record count and length. Warm hits allocate no request
+buffers and repeat no page parse or hash. Every operation still checks live
+cancellation/authority and charges its logical read quota. Residency and active
+load limits remain independent; optional workspace pressure falls back to an
+admitted uncached read. Reader cursors pin decoded pages until advancement or
+close, with no request context retained in cache items.
+
+Cold aggregate reduction detects strictly disjoint key ranges before reducing
+records. It rewrites their boundary spines and reuses all unaffected descendants,
+including original attempt identities. Overlapping envelopes decline without
+writes and preserve the existing exact key/reducer merge; historical layouts
+still upgrade through the ordinary path. A 24,000-record disjoint fixture writes
+8,218 bytes with six page reads, including reverse inputs; unequal heights,
+overlap fallback and allocation failures retain the same snapshot semantics.
+
+Serving retains one bounded immutable aggregate frame until the next cursor
+pull, alongside at most one independently owned prefetched frame. Native state
+views borrow its bytes, so selecting COUNT from a wide cohort no longer copies
+unused MIN/MAX payloads into the result page. Key validation uses reclaimable
+scratch, while final SQL result keys and values retain their existing owned
+output boundary. A 512-group fixture with 8 KiB unused states peaks at 122,684
+bytes in a 512 KiB output allowance, including a MIN value retained after its
+reader closes. Cached borrowed NUMERIC SUM/AVG finalization likewise uses
+private scratch and copies only the result, without mutating the cache's reducer
+memo. The 16,384-result cached SUM fixture now peaks at 962,324 bytes under a
+4 MiB output budget (AVG: 869,998 bytes); the prior SUM helper exhausted that
+budget after 10,057 results.
+
+No wire format or reader protocol changes are needed. Archive-scale cold BM25,
+provider latency and post-GC live-byte improvements still require the controlled
+qualification described above; the unavailable HN fixture and deferred live
+provider runs remain separate from these deterministic checks.
