@@ -4,6 +4,56 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Scoped resource stages through borrowed executions (2026-10-20)
+
+Source `4e43317f563766329da969438208fbba16ae1571` adds the following capability.
+Borrowed original executions now expose a synchronous, checked resource stage.
+The owner parks the existing CPU, atomically admits the complete resource bundle
+with CPU, and detaches the temporary participant before every return. The native
+bridge preserves arbitrary original restriction failures and remembers their
+cause for later lifetime/checkpoint calls. No new operation, deadline or resource
+ledger is created. Physical bundle credit remains owned until all allocations
+and physical consumers retire, independently of CPU finish.
+
+The owner, ingress-read and independent-child adapters forward this capability.
+Read policy is checked before admission and after reentry; the original
+restriction is checked again after policy validation can perform IO. Missing
+capabilities and malformed frames fail before parking. Retained completion and
+control roots still reject incremental bundles; this does not authorize fresh
+post-decision resource demand. A failed attachment stops the retained waiter.
+
+Runnable ABI 16, native ABI 45, API ABI 55 and storage-owner ABI 109 fence the
+new callback layouts. Runtime-failure ABI 66, engine descriptor 29, reader floor
+10 and durable transaction formats remain unchanged.
+
+Thirteen resource-forwarding cases cover the actual opaque owner/native bridge,
+read and child adapters, repeated scoped grants, original deadline preservation,
+missing capability and short frames, rejection before queueing, during resource
+waiting, after an atomic grant and after policy validation, callback detachment,
+and physical allocations retaining credit after CPU finish. The existing tiny
+memory fixture now explicitly provisions accounted identity metadata with the
+shared metadata fixture; its payload ceiling remains 100 bytes.
+
+`borrowed-scoped-resources-integration-v1` passes 100/100 build steps,
+including 110 coordinator cases, 46 companions, 16 native protocol/owner cases
+and three DB regressions. Both startup profiles and the source controller have
+semantic analysis only; full linked archive/cold-source runtime remain unqualified.
+The final focused run passes 30/30 build steps with 13 forwarding and 23 bundle
+cases. The integration inventory differs from the committed source only by an
+expanded existing license comment in `runnable_reentry.zig`; the saved amendment
+verifies the executable body is byte-identical. Focused tests also pass after
+that comment correction.
+
+`borrowed-scoped-resources-verified.json` binds both native input inventories,
+the license-only amendment and 4544 matching immutable public sources to the
+25/25 passing ReleaseSafe consumer steps. ABI/status and source-boundary checks
+pass without enabling required providers.
+
+This is a prerequisite for original generated-effect producer funding. Those
+producers, durable completion resource reservations and actual required-mode
+providers remain unfinished and disabled. The full design remains incomplete;
+full Linux qualification remains waived.
+
 ## Original execution through native acknowledgements (2026-10-20)
 
 Source `248aa89954b727b4675491ed2826239ae4b1ff7c` carries ordinary single and batched acknowledgements

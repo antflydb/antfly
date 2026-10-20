@@ -18,12 +18,22 @@ implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `d227ec2811235d618b8e50d86ab4b1472b207cc4`
 (merge commit `b81563cddd6bd86941e40ebcdf2b1bf805113605`).
 
-Native ABI 44, storage-owner ABI 108, engine descriptor 29, required preparation
+Native ABI 45, storage-owner ABI 109, engine descriptor 29, required preparation
 file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
+
+Source `4e43317f563766329da969438208fbba16ae1571` adds scoped resource admission to borrowed
+original executions. The same owner admits CPU and the complete resource bundle;
+temporary callbacks detach on every return, while physical allocation credit
+survives CPU finish until actual retirement. Read and child adapters preserve
+original restrictions through queueing and post-grant policy validation.
+Runnable ABI 16 and API ABI 55 reject older callback layouts. The focused resource
+and 100-step native integration runs pass, as does the 25-step immutable-package
+ReleaseSafe consumer. Original generated-effect producers,
+completion bundles and required-mode providers remain unfinished and disabled.
 
 Source `248aa89954b727b4675491ed2826239ae4b1ff7c` carries original completion
 execution through ordinary native ACK and ACK-many, including both local worker
