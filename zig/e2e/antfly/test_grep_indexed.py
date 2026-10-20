@@ -1232,6 +1232,27 @@ def test_logical_scalable_work_profile(stateful_api):
                 "max_regex_work": 1000000000,
             },
         }
+        # Full-index acknowledgement does not wait for background compaction.
+        # Separate ingestion CPU from the query comparison, including under a
+        # small cgroup quota. Keep every observation instead of dropping slow
+        # query trials after seeing their results.
+        settling = []
+        quiet = 0
+        settle_started = time.monotonic()
+        previous = read_process()
+        while quiet < 3 and time.monotonic() - settle_started < 15:
+            time.sleep(0.2)
+            current = read_process()
+            cpu_ms = (current["cpu_ns"] - previous["cpu_ns"]) / 1000000
+            settling.append(
+                {
+                    "elapsed_ms": (time.monotonic() - settle_started) * 1000,
+                    "cpu_ms": cpu_ms,
+                }
+            )
+            quiet = quiet + 1 if cpu_ms <= 10 else 0
+            previous = current
+        assert quiet == 3, ("server ingestion CPU did not settle", settling)
         runs = []
         initial_process = read_process()
         samples = [initial_process]
@@ -1328,6 +1349,7 @@ def test_logical_scalable_work_profile(stateful_api):
                 "name": name,
                 "documents": count,
                 "corpus_sha256": hashlib.sha256(corpus).hexdigest(),
+                "settling": settling,
                 "median_http_ms": statistics.median(r["http_ms"] for r in runs),
                 "median_first_result_ms": statistics.median(
                     r["first_result_ms"] for r in runs
@@ -1361,6 +1383,8 @@ def test_logical_scalable_work_profile(stateful_api):
     Path(destination).write_text(
         json.dumps(
             {
+                "benchmark_protocol_version": 2,
+                "settling_rule": "three consecutive 200 ms process-CPU windows at or below 10 ms, before timed queries; deadline 15 s",
                 "platform": platform.platform(),
                 "machine": platform.machine(),
                 "logical_cpus": os.cpu_count(),
