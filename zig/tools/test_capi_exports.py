@@ -167,6 +167,7 @@ else:
             "build_test_filters.zig",
             "tools/build_support.zig",
             "tools/capi_exports.py",
+            "pkg/inference/build/decision_modules.zig",
         ):
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
