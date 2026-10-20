@@ -180,7 +180,7 @@ async function embeddingFixture(directory) {
   const files = new Map([['config.json', json(config)], ['tokenizer_config.json', json({})], ['config_sentence_transformers.json', json({})], ['1_Pooling/config.json', json({ pooling_mode_mean_tokens: true })], ['processor_config.json', new Blob([await readFile(new URL('../src/models/embedding_gemma2_processor.json', import.meta.url))])]]);
   const tokens = ['<pad>', '<eos>', '<bos>', '<unk>'];
   const added_tokens = tokens.slice(0, 3).map((content, id) => ({ id, content, special: true, normalized: false }));
-  for (const [id, content] of [[255999, '<|image>'], [256000, '<|audio>'], [258880, '<|image|>'], [258881, '<|audio|>'], [258882, '<image|>'], [258883, '<audio|>']]) added_tokens.push({ id, content, special: true, normalized: false });
+  for (const [id, content] of [[255999, '<|image>'], [256000, '<|audio>'], [258880, '<|image|>'], [258881, '<|audio|>'], [258882, '<image|>'], [258883, '<audio|>'], [258884, '<|video|>']]) added_tokens.push({ id, content, special: true, normalized: false });
   files.set('tokenizer.json', json({ model: { type: 'WordPiece', unk_token: '<unk>', continuing_subword_prefix: '##', max_input_chars_per_word: 100, vocab: Object.fromEntries(tokens.map((t, i) => [t, i])) }, added_tokens, pre_tokenizer: { type: 'WhitespaceSplit' }, post_processor: { type: 'TemplateProcessing', single: [{ SpecialToken: { id: '<bos>', type_id: 0 } }, { Sequence: { id: 'A', type_id: 0 } }, { SpecialToken: { id: '<eos>', type_id: 0 } }], special_tokens: { '<bos>': { id: '<bos>', ids: [2], tokens: ['<bos>'] }, '<eos>': { id: '<eos>', ids: [1], tokens: ['<eos>'] } } } }));
   const header = {}; let offset = 0; const writes = [];
   const add = (name, shape, nonzero = []) => {
@@ -208,6 +208,12 @@ test('EmbeddingGemma2 full geometry: native identity, cosine prototypes and mult
   const runtime = await session();
   try {
     const files = await embeddingFixture(directory);
+    const tokenizer = files.get('tokenizer.json');
+    const missingVideo = JSON.parse(await tokenizer.text());
+    missingVideo.added_tokens = missingVideo.added_tokens.filter(token => token.id !== 258884);
+    files.set('tokenizer.json', json(missingVideo));
+    await assert.rejects(runtime.load(files, 'bf16'), /InvalidEmbeddingGemma2Tokenizer/);
+    files.set('tokenizer.json', tokenizer);
     await runtime.load(files, 'bf16');
     const question = { name: 'tool', type: 'choice', choices: [{ value: 'search' }, { value: 'fetch' }], instructions: 'question', embedding_options: { min_margin: 0.1 } };
     const input = { model: 'local', input: 'state', questions: [question] };
@@ -217,7 +223,7 @@ test('EmbeddingGemma2 full geometry: native identity, cosine prototypes and mult
     assert.equal(result.answers[0].decision_method, 'embedding_similarity');
     assert.equal(result.answers[0].status, 'abstained');
     assert(result.answers[0].similarities.every(s => Math.abs(s.similarity - 1) < 1e-6));
-    const aggregate = createHash('sha256').update('embeddinggemma2-f32-mean-v1');
+    const aggregate = createHash('sha256').update('embeddinggemma2-f32-mean-v6-webm-presentation');
     for (const name of ['config.json', 'tokenizer.json', 'tokenizer_config.json', 'processor_config.json', 'config_sentence_transformers.json', '1_Pooling/config.json', 'model.safetensors']) {
       aggregate.update(name === 'model.safetensors' ? 'weights' : name).update(Buffer.from([0]));
       const hash = createHash('sha256'); for await (const chunk of files.get(name).stream()) hash.update(chunk); aggregate.update(hash.digest());
