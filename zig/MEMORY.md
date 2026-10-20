@@ -26,6 +26,22 @@ an implicit memory-space rename; a mismatched binding fails explicitly.
 Storage adapters must route through existing table transactions or the native
 embedded DB; memory owns no additional storage engine or transaction manager.
 
+Remote spaces require native catalog support. Their catalog resources carry an
+immutable `native_service: memory` ownership binding, captured with both point
+identity and batched query definitions. The shared catalog data-admission boundary
+rejects ordinary HTTP, MCP, SQL, join and graph access to that storage, even for a
+caller with table grants. Only memory's in-process service capability admits its
+backing table. Public request bodies and headers cannot mint that capability.
+Generic catalog mutation cannot rename, drop or remove service ownership; lifetime
+operations belong to the service. Embedded raw access remains the database owner's
+authority, rather than an authentication boundary between local principals.
+
+Native provisioning uses a distinct body-bound administrative metadata call and
+requires topology protocol 36; old metadata must reject it before private data is
+published. Upgrade every public ingress and metadata peer before enabling spaces.
+The private catalog protocol preserves ownership across restart and projections;
+unsupported catalog providers fail closed instead of creating an ordinary table.
+
 The embedded JSON envelope is `{action, id?, body?, idempotency_key?, principal?}`.
 The database owner is its authority; local `principal` is attribution. Remote
 transports derive principals and table grants from Antfly authentication.
@@ -39,7 +55,14 @@ revisions describe when Antfly learned or revised it. Unknown validity never
 becomes an update order merely because a document was ingested later.
 
 Provisional/settled stability, factual modality, provenance role and lifecycle
-are independent. Typed links connect evidence, decisions, rationale, rejected
+are independent. Identity corrections reconcile the affected canonical belief
+groups in the same transaction as redirects. Raw subject/value IDs and explicit
+human or producer dispositions remain immutable inputs to that projection; unmerge
+rebuilds the separate groups without erasing explicit retractions or supersession.
+Missing forgotten replacements never authorize revival. Subject and typed-object
+reverse indexes bound the affected set; one atomic curation admits at most 256
+assertions, rejecting a larger operation without changing identity or facts.
+Typed links connect evidence, decisions, rationale, rejected
 alternatives, episodes and procedures. Alias/name matches never authorize a
 canonical identity merge. Explicit distinct IDs must remain distinct.
 The original assertion fingerprint and asserted upper validity bound survive
@@ -62,7 +85,8 @@ and reports omitted candidates, scan limits, revisions and actual retrieval
 path. A truncated ranking is never a completeness claim. Context and authoritative
 lifecycle filters apply before rendering citations. Private provenance cannot
 be widened by a team-visible derived assertion. Forgetting erects durable
-non-resurrection fences immediately; bounded physical cleanup is separate.
+non-resurrection fences immediately in every source-backed view, including entity
+lookup, identity resolution and enumeration; bounded physical cleanup is separate.
 
 ## Public operations and bounded execution
 
@@ -70,6 +94,9 @@ All timestamps are signed milliseconds since Unix epoch. `valid_at` asks about
 business validity; `known_at` selects recorded assertion and premise revisions.
 Forgetting and retention still apply to historical reads. `history` is the exact
 audit view; current recall excludes stale dependencies and historical guidance.
+Structural enumeration and ranked recall share lifecycle and validity filtering.
+An explicit `valid_at` can select a superseded version in its original interval;
+it never requires `include_history` merely to reconstruct that valid state.
 
 HTTP routes live under `/memory/v1/spaces/{space}`. Use
 `X-Antfly-Database` and `X-Antfly-Namespace` for catalog scope (defaults:
@@ -136,7 +163,11 @@ revision and dimensions, and supply `embedding_model` with each vector.
 
 Embedder reconfiguration retains the serving configuration while a pending
 configuration builds new vectors in bounded pages. External producers stage
-vectors for the exact pending generation. Publication switches the configuration
+vectors for the exact pending generation. Configuration generations use unique
+admission revisions, including failed builds; they are never allocated from the
+serving generation or reused after cancellation. An immutable generation snapshot
+binds every staged vector to its exact model, so a later model cannot inherit
+staging left by a failed transition. Publication switches the configuration
 only when the build completes; old and new vector spaces never share scores.
 Model failures and schema/grounding rejection retain bounded retry status and
 publish no partial generated output. Recovery replays committed receipts.

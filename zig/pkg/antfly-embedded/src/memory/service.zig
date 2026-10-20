@@ -136,8 +136,9 @@ pub const Service = struct {
                 const request = try parse(struct { expected_revision: u64, config: t.Config }, a, body);
                 if (request.expected_revision != run.state.revision - 1) return error.MemoryRevisionConflict;
                 var config = request.config;
-                if (run.state.config.generation == std.math.maxInt(u64)) return error.MemoryCorruptState;
-                config.generation = run.state.config.generation + 1;
+                // Admission revisions are durable and never reused, including failed
+                // builds. Serving generations are not allocation counters.
+                config.generation = run.state.revision;
                 try self.validate(config);
                 if (self.context.execution_signature.len > 0) {
                     run.state.execution_principal = self.context.execution_principal;
@@ -229,6 +230,9 @@ const Run = struct {
     state: t.State = undefined,
     state_row: ?Row = null,
     changes: std.ArrayList(Change) = .empty,
+    identity_policy: ?EntityPolicy = null,
+    identity_index: ?curation.RedirectIndex = null,
+    suppression_index: ?curation.Index = null,
 
     fn encode(self: *Run, value: anytype) ![]const u8 {
         return std.json.Stringify.valueAlloc(self.a, value, .{});
@@ -335,6 +339,7 @@ const Run = struct {
         return self.supportVisibleTime(refs, dependencies, null, null, depth);
     }
     fn supportVisibleTime(self: *Run, refs: []const t.EvidenceRef, dependencies: []const []const u8, known: ?i64, valid: ?i64, depth: u8) anyerror!bool {
+        if (try self.read(bool, "forgotten-all") != null) return false;
         if (refs.len == 0) return false;
         for (refs) |ref| {
             const source = (try self.evidence(ref.id)) orelse return false;
@@ -549,7 +554,7 @@ const Run = struct {
                 var old = (try self.assertion(previous)) orelse return error.MemoryNotFound;
                 try self.authorize(old.owner, old.assertion.visibility);
                 if (claim.visibility == .private and !eql(u8, old.owner, self.service.context.principal)) return error.MemoryVisibilityConflict;
-                if (!sameGroup(claim, old.assertion) or claim.modality != .actual or claim.role == .hypothesized or claim.stability != .settled) return error.MemoryInvalidSupersession;
+                if (!try self.sameCanonicalGroup(claim, old.assertion) or claim.modality != .actual or claim.role == .hypothesized or claim.stability != .settled) return error.MemoryInvalidSupersession;
                 old.lifecycle = .superseded;
                 old.superseded_by = claim.id;
                 if (claim.valid_from) |start| {
@@ -557,6 +562,7 @@ const Run = struct {
                     if (old.assertion.valid_to == null or old.assertion.valid_to.? > start) old.assertion.valid_to = start;
                 }
                 old.recorded_to = self.service.context.now_ms;
+                old.explicit_disposition = explicitDisposition(old);
                 old.revision = self.state.revision;
                 try self.putAssertion(old);
                 try self.invalidate("assertion", previous);
@@ -566,23 +572,132 @@ const Run = struct {
     }
     fn candidates(self: *Run, claim: t.Assertion) ![]const t.StoredAssertion {
         var result: std.ArrayList(t.StoredAssertion) = .empty;
-        const prefix = try groupPrefix(self.a, claim, self.service.context.principal);
-        var cursor: ?[]const u8 = null;
-        while (true) {
-            const page = try self.scanOverlay(prefix, cursor, 128);
-            for (page.rows) |row| {
-                const entry = try parse(struct { id: []const u8 }, self.a, row.json);
-                const old = (try self.assertion(entry.id)) orelse continue;
-                if (eql(u8, old.assertion.id, claim.id) or old.lifecycle != .active or old.stale or old.assertion.modality != .actual or old.assertion.role == .hypothesized or old.assertion.stability != .settled) continue;
-                self.authorize(old.owner, old.assertion.visibility) catch continue;
-                if (!try self.evidenceVisible(old)) continue;
-                if (result.items.len >= t.max_items) return error.MemoryWorkLimit;
-                try result.append(self.a, old);
-            }
-            cursor = page.next;
-            if (cursor == null) break;
+        for (try self.canonicalGroup(claim, self.service.context.principal)) |old| {
+            if (eql(u8, old.assertion.id, claim.id) or old.lifecycle != .active or old.stale or old.assertion.modality != .actual or old.assertion.role == .hypothesized or old.assertion.stability != .settled) continue;
+            self.authorize(old.owner, old.assertion.visibility) catch continue;
+            if (!try self.evidenceVisible(old)) continue;
+            if (result.items.len >= t.max_items) return error.MemoryWorkLimit;
+            try result.append(self.a, old);
         }
         return result.items;
+    }
+    fn objectTyped(self: *Run, predicate: []const u8) bool {
+        for (self.state.config.predicates) |definition| if (eql(u8, definition.name, predicate)) return definition.object_type != null;
+        return false;
+    }
+    fn prepareIdentityIndex(self: *Run) !void {
+        if (self.identity_index != null) return;
+        const policy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+        if (policy.redirects.len > 4096) return error.MemoryWorkLimit;
+        const redirects = try curation.RedirectIndex.init(self.a, policy.redirects);
+        var suppression = try curation.Index.init(self.a, "", try self.encode(policy.state));
+        try suppression.bindRedirects(self.a, redirects);
+        self.identity_policy = policy;
+        self.identity_index = redirects;
+        self.suppression_index = suppression;
+    }
+    fn identityMembers(self: *Run, id: []const u8) ![]const []const u8 {
+        try self.prepareIdentityIndex();
+        const policy = self.identity_policy.?;
+        const index = self.identity_index.?;
+        const target = index.canonical(id);
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        try names.put(self.a, id, {});
+        try names.put(self.a, target, {});
+        for (policy.redirects) |redirect| if (eql(u8, index.canonical(redirect.key), target)) {
+            try names.put(self.a, redirect.key, {});
+        };
+        const result = try self.a.alloc([]const u8, names.count());
+        var iterator = names.keyIterator();
+        var count: usize = 0;
+        while (iterator.next()) |name| : (count += 1) result[count] = name.*;
+        return result;
+    }
+    fn sameCanonicalGroup(self: *Run, left: t.Assertion, right: t.Assertion) !bool {
+        var lhs = left;
+        var rhs = right;
+        lhs.subject = (try self.canonical(left.subject)) orelse return false;
+        rhs.subject = (try self.canonical(right.subject)) orelse return false;
+        return sameGroup(lhs, rhs);
+    }
+    fn sameCanonicalValue(self: *Run, left: t.Assertion, right: t.Assertion) !bool {
+        if (!self.objectTyped(left.predicate)) return eql(u8, left.value, right.value);
+        const lhs = (try self.canonical(left.value)) orelse return false;
+        const rhs = (try self.canonical(right.value)) orelse return false;
+        return eql(u8, lhs, rhs);
+    }
+    fn canonicalGroup(self: *Run, claim: t.Assertion, owner: []const u8) ![]const t.StoredAssertion {
+        var records: std.ArrayList(t.StoredAssertion) = .empty;
+        for (try self.identityMembers(claim.subject)) |subject| {
+            var raw = claim;
+            raw.subject = subject;
+            const prefix = try groupPrefix(self.a, raw, owner);
+            var cursor: ?[]const u8 = null;
+            while (true) {
+                try self.service.context.check();
+                const page = try self.scanOverlay(prefix, cursor, 128);
+                for (page.rows) |row| {
+                    const entry = try parse(struct { id: []const u8 }, self.a, row.json);
+                    const record = (try self.assertion(entry.id)) orelse continue;
+                    if (records.items.len >= 4096) return error.MemoryWorkLimit;
+                    try records.append(self.a, record);
+                }
+                cursor = page.next;
+                if (cursor == null) break;
+            }
+        }
+        return records.items;
+    }
+    fn rebuildIdentityGroups(self: *Run, names: *std.StringHashMapUnmanaged(void)) !void {
+        var affected: std.StringHashMapUnmanaged(t.StoredAssertion) = .empty;
+        var iterator = names.keyIterator();
+        while (iterator.next()) |name| {
+            const prefix = try std.fmt.allocPrint(self.a, "dependency/identity/{s}/", .{try hash(self.a, name.*)});
+            var cursor: ?[]const u8 = null;
+            while (true) {
+                const page = try self.scanOverlay(prefix, cursor, 128);
+                for (page.rows) |row| {
+                    const entry = try parse(struct { child: []const u8 }, self.a, row.json);
+                    const seed = (try self.assertion(entry.child)) orelse continue;
+                    for (try self.canonicalGroup(seed.assertion, seed.owner)) |record| {
+                        try affected.put(self.a, record.assertion.id, record);
+                        if (affected.count() > t.max_items) return error.MemoryWorkLimit;
+                    }
+                }
+                cursor = page.next;
+                if (cursor == null) break;
+            }
+        }
+        var values = affected.valueIterator();
+        while (values.next()) |value| {
+            var record = value.*;
+            // Missing forgotten replacements do not authorize revival.
+            var retained_links = true;
+            if (record.superseded_by) |id| if (try self.assertion(id)) |linked| {
+                if (!try self.retained(linked, 0)) retained_links = false;
+            } else {
+                retained_links = false;
+            };
+            for (record.conflicts_with) |id| if (try self.assertion(id)) |linked| {
+                if (!try self.retained(linked, 0)) retained_links = false;
+            } else {
+                retained_links = false;
+            };
+            if (retained_links) {
+                const baseline = record.explicit_disposition orelse t.ExplicitDisposition{ .lifecycle = .active, .valid_to = record.asserted_valid_to, .superseded_by = null, .recorded_to = null, .conflicts_with = &.{}, .reason = null };
+                record.lifecycle = baseline.lifecycle;
+                record.assertion.valid_to = baseline.valid_to;
+                record.superseded_by = baseline.superseded_by;
+                record.recorded_to = baseline.recorded_to;
+                record.conflicts_with = baseline.conflicts_with;
+                record.reason = baseline.reason;
+            }
+            if (record.assertion.kind == .summary or record.assertion.kind == .procedural) record.stale = true;
+            record.revision = self.state.revision;
+            try self.putAssertion(record);
+        }
+        values = affected.valueIterator();
+        while (values.next()) |value| if (try self.assertion(value.assertion.id)) |record| try self.reconcile(record);
     }
     fn canonical(self: *Run, id: []const u8) !?[]const u8 {
         const input = try self.read(t.EntityRecord, try key(self.a, "entity", id));
@@ -590,10 +705,9 @@ const Run = struct {
             self.authorize(record.owner, record.entity.visibility) catch return null;
             if (!try self.supportVisible(record.entity.evidence, &.{}, 0)) return null;
         }
-        const policy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
-        const redirects = try curation.RedirectIndex.init(self.a, policy.redirects);
-        var index = try curation.Index.init(self.a, "", try self.encode(policy.state));
-        try index.bindRedirects(self.a, redirects);
+        try self.prepareIdentityIndex();
+        const redirects = self.identity_index.?;
+        const index = self.suppression_index.?;
         if (index.keySuppressed(id)) return null;
         const canonical_id = redirects.canonical(id);
         if (index.keySuppressed(canonical_id)) return null;
@@ -620,6 +734,11 @@ const Run = struct {
                 for (to.entity.distinct_from) |id| if (eql(u8, id, request.from)) return error.MemoryEntityConflict;
             }
         }
+        var affected_names: std.StringHashMapUnmanaged(void) = .empty;
+        for (try self.identityMembers(request.from)) |name| try affected_names.put(self.a, name, {});
+        if (request.to) |target| for (try self.identityMembers(target)) |name| {
+            try affected_names.put(self.a, name, {});
+        };
         const plan = try curation.plan(self.a, try self.encode(stored.state), stored.redirects, stored.redirects, .{
             .action = switch (request.action) {
                 .merge => .merge,
@@ -637,6 +756,12 @@ const Run = struct {
         var index = try curation.Index.init(self.a, "", try self.encode(plan.state));
         try index.bindRedirects(self.a, redirects);
         try self.put("entity-policy", EntityPolicy{ .state = plan.state, .redirects = plan.merges });
+        self.identity_policy = null;
+        self.identity_index = null;
+        self.suppression_index = null;
+        // Reconcile affected belief groups in the redirect transaction.
+        // A work-limit rejection publishes neither identity nor partial facts.
+        try self.rebuildIdentityGroups(&affected_names);
         try self.invalidate("entity", request.from);
     }
     fn resolveEntity(self: *Run, id: []const u8) ![]const u8 {
@@ -680,6 +805,8 @@ const Run = struct {
         try self.put(try key(self.a, "assertion", record.assertion.id), record);
         try self.put(try historyKey(self.a, record.assertion.id, self.state.revision), record);
         try self.put(try groupKey(self.a, record.assertion, record.owner), .{ .id = record.assertion.id });
+        try self.put(try dependencyKey(self.a, "identity", record.assertion.subject, record.assertion.id), .{ .child = record.assertion.id });
+        if (self.objectTyped(record.assertion.predicate)) try self.put(try dependencyKey(self.a, "identity", record.assertion.value, record.assertion.id), .{ .child = record.assertion.id });
     }
     // Include the transaction's own writes: reconciliation within an import
     // must have the same semantics as the same observations committed singly.
@@ -736,50 +863,45 @@ const Run = struct {
     }
     fn reconcile(self: *Run, incoming: t.StoredAssertion) !void {
         const claim = incoming.assertion;
+        if (try self.canonical(claim.subject) == null) return;
+        if (self.objectTyped(claim.predicate) and try self.canonical(claim.value) == null) return;
         if (incoming.lifecycle != .active or incoming.stale or claim.modality != .actual or claim.role == .hypothesized or claim.stability != .settled or !self.singlePredicate(claim.predicate)) return;
-        const prefix = try groupPrefix(self.a, claim, incoming.owner);
-        var after: ?[]const u8 = null;
-        var visited: usize = 0;
-        while (true) {
+        for (try self.canonicalGroup(claim, incoming.owner)) |candidate| {
             try self.service.context.check();
-            const page = try self.scanOverlay(prefix, after, 128);
-            for (page.rows) |row| {
-                visited += 1;
-                if (visited > 4096) return error.MemoryWorkLimit;
-                const entry = try parse(struct { id: []const u8 }, self.a, row.json);
-                if (eql(u8, entry.id, claim.id)) continue;
-                var old = (try self.assertion(entry.id)) orelse continue;
-                if (old.lifecycle == .retracted or old.stale or old.assertion.modality != .actual or old.assertion.role == .hypothesized or old.assertion.stability != .settled) continue;
-                if (!sameGroup(claim, old.assertion)) return error.MemoryCorruptState;
-                self.authorize(old.owner, old.assertion.visibility) catch continue;
-                if (eql(u8, claim.value, old.assertion.value) or !intervalsOverlap(claim, old.assertion)) continue;
-                // Unknown business validity is never inferred from ingestion
-                // order. Competing unknown/simultaneous assertions are disputed.
-                var current = (try self.assertion(claim.id)).?;
-                if (claim.valid_from != null and old.assertion.valid_from != null and claim.valid_from.? != old.assertion.valid_from.?) {
-                    const newer = claim.valid_from.? > old.assertion.valid_from.?;
-                    const incoming_authority = try self.authority(claim);
-                    const previous_authority = try self.authority(old.assertion);
-                    if ((newer and incoming_authority < previous_authority) or (!newer and previous_authority < incoming_authority)) {
-                        try self.conflict(&old, claim.id, "Overlapping assertions have conflicting source authority");
-                        try self.conflict(&current, old.assertion.id, "Overlapping assertions have conflicting source authority");
-                    } else if (newer) {
-                        try self.successor(&old, current);
-                    } else {
-                        try self.successor(&current, old);
-                    }
+            if (eql(u8, candidate.assertion.id, claim.id)) continue;
+            var old = (try self.assertion(candidate.assertion.id)) orelse continue;
+            if (old.explicit_disposition) |baseline| if (baseline.lifecycle == .superseded or baseline.lifecycle == .retracted) continue;
+            if (old.lifecycle == .retracted or old.stale or old.assertion.modality != .actual or old.assertion.role == .hypothesized or old.assertion.stability != .settled) continue;
+            if (try self.canonical(old.assertion.subject) == null) continue;
+            if (self.objectTyped(old.assertion.predicate) and try self.canonical(old.assertion.value) == null) continue;
+            if (!try self.retained(old, 0)) continue;
+            if (!try self.sameCanonicalGroup(claim, old.assertion)) return error.MemoryCorruptState;
+            self.authorize(old.owner, old.assertion.visibility) catch continue;
+            if (try self.sameCanonicalValue(claim, old.assertion) or !intervalsOverlap(claim, old.assertion)) continue;
+            // Unknown business validity is never inferred from ingestion
+            // order. Competing unknown/simultaneous assertions are disputed.
+            var current = (try self.assertion(claim.id)).?;
+            if (self.state.config.features.reconciliation == .deterministic and claim.valid_from != null and old.assertion.valid_from != null and claim.valid_from.? != old.assertion.valid_from.?) {
+                const newer = claim.valid_from.? > old.assertion.valid_from.?;
+                const incoming_authority = try self.authority(claim);
+                const previous_authority = try self.authority(old.assertion);
+                if ((newer and incoming_authority < previous_authority) or (!newer and previous_authority < incoming_authority)) {
+                    try self.conflict(&old, claim.id, "Overlapping assertions have conflicting source authority");
+                    try self.conflict(&current, old.assertion.id, "Overlapping assertions have conflicting source authority");
+                } else if (newer) {
+                    try self.successor(&old, current);
                 } else {
-                    try self.conflict(&old, claim.id, "Competing actual values have unknown or concurrent business validity");
-                    try self.conflict(&current, old.assertion.id, "Competing actual values have unknown or concurrent business validity");
+                    try self.successor(&current, old);
                 }
-                old.revision = self.state.revision;
-                current.revision = self.state.revision;
-                try self.putAssertion(old);
-                try self.putAssertion(current);
-                try self.invalidate("assertion", old.assertion.id);
+            } else {
+                try self.conflict(&old, claim.id, "Competing actual values have unknown or concurrent business validity");
+                try self.conflict(&current, old.assertion.id, "Competing actual values have unknown or concurrent business validity");
             }
-            after = page.next;
-            if (after == null) break;
+            old.revision = self.state.revision;
+            current.revision = self.state.revision;
+            try self.putAssertion(old);
+            try self.putAssertion(current);
+            try self.invalidate("assertion", old.assertion.id);
         }
     }
     fn correct(self: *Run, request: t.Correction) !void {
@@ -803,6 +925,7 @@ const Run = struct {
         record.reason = request.reason;
         record.revision = self.state.revision;
         if (request.lifecycle == .retracted) record.recorded_to = self.service.context.now_ms;
+        record.explicit_disposition = explicitDisposition(record);
         try self.putAssertion(record);
         if (self.state.config.features.reconciliation == .deterministic and record.lifecycle == .active) try self.reconcile(record);
         try self.invalidate("assertion", request.id);
@@ -1131,9 +1254,10 @@ const Run = struct {
             if (!try self.evidenceVisibleTime(record, request.known_at, request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null, 0)) continue;
             const claim = record.assertion;
             if (!relationsMatch(request, claim)) continue;
-            if (!request.include_history and (record.lifecycle == .superseded or record.lifecycle == .retracted or record.stale)) continue;
+            if (!matchesTime(request, record, self.service.context.now_ms)) continue;
             if (!request.include_provisional and claim.stability == .provisional) continue;
             const canonical_subject = (try self.canonical(claim.subject)) orelse continue;
+            if (self.objectTyped(claim.predicate) and try self.canonical(claim.value) == null) continue;
             if (request.subject) |v| {
                 const wanted = (try self.canonical(v)) orelse continue;
                 if (!eql(u8, wanted, canonical_subject)) continue;
@@ -1143,10 +1267,6 @@ const Run = struct {
             if (request.kind) |v| if (claim.kind != v) continue;
             if (request.environment) |v| if (claim.environment != null and !eql(u8, v, claim.environment.?)) continue;
             if (request.task) |v| if (claim.task != null and !eql(u8, v, claim.task.?)) continue;
-            if (request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null) |time| {
-                if (claim.valid_from) |v| if (v > time) continue;
-                if (claim.valid_to) |v| if (v <= time) continue;
-            }
             try items.append(self.a, record);
             if (page.next == null) {
                 more = false;
@@ -1182,10 +1302,10 @@ const Run = struct {
                 const claim = record.assertion;
                 if (!relationsMatch(request, claim)) continue;
                 const historical = record.lifecycle == .superseded or record.lifecycle == .retracted or (claim.valid_to != null and claim.valid_to.? <= self.service.context.now_ms);
-                if (record.stale) continue;
-                if (!request.include_history and request.valid_at == null and historical) continue;
+                if (!matchesTime(request, record, self.service.context.now_ms)) continue;
                 if (!request.include_provisional and claim.stability == .provisional) continue;
                 const canonical_subject = (try self.canonical(claim.subject)) orelse continue;
+                if (self.objectTyped(claim.predicate) and try self.canonical(claim.value) == null) continue;
                 if (request.subject) |value| {
                     const wanted = (try self.canonical(value)) orelse continue;
                     if (!eql(u8, wanted, canonical_subject)) continue;
@@ -1195,11 +1315,6 @@ const Run = struct {
                 if (request.environment) |value| if (claim.environment != null and !eql(u8, value, claim.environment.?)) continue;
                 if (request.task) |value| if (claim.task != null and !eql(u8, value, claim.task.?)) continue;
                 if (request.kind) |value| if (value != claim.kind) continue;
-                if (request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null) |time| {
-                    if (claim.valid_from) |start| if (start > time) continue;
-                    if (claim.valid_to) |end| if (end <= time) continue;
-                    if (record.lifecycle == .retracted) continue;
-                }
                 var score = lexical(request.query, claim.statement);
                 const compatible_embedding = if (record.next_embedding_generation == self.state.config.embedding_generation) record.next_embedding else if (record.embedding_generation == self.state.config.embedding_generation) claim.embedding else null;
                 if (vector) |query_vector| if (compatible_embedding) |embedding| {
@@ -1235,7 +1350,7 @@ const Run = struct {
             if (!request.include_history and request.valid_at == null and request.known_at == null) for (selected.items) |present| {
                 const left = hit.memory.assertion;
                 const right = present.memory.assertion;
-                if (sameGroup(left, right) and eql(u8, left.value, right.value) and left.kind == right.kind and left.role == right.role and left.modality == right.modality and left.stability == right.stability and hit.memory.lifecycle == present.memory.lifecycle and (left.visibility == .team or eql(u8, hit.memory.owner, present.memory.owner))) {
+                if (try self.sameCanonicalGroup(left, right) and try self.sameCanonicalValue(left, right) and left.kind == right.kind and left.role == right.role and left.modality == right.modality and left.stability == right.stability and hit.memory.lifecycle == present.memory.lifecycle and (left.visibility == .team or eql(u8, hit.memory.owner, present.memory.owner))) {
                     duplicate = true;
                     break;
                 }
@@ -1284,6 +1399,21 @@ const Run = struct {
         return self.encode(.{ .items = values.items, .next_cursor = try self.encodeCursor("entity/", page.next), .complete = page.next == null });
     }
 };
+
+fn explicitDisposition(record: t.StoredAssertion) t.ExplicitDisposition {
+    return .{ .lifecycle = record.lifecycle, .valid_to = record.assertion.valid_to, .superseded_by = record.superseded_by, .recorded_to = record.recorded_to, .conflicts_with = record.conflicts_with, .reason = record.reason };
+}
+
+fn matchesTime(request: t.Recall, record: t.StoredAssertion, now: i64) bool {
+    if (record.stale) return false;
+    if (!request.include_history and request.valid_at == null and (record.lifecycle == .superseded or record.lifecycle == .retracted)) return false;
+    if (request.valid_at orelse if (!request.include_history) now else null) |time| {
+        if (record.lifecycle == .retracted) return false;
+        if (record.assertion.valid_from) |start| if (start > time) return false;
+        if (record.assertion.valid_to) |end| if (end <= time) return false;
+    }
+    return true;
+}
 
 fn relationValues(claim: t.Assertion, relation: t.Relationship) []const []const u8 {
     return switch (relation) {

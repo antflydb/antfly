@@ -65,7 +65,9 @@ const std = @import("std");
 /// their durable dependency index and applies bounded replay pages.
 /// Version 35 rejects incompatible resolver projection at admission and apply,
 /// and fences every namespace mutation against its validated consumer cut.
-pub const current_version: u16 = 35;
+pub const current_version: u16 = 36;
+/// All ingress and metadata peers must preserve native service ownership.
+pub const native_service_tables_version: u16 = 36;
 pub const resolver_namespaces_version: u16 = 35;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.

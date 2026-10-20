@@ -14191,6 +14191,7 @@ pub const RaftApplyStore = struct {
             if (table.table_id != owner.table_id) return error.InvalidCatalogRecord;
             var binding = try system_catalog_storage.getById(alloc, &txn, group_id, .table, owner.table_id);
             defer if (binding) |*value| value.deinit();
+            if (binding) |value| table.native_service = value.value.native_service;
             const logical_name = if (binding) |value| blk: {
                 if (value.value.parent_id != namespace_id or !std.mem.eql(u8, value.value.storage_name, table.name)) return error.InvalidCatalogRecord;
                 break :blk value.value.name;
@@ -14270,6 +14271,7 @@ pub const RaftApplyStore = struct {
                     errdefer table.deinit(alloc);
                     var binding = try system_catalog_storage.getById(alloc, txn, group_id, .table, table.table_id);
                     defer if (binding) |*value| value.deinit();
+                    if (binding) |value| table.native_service = value.value.native_service;
                     const logical_name = if (binding) |value| value.value.name else table.name;
                     slot.* = .{ .owner = claim.owner, .table = table, .logical_table = try alloc.dupe(u8, logical_name) };
                 }
@@ -14337,7 +14339,13 @@ pub const RaftApplyStore = struct {
         const bytes = try txn.get(try tableKeyForGroup(&key_buf, group_id, identity.table_id));
         const projection = try decodeTableQueryProjection(alloc, bytes, true);
         defer alloc.free(projection.name);
-        return projection.query_definition;
+        var definition = projection.query_definition;
+        if (definition) |*value| {
+            var binding = try system_catalog_storage.getById(alloc, txn, group_id, .table, identity.table_id);
+            defer if (binding) |*owned| owned.deinit();
+            if (binding) |owned| value.native_service = owned.value.native_service;
+        }
+        return definition;
     }
 
     fn resolveSystemCatalogNamespaceTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, database_name: []const u8, namespace_name: []const u8) !?u64 {
@@ -14360,7 +14368,8 @@ pub const RaftApplyStore = struct {
                 error.NotFound => return error.InvalidCatalogRecord,
                 else => return err,
             };
-            const table: Result = if (Result == metadata.TableRecord) try decodeTableRecord(alloc, bytes) else try decodeTableIdentity(alloc, bytes);
+            var table: Result = if (Result == metadata.TableRecord) try decodeTableRecord(alloc, bytes) else try decodeTableIdentity(alloc, bytes);
+            if (Result == system_catalog.ResolvedTable) table.native_service = binding.value.native_service;
             if (table.table_id != binding.value.id or !std.mem.eql(u8, table.name, binding.value.storage_name)) {
                 if (Result == metadata.TableRecord) metadata_table_manager.freeTable(alloc, table) else table.deinit(alloc);
                 return error.InvalidCatalogRecord;
@@ -39442,4 +39451,31 @@ test "resolver curation namespace propagation rejects source edits racing adopti
     try std.testing.expect(identities.identities[0].namespace_owned);
     try std.testing.expectEqualStrings("concept/c", identities.identities[0].merges[0].target);
     try std.testing.expectEqualStrings(ordinary.schema_json, current.schema_json);
+}
+
+test "system catalog native memory ownership survives raft replay and reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/memory-ownership", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        const table: metadata.TableRecord = .{ .table_id = 42, .name = "table:42", .min_ranges = 1 };
+        const ranges = [_]metadata.RangeRecord{.{ .table_id = 42, .group_id = 301, .range_id = 301, .start_key = "" }};
+        try applySystemCatalogTestCommand(&store, 1, .{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .table, .name = "memory_team", .native_service = .memory, .table_id = 42, .storage_name = "table:42" }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &ranges } } });
+    }
+    var reopened = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer reopened.deinit();
+    const identity = (try reopened.resolveSystemCatalogIdentity(a, 21, .{ .table = "memory_team" })).?;
+    defer identity.deinit(a);
+    try std.testing.expectEqual(system_catalog.ServiceOwner.memory, identity.native_service.?);
+    const batch = try reopened.resolveSystemCatalogIdentities(a, 21, .{ .targets = &.{.{ .table = "memory_team" }}, .include_query_definitions = true });
+    defer batch.deinit(a);
+    try std.testing.expectEqual(system_catalog.ServiceOwner.memory, batch.tables[0].?.native_service.?);
+    try std.testing.expectEqual(system_catalog.ServiceOwner.memory, batch.tables[0].?.query_definition.?.native_service.?);
+    const definition = (try reopened.queryTableDefinition(a, 21, "table:42")).?;
+    defer definition.deinit(a);
+    try std.testing.expectEqual(system_catalog.ServiceOwner.memory, definition.native_service.?);
 }

@@ -10,6 +10,9 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.memory_recall_result_items_item_memory_assertion import MemoryRecallResultItemsItemMemoryAssertion
+    from ..models.memory_recall_result_items_item_memory_explicit_disposition_type_0 import (
+        MemoryRecallResultItemsItemMemoryExplicitDispositionType0,
+    )
 
 
 T = TypeVar("T", bound="MemoryRecallResultItemsItemMemory")
@@ -26,6 +29,7 @@ class MemoryRecallResultItemsItemMemory:
         config_generation (int):
         input_hash (str | Unset):
         asserted_valid_to (int | None | Unset):
+        explicit_disposition (MemoryRecallResultItemsItemMemoryExplicitDispositionType0 | None | Unset):
         recorded_at (int | Unset):
         lifecycle (MemoryRecallResultItemsItemMemoryLifecycle | Unset):
         stale (bool | Unset):
@@ -45,6 +49,7 @@ class MemoryRecallResultItemsItemMemory:
     config_generation: int
     input_hash: str | Unset = UNSET
     asserted_valid_to: int | None | Unset = UNSET
+    explicit_disposition: MemoryRecallResultItemsItemMemoryExplicitDispositionType0 | None | Unset = UNSET
     recorded_at: int | Unset = UNSET
     lifecycle: MemoryRecallResultItemsItemMemoryLifecycle | Unset = UNSET
     stale: bool | Unset = UNSET
@@ -57,6 +62,10 @@ class MemoryRecallResultItemsItemMemory:
     next_embedding: list[float] | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.memory_recall_result_items_item_memory_explicit_disposition_type_0 import (
+            MemoryRecallResultItemsItemMemoryExplicitDispositionType0,
+        )
+
         assertion = self.assertion.to_dict()
 
         owner = self.owner
@@ -74,6 +83,14 @@ class MemoryRecallResultItemsItemMemory:
             asserted_valid_to = UNSET
         else:
             asserted_valid_to = self.asserted_valid_to
+
+        explicit_disposition: dict[str, Any] | None | Unset
+        if isinstance(self.explicit_disposition, Unset):
+            explicit_disposition = UNSET
+        elif isinstance(self.explicit_disposition, MemoryRecallResultItemsItemMemoryExplicitDispositionType0):
+            explicit_disposition = self.explicit_disposition.to_dict()
+        else:
+            explicit_disposition = self.explicit_disposition
 
         recorded_at = self.recorded_at
 
@@ -137,6 +154,8 @@ class MemoryRecallResultItemsItemMemory:
             field_dict["input_hash"] = input_hash
         if asserted_valid_to is not UNSET:
             field_dict["asserted_valid_to"] = asserted_valid_to
+        if explicit_disposition is not UNSET:
+            field_dict["explicit_disposition"] = explicit_disposition
         if recorded_at is not UNSET:
             field_dict["recorded_at"] = recorded_at
         if lifecycle is not UNSET:
@@ -163,6 +182,9 @@ class MemoryRecallResultItemsItemMemory:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.memory_recall_result_items_item_memory_assertion import MemoryRecallResultItemsItemMemoryAssertion
+        from ..models.memory_recall_result_items_item_memory_explicit_disposition_type_0 import (
+            MemoryRecallResultItemsItemMemoryExplicitDispositionType0,
+        )
 
         d = dict(src_dict)
         assertion = MemoryRecallResultItemsItemMemoryAssertion.from_dict(d.pop("assertion"))
@@ -185,6 +207,25 @@ class MemoryRecallResultItemsItemMemory:
             return cast(int | None | Unset, data)
 
         asserted_valid_to = _parse_asserted_valid_to(d.pop("asserted_valid_to", UNSET))
+
+        def _parse_explicit_disposition(
+            data: object,
+        ) -> MemoryRecallResultItemsItemMemoryExplicitDispositionType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                explicit_disposition_type_0 = MemoryRecallResultItemsItemMemoryExplicitDispositionType0.from_dict(data)
+
+                return explicit_disposition_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(MemoryRecallResultItemsItemMemoryExplicitDispositionType0 | None | Unset, data)
+
+        explicit_disposition = _parse_explicit_disposition(d.pop("explicit_disposition", UNSET))
 
         recorded_at = d.pop("recorded_at", UNSET)
 
@@ -262,6 +303,7 @@ class MemoryRecallResultItemsItemMemory:
             config_generation=config_generation,
             input_hash=input_hash,
             asserted_valid_to=asserted_valid_to,
+            explicit_disposition=explicit_disposition,
             recorded_at=recorded_at,
             lifecycle=lifecycle,
             stale=stale,

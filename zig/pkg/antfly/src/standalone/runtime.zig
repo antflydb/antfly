@@ -2315,7 +2315,7 @@ const LocalStandaloneMetadata = struct {
                 defer cut.deinit();
                 for (cut.claims) |claim| if (std.mem.eql(u8, claim.key.name, target.name)) {
                     if (slot.* != null) return error.InvalidCatalogRecord;
-                    slot.* = .{ .table = system_catalog.ResolvedTable.fromTable(table.*), .logical_table = logical_name, .owner = claim.owner };
+                    slot.* = .{ .table = self.ownedTableIdentity(table.*), .logical_table = logical_name, .owner = claim.owner };
                 };
             }
         }
@@ -2457,6 +2457,13 @@ const LocalStandaloneMetadata = struct {
         return .{ .arena = arena, .value = .{ .revision = self.systemCatalogState().revision, .entries = page.entries, .legacy_membership = membership, .next_after = page.next, .next_table_id = if (page.next != null) page.entries[page.entries.len - 1].table.table_id else null, .ranges = ranges.items, .stores = stores, .placement_intents = intents.items } };
     }
 
+    fn ownedTableIdentity(self: *LocalStandaloneMetadata, table: anytype) system_catalog.ResolvedTable {
+        var identity = system_catalog.ResolvedTable.fromTable(table);
+        if (self.system_catalog_state) |state| if (state.index.byId(.table, table.table_id)) |binding| {
+            identity.native_service = binding.native_service;
+        };
+        return identity;
+    }
     fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         // Cancellation callbacks may consult this same catalog (restore checks
         // its leadership term). Invoke them only outside the metadata mutex.
@@ -2556,6 +2563,12 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
+        if (call == .native_memory_create) {
+            if (!context.setting_admin or context.native_service != .memory) return error.Forbidden;
+            var request = call.native_memory_create;
+            request.mutation.native_service = .memory;
+            return systemCatalogAdmitted(ptr, alloc, context, .{ .mutate = request });
+        }
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, context);
@@ -2924,13 +2937,17 @@ const LocalStandaloneMetadata = struct {
             },
             .query_definition => |name| {
                 const table = self.manager.findTableByName(name);
-                const definition: ?system_catalog.QueryDefinition = if (table) |value| system_catalog.QueryDefinition.fromTable(value) else null;
+                const definition: ?system_catalog.QueryDefinition = if (table) |value| blk: {
+                    var projected = system_catalog.QueryDefinition.fromTable(value);
+                    projected.native_service = self.ownedTableIdentity(value).native_service;
+                    break :blk projected;
+                } else null;
                 return std.json.Stringify.valueAlloc(alloc, definition, .{});
             },
             .snapshot => return std.json.Stringify.valueAlloc(alloc, self.systemCatalogState(), .{}),
             .resolve => |target| {
                 const table = try self.resolveSystemCatalogLocked(target);
-                const identity: ?system_catalog.ResolvedTable = if (table) |value| system_catalog.ResolvedTable.fromTable(value) else null;
+                const identity: ?system_catalog.ResolvedTable = if (table) |value| self.ownedTableIdentity(value) else null;
                 return std.json.Stringify.valueAlloc(alloc, identity, .{});
             },
             .resolve_many => |request| {
@@ -2949,8 +2966,12 @@ const LocalStandaloneMetadata = struct {
                 defer alloc.free(tables);
                 for (request.targets, tables) |target, *table| {
                     table.* = if (try self.resolveSystemCatalogLocked(target)) |value| blk: {
-                        var identity = system_catalog.ResolvedTable.fromTable(value);
-                        if (request.include_query_definitions) identity.query_definition = system_catalog.QueryDefinition.fromTable(value);
+                        var identity = self.ownedTableIdentity(value);
+                        if (request.include_query_definitions) {
+                            var definition = system_catalog.QueryDefinition.fromTable(value);
+                            definition.native_service = identity.native_service;
+                            identity.query_definition = definition;
+                        }
                         break :blk identity;
                     } else null;
                 }
@@ -2975,7 +2996,9 @@ const LocalStandaloneMetadata = struct {
                 return self.replaceRelationLocked(alloc, context, .{ .guard = request.guard, .expected = before, .replacement = after });
             },
             .relation_replace => |request| return self.replaceRelationLocked(alloc, context, request),
+            .native_memory_create => unreachable,
             .mutate => |request| {
+                if (request.mutation.native_service != null and request.mutation.native_service != context.native_service) return error.Forbidden;
                 if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
                 var arena = std.heap.ArenaAllocator.init(alloc);
                 defer arena.deinit();
@@ -15234,4 +15257,41 @@ test "system catalog standalone relation coordinator startup surfaces terminal s
     const work = try store.relationReconciliationWork(group_ids.main_metadata_group_id);
     try std.testing.expect(work.published_epoch == null);
     try std.testing.expectEqual(.name_conflict, work.current.?.failure);
+}
+
+test "system catalog native memory ownership provisions privately and survives standalone restart" {
+    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/memory-catalog.json", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer backend.deinit();
+    const create: @import("../system_catalog/server_call.zig").Call = .{ .native_memory_create = .{ .mutation = .{ .action = .create, .kind = .table, .name = "memory_team" }, .physical_name = "table:memory-test", .create_table_json = "{\"num_shards\":1}" } };
+    {
+        var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        const source = metadata.statusSource();
+        try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, create));
+        const created = try source.systemCatalog(a, .{ .setting_admin = true, .native_service = .memory }, create);
+        a.free(created);
+        try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve = .{ .table = "memory_team" } }));
+        try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .query_definition = "table:memory-test" }));
+    }
+    var reopened = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer reopened.deinit();
+    const source = reopened.statusSource();
+    const resolved = try source.systemCatalog(a, .{ .native_service = .memory }, .{ .resolve = .{ .table = "memory_team" } });
+    defer a.free(resolved);
+    var parsed = try std.json.parseFromSlice(system_catalog.ResolvedTable, a, resolved, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(system_catalog.ServiceOwner.memory, parsed.value.native_service.?);
+    const batch = try source.systemCatalog(a, .{ .native_service = .memory }, .{ .resolve_many = .{ .targets = &.{.{ .table = "memory_team" }}, .include_query_definitions = true } });
+    defer a.free(batch);
+    var definitions = try std.json.parseFromSlice(system_catalog.ResolvedMany, a, batch, .{});
+    defer definitions.deinit();
+    try std.testing.expectEqual(system_catalog.ServiceOwner.memory, definitions.value.tables[0].?.query_definition.?.native_service.?);
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve_many = .{ .targets = &.{.{ .table = "memory_team" }}, .include_query_definitions = true } }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .table, .name = "memory_team", .new_name = "public_copy" } } }));
 }

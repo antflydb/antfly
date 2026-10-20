@@ -461,3 +461,192 @@ test "memory publication authorization revocation prevents commits and receipt r
     try std.testing.expectError(error.Forbidden, denied.execute(std.testing.allocator, .assertions, "", helm, "claim"));
     try std.testing.expectError(error.Forbidden, denied.execute(std.testing.allocator, .get, "helm", "{}", ""));
 }
+
+test "memory regression: forget all immediately removes entity lookup" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"source_id\":\"runbook\",\"source_version\":\"v1\",\"text\":\"Production uses Helm\"}],\"entities\":[{\"id\":\"secret\",\"name\":\"Private secret name\",\"evidence\":[{\"id\":\"e1\"}]}]}", "entity", 3);
+    try discard(&store, .forget, "", "{\"all\":true}", "forget", 4);
+    try std.testing.expectError(error.MemoryNotFound, store.run(.resolve_entity, "secret", "{}", "", 5));
+}
+
+test "memory regression: structural historical enumeration agrees with recall" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    try discard(&store, .assertions, "", terraform, "terraform", 3);
+    try discard(&store, .assertions, "", helm, "helm", 4);
+    const a = store.arena.allocator();
+    const recalled = try store.service("alice", true, 500).execute(a, .recall, "", "{\"valid_at\":200,\"token_budget\":8192}", "");
+    const listed = try store.service("alice", true, 500).execute(a, .list, "", "{\"valid_at\":200}", "");
+    try std.testing.expect(std.mem.indexOf(u8, recalled, "Production uses Helm") != null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, listed, .{});
+    try std.testing.expectEqual(@as(usize, 1), parsed.object.get("items").?.array.items.len);
+}
+
+test "memory regression: canonical merge preserves single-valued reconciliation" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"source_id\":\"runbook\",\"source_version\":\"v1\",\"text\":\"Production uses Helm\"}],\"entities\":[{\"id\":\"left\",\"name\":\"Production\",\"evidence\":[{\"id\":\"e1\"}]},{\"id\":\"right\",\"name\":\"Production\",\"evidence\":[{\"id\":\"e1\"}]}]}", "entities", 3);
+    const a = store.arena.allocator();
+    const first = try std.mem.replaceOwned(u8, a, helm, "production", "left");
+    const second = try std.mem.replaceOwned(u8, a, terraform, "production", "right");
+    _ = try store.service("alice", true, 4).execute(a, .assertions, "", first, "helm");
+    _ = try store.service("alice", true, 5).execute(a, .assertions, "", second, "terraform");
+    try discard(&store, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"left\",\"to\":\"right\",\"expected_revision\":6}", "merge", 6);
+    const result = try store.service("alice", true, 500).execute(a, .recall, "", "{\"subject\":\"right\",\"token_budget\":8192}", "");
+
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, result, .{});
+    try std.testing.expectEqual(@as(usize, 1), parsed.object.get("items").?.array.items.len);
+}
+
+fn reviewEmbed(ptr: *anyopaque, a: A, _: m.types.Model, _: []const u8) ![]const f32 {
+    const store: *Store = @ptrCast(@alignCast(ptr));
+    if (store.failures > 0) {
+        store.failures -= 1;
+        return error.TransientInferenceFailure;
+    }
+    return a.dupe(f32, &.{ 1, 0 });
+}
+fn reviewService(store: *Store, now: i64) m.Service {
+    var service = modelService(store, now);
+    service.backend.embed = reviewEmbed;
+    return service;
+}
+
+test "memory regression: failed reindex generation cannot label old vectors as a different model" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    const a = store.arena.allocator();
+    var claims: std.ArrayList(m.types.Assertion) = .empty;
+    for (0..10) |i| try claims.append(a, .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = "s", .predicate = "p", .value = "v", .statement = "Document unrelated to query", .evidence = &.{.{ .id = "e1" }} });
+    _ = try reviewService(&store, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims.items }, .{}), "claims");
+    const config_b: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } };
+    const configured_b = try reviewService(&store, 4).execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = 4, .config = config_b }, .{}), "config-b");
+    const op_b = try std.json.parseFromSliceLeaky(m.types.Operation, a, configured_b, .{});
+    _ = try reviewService(&store, 5).execute(a, .advance, op_b.id, "{}", "b-page1");
+    store.failures = 3;
+    for (0..3) |i| _ = try reviewService(&store, @intCast(10000 + i * 10000)).execute(a, .advance, op_b.id, "{}", try std.fmt.allocPrint(a, "b-fail-{d}", .{i}));
+    const external_c: m.types.Model = .{ .provider = "external", .model = "different-C", .revision = "C", .dimensions = 2 };
+    const config_c: m.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = external_c } };
+    const configured_c = try reviewService(&store, 40000).execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = 9, .config = config_c }, .{}), "config-c");
+    const op_c = try std.json.parseFromSliceLeaky(m.types.Operation, a, configured_c, .{});
+    try std.testing.expect(op_c.config_generation > op_b.config_generation);
+    const snapshot = try reviewService(&store, 40001).execute(a, .configuration, try std.fmt.allocPrint(a, "{d}", .{op_b.config_generation}), "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "fake") != null);
+    const missing = try reviewService(&store, 40001).execute(a, .advance, op_c.id, "{}", "c-not-staged");
+    try std.testing.expect(std.mem.indexOf(u8, missing, "MemoryExternalVectorRequired") != null);
+    var staged: std.ArrayList(std.meta.Elem(@FieldType(m.types.EmbeddingBatch, "items"))) = .empty;
+    var it = store.values.iterator();
+    while (it.next()) |entry| {
+        if (!std.mem.startsWith(u8, entry.key_ptr.*, "assertion/")) continue;
+        const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, entry.value_ptr.*, .{});
+        if (record.next_embedding_generation != op_c.config_generation) try staged.append(a, .{ .id = record.assertion.id, .embedding = &.{ 0, 1 } });
+    }
+    try std.testing.expectEqual(@as(usize, 10), staged.items.len);
+    const batch: m.types.EmbeddingBatch = .{ .generation = op_c.config_generation, .model = external_c, .items = staged.items };
+    _ = try reviewService(&store, 40001).execute(a, .stage_embeddings, "", try std.json.Stringify.valueAlloc(a, batch, .{}), "stage-c-only-missing");
+    _ = try reviewService(&store, 50000).execute(a, .advance, op_c.id, "{}", "c-page1");
+    _ = try reviewService(&store, 50001).execute(a, .advance, op_c.id, "{}", "c-page2");
+    const recall_body = try std.json.Stringify.valueAlloc(a, .{ .query = "zzzz", .embedding = &[_]f32{ 1, 0 }, .embedding_model = external_c, .token_budget = 8192 }, .{});
+    const result = try reviewService(&store, 50002).execute(a, .recall, "", recall_body, "");
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, result, .{});
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.object.get("items").?.array.items.len);
+}
+
+test "memory identity unmerge restores separate groups without erasing explicit corrections" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    const a = store.arena.allocator();
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"source_id\":\"runbook\",\"source_version\":\"v1\",\"text\":\"Production uses Helm\"}],\"entities\":[{\"id\":\"left\",\"name\":\"Production\",\"evidence\":[{\"id\":\"e1\"}]},{\"id\":\"right\",\"name\":\"Production\",\"evidence\":[{\"id\":\"e1\"}]}]}", "entities", 3);
+    _ = try store.service("alice", true, 4).execute(a, .assertions, "", try std.mem.replaceOwned(u8, a, helm, "production", "left"), "helm");
+    _ = try store.service("alice", true, 5).execute(a, .assertions, "", try std.mem.replaceOwned(u8, a, terraform, "production", "right"), "terraform");
+    try discard(&store, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"left\",\"to\":\"right\",\"expected_revision\":6}", "merge", 6);
+    try discard(&store, .curate_entity, "", "{\"action\":\"unmerge\",\"from\":\"left\",\"expected_revision\":7}", "unmerge", 7);
+    const restored = try store.service("alice", true, 500).execute(a, .recall, "", "{\"subject\":\"left\",\"token_budget\":8192}", "");
+    try std.testing.expect(std.mem.indexOf(u8, restored, "Production uses Helm") != null);
+    try discard(&store, .correct, "", "{\"id\":\"helm\",\"expected_revision\":8,\"lifecycle\":\"retracted\",\"reason\":\"Explicit correction\"}", "retract", 8);
+    try discard(&store, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"left\",\"to\":\"right\",\"expected_revision\":9}", "merge-again", 9);
+    try discard(&store, .curate_entity, "", "{\"action\":\"unmerge\",\"from\":\"left\",\"expected_revision\":10}", "unmerge-again", 10);
+    const hidden = try store.service("alice", true, 500).execute(a, .recall, "", "{\"subject\":\"left\",\"token_budget\":8192}", "");
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "Production uses Helm") == null);
+}
+
+test "memory alias writes reconcile with canonical facts and suppression is reversible" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    const a = store.arena.allocator();
+    try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"e1\",\"source_id\":\"runbook\",\"source_version\":\"v1\",\"text\":\"Production uses Helm\"}],\"entities\":[{\"id\":\"left\",\"name\":\"Production\",\"evidence\":[{\"id\":\"e1\"}]},{\"id\":\"right\",\"name\":\"Production\",\"evidence\":[{\"id\":\"e1\"}]}]}", "entities", 3);
+    try discard(&store, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"left\",\"to\":\"right\",\"expected_revision\":4}", "merge", 4);
+    _ = try store.service("alice", true, 5).execute(a, .assertions, "", try std.mem.replaceOwned(u8, a, helm, "production", "right"), "helm");
+    _ = try store.service("alice", true, 6).execute(a, .assertions, "", try std.mem.replaceOwned(u8, a, terraform, "production", "left"), "terraform");
+    const recalled = try store.service("alice", true, 500).execute(a, .recall, "", "{\"subject\":\"right\",\"token_budget\":8192}", "");
+    try std.testing.expect(std.mem.indexOf(u8, recalled, "Production uses Terraform") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recalled, "Production uses Helm") == null);
+    try discard(&store, .curate_entity, "", "{\"action\":\"suppress\",\"from\":\"right\",\"expected_revision\":7}", "suppress", 7);
+    const hidden = try store.service("alice", true, 500).execute(a, .recall, "", "{\"token_budget\":8192}", "");
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "Production uses Terraform") == null);
+    try discard(&store, .curate_entity, "", "{\"action\":\"unsuppress\",\"from\":\"right\",\"expected_revision\":8}", "unsuppress", 8);
+    const restored = try store.service("alice", true, 500).execute(a, .recall, "", "{\"subject\":\"right\",\"token_budget\":8192}", "");
+    try std.testing.expect(std.mem.indexOf(u8, restored, "Production uses Terraform") != null);
+}
+
+test "memory identity curation work limit rejects the entire redirect transaction" {
+    var store = Store.init();
+    defer store.deinit();
+    try setup(&store);
+    const a = store.arena.allocator();
+    const entities = [_]m.types.Entity{
+        .{ .id = "left", .name = "Left", .evidence = &.{.{ .id = "e1" }} },
+        .{ .id = "right", .name = "Right", .evidence = &.{.{ .id = "e1" }} },
+    };
+    _ = try store.service("alice", true, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &[_]m.types.Evidence{.{ .id = "e1", .source_id = "runbook", .source_version = "v1", .text = "Production uses Helm" }}, .entities = entities }, .{}), "entities");
+    var claims: std.ArrayList(m.types.Assertion) = .empty;
+    for (0..m.types.max_items) |i| try claims.append(a, .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = "left", .predicate = "mentions", .value = "v", .statement = "Grounded fact", .evidence = &.{.{ .id = "e1" }} });
+    for (0..2) |page| _ = try store.service("alice", true, @intCast(4 + page)).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims.items[page * 128 .. (page + 1) * 128] }, .{}), try std.fmt.allocPrint(a, "claims-{d}", .{page}));
+    const last = [_]m.types.Assertion{.{ .id = "last", .subject = "right", .predicate = "mentions", .value = "v", .statement = "Grounded fact", .evidence = &.{.{ .id = "e1" }} }};
+    _ = try store.service("alice", true, 5).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = last }, .{}), "last");
+    const revision = store.revision;
+    try std.testing.expectError(error.MemoryWorkLimit, store.run(.curate_entity, "", "{\"action\":\"merge\",\"from\":\"left\",\"to\":\"right\",\"expected_revision\":7}", "oversized-merge", 6));
+    try std.testing.expectEqual(revision, store.revision);
+    const resolved = try store.service("alice", true, 7).execute(a, .resolve_entity, "left", "{}", "");
+    const identity = try std.json.parseFromSliceLeaky(std.json.Value, a, resolved, .{});
+    try std.testing.expectEqualStrings("left", identity.object.get("canonical_id").?.string);
+    const retained = try store.service("alice", true, 7).execute(a, .get, "last", "{}", "");
+    const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, retained, .{});
+    try std.testing.expectEqual(m.types.Lifecycle.active, record.lifecycle);
+}
+
+test "memory typed object identity merge resolves disputes and unmerge restores them" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const config: m.types.Config = .{ .features = .{ .reconciliation = .deterministic }, .predicates = &.{.{ .name = "deploys_with", .cardinality = .one, .object_type = "tool" }} };
+    _ = try store.service("alice", true, 1).execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try store.service("alice", true, 2).execute(a, .observe, "", source, "source");
+    const entities = [_]m.types.Entity{
+        .{ .id = "Helm", .name = "Helm", .type = "tool", .evidence = &.{.{ .id = "e1" }} },
+        .{ .id = "Terraform", .name = "Terraform", .type = "tool", .evidence = &.{.{ .id = "e1" }} },
+    };
+    _ = try store.service("alice", true, 3).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &[_]m.types.Evidence{.{ .id = "e1", .source_id = "runbook", .source_version = "v1", .text = "Production uses Helm" }}, .entities = entities }, .{}), "entities");
+    const claims = [_]m.types.Assertion{
+        .{ .id = "a", .subject = "production", .predicate = "deploys_with", .value = "Helm", .statement = "Production uses Helm", .evidence = &.{.{ .id = "e1" }} },
+        .{ .id = "b", .subject = "production", .predicate = "deploys_with", .value = "Terraform", .statement = "Production uses Terraform", .evidence = &.{.{ .id = "e1" }} },
+    };
+    _ = try store.service("alice", true, 4).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "claims");
+    const disputed = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 5).execute(a, .get, "a", "{}", ""), .{});
+    try std.testing.expectEqual(m.types.Lifecycle.disputed, disputed.lifecycle);
+    try discard(&store, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"Helm\",\"to\":\"Terraform\",\"expected_revision\":5}", "merge", 5);
+    const unified = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 6).execute(a, .get, "a", "{}", ""), .{});
+    try std.testing.expectEqual(m.types.Lifecycle.active, unified.lifecycle);
+    try std.testing.expectEqualStrings("Helm", unified.assertion.value);
+    try discard(&store, .curate_entity, "", "{\"action\":\"unmerge\",\"from\":\"Helm\",\"expected_revision\":6}", "unmerge", 6);
+    const separated = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 7).execute(a, .get, "a", "{}", ""), .{});
+    try std.testing.expectEqual(m.types.Lifecycle.disputed, separated.lifecycle);
+}

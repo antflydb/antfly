@@ -32734,6 +32734,7 @@ pub const MemoryRecord = struct {
     assertion: std.json.Value,
     input_hash: ?[]const u8 = null,
     asserted_valid_to: OpenApiOptionalNullable(i64) = .absent,
+    explicit_disposition: OpenApiOptionalNullable(std.json.Value) = .absent,
     owner: []const u8,
     recorded_from: i64,
     recorded_at: ?i64 = null,
@@ -32754,6 +32755,7 @@ pub const MemoryRecord = struct {
         .{ "assertion", "assertion", false },
         .{ "input_hash", "input_hash", true },
         .{ "asserted_valid_to", "asserted_valid_to", false },
+        .{ "explicit_disposition", "explicit_disposition", false },
         .{ "owner", "owner", false },
         .{ "recorded_from", "recorded_from", false },
         .{ "recorded_at", "recorded_at", true },
@@ -32794,6 +32796,17 @@ pub const MemoryRecord = struct {
             },
             .value => |value| {
                 try jw.objectField("asserted_valid_to");
+                try jw.write(value);
+            },
+        }
+        switch (self.explicit_disposition) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("explicit_disposition");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("explicit_disposition");
                 try jw.write(value);
             },
         }

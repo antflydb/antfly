@@ -3127,6 +3127,41 @@ components:
         asserted_valid_to:
           type: integer
           nullable: true
+        explicit_disposition:
+          type: object
+          properties:
+            lifecycle:
+              type: string
+              enum:
+              - active
+              - disputed
+              - superseded
+              - retracted
+            valid_to:
+              type: integer
+              nullable: true
+            superseded_by:
+              type: string
+              nullable: true
+            recorded_to:
+              type: integer
+              nullable: true
+            conflicts_with:
+              type: array
+              items:
+                type: string
+            reason:
+              type: string
+              nullable: true
+          required:
+          - lifecycle
+          - valid_to
+          - superseded_by
+          - recorded_to
+          - conflicts_with
+          - reason
+          additionalProperties: false
+          nullable: true
         owner:
           type: string
         recorded_from:
@@ -3493,6 +3528,41 @@ components:
                   asserted_valid_to:
                     type: integer
                     nullable: true
+                  explicit_disposition:
+                    type: object
+                    properties:
+                      lifecycle:
+                        type: string
+                        enum:
+                        - active
+                        - disputed
+                        - superseded
+                        - retracted
+                      valid_to:
+                        type: integer
+                        nullable: true
+                      superseded_by:
+                        type: string
+                        nullable: true
+                      recorded_to:
+                        type: integer
+                        nullable: true
+                      conflicts_with:
+                        type: array
+                        items:
+                          type: string
+                      reason:
+                        type: string
+                        nullable: true
+                    required:
+                    - lifecycle
+                    - valid_to
+                    - superseded_by
+                    - recorded_to
+                    - conflicts_with
+                    - reason
+                    additionalProperties: false
+                    nullable: true
                   owner:
                     type: string
                   recorded_from:
@@ -3805,6 +3875,41 @@ components:
                 type: string
               asserted_valid_to:
                 type: integer
+                nullable: true
+              explicit_disposition:
+                type: object
+                properties:
+                  lifecycle:
+                    type: string
+                    enum:
+                    - active
+                    - disputed
+                    - superseded
+                    - retracted
+                  valid_to:
+                    type: integer
+                    nullable: true
+                  superseded_by:
+                    type: string
+                    nullable: true
+                  recorded_to:
+                    type: integer
+                    nullable: true
+                  conflicts_with:
+                    type: array
+                    items:
+                      type: string
+                  reason:
+                    type: string
+                    nullable: true
+                required:
+                - lifecycle
+                - valid_to
+                - superseded_by
+                - recorded_to
+                - conflicts_with
+                - reason
+                additionalProperties: false
                 nullable: true
               owner:
                 type: string

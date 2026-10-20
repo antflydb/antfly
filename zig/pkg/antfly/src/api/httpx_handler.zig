@@ -10483,6 +10483,30 @@ pub const SchemaUpdateStatusSource = struct {
         };
     }
 
+    pub fn memoryIface(self: *@This()) http_server_mod.StatusSource {
+        return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot, .system_catalog = memoryCatalog } };
+    }
+    fn memoryCatalog(ptr: *anyopaque, a: std.mem.Allocator, _: @import("antfly_local_sources").api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const owned: system_catalog.ResolvedTable = .{ .table_id = 7, .name = self.table_name, .native_service = .memory };
+        return switch (call) {
+            .resolve => |target| std.json.Stringify.valueAlloc(a, @as(?system_catalog.ResolvedTable, if (std.mem.eql(u8, target.table, self.table_name)) owned else null), .{}),
+            .resolve_many => |request| blk: {
+                const tables = try a.alloc(?system_catalog.ResolvedTable, request.targets.len);
+                defer a.free(tables);
+                for (request.targets, tables) |target, *slot| slot.* = if (std.mem.eql(u8, target.table, self.table_name)) owned else null;
+                const names = try a.alloc(?[]const u8, request.storage_names.len);
+                defer a.free(names);
+                for (request.storage_names, names) |name, *slot| slot.* = if (std.mem.eql(u8, name, self.table_name)) self.table_name else null;
+                break :blk std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 1, .tables = tables, .logical_names = names }, .{});
+            },
+            .query_definition => std.json.Stringify.valueAlloc(a, system_catalog.QueryDefinition{ .native_service = .memory, .table_id = 7, .schema_json = tables_api.default_schema_json, .read_schema_json = "", .indexes_json = tables_api.default_indexes_json }, .{}),
+            .write_validation => std.json.Stringify.valueAlloc(a, .{ .schema_json = tables_api.default_schema_json, .data_shapes = &[_]struct {}{} }, .{}),
+            .policy_publication_status => a.dupe(u8, "null"),
+            else => error.UnsupportedOperation,
+        };
+    }
+
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.owns_schema_json) alloc.free(self.schema_json.?);
     }
@@ -17737,7 +17761,7 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     var reads = table_reads.BoundTableReadSource.init("memory_team", 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("memory_team", &db);
     var status_source = SchemaUpdateStatusSource{ .table_name = "memory_team" };
-    var api = ApiHttpServer.init(a, .{}, status_source.iface(), reads.source(), writes.source());
+    var api = ApiHttpServer.init(a, .{}, status_source.memoryIface(), reads.source(), writes.source());
     defer api.deinit();
     var server: HttpxE2eServer = undefined;
     try server.init(a, &api);
@@ -17785,6 +17809,12 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     var denied = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, bob, .{});
     defer denied.deinit(a);
     try std.testing.expectEqual(@as(u16, 403), denied.status);
+    // Table grants never grant raw access to native service storage.
+    // This path used to bypass memory's private provenance checks entirely.
+    var raw_document = try api.executeMcpApplicationOperation(.{ .get_document = .{ .table_name = "memory_team", .key = "a1" } }, bob);
+    defer raw_document.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), raw_document.status);
+    try std.testing.expect(std.mem.indexOf(u8, raw_document.body, "Production uses Terraform") == null);
     var forget_arena = std.heap.ArenaAllocator.init(a);
     defer forget_arena.deinit();
     var forgotten = try api.executeMemoryService("team", .{ .action = .forget, .body = try std.json.parseFromSliceLeaky(std.json.Value, forget_arena.allocator(), "{\"evidence_ids\":[\"e1\"]}", .{}), .idempotency_key = "forget" }, null, .{});
@@ -17793,4 +17823,18 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     var hidden = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, null, .{});
     defer hidden.deinit(a);
     try std.testing.expectEqual(@as(u16, 404), hidden.status);
+}
+
+test "native memory catalog ownership denies generic and batched data admission" {
+    const a = std.testing.allocator;
+    var fixture: SchemaUpdateStatusSource = .{ .table_name = "memory_team" };
+    const source = fixture.memoryIface();
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve = .{ .table = "memory_team" } }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve_many = .{ .targets = &.{.{ .table = "memory_team" }} } }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .query_definition = "memory_team" }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .native_memory_create = .{ .mutation = .{ .action = .create, .kind = .table, .name = "memory_other" } } }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .table, .name = "memory_other", .native_service = .memory } } }));
+    const native = try source.systemCatalog(a, .{ .native_service = .memory }, .{ .resolve = .{ .table = "memory_team" } });
+    defer a.free(native);
+    try std.testing.expect(std.mem.indexOf(u8, native, "\"native_service\":\"memory\"") != null);
 }

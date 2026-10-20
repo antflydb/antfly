@@ -23011,6 +23011,15 @@ export interface components {
             };
             input_hash?: string;
             asserted_valid_to?: number | null;
+            explicit_disposition?: {
+                /** @enum {string} */
+                lifecycle: "active" | "disputed" | "superseded" | "retracted";
+                valid_to: number | null;
+                superseded_by: string | null;
+                recorded_to: number | null;
+                conflicts_with: string[];
+                reason: string | null;
+            } | null;
             owner: string;
             recorded_from: number;
             recorded_at?: number;
@@ -23125,6 +23134,15 @@ export interface components {
                     };
                     input_hash?: string;
                     asserted_valid_to?: number | null;
+                    explicit_disposition?: {
+                        /** @enum {string} */
+                        lifecycle: "active" | "disputed" | "superseded" | "retracted";
+                        valid_to: number | null;
+                        superseded_by: string | null;
+                        recorded_to: number | null;
+                        conflicts_with: string[];
+                        reason: string | null;
+                    } | null;
                     owner: string;
                     recorded_from: number;
                     recorded_at?: number;
@@ -23221,6 +23239,15 @@ export interface components {
                 };
                 input_hash?: string;
                 asserted_valid_to?: number | null;
+                explicit_disposition?: {
+                    /** @enum {string} */
+                    lifecycle: "active" | "disputed" | "superseded" | "retracted";
+                    valid_to: number | null;
+                    superseded_by: string | null;
+                    recorded_to: number | null;
+                    conflicts_with: string[];
+                    reason: string | null;
+                } | null;
                 owner: string;
                 recorded_from: number;
                 recorded_at?: number;

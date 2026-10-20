@@ -103,6 +103,9 @@ pub const Call = union(enum) {
     relation_replace: RelationReplacement,
     relation_schema_mutate: RelationSchemaMutation,
     query_definition: []const u8,
+    /// Private body-bound native service provisioning. Old metadata peers
+    /// reject this tag before any table or private source is published.
+    native_memory_create: Request,
     mutate: Request,
     // A distinct operation makes older peers reject unsupported point reads.
     table_status: TableStatusTarget,
@@ -112,7 +115,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace, .relation_schema_mutate => true,
+            .relation_replace, .relation_schema_mutate, .native_memory_create => true,
             .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };

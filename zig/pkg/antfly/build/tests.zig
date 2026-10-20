@@ -336,6 +336,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes", "standalone metadata" },
     });
+    const memory_metadata_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[8], .filters = &.{"native memory ownership"} });
+    const memory_metadata_step = b.step("memory-metadata-test", "Verify native service ownership through Raft and standalone restart");
+    memory_metadata_step.dependOn(&b.addRunArtifact(memory_metadata_tests).step);
     const system_catalog_store_step = b.step("antfly-system-catalog-store-test", "Run catalog report persistence, snapshot, drain, and migration regressions");
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
     const lake_catalog_step = b.step("antfly-lake-index-catalog-test", "Run durable native lake index generation framing and decoder admission contracts");
@@ -4875,6 +4878,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = system_catalog_standalone_test_mod,
         .filters = &.{"system catalog"},
     });
+    const memory_standalone_tests = b.addTest(.{ .root_module = system_catalog_standalone_test_mod, .filters = &.{"native memory ownership"} });
+    memory_metadata_step.dependOn(&b.addRunArtifact(memory_standalone_tests).step);
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
     const standalone_ddl_tests = b.addTest(.{

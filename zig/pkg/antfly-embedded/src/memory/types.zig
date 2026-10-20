@@ -209,10 +209,21 @@ pub const State = struct {
     created_at: i64,
 };
 pub const StoredEvidence = struct { context_only: bool = false, evidence: Evidence, owner: []const u8, recorded_at: i64, revision: u64, forgotten: bool = false };
+/// Explicit human/producer decisions are the baseline for identity-policy
+/// projection. Rebuilding canonical groups never erases these decisions.
+pub const ExplicitDisposition = struct {
+    lifecycle: Lifecycle,
+    valid_to: ?i64,
+    superseded_by: ?[]const u8,
+    recorded_to: ?i64,
+    conflicts_with: []const []const u8,
+    reason: ?[]const u8,
+};
 pub const StoredAssertion = struct {
     assertion: Assertion,
     input_hash: []const u8 = "",
     asserted_valid_to: ?i64 = null,
+    explicit_disposition: ?ExplicitDisposition = null,
     owner: []const u8,
     recorded_from: i64,
     recorded_at: i64 = 0,

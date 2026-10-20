@@ -2081,7 +2081,42 @@ pub const StatusSource = struct {
         return try BoundaryAbi.call("acquire_join_planning", self.boundary_dispatch, capture, .{ self.ptr, budget });
     }
 
+    /// The shared public data-admission boundary. Ownership is captured with
+    /// catalog identity, so every HTTP/MCP/SQL resolver gets the same decision.
     pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        switch (input) {
+            .native_memory_create => |request| {
+                if (context.native_service != .memory or !context.setting_admin or request.mutation.kind != .table or request.mutation.action != .create) return error.Forbidden;
+            },
+            .mutate => |request| {
+                if (request.mutation.native_service != null) return error.Forbidden;
+            },
+            else => {},
+        }
+        const bytes = try self.rawSystemCatalog(alloc, context, input);
+        errdefer alloc.free(bytes);
+        switch (input) {
+            .query_definition => {
+                var parsed = try std.json.parseFromSlice(?system_catalog.QueryDefinition, alloc, bytes, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                if (parsed.value) |definition| try @import("antfly_local_sources").api_operation.requireNativeServiceAccess(definition.native_service, context.native_service);
+            },
+            .resolve => {
+                var parsed = try std.json.parseFromSlice(?system_catalog.ResolvedTable, alloc, bytes, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                if (parsed.value) |table| try table.requireAccess(context.native_service);
+            },
+            .resolve_many => {
+                var parsed = try std.json.parseFromSlice(system_catalog.ResolvedMany, alloc, bytes, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                for (parsed.value.tables) |table| if (table) |value| try value.requireAccess(context.native_service);
+                for (parsed.value.relations) |relation| if (relation) |value| try value.table.requireAccess(context.native_service);
+            },
+            else => {},
+        }
+        return bytes;
+    }
+    fn rawSystemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const callback = self.vtable.system_catalog orelse return error.UnsupportedOperation;
         return BoundaryAbi.call("system_catalog", self.boundary_dispatch, callback, .{ self.ptr, alloc, context, input }) catch |err| switch (err) {
             error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch => error.CatalogRoutingUnavailable,
@@ -21390,6 +21425,7 @@ pub const ApiHttpServer = struct {
         try module.memory.types.validateId(space);
         if (std.mem.indexOfAny(u8, space, "/.\\%") != null) return error.InvalidMemoryId;
         if (borrowed_identity == null and self.cfg.auth_enabled) return error.Unauthorized;
+        if (self.source.vtable.system_catalog == null) return error.MemoryCapabilityUnavailable;
         if (module.memory.mutates(input.action) and (input.idempotency_key.len == 0 or input.idempotency_key.len > 256)) return error.MemoryIdempotencyKeyRequired;
         const admitted = if (module.memory.mutates(input.action)) self.tryAcquireWrite() else self.tryAcquireQuery();
         if (!admitted) return error.MemoryOverloaded;
@@ -21402,6 +21438,7 @@ pub const ApiHttpServer = struct {
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*value| value.deinit(self.alloc);
         var request = borrowed_context;
+        request.native_service = .memory;
         request.row_policy_credential = &identity;
         request.principal = if (identity) |value| .{ .kind = .user, .subject = value.username } else null;
         const required: usermgr.PermissionType = if (input.action == .create or input.action == .configure) .admin else if (module.memory.mutates(input.action)) .write else .read;
@@ -21412,13 +21449,13 @@ pub const ApiHttpServer = struct {
             const physical = if (self.source.vtable.system_catalog != null) try self.catalogStorageNameAlloc(a) else logical;
             const create: tables_api.CreateTableRequest = .{ .num_shards = 1 };
             var created = true;
-            self.createNativeOrLegacyTable(logical, physical, create, identity) catch |err| switch (err) {
-                error.TableAlreadyExists, error.AlreadyExists, error.ObjectAlreadyExists => created = false,
+            self.createNativeMemoryTable(a, request, logical, physical, create) catch |err| switch (err) {
+                error.TableAlreadyExists, error.CatalogAlreadyExists, error.AlreadyExists, error.ObjectAlreadyExists => created = false,
                 else => return err,
             };
             if (created) _ = self.materializeCommittedTableCreate(a, physical, create);
         }
-        const table = try self.resolveCatalogKeyAlloc(a, .{}, logical, &identity, null);
+        const table = try self.resolveCatalogKeyAlloc(a, request, logical, &identity, null);
         if (identity) |value| if (!permissionsAllow(value.permissions, .table, table, required)) return error.Forbidden;
         const row_filter = try self.authorizedReadFilter(a, request, table);
         if (row_filter.len != 0) return error.MemoryRowPolicyUnsupported;
@@ -21591,6 +21628,23 @@ pub const ApiHttpServer = struct {
                 return try contextualResponseFromPublicTable(self.alloc, response);
             },
         }
+    }
+
+    fn createNativeMemoryTable(self: *ApiHttpServer, alloc: std.mem.Allocator, borrowed_context: api_operation.RequestContext, logical: []const u8, physical: []const u8, create: tables_api.CreateTableRequest) !void {
+        const target = try system_catalog.Target.parse(logical);
+        var context = borrowed_context;
+        // This is node-internal provisioning authority after memory's catalog
+        // table-admin admission, never a caller-provided override.
+        context.setting_admin = true;
+        context.native_service = .memory;
+        const body = try tables_api.encodeStoredCreateTableRequestAlloc(alloc, create);
+        defer alloc.free(body);
+        const result = try self.source.systemCatalog(alloc, context, .{ .native_memory_create = .{
+            .mutation = .{ .action = .create, .kind = .table, .database = target.database, .namespace = target.namespace, .name = target.table },
+            .physical_name = physical,
+            .create_table_json = body,
+        } });
+        alloc.free(result);
     }
 
     fn createNativeOrLegacyTable(self: *ApiHttpServer, logical_name: []const u8, physical_name: []const u8, request: tables_api.CreateTableRequest, identity: ?AuthenticatedIdentity) !void {
