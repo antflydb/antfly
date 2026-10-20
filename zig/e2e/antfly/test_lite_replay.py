@@ -400,7 +400,7 @@ def test_embedding_identity_failures_are_isolated_without_retry(storage_engine):
                 }
             },
         )
-        for ordinal, invalid in enumerate((None, "f" * 64)):
+        for ordinal, invalid in enumerate((None, "f" * 64, 7)):
             calls_before = len(embedder.received_corpus_model_identities)
             embedder.model_identity = invalid
             call(
@@ -446,7 +446,7 @@ def test_embedding_identity_failures_are_isolated_without_retry(storage_engine):
             ready_when=lambda value: value.get("status", {}).get("total_indexed") == 1,
         )
         assert status, server.debug_logs()
-        assert status["status"]["coverage"]["terminal_failed"] == 2, status
+        assert status["status"]["coverage"]["terminal_failed"] == 3, status
         assert not status["status"]["enrichment_runtime"]["worker_failed"], status
         assert "untransportable error" not in server.debug_logs()
         failed = False

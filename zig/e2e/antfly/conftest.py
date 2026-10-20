@@ -2341,7 +2341,7 @@ class InferenceEmbeddingServer:
         self,
         host: str = "127.0.0.1",
         response_delay_s: float | None = 0.0,
-        model_identity: str | None = None,
+        model_identity: str | int | None = None,
     ):
         port = find_free_port()
         self.base_url = f"http://{host}:{port}"
