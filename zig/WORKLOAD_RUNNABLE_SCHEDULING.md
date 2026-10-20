@@ -19,6 +19,47 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Speculative producer holder retirement (2026-10-20)
+
+Source `decfefff899c926b0ac7ccb3a07ac2ca6118d65f`: eligible controlled document and relational precompute now retire their owned
+policy admission and both nested and enclosing capture readers before provider
+work. This phase precedes snapshot mutation and exclusive apply admission. The
+same capture root and original controls stay attached to the retirement scope.
+Capture reentry does not wait while caller CPU is held, and partial admissions
+retire on failure. Another live root borrower prevents retirement.
+
+Policy reentry restores the original write lease only when phase, policy
+generation, catalog epoch and schema version still match. Both authentication
+expiry domains remain unchanged; reentry never authenticates anew or makes a
+fresh deadline. A failed reentry consumes its guard. Existing apply-time catalog
+and row-observation validation still decides whether the computed effects can
+be committed. No shared admission layout, status number or durable format changes.
+
+The caller still retains CPU through this speculative phase. External snapshot
+holders, borrowed policy holders and the in-apply generated fallback retain
+their existing path. Independent producer CPU/children, complete eligibility,
+accepted durable effects and completion reservations before PREPARE, and
+required-mode activation remain unfinished. No provider fanout or PDF prefetch
+is enabled by this change. The full design remains incomplete.
+
+`speculative-holder-retirement-v4` passes 69/69 build steps, including
+45 provider/admission cases and seven owner-preflight cases plus their root.
+The actual dense/sparse provider fixture covers both document and relational
+precompute, checks that policy/apply/snapshot capture admission is free during
+dispatch, rejects publication beginning before row commit, and succeeds on a
+subsequent request. Separate cases cover original expiry, changed policy tuples,
+nested capture retirement, contention, original lifetime rejection, partial
+reentry cleanup and another live borrower. The publication-start fixture aborts
+the simulated transition; it does not publish a durable policy bundle.
+
+`speculative-holder-verified.json` binds 5266 unchanged native inputs and
+4548 matching immutable public sources to this commit, together with 25/25
+ReleaseSafe public-consumer build steps. That consumer checks module composition
+without linking provider products. Native ABI 49, API 55, storage-owner 109,
+runnable 16 and failure 66 remain unchanged. Source-controller coverage remains semantic. The small linked
+visibility fixture proves its contract only; full archive/cold-source runtime
+remain unqualified. Full Linux qualification remains waived.
+
 ## Borrowed execution IO in owner operations (2026-10-20)
 
 Source `634626b904c19a1cc190ce0a7691b0ca99de2628`: controlled writes now borrow the request executor, or the configured host

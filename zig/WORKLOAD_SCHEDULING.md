@@ -25,6 +25,17 @@ cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
 
+Source `decfefff899c926b0ac7ccb3a07ac2ca6118d65f` retires owned policy and capture
+admissions around eligible controlled document/relational precompute. Reentry
+uses the original root and controls, checks the saved policy tuple, preserves
+both expiry domains and retires partial admissions. Caller CPU remains held;
+external snapshot/borrowed policy paths and in-apply fallback retain their
+existing holders. The 69-step focused run passes 45 provider/admission cases,
+including actual publication-start rejection before row commit. The immutable
+package passes 25/25 ReleaseSafe consumer build steps. This enables
+the next independently funded producer phase; it does not complete that CPU
+handoff or durable reservations before PREPARE. Full design work remains open.
+
 Source `634626b904c19a1cc190ce0a7691b0ca99de2628` removes the per-request executor
 from controlled owner writes. Request IO survives pre-decision callbacks;
 configured host IO supplies requests without an explicit executor. Clock-only
