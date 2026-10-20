@@ -214,7 +214,38 @@ and moves owned representation metadata rather than cloning it again; normal
 status reads reuse cached groups. This changes the capability response contract:
 SDKs and callers consuming flat type/analyzer/query-mode properties must read
 `representations` instead. Query expressions and physical-field escape hatches
-retain their contracts. Declared named search-as-you-type roots retain their configured
+retain their contracts.
+
+For example, a logical text source with one sortable keyword view is exposed as:
+
+```json
+{
+  "field": "title",
+  "kind": "source",
+  "value_operations": ["equals", "contains", "matches"],
+  "sortable": true,
+  "sort_lifecycle_state": "declared",
+  "sort_requires_scoring": false,
+  "representations": [{
+    "field": "title._keyword",
+    "type": "keyword",
+    "analyzer": "keyword",
+    "query_modes": ["exact"],
+    "sortable": true,
+    "sort_lifecycle_state": "declared",
+    "doc_value_coverage": "schema_declared",
+    "queryability_state": "declared",
+    "missing_null_policy": "missing_rejected",
+    "provenance": "document_schema"
+  }]
+}
+```
+
+MCP raw-query discovery exposes the same `value_search_execution` budgets and
+`remote_snapshot` cursor control as REST. Sequential `hierarchy.children`
+traversal accepts its retained snapshot token and rejects value-search policy,
+because that mode performs no relevance/filter verification phase.
+ Declared named search-as-you-type roots retain their configured
 analyzers; shorthand mappings may additionally resolve declared generated shingle
 representations. Conflicting roots are rejected rather than selected arbitrarily.
 

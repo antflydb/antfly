@@ -24809,7 +24809,7 @@ components:
                   - required:
                       - foreign_sources
                   - required:
-                      - remote_snapshot
+                      - value_search_execution
       properties:
         value_search_execution:
           $ref: '#/components/schemas/ValueSearchExecution'

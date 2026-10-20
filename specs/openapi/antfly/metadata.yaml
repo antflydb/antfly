@@ -9662,7 +9662,7 @@ components:
                   - required: [evaluate]
                   - required: [join]
                   - required: [foreign_sources]
-                  - required: [remote_snapshot]
+                  - required: [value_search_execution]
       properties:
         value_search_execution:
           $ref: "#/components/schemas/ValueSearchExecution"
