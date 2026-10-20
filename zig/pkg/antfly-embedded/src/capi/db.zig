@@ -7813,6 +7813,23 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     return waitResolverCurationResponse(handle_ptr, if (input.wait) |wait| wait.timeout_ms else 0, out);
 }
 
+/// Admission owns the handle's exclusive writer fence. Read only the two
+/// destination manifests; migration does not need a database-wide source scan.
+fn requireProposalQueueIdle(root: *Handle, a: std.mem.Allocator, table: []const u8) !void {
+    const db = @import("tables.zig").get(root, table) catch |err| switch (err) {
+        error.UndefinedTable => return,
+        else => return err,
+    };
+    var manifest = try proposalManifest(a, db);
+    if (manifest.pending_id != null) return error.ResolverCurationConflict;
+    // Publish recovered supersessions before migration can erase their only
+    // source receipt. Healthy queues do not scan any other source catalogs.
+    if (manifest.refresh_required) {
+        try refreshProposalManifest(root, a, table, &manifest);
+        try saveProposalManifest(a, db, manifest);
+    }
+}
+
 const proposal_store_key = @import("antfly_resolver").curation.proposal_store_key;
 const ProposalManifest = @import("antfly_resolver").curation.ProposalManifest;
 fn saveProposalManifest(a: std.mem.Allocator, db: *db_mod.DB, manifest: ProposalManifest) !void {
@@ -7820,11 +7837,12 @@ fn saveProposalManifest(a: std.mem.Allocator, db: *db_mod.DB, manifest: Proposal
     defer lease.release();
     if (try db.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
     const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
-    const version = @max(if (manifest.queue.receipt_scope != null) catalog.scoped_curation_reader_version else catalog.curation_provenance_reader_version, db.core.index_manager.minimum_reader_version.load(.acquire));
+    const version = @max(catalog.scoped_curation_reader_version, db.core.index_manager.minimum_reader_version.load(.acquire));
     _ = try @import("antfly_resolver").curation.parseState(a, try std.json.Stringify.valueAlloc(a, manifest.queue, .{}));
+    try @import("antfly_resolver").curation.validateProposalQueue(manifest.queue);
     const bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
     // Queue budgets exclude only the fixed pending-decision envelope.
-    if (bytes.len > 4 * 1024 * 1024 + 16384) return error.ResolverCurationLimitExceeded;
+    if (bytes.len > @import("antfly_resolver").curation.max_manifest_bytes) return error.ResolverCurationLimitExceeded;
     try db.core.store.putBatch(&.{ .{ .key = proposal_store_key, .value = bytes }, .{ .key = catalog.minimum_reader_key, .value = try catalog.readerVersionBytes(version) } }, &.{});
     db.core.index_manager.minimum_reader_version.store(version, .release);
 }
@@ -8230,6 +8248,11 @@ pub fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_n
     }
     for (configs) |cfg| {
         if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
+        // Namespace changes can discard receipts or enroll a new queue. Fence
+        // both authorities before changing identity, including same-table resets.
+        const root = handle.parent_handle orelse handle;
+        requireProposalQueueIdle(root, arena.allocator(), cfg.table) catch |err| return capi.mapError(err);
+        if (!std.mem.eql(u8, cfg.table, request.table)) requireProposalQueueIdle(root, arena.allocator(), request.table) catch |err| return capi.mapError(err);
         // Validate the destination before publishing identity state.
         _ = @import("tables.zig").get(handle.parent_handle orelse handle, request.table) catch |err| return capi.mapErrorContext(if (err == error.UndefinedTable) error.NotFound else err, "resolver namespace destination table does not exist");
         const next = curation.namespaceConfig(arena.allocator(), cfg, request) catch |err| return capi.mapErrorContext(err, "mapping every inline alias endpoint and resolver policy key into the destination namespace");

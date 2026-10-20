@@ -715,11 +715,29 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
     }
 }
 
+/// HTTP decisions must fit the metadata CAS as well as the standalone queue.
+/// Both expected and replacement carry the full queue. Reserve terminal growth
+/// on both sides, plus room for the bounded logical relation-owner guard.
+fn validateProposalPublicationCapacity(alloc: std.mem.Allocator, table: @import("../metadata/table_manager.zig").TableRecord, state: resolver.curation.State) !void {
+    const codec = @import("../metadata/storage/raft_apply_store.zig");
+    const protocol = @import("../metadata/topology_protocol.zig");
+    // Index JSON is a length-framed byte string in the codec. Size its two
+    // copies arithmetically instead of copying queue evidence into a probe.
+    var header = table;
+    header.indexes_json = "";
+    const encoded = try codec.encodeTransitionCommand(alloc, .{ .compare_and_replace_table = .{ .expected = header, .replacement = header } });
+    defer alloc.free(encoded);
+    const growth = resolver.curation.proposalCapacityBytes(state) - resolver.curation.jsonSize(state);
+    if (encoded.len + 2 * (table.indexes_json.len + growth) + 64 * 1024 > protocol.max_transition_command_bytes) return error.ResolverCurationLimitExceeded;
+}
+
 const proposals_key = curation.proposals_key;
 const ProposalEdit = struct { id: []const u8, decision: resolver.curation.ProposalDecision };
 fn proposalQueue(a: std.mem.Allocator, root: std.json.Value) !resolver.curation.State {
     const value = root.object.get(proposals_key) orelse return .{};
-    return resolver.curation.parseState(a, try std.json.Stringify.valueAlloc(a, value, .{}));
+    const state = try resolver.curation.parseState(a, try std.json.Stringify.valueAlloc(a, value, .{}));
+    try resolver.curation.validateProposalQueue(state);
+    return state;
 }
 fn findProposal(state: resolver.curation.State, id: []const u8) !resolver.curation.Proposal {
     for (state.proposals) |proposal| if (std.mem.eql(u8, proposal.id, id)) return proposal;
@@ -826,6 +844,7 @@ fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloc
     try root.object.put(a, proposals_key, try json(a, state));
     var replacement = table.*;
     replacement.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
+    if (op == .proposal_create) try validateProposalPublicationCapacity(alloc, replacement, state);
     try request.ensureActive();
     _ = try server.source.replaceTableDefinitionStamped(table.*, replacement);
     if (op == .proposal_create) return response(alloc, 200, try findProposal(state, try resolver.curation.proposalId(a, try std.json.parseFromSliceLeaky(resolver.curation.ProposalRequest, a, body, .{}))));
@@ -1355,4 +1374,32 @@ test "resolver curation progress probes an idle heartbeat below an accepted jour
     promoted.promote = true;
     _ = try sampleForReplay(&server, a, &snapshot, &table, .{}, true, .{ .target = promoted, .revision = 0, .floor = .{ .group = 7, .sequence = 5 } });
     try std.testing.expectEqual(@as(usize, 2), server.probes);
+}
+
+test "resolver curation HTTP queue capacity reserves both metadata CAS definitions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pure = resolver.curation;
+    var state: pure.State = .{};
+    var count: usize = 0;
+    while (true) : (count += 1) {
+        const next = try pure.propose(a, state, &.{}, .{ .action = .suppress, .key = try std.fmt.allocPrint(a, "concept/{d}", .{count}) }, .{});
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ ._curation_proposals = next.state }, .{});
+        validateProposalPublicationCapacity(std.testing.allocator, .{ .table_id = 1, .name = "entities", .indexes_json = bytes }, next.state) catch |err| {
+            try std.testing.expectEqual(error.ResolverCurationLimitExceeded, err);
+            break;
+        };
+        state = next.state;
+    }
+    try std.testing.expect(count > 1);
+    // The shared 4 MiB queue still has capacity, but HTTP's two-definition
+    // transition is the tighter authority and must reject creation earlier.
+    const actor: [256]u8 = @splat(0);
+    const reason: [4096]u8 = @splat(0);
+    for (0..count) |i| {
+        state = (try pure.decide(a, state, &.{}, &.{}, state.proposals[i].id, .{ .accept = false }, .{ .actor = &actor, .reason = &reason, .revision = std.math.maxInt(u64), .created_at_ms = std.math.maxInt(u64) })).state;
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ ._curation_proposals = state }, .{});
+        try validateProposalPublicationCapacity(std.testing.allocator, .{ .table_id = 1, .name = "entities", .indexes_json = bytes }, state);
+    }
 }

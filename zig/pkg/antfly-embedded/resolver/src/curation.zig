@@ -29,6 +29,11 @@ pub const Origin = struct {
     cascade_from: ?[]const u8 = null,
 
     pub fn validate(self: Origin) !void {
+        if (self.proposal_id) |id| {
+            if (id.len != 64) return error.InvalidResolverCurationRequest;
+            for (id) |byte| if (!std.ascii.isHex(byte)) return error.InvalidResolverCurationRequest;
+        }
+        if (self.cascade_from) |key| try validKey(key);
         if (self.actor.len > 256 or self.reason.len > 4096 or !std.unicode.utf8ValidateSlice(self.actor) or !std.unicode.utf8ValidateSlice(self.reason)) return error.InvalidResolverCurationRequest;
     }
 };
@@ -45,7 +50,7 @@ pub const Suppression = struct {
 };
 pub const Pair = struct { from: []const u8, to: []const u8, origin: ?Origin = null };
 /// Durable identity of one queue lifetime, independent of its table name.
-/// Null denotes an existing legacy queue and retains its historical receipts.
+/// A queue receives its identity before its first proposal is persisted.
 pub const ReceiptScope = [32]u8;
 pub fn sameReceiptScope(left: ?ReceiptScope, right: ?ReceiptScope) bool {
     if (left == null or right == null) return left == null and right == null;
@@ -68,19 +73,6 @@ pub const State = struct {
     /// Mask a declarative alias after an explicit unmerge. Future graph
     /// replacements must not silently recreate the redirect just corrected.
     removed_aliases: []const []const u8 = &.{},
-
-    // Preserve the v10 legacy encoding when no scoped receipts exist.
-    pub fn jsonStringify(self: State, jw: anytype) !void {
-        try jw.beginObject();
-        inline for (@typeInfo(State).@"struct".field_names) |field| {
-            const omit = if (comptime std.mem.eql(u8, field, "receipt_scope")) self.receipt_scope == null else false;
-            if (!omit) {
-                try jw.objectField(field);
-                try jw.write(@field(self, field));
-            }
-        }
-        try jw.endObject();
-    }
 };
 pub const ProposalState = enum { open, accepted, rejected, superseded };
 pub const EntityAction = enum { merge, unmerge, suppress, unsuppress, distinct };
@@ -153,10 +145,10 @@ fn validateEvidence(a: std.mem.Allocator, evidence: std.json.Value) !void {
             else => {},
         }
     }
-    if ((try std.json.Stringify.valueAlloc(a, evidence, .{})).len > 16384) return error.ResolverCurationLimitExceeded;
+    if (jsonSize(evidence) > 16384) return error.ResolverCurationLimitExceeded;
 }
 pub fn propose(a: std.mem.Allocator, state: State, merges: []const Redirect, input: ProposalRequest, stamp: Origin) !Plan {
-    try stamp.validate();
+    try validateProposalOrigin(stamp);
     const id = try proposalId(a, input);
     if (input.options.absorbed != .reject and input.action != .suppress) return error.InvalidResolverCurationRequest;
     if (input.options.replace and input.action != .merge) return error.InvalidResolverCurationRequest;
@@ -170,11 +162,11 @@ pub fn propose(a: std.mem.Allocator, state: State, merges: []const Redirect, inp
     entries[state.proposals.len] = .{ .id = id, .action = input.action, .key = input.key, .into = input.into, .options = input.options, .confidence = input.confidence, .evidence = input.evidence, .origin = stamp };
     var next = state;
     next.proposals = entries;
-    try boundedState(a, next);
+    try validateProposalQueue(next);
     return .{ .state = next, .merges = merges, .changed = true };
 }
 pub fn decide(a: std.mem.Allocator, state: State, merges: []const Redirect, effective: []const Redirect, id: []const u8, input: ProposalDecision, stamp: Origin) !Plan {
-    try stamp.validate();
+    try validateProposalOrigin(stamp);
     const selected = for (state.proposals, 0..) |proposal, i| {
         if (std.mem.eql(u8, proposal.id, id)) break i;
     } else return error.NotFound;
@@ -261,10 +253,41 @@ pub fn proposalPage(a: std.mem.Allocator, state: State, query: []const u8) !Prop
     return .{ .proposals = items.items[0..count], .next_cursor = if (count < items.items.len) items.items[count - 1].id else null };
 }
 
-fn boundedState(a: std.mem.Allocator, state: State) !void {
-    if ((try std.json.Stringify.valueAlloc(a, state, .{})).len > 4 * 1024 * 1024) return error.ResolverCurationLimitExceeded;
+pub const max_state_bytes = 4 * 1024 * 1024;
+/// Count encoded bytes with fixed scratch space; do not allocate another copy
+/// of a multi-megabyte queue merely to enforce its budget.
+pub fn jsonSize(value: anytype) u64 {
+    var buffer: [1024]u8 = undefined;
+    var sink = std.Io.Writer.Discarding.init(&buffer);
+    std.json.Stringify.value(value, .{}, &sink.writer) catch unreachable;
+    return sink.fullCount();
+}
+fn boundedState(_: std.mem.Allocator, state: State) !void {
+    if (jsonSize(state) > max_state_bytes) return error.ResolverCurationLimitExceeded;
+}
+// UTF-8 actor/reason bytes may all require six-byte JSON escapes. The fixed
+// allowance covers field names, enum tags, two maximal u64s and a proposal ID.
+// Queue decisions have no cascade_from (cascade attribution belongs to policy).
+pub const decision_origin_byte_budget = (256 + 4096) * 6 + 512;
+fn validateProposalOrigin(origin: Origin) !void {
+    try origin.validate();
+    if (origin.cascade_from != null) return error.InvalidResolverCurationRequest;
+}
+pub fn proposalCapacityBytes(state: State) u64 {
+    var bytes = jsonSize(state);
+    for (state.proposals) |proposal| if (proposal.state == .open) {
+        // Replace null with maximal provenance, and open with superseded.
+        bytes += decision_origin_byte_budget - 4 + ("superseded".len - "open".len);
+    };
+    return bytes;
+}
+pub fn validateProposalQueue(state: State) !void {
+    if (state.proposals.len > 4096 or proposalCapacityBytes(state) > max_state_bytes) return error.ResolverCurationLimitExceeded;
 }
 
+// The pending decision freezes attribution in both its request and origin.
+// Its bound is independent of queue evidence and allows maximal JSON escaping.
+pub const max_manifest_bytes = max_state_bytes + 2 * decision_origin_byte_budget + 4096;
 pub const proposal_store_key = "\x00\x00__metadata__:curation_proposals";
 pub const ProposalManifest = struct {
     queue: State = .{},
@@ -274,11 +297,14 @@ pub const ProposalManifest = struct {
     pending_origin: ?Origin = null,
 };
 pub fn parseProposalManifest(a: std.mem.Allocator, bytes: []const u8) !ProposalManifest {
-    if (bytes.len > 4 * 1024 * 1024 + 16384) return error.ResolverCurationLimitExceeded;
+    if (bytes.len > max_manifest_bytes) return error.ResolverCurationLimitExceeded;
     const manifest = try std.json.parseFromSliceLeaky(ProposalManifest, a, bytes, .{});
     _ = try parseState(a, try std.json.Stringify.valueAlloc(a, manifest.queue, .{}));
+    try validateProposalQueue(manifest.queue);
+    if (manifest.queue.proposals.len > 0 and manifest.queue.receipt_scope == null) return error.InvalidResolverCurationRequest;
     if ((manifest.pending_id == null) != (manifest.pending_decision == null) or (manifest.pending_id == null) != (manifest.pending_origin == null)) return error.InvalidResolverCurationRequest;
-    if (manifest.pending_origin) |origin| try origin.validate();
+    if (manifest.pending_origin) |origin| try validateProposalOrigin(origin);
+    if (manifest.pending_decision) |decision| try validateProposalOrigin(.{ .actor = decision.actor, .reason = decision.reason });
     if (manifest.pending_id) |id| {
         const proposal = for (manifest.queue.proposals) |proposal| {
             if (std.mem.eql(u8, proposal.id, id)) break proposal;
@@ -592,6 +618,7 @@ pub fn planWithOrigin(a: std.mem.Allocator, state_json: []const u8, merges: []co
 /// Queue supersession is independent of policy serialization. Evidence never
 /// enters a resolver catalog or the scratch state used to plan its action.
 pub fn supersede(a: std.mem.Allocator, current: []const Proposal, request: Request, absorbed: []const AbsorbedResult, origin: Origin) ![]const Proposal {
+    try validateProposalOrigin(origin);
     var affected: std.StringHashMapUnmanaged(void) = .empty;
     const key = request.from orelse request.key;
     if (key) |value| try affected.put(a, value, {});
@@ -735,7 +762,7 @@ pub const Index = struct {
 
     pub fn init(a: std.mem.Allocator, config_json: []const u8, state_json: []const u8) !Index {
         const config = if (config_json.len == 0) Suppression{} else try std.json.parseFromSliceLeaky(Suppression, a, config_json, .{ .allocate = .alloc_always });
-        if (state_json.len > 4 * 1024 * 1024) return error.ResolverCurationLimitExceeded;
+        if (state_json.len > max_state_bytes) return error.ResolverCurationLimitExceeded;
         const Policy = struct { keys: []const []const u8 = &.{}, texts: []const []const u8 = &.{}, min_text_chars: u32 = 0 };
         const ExecutionState = struct { version: u32 = 1, suppress: Policy = .{}, distinct: []const struct { from: []const u8, to: []const u8 } = &.{}, removed_aliases: []const []const u8 = &.{} };
         const state = if (state_json.len == 0) ExecutionState{} else try std.json.parseFromSliceLeaky(ExecutionState, a, state_json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
@@ -798,18 +825,14 @@ pub const Index = struct {
 };
 
 pub fn parseState(a: std.mem.Allocator, json: []const u8) !State {
-    if (json.len > 4 * 1024 * 1024) return error.ResolverCurationLimitExceeded;
+    if (json.len > max_state_bytes) return error.ResolverCurationLimitExceeded;
     const value = if (json.len == 0) State{} else try std.json.parseFromSliceLeaky(State, a, json, .{ .allocate = .alloc_always });
     if (value.proposals.len > 4096) return error.ResolverCurationLimitExceeded;
     if (value.version != 1) return error.InvalidResolverCurationVersion;
     if (value.suppress.keys.len + value.suppress.texts.len + value.distinct.len + value.removed_aliases.len > 100000) return error.ResolverCurationLimitExceeded;
-    var result = value;
-    // Old catalogs remain readable. Unknown timestamps stay zero rather than
-    // inventing a creation time when a client first inspects a legacy record.
-    result.suppress.entries = try updateEntries(a, value.suppress.entries, value.suppress.keys, true, .{});
-    var texts: std.ArrayListUnmanaged([]const u8) = .empty;
-    for (value.suppress.texts) |text| try texts.append(a, try normalize(a, text));
-    result.suppress.text_entries = try updateEntries(a, value.suppress.text_entries, texts.items, true, .{});
+    const result = value;
+    // Attribution is sparse. Reading a key-only policy must not manufacture
+    // a full Origin for every key or inflate its next catalog publication.
     for (result.suppress.entries) |entry| {
         try validKey(entry.key);
         try entry.origin.validate();
@@ -827,14 +850,15 @@ pub fn parseState(a: std.mem.Allocator, json: []const u8) !State {
         if (!std.mem.eql(u8, proposal.id, try proposalId(a, .{ .action = proposal.action, .key = proposal.key, .into = proposal.into }))) return error.InvalidResolverCurationRequest;
         if (proposal.evidence) |evidence| try validateEvidence(a, evidence);
         if (proposal.confidence) |confidence| if (!std.math.isFinite(confidence) or confidence < 0 or confidence > 1) return error.InvalidResolverCurationRequest;
-        try proposal.origin.validate();
-        if (proposal.decided) |origin| try origin.validate();
+        try validateProposalOrigin(proposal.origin);
+        if (proposal.decided) |origin| try validateProposalOrigin(origin);
+        if (proposal.state == .open and proposal.decided != null) return error.InvalidResolverCurationRequest;
     }
     return result;
 }
 
 pub fn validateConfig(a: std.mem.Allocator, json: []const u8) !void {
-    if (json.len > 4 * 1024 * 1024) return error.ResolverCurationLimitExceeded;
+    if (json.len > max_state_bytes) return error.ResolverCurationLimitExceeded;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     _ = try Index.init(arena.allocator(), json, "");
@@ -1071,7 +1095,7 @@ test "curation supersession follows both entity references and symmetric merge j
     try std.testing.expectEqual(.open, suppressed[3].state);
 }
 
-test "curation receipt scopes distinguish fresh queues and preserve legacy retries" {
+test "curation receipt scopes distinguish queue lifetimes and preserve retries" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1093,10 +1117,85 @@ test "curation receipt scopes distinguish fresh queues and preserve legacy retri
     try std.testing.expectEqual(@as(usize, 1), applied.state.suppress.keys.len);
     const restored = try parseState(a, try std.json.Stringify.valueAlloc(a, applied.state, .{}));
     try std.testing.expect(sameReceiptScope(second, restored.receipt_scope));
-    // Pre-v11 histories retain the null identity for their entire lifetime.
-    const legacy = try propose(a, .{}, &.{}, request, .{});
-    const legacy_bytes = try std.json.Stringify.valueAlloc(a, legacy.state, .{});
-    try std.testing.expect(std.mem.indexOf(u8, legacy_bytes, "receipt_scope") == null);
-    try std.testing.expectEqual(@as(usize, 1), bindReceiptScope(legacy.state, null).proposals.len);
-    try std.testing.expectEqual(@as(usize, 0), bindReceiptScope(legacy.state, second).proposals.len);
+}
+
+test "curation sparse attribution keeps large key and text policies editable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const keys = try a.alloc([]const u8, 40000);
+    for (keys, 0..) |*key, i| key.* = try std.fmt.allocPrint(a, "concept/key-{d}", .{i});
+    const texts = try a.alloc([]const u8, 10000);
+    for (texts, 0..) |*text, i| text.* = try std.fmt.allocPrint(a, "text {d}", .{i});
+    const bytes = try std.json.Stringify.valueAlloc(a, State{ .suppress = .{ .keys = keys, .texts = texts } }, .{});
+    const parsed = try parseState(a, bytes);
+    try std.testing.expectEqual(@as(usize, 0), parsed.suppress.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.suppress.text_entries.len);
+    try std.testing.expectEqual(bytes.len, jsonSize(parsed));
+    const edit = try plan(a, bytes, &.{}, &.{}, .{ .action = .unsuppress, .key = keys[0] });
+    try std.testing.expect(edit.changed);
+    try std.testing.expectEqual(keys.len - 1, edit.state.suppress.keys.len);
+    try std.testing.expectEqual(@as(usize, 0), edit.state.suppress.entries.len);
+    const asserted = try planWithOrigin(a, bytes, &.{}, &.{}, .{ .action = .suppress, .key = "concept/new" }, .{ .actor = "curator" });
+    try std.testing.expectEqual(@as(usize, 1), asserted.state.suppress.entries.len);
+    try std.testing.expectEqualStrings("curator", asserted.state.suppress.entries[0].origin.actor);
+}
+
+test "curation queue reserves escaped decision attribution for every open proposal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var evidence: std.json.ObjectMap = .empty;
+    const payload = try a.alloc(u8, 14000);
+    @memset(payload, 'x');
+    try evidence.put(a, "data", .{ .string = payload });
+    var state: State = .{ .receipt_scope = @splat('a') };
+    var count: usize = 0;
+    while (true) : (count += 1) {
+        const request: ProposalRequest = .{ .action = .suppress, .key = try std.fmt.allocPrint(a, "concept/{d}", .{count}), .evidence = .{ .object = evidence } };
+        const next = propose(a, state, &.{}, request, .{}) catch |err| {
+            try std.testing.expectEqual(error.ResolverCurationLimitExceeded, err);
+            break;
+        };
+        state = next.state;
+    }
+    try std.testing.expect(count > 1 and count < 4096);
+    try validateProposalQueue(state);
+    const reservation = proposalCapacityBytes(state);
+    const actor: [256]u8 = @splat(0);
+    const reason: [4096]u8 = @splat(0);
+    const stamp: Origin = .{ .actor = &actor, .reason = &reason, .created_at_ms = std.math.maxInt(u64), .revision = std.math.maxInt(u64) };
+    const superseded = try supersede(a, state.proposals, .{ .action = .suppress, .keys = blk: {
+        const keys = try a.alloc([]const u8, state.proposals.len);
+        for (state.proposals, keys) |proposal, *key| key.* = proposal.key;
+        break :blk keys;
+    } }, &.{}, stamp);
+    var all_settled = state;
+    all_settled.proposals = superseded;
+    try validateProposalQueue(all_settled);
+    for (superseded) |proposal| try std.testing.expectEqual(.superseded, proposal.state);
+    // Rejections are always possible, including when every decision has the
+    // largest legal attribution and every byte requires JSON escaping.
+    for (0..count) |i| {
+        if (i == count - 1) {
+            const pending = try std.json.Stringify.valueAlloc(a, ProposalManifest{
+                .queue = state,
+                .pending_id = state.proposals[i].id,
+                .pending_decision = .{ .accept = true, .actor = &actor, .reason = &reason },
+                .pending_origin = stamp,
+            }, .{});
+            try std.testing.expect(pending.len <= max_manifest_bytes);
+            _ = try parseProposalManifest(a, pending);
+        }
+        state = (try decide(a, state, &.{}, &.{}, state.proposals[i].id, .{ .accept = false }, stamp)).state;
+        try std.testing.expect(proposalCapacityBytes(state) <= reservation);
+    }
+    for (state.proposals) |proposal| {
+        try std.testing.expectEqual(.rejected, proposal.state);
+        try std.testing.expect(jsonSize(proposal.decided.?) <= decision_origin_byte_budget);
+    }
+    const manifest = try std.json.Stringify.valueAlloc(a, ProposalManifest{ .queue = state }, .{});
+    const reopened = try parseProposalManifest(a, manifest);
+    try std.testing.expectEqual(count, reopened.queue.proposals.len);
+    try std.testing.expectEqual(jsonSize(state), jsonSize(reopened.queue));
 }

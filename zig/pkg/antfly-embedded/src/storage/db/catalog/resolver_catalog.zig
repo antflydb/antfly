@@ -1100,13 +1100,13 @@ test "resolver public inspection redacts nested generated provider credentials w
     try std.testing.expect(std.mem.indexOf(u8, cfg.adjudicate_json, "nested-private-key") != null);
 }
 
-test "resolver curation scoped receipts fence reader ten" {
+test "resolver curation state requires the current receipt decoder" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const curation = @import("antfly_resolver").curation;
-    const legacy = try std.json.Stringify.valueAlloc(a, .{.{ .curation_json = try std.json.Stringify.valueAlloc(a, curation.State{}, .{}) }}, .{});
-    try std.testing.expectEqual(curation_provenance_reader_version, try catalogReaderVersion(a, legacy));
+    const empty = try std.json.Stringify.valueAlloc(a, .{.{ .curation_json = try std.json.Stringify.valueAlloc(a, curation.State{}, .{}) }}, .{});
+    try std.testing.expectEqual(scoped_curation_reader_version, try catalogReaderVersion(a, empty));
     const scoped = try std.json.Stringify.valueAlloc(a, .{.{ .curation_json = try std.json.Stringify.valueAlloc(a, curation.State{ .receipt_scope = @splat('a') }, .{}) }}, .{});
     try std.testing.expectEqual(scoped_curation_reader_version, try catalogReaderVersion(a, scoped));
     try std.testing.expectEqualStrings("11", try readerVersionBytes(scoped_curation_reader_version));

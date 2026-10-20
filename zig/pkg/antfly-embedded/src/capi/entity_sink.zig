@@ -2346,10 +2346,17 @@ test "capi resolver curation proposals persist decisions and resume per resolver
     const pending_bytes = try std.json.Stringify.valueAlloc(a, unfinished.value, .{});
     defer a.free(pending_bytes);
     try root.db.core.store.put(@import("antfly_resolver").curation.proposal_store_key, pending_bytes);
+    // A second identity tests migration into a busy destination as well as
+    // leaving/resetting the namespace whose receipt is already committed.
+    try @import("tables.zig").create(root, "other", "{}", false);
+    try root.db.addResolver(.{ .name = "other_concepts", .table = "other", .source_artifact = "other_kg", .resolution_artifact = "other_resolved", .key_template = "other/{{uslug _entity.text}}", .promote = false });
     // Resolver-level writes share the pending-decision fence; they cannot
     // race an unfinished fanout and invalidate its frozen receipt set.
     try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_unsuppress_resolver_key_json(id, .fromSlice("concepts"), .fromSlice("{\"key\":\"concept/b\"}"), &out));
     api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_set_resolver_namespace_json(id, .fromSlice("concepts"), .fromSlice("{\"table\":\"other\",\"key_template\":\"other/{{uslug _entity.text}}\",\"reset_merges\":true,\"reset_curation\":true}")));
+    try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_set_resolver_namespace_json(id, .fromSlice("concepts"), .fromSlice("{\"table\":\"default\",\"key_template\":\"concept/{{uslug _entity.text}}\",\"reset_merges\":true,\"reset_curation\":true}")));
+    try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_set_resolver_namespace_json(id, .fromSlice("other_concepts"), .fromSlice("{\"table\":\"default\",\"key_template\":\"concept/{{uslug _entity.text}}\",\"reset_merges\":true,\"reset_curation\":true}")));
     api.antfly_db_close(id);
     closed = true;
     const reopened = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
@@ -2413,6 +2420,13 @@ test "capi resolver curation proposals persist decisions and resume per resolver
     try reopened.db.core.store.put(@import("antfly_resolver").curation.proposal_store_key, interrupted_bytes);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_suppress_resolver_keys_json(reopened_id, .fromSlice("places"), .fromSlice("{\"add\":{\"keys\":[\"place/second\"]}}"), &out));
     api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(later_id), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"superseded\"") != null);
+    api.antfly_buffer_free(&out);
+    // Migration must persist dirty supersessions before clearing their source
+    // receipts, even when no acceptance is pending anymore.
+    try reopened.db.core.store.put(@import("antfly_resolver").curation.proposal_store_key, interrupted_bytes);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_set_resolver_namespace_json(reopened_id, .fromSlice("concepts"), .fromSlice("{\"table\":\"other\",\"key_template\":\"other/{{uslug _entity.text}}\",\"reset_merges\":true,\"reset_curation\":true}")));
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(later_id), &out));
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"superseded\"") != null);
 }

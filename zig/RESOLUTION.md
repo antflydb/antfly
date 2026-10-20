@@ -1827,17 +1827,18 @@ The planner computes the component before changing any edge, then publishes one
 policy edit. Removed configured aliases stay masked. Unsuppression never restores
 a redirect or unsuppresses other keys implicitly.
 
-Curation writes accept UTF-8 `actor` (256 bytes) and `reason` (4096 bytes).
-The admission owner stamps origin, creation time and the committed policy
-revision; clients cannot supply a server origin through entity/redirect writes.
-Read projections attach provenance to redirects and distinct pairs. Runtime
-suppressions retain the compatible `keys`/`texts` sets and add attributed
-`entries`/`text_entries`. Cascades name their original target in `cascade_from`;
-review acceptance names its proposal in `proposal_id`. Legacy attribution remains absent or has zero creation time/revision; table-level
-proposals can also have revision zero until an individual policy edit is recorded. Persisting this extended
-curation provenance requires reader version 10; scoped queue receipts require
-reader version 11. Cluster metadata writers require
-coordinated decoder version 37 before publishing resolver policy or proposal
+Curation writes accept UTF-8 `actor` (256 bytes) and `reason` (4096 bytes). The
+admission owner stamps origin, creation time and the committed policy revision; clients
+cannot supply a server origin through entity/redirect writes. Read projections attach
+provenance to redirects and distinct pairs. Runtime suppressions retain the compatible
+`keys`/`texts` sets and add attributed `entries`/`text_entries`. Cascades name their
+original target in `cascade_from`; review acceptance names its proposal in
+`proposal_id`. Attribution remains sparse when no origin was recorded; reading a policy
+never synthesizes per-key origins. Records may have zero creation time/revision;
+table-level proposals can also have revision zero until an individual policy edit is
+recorded. Mention-review provenance requires reader version 10; newly serialized
+curation state and queue receipts require reader version 11. Cluster metadata writers
+require coordinated decoder version 37 before publishing resolver policy or proposal
 queues, including queue-only and retired resolver metadata restored from backups.
 
 `/tables/{entity_table}/curation/proposals` is the entity-level review surface;
@@ -1858,33 +1859,39 @@ Terminal proposals retain their identity: repeated screening does not
 reopen a rejection, and repeated acceptance does not override a later correction.
 
 The stable ID hashes the action and length-framed JSON keys, excluding confidence,
-evidence and options. Distinct-pair IDs are symmetric. Listing uses ordered IDs
-for keyset pagination, with a default open-state filter and pages of 1–256 records.
-Evidence is bounded at 16 KiB, 4096 JSON values and depth 32; confidence must be
-finite and between zero and one. Each table queue has a 4096-record, 4 MiB budget.
-Budget exhaustion is explicit; no existing decision is silently evicted. Queue
-records are metadata, never resolver declarations, and inference admission parses
-only execution policy, skipping proposal evidence and attribution history.
+evidence and options. Distinct-pair IDs are symmetric. Listing uses ordered IDs for
+keyset pagination, with a default open-state filter and pages of 1–256 records. Evidence
+is bounded at 16 KiB, 4096 JSON values and depth 32; confidence must be finite and
+between zero and one. Each table queue has a 4096-record, 4 MiB budget. Admission
+reserves the maximum escaped decision attribution for every open proposal, so rejecting
+or superseding admitted work never runs out of queue space. The HTTP path also reserves
+this growth in both definitions of its bounded metadata CAS. Size checks use a counting
+writer with fixed scratch space. Interrupted Lite decisions have a separately bounded
+envelope sized for both copies of frozen attribution. Budget exhaustion is explicit; no
+existing decision is silently evicted. Queue records are metadata, never resolver
+declarations, and inference admission parses only execution policy, skipping proposal
+evidence and attribution history.
 
-HTTP stores proposals alongside destination namespace authority. Accept/reject
-and their policy effects share one destination-table metadata CAS, including
-catalog retries and Raft replay. Queue-only edits leave resolver policy revisions
-unchanged and do not enqueue resolver work. Lite retains the existing per-resolver
-atomicity of entity actions: each accepted effect and its decision receipt share
-one catalog publication. A durable pending decision fences competing decisions
-and supports resuming a partial fanout after reopening. Every queue writer first
-reconciles a dirty manifest across all source namespaces, including unrelated
-entity and resolver edits. Recovery indexes open IDs once and releases each
-source catalog's scratch memory before reading the next source. Edits that do
-not affect proposals skip extra queue publications. `complete: false` means
-the caller should retry the same decision. Effect options and attribution remain
-frozen, while revision fences and wait budgets belong to the current request.
-A newly created Lite queue receives a durable random identity. Source receipts
-are bound to that queue identity as well as the public proposal ID. Dropping and
-recreating a destination therefore cannot reuse its prior source receipts.
-Backups preserve the identity and reopen/retry preserves completed decisions.
-Existing unscoped queues retain the legacy null identity for their lifetime;
-new queues always use a fresh identity. Inference ignores this receipt metadata.
+HTTP stores proposals alongside destination namespace authority. Accept/reject and their
+policy effects share one destination-table metadata CAS, including catalog retries and
+Raft replay. Queue-only edits leave resolver policy revisions unchanged and do not
+enqueue resolver work. Lite retains the existing per-resolver atomicity of entity
+actions: each accepted effect and its decision receipt share one catalog publication. A
+durable pending decision fences competing decisions and resolver namespace migrations,
+including same-table resets and migrations into its destination. It supports resuming a
+partial fanout after reopening. Namespace migration reconciles dirty supersessions
+before removing their source receipts; healthy migrations inspect only the old and new
+destination manifests. Every queue writer first reconciles a dirty manifest across all
+source namespaces, including unrelated entity and resolver edits. Recovery indexes open
+IDs once and releases each source catalog's scratch memory before reading the next
+source. Edits that do not affect proposals skip extra queue publications. `complete` set to false means the caller should retry the same decision. Effect options and attribution
+remain frozen, while revision fences and wait budgets belong to the current request. A
+newly created Lite queue receives a durable random identity. Source receipts are bound
+to that queue identity as well as the public proposal ID. Dropping and recreating a
+destination therefore cannot reuse its prior source receipts. Backups preserve the
+identity and reopen/retry preserves completed decisions. Persisted nonempty Lite queues
+require this identity; there is no migration path for unreleased unscoped queues.
+Inference ignores this receipt metadata.
 
 HTTP initial decisions and terminal retries return the same decision envelope,
 including the proposal, `changed`, `complete`, `applied`, and per-consumer results.
