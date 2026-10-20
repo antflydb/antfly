@@ -19,6 +19,46 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Borrowed execution IO in owner operations (2026-10-20)
+
+Source `634626b904c19a1cc190ce0a7691b0ca99de2628`: controlled writes now borrow the request executor, or the configured host
+executor when the request has none. They no longer construct a per-request
+thread pool. Deadline clocks remain separate from execution IO. Native
+BEGIN/PREPARE/resolve/ACK, status reads and configured owner waits preserve this
+selection; malformed explicit descriptors fail without choosing another pool.
+Production owner sources already attach the host BackendRuntime. Unconfigured
+legacy maintenance and acquisition waits retain their standalone fallback.
+
+PreDecisionContext carries the borrowed executor through compiled callbacks.
+Its fromRequest helper preserves lifetime and IO without lending coordinator
+CPU to participant children. OwnerTransition.wait uses its original execution
+IO while retiring capture and lending CPU before retry. Native ABI 49 fences
+the private layout change; shared status numbers and durable formats do not
+change.
+
+This corrects an earlier source-level gap: fc34f7465f supplied the provider IO
+descriptor from a newly created executor. Its direct DB fixture proved that a
+supplied descriptor survived preparation, but did not prove caller-executor
+reuse through the source controller.
+
+`caller-executor-reuse-v8` passes 87/87 build steps: seven owner-preflight
+cases plus the discovery root, eight compiled context cases and 42 provider
+regressions. Three IO-selection cases have unchanged-source passing evidence;
+they cover caller precedence, configured fallback, missing/malformed authority
+and caller capacity refusal. The unchanged public consumer passes 25/25
+ReleaseSafe build steps against the immutable source commit. These are module
+composition checks, without linked provider products. `caller-executor-verified.json`
+binds the exact source hashes and records qualification limits.
+Source-controller and range-dispatch checks remain semantic;
+the small linked visibility fixture proves its contract only. Full linked
+storage archive/cold-source runtime remain unqualified; full Linux
+qualification is waived.
+
+Independent producer CPU and children outside retained holders, durable accepted
+effects and completion reservations before PREPARE, required-mode activation,
+hidden-owner authority, remaining routes/backends, overload faults and default
+policy integration remain open. The full design remains incomplete.
+
 ## Latest main integration after controlled preparation (2026-10-20)
 
 Merged `origin/main` through `097588bf5d9d2f32cc16574545d95c375bbb24a1`
@@ -53,7 +93,7 @@ of the full design remain open.
 Merged `origin/main` at `51cfaa8f6ef8ccc8b14f7c7b3201b84a36863449` in
 `9b633a4125766c95a42bf80e75f2cc3599cce691`, retaining the same worktree,
 branch and PR. Source `fc34f7465f4bd2d8019ee59fac80de149bb8fa8b` carries original request lifetime,
-IO and the projected monotonic deadline through the controlled native batch
+the supplied provider IO descriptor and projected monotonic deadline through the controlled native batch
 boundary into ordinary generated-effect preparation. The scope latches the
 first rejection. Native errors retain their original identity after inference
 transport aliases, using only the already latched cause when returning failure;
@@ -78,7 +118,7 @@ reader floor 10 remain unchanged. No durable format changes.
 provider/admission/telemetry cases and 21 PDF/funding cases. The two cached private error-name round trips
 retain the prior passing evidence with identical table, compiler and joinable-IO
 inputs. The new actual batch fixture exercises dense and sparse providers with expiration before
-dispatch, inherited deadline intersection, borrowed original IO, caller-thread
+dispatch, inherited deadline intersection, preservation of supplied IO in the direct DB fixture, caller-thread
 execution without a child runnable, late output rejection, source absence,
 released fences, unchanged resident configuration, retained counters and a
 successful new request after the rejected scope retires. It covers original

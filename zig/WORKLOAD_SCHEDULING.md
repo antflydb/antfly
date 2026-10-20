@@ -18,15 +18,26 @@ implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` through `097588bf5d9d2f32cc16574545d95c375bbb24a1`
 (merge commit `1f1d60a4387601fa6d3f88150e4fd98218a2e99d`).
 
-Native ABI 48, storage-owner ABI 109, engine descriptor 29, required preparation
+Native ABI 49, storage-owner ABI 109, engine descriptor 29, required preparation
 file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
 
+Source `634626b904c19a1cc190ce0a7691b0ca99de2628` removes the per-request executor
+from controlled owner writes. Request IO survives pre-decision callbacks;
+configured host IO supplies requests without an explicit executor. Clock-only
+IO is separate, explicit invalid descriptors fail, and owner transitions sleep
+on their original executor. Seven admission cases, eight context cases,
+42 provider regressions and three unchanged-source IO cases pass, with 87/87
+focused build steps and 25/25 immutable-package ReleaseSafe consumer steps.
+The small linked visibility fixture proves its contract; source-controller and
+range-dispatch coverage remain semantic only. Full archive/cold-source runtime
+remain unqualified. The full design is incomplete.
+
 Source `fc34f7465f4bd2d8019ee59fac80de149bb8fa8b` carries original lifetime,
-IO and projected deadlines through ordinary controlled native batch preparation.
+the supplied provider IO descriptor and projected deadlines through ordinary controlled native batch preparation.
 Owned runtime/config copies intersect inherited provider controls; rejected
 outputs retire without changing the shared lifecycle guard or configuration.
 Native error translation preserves the already latched original cause without
