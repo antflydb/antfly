@@ -24,12 +24,22 @@ fn typeContract(comptime T: type) native.TypeContract {
 
 const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
 
+/// Provider work retains the caller's CPU while mutation/capture holders live.
+/// This descriptor supplies its original IO and native monotonic deadline only;
+/// no runnable capability may escape into provider workers through it.
+pub const ProducerInputs = struct {
+    io: native.IoBorrow,
+    deadline_ns: ?u64 = null,
+};
+
 pub const RootContext = struct {
+    producer: ?ProducerInputs = null,
     root: ?*Barrier.RootSharedLease = null,
     retirement: ?*?Barrier.SharedLease = null,
     /// Used only after native commit retires all service holders.
     committed_visibility: ?@import("../common/execution_wait.zig").Boundary = null,
     pub fn validate(self: @This()) !void {
+        if (self.producer) |producer| _ = try producer.io.receive();
         if (self.retirement) |slot| {
             const root = self.root orelse return error.InvalidArgument;
             if (slot.*) |lease| if (lease.root != root or lease.barrier != root.barrier) return error.InvalidArgument;

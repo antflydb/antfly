@@ -7506,7 +7506,10 @@ pub const DB = struct {
         var invocation: @import("mutation_admission.zig").InvocationRoot = .{};
         defer invocation.deinit();
         const root = try invocation.bind(self.replicationMutationBarrier(), roots.root);
+        var provider_scope: execution_resources.PreparationProviderScope = .{};
+        const provider_context = try provider_scope.bind(controls, roots.producer, self.backend_runtime.io() orelse std.Options.debug_io);
         const opts: BatchExecutionOptions = .{
+            .provider_context = provider_context,
             .mutation_root = root,
             .enclosing_mutation_retirement = roots.retirement,
             .committed_visibility_wait = roots.committed_visibility,
@@ -7518,10 +7521,10 @@ pub const DB = struct {
         };
         if (benchMetricsEnabled()) {
             var profile: BatchProfile = .{};
-            try self.batchInternal(req, &profile, opts);
+            self.batchInternal(req, &profile, opts) catch |err| return provider_scope.originalFailure(err);
             logBatchProfile(req, profile);
         } else {
-            try self.batchInternal(req, null, opts);
+            self.batchInternal(req, null, opts) catch |err| return provider_scope.originalFailure(err);
         }
     }
 
@@ -62974,6 +62977,28 @@ test "db controlled mutation admission BEGIN and prepare preserve terminal clean
             self.checks += 1;
             if (self.checks >= self.fail_at) return self.cause;
         }
+        fn attempt(self: *@This(), target: *DB, id: types.TxnId, req: ?types.TransactionIntentRequest, created_at_ns: u64) !void {
+            const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = self, .check_fn = check } };
+            if (req) |request| try target.writeTransactionWithAdmissionControls(id, request, controls) else _ = try target.beginTransactionWithAdmissionControls(id, 1, created_at_ns, &.{}, true, true, controls);
+        }
+        fn expectFailure(self: *@This(), target: *DB, id: types.TxnId, req: ?types.TransactionIntentRequest, created_at_ns: u64, cause: anyerror, fail_at: usize) !void {
+            // Backend maintenance may win a fail-fast gate before this check.
+            // Retry only after the operation retires all holders; each new
+            // attempt targets the same original checkpoint from zero.
+            for (0..64) |_| {
+                self.* = .{ .cause = cause, .fail_at = fail_at };
+                self.attempt(target, id, req, created_at_ns) catch |err| {
+                    if (err == error.Backpressured) {
+                        sleepNs(std.time.ns_per_ms);
+                        continue;
+                    }
+                    try std.testing.expectEqual(cause, err);
+                    return;
+                };
+                return error.TestExpectedError;
+            }
+            return error.TestUnexpectedError;
+        }
     };
     var state: State = .{};
     const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &state, .check_fn = State.check } };
@@ -62983,20 +63008,19 @@ test "db controlled mutation admission BEGIN and prepare preserve terminal clean
     const begin_checks = state.checks;
     try std.testing.expect(begin_checks >= 4);
     try db.resolveTransactionIntents(baseline, .aborted, 2);
-    var ordinal: u8 = 2;
+    var ordinal: u128 = 2;
     for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
         for (1..begin_checks + 1) |fail_at| {
-            const id: types.TxnId = @splat(ordinal);
+            const id: types.TxnId = std.mem.toBytes(ordinal);
             ordinal += 1;
-            state = .{ .cause = cause, .fail_at = fail_at };
-            try std.testing.expectError(cause, db.beginTransactionWithAdmissionControls(id, 1, created_at_ns, &.{}, true, true, controls));
+            try state.expectFailure(&db, id, null, created_at_ns, cause, fail_at);
             try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(id));
             try std.testing.expect(db.core.tryLockApplyExclusive());
             db.core.unlockApply();
         }
     }
     const request: types.TransactionIntentRequest = .{ .writes = &.{.{ .key = "prepared", .value = "{}" }} };
-    const prepared_baseline: types.TxnId = @splat(ordinal);
+    const prepared_baseline: types.TxnId = std.mem.toBytes(ordinal);
     ordinal += 1;
     _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(prepared_baseline, 1, created_at_ns, &.{}, true, true);
     state = .{};
@@ -63006,11 +63030,10 @@ test "db controlled mutation admission BEGIN and prepare preserve terminal clean
     try db.resolveTransactionIntents(prepared_baseline, .aborted, 2);
     for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
         for (1..prepare_checks + 1) |fail_at| {
-            const id: types.TxnId = @splat(ordinal);
+            const id: types.TxnId = std.mem.toBytes(ordinal);
             ordinal += 1;
             _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(id, 1, created_at_ns, &.{}, true, true);
-            state = .{ .cause = cause, .fail_at = fail_at };
-            try std.testing.expectError(cause, db.writeTransactionWithAdmissionControls(id, request, controls));
+            try state.expectFailure(&db, id, request, created_at_ns, cause, fail_at);
             try std.testing.expectEqual(types.TxnStatus.pending, try db.getTransactionStatus(id));
             // The foreground authority remains rejected. Mandatory terminal
             // cleanup must still complete under its independent ownership.
@@ -63059,6 +63082,94 @@ test "db controlled mutation admission real borrowed receiver rejects conflictin
     try std.testing.expect(receiver.mutation_root == &inherited);
     try std.testing.expect(!inherited.held and inherited.borrowers.load(.acquire) == 0);
     try std.testing.expect(!conflicting.held and conflicting.borrowers.load(.acquire) == 0);
+}
+
+test "db controlled generated providers retain original controls and retire rejected output" {
+    const a = std.testing.allocator;
+    const Context = @import("antfly_inference_execution_context").RequestContext;
+    const Probe = struct {
+        calls: usize = 0,
+        rejected: bool = false,
+        cause: anyerror,
+        reject_output: bool = false,
+        thread: @TypeOf(std.Thread.getCurrentId()),
+        deadline: u64 = std.math.maxInt(u64) - 1,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.rejected) return self.cause;
+        }
+        fn legacy(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UncontrolledProviderDispatched;
+        }
+        fn controlled(raw: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, dims: u32, context: Context) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
+            try std.testing.expect(context.runnable == null);
+            try std.testing.expectEqual(@as(?u64, self.deadline), context.deadline_ns);
+            try std.testing.expect(context.io.userdata == std.testing.io.userdata);
+            try context.check();
+            self.calls += 1;
+            const output = try alloc.alloc(f32, dims);
+            @memset(output, 1);
+            self.rejected = self.reject_output;
+            return output;
+        }
+        fn sparseLegacy(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            return error.UncontrolledProviderDispatched;
+        }
+        fn sparseControlled(raw: *anyopaque, alloc: Allocator, name: []const u8, text: []const u8, context: Context) !embedder_mod.SparseEmbedding {
+            const indices = try alloc.alloc(u32, 1);
+            errdefer alloc.free(indices);
+            indices[0] = 1;
+            const values = try controlled(raw, alloc, name, text, 1, context);
+            return .{ .indices = indices, .values = values };
+        }
+    };
+    for ([_]bool{ false, true }) |sparse| {
+        for ([_]anyerror{ error.OriginalProviderAuthorityRejected, error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+            var probe: Probe = .{ .thread = std.Thread.getCurrentId(), .cause = cause };
+            var directory = try TestDirectory.init("controlled-generated-providers");
+            defer directory.cleanup();
+            var db = try DB.open(a, directory.path(), .{
+                .enrichment = .{ .owner_id = "controlled-request", .dense_embedder = if (sparse) null else .{ .ptr = &probe, .dense_embed_fn = Probe.legacy, .dense_embed_with_context_fn = Probe.controlled, .foreground_bounded = true, .part_request_context = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) - 1 } }, .sparse_embedder = if (!sparse) null else .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseLegacy, .sparse_embed_with_context_fn = Probe.sparseControlled, .foreground_bounded = true, .request_context = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) - 1 } } },
+            });
+            defer db.close();
+            try db.addIndex(if (sparse) .{ .name = "sp_controls", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}" } else .{ .name = "dv_controls", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}" });
+            const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &probe, .check_fn = Probe.check } };
+            const io = std.testing.io;
+            var roots: @import("../../api/batch_execution_admission.zig").RootContext = .{ .producer = .{ .io = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&io), .deadline_ns = 0 } };
+            const request: types.BatchRequest = .{ .writes = &.{.{ .key = "doc:controls", .value = "{\"body\":\"alpha\"}" }}, .sync_level = .enrichments };
+            try std.testing.expectError(error.Timeout, db.batchWithAdmissionControlsAndRootContext(request, controls, .none, roots, null, null));
+            try std.testing.expectEqual(@as(usize, 0), probe.calls);
+            roots.producer.?.deadline_ns = std.math.maxInt(u64);
+            probe.reject_output = true;
+            try std.testing.expectError(cause, db.batchWithAdmissionControlsAndRootContext(request, controls, .none, roots, null, null));
+            try std.testing.expectEqual(@as(usize, 1), probe.calls);
+            try std.testing.expect((try db.get(a, "doc:controls")) == null);
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApply();
+            var capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedMutationAdmission;
+            capture.release();
+            const resident = db.enrichment_runtime.?;
+            try std.testing.expect(resident.provider_request_context == null);
+            try std.testing.expectEqual(@as(?u64, probe.deadline), if (sparse) resident.config.sparse_embedder.?.request_context.?.deadline_ns else resident.config.dense_embedder.?.part_request_context.?.deadline_ns);
+            const failed_stats = resident.stats();
+            try std.testing.expectEqual(@as(u64, 1), failed_stats.embed_batches_started);
+            try std.testing.expectEqual(@as(u64, 0), failed_stats.embed_batches_completed);
+            probe.rejected = false;
+            probe.reject_output = false;
+            try db.batchWithAdmissionControlsAndRootContext(request, controls, .none, roots, null, null);
+            const value = (try db.get(a, "doc:controls")).?;
+            defer a.free(value);
+            try std.testing.expectEqualStrings(request.writes[0].value, value);
+            try std.testing.expectEqual(@as(usize, 2), probe.calls);
+            const stats = resident.stats();
+            try std.testing.expectEqual(@as(u64, 2), stats.embed_batches_started);
+            try std.testing.expectEqual(@as(u64, 1), stats.embed_batches_completed);
+            try std.testing.expect(resident.provider_request_context == null);
+            try std.testing.expectEqual(@as(?u64, probe.deadline), if (sparse) resident.config.sparse_embedder.?.request_context.?.deadline_ns else resident.config.dense_embedder.?.part_request_context.?.deadline_ns);
+        }
+    }
 }
 
 test "db controlled mutation admission rejects before effects and releases service fences" {

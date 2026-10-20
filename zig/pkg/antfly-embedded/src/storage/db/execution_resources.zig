@@ -1007,7 +1007,46 @@ pub const RelationalPriorMembership = struct {
     }
 };
 
+/// Original non-suspending authority for synchronous pre-decision providers.
+/// IO and callbacks borrow this stable scope through every physical child join.
+pub const PreparationProviderScope = struct {
+    controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = undefined,
+    io_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = null,
+    deadline_ns: ?u64 = null,
+    rejection: @import("antfly_cancellation").Rejection = .{},
+
+    pub fn bind(self: *@This(), controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition, inputs: ?@import("../../api/batch_execution_admission.zig").ProducerInputs, fallback_io: std.Io) !@import("antfly_inference_execution_context").RequestContext {
+        self.* = .{ .controls = controls, .deadline_ns = if (inputs) |value| value.deadline_ns else null };
+        if (inputs) |value| self.io_receiver = try value.io.receive();
+        try check(self);
+        const context: @import("antfly_inference_execution_context").RequestContext = .{
+            .io = if (self.io_receiver) |*receiver| receiver.io() else fallback_io,
+            .deadline_ns = self.deadline_ns,
+            .cancellation = .{ .ptr = self, .check_fn = check },
+        };
+        return context;
+    }
+
+    /// Restore the native admission cause after inference's transport aliases.
+    /// Inspect only an already latched rejection; never poll after durability.
+    pub fn originalFailure(self: *const @This(), fallback: anyerror) anyerror {
+        self.rejection.check() catch |cause| return cause;
+        return fallback;
+    }
+
+    fn check(raw: *const anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+        try self.rejection.check();
+        self.controls.lifetime.check() catch |err| return self.rejection.remember(err);
+        if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline)
+            return self.rejection.remember(error.Timeout);
+        try self.rejection.check();
+    }
+};
+
 pub const BatchExecutionOptions = struct {
+    /// Pre-decision only. Never used to veto accepted durability or visibility.
+    provider_context: ?@import("antfly_inference_execution_context").RequestContext = null,
     /// Resolver-owned reader, borrowed until the batch orders its local tails.
     /// The batch retires its nested reader first and nulls this slot before waits.
     enclosing_mutation_retirement: ?*?MutationBarrier.SharedLease = null,

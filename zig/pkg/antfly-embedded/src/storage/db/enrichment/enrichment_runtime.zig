@@ -1229,7 +1229,8 @@ fn updateIndexPreparation(runtime: *EnrichmentRuntime, index_names: []const []co
 /// Records completed request-path chunk work. The synchronous caller does not
 /// expose a preparation lifetime, so this updates throughput counters without
 /// manufacturing an in-flight phase.
-pub fn noteIndexChunksCreated(runtime: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
+pub fn noteIndexChunksCreated(invocation: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
+    const runtime = invocation.request_telemetry_parent orelse invocation;
     if (count == 0) return;
     updateIndexPreparation(runtime, index_names, false, count);
 }
@@ -1632,7 +1633,8 @@ fn statusPhaseName(active: bool, phase: inference_request_context.Phase) []const
 // deliberately do not overwrite the replay worker's single active-batch
 // snapshot. Treating concurrent request batches as that one slot lets the
 // first completion clear another still-running batch from runtime status.
-fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize) void {
+fn noteTrackedRequestEmbedBatchStarted(invocation: *EnrichmentRuntime, index_names: []const []const u8, items: usize) void {
+    const runtime = invocation.request_telemetry_parent orelse invocation;
     if (comptime builtin.os.tag == .freestanding) {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
@@ -1656,7 +1658,7 @@ fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names:
 }
 
 fn noteTrackedRequestEmbedBatchFinished(
-    runtime: *EnrichmentRuntime,
+    invocation: *EnrichmentRuntime,
     index_names: []const []const u8,
     items: usize,
     bytes: usize,
@@ -1664,6 +1666,7 @@ fn noteTrackedRequestEmbedBatchFinished(
     elapsed_ns: u64,
     success: bool,
 ) void {
+    const runtime = invocation.request_telemetry_parent orelse invocation;
     if (!success) {
         if (comptime builtin.os.tag == .freestanding) {
             noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false, .synchronous_request);
@@ -3577,6 +3580,7 @@ fn checkProviderFailureGuard(runtime: *EnrichmentRuntime) !void {
 }
 
 fn assetProviderRequestContext(runtime: *EnrichmentRuntime) inference_request_context.RequestContext {
+    if (runtime.provider_request_context) |context| return context;
     const guard = runtime.active_provider_guard;
     const cancellation = if (guard.cancellation.ptr != null)
         guard.cancellation
@@ -3600,6 +3604,18 @@ fn foregroundProviderRequestContext(runtime: *EnrichmentRuntime) ?inference_requ
     const guard = runtime.active_provider_guard;
     if (guard.deadline_ns == null and guard.cancellation.ptr == null) return null;
     return assetProviderRequestContext(runtime);
+}
+
+// Config copies in controlled preparation already intersect inherited controls.
+// Explicit retry calls must retain that provider-specific intersection as well.
+fn denseProviderRequestContext(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder) ?inference_request_context.RequestContext {
+    if (runtime.provider_request_context != null) return provider.part_request_context orelse assetProviderRequestContext(runtime);
+    return foregroundProviderRequestContext(runtime);
+}
+
+fn sparseProviderRequestContext(runtime: *EnrichmentRuntime, provider: embedder_mod.SparseEmbedder) ?inference_request_context.RequestContext {
+    if (runtime.provider_request_context != null) return provider.request_context orelse assetProviderRequestContext(runtime);
+    return foregroundProviderRequestContext(runtime);
 }
 
 fn checkProviderFailureGuardRecording(
@@ -3905,7 +3921,7 @@ fn embedDenseWithRetryUncached(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vector = (if (foregroundProviderRequestContext(runtime)) |context|
+        const vector = (if (denseProviderRequestContext(runtime, dense_embedder)) |context|
             dense_embedder.embedDenseWithContext(runtime.alloc, embedding_name, text, dims, context)
         else
             dense_embedder.embedDense(runtime.alloc, embedding_name, text, dims)) catch |err| {
@@ -3973,10 +3989,10 @@ fn embedDenseBatchAttempt(dense_embedder: embedder_mod.DenseEmbedder, runtime: *
     // Context-aware callbacks still require an explicit reentrancy guarantee.
     // Custom and legacy providers retain their serial path by default.
     const parallelism = @min(@min(generatedEmbedParallelBatches(), @max(@as(usize, 1), dense_embedder.dense_batch_concurrency)), texts.len);
-    if (parallelism <= 1 or dense_embedder.dense_embed_batch_with_context_fn == null) {
+    if (runtime.provider_request_context != null or parallelism <= 1 or dense_embedder.dense_embed_batch_with_context_fn == null) {
         if (dense_embedder.dense_embed_batch_with_context_fn != null)
-            return dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, assetProviderRequestContext(runtime));
-        return if (foregroundProviderRequestContext(runtime)) |context|
+            return dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, denseProviderRequestContext(runtime, dense_embedder) orelse assetProviderRequestContext(runtime));
+        return if (denseProviderRequestContext(runtime, dense_embedder)) |context|
             dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, context)
         else
             dense_embedder.embedDenseBatch(runtime.alloc, name, texts, dims);
@@ -4184,7 +4200,7 @@ fn embedDensePartsWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vector = (if (foregroundProviderRequestContext(runtime)) |context|
+        const vector = (if (denseProviderRequestContext(runtime, dense_embedder)) |context|
             dense_embedder.embedDensePartsWithContext(runtime.alloc, embedding_name, parts, dims, context)
         else
             dense_embedder.embedDenseParts(runtime.alloc, embedding_name, parts, dims)) catch |err| {
@@ -4222,7 +4238,7 @@ fn embedSparseWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, sparse_embedder.foreground_bounded);
-        const sparse = (if (foregroundProviderRequestContext(runtime)) |context|
+        const sparse = (if (sparseProviderRequestContext(runtime, sparse_embedder)) |context|
             sparse_embedder.embedSparseWithContext(runtime.alloc, embedding_name, text, context)
         else
             sparse_embedder.embedSparse(runtime.alloc, embedding_name, text)) catch |err| {
@@ -4261,7 +4277,7 @@ fn embedSparseBatchWithRetry(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, sparse_embedder.foreground_bounded);
-        const sparse_batch = (if (foregroundProviderRequestContext(runtime)) |context|
+        const sparse_batch = (if (sparseProviderRequestContext(runtime, sparse_embedder)) |context|
             sparse_embedder.embedSparseBatchWithContext(runtime.alloc, embedding_name, texts, context)
         else
             sparse_embedder.embedSparseBatch(runtime.alloc, embedding_name, texts)) catch |err| {
@@ -4921,6 +4937,10 @@ const UnsupportedEnrichmentRuntime = struct {
     dense_result_cache: ?embedder_mod.DenseResultCache = null,
     generated_publication: ?GeneratedPublicationPort = null,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
+    /// Invocation-local only; never installed on the shared lifecycle runtime.
+    provider_request_context: ?inference_request_context.RequestContext = null,
+    /// Request counters use the resident runtime; provider controls stay local.
+    request_telemetry_parent: ?*EnrichmentRuntime = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
     /// before releasing BackendRuntime.
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
@@ -5437,6 +5457,10 @@ const PlatformEnrichmentRuntime = struct {
 
     alloc: Allocator,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
+    /// Invocation-local only; never installed on the shared lifecycle runtime.
+    provider_request_context: ?inference_request_context.RequestContext = null,
+    /// Request counters use the resident runtime; provider controls stay local.
+    request_telemetry_parent: ?*EnrichmentRuntime = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
     /// before releasing BackendRuntime. Per-operation lane leases protect
     /// lazily owned executors during concurrent shutdown.
@@ -8828,6 +8852,7 @@ const SharedPdfWindowScheduler = struct {
             } else if (producer.vtable.produce_batch_reported_with_context == null) return false;
             if (producer.vtable.invocation_memory_for_requests_with_context == null) return false;
             const runtime = self.scheduler.runtime;
+            if (runtime.provider_request_context != null) return false;
             const backend = runtime.backend_runtime orelse return false;
             if (self.lane == null) self.lane = backend.acquireInferenceLane() catch |err| switch (err) {
                 error.BackendRuntimeUnavailable => return false,
@@ -8915,6 +8940,7 @@ const SharedPdfWindowScheduler = struct {
 
         fn submit(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, sha: []const u8, stage_id: []const u8, rendered: PdfEmbeddingRenderedWindow, required: usize) !bool {
             const runtime = self.scheduler.runtime;
+            if (runtime.provider_request_context != null) return false;
             const provider = runtime.config.dense_embedder orelse return false;
             if (rendered == .raster) {
                 if (provider.dense_embed_raster_items_with_context_fn == null) return false;
@@ -15025,6 +15051,7 @@ test "shared PDF precommit cache reclamation skips locked borrowers and preserve
 /// in DB's existing atomic batch, and optional staging is strictly bounded.
 pub const PrecommitDocumentExecution = struct {
     owner_alloc: Allocator,
+    provider_cancellations: [4]AssetInvocationCancellation = undefined,
     runtime: EnrichmentRuntime,
     scheduler: SharedPdfWindowScheduler,
     results: PrecommitResultCache = .{},
@@ -15048,6 +15075,16 @@ pub const PrecommitDocumentExecution = struct {
     /// It owns invocation and coordinator metadata; separately granted native
     /// windows/results retain raw backing and their existing resource ledger.
     pub fn createWithAllocator(parent: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !*@This() {
+        return createWithContext(parent, alloc, requests, raw, parent.provider_request_context);
+    }
+
+    /// Original lifetime is borrowed through all physical joins. CPU stays
+    /// retained by the caller; a parent's runnable is never lent under holders.
+    pub fn createWithContext(parent: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8, context: ?inference_request_context.RequestContext) !*@This() {
+        if (context) |original| {
+            if (original.runnable != null) return error.InvalidRunnableTransition;
+            try original.check();
+        }
         if (builtin.os.tag == .freestanding) return error.UnsupportedPrecommitDocumentExecution;
         const self = try alloc.create(@This());
         errdefer alloc.destroy(self);
@@ -15069,6 +15106,7 @@ pub const PrecommitDocumentExecution = struct {
                 .notify_ctx = self,
                 .notify_fn = ignoreNotification,
                 .config = parent.config,
+                .request_telemetry_parent = parent.request_telemetry_parent orelse (if (context != null) parent else null),
                 .ownership = try ownership_mod.State.init(alloc, parent.store, "precommit-no-lease", .{}),
             },
             .scheduler = undefined,
@@ -15081,7 +15119,44 @@ pub const PrecommitDocumentExecution = struct {
         self.scheduler.precommit = self;
         self.scheduler.raw_doc = raw;
         self.runtime.shared_pdf_windows = &self.scheduler;
+        errdefer self.results.deinit();
+        if (context) |original| try self.installProviderContext(original);
         return self;
+    }
+
+    fn mergeProviderContext(self: *@This(), slot: usize, original: inference_request_context.RequestContext, inherited: ?inference_request_context.RequestContext) !inference_request_context.RequestContext {
+        if (inherited) |value| if (value.runnable != null) return error.InvalidRunnableTransition;
+        self.provider_cancellations[slot] = .{
+            .lifecycle = self.runtime.config.cancellation,
+            .request = original.cancellation orelse .none,
+            .inherited = if (inherited) |value| value.cancellation orelse .none else .none,
+        };
+        var merged = original;
+        if (inherited) |value| if (value.deadline_ns) |deadline| {
+            merged.deadline_ns = if (merged.deadline_ns) |current| @min(current, deadline) else deadline;
+        };
+        merged.cancellation = .{ .ptr = &self.provider_cancellations[slot], .check_fn = AssetInvocationCancellation.check, .is_cancelled_fn = AssetInvocationCancellation.isCancelled };
+        try merged.check();
+        return merged;
+    }
+
+    fn installProviderContext(self: *@This(), original: inference_request_context.RequestContext) !void {
+        const context = try self.mergeProviderContext(0, original, null);
+        self.runtime.provider_request_context = context;
+        self.runtime.active_provider_guard = .{
+            .clock = self.runtime.deadline_clock,
+            .deadline_ns = if (context.deadline_ns) |deadline| self.runtime.deadline_clock.nowRealtimeNs() +| (deadline -| platform_time.monotonicNs()) else null,
+            .cancellation = context.cancellation orelse .none,
+        };
+        if (self.runtime.config.dense_embedder) |*provider| provider.part_request_context = try self.mergeProviderContext(1, original, provider.part_request_context);
+        if (self.runtime.config.sparse_embedder) |*provider| provider.request_context = try self.mergeProviderContext(2, original, provider.request_context);
+        if (self.runtime.config.asset_producer) |*provider| {
+            const inherited = provider.invocation_context;
+            const scoped = try self.mergeProviderContext(3, original, .{ .io = context.io, .deadline_ns = inherited.deadline_ns, .cancellation = inherited.cancellation, .progress = inherited.progress });
+            var invocation = asset_producer_mod.InvocationContext.fromRequestContext(scoped);
+            invocation.max_response_bytes = inherited.max_response_bytes;
+            provider.* = provider.withInvocationContext(invocation);
+        }
     }
 
     pub fn select(self: *@This(), index: usize) void {
@@ -18414,7 +18489,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         .started_ns = 0,
     };
     var pdf_prefetch_future: ?Io.Future(void) = null;
-    const pdf_prefetch_io = runtime.config.io;
+    const pdf_prefetch_io = if (runtime.provider_request_context == null) runtime.config.io else null;
     defer {
         SharedPdfWindowScheduler.WindowWork.cancel(&shared_work);
         pdf_prefetch_cancel_requested.store(true, .release);
@@ -26834,7 +26909,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
         .use_borrowed_rasters = use_borrowed_rasters,
         .cancel_requested = &prefetch_cancel_requested,
     };
-    const prefetch_io = runtime.config.io;
+    const prefetch_io = if (runtime.provider_request_context == null) runtime.config.io else null;
     const prefetch_batches = generatedPdfRenderPrefetchBatches();
     var prefetch_job = PdfEmbeddingWindowPrefetch{
         .preparer = &window_preparer,

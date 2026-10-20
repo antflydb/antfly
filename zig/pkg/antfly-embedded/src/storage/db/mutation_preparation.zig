@@ -1180,6 +1180,52 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preplanned: ?*const GeneratedBatchWritePlan,
             generated_memo: ?*GeneratedEmbeddingMemo,
         ) !PrecomputedGeneratedBatch {
+            return prepareGeneratedEnrichmentsWithContext(self, alloc, req, extracted, precompute_mode, force_generated_artifact_names, preplanned, generated_memo, null);
+        }
+
+        pub fn prepareGeneratedEnrichmentsWithContext(
+            self: anytype,
+            alloc: Allocator,
+            req: types.BatchRequest,
+            extracted: []const mapper.ExtractedWrite,
+            precompute_mode: GeneratedPrecomputeMode,
+            force_generated_artifact_names: []const []const u8,
+            preplanned: ?*const GeneratedBatchWritePlan,
+            generated_memo: ?*GeneratedEmbeddingMemo,
+            context: ?@import("antfly_inference_execution_context").RequestContext,
+        ) !PrecomputedGeneratedBatch {
+            if (context) |original| {
+                try original.check();
+                if (preplanned == null and !S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets()) return .{};
+                if (S.ownerField(self, "enrichment_runtime").*) |parent| {
+                    const invocation = try enrichment_runtime_mod.PrecommitDocumentExecution.createWithContext(parent, alloc, &.{}, "", original);
+                    defer invocation.destroy();
+                    // The enclosing scope carries provider controls only. A real
+                    // document invocation installs its own nonempty PDF scheduler.
+                    invocation.runtime.shared_pdf_windows = null;
+                    var runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = &invocation.runtime;
+                    var receiver = if (@TypeOf(self) == *S.PreparedBatchOwner) self.* else S.PreparedBatchOwner.from(self);
+                    receiver.enrichment_runtime = &runtime;
+                    var result = try prepareGeneratedEnrichmentsImpl(&receiver, alloc, req, extracted, precompute_mode, force_generated_artifact_names, preplanned, generated_memo, original);
+                    errdefer result.deinit(alloc);
+                    try original.check();
+                    return result;
+                }
+            }
+            return prepareGeneratedEnrichmentsImpl(self, alloc, req, extracted, precompute_mode, force_generated_artifact_names, preplanned, generated_memo, context);
+        }
+
+        fn prepareGeneratedEnrichmentsImpl(
+            self: anytype,
+            alloc: Allocator,
+            req: types.BatchRequest,
+            extracted: []const mapper.ExtractedWrite,
+            precompute_mode: GeneratedPrecomputeMode,
+            force_generated_artifact_names: []const []const u8,
+            preplanned: ?*const GeneratedBatchWritePlan,
+            generated_memo: ?*GeneratedEmbeddingMemo,
+            context: ?@import("antfly_inference_execution_context").RequestContext,
+        ) !PrecomputedGeneratedBatch {
             if (preplanned == null and !S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets()) return .{};
             if (preplanned) |plan| if (plan.rows.len != req.writes.len) return error.InvalidArgument;
             var fallback_write_plan = if (preplanned == null)
@@ -1251,6 +1297,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             for (req.writes, 0..) |_, i| {
+                if (context) |original| try original.check();
                 if (!extracted[i].hasDocument()) continue;
                 var owned_row_plan: ?GeneratedBatchWritePlan = null;
                 defer if (owned_row_plan) |*plan| plan.deinit();
@@ -1307,6 +1354,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     null;
                 defer if (document_execution) |execution| execution.destroy();
                 for (generated, 0..) |request, request_index| {
+                    if (context) |original| try original.check();
                     if (document_execution) |execution| execution.select(request_index);
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) {
                         if (request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request))) {
@@ -1576,6 +1624,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const max_bytes = generatedEmbedBatchBytes();
 
             for (req.writes, 0..) |_, row_index| {
+                if (runtime.provider_request_context) |original| try original.check();
                 for (plan.rows[row_index].requests) |request| {
                     if (request.kind != .dense_embedding or request.input_kind != .document) continue;
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) continue;
@@ -1697,7 +1746,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             plan: *const GeneratedBatchWritePlan,
             memo: *GeneratedEmbeddingMemo,
         ) !void {
-            if (S.ownerField(self, "enrichment_runtime").* == null or S.ownerField(self, "enrichment_runtime").*.?.config.sparse_embedder == null) return;
+            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
+            if (runtime.config.sparse_embedder == null) return;
             var jobs = std.ArrayListUnmanaged(GeneratedSparseMemoJob).empty;
             defer {
                 clearGeneratedSparseMemoJobs(memo.alloc, &jobs);
@@ -1710,6 +1760,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const max_bytes = generatedEmbedBatchBytes();
 
             for (req.writes, 0..) |_, row_index| {
+                if (runtime.provider_request_context) |original| try original.check();
                 for (plan.rows[row_index].requests) |request| {
                     if (request.kind != .sparse_embedding or request.input_kind != .document) continue;
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) continue;

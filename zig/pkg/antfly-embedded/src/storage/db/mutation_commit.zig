@@ -165,7 +165,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const makeTimestampKey = S.makeTimestampKey;
         const overwriteProbeLessThan = S.overwriteProbeLessThan;
         const planGeneratedEnrichmentsForRows = S.planGeneratedEnrichmentsForRows;
-        const prepareGeneratedEnrichments = S.prepareGeneratedEnrichments;
+        const prepareGeneratedEnrichmentsWithContext = S.prepareGeneratedEnrichmentsWithContext;
         const prepareRelationalRows = S.prepareRelationalRows;
         const projectedBatchLsmAdmissionBytes = S.projectedBatchLsmAdmissionBytes;
         const relationalColumns = S.relationalColumns;
@@ -691,7 +691,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         var extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, rows.len);
                         defer preparation_alloc.free(extracted_rows);
                         for (rows, 0..) |maybe_row, index| extracted_rows[index] = maybe_row.?.extracted;
-                        preprepared_generated = try prepareGeneratedEnrichments(
+                        preprepared_generated = try prepareGeneratedEnrichmentsWithContext(
                             self,
                             preparation_alloc,
                             effective_req,
@@ -700,6 +700,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             opts.force_generated_artifact_names,
                             &preprepared_generated_plan.?,
                             generated_memo,
+                            opts.provider_context,
                         );
                     }
                     if (profile) |active_profile| {
@@ -780,7 +781,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
                         }
                     }
-                    preprepared_document_generated = try prepareGeneratedEnrichments(
+                    preprepared_document_generated = try prepareGeneratedEnrichmentsWithContext(
                         self,
                         preparation_alloc,
                         effective_req,
@@ -789,6 +790,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         opts.force_generated_artifact_names,
                         null,
                         generated_memo,
+                        opts.provider_context,
                     );
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
                 }
@@ -2255,7 +2257,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     precomputed_generated = preprepared_document_generated.?;
                     preprepared_document_generated = null;
                 } else {
-                    precomputed_generated = try prepareGeneratedEnrichments(
+                    precomputed_generated = try prepareGeneratedEnrichmentsWithContext(
                         self,
                         preparation_alloc,
                         effective_req,
@@ -2264,6 +2266,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         opts.force_generated_artifact_names,
                         null,
                         generated_memo,
+                        opts.provider_context,
                     );
                 }
 

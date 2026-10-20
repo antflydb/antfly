@@ -134,6 +134,7 @@ pub const DenseEmbedder = struct {
     foreground_bounded: bool = false,
 
     pub fn embedDense(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
+        if (self.part_request_context) |context| return self.embedDenseWithContext(alloc, embedding_name, text, dims, context);
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "dense embedder");
         defer sanitized.deinit(alloc);
         return try self.dense_embed_fn(self.ptr, alloc, embedding_name, sanitized.text, dims);
@@ -146,6 +147,7 @@ pub const DenseEmbedder = struct {
         texts: []const []const u8,
         dims: u32,
     ) ![]const []const f32 {
+        if (self.part_request_context) |context| return self.embedDenseBatchWithContext(alloc, embedding_name, texts, dims, context);
         var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
         defer sanitized.deinit(alloc);
         const safe_texts = sanitized.texts();
@@ -593,6 +595,7 @@ fn contentPartPreparationBytes(parts: []const template_mod.ContentPart) !usize {
 }
 
 pub const SparseEmbedder = struct {
+    request_context: ?RequestContext = null,
     ptr: *anyopaque,
     sparse_embed_fn: SparseEmbedFn,
     sparse_embed_batch_fn: ?SparseEmbedBatchFn = null,
@@ -606,6 +609,7 @@ pub const SparseEmbedder = struct {
     foreground_bounded: bool = false,
 
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
+        if (self.request_context) |context| return self.embedSparseWithContext(alloc, embedding_name, text, context);
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "sparse embedder");
         defer sanitized.deinit(alloc);
         return try self.sparse_embed_fn(self.ptr, alloc, embedding_name, sanitized.text);
@@ -617,6 +621,7 @@ pub const SparseEmbedder = struct {
         embedding_name: []const u8,
         texts: []const []const u8,
     ) ![]SparseEmbedding {
+        if (self.request_context) |context| return self.embedSparseBatchWithContext(alloc, embedding_name, texts, context);
         var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
         defer sanitized.deinit(alloc);
         const safe_texts = sanitized.texts();

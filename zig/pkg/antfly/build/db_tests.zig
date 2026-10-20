@@ -35,6 +35,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.embedder.test.",
         "storage.db.enrichment.asset_producer.test.",
         "asset producer runtime invocation context can only tighten configured controls",
+        "db controlled generated providers",
+        "db controlled mutation admission",
+        "request embedding telemetry preserves",
     };
     const provider_control_tests = b.addTest(.{
         .name = "precommit-provider-control-tests",

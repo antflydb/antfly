@@ -5690,12 +5690,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         var execution_admission: controlled.Session = .{};
         const execution_port = if (original_context) |original| try execution_admission.bindWithRunnable(original, admission_io.?.io(), original_runnable) else null;
         const batch_admission = @import("antfly_local_sources").api_batch_execution_admission;
+        const producer_io: ?std.Io = if (original_context != null) admission_io.?.io() else null;
+        const producer_deadline: ?u64 = if (original_context) |original| (try platformDeadlineContext(original)).deadline_ns else null;
         var batch_payload: ?batch_admission.Payload = if (execution_port) |port| .{
             .original = port,
             .roots = .{
                 .root = if (capture_root) |*root| root else null,
                 .retirement = if (capture_root != null) &replication_mutation else null,
                 .committed_visibility = execution_admission.committedVisibilityBoundary(),
+                .producer = .{ .io = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&producer_io.?), .deadline_ns = producer_deadline },
             },
         } else null;
         var batch_port: ?batch_admission.Port = if (batch_payload) |*payload| batch_admission.Port.init(payload) else null;

@@ -660,6 +660,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const preflightReplicationMirrorSyncCommitContext = commit.preflightReplicationMirrorSyncCommitContext;
         pub const prepareDirectChangeRecord = commit.prepareDirectChangeRecord;
         pub const prepareGeneratedEnrichments = preparation.prepareGeneratedEnrichments;
+        pub const prepareGeneratedEnrichmentsWithContext = preparation.prepareGeneratedEnrichmentsWithContext;
         pub const prepareGraphContenderReconcilePage = materialization.prepareGraphContenderReconcilePage;
         pub const preparePreservedEmbeddingSources = preparation.preparePreservedEmbeddingSources;
         pub const prewarmGeneratedDenseMemo = preparation.prewarmGeneratedDenseMemo;
