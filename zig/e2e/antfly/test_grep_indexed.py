@@ -1201,7 +1201,12 @@ def test_logical_scalable_work_profile(stateful_api):
         # source. Projection should decline without a persistent read penalty.
         ("selected_dominant", 1024, "needle alpha beta " + "x" * 16384, {}),
         ("unselected_arrays", 1024, "needle alpha beta", {"unused": ["\n" * 16] * 512}),
-        ("nested_source", 1024, "needle alpha beta", {"unused": ["\n" * 16] * 512}),
+        (
+            "nested_source",
+            1024,
+            "needle alpha beta",
+            {"regions": [{"start_line": 1, "end_line": 1}] * 1024},
+        ),
     ]:
         table = f"logical_scalable_{name}_{time.time_ns()}"
         stateful_api.create_table(table)
@@ -1224,12 +1229,16 @@ def test_logical_scalable_work_profile(stateful_api):
         )
         field = "grep.content" if name == "nested_source" else "title"
         missing_field = "grep.other" if name == "nested_source" else "other"
-        value = (
-            {"grep": {"content": title, "regions": extra["unused"]}}
-            if name == "nested_source"
-            else {"title": title, **extra}
-        )
-        documents = {f"{i:06}": value for i in range(count)}
+        if name == "nested_source":
+            # Exercise the actual v1 source contract, including large valid
+            # region metadata and the default nested content path.
+            documents = {}
+            for i in range(count):
+                value = document(f"{i:06}.py", title)
+                value["grep"]["regions"] = extra["regions"]
+                documents[f"{i:06}"] = value
+        else:
+            documents = {f"{i:06}": {"title": title, **extra} for i in range(count)}
         corpus = json.dumps(documents, sort_keys=True, separators=(",", ":")).encode()
         for offset in range(0, count, 128):
             keys = list(documents)[offset : offset + 128]
