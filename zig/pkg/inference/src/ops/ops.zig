@@ -788,13 +788,15 @@ pub const EmbeddingHeadParams = extern struct {
     stride: u32,
     start: u32,
     rotate: u32,
+    /// 0: identity rows; 1: source row IDs; 2: identity rows, explicit positions.
     gather: u32,
     weighted: u32,
     eps: f32,
     theta: f32,
     scale: f32,
+    cached_rotary: u32 = 0,
     pub fn validate(self: EmbeddingHeadParams) !void {
-        if (self.source_rows == 0 or self.rows == 0 or self.source_heads == 0 or self.heads == 0 or self.heads % self.source_heads != 0 or self.dim == 0 or self.dim > 512 or self.dim % 2 != 0 or self.sequence == 0 or self.rotate > 1 or self.gather > 1 or self.weighted > 1 or !std.math.isFinite(self.scale) or !std.math.isFinite(self.theta) or self.theta <= 0 or !std.math.isFinite(self.eps) or self.eps <= 0 or @as(usize, self.start) + @as(usize, self.source_heads) * self.dim > self.stride or (self.gather == 0 and self.rows > self.source_rows)) return error.InvalidTensorShape;
+        if (self.source_rows == 0 or self.rows == 0 or self.source_heads == 0 or self.heads == 0 or self.heads % self.source_heads != 0 or self.dim == 0 or self.dim > 512 or self.dim % 2 != 0 or self.sequence == 0 or self.rotate > 1 or self.gather > 2 or self.weighted > 1 or !std.math.isFinite(self.scale) or !std.math.isFinite(self.theta) or self.theta <= 0 or !std.math.isFinite(self.eps) or self.eps <= 0 or @as(usize, self.start) + @as(usize, self.source_heads) * self.dim > self.stride or (self.gather != 1 and self.rows > self.source_rows)) return error.InvalidTensorShape;
     }
 };
 
@@ -807,7 +809,24 @@ pub const VisionNormRopeParams = extern struct {
     eps: f32,
     theta: f32,
     scale: f32,
+    stride: u32 = 0,
+    start: u32 = 0,
+    rotate: u32 = 1,
+    weighted: u32 = 1,
+    cached_rotary: u32 = 0,
 };
+pub const EmbeddingRotarySpec = struct {
+    vision: bool = false,
+    dim: u32,
+    x: u32,
+    y: u32 = 0,
+    theta: f32,
+    pub fn values(self: EmbeddingRotarySpec) !usize {
+        if (self.dim == 0 or self.dim > 512 or self.dim % (if (self.vision) @as(u32, 4) else 2) != 0 or self.x == 0 or self.x > 8192 or self.y > 8192 or (self.vision and self.y == 0) or (!self.vision and self.y != 0) or !std.math.isFinite(self.theta) or self.theta <= 0) return error.InvalidTensorShape;
+        return try std.math.mul(usize, try std.math.add(usize, self.x, self.y), self.dim / (if (self.vision) @as(u32, 4) else 2) * 2);
+    }
+};
+pub const EmbeddingVisionSpec = struct { rows: usize, hidden: usize, intermediate: usize };
 pub const Gemma4AudioLocalAttentionParams = struct {
     rows: usize,
     hidden: usize,
@@ -823,6 +842,9 @@ pub const Gemma4AudioLocalAttentionParams = struct {
     exclude_farthest_key: bool = false,
     /// Segmented entries carry +/- (clip_start + 1); negative is invalid.
     segmented: bool = false,
+    packed_qkv: bool = false,
+    packed_clamp_flags: u32 = 0,
+    packed_bounds: [6]f32 = @splat(0),
 };
 pub const DecoderRuntimeApplyActivationRequest = backend_contracts.DecoderRuntimeApplyActivationRequest;
 pub const DecoderRuntimeApplyGeluBackwardRequest = backend_contracts.DecoderRuntimeApplyGeluBackwardRequest;
@@ -1618,6 +1640,32 @@ pub const LayaActionFeaturesRequest = struct {
 };
 
 /// Abstract compute backend for tensor operations.
+/// Borrowed from a synchronous media pipeline. Only completed, independently
+/// owned projections may cross a yield. Cleanup restores ownership even after
+/// cancellation; no queue/provider lease escapes its loaded model handle.
+pub const EmbeddingStageControl = struct {
+    ptr: *anyopaque,
+    pause_fn: *const fn (*anyopaque) anyerror!void,
+    resume_fn: *const fn (*anyopaque) anyerror!void,
+    cleanup_fn: *const fn (*anyopaque) void,
+    /// Replace the execution supplement at a fenced video boundary. Null
+    /// restores the composition envelope; zero retains only idle resources.
+    workspace_fn: ?*const fn (*anyopaque, ?usize) anyerror!void = null,
+    copy_fn: ?*const fn (*anyopaque, usize, u64) void = null,
+    pub fn workspace(self: *const @This(), bytes: ?usize) !void {
+        if (self.workspace_fn) |run| try run(self.ptr, bytes);
+    }
+    pub fn pause(self: *const @This()) !void {
+        try self.pause_fn(self.ptr);
+    }
+    pub fn acquire(self: *const @This()) !void {
+        try self.resume_fn(self.ptr);
+    }
+    pub fn cleanup(self: *const @This()) void {
+        self.cleanup_fn(self.ptr);
+    }
+};
+
 pub const ComputeBackend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -1626,6 +1674,7 @@ pub const ComputeBackend = struct {
     /// universal bounded checkpoint even for architectures without a bespoke
     /// `forwardWithControl` entry point.
     execution_control: ?InferenceExecutionControl = null,
+    embedding_stage: ?*const EmbeddingStageControl = null,
 
     pub fn checkExecutionControl(self: *const ComputeBackend) !void {
         if (self.execution_control) |control| try control.check();
@@ -2064,7 +2113,19 @@ pub const ComputeBackend = struct {
         depthwiseCausalConv1dSegmented: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, starts: CT, rows: usize, dim: usize, kernel_size: usize) anyerror!?CT = null,
         rmsNormClamped: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: NormClampParams) anyerror!?CT = null,
         clippedLinear: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, params: ClippedLinearParams) anyerror!?CT = null,
+        embeddingRotaryPrepare: ?*const fn (ctx: *anyopaque, spec: EmbeddingRotarySpec) anyerror!void = null,
+        embeddingVisionWorkspace: ?*const fn (ctx: *anyopaque, spec: ?EmbeddingVisionSpec) anyerror!void = null,
+        embeddingVisionNorm: ?*const fn (ctx: *anyopaque, input: CT, residual: ?CT, eps: f32, slot: usize) anyerror!?CT = null,
+        embeddingVisionQKV: ?*const fn (ctx: *anyopaque, input: CT, layer: usize, params: VisionNormRopeParams) anyerror!?SplitLastDim3Result = null,
+        embeddingVisionFFN: ?*const fn (ctx: *anyopaque, input: CT, layer: usize) anyerror!?CT = null,
+        embeddingCompactVisibility: ?*const fn (ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?EmbeddingCompactVisibility = null,
         embeddingModelVisibility: ?*const fn (ctx: *anyopaque, mask: []const i64, batch: usize, seq: usize, window: u32) anyerror!?EmbeddingModelVisibility = null,
+        embeddingWorkspacePrepare: ?*const fn (ctx: *anyopaque, spec: EmbeddingWorkspaceSpec) anyerror!void = null,
+        embeddingWorkspaceNorm: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelWeight, input: CT, residual: ?CT, dim: usize, eps: f32, scale: f32) anyerror!?CT = null,
+        maskedMeanSegments: ?*const fn (ctx: *anyopaque, input: CT, offsets: []const usize, width: usize) anyerror!?CT = null,
+        maskedMeanBatch: ?*const fn (ctx: *anyopaque, input: CT, mask: ?[]const i64, batch: usize, sequence: usize, width: usize, dimensions: usize, normalize: bool) anyerror!?CT = null,
+        embeddingComposeRows: ?*const fn (ctx: *anyopaque, wrappers: ?CT, media: CT, map: []const i32, width: usize) anyerror!?CT = null,
+        embeddingMediaTemplate: ?*const fn (ctx: *anyopaque, key: u64, ids: ?[]const i64, mask: ?[]const i64) anyerror!?EmbeddingMediaTemplate = null,
         embeddingModelPrepare: ?*const fn (ctx: *anyopaque, layers: usize) anyerror!void = null,
         embeddingModelWeight: ?*const fn (ctx: *anyopaque, layer: usize, kind: EmbeddingModelWeight) ?CT = null,
         embeddingModelScalar: ?*const fn (ctx: *anyopaque, layer: usize) ?f32 = null,
@@ -2086,6 +2147,7 @@ pub const ComputeBackend = struct {
         audioFrontend: ?*const fn (ctx: *anyopaque, input: CT, auxiliary: ?CT, params: AudioFrontendParams) anyerror!?CT = null,
         supportsLinearPackedNamed: ?*const fn (ctx: *anyopaque) bool = null,
         gemma4AudioLocalAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
+        gemma4AudioPackedAttention: ?*const fn (ctx: *anyopaque, q: CT, k: CT, v: CT, rel: CT, q_dim_scales: CT, valid: CT, params: Gemma4AudioLocalAttentionParams) anyerror!?CT = null,
 
         /// Y = X + value. Backends may keep scalar adds on device; callers
         /// fall back to host materialization or a broadcast scalar tensor.
@@ -2098,6 +2160,9 @@ pub const ComputeBackend = struct {
         /// Y = activation(gate) * up for decoder-runtime activation kinds.
         /// Backends may fuse the common gated-FFN activation/multiply pair.
         /// Consume row-packed [gelu gate; up] without materializing either half.
+        /// Optional bounded projection/GELU pipeline; avoids full packed FFN output.
+        embeddingStreamedFFN: ?*const fn (ctx: *anyopaque, layer: usize, input: CT, rows: usize, hidden: usize, intermediate: usize) anyerror!?CT = null,
+        embeddingGatedFFN: ?*const fn (ctx: *anyopaque, layer: usize, input: CT, rows: usize, hidden: usize, intermediate: usize) anyerror!?CT = null,
         packedGeluMultiply: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT = null,
         activationMultiply: ?*const fn (ctx: *anyopaque, gate: CT, up: CT, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
 
@@ -4820,6 +4885,22 @@ pub const ComputeBackend = struct {
         try self.checkExecutionControl();
         return out;
     }
+    /// Cooperatively cancel between FFN row tiles and restore nested controls.
+    pub fn embeddingFFN(self: *const ComputeBackend, layer: usize, input: CT, rows: usize, hidden: usize, intermediate: usize, streamed: bool) !?CT {
+        const run = (if (streamed) self.vtable.embeddingStreamedFFN else self.vtable.embeddingGatedFFN) orelse return null;
+        try self.checkExecutionControl();
+        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.audioSetControl) |set| {
+            _ = set(self.ptr, previous);
+        };
+        const output = try run(self.ptr, layer, input, rows, hidden, intermediate);
+        self.checkExecutionControl() catch |err| {
+            if (output) |tensor| self.free(tensor);
+            return err;
+        };
+        return output;
+    }
+
     pub fn audioExecution(self: *const ComputeBackend, key: u64, inputs: []const CT, context: *anyopaque, run: *const fn (*anyopaque, []const CT) anyerror!CT) !?CT {
         const op = self.vtable.audioExecution orelse return null;
         const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
@@ -4983,6 +5064,21 @@ pub const ComputeBackend = struct {
     pub fn mrope(self: *const ComputeBackend, input: CT, token_count: usize, head_dim: usize, theta: f32, freq_scale: f32, positions: []const u32, sections: [3]u32) !?CT {
         const op = self.vtable.mrope orelse return null;
         return op(self.ptr, input, token_count, head_dim, theta, freq_scale, positions, sections);
+    }
+
+    pub fn runEmbeddingVisionFFN(self: *const ComputeBackend, input: CT, layer: usize) !?CT {
+        const run = self.vtable.embeddingVisionFFN orelse return null;
+        try self.checkExecutionControl();
+        const previous = if (self.vtable.audioSetControl) |set| set(self.ptr, self.execution_control) else null;
+        defer if (self.vtable.audioSetControl) |set| {
+            _ = set(self.ptr, previous);
+        };
+        const output = try run(self.ptr, input, layer);
+        self.checkExecutionControl() catch |err| {
+            if (output) |ct| self.free(ct);
+            return err;
+        };
+        return output;
     }
 
     pub fn visionNormRope(self: *const ComputeBackend, input: CT, weight: CT, params: VisionNormRopeParams) !?CT {
@@ -6510,3 +6606,78 @@ pub const EmbeddingModelVisibility = struct {
     global_metadata: CT,
     window_metadata: CT,
 };
+
+pub const EmbeddingCompactVisibility = struct {
+    visibility: EmbeddingModelVisibility,
+    source_rows: []i64,
+    offsets: []usize,
+    ones: []i64,
+    device_positions: CT,
+};
+
+pub const EmbeddingWorkspaceSpec = struct {
+    rows: usize,
+    hidden: usize,
+    alternate_qkv_width: usize,
+    /// packed QKV, attention output, packed FFN, down, PLE gate, PLE output.
+    widths: [6]usize,
+};
+pub const EmbeddingMediaTemplate = struct { ids: []i64, mask: []i64 };
+
+test "embeddinggemma2 streamed FFN restores controls and releases post-cancel outputs" {
+    const Probe = struct {
+        cancelled: bool = false,
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+    };
+    const Fixture = struct {
+        active: ?InferenceExecutionControl = null,
+        probe: *Probe,
+        cancel_during: bool,
+        calls: usize = 0,
+        frees: usize = 0,
+        token: u8 = 0,
+        fn set(raw: *anyopaque, value: ?InferenceExecutionControl) ?InferenceExecutionControl {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const previous = self.active;
+            self.active = value;
+            return previous;
+        }
+        fn run(raw: *anyopaque, _: usize, _: CT, _: usize, _: usize, _: usize) anyerror!?CT {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(?*anyopaque, self.probe), self.active.?.ptr);
+            try self.active.?.check();
+            if (self.cancel_during) self.probe.cancelled = true;
+            return @ptrCast(&self.token);
+        }
+        fn free(raw: *anyopaque, _: CT) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.frees += 1;
+        }
+    };
+    for ([_]u8{ 0, 1, 2 }) |case| {
+        var probe = Probe{ .cancelled = case == 1 };
+        var old_probe = Probe{};
+        const old = InferenceExecutionControl{ .ptr = &old_probe, .check_fn = Probe.check };
+        var fixture = Fixture{ .probe = &probe, .cancel_during = case == 2, .active = old };
+        var table: ComputeBackend.VTable = undefined;
+        table.embeddingStreamedFFN = Fixture.run;
+        table.audioSetControl = Fixture.set;
+        table.freeTensor = Fixture.free;
+        const cb = ComputeBackend{ .ptr = &fixture, .vtable = &table, .execution_control = .{ .ptr = &probe, .check_fn = Probe.check } };
+        if (case == 0) {
+            const output = (try cb.embeddingFFN(0, @ptrCast(&fixture.token), 4, 4, 8, true)).?;
+            cb.free(output);
+        } else try std.testing.expectError(error.Cancelled, cb.embeddingFFN(0, @ptrCast(&fixture.token), 4, 4, 8, true));
+        try std.testing.expectEqual(@as(?*anyopaque, &old_probe), fixture.active.?.ptr);
+        try std.testing.expectEqual(@as(usize, if (case == 1) 0 else 1), fixture.calls);
+        try std.testing.expectEqual(@as(usize, if (case == 1) 0 else 1), fixture.frees);
+    }
+}
+
+test {
+    _ = @import("embedding_vision_plan.zig");
+}

@@ -56,6 +56,9 @@ pub const SpecialTokens = struct {
 pub const Tokenizer = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Optional immutable tokenization generation for lifetime-bound caches.
+    /// Change this before mutation/address reuse; mutable adapters leave it null.
+    cache_identity: ?u64 = null,
 
     pub const VTable = struct {
         /// Encode text into token IDs (without special tokens or padding).
