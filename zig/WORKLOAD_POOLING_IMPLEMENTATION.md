@@ -4,6 +4,48 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Caller-funded precommit producer planning (2026-10-20)
+
+Source `7ca0f1d0b40aa424d5de9ca8ebfe8881772706cb` connects generated-document preparation to
+the caller's preparation allocator. Invocation storage, ownership state, consumer
+configuration/plans, masks and coordinator-owned job metadata retain that allocator
+until the invocation's physical children join and teardown completes. Each shared
+PDF scheduler stores its allocator explicitly; nested runtime activity cannot
+change allocation/free ownership. The shared lifecycle runtime and provider state
+remain borrowed.
+
+Native page buffers, replay segments, optional result staging and independently
+admitted inference outputs keep their existing physical grants and raw backing.
+Charging those allocations through the preparation allocator again would count
+physical memory twice. Asynchronous workers retain their independently admitted
+allocation views; they do not borrow the coordinator's allocator.
+
+Native ABI 46 rejects older private execution layouts. API ABI 55, storage-owner
+ABI 109, runnable ABI 16, runtime-failure ABI 66, engine descriptor 29 and reader
+floor 10 remain unchanged. No new durable transaction format is introduced.
+
+`producer-planning-funding-v3` passes 76/76 build steps, with 21 producer/PDF cases
+and three borrowed-lifetime cases. The actual shared-consumer scenario now verifies
+quota refusal before a failing backing allocator is called, invocation allocation
+failure, failed consumer allocation with no published consumer array, continued
+use after that failure, and complete metadata release after joined work. Existing
+native window/grant, cache reclamation and document artifact reuse checks pass.
+The aggregate-pressure fixture provisions identity metadata explicitly while
+retaining its 64 KiB payload ceiling and original pressure thresholds. Both startup
+profiles and the source controller have semantic analysis only; full linked
+archive/cold-source runtime remain unqualified.
+
+`producer-planning-funding-verified.json` binds 5260 unchanged native inputs,
+all ABI/status/source-boundary checks and 4544 matching public sources from the
+immutable code commit. Its independent ReleaseSafe consumer passes 25/25 steps.
+
+Original provider deadline/cancellation/runnable controls, independently funded
+producer CPU, complete effect preparation before durable voting, completion
+resource reservations and required-mode provider activation remain open. This
+increment funds producer planning; it does not establish those remaining execution
+and durability guarantees. The full design remains incomplete, and full Linux
+qualification remains waived.
+
 ## Scoped resource stages through borrowed executions (2026-10-20)
 
 Source `4e43317f563766329da969438208fbba16ae1571` adds the following capability.

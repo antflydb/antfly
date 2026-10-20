@@ -18,12 +18,21 @@ implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `d227ec2811235d618b8e50d86ab4b1472b207cc4`
 (merge commit `b81563cddd6bd86941e40ebcdf2b1bf805113605`).
 
-Native ABI 45, storage-owner ABI 109, engine descriptor 29, required preparation
+Native ABI 46, storage-owner ABI 109, engine descriptor 29, required preparation
 file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
+
+Source `7ca0f1d0b40aa424d5de9ca8ebfe8881772706cb` funds precommit producer invocation and
+coordinator planning metadata from the original preparation allocator, retained
+through physical joins. Native windows and inference outputs keep their existing
+grants and raw backing. Explicit scheduler allocator ownership and quota/error
+regressions pass with 76/76 focused build steps and 25/25 immutable-package
+ReleaseSafe consumer steps. Original provider execution
+controls, durable completion resource reservations and required-mode providers
+remain open.
 
 Source `4e43317f563766329da969438208fbba16ae1571` adds scoped resource admission to borrowed
 original executions. The same owner admits CPU and the complete resource bundle;
