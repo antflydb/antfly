@@ -1197,6 +1197,9 @@ def test_logical_scalable_work_profile(stateful_api):
     for name, count, title, extra in [
         ("tiny", 4096, "needle alpha beta", {}),
         ("selected_large", 4096, "needle alpha beta " + "x" * 4096, {}),
+        # Above the authority threshold, but the selected root dominates the
+        # source. Projection should decline without a persistent read penalty.
+        ("selected_dominant", 1024, "needle alpha beta " + "x" * 16384, {}),
         ("unselected_arrays", 1024, "needle alpha beta", {"unused": ["\n" * 16] * 512}),
     ]:
         table = f"logical_scalable_{name}_{time.time_ns()}"
@@ -1639,6 +1642,7 @@ def test_logical_source_concurrency_profile(stateful_api):
             for trial in range(9):
                 barrier = threading.Barrier(concurrency + 1)
                 futures = [pool.submit(request, barrier) for _ in range(concurrency)]
+                host_load = os.getloadavg() if hasattr(os, "getloadavg") else None
                 before = read_process()
                 started = time.perf_counter_ns()
                 barrier.wait(timeout=30)
@@ -1649,6 +1653,7 @@ def test_logical_source_concurrency_profile(stateful_api):
                     {
                         "trial": trial,
                         "group_ms": elapsed,
+                        "host_load_average": host_load,
                         "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1e6,
                         "process_before": before,
                         "process_after": after,
@@ -1662,9 +1667,7 @@ def test_logical_source_concurrency_profile(stateful_api):
                 "cold_process": cold_process,
                 "runs": runs,
                 "median_request_ms": statistics.median(latencies),
-                "p95_request_ms": latencies[
-                    min(len(latencies) - 1, int(len(latencies) * 0.95))
-                ],
+                "p95_request_ms": latencies[(95 * len(latencies) + 99) // 100 - 1],
                 "mean_cpu_ms_per_request": statistics.mean(
                     r["cpu_ms"] / concurrency for r in runs
                 ),
