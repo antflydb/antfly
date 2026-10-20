@@ -23891,6 +23891,11 @@ pub const DB = struct {
 
     pub fn beginReplicatedTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8, requirement: ?@import("prepared_transaction_effects.zig").Requirement) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, requirement });
+        return self.beginReplicatedTransactionScopedWithBinding(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, requirement, null);
+    }
+
+    pub fn beginReplicatedTransactionScopedWithBinding(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8, requirement: ?@import("prepared_transaction_effects.zig").Requirement, binding: ?@import("prepared_transaction_effects.zig").Binding) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedTransactionScopedWithBinding", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, requirement, binding });
         lockApply(self);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
@@ -23905,7 +23910,8 @@ pub const DB = struct {
         }
         var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(identity, &value_buf);
-        if (requirement) |required| return self.core.beginTransactionRequiringPreparedEffects(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, required, .{ .writes = &.{marker} }, null);
+        if (requirement) |required| return self.core.beginTransactionRequiringPreparedEffectsWithBinding(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, required, binding, .{ .writes = &.{marker} }, null);
+        if (binding != null) return error.InvalidPreparationRequirement;
         return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
             txn_id,
             timestamp_ns,
@@ -23921,6 +23927,11 @@ pub const DB = struct {
     /// verifies/binds immutable bytes; it never invokes a producer.
     pub fn sealReplicatedTransactionEffectsAtOrderedReceipt(self: *DB, txn_id: types.TxnId, frame: []const u8, mode: @import("prepared_transaction_effects.zig").Mode, identity: OrderedApplyReceipt, scope: ?[32]u8) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("sealReplicatedTransactionEffectsAtOrderedReceipt", .{ self, txn_id, frame, mode, identity, scope });
+        return self.sealReplicatedTransactionEffectsWithBindingAtOrderedReceipt(txn_id, frame, mode, identity, scope, null);
+    }
+
+    pub fn sealReplicatedTransactionEffectsWithBindingAtOrderedReceipt(self: *DB, txn_id: types.TxnId, frame: []const u8, mode: @import("prepared_transaction_effects.zig").Mode, identity: OrderedApplyReceipt, scope: ?[32]u8, binding: ?@import("prepared_transaction_effects.zig").Binding) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("sealReplicatedTransactionEffectsWithBindingAtOrderedReceipt", .{ self, txn_id, frame, mode, identity, scope, binding });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         lockApply(self);
         defer self.core.unlockApply();
@@ -23940,11 +23951,12 @@ pub const DB = struct {
         const decision = try manager.getPreparationDecision(txn_id, null);
         if (decision.status != .pending) return error.DecisionConflict;
         const agreed = decision.requirement orelse return error.PreparationContractConflict;
+        if (!std.meta.eql(decision.binding, binding)) return error.PreparationContractConflict;
         if (agreed.mode != mode) return error.PreparationContractConflict;
         const catalog = try self.core.preparedEffectsCatalogDigest(null);
         var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(identity, &value_buf);
-        try manager.sealPreparedEffectsWithExtraBatch(txn_id, frame, catalog, mode, .{ .writes = &.{marker} }, null);
+        try manager.sealBoundPreparedEffectsWithExtraBatch(txn_id, frame, catalog, mode, binding, .{ .writes = &.{marker} }, null);
     }
 
     pub fn writeIntents(
@@ -24052,7 +24064,7 @@ pub const DB = struct {
         var replication_mutation = try admission.acquireReplicationMutationSharedPreDecisionScoped(self, controls, admission.receiverMutationRoot(self));
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.writeTransactionInternal(txn_id, req, null, if (replication_mutation != null) admission.retainedLeaseControls(controls) else controls, null);
+        try self.writeTransactionInternal(txn_id, req, null, if (replication_mutation != null) admission.retainedLeaseControls(controls) else controls, null, null);
     }
 
     pub fn writeReplicatedTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: OrderedApplyReceipt) !void {
@@ -24068,7 +24080,20 @@ pub const DB = struct {
         requirement: ?@import("prepared_transaction_effects.zig").Requirement,
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("writeReplicatedTransactionWithRequirementAtOrderedReceipt", .{ self, txn_id, req, identity, requirement });
+        return self.writeReplicatedTransactionWithBindingAtOrderedReceipt(txn_id, req, identity, requirement, null);
+    }
+
+    pub fn writeReplicatedTransactionWithBindingAtOrderedReceipt(
+        self: *DB,
+        txn_id: types.TxnId,
+        req: types.TransactionIntentRequest,
+        identity: OrderedApplyReceipt,
+        requirement: ?@import("prepared_transaction_effects.zig").Requirement,
+        binding: ?@import("prepared_transaction_effects.zig").Binding,
+    ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("writeReplicatedTransactionWithBindingAtOrderedReceipt", .{ self, txn_id, req, identity, requirement, binding });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        if (binding != null and requirement == null) return error.InvalidPreparationRequirement;
         if (requirement != null) {
             if (req.transforms.len != 0) return error.InvalidBatchRequest;
             lockApply(self);
@@ -24080,9 +24105,10 @@ pub const DB = struct {
             const decision = try manager.getPreparationDecision(txn_id, null);
             if (decision.status != .pending) return error.DecisionConflict;
             const agreed = decision.requirement orelse return error.PreparationContractConflict;
+            if (!std.meta.eql(decision.binding, binding)) return error.PreparationContractConflict;
             if (agreed.mode != requirement.?.mode) return error.PreparationContractConflict;
         }
-        try self.writeTransactionInternal(txn_id, req, identity, null, requirement);
+        try self.writeTransactionInternal(txn_id, req, identity, null, requirement, binding);
     }
 
     fn writeTransactionInternal(
@@ -24092,6 +24118,7 @@ pub const DB = struct {
         ordered_receipt: ?OrderedApplyReceipt,
         controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
         requirement: ?@import("prepared_transaction_effects.zig").Requirement,
+        preparation_binding: ?@import("prepared_transaction_effects.zig").Binding,
     ) !void {
         if (ordered_receipt == null) try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
@@ -24127,7 +24154,7 @@ pub const DB = struct {
                 @import("mutation_admission.zig").retainedLeaseControls(controls)
             else
                 controls;
-            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null, prepared_controls, requirement) catch |err| switch (err) {
+            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null, prepared_controls, requirement, preparation_binding) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -24149,6 +24176,7 @@ pub const DB = struct {
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
         controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
         requirement: ?@import("prepared_transaction_effects.zig").Requirement,
+        preparation_binding: ?@import("prepared_transaction_effects.zig").Binding,
     ) !void {
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
@@ -24485,6 +24513,7 @@ pub const DB = struct {
                 const decision = try topology_manager.getPreparationDecision(txn_id, null);
                 if (decision.status != .pending) return error.DecisionConflict;
                 const agreed = decision.requirement orelse return error.PreparationContractConflict;
+                if (!std.meta.eql(decision.binding, preparation_binding)) return error.PreparationContractConflict;
                 if (agreed.mode != required.mode) return error.PreparationContractConflict;
             }
             var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
@@ -124575,8 +124604,8 @@ test "db prepared transaction effects required protocol activation is durable an
         try std.testing.expect(try db.removeResolver("identity"));
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        try std.testing.expectEqual(@as(u32, 6), try catalog.readAuthoritativeReaderVersion(&read, catalog.supported_reader_version));
-        try std.testing.expectEqual(@as(u32, 6), try catalog.catalogReaderVersion(a, try read.get(inventory.resolver_key)));
+        try std.testing.expectEqual(@as(u32, 7), try catalog.readAuthoritativeReaderVersion(&read, catalog.supported_reader_version));
+        try std.testing.expectEqual(@as(u32, 7), try catalog.catalogReaderVersion(a, try read.get(inventory.resolver_key)));
         // Exercise the exact version predicate used by the previous reader.
         try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, catalog.readMinimumReaderVersion(&read, 5));
     }
@@ -124615,8 +124644,8 @@ test "db prepared transaction effects required protocol activation rejects unfen
     try db.enablePreparedTransactionProtocol();
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
-    try std.testing.expectEqualStrings("6", try read.get(catalog.replacement_reader_base_key));
-    try std.testing.expectEqualStrings("6", try read.get(catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings("7", try read.get(catalog.replacement_reader_base_key));
+    try std.testing.expectEqualStrings("7", try read.get(catalog.minimum_reader_key));
 }
 
 test "db prepared transaction effects required protocol rejects incomplete activation" {
@@ -124626,10 +124655,10 @@ test "db prepared transaction effects required protocol rejects incomplete activ
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
     defer db.close();
-    try db.core.store.put(catalog.minimum_reader_key, "6");
+    try db.core.store.put(catalog.minimum_reader_key, "7");
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.enablePreparedTransactionProtocol());
-    try db.core.store.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":6,\"resolvers\":[]}");
+    try db.core.store.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":7,\"resolvers\":[]}");
     try db.core.store.put(catalog.replacement_reader_base_key, "4");
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
 }
@@ -124746,15 +124775,15 @@ test "db prepared transaction effects required catalog raw transaction batch app
                 .transaction_put, .transaction_delete => {
                     var txn = try db.core.store.beginWriteTxn();
                     errdefer txn.abort();
-                    if (mode == .transaction_put) try txn.put(key, "{\"version\":6,\"resolvers\":[]}") else try txn.delete(key);
+                    if (mode == .transaction_put) try txn.put(key, "{\"version\":7,\"resolvers\":[]}") else try txn.delete(key);
                     try txn.commit();
                 },
                 .batch_put, .batch_append, .batch_delete => {
                     var batch = try db.core.store.beginWriteBatch();
                     errdefer batch.abort();
                     switch (mode) {
-                        .batch_put => try batch.put(key, "{\"version\":6,\"resolvers\":[]}"),
-                        .batch_append => try batch.asTxn().appendPut(key, "{\"version\":6,\"resolvers\":[]}"),
+                        .batch_put => try batch.put(key, "{\"version\":7,\"resolvers\":[]}"),
+                        .batch_append => try batch.asTxn().appendPut(key, "{\"version\":7,\"resolvers\":[]}"),
                         .batch_delete => try batch.delete(key),
                         else => unreachable,
                     }
@@ -124828,7 +124857,7 @@ test "db prepared transaction effects required catalog ambiguous commit invalida
         defer batch.abort();
         var fault: Fault = .{ .inner = batch.runtime.?, .publish = publish, .revision = &db.core.store.resolver_catalog_revision };
         batch.runtime = .{ .allocator = a, .ptr = &fault, .vtable = &Fault.vtable };
-        try batch.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":6,\"resolvers\":[]}");
+        try batch.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":7,\"resolvers\":[]}");
         try std.testing.expectError(error.TestCommitReplyLost, batch.commit());
         try std.testing.expectEqual(publish, fault.committed);
         try std.testing.expect(db.core.store.resolver_catalog_revision.read() != null);
@@ -124860,10 +124889,10 @@ test "db prepared transaction effects required catalog partial reload cannot pub
     try db.enablePreparedTransactionProtocol();
     // The header is supported, but the resolver definition cannot be loaded.
     // Publishing the cached version before deserialization is insufficient.
-    try db.core.store.put(key, "{\"version\":6,\"resolvers\":[{}]}");
+    try db.core.store.put(key, "{\"version\":7,\"resolvers\":[{}]}");
     try std.testing.expectError(error.MissingField, db.core.loadIndexCatalogOnly());
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
-    try db.core.store.put(key, "{\"version\":6,\"resolvers\":[]}");
+    try db.core.store.put(key, "{\"version\":7,\"resolvers\":[]}");
     try db.core.loadIndexCatalogOnly();
     try db.core.requirePreparedTransactionProtocol(null);
 }
@@ -124894,8 +124923,8 @@ test "db prepared transaction effects required catalog attestation belongs to it
     defer second.close();
     try first.enablePreparedTransactionProtocol();
     // Equal numeric revisions and floors do not prove that another store has
-    // a validated version-6 envelope. Model rebinding before a loader succeeds.
-    try second.core.store.put(@import("catalog/resolver_catalog.zig").minimum_reader_key, "6");
+    // a validated version-7 envelope. Model rebinding before a loader succeeds.
+    try second.core.store.put(@import("catalog/resolver_catalog.zig").minimum_reader_key, "7");
     try second.core.store.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":4,\"resolvers\":[]}");
     try std.testing.expectEqual(first.core.store.resolver_catalog_revision.read(), second.core.store.resolver_catalog_revision.read());
     const manager = first.core.index_manager;

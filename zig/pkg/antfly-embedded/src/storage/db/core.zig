@@ -2258,11 +2258,15 @@ pub const DBCore = struct {
     /// The serving/replicated BEGIN adapter must hold the same apply fence as
     /// ordinary transaction creation. extra_batch carries its ordered receipt.
     pub fn beginTransactionRequiringPreparedEffects(self: *DBCore, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: @import("prepared_transaction_effects.zig").Requirement, extra_batch: transactions_mod.MutationExtraBatch, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.TxnId {
+        return self.beginTransactionRequiringPreparedEffectsWithBinding(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, requirement, null, extra_batch, control);
+    }
+
+    pub fn beginTransactionRequiringPreparedEffectsWithBinding(self: *DBCore, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: @import("prepared_transaction_effects.zig").Requirement, binding: ?@import("prepared_transaction_effects.zig").Binding, extra_batch: transactions_mod.MutationExtraBatch, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.TxnId {
         if (control) |owner| try owner.checkpoint();
         try self.requirePreparedTransactionProtocol(control);
         var manager = try self.initTxnManager();
         defer manager.deinit();
-        try manager.initTransactionRequiringPreparedEffects(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, requirement, extra_batch, control);
+        try manager.initTransactionRequiringPreparedEffectsWithBinding(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, requirement, binding, extra_batch, control);
         return txn_id;
     }
 

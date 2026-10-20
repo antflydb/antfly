@@ -8431,9 +8431,9 @@ const PreparedCoordinatorFixture = struct {
         .protocol = 1,
         .requirement_format = 1,
         .effects_format = 1,
-        .minimum_reader = 6,
-        .permanent_reader = 6,
-        .catalog_envelope = 6,
+        .minimum_reader = 7,
+        .permanent_reader = 7,
+        .catalog_envelope = 7,
         .durable_begin = true,
         .durable_seal = true,
         .recovery_consumes_effects = true,
@@ -8726,7 +8726,7 @@ test "distributed txn prepared protocol requires each migration and durable capa
     }
     inline for (.{ "minimum_reader", "permanent_reader", "catalog_envelope" }) |field| {
         var capabilities = PreparedCoordinatorFixture.ready;
-        @field(capabilities, field) = 5;
+        @field(capabilities, field) = 6;
         try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, capabilities.require(.{ .mode = .synchronous }));
     }
 }

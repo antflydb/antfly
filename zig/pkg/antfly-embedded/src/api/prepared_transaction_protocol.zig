@@ -51,7 +51,7 @@ pub const Capabilities = struct {
 
     pub fn require(self: @This(), requirement: Requirement) !void {
         if (self.protocol != wire_version or self.requirement_format != 1 or self.effects_format != 1 or
-            self.minimum_reader < 6 or self.permanent_reader < 6 or self.catalog_envelope < 6 or
+            self.minimum_reader < 7 or self.permanent_reader < 7 or self.catalog_envelope < 7 or
             !self.durable_begin or !self.durable_seal or !self.recovery_consumes_effects or !self.retained_contract or
             !self.catalog_migration_complete or !self.import_policy_fenced or
             !(if (requirement.mode == .deferred) self.deferred else self.synchronous))
@@ -67,6 +67,9 @@ pub const SealRequest = struct {
     participant_digest: [32]u8,
     route_digest: [32]u8,
     requirement: Requirement,
+    pub fn binding(self: @This()) @import("../storage/db/prepared_transaction_effects.zig").Binding {
+        return .{ .group_id = self.group_id, .topology_epoch = self.topology_epoch, .participant_digest = self.participant_digest, .route_digest = self.route_digest };
+    }
 };
 
 /// Returned only after accepted effects and their requirement are durable.
@@ -77,6 +80,9 @@ pub const SealReceipt = struct {
     intent_digest: [32]u8,
     catalog_digest: [32]u8,
     frame_digest: [32]u8,
+    pub fn fromDurable(value: @import("../storage/db/prepared_transaction_effects.zig").BoundReceipt) @This() {
+        return .{ .request = .{ .txn_id = value.txn_id, .group_id = value.binding.group_id, .topology_epoch = value.binding.topology_epoch, .participant_digest = value.binding.participant_digest, .route_digest = value.binding.route_digest, .requirement = value.requirement }, .intent_revision = value.intent_revision, .intent_digest = value.intent_digest, .catalog_digest = value.catalog_digest, .frame_digest = value.frame_digest };
+    }
     pub fn validate(self: @This(), expected: SealRequest) !void {
         if (!std.meta.eql(self.request, expected)) return error.PreparedEffectsMismatch;
     }

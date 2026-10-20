@@ -12648,6 +12648,9 @@ pub const DataServer = struct {
     }
 
     pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.transaction) |mutation| if ((mutation == .begin and mutation.begin.preparation_binding != null) or
+            (mutation == .prepare and mutation.prepare.preparation_binding != null))
+            return @import("../common/data_raft_protocol.zig").batch_bound_preparation_protocol_version;
         if (req.transaction) |mutation| if (mutation == .prepare and (mutation.prepare.preparation_requirement != null or mutation.prepare.sealed_effects != null))
             return @import("../common/data_raft_protocol.zig").batch_required_seal_protocol_version;
         if (req.transaction) |mutation| if (mutation == .begin and mutation.begin.preparation_requirement != null)

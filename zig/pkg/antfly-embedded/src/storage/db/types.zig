@@ -317,11 +317,13 @@ pub const TransactionMutation = union(enum) {
         retain_terminal: bool = false,
         participants: []const []const u8,
         preparation_requirement: ?@import("prepared_transaction_effects.zig").Requirement = null,
+        preparation_binding: ?@import("prepared_transaction_effects.zig").Binding = null,
     },
     prepare: struct {
         txn_id: TxnId,
         topology_epoch: u64,
         preparation_requirement: ?@import("prepared_transaction_effects.zig").Requirement = null,
+        preparation_binding: ?@import("prepared_transaction_effects.zig").Binding = null,
         /// Final seal command carries immutable precomputed output, no rows.
         sealed_effects: ?[]const u8 = null,
     },

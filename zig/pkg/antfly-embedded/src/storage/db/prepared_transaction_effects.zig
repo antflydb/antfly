@@ -48,6 +48,46 @@ pub const Requirement = struct {
     }
 };
 
+/// Exact route/participant identity supplied by a verified route owner at
+/// BEGIN. These hashes bind an agreement; they do not mint route authority.
+pub const Binding = struct {
+    group_id: u64,
+    topology_epoch: u64,
+    participant_digest: [32]u8,
+    route_digest: [32]u8,
+    pub const encoded_bytes = 80;
+    pub fn encode(self: Binding) ![encoded_bytes]u8 {
+        if (self.group_id == 0) return error.InvalidPreparationRequirement;
+        var raw: [encoded_bytes]u8 = undefined;
+        std.mem.writeInt(u64, raw[0..8], self.group_id, .little);
+        std.mem.writeInt(u64, raw[8..16], self.topology_epoch, .little);
+        raw[16..48].* = self.participant_digest;
+        raw[48..80].* = self.route_digest;
+        return raw;
+    }
+    pub fn decode(raw: []const u8) !Binding {
+        if (raw.len != encoded_bytes) return error.InvalidPreparationRequirement;
+        const result: Binding = .{
+            .group_id = std.mem.readInt(u64, raw[0..8], .little),
+            .topology_epoch = std.mem.readInt(u64, raw[8..16], .little),
+            .participant_digest = raw[16..48].*,
+            .route_digest = raw[48..80].*,
+        };
+        if (result.group_id == 0) return error.InvalidPreparationRequirement;
+        return result;
+    }
+};
+
+pub const BoundReceipt = struct {
+    txn_id: [16]u8,
+    requirement: Requirement,
+    binding: Binding,
+    intent_revision: u64,
+    intent_digest: [32]u8,
+    catalog_digest: [32]u8,
+    frame_digest: [32]u8,
+};
+
 pub const Contract = struct {
     txn_id: [16]u8,
     intent_revision: u64,

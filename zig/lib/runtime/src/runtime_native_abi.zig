@@ -73,7 +73,8 @@ const builtin = @import("builtin");
 // Transaction records retain their original required-preparation contract.
 // Replicated BEGIN carries an explicit required-preparation contract.
 // Accepted effect seals can atomically publish an ordered apply receipt.
-pub const abi_version: u32 = 39;
+// Required transaction records and native methods retain exact seal bindings.
+pub const abi_version: u32 = 40;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

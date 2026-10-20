@@ -511,6 +511,7 @@ const TxnRecord = struct {
     /// Agreed at BEGIN, retained in the same record through resolution and
     /// the existing retry window. Absence never upgrades a legacy contract.
     preparation_requirement: ?prepared_effects.Requirement = null,
+    preparation_binding: ?prepared_effects.Binding = null,
 
     fn visibleVersion(self: TxnRecord) u64 {
         if (self.commit_version > 0) return self.commit_version;
@@ -526,6 +527,7 @@ const txn_record_v4_size = 51;
 const txn_record_v5_size = 52;
 const txn_record_v6_size = 53;
 const txn_record_v7_size = 54;
+const txn_record_v8_size = txn_record_v7_size + prepared_effects.Binding.encoded_bytes;
 
 // ============================================================================
 // TxnManager
@@ -655,23 +657,28 @@ pub const TxnManager = struct {
     }
 
     pub fn initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(self: *TxnManager, txn_id: TxnId, timestamp: u64, created_at: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, extra_batch: MutationExtraBatch) !void {
-        return self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, extra_batch, null, null);
+        return self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, extra_batch, null, null, null);
     }
 
     pub fn initTransactionWithParticipantsCreatedAtRoleAndRetentionWithAdmission(self: *TxnManager, txn_id: TxnId, timestamp: u64, created_at: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, control: ?read_control.Port) !void {
-        return self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, .{}, control, null);
+        return self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, .{}, control, null, null);
     }
 
     /// Opt-in BEGIN contract. Caller retains the DB apply fence and passes
     /// retained controls while holding dependencies. A legacy in-flight record
     /// cannot be upgraded after its coordinator may already have decided.
     pub fn initTransactionRequiringPreparedEffects(self: *TxnManager, txn_id: TxnId, timestamp: u64, created_at: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: prepared_effects.Requirement, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
+        return self.initTransactionRequiringPreparedEffectsWithBinding(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, requirement, null, extra_batch, original);
+    }
+
+    pub fn initTransactionRequiringPreparedEffectsWithBinding(self: *TxnManager, txn_id: TxnId, timestamp: u64, created_at: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: prepared_effects.Requirement, binding: ?prepared_effects.Binding, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
+        if (binding) |value| _ = try value.encode();
         var trace: BeginAdmissionTrace = .{};
-        self.initRequiredPreparationInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, requirement, extra_batch, trace.bind(original)) catch |err| return trace.failure orelse err;
+        self.initRequiredPreparationInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, requirement, binding, extra_batch, trace.bind(original)) catch |err| return trace.failure orelse err;
         if (trace.failure) |cause| return cause;
     }
 
-    fn initRequiredPreparationInner(self: *TxnManager, txn_id: TxnId, timestamp: u64, created_at: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: prepared_effects.Requirement, extra_batch: MutationExtraBatch, control: ?read_control.Port) !void {
+    fn initRequiredPreparationInner(self: *TxnManager, txn_id: TxnId, timestamp: u64, created_at: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, requirement: prepared_effects.Requirement, binding: ?prepared_effects.Binding, extra_batch: MutationExtraBatch, control: ?read_control.Port) !void {
         if (control) |owner| try owner.checkpoint();
         const existing = self.loadTransactionRecordWithAdmission(txn_id, control) catch |err| blk: {
             if (err != TxnError.TxnNotFound) return err;
@@ -695,7 +702,7 @@ pub const TxnManager = struct {
             const accepted = previous orelse return error.PreparationContractConflict;
             if (accepted.mode != requirement.mode) return error.PreparationContractConflict;
             // Retry never rewrites the requirement or reacquires its credit.
-            return self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, extra_batch, control, requirement);
+            return self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, extra_batch, control, requirement, binding);
         }
         if (previous != null or try self.hasPreparedEffects(txn_id)) return error.InvalidTxnRecord;
         const encoded = requirement.encode();
@@ -705,7 +712,7 @@ pub const TxnManager = struct {
         try writes.appendSlice(self.alloc, extra_batch.writes);
         var batch = extra_batch;
         batch.writes = writes.items;
-        try self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, batch, control, requirement);
+        try self.initTransactionWithParticipantsCreatedAtRoleAndRetentionInner(txn_id, timestamp, created_at, participants, coordinator, retain_terminal, batch, control, requirement, binding);
     }
 
     pub fn loadPreparationRequirement(self: *TxnManager, txn_id: TxnId, original: ?read_control.Port) !?prepared_effects.Requirement {
@@ -715,7 +722,7 @@ pub const TxnManager = struct {
         return result;
     }
 
-    pub const PreparationDecision = struct { status: TxnStatus, requirement: ?prepared_effects.Requirement };
+    pub const PreparationDecision = struct { status: TxnStatus, requirement: ?prepared_effects.Requirement, binding: ?prepared_effects.Binding };
 
     /// Durable evidence for requirement-aware retries, including after accepted
     /// effects retire. Legacy records never gain authority from a sidecar alone.
@@ -735,7 +742,32 @@ pub const TxnManager = struct {
         }
         if (control) |owner| try owner.checkpoint();
         if (trace.failure) |cause| return cause;
-        return .{ .status = record.status, .requirement = record.preparation_requirement };
+        return .{ .status = record.status, .requirement = record.preparation_requirement, .binding = record.preparation_binding };
+    }
+
+    pub fn getBoundPreparedSealReceipt(self: *TxnManager, txn_id: TxnId, expected: prepared_effects.Binding, original: ?read_control.Port) !prepared_effects.BoundReceipt {
+        var trace: MutationAdmissionTrace = .{};
+        const control = trace.bind(original);
+        const decision = self.getPreparationDecision(txn_id, control) catch |err| return trace.failure orelse err;
+        if (decision.status == .aborted) return error.DecisionConflict;
+        const binding = decision.binding orelse return error.PreparationContractConflict;
+        if (!std.meta.eql(binding, expected)) return error.PreparationContractConflict;
+        const required = decision.requirement orelse return error.PreparationContractConflict;
+        const key = makePreparedEffectsKey(txn_id);
+        const raw = self.getAllocWithAdmission(self.alloc, &key, control) catch |err| {
+            if (trace.failure) |cause| return cause;
+            return if (err == error.NotFound) error.PreparedEffectsRequired else err;
+        };
+        defer self.alloc.free(raw);
+        const inspection = prepared_effects.inspect(raw, control) catch |err| return trace.failure orelse err;
+        const contract = inspection.contract;
+        const record = self.loadTransactionRecordWithAdmission(txn_id, control) catch |err| return trace.failure orelse err;
+        if (!std.meta.eql(record.preparation_binding, decision.binding) or record.preparation_requirement == null or record.preparation_requirement.?.mode != required.mode or record.status == .aborted) return error.PreparationContractConflict;
+        if (!record.prepared or (record.intents_resolved_known and record.intents_resolved)) return error.InvalidTxnRecord;
+        if (!std.mem.eql(u8, &contract.txn_id, &txn_id) or contract.mode != required.mode or contract.intent_revision != record.intent_revision) return error.PreparedEffectsMismatch;
+        if (control) |owner| try owner.checkpoint();
+        if (trace.failure) |cause| return cause;
+        return .{ .txn_id = txn_id, .requirement = required, .binding = binding, .intent_revision = contract.intent_revision, .intent_digest = contract.intent_digest, .catalog_digest = contract.catalog_digest, .frame_digest = inspection.fingerprint };
     }
 
     fn loadPreparationRequirementInner(self: *TxnManager, txn_id: TxnId, control: ?read_control.Port) !?prepared_effects.Requirement {
@@ -765,6 +797,7 @@ pub const TxnManager = struct {
         extra_batch: MutationExtraBatch,
         original_control: ?read_control.Port,
         preparation_requirement: ?prepared_effects.Requirement,
+        preparation_binding: ?prepared_effects.Binding,
     ) !void {
         var trace: BeginAdmissionTrace = .{};
         const control = trace.bind(original_control);
@@ -780,6 +813,7 @@ pub const TxnManager = struct {
             };
         };
         if (existing) |record| {
+            if (!std.meta.eql(record.preparation_binding, preparation_binding)) return error.PreparationContractConflict;
             if (preparation_requirement) |required| {
                 const accepted = record.preparation_requirement orelse return error.PreparationContractConflict;
                 if (accepted.mode != required.mode) return error.PreparationContractConflict;
@@ -822,6 +856,7 @@ pub const TxnManager = struct {
             .coordinator = coordinator,
             .retain_terminal = retain_terminal,
             .preparation_requirement = preparation_requirement,
+            .preparation_binding = preparation_binding,
         };
         const record_value = try self.encodeRecord(record);
         defer self.alloc.free(record_value);
@@ -1577,12 +1612,16 @@ pub const TxnManager = struct {
     /// Publish an ordered receipt in the same transaction as the immutable
     /// frame and its backlog grant. A retry preserves the first accepted frame.
     pub fn sealPreparedEffectsWithExtraBatch(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
+        return self.sealBoundPreparedEffectsWithExtraBatch(txn_id, frame, catalog_digest, mode, null, extra_batch, original);
+    }
+
+    pub fn sealBoundPreparedEffectsWithExtraBatch(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, binding: ?prepared_effects.Binding, extra_batch: MutationExtraBatch, original: ?read_control.Port) !void {
         var trace: MutationAdmissionTrace = .{};
-        self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, extra_batch, trace.bind(original)) catch |err| return trace.failure orelse err;
+        self.sealPreparedEffectsInner(txn_id, frame, catalog_digest, mode, binding, extra_batch, trace.bind(original)) catch |err| return trace.failure orelse err;
         if (trace.failure) |cause| return cause;
     }
 
-    fn sealPreparedEffectsInner(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, extra_batch: MutationExtraBatch, control: ?read_control.Port) !void {
+    fn sealPreparedEffectsInner(self: *TxnManager, txn_id: TxnId, frame: []const u8, catalog_digest: [32]u8, mode: prepared_effects.Mode, binding: ?prepared_effects.Binding, extra_batch: MutationExtraBatch, control: ?read_control.Port) !void {
         const key = makePreparedEffectsKey(txn_id);
         const requirement_key = makePreparationRequirementKey(txn_id);
         const record_key = makeRecordKey(txn_id);
@@ -1596,6 +1635,7 @@ pub const TxnManager = struct {
         }
         const record = try self.loadTransactionRecordWithAdmission(txn_id, control);
         if (record.status != .pending) return TxnError.DecisionConflict;
+        if (!std.meta.eql(record.preparation_binding, binding)) return error.PreparationContractConflict;
         if (try self.loadPreparationRequirementInner(txn_id, control)) |required| if (required.mode != mode) return error.PreparationContractConflict;
         const inspection = try prepared_effects.inspect(frame, control);
         const expected = try self.preparedEffectsContractInner(txn_id, catalog_digest, mode, control);
@@ -2895,7 +2935,7 @@ pub const TxnManager = struct {
     }
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
-        const buf = try self.alloc.alloc(u8, if (record.preparation_requirement != null) txn_record_v7_size else txn_record_v6_size);
+        const buf = try self.alloc.alloc(u8, if (record.preparation_binding != null) txn_record_v8_size else if (record.preparation_requirement != null) txn_record_v7_size else txn_record_v6_size);
         buf[0] = @backingInt(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
@@ -2911,6 +2951,17 @@ pub const TxnManager = struct {
             .deferred => 1,
             .synchronous => 2,
         };
+        if (record.preparation_binding) |binding| {
+            if (record.preparation_requirement == null) {
+                self.alloc.free(buf);
+                return error.InvalidTxnRecord;
+            }
+            const raw = binding.encode() catch |err| {
+                self.alloc.free(buf);
+                return err;
+            };
+            buf[txn_record_v7_size..][0..prepared_effects.Binding.encoded_bytes].* = raw;
+        }
         return buf;
     }
 
@@ -3666,6 +3717,11 @@ fn resolveDecisionConflictReason(current: TxnStatus, requested: TxnStatus) []con
 
 fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == 0 or raw[0] > @backingInt(TxnStatus.aborted)) return TxnError.InvalidTxnRecord;
+    if (raw.len == txn_record_v8_size) {
+        var record = try decodeRecord(raw[0..txn_record_v7_size]);
+        record.preparation_binding = prepared_effects.Binding.decode(raw[txn_record_v7_size..]) catch return error.InvalidTxnRecord;
+        return record;
+    }
     if (raw.len == txn_record_v7_size) {
         const mode: prepared_effects.Mode = switch (raw[53]) {
             1 => .deferred,
@@ -7285,4 +7341,87 @@ test "prepared transaction effects ordered seal publishes frame grant and receip
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "prepared transaction effects bound begin is atomic at every allocation and never upgrades legacy" {
+    const Case = struct {
+        fn run(failing: Allocator) !void {
+            const a = std.testing.allocator;
+            for (std.meta.tags(prepared_effects.Mode)) |mode| {
+                var backend = mem_backend.Backend.init(a, .{});
+                defer backend.close();
+                var runtime = try backend.runtimeStore(a, .{});
+                defer runtime.deinit();
+                var manager = try TxnManager.init(a, &runtime);
+                defer manager.deinit();
+                const binding: prepared_effects.Binding = .{ .group_id = 7, .topology_epoch = 3, .participant_digest = @splat(1), .route_digest = @splat(2) };
+                const legacy: TxnId = @splat(0xe7);
+                try manager.initTransactionRequiringPreparedEffects(legacy, 1, 1, &.{}, false, true, .{ .mode = mode }, .{}, null);
+                try std.testing.expectError(error.PreparationContractConflict, manager.initTransactionRequiringPreparedEffectsWithBinding(legacy, 1, 1, &.{}, false, true, .{ .mode = mode }, binding, .{}, null));
+                try std.testing.expect((try manager.getPreparationDecision(legacy, null)).binding == null);
+                const id: TxnId = @splat(0xe8);
+                manager.alloc = failing;
+                const result = manager.initTransactionRequiringPreparedEffectsWithBinding(id, 1, 1, &.{}, false, true, .{ .mode = mode }, binding, .{ .writes = &.{.{ .key = "bound-begin-receipt", .value = "accepted" }} }, null);
+                manager.alloc = a;
+                if (result) |_| {
+                    try std.testing.expectEqualDeep(binding, (try manager.getPreparationDecision(id, null)).binding.?);
+                    const key = makeRecordKey(id);
+                    const raw = try manager.getAlloc(a, &key);
+                    defer a.free(raw);
+                    try std.testing.expectEqual(txn_record_v8_size, raw.len);
+                    try std.testing.expect((try decodeRecord(raw[0..txn_record_v7_size])).preparation_binding == null);
+                    try std.testing.expectError(error.PreparationContractConflict, manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, true, .{ .mode = mode }, .{}, null));
+                    try manager.resolveIntents(id, .aborted, 10);
+                    try std.testing.expectEqualDeep(binding, (try manager.getPreparationDecision(id, null)).binding.?);
+                    try std.testing.expect(try manager.cleanupTransactionMetadataIfEligible(id, 100, 100));
+                    try std.testing.expectError(error.TxnNotFound, manager.getPreparationDecision(id, null));
+                } else |err| {
+                    try std.testing.expectError(error.TxnNotFound, manager.getPreparationDecision(id, null));
+                    try std.testing.expect(!try manager.hasPreparationRequirement(id));
+                    try std.testing.expectError(error.NotFound, manager.getAlloc(a, "bound-begin-receipt"));
+                    return err;
+                }
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "prepared transaction effects bound receipt preserves every original rejection" {
+    const Control = struct {
+        count: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            if (self.count == self.fail_at) return self.cause;
+        }
+    };
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(0xe9);
+    const binding: prepared_effects.Binding = .{ .group_id = 7, .topology_epoch = 3, .participant_digest = @splat(1), .route_digest = @splat(2) };
+    try manager.initTransactionRequiringPreparedEffectsWithBinding(id, 1, 1, &.{}, false, true, .{ .mode = .synchronous }, binding, .{}, null);
+    try manager.writeIntents(id, &.{}, &.{});
+    const contract = try manager.preparedEffectsContract(id, @splat(3), .synchronous, null);
+    const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(frame);
+    try manager.sealBoundPreparedEffectsWithExtraBatch(id, frame, @splat(3), .synchronous, binding, .{}, null);
+    var control: Control = .{};
+    const payload: read_control.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+    _ = try manager.getBoundPreparedSealReceipt(id, binding, .init(&payload));
+    const checkpoints = control.count;
+    try std.testing.expect(checkpoints > 0);
+    for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.MemoryLimitExceeded }) |cause| {
+        for (1..checkpoints + 1) |fail_at| {
+            control = .{ .fail_at = fail_at, .cause = cause };
+            try std.testing.expectError(cause, manager.getBoundPreparedSealReceipt(id, binding, .init(&payload)));
+        }
+    }
 }

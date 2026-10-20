@@ -45,7 +45,8 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 pub const batch_required_preparation_protocol_version: u16 = 23;
 /// Required PREPARE and immutable final-seal commands preserve the BEGIN contract.
 pub const batch_required_seal_protocol_version: u16 = 24;
-pub const batch_protocol_version: u16 = 24;
+pub const batch_bound_preparation_protocol_version: u16 = 25;
+pub const batch_protocol_version: u16 = 25;
 pub const batch_row_semantics_protocol_version: u16 = 18;
 pub const batch_artifact_catalog_protocol_version: u16 = 14;
 /// Full producer publications require a separate all-member barrier; the

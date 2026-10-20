@@ -1315,9 +1315,19 @@ fn parseBatchRequestWithOptions(
         if (phase_value != .string or txn_value != .string or txn_value.string.len != 32) return error.InvalidBatchRequest;
         var txn_id: db_mod.types.TxnId = undefined;
         _ = std.fmt.hexToBytes(&txn_id, txn_value.string) catch return error.InvalidBatchRequest;
-        const required_begin = std.mem.eql(u8, phase_value.string, "begin_required_v1");
-        const required_prepare = std.mem.eql(u8, phase_value.string, "prepare_required_v1");
-        const required_seal = std.mem.eql(u8, phase_value.string, "seal_required_v1");
+        const bound_begin = std.mem.eql(u8, phase_value.string, "begin_bound_v1");
+        const bound_prepare = std.mem.eql(u8, phase_value.string, "prepare_bound_v1");
+        const bound_seal = std.mem.eql(u8, phase_value.string, "seal_bound_v1");
+        const required_begin = bound_begin or std.mem.eql(u8, phase_value.string, "begin_required_v1");
+        const required_prepare = bound_prepare or std.mem.eql(u8, phase_value.string, "prepare_required_v1");
+        const required_seal = bound_seal or std.mem.eql(u8, phase_value.string, "seal_required_v1");
+        const binding: ?@import("../storage/db/prepared_transaction_effects.zig").Binding = if (bound_begin or bound_prepare or bound_seal) blk: {
+            const value_ = object.get("preparation_binding") orelse return error.InvalidBatchRequest;
+            if (value_ != .string or value_.string.len != 160) return error.InvalidBatchRequest;
+            var raw: [80]u8 = undefined;
+            _ = std.fmt.hexToBytes(&raw, value_.string) catch return error.InvalidBatchRequest;
+            break :blk @import("../storage/db/prepared_transaction_effects.zig").Binding.decode(&raw) catch return error.InvalidBatchRequest;
+        } else if (object.contains("preparation_binding")) return error.InvalidBatchRequest else null;
         if (!required_begin and !required_prepare and !required_seal and object.contains("preparation_mode")) return error.InvalidBatchRequest;
         if (!required_seal and object.contains("prepared_effects_base64")) return error.InvalidBatchRequest;
         if (std.mem.eql(u8, phase_value.string, "begin") or required_begin) {
@@ -1343,6 +1353,7 @@ fn parseBatchRequestWithOptions(
                     if (mode != .string) return error.InvalidBatchRequest;
                     break :blk .{ .mode = std.meta.stringToEnum(@import("../storage/db/prepared_transaction_effects.zig").Mode, mode.string) orelse return error.InvalidBatchRequest };
                 } else null,
+                .preparation_binding = binding,
                 .participants = transaction_participants,
             } };
         }
@@ -1370,6 +1381,7 @@ fn parseBatchRequestWithOptions(
                 .txn_id = txn_id,
                 .topology_epoch = try parseInternalU64(object.get("topology_epoch") orelse return error.InvalidBatchRequest),
                 .preparation_requirement = required,
+                .preparation_binding = binding,
                 .sealed_effects = prepared_frame,
             } };
         }
@@ -1641,6 +1653,13 @@ pub fn validatePreparedSealRequest(req: db_mod.types.BatchRequest) !void {
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+    if (req.transaction) |mutation| {
+        switch (mutation) {
+            .begin => |begin| if (begin.preparation_binding != null and begin.preparation_requirement == null) return error.InvalidBatchRequest,
+            .prepare => |prepare| if (prepare.preparation_binding != null and prepare.preparation_requirement == null) return error.InvalidBatchRequest,
+            else => {},
+        }
+    }
     try validatePreparedSealRequest(req);
     if (req.transaction) |mutation| if (mutation == .prepare) {
         const prepare = mutation.prepare;
@@ -2107,7 +2126,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
             .begin => |begin| {
                 const txn_hex = std.fmt.bytesToHex(begin.txn_id, .lower);
                 try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"begin_timestamp\":\"{d}\",\"created_at_ns\":\"{d}\",\"topology_epoch\":\"{d}\",\"retain_terminal\":{},\"participants\":[", .{
-                    if (begin.preparation_requirement != null) "begin_required_v1" else "begin", &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch, begin.retain_terminal,
+                    if (begin.preparation_binding != null) "begin_bound_v1" else if (begin.preparation_requirement != null) "begin_required_v1" else "begin", &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch, begin.retain_terminal,
                 });
                 for (begin.participants, 0..) |participant, i| {
                     if (i != 0) try writer.writeByte(',');
@@ -2118,7 +2137,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
             },
             .prepare => |prepare| {
                 const txn_hex = std.fmt.bytesToHex(prepare.txn_id, .lower);
-                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (prepare.sealed_effects != null) "seal_required_v1" else if (prepare.preparation_requirement != null) "prepare_required_v1" else if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
+                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"topology_epoch\":\"{d}\"", .{ if (prepare.preparation_binding != null) (if (prepare.sealed_effects != null) "seal_bound_v1" else "prepare_bound_v1") else if (prepare.sealed_effects != null) "seal_required_v1" else if (prepare.preparation_requirement != null) "prepare_required_v1" else if (req.range_guards.len != 0) "prepare_ranges_v1" else "prepare", &txn_hex, prepare.topology_epoch });
                 if (prepare.preparation_requirement) |required| try writer.print(",\"preparation_mode\":{f}", .{std.json.fmt(@tagName(required.mode), .{})});
                 if (prepare.sealed_effects) |frame| {
                     const base64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(frame.len));
@@ -2150,6 +2169,15 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                     &txn_hex, cleanup.cutoff_timestamp, cleanup.retained_cutoff_timestamp,
                 });
             },
+        }
+        const binding = switch (mutation) {
+            .begin => |value| value.preparation_binding,
+            .prepare => |value| value.preparation_binding,
+            else => null,
+        };
+        if (binding) |value| {
+            const raw = try value.encode();
+            try writer.print(",\"preparation_binding\":\"{s}\"", .{std.fmt.bytesToHex(raw, .lower)});
         }
         try writer.writeByte('}');
     }

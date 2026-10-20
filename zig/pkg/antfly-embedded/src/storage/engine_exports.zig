@@ -2141,3 +2141,13 @@ fn sealReplicatedTransactionEffectsAtOrderedReceipt(self: *DB, txn_id: types.Txn
 fn writeReplicatedTransactionAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt) engine.Outcome(void) {
     return .{ .value = self.writeReplicatedTransactionAtOrderedReceipt(txn_id, req, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+
+fn beginReplicatedTransactionScopedWithBinding(self: *DB, txn_id: types.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8, requirement: ?@import("db/prepared_transaction_effects.zig").Requirement, binding: ?@import("db/prepared_transaction_effects.zig").Binding) engine.Outcome(types.TxnId) {
+    return .{ .value = self.beginReplicatedTransactionScopedWithBinding(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, requirement, binding) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn writeReplicatedTransactionWithBindingAtOrderedReceipt(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt, requirement: ?@import("db/prepared_transaction_effects.zig").Requirement, binding: ?@import("db/prepared_transaction_effects.zig").Binding) engine.Outcome(void) {
+    return .{ .value = self.writeReplicatedTransactionWithBindingAtOrderedReceipt(txn_id, req, identity, requirement, binding) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+fn sealReplicatedTransactionEffectsWithBindingAtOrderedReceipt(self: *DB, txn_id: types.TxnId, frame: []const u8, mode: @import("db/prepared_transaction_effects.zig").Mode, identity: db.OrderedApplyReceipt, scope: ?[32]u8, binding: ?@import("db/prepared_transaction_effects.zig").Binding) engine.Outcome(void) {
+    return .{ .value = self.sealReplicatedTransactionEffectsWithBindingAtOrderedReceipt(txn_id, frame, mode, identity, scope, binding) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}

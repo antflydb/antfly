@@ -23,6 +23,19 @@ const validateTableBatchAgainstLocalSchema = local_write.validateTableBatchAgain
 const runTestBeforeBatchExecutionHook = @import("antfly_local_sources").api_local_write_test_hooks.runTestBeforeBatchExecutionHook;
 const batchWritesAsTransactionWrites = local_write.batchWritesAsTransactionWrites;
 
+fn validatePreparationBinding(alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, epoch: u64, scope: ?[32]u8, plan: ?[16]u8, binding: ?@import("antfly_local_sources").storage_prepared_transaction_effects.Binding, execution: ?@import("antfly_runtime_abi").runnable_abi.Borrowed) !void {
+    const value = binding orelse return;
+    if (execution) |owner| try owner.checkLifetime();
+    if (value.group_id != group_id or value.topology_epoch != epoch) return error.PreparationContractConflict;
+    const locator = try local_transaction_contract.participantIdForGroupScoped(alloc, table_name, group_id, scope, plan);
+    defer alloc.free(locator);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(locator, &digest, .{});
+    if (!std.mem.eql(u8, &digest, &value.participant_digest)) return error.PreparationContractConflict;
+    // The route owner validates authority before BEGIN. Apply preserves the
+    // exact accepted route digest; it must never perform metadata RPC here.
+}
+
 pub fn applyStorageKernelReplicatedBatch(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -87,6 +100,7 @@ pub fn applyReplicatedTransactionMutationInternalWithExecution(
     var admission_borrow: @import("transaction_execution_admission.zig").Borrow = .{};
     switch (mutation) {
         .begin => |begin| {
+            try validatePreparationBinding(alloc, table_name, group_id, begin.topology_epoch, req.restore_staging_scope, req.restore_staging_plan_id, begin.preparation_binding, execution);
             if (begin.preparation_requirement != null and raft_entry == null) return error.PreparedTransactionProtocolUnavailable;
             const local_participant = try local_transaction_contract.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
             defer alloc.free(local_participant);
@@ -97,7 +111,7 @@ pub fn applyReplicatedTransactionMutationInternalWithExecution(
             // than every participant retrying every other participant.
             const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
             if (raft_entry) |entry|
-                _ = try db.beginReplicatedTransactionScoped(
+                _ = try db.beginReplicatedTransactionScopedWithBinding(
                     begin.txn_id,
                     begin.begin_timestamp,
                     begin.created_at_ns,
@@ -107,6 +121,7 @@ pub fn applyReplicatedTransactionMutationInternalWithExecution(
                     entry,
                     req.restore_staging_scope,
                     begin.preparation_requirement,
+                    begin.preparation_binding,
                 )
             else if (execution) |original| {
                 var borrow: @import("transaction_execution_admission.zig").Borrow = .{};
@@ -132,11 +147,12 @@ pub fn applyReplicatedTransactionMutationInternalWithExecution(
             );
         },
         .prepare => |prepare| {
+            try validatePreparationBinding(alloc, table_name, group_id, prepare.topology_epoch, req.restore_staging_scope, req.restore_staging_plan_id, prepare.preparation_binding, execution);
             if (prepare.sealed_effects) |frame| {
                 try @import("antfly_local_sources").api_batch.validatePreparedSealRequest(req);
                 const required = prepare.preparation_requirement orelse return error.InvalidBatchRequest;
                 const entry = raft_entry orelse return error.PreparedTransactionProtocolUnavailable;
-                try db.sealReplicatedTransactionEffectsAtOrderedReceipt(prepare.txn_id, frame, required.mode, entry, req.restore_staging_scope);
+                try db.sealReplicatedTransactionEffectsWithBindingAtOrderedReceipt(prepare.txn_id, frame, required.mode, entry, req.restore_staging_scope, prepare.preparation_binding);
                 return;
             }
             if (prepare.preparation_requirement != null and raft_entry == null) return error.PreparedTransactionProtocolUnavailable;
@@ -159,7 +175,7 @@ pub fn applyReplicatedTransactionMutationInternalWithExecution(
                 .relational_repair = req.relational_repair,
             };
             if (raft_entry) |entry|
-                try db.writeReplicatedTransactionWithRequirementAtOrderedReceipt(prepare.txn_id, intents, entry, prepare.preparation_requirement)
+                try db.writeReplicatedTransactionWithBindingAtOrderedReceipt(prepare.txn_id, intents, entry, prepare.preparation_requirement, prepare.preparation_binding)
             else if (execution) |original| {
                 var borrow: @import("transaction_execution_admission.zig").Borrow = .{};
                 try db.writeTransactionWithAdmissionControls(prepare.txn_id, intents, try borrow.bind(original));
