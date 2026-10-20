@@ -75,6 +75,7 @@ pub const WorkingSetAllocator = struct {
         }
         if (@import("antfly_local_sources").sql_parallel_scheduler.LockedAllocator.parentAllocator(a)) |parent| return headroom(parent);
         if (comptime @import("builtin").is_test) if (a.vtable == std.testing.allocator.vtable) return std.math.maxInt(usize);
+        if (@import("antfly_local_sources").sql_memory_budget.optionalLocalHeadroom(a)) |layer| return @min(layer.available, headroom(layer.backing) orelse return null);
         return @import("antfly_local_sources").sql_memory_budget.optionalHeadroom(a);
     }
     fn permitsGrowth(self: *WorkingSetAllocator, additional_bytes: usize) bool {
@@ -266,4 +267,20 @@ test "lake build working-set allocator shares exact accounting across upload wor
     started = 0;
     try std.testing.expectEqual(@as(usize, 0), bounded.live_bytes);
     try std.testing.expect(!bounded.limit_exceeded);
+}
+
+test "lake build working-set headroom composes SQL budgets without bypassing opaque quotas" {
+    const Memory = @import("antfly_local_sources").sql_memory_budget;
+    var build = try WorkingSetAllocator.init(std.testing.allocator, .{ .max_working_set_bytes = 8192 });
+    var sql: Memory = .{ .backing = build.allocator(), .limit = 4096 };
+    const bytes = try sql.allocator().alloc(u8, 1024);
+    defer sql.allocator().free(bytes);
+    try std.testing.expectEqual(@as(?usize, 3072), WorkingSetAllocator.headroom(sql.allocator()));
+    const outer = try build.allocator().alloc(u8, 5000);
+    defer build.allocator().free(outer);
+    try std.testing.expectEqual(@as(?usize, 2168), WorkingSetAllocator.headroom(sql.allocator()));
+    var buffer: [8192]u8 = undefined;
+    var unknown_backing = std.heap.FixedBufferAllocator.init(&buffer);
+    var unknown: Memory = .{ .backing = unknown_backing.allocator(), .limit = 4096 };
+    try std.testing.expectEqual(@as(?usize, null), WorkingSetAllocator.headroom(unknown.allocator()));
 }

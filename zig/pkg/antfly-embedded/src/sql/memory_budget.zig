@@ -121,21 +121,24 @@ pub fn headroom(a: std.mem.Allocator) ?usize {
     const actual = if (a.vtable.alloc == scratchAlloc) reclaimingAllocator(backing) else backing;
     return if (headroom(actual)) |parent| @min(available, parent) else available;
 }
+/// Inspect only this known budget layer so other allocation owners can compose
+/// complete headroom chains without treating opaque backings as unbounded.
+/// External reservation owners have no locally provable spare capacity.
+pub fn optionalLocalHeadroom(a: std.mem.Allocator) ?struct { available: usize, backing: std.mem.Allocator } {
+    if (a.vtable.alloc != alloc and a.vtable.alloc != scratchAlloc) return null;
+    const self: *Budget = @ptrCast(@alignCast(a.ptr));
+    self.lock();
+    defer self.mutex.unlock();
+    if (self.admission != null) return null;
+    return .{ .available = self.limit -| if (self.monotonic) self.spent else self.live, .backing = self.backing };
+}
 /// Optional acceleration must not speculate through an opaque quota wrapper.
 /// Recognize only our complete budget chain and standard unbounded backings;
 /// mandatory allocations continue to use the normal allocator error contract.
 pub fn optionalHeadroom(a: std.mem.Allocator) ?usize {
-    if (a.vtable.alloc == alloc or a.vtable.alloc == scratchAlloc) {
-        const self: *Budget = @ptrCast(@alignCast(a.ptr));
-        self.lock();
-        const available = self.limit -| if (self.monotonic) self.spent else self.live;
-        const backing = self.backing;
-        const shared_admission = self.admission != null;
-        self.mutex.unlock();
-        // An external reservation owner can impose another, opaque cap.
-        if (shared_admission) return null;
-        const parent = optionalHeadroom(backing) orelse return null;
-        return @min(available, parent);
+    if (optionalLocalHeadroom(a)) |layer| {
+        const parent = optionalHeadroom(layer.backing) orelse return null;
+        return @min(layer.available, parent);
     }
     if (a.vtable == std.heap.page_allocator.vtable) return std.math.maxInt(usize);
     if (comptime !@import("builtin").single_threaded) {

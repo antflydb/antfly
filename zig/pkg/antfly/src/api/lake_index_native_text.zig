@@ -481,7 +481,16 @@ pub const ManifestReader = struct {
                 defer phase.abort();
                 const result = pending.task.await(self.store.io_phase.?.io);
                 self.pending = null;
-                const bytes = result catch |err| return phase.failed(err);
+                const bytes = result catch |err| {
+                    // Speculation may lose its allocation headroom while the
+                    // reducer runs. Drain it and retry as a required read after
+                    // restoring CPU admission; integrity/provider failures stay
+                    // fatal and cancellation is checked before the retry.
+                    try phase.finish();
+                    try self.token.check();
+                    if (err == error.OutOfMemory) return loadFileManifestPublication(a, self.store, ref, self.domain, self.token);
+                    return err;
+                };
                 defer self.a.free(bytes);
                 try phase.finish();
                 try self.token.check();
@@ -2023,7 +2032,7 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
         entered: std.Io.Event = .unset,
         gate: std.Io.Event = .unset,
         blocked: bool = true,
-        failure: bool = false,
+        failure: ?anyerror = null,
         cancel_resume: bool = false,
         canceled: bool = false,
         reads: std.atomic.Value(usize) = .init(0),
@@ -2032,7 +2041,7 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
             _ = self.reads.fetchAdd(1, .monotonic);
             self.entered.set(std.testing.io);
             if (self.blocked) try self.gate.wait(std.testing.io);
-            if (self.failure) return error.InjectedReadFailure;
+            if (self.failure) |err| return err;
             const bytes = try self.backend.getAllocWithCancellationUsingAllocator(a, id, token);
             errdefer a.free(bytes);
             if (bytes.len > maximum) return error.ArtifactTooLarge;
@@ -2103,11 +2112,15 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
     try std.testing.expect(probe.execution.active);
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
     scheduler.max_io_workers = 2;
-    probe.failure = true;
+    probe.failure = error.InjectedReadFailure;
     manifests.prefetch(ref);
     try std.testing.expectError(error.InjectedReadFailure, manifests.load(arena.allocator(), ref));
     try std.testing.expect(probe.execution.active);
-    probe.failure = false;
+    probe.failure = error.ArtifactIntegrityMismatch;
+    manifests.prefetch(ref);
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, manifests.load(arena.allocator(), ref));
+    try std.testing.expect(probe.execution.active);
+    probe.failure = null;
     probe.cancel_resume = true;
     manifests.prefetch(ref);
     try std.testing.expectError(error.Canceled, manifests.load(arena.allocator(), ref));
@@ -2124,16 +2137,50 @@ test "external lake publication manifest prefetch overlaps CPU bounds ownership 
     try probe.entered.wait(std.testing.io);
     manifests.deinit();
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
-    // Saturation and opaque allocator wrappers decline optional work.
-    var occupied = scheduler.submitIoTransient(std.testing.io, 1, struct {
-        fn wait(gate: *std.Io.Event) anyerror!void {
-            try gate.wait(std.testing.io);
+    // A reducer can consume the advisory headroom before the child allocates.
+    // Once it releases that memory, required publication must still succeed.
+    {
+        const Limits = @import("../serverless/build/lake_build_limits.zig");
+        var budget = try Limits.WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 1024 * 1024 });
+        const bounded = budget.allocator();
+        manifests.a = bounded;
+        defer {
+            manifests.deinit();
+            manifests.a = a;
         }
-    }.wait, .{&probe.gate}).?;
-    scheduler.max_io_workers = 1;
-    manifests.prefetch(ref);
-    try std.testing.expect(manifests.pending == null);
-    _ = occupied.cancel(std.testing.io) catch {};
+        probe.gate = .unset;
+        probe.entered = .unset;
+        manifests.prefetch(ref);
+        try std.testing.expect(manifests.pending != null);
+        try probe.entered.wait(std.testing.io);
+        const held = try bounded.alloc(u8, budget.max_live_bytes - budget.live_bytes);
+        probe.gate.set(std.testing.io);
+        while (!manifests.pending.?.task.isComplete()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        bounded.free(held);
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        const before = probe.reads.load(.acquire);
+        var required = std.heap.ArenaAllocator.init(bounded);
+        const recovered = try manifests.load(required.allocator(), ref);
+        try std.testing.expectEqualStrings("one", recovered.file.id);
+        try std.testing.expectEqual(before + 1, probe.reads.load(.acquire));
+        try std.testing.expect(manifests.pending == null and probe.execution.active);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        required.deinit();
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+    }
+    // Saturation and opaque allocator wrappers decline optional work.
+    {
+        probe.gate = .unset;
+        var occupied = scheduler.submitIoTransient(std.testing.io, 1, struct {
+            fn wait(gate: *std.Io.Event) anyerror!void {
+                try gate.wait(std.testing.io);
+            }
+        }.wait, .{&probe.gate}).?;
+        defer _ = occupied.cancel(std.testing.io) catch {};
+        scheduler.max_io_workers = 1;
+        manifests.prefetch(ref);
+        try std.testing.expect(manifests.pending == null);
+    }
     scheduler.max_io_workers = 2;
     var buffer: [1024]u8 = undefined;
     var unknown = std.heap.FixedBufferAllocator.init(&buffer);

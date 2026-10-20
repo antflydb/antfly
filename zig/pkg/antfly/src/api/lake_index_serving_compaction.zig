@@ -41,12 +41,12 @@ const Builder = struct {
     ownership: *corpus.text_directory.Mutations,
     source_routes: *corpus.text_directory.Mutations,
     ties: *corpus.text_directory.Mutations,
+    additions: *corpus.text_directory.Publisher,
+    deletions: *corpus.text_directory.Publisher,
     open_packs: std.ArrayList(Chunk) = .empty,
     open_tails: std.ArrayList(corpus.Root.Tail) = .empty,
     candidates: [4]std.ArrayList(corpus.Root.Tail) = @splat(.empty),
     activated: [4]bool = @splat(false),
-    added: std.ArrayList(Chunk) = .empty,
-    removed: std.ArrayList(Chunk) = .empty,
     // Four eight-way tiers fill tiny-file packs by bytes. Source spans live in
     // independent pages; no merge opens more than eight posting inputs.
     pending: [4][8]Input = undefined,
@@ -68,6 +68,9 @@ const Builder = struct {
         for (group.summaries, group.segments) |summary, segment| try self.terms.add(self.pages.store(), summary, corpus.term_directory.identity(segment.artifact_id), sign);
     }
     fn owner(self: *@This(), group: corpus.FileGroup, manifest: Chunk, deleting: bool) !void {
+        // Separate bounded reducers preserve deletion-before-addition even
+        // when tier activation discovers a deletion after an emitted addition.
+        try (if (deleting) self.deletions else self.additions).add(group, manifest, deleting);
         try @import("lake_index_source_routes.zig").mutate(self.a, self.source_routes, group, deleting);
         try @import("lake_index_text_ties.zig").mutate(self.a, self.ties, group, deleting);
         const a = self.pending_arena[0].child_allocator;
@@ -96,7 +99,6 @@ const Builder = struct {
             _ = arena.reset(.free_all);
             const group = try corpus.loadFileManifestPublication(arena.allocator(), self.store.*, tail.ref, self.pages.domain, self.token);
             if (group.segments.len != 1 or group.sources.len != tail.spans or group.admissions[0].bytes != tail.bytes) return error.InvalidNativeLakeTextCorpus;
-            try self.removed.append(self.out, tail.ref);
             try self.contribution(group, -1);
             try self.owner(group, tail.ref, true);
             self.pack_count = try std.math.sub(u32, self.pack_count, 1);
@@ -194,8 +196,7 @@ const Builder = struct {
         const id = try std.fmt.allocPrint(out, "pack-{x}", .{&digest});
         group.file = .{ .id = id, .digest = digest };
         try corpus.text_directory.prepare(out, self.store, &group, self.token);
-        const manifest = try put(out, self.out, self.store, group, self.token);
-        try self.added.append(self.out, manifest);
+        const manifest = try put(out, out, self.store, group, self.token);
         try self.owner(group, manifest, false);
         var tier: usize = 0;
         var threshold: usize = 8;
@@ -203,8 +204,11 @@ const Builder = struct {
         var source_metadata: usize = 0;
         for (group.sources) |span| source_metadata += span.file.id.len + 512;
         if (group.sources.len < corpus.source_spans.max_spans and source_metadata < 512 * 1024 and group.admissions[0].bytes < 2 * 1024 * 1024 and self.open_counts[tier] < 7) {
-            try self.open_packs.append(self.out, manifest);
-            try self.open_tails.append(self.out, .{ .ref = manifest, .tier = @intCast(tier), .bytes = group.admissions[0].bytes, .spans = @intCast(group.sources.len) });
+            // Only the bounded open-tail inventory retains this reference;
+            // directory/ownership reducers have already copied their records.
+            const retained: Chunk = .{ .artifact_id = try self.out.dupe(u8, manifest.artifact_id), .checksum = try self.out.dupe(u8, manifest.checksum), .byte_len = manifest.byte_len };
+            try self.open_packs.append(self.out, retained);
+            try self.open_tails.append(self.out, .{ .ref = retained, .tier = @intCast(tier), .bytes = group.admissions[0].bytes, .spans = @intCast(group.sources.len) });
             self.open_counts[tier] += 1;
         }
         try self.contribution(group, 1);
@@ -225,7 +229,7 @@ const Builder = struct {
         };
         for (inputs, 0..) |input, i| {
             try self.check();
-            data[i] = try @import("lake_index_seekable_text.zig").load(a, .{ .store = self.store.*, .cache = null, .context = self.context, .cancellation = self.token }, input.ref);
+            data[i] = try @import("lake_index_seekable_text.zig").loadPublication(a, .{ .store = self.store.*, .cache = null, .context = self.context, .cancellation = self.token }, input.ref);
             readers[i] = data[i].initReader(a) catch |err| {
                 data[i].deinit(a);
                 return err;
@@ -308,7 +312,13 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     var ties = corpus.text_directory.Mutations.init(a, &manager, pages.store());
     ties.reduction = @import("lake_index_text_ties.zig").reduce;
     defer ties.deinit();
-    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .source_routes = &source_routes, .ties = &ties, .pending_arena = .{ .init(a), .init(a), .init(a), .init(a) } };
+    var additions: corpus.text_directory.Publisher = undefined;
+    try additions.init(a, store, token, context.io.?);
+    defer additions.deinit();
+    var deletions: corpus.text_directory.Publisher = undefined;
+    try deletions.init(a, store, token, context.io.?);
+    defer deletions.deinit();
+    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .source_routes = &source_routes, .ties = &ties, .additions = &additions, .deletions = &deletions, .pending_arena = .{ .init(a), .init(a), .init(a), .init(a) } };
     defer for (&builder.pending_arena) |*pending| pending.deinit();
     var prior: ?corpus.Root = null;
     if (previous) |old| if (old.serving != null) {
@@ -318,11 +328,12 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     defer scratch.deinit();
     if (prior) |old| {
         builder.collect_term_deltas = old.term_directory.leaves != null;
-        if (old.source_routes_version == 0) {
+        if (old.source_routes_version == 0 or old.tie_bounds == null) {
             for (try corpus.text_directory.fileRecordsPublication(ca, old, store.*, token)) |record| {
                 _ = scratch.reset(.free_all);
                 const group = try corpus.loadFileManifestPublication(scratch.allocator(), store.*, record.manifest, old.domain, token);
-                try @import("lake_index_source_routes.zig").mutate(a, &source_routes, group, false);
+                if (old.source_routes_version == 0) try @import("lake_index_source_routes.zig").mutate(a, &source_routes, group, false);
+                if (old.tie_bounds == null) try @import("lake_index_text_ties.zig").mutate(a, &ties, group, false);
             }
         }
         builder.pack_count = old.segment_count;
@@ -362,7 +373,6 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
                 if (!std.mem.eql(u8, &span.file.digest, &(try plan.stateAt(ordinal)).digest)) continue;
                 try sources.append(sa, span);
             };
-            try builder.removed.append(ca, ref.*);
             try builder.contribution(group, -1);
             try builder.owner(group, ref.*, true);
             builder.pack_count = try std.math.sub(u32, builder.pack_count, 1);
@@ -396,7 +406,10 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     };
     var root = current;
     root.serving = null;
-    root.directories = try corpus.text_directory.publishManifests(a, store, builder.added.items, builder.removed.items, if (prior) |old| old.directories else .{}, current.domain, token, context.io.?);
+    // Every group has already been authenticated or constructed locally. The
+    // reducers copy it before its arena resets; no archive-sized handoff and no
+    // GET of a just-written manifest or source-span page is required.
+    root.directories = try additions.finish(try deletions.finish(if (prior) |old| old.directories else .{}));
     root.file_count = builder.pack_count;
     root.segment_count = builder.pack_count;
     if (!builder.collect_term_deltas) {
@@ -419,15 +432,6 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
         };
         var bootstrap: Bootstrap = .{ .pages = &pages, .terms = &terms, .context = context, .token = token };
         try corpus.text_directory.walkSegmentsPublication(a, root, store.*, token, &bootstrap);
-    }
-    if (prior == null or prior.?.tie_bounds == null) {
-        // Bootstrap compact navigation once for an older publication. Only
-        // manifests/spans are read, never postings or source Parquet data.
-        for (try corpus.text_directory.fileRecordsPublication(ca, root, store.*, token)) |record| {
-            _ = scratch.reset(.free_all);
-            const group = try corpus.loadFileManifestPublication(scratch.allocator(), store.*, record.manifest, root.domain, token);
-            try @import("lake_index_text_ties.zig").mutate(a, &ties, group, false);
-        }
     }
     root.tie_bounds = try ties.finish(if (prior) |old| old.tie_bounds else null);
     root.term_directory = try terms.finish(pages.store(), if (prior) |old| old.term_directory else .{});
@@ -542,7 +546,19 @@ test "external lake global frontier cross file packs preserve coordinates ties r
         execution: local.sql_parallel_scheduler.Execution,
         pending: ?local.sql_parallel_scheduler.Execution.Io = null,
         peak: usize = 0,
-        parked_reads: usize = 0,
+        parked_reads: std.atomic.Value(usize) = .init(0),
+        read_count: std.atomic.Value(usize) = .init(0),
+        read_ids: [4096][32]u8 = undefined,
+        fn read(_: *anyopaque, alloc: A, id: []const u8, maximum: usize, token: Cancellation) ![]u8 {
+            const self = active;
+            const index = self.read_count.fetchAdd(1, .monotonic);
+            try std.testing.expect(index < self.read_ids.len);
+            self.read_ids[index] = corpus.term_directory.identity(id);
+            const bytes = try self.original.getAllocWithCancellationUsingAllocator(alloc, id, token);
+            errdefer alloc.free(bytes);
+            if (bytes.len > maximum) return error.ArtifactTooLarge;
+            return bytes;
+        }
         fn begin(raw: *anyopaque, count: usize) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.peak = @max(self.peak, count);
@@ -561,8 +577,9 @@ test "external lake global frontier cross file packs preserve coordinates ties r
         }
         fn range(_: *anyopaque, alloc: A, id: []const u8, offset: u64, count: usize, token: Cancellation) ![]u8 {
             const self = active;
+            try std.testing.expect(!self.execution.active);
             if (!self.execution.active) {
-                self.parked_reads += 1;
+                _ = self.parked_reads.fetchAdd(1, .monotonic);
                 var other: local.sql_parallel_scheduler.Execution = .{ .scheduler = self.execution.scheduler, .bytes = 1024 };
                 try other.enter(std.testing.io);
                 other.pause();
@@ -578,12 +595,13 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     const capability: stores.IoPhase = .{ .io = std.testing.io, .ptr = &probe, .scheduler = &scheduler, .max_parallel = 3, .begin = IoProbe.begin, .finish = IoProbe.finish, .abort = IoProbe.abort };
     var vtable = store.vtable.*;
     vtable.get_range_alloc_with_cancellation = IoProbe.range;
+    vtable.get_bounded_alloc_with_cancellation = IoProbe.read;
     var publication_store = store;
     publication_store.io_phase = &capability;
     publication_store.vtable = &vtable;
     current.serving = try publish(a, ca, &publication_store, current, null, &first_plan, .{ .io = std.testing.io }, .none);
     try std.testing.expect(probe.execution.active);
-    try std.testing.expect(probe.parked_reads > 0);
+    try std.testing.expect(probe.parked_reads.load(.acquire) > 0);
     try std.testing.expect(probe.peak > 1 and probe.peak <= 3);
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
     probe.execution.pause();
@@ -593,6 +611,10 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     try std.testing.expectEqual(@as(usize, 1), first.open_packs.len);
     const first_packs = try corpus.text_directory.fileRecords(ca, first, store, null, .none);
     for (first_packs) |pack| {
+        // Locally emitted metadata feeds directory/tie reducers directly. A
+        // fresh serving manifest must never be read back during publication.
+        const identity = corpus.term_directory.identity(pack.manifest.artifact_id);
+        for (probe.read_ids[0..probe.read_count.load(.acquire)]) |read_id| try std.testing.expect(!std.mem.eql(u8, &identity, &read_id));
         const group = try corpus.loadFileManifest(ca, store, pack.manifest, current.domain, .none, null);
         try std.testing.expectEqual(@as(usize, 128), group.sources.len);
         try std.testing.expectEqual(@as(usize, 2), group.source_pages.len);
@@ -683,6 +705,11 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     // signed deletions against an absent base must never reach sorted build.
     var disabled_serving = appended_root;
     disabled_serving.term_directory = .{ .version = 2 };
+    // Legacy navigation bootstraps from old groups before signed changes, so
+    // untouched packs survive without reloading any freshly emitted manifest.
+    disabled_serving.tie_bounds = null;
+    disabled_serving.source_routes_version = 0;
+    disabled_serving.source_routes = null;
     var disabled_base = appended;
     disabled_base.serving = try put(ca, ca, &store, disabled_serving, .none);
     const original_tail = refs[128];
@@ -693,6 +720,7 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     bootstrapped.serving = try publish(a, ca, &store, bootstrapped, disabled_base, &bootstrap_plan, .{ .io = std.testing.io }, .none);
     const complete = try Helper.reopen(ca, &store, bootstrapped);
     try Helper.verify(ca, store, complete, 258);
+    try std.testing.expectEqual(@as(u64, complete.segment_count), complete.tie_bounds.?.records);
     var expected_terms: u64 = 0;
     for (try corpus.text_directory.fileRecords(ca, complete, store, null, .none)) |pack| {
         const group_ = try corpus.loadFileManifest(ca, store, pack.manifest, complete.domain, .none, null);

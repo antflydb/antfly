@@ -3332,3 +3332,37 @@ survives without a lease, and scalar/vector, analyzer, typed-value and highlight
 behavior remain identical. These changes preserve existing artifact formats and
 require no new public configuration. Archive/cloud throughput still needs the
 controlled qualification described above.
+
+### Compaction posting transport and streamed serving metadata
+
+Compaction owns a dedicated seekable-source read capability for its lifetime.
+Required directory, navigation-bundle and posting-range transport parks its CPU
+execution and restores it before serial decoding continues. Broad reads reserve
+bounded waves of at most four 1 MiB slices, further capped by the publication's
+I/O width and known working-set headroom. Provider scratch is charged to the
+compaction allocator; opaque quotas retain one slice per wave. Children use raw
+transport under the parent's reservation, without
+nested scheduler admission; single-slot execution uses the required serial path.
+Backend failures drain every child and restore admission before returning.
+Serving readers and their speculative workers retain independent capabilities.
+
+Emitted serving groups feed bounded file/segment/routing reducers directly,
+alongside ownership, source-route, tie and term reducers. Separate deletion and
+addition streams apply removals first even when lazy tier activation discovers a
+removal after another pack has been emitted. Each stream uses three bounded sorts
+with durable spill runs; decoded groups and source spans are consumed before
+merge arenas reset. Publication no longer retains a list of all added/removed
+manifest references for reconstruction, nor fetches fresh serving manifests or
+their span pages to rebuild those directories. Missing legacy tie/source-route
+navigation bootstraps from the old inventory before changes; fresh packs supply
+navigation as they are emitted. No persistent artifact format changes.
+
+Manifest read-ahead remains optional after scheduling as well as before it. If a
+child loses its allocation headroom to the active reducer, its failed task is
+joined and retired, CPU admission resumes, cancellation is checked, and a
+required synchronous read retries. Integrity and provider failures remain fatal.
+The pressure regression exhausts a real working-set quota while prefetch waits,
+releases the reducer memory, and verifies successful required publication with
+no retained buffers or reservations. Transport overlap and absence of redundant
+fresh-manifest GETs are deterministic contracts; archive/cloud latency and the
+write cost of the two directory phases still require controlled measurement.

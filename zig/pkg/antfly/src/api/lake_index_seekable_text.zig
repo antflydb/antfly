@@ -87,6 +87,10 @@ pub const Read = struct {
     /// Generation-owned descriptor routing. Shared physical sources never
     /// decide which generation's file manifest a reader must retain.
     descriptors: ?*const Descriptors = null,
+    /// Serial operation-owned compaction only. Shared serving readers and their
+    /// speculative workers never borrow the publication CPU capability.
+    publication: bool = false,
+    transport_allocator: ?A = null,
     store: stores.ArtifactStore,
     cache: ?artifacts.CachedRead,
     context: local.serverless_query_lake_read_context.Context,
@@ -248,7 +252,7 @@ pub fn publishWithOpeningCollector(a: A, out: A, store: *stores.ArtifactStore, b
 }
 pub fn loadDirectory(a: A, read: Read, ref: Ref) !Directory {
     if (ref.byte_len > 4 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
-    const bytes = try artifacts.readArtifact(a, read.store, ref, read.cancellation, read.cache);
+    const bytes = if (read.publication) try artifacts.readPublicationArtifact(a, read.store, ref, read.cancellation) else try artifacts.readArtifact(a, read.store, ref, read.cancellation, read.cache);
     defer a.free(bytes);
     const directory = try std.json.parseFromSliceLeaky(Directory, a, bytes, .{ .allocate = .alloc_always });
     try directory.validate();
@@ -313,7 +317,19 @@ const PhysicalWarm = struct {
         return .{ .value = .{ .bytes = bytes, .digest = digest }, .owner = .{ .bytes = bytes, .owner = .{ .shared = .{ .ptr = holder, .release_fn = release } } } };
     }
 };
+fn requiredRange(a: A, store: stores.ArtifactStore, id: []const u8, offset: u64, length: usize, token: Cancellation, publication: bool) ![]u8 {
+    var phase = if (publication) try store.beginIo(1) else stores.IoGuard{};
+    defer phase.abort();
+    var backend = store;
+    backend.io_phase = null;
+    const bytes = backend.getRangeAllocWithCancellationUsingAllocator(a, id, offset, length, token) catch |err| return phase.failed(err);
+    errdefer a.free(bytes);
+    try phase.finish();
+    try token.check();
+    return bytes;
+}
 const CoalescedRead = struct {
+    publication: bool = false,
     store: stores.ArtifactStore,
     pack: Ref,
     start: u64,
@@ -504,7 +520,7 @@ const CoalescedRead = struct {
     }
     fn range(self: *@This(), a: A, piece: Piece) ![]u8 {
         if (self.bytes == null) {
-            self.bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(self.a, self.pack.artifact_id, self.start, self.length, self.cancellation);
+            self.bytes = try requiredRange(self.a, self.store, self.pack.artifact_id, self.start, self.length, self.cancellation, self.publication);
             if (self.bytes.?.len != self.length) return error.ArtifactIntegrityMismatch;
         }
         const offset: usize = @intCast(piece.pack_offset - self.start);
@@ -512,16 +528,20 @@ const CoalescedRead = struct {
     }
 };
 fn readPieceLease(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
-    return readPieceLeaseCoalesced(a, store, piece, cancellation, cached, null);
+    return readPieceLeaseCoalesced(a, store, piece, cancellation, cached, null, false);
 }
-fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
-    if (piece.pack == null) return artifacts.readArtifactLease(a, store, piece.ref, cancellation, cached);
+fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead, publication: bool) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
+    if (piece.pack == null) {
+        if (publication) return .{ .heap = .{ .alloc = a, .bytes = try artifacts.readPublicationArtifact(a, store, piece.ref, cancellation) } };
+        return artifacts.readArtifactLease(a, store, piece.ref, cancellation, cached);
+    }
     const Loader = struct {
         store: stores.ArtifactStore,
         piece: Piece,
         cancellation: Cancellation,
         coalesced: ?*CoalescedRead,
         cached: ?artifacts.CachedRead,
+        publication: bool,
         traffic: local.serverless_query_lake_serving_cache.Cache.ProviderRead = .{ .requests = 0, .bytes = 0 },
         fn providerRead(raw: *anyopaque) local.serverless_query_lake_serving_cache.Cache.ProviderRead {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -529,10 +549,9 @@ fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, canc
         }
         fn load(raw: *anyopaque, alloc: A) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            var source = self.store;
             self.traffic = if (self.coalesced) |group| if (group.bytes == null) .{ .requests = 1, .bytes = group.length } else .{ .requests = 0, .bytes = 0 } else .{ .requests = 1, .bytes = self.piece.ref.byte_len };
             if (self.coalesced != null and self.cached != null) self.traffic = .{ .requests = 0, .bytes = 0 };
-            const bytes = if (self.coalesced) |group| try group.range(alloc, self.piece) else try source.getRangeAllocWithCancellationUsingAllocator(alloc, self.piece.pack.?.artifact_id, self.piece.pack_offset, @intCast(self.piece.ref.byte_len), self.cancellation);
+            const bytes = if (self.coalesced) |group| try group.range(alloc, self.piece) else try requiredRange(alloc, self.store, self.piece.pack.?.artifact_id, self.piece.pack_offset, @intCast(self.piece.ref.byte_len), self.cancellation, self.publication);
             errdefer alloc.free(bytes);
             if (bytes.len != self.piece.ref.byte_len) return error.ArtifactIntegrityMismatch;
             var digest: [32]u8 = undefined;
@@ -556,7 +575,7 @@ fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, canc
         };
         return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, verified);
     }
-    var loader: Loader = .{ .store = store, .piece = piece, .cancellation = cancellation, .coalesced = coalesced, .cached = cached };
+    var loader: Loader = .{ .store = store, .piece = piece, .cancellation = cancellation, .coalesced = coalesced, .cached = cached, .publication = publication };
     return .{ .heap = .{ .alloc = a, .bytes = try Loader.load(&loader, a) } };
 }
 const Owner = struct {
@@ -696,7 +715,7 @@ const Owner = struct {
             defer if (group) |*value| value.deinit();
             for (pieces) |piece| {
                 try self.capability.check();
-                var lease = try readPieceLeaseCoalesced(std.heap.page_allocator, self.capability.store, piece, token, cached, if (group) |*value| value else null);
+                var lease = try readPieceLeaseCoalesced(std.heap.page_allocator, self.capability.store, piece, token, cached, if (group) |*value| value else null, false);
                 lease.deinit();
             }
         }
@@ -868,6 +887,7 @@ const Owner = struct {
         defer pin.release();
         const directory = pin.value;
         if (start > directory.bytes or out.len > directory.bytes - start) return error.InvalidNativeLakeTextCorpus;
+        if (capability.publication) return self.readPublication(directory, capability, start, out);
         const io = capability.context.io orelse return self.readSerial(directory, capability, start, out);
         if (out.len <= pack_bytes) return self.readSerial(directory, capability, start, out);
         var tasks: [3]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
@@ -905,13 +925,56 @@ const Owner = struct {
         }
         try capability.check();
     }
+    fn readPublication(self: *@This(), directory: Directory, capability: Read, start: u64, out: []u8) !void {
+        const phase_cap = capability.store.io_phase orelse return self.readSerial(directory, capability, start, out);
+        const scratch = capability.transport_allocator orelse self.a;
+        const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(scratch);
+        const memory_width = if (available) |bytes| @max(1, bytes / (pack_bytes * 3)) else 1;
+        const width = @max(1, @min(4, phase_cap.max_parallel, memory_width));
+        if (out.len <= pack_bytes) return self.readSerial(directory, capability, start, out);
+        // Reserve the whole bounded wave while parking its CPU owner. Children
+        // use raw transport, so a one-slot scheduler cannot nest I/O admission.
+        var worker = capability;
+        worker.publication = false;
+        worker.transport_allocator = scratch;
+        worker.store.io_phase = null;
+        const Worker = struct {
+            fn run(owner: *Owner, dir: Directory, cap: Read, offset: u64, target: []u8, failure: *?anyerror) void {
+                owner.readSerial(dir, cap, offset, target) catch |err| {
+                    failure.* = err;
+                };
+            }
+        };
+        var done: usize = 0;
+        while (done < out.len) {
+            try capability.check();
+            const count = @min(width, std.math.divCeil(usize, out.len - done, pack_bytes) catch unreachable);
+            var phase = try capability.store.beginIo(count);
+            defer phase.abort();
+            var failures: [4]?anyerror = @splat(null);
+            var group: std.Io.Group = .init;
+            defer group.cancel(phase_cap.io);
+            for (0..count) |lane| {
+                const take = @min(pack_bytes, out.len - done);
+                group.async(phase_cap.io, Worker.run, .{ self, directory, worker, start + done, out[done..][0..take], &failures[lane] });
+                done += take;
+            }
+            group.await(phase_cap.io) catch |err| {
+                group.cancel(phase_cap.io);
+                return phase.failed(err);
+            };
+            for (failures[0..count]) |failure| if (failure) |err| return phase.failed(err);
+            try phase.finish();
+        }
+        try capability.check();
+    }
     fn metadataBytes(self: *@This(), directory: Directory, capability: Read) !?[]const u8 {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         try capability.check();
         if (self.metadata_bundle.len == 0) {
             const pack = directory.metadata_bundle orelse return null;
-            const encoded = artifacts.readArtifact(self.a, capability.store, pack, capability.cancellation, capability.cache) catch |err| switch (err) {
+            const encoded = (if (capability.publication) artifacts.readPublicationArtifact(self.a, capability.store, pack, capability.cancellation) else artifacts.readArtifact(self.a, capability.store, pack, capability.cancellation, capability.cache)) catch |err| switch (err) {
                 // Navigation residency is optional; continue through bounded
                 // verified range leases when this physical owner is full.
                 error.OutOfMemory => return null,
@@ -943,6 +1006,7 @@ const Owner = struct {
     fn readSerial(self: *@This(), directory: Directory, capability: Read, start: u64, out: []u8) anyerror!void {
         try capability.check();
         if (start > directory.bytes or out.len > directory.bytes - start) return error.InvalidNativeLakeTextCorpus;
+        const transport = capability.transport_allocator orelse if (capability.publication) self.a else std.heap.page_allocator;
         var offset: usize = @intCast(start);
         var done: usize = 0;
         var group: ?CoalescedRead = null;
@@ -975,10 +1039,10 @@ const Owner = struct {
                         if (following.offset != piece.offset + length or following.offset >= requested_end or following.pack == null or !std.mem.eql(u8, following.pack.?.artifact_id, pack.artifact_id) or following.pack_offset != piece.pack_offset + length) break;
                         length += @intCast(following.ref.byte_len);
                     }
-                    group = .{ .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = std.heap.page_allocator, .pieces = directory.blocks[index..next] };
+                    group = .{ .publication = capability.publication, .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = transport, .pieces = directory.blocks[index..next] };
                 };
             }
-            var lease = try readPieceLeaseCoalesced(std.heap.page_allocator, capability.store, piece, capability.cancellation, capability.cache, if (group) |*value| value else null);
+            var lease = try readPieceLeaseCoalesced(transport, capability.store, piece, capability.cancellation, capability.cache, if (group) |*value| value else null, capability.publication);
             defer lease.deinit();
             const data = lease.bytes();
             try capability.check();
@@ -1043,6 +1107,15 @@ pub fn routedReader(a: A, source: local.index.SegmentSource) !local.segment.Segm
     const ref = owner.directory_ref.?;
     if (!std.mem.eql(u8, group.segments[index].artifact_id, ref.artifact_id) or !std.mem.eql(u8, group.segments[index].checksum, ref.checksum) or group.segments[index].byte_len != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
     return local.segment.SegmentReader.initAuthenticated(a, source, group.admissions[index]);
+}
+/// The caller owns this source and all of its readers until merge completion.
+/// It must not publish it into a shared serving corpus.
+pub fn loadPublication(a: A, read: Read, ref: Ref) !local.index.SegmentData {
+    std.debug.assert(read.cache == null);
+    var capability = read;
+    capability.publication = true;
+    capability.transport_allocator = a;
+    return load(a, capability, ref);
 }
 pub fn load(a: A, read: Read, ref: Ref) !local.index.SegmentData {
     const owner = try a.create(Owner);
@@ -1807,8 +1880,15 @@ test "external lake required pack reads overlap and return every scheduler reser
         active: std.atomic.Value(usize) = .init(0),
         peak: std.atomic.Value(usize) = .init(0),
         fail: bool = false,
+        execution: ?*local.sql_parallel_scheduler.Execution = null,
         fn range(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, len: usize, cancellation: Cancellation) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.execution) |execution| {
+                try std.testing.expect(!execution.active);
+                var other: local.sql_parallel_scheduler.Execution = .{ .scheduler = execution.scheduler, .bytes = 1 };
+                try other.enter(std.testing.io);
+                other.pause();
+            }
             const active = self.active.fetchAdd(1, .acq_rel) + 1;
             defer _ = self.active.fetchSub(1, .acq_rel);
             _ = self.peak.fetchMax(active, .monotonic);
@@ -1835,6 +1915,62 @@ test "external lake required pack reads overlap and return every scheduler reser
     try std.testing.expectEqual(@as(usize, 0), provider.active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().workers);
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().bytes);
+    const Phase = struct {
+        execution: local.sql_parallel_scheduler.Execution,
+        pending: ?local.sql_parallel_scheduler.Execution.Io = null,
+        fn begin(raw: *anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pending = try self.execution.beginIo(std.testing.io, count);
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var pending = self.pending.?;
+            self.pending = null;
+            try pending.finish();
+        }
+        fn abort(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.pending) |*pending| pending.abort();
+            self.pending = null;
+        }
+    };
+    // Both bounded parallel waves and the single-lane fallback park the CPU
+    // owner for every provider read, then resume it before decoding continues.
+    for ([_]usize{ 1, 3, 3 }, 0..) |width, case| {
+        var build = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = pack_bytes * 12 });
+        var memory: local.sql_memory_budget = .{ .backing = build.allocator(), .limit = pack_bytes * 3 * (if (case == 2) @as(usize, 1) else width) };
+        const expected_width: usize = if (case == 2) 1 else width;
+        var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = width };
+        var phase: Phase = .{ .execution = .{ .scheduler = &scheduler, .bytes = 1 } };
+        try phase.execution.enter(io);
+        defer phase.execution.pause();
+        const capability: stores.IoPhase = .{ .io = io, .ptr = &phase, .max_parallel = width, .begin = Phase.begin, .finish = Phase.finish, .abort = Phase.abort };
+        var publication = read;
+        publication.publication = true;
+        publication.transport_allocator = memory.allocator();
+        publication.store.io_phase = &capability;
+        provider.execution = &phase.execution;
+        defer provider.execution = null;
+        provider.fail = false;
+        provider.peak.store(0, .release);
+        try owner.read(publication, 0, output);
+        try std.testing.expectEqualSlices(u8, bytes, output);
+        try std.testing.expect(phase.execution.active);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        if (expected_width > 1) try std.testing.expect(provider.peak.load(.acquire) > 1);
+        try std.testing.expect(provider.peak.load(.acquire) <= expected_width);
+        try std.testing.expect(memory.peak > 0 and memory.peak <= memory.limit);
+        try std.testing.expectEqual(@as(usize, 0), memory.live);
+        try std.testing.expectEqual(@as(usize, 0), build.live_bytes);
+        // Small reads and broad backend failures restore the same admission.
+        try owner.read(publication, 17, output[0..97]);
+        try std.testing.expectEqualSlices(u8, bytes[17..][0..97], output[0..97]);
+        provider.fail = true;
+        try std.testing.expectError(error.TestRemoteUnavailable, owner.read(publication, 0, output));
+        try std.testing.expect(phase.execution.active);
+        try std.testing.expectEqual(@as(usize, 0), provider.active.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    }
 }
 
 test "external lake admitted directories evict independently of the corpus heap and pin live readers" {
