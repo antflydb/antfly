@@ -937,3 +937,11 @@ retained prefix for each packet quantum. Prepared consumers still own immutable
 metadata snapshots. Probe growth is admitted before allocation, retains encoded
 snapshot owners, and resets on eviction or failed append; transport publication
 and output acknowledgement boundaries remain transactional.
+
+Live video validation can retain exact model-prepared frame inputs under a
+versioned preparation policy; raw pixels and prepared inputs share one bounded
+cache with immutable window pins. The inference stream installs and restores
+its policy, while generic media callers retain the raw-pixel default. Admitted
+video producers prepare ahead of the model execution queue; completed windows
+can compose independently within a cohort. See `../video/VIDEO.md` for ownership,
+policy matching, scratch admission and fallback behavior.

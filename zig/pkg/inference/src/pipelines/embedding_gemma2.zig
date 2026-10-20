@@ -377,7 +377,7 @@ pub const Options = struct {
     video_ahead: ?*VideoAhead = null,
     video_prepared: ?VideoPreparedHook = null,
     /// Scoped to one admitted video row; never retained past preparation.
-    video_encoded: ?*const @import("embedding_gemma2_video.zig").Encoded = null,
+    video_encoded: ?*@import("embedding_gemma2_video.zig").Encoded = null,
     task_type: []const u8 = "RETRIEVAL_DOCUMENT",
     dimensions: usize = 768,
     /// Expanded input limit, including prompts, wrappers, and media tokens.
@@ -502,7 +502,7 @@ pub const VideoAhead = struct {
 pub const Result = struct { vector: []f32, input_tokens: usize };
 
 const CT = @import("../ops/ops.zig").CT;
-const SoftTokens = struct { id: i64, embeddings: []f32, tokens: usize, tensor: ?CT = null };
+const SoftTokens = struct { id: i64, embeddings: []f32, tokens: usize, tensor: ?CT = null, tensor_owned: bool = true };
 
 /// Keep live workspace accounting independent of the platform allocator. On
 /// macOS libc reuses large CPU buffers instead of remapping them per operation.
@@ -1062,6 +1062,24 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
 /// No queue fill delay: callers pass only already available windows (max four).
 pub const VideoBatchResult = struct { vectors: [][]f32, input_tokens: []usize, execution: BatchExecution.Execution, shared_vision_batches: usize = 0 };
 pub const VideoBatchItem = struct { movie: SampledVideo, caption: ?[]const u8 = null, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*VideoAhead = null };
+fn releaseVideoBatchPreparations(items: []const VideoBatchItem, producers: []const *@import("embedding_gemma2_video.zig").Prefetch) void {
+    const Prefetch = @import("embedding_gemma2_video.zig").Prefetch;
+    var owned: [4]*Prefetch = undefined;
+    var count: usize = 0;
+    // Adopt already-running ahead rows too, even when an earlier ordinary row
+    // fails startup. Otherwise fallback can wait on their full decoder queue.
+    for (items, 0..) |item, index| {
+        const producer = if (index < producers.len) producers[index] else if (item.ahead) |ahead| ahead.producer else null;
+        if (producer) |value| {
+            owned[count] = value;
+            count += 1;
+        }
+    }
+    Prefetch.cancelCohort(owned[0..count]);
+    for (items, 0..) |item, index| {
+        if (item.ahead) |ahead| ahead.release() else if (index < producers.len) producers[index].deinit();
+    }
+}
 pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, items: []const VideoBatchItem, input_options: Options, lock: ?*std.atomic.Mutex, control: Control, cache: ?*FrameCache) !VideoBatchResult {
     var pins = @import("embedding_gemma2_video.zig").CachePins{ .cache = cache };
     defer pins.deinit();
@@ -1095,6 +1113,9 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     const preparation_context = try factory.videoPreparationContext(session, false);
     const cohort_io = control.io orelse preparation_context.io;
     const cohort = items.len > 1 and cohort_io != null and !@import("builtin").single_threaded and !@import("builtin").cpu.arch.isWasm() and (session.backend() == .metal or session.backend() == .native);
+    // Admission/compatibility can decline before ordinary producers start.
+    // A running later row must not retain the decoder lease during fallback.
+    errdefer if (cohort) releaseVideoBatchPreparations(items, &.{});
     for (items) |item| {
         const movie = item.movie;
         try control.check();
@@ -1136,37 +1157,18 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     defer permit.deinit();
     var pool = media_admission.Pool{ .limits = .{ .host_bytes = host, .device_bytes = if (session.backend() == .metal) device else 0, .commands = if (session.backend() == .metal) commands else 0 } };
     defer std.debug.assert(std.meta.eql(pool.snapshot(), media_admission.Resources{}));
-    var execution_waiter = Scheduler.Waiter{};
-    try enterModel(session, lock, control, &execution_waiter);
-    defer leaveModel(lock, &execution_waiter);
-    if (session.backend() == .metal) options.video_coefficients = (try factory.videoPreparationContext(session, commands != 0)).coefficients;
-    var managed = try factory.getManagedComputeBackend(session, a, null, control);
-    defer managed.deinit();
-    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = idle_backend, .cb = &managed.backend, .control = control, .video_phases = video_phases, .composition_request = if (video_phases) try compositionRequest(execution_request, idle_backend, total + items.len * 128) else null };
-    lane.attach();
-    defer lane.deinit();
-    if (video_phases) try lane.reserve(null);
-    const cb = &managed.backend;
-    var rows: [4]PreparedGroup = undefined;
-    var initialized: usize = 0;
-    defer for (rows[0..initialized]) |row| row.deinit(a);
-    defer if (cb.embedding_stage) |stage| stage.cleanup();
+    var preparation_guard = if (cohort) try control.enterUninterruptible(session.interruption()) else @import("../execution_control.zig").UninterruptibleGuard{};
+    defer preparation_guard.deinit();
     const video_model = @import("embedding_gemma2_video.zig");
-    var encoded_rows: [4]video_model.Encoded = undefined;
-    var encoded_count: usize = 0;
-    var shared_vision_batches: usize = 0;
-    defer for (encoded_rows[0..encoded_count]) |encoded| encoded.deinit(a);
+    var preparation_wake: std.Io.Event = .unset;
+    var producers: [4]*video_model.Prefetch = undefined;
+    var producer_count: usize = 0;
+    defer if (cohort) releaseVideoBatchPreparations(items, producers[0..producer_count]);
+    // Admission and immutable inspection precede producer publication. Decode
+    // and preparation can fill bounded queues while this request waits its turn.
     if (cohort) {
         var context = preparation_context;
         if (commands != 0) context = try factory.videoPreparationContext(session, true);
-        var producers: [4]*video_model.Prefetch = undefined;
-        var producer_count: usize = 0;
-        defer {
-            video_model.Prefetch.cancelCohort(producers[0..producer_count]);
-            for (items[0..producer_count], producers[0..producer_count]) |item, producer| {
-                if (item.ahead) |ahead| ahead.release() else producer.deinit();
-            }
-        }
         // Complete shared inspection/pin mutations before any new producer
         // reads those immutable entries on another thread.
         for (items) |item| if (item.ahead == null) {
@@ -1179,33 +1181,71 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
             producers[index] = if (item.ahead) |ahead| ahead.producer.? else try video_model.Prefetch.startConfigured(a, cohort_io.?, context.device, movie.bytes, movie.reader, control, .{ .predecessor = if (index == 0) null else producers[index - 1], .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins, .inspection_scope = &inspection_scope, .pool = &pool, .cache = cache, .coefficients = context.coefficients });
             producer_count += 1;
         }
-        shared_vision_batches = try video_model.Prefetch.encodeCohort(a, cb, producers[0..producer_count], encoded_rows[0..producer_count]);
-        encoded_count = producer_count;
     }
-    for (items, 0..) |item, row_index| {
-        const movie = item.movie;
-        const parts = [_]Part{ .{ .sampled_video = movie }, .{ .text = item.caption orelse "" } };
-        const group = Group{ .content = parts[0..if (item.caption != null) 2 else 1] };
-        try validateGroup(group, options);
-        var row_options = options;
-        if (cohort) row_options.video_encoded = &encoded_rows[row_index];
-        rows[initialized] = try prepareGroupWithBudget(a, cb, tokenizer, group, row_options, control, &pool, if (!cohort and item.ahead != null) item.ahead.?.producer else null, cache);
-        if (cb.embedding_stage != null) if (rows[initialized].tensor) |tensor| {
-            rows[initialized].tensor = @import("../ops/metal_compute.zig").MetalCompute.escapeEmbeddingStage(cb, tensor) catch |err| {
-                rows[initialized].deinit(a);
-                return err;
-            };
-            cb.free(tensor);
-        };
-        if (!cohort) if (item.ahead) |ahead| ahead.release();
-        initialized += 1;
-        if (cb.embedding_stage) |stage| {
-            try stage.pause();
-            try stage.acquire();
+    if (cohort) try video_model.Prefetch.waitCohortReady(producers[0..producer_count], &preparation_wake, control);
+    var execution_waiter = Scheduler.Waiter{};
+    try enterModel(session, lock, control, &execution_waiter);
+    defer leaveModel(lock, &execution_waiter);
+    if (session.backend() == .metal) options.video_coefficients = (try factory.videoPreparationContext(session, commands != 0)).coefficients;
+    var managed = try factory.getManagedComputeBackend(session, a, null, control);
+    defer managed.deinit();
+    var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = idle_backend, .cb = &managed.backend, .control = control, .video_phases = video_phases, .composition_request = if (video_phases) try compositionRequest(execution_request, idle_backend, total + items.len * 128) else null };
+    lane.attach();
+    defer lane.deinit();
+    if (video_phases) try lane.reserve(null);
+    const cb = &managed.backend;
+    var rows: [4]PreparedGroup = undefined;
+    var prepared: [4]bool = @splat(false);
+    defer for (prepared, 0..) |live, index| {
+        if (live) rows[index].deinit(a);
+    };
+    defer if (cb.embedding_stage) |stage| stage.cleanup();
+    const Composer = struct {
+        a: std.mem.Allocator,
+        cb: *const ComputeBackend,
+        tokenizer: Tokenizer,
+        items: []const VideoBatchItem,
+        options: Options,
+        control: Control,
+        pool: *media_admission.Pool,
+        cache: ?*FrameCache,
+        rows: *[4]PreparedGroup,
+        prepared: *[4]bool,
+        fn ready(raw: *anyopaque, index: usize, encoded: *video_model.Encoded) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.prepare(index, encoded);
         }
-    }
-    for (encoded_rows[0..encoded_count]) |encoded| encoded.deinit(a);
-    encoded_count = 0;
+        fn prepare(self: *@This(), index: usize, encoded: ?*video_model.Encoded) !void {
+            const item = self.items[index];
+            const parts = [_]Part{ .{ .sampled_video = item.movie }, .{ .text = item.caption orelse "" } };
+            const group = Group{ .content = parts[0..if (item.caption != null) 2 else 1] };
+            try validateGroup(group, self.options);
+            var row_options = self.options;
+            row_options.video_encoded = encoded;
+            self.rows[index] = try prepareGroupWithBudget(self.a, self.cb, self.tokenizer, group, row_options, self.control, self.pool, if (encoded == null and item.ahead != null) item.ahead.?.producer else null, self.cache);
+            self.prepared[index] = true;
+            if (self.cb.embedding_stage != null) if (self.rows[index].tensor) |tensor| {
+                self.rows[index].tensor = try @import("../ops/metal_compute.zig").MetalCompute.escapeEmbeddingStage(self.cb, tensor);
+                self.cb.free(tensor);
+            };
+            if (encoded == null) if (item.ahead) |ahead| ahead.release();
+            if (self.cb.embedding_stage) |stage| {
+                try stage.pause();
+                try stage.acquire();
+            }
+        }
+    };
+    var composer = Composer{ .a = a, .cb = cb, .tokenizer = tokenizer, .items = items, .options = options, .control = control, .pool = &pool, .cache = cache, .rows = &rows, .prepared = &prepared };
+    var encoded_rows: [4]video_model.Encoded = @splat(.{});
+    defer for (encoded_rows[0..items.len]) |encoded| encoded.deinit(a);
+    const shared_vision_batches = if (cohort) try video_model.Prefetch.encodeCohortReady(a, cb, producers[0..producer_count], encoded_rows[0..producer_count], .{ .context = &composer, .ready = Composer.ready }) else 0;
+    // Retire preparation permits before backbone admission. The queued error
+    // path still owns this same cleanup until successful consumption completes.
+    if (cohort) releaseVideoBatchPreparations(items, producers[0..producer_count]);
+    producer_count = 0;
+    preparation_guard.deinit();
+    if (!cohort) for (items, 0..) |_, index| try composer.prepare(index, null);
+    const initialized = items.len;
     for (rows[0..initialized]) |row| if (row.ids.len > longest) return error.MemoryBudgetExceeded;
     inspection_scope.deinit();
     const batch_inputs = try packVideoRows(a, cb, rows[0..initialized]);
@@ -2239,7 +2279,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
     defer {
         for (media.items) |item| {
             a.free(item.embeddings);
-            if (item.tensor) |tensor| cb.free(tensor);
+            if (item.tensor_owned) if (item.tensor) |tensor| cb.free(tensor);
         }
         media.deinit(a);
     }
@@ -2253,26 +2293,14 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
             inline .video, .sampled_video => |payload| {
                 const bytes = if (@TypeOf(payload) == SampledVideo) payload.bytes else payload;
                 const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
-                const encoded = if (!used_prefetch and options.video_encoded != null) blk: {
+                var encoded = if (!used_prefetch and options.video_encoded != null) blk: {
                     used_prefetch = true;
-                    const source = options.video_encoded.?;
-                    const counts = try a.dupe(usize, source.frame_tokens);
-                    errdefer a.free(counts);
-                    var tokens: usize = 0;
-                    for (counts) |count| tokens += count;
-                    const tensor = if (source.tensor) |value| try cb.sliceRows2D(a, value, 0, tokens, 512) else null;
-                    errdefer if (tensor) |value| cb.free(value);
-                    break :blk @import("embedding_gemma2_video.zig").Encoded{ .embeddings = try a.dupe(f32, source.embeddings), .tensor = tensor, .backend = cb, .frame_tokens = counts };
+                    break :blk options.video_encoded.?.take();
                 } else if (!used_prefetch and prefetched != null) blk: {
                     used_prefetch = true;
                     break :blk try prefetched.?.encodeAllocStaged(a, cb, cb.embedding_stage);
                 } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });
-                defer a.free(encoded.frame_tokens);
-                var owned = true;
-                errdefer if (owned) {
-                    a.free(encoded.embeddings);
-                    if (encoded.tensor) |tensor| cb.free(tensor);
-                };
+                defer encoded.deinit(a);
                 var count_video: usize = 0;
                 for (encoded.frame_tokens) |frame_count| count_video += frame_count;
                 media_tokens = std.math.add(usize, media_tokens, count_video) catch return error.EmbeddingInputTooLong;
@@ -2285,8 +2313,18 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
                     for (0..count_frame) |_| try rendered.appendSlice(a, "<|image|>");
                     try rendered.appendSlice(a, "<image|>");
                 }
-                try media.append(a, .{ .id = 258884, .embeddings = encoded.embeddings, .tokens = count_video, .tensor = encoded.tensor });
-                owned = false;
+                if (encoded.projections.len != 0) {
+                    const base = media.items.len;
+                    for (encoded.projections, encoded.frame_sources, encoded.frame_tokens, 0..) |tensor, source, count, frame| {
+                        const value = tensor orelse media.items[base + source].tensor.?;
+                        try media.append(a, .{ .id = 258884, .embeddings = &.{}, .tokens = count, .tensor = value, .tensor_owned = tensor != null });
+                        encoded.projections[frame] = null;
+                    }
+                } else {
+                    try media.append(a, .{ .id = 258884, .embeddings = encoded.embeddings, .tokens = count_video, .tensor = encoded.tensor });
+                    encoded.embeddings = &.{};
+                    encoded.tensor = null;
+                }
             },
             .image, .audio, .raster, .pcm => {
                 const bytes = partBytes(part);
@@ -2439,21 +2477,61 @@ fn composeCompactMedia(a: std.mem.Allocator, cb: *const ComputeBackend, ids: []i
     defer if (raw) |tensor| cb.free(tensor);
     const scaled: ?CT = if (raw) |tensor| (try cb.multiplyScalar(tensor, @sqrt(@as(f32, 512)))) orelse return error.ResidentImageOperationUnavailable else null;
     defer if (scaled) |tensor| cb.free(tensor);
-    const direct = media.len == 1 and media[0].tensor != null;
-    const pixels = if (direct) media[0].tensor.? else (try cb.allocUninitF32Shape(&.{ @intCast(media_count), 512 })) orelse return null;
-    defer if (!direct) cb.free(pixels);
-    if (!direct) {
-        var offset: usize = 0;
-        for (media) |item| {
-            const tensor = item.tensor orelse try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(item.embeddings, &.{ @intCast(item.tokens), 512 }));
-            defer if (item.tensor == null) cb.free(tensor);
-            if (!try cb.copyRows2D(a, pixels, offset, tensor, 0, item.tokens, 512)) return error.ResidentImageOperationUnavailable;
-            offset += item.tokens;
+    const video_frames = for (media) |item| {
+        if (item.id != 258884) break false;
+    } else true;
+    const result = if (media.len > 1 and video_frames) try composeSegmentedMedia(a, cb, scaled, map, media) else blk: {
+        const direct = media.len == 1 and media[0].tensor != null;
+        const pixels = if (direct) media[0].tensor.? else (try cb.allocUninitF32Shape(&.{ @intCast(media_count), 512 })) orelse return null;
+        defer if (!direct) cb.free(pixels);
+        if (!direct) {
+            var offset: usize = 0;
+            for (media) |item| {
+                const tensor = item.tensor orelse try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(item.embeddings, &.{ @intCast(item.tokens), 512 }));
+                defer if (item.tensor == null) cb.free(tensor);
+                if (!try cb.copyRows2D(a, pixels, offset, tensor, 0, item.tokens, 512)) return error.ResidentImageOperationUnavailable;
+                offset += item.tokens;
+            }
         }
-    }
-    const result = (try compose(cb.ptr, scaled, pixels, map, 512)) orelse return null;
+        break :blk (try compose(cb.ptr, scaled, pixels, map, 512)) orelse return null;
+    };
     @memcpy(ids, rewritten);
     return result;
+}
+
+/// Scatter compact wrapper rows and independent frame owners into their final
+/// token positions. No concatenated media table or per-window projection tensor.
+fn composeSegmentedMedia(a: std.mem.Allocator, cb: *const ComputeBackend, text: ?CT, map: []const i32, media: []const SoftTokens) !CT {
+    const output = (try cb.allocUninitF32Shape(&.{ @intCast(map.len), 512 })) orelse return error.ResidentImageOperationUnavailable;
+    errdefer cb.free(output);
+    var cursor: usize = 0;
+    while (cursor < map.len) {
+        if (map[cursor] < 0) {
+            cursor += 1;
+            continue;
+        }
+        const first = cursor;
+        while (cursor < map.len and map[cursor] == map[first] + @as(i32, @intCast(cursor - first))) : (cursor += 1) {}
+        if (!try cb.copyRows2D(a, output, first, text orelse return error.InvalidEmbeddingGroup, @intCast(map[first]), cursor - first, 512)) return error.ResidentImageOperationUnavailable;
+    }
+    var base: usize = 0;
+    cursor = 0;
+    for (media) |item| {
+        const tensor = item.tensor orelse try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(item.embeddings, &.{ @intCast(item.tokens), 512 }));
+        defer if (item.tensor == null) cb.free(tensor);
+        var copied: usize = 0;
+        while (copied < item.tokens) {
+            const index: i32 = -@as(i32, @intCast(base + copied + 1));
+            while (cursor < map.len and map[cursor] != index) : (cursor += 1) {}
+            if (cursor == map.len) return error.InvalidEmbeddingGroup;
+            const first = cursor;
+            while (cursor < map.len and cursor - first < item.tokens - copied and map[cursor] == index - @as(i32, @intCast(cursor - first))) : (cursor += 1) {}
+            if (!try cb.copyRows2D(a, output, first, tensor, copied, cursor - first, 512)) return error.ResidentImageOperationUnavailable;
+            copied += cursor - first;
+        }
+        base += item.tokens;
+    }
+    return output;
 }
 
 fn composeDeviceTokens(a: std.mem.Allocator, cb: *const ComputeBackend, text: CT, ids: []i64, media: []const SoftTokens) !CT {
@@ -5584,4 +5662,35 @@ test "embeddinggemma2 live decoder retains immutable references across growing w
     owner.deinit();
     owner_live = false;
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "embeddinggemma2 segmented composition scatters wrappers and variable frame rows without concatenation" {
+    const Fixture = struct {
+        fn check(cb: ComputeBackend, _: ComputeBackend) !void {
+            const a = std.testing.allocator;
+            var wrappers: [2 * 512]f32 = undefined;
+            @memset(wrappers[0..512], 0.5);
+            @memset(wrappers[512..], -0.5);
+            const text = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&wrappers, &.{ 2, 512 }));
+            defer cb.free(text);
+            const first: [2 * 512]f32 = @splat(0.25);
+            const second: [512]f32 = @splat(0.75);
+            const left = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&first, &.{ 2, 512 }));
+            defer cb.free(left);
+            const right = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&second, &.{ 1, 512 }));
+            defer cb.free(right);
+            const media = [_]SoftTokens{ .{ .id = 258884, .tokens = 2, .embeddings = &.{}, .tensor = left }, .{ .id = 258884, .tokens = 1, .embeddings = &.{}, .tensor = right }, .{ .id = 258884, .tokens = 2, .embeddings = &.{}, .tensor = left } };
+            const map = [_]i32{ 0, -1, -2, 1, -3, -4, -5 };
+            const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+            const result = try composeSegmentedMedia(a, &cb, text, &map, &media);
+            defer cb.free(result);
+            try before.expectUnchanged(cb);
+            const actual = try cb.toFloat32(result, a);
+            defer a.free(actual);
+            for ([_]f32{ 0.5, 0.25, 0.25, -0.5, 0.75, 0.25, 0.25 }, 0..) |value, row| for (actual[row * 512 ..][0..512]) |got| try std.testing.expectEqual(value, got);
+        }
+    };
+    const tests = @import("../ops/media_residency_test.zig");
+    try tests.onNative(tests.noWeights, Fixture.check);
+    try tests.onMetal(tests.noWeights, Fixture.check);
 }

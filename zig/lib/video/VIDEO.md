@@ -1027,6 +1027,35 @@ and unload release the corresponding tables. Denied optional retention keeps
 the original precise kernel math. Set
 `ANTFLY_EMBEDDINGGEMMA2_DISABLE_ROTARY_CACHE=1` to qualify that fallback.
 
+Video cohorts start their bounded decode/preparation producers after shared
+admission and immutable inspection, before waiting for the model gate. Queued
+cancellation cancels and joins every producer before releasing its inspection,
+cache pins or memory reservation. Decoder continuations retain coded-order
+serialization; this does not introduce concurrent access to a decoder. Adaptive
+singleton execution restarts validation after its ownership handoff and prepares
+the nearest successor. Decoder-lease waits observe producer cancellation, so
+retiring a farther speculative window cannot block on a current row's full queue.
+
+Completed windows can compose while remaining windows prepare or project.
+Composition consumes host projection ownership and escaped per-frame Metal
+owners directly. Segmented device composition scatters compact wrapper rows and
+frame rows into token order without a concatenated media table or intermediate
+window projection tensor. Repeated frames preserve their source mapping. Every
+row retains independent captions, masks, attention and pooling; final batch
+packing and stage lifetime copies remain explicit ownership boundaries.
+
+Live validation optionally accepts a model preparation policy with a versioned
+identity. For frames whose exact F32 patch inputs consume at most half the raw
+pixel storage, the validated-frame cache retains those inputs instead of copying
+full-resolution pixels. Actual frame depth, chroma, color, rotation and display
+geometry feed the same reference preparation used by ordinary inference. Small
+frames keep the raw-pixel path; unsupported preparation or denied optional
+retention preserves strict validation and ordinary decoding. Prepared inputs and
+immutable pins share the existing cache byte ceiling, and preparation scratch
+receives separate shared admission. Consumers require the policy identity to
+match before reusing prepared inputs. Model stream teardown restores the
+coordinator's prior preparation policy.
+
 EmbeddingGemma 2 sessions share a FIFO of ready execution cohorts. Text and
 media callers use the same model gate; image preparation runs outside it and
 long media requests requeue after each ready wave. Each request retains at most

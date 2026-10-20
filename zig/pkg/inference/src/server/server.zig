@@ -38665,6 +38665,127 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
         }
         try std.testing.expect(published_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
         std.debug.print("whole publication metal={} windows={d} batches={d} validation_overlap_packets={d} validated_frames={d} max_error={d:.9} completed_ns={d}\n", .{ metal, published.count, published_stream.stats.native_batches, published_stream.stats.overlapped_validation_packets, published_telemetry.validated_frames.load(.acquire), published_error, published_ns });
+        // Extra lifecycle/host-input qualification follows timed sections so
+        // before/after benchmarks perform the same work before each sample.
+        {
+            var pools = [_]stream_media.admission.Pool{ .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } }, .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } } };
+            var items: [2]stream_embedding.VideoBatchItem = undefined;
+            for (&items, 0..) |*item, index| item.* = .{ .movie = .{ .reader = &snapshots[index].?.window.reader, .sampling = .{ .source_timestamps = snapshots[index].?.policy } }, .caption = caption };
+            const expected_vectors = [_][]f32{ captured.outputs[0].?.result.?.vector, captured.outputs[1].?.result.?.vector };
+            if (metal) {
+                // Compact validation entries yield exact host patches. Exercise
+                // their ready-cohort path with the same pinned checkpoint too.
+                var host_rows: [2]?*stream_embedding.VideoAhead = @splat(null);
+                defer for (host_rows) |entry| if (entry) |ahead| ahead.deinit();
+                var host_items = items;
+                for (&host_items, &host_rows, 0..) |*item, *owner, index| {
+                    const ahead = (try stream_embedding.VideoAhead.start(loaded.session, item.movie, node.extractionExecutionControl(null), null, &pools[index], .{})).?;
+                    owner.* = ahead;
+                    ahead.producer.?.deinit();
+                    ahead.producer = null;
+                    ahead.producer = try @import("../pipelines/embedding_gemma2_video.zig").Prefetch.startConfigured(ahead.bounded.allocator(), std.testing.io, null, item.movie.bytes, item.movie.reader, node.extractionExecutionControl(null), .{ .sampling = item.movie.sampling, .selection = item.movie.selection, .cache_pins = ahead.pins, .inspection_scope = ahead.inspection_scope, .pool = &ahead.pool });
+                    item.ahead = ahead;
+                }
+                for (host_rows) |entry| entry.?.producer.?.finished.waitUncancelable(std.testing.io);
+                const host = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &host_items, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (host.vectors) |vector| a.free(vector);
+                    a.free(host.vectors);
+                    a.free(host.input_tokens);
+                }
+                for (host.vectors, expected_vectors) |actual, expected| for (actual, expected) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+                std.debug.print("host patch cohort metal=true parity=true shared_batches={d}\n", .{host.shared_vision_batches});
+            }
+            // Ordinary rows must begin bounded preparation while the model
+            // gate belongs to another request, rather than waiting to decode.
+            const Queued = struct {
+                session: @import("../backends/session.zig").Session,
+                tokenizer: @import("inference_tokenizer").Tokenizer,
+                items: []const stream_embedding.VideoBatchItem,
+                control: @import("../execution_control.zig").InferenceExecutionControl,
+                gate: *std.atomic.Mutex,
+                telemetry: *@import("antfly_video").decoding.Telemetry,
+                result: ?stream_embedding.VideoBatchResult = null,
+                failure: ?anyerror = null,
+                done: std.atomic.Value(bool) = .init(false),
+                fn run(self: *@This()) void {
+                    defer self.done.store(true, .release);
+                    self.result = stream_embedding.embedVideos(std.testing.allocator, self.session, self.tokenizer, self.items, .{ .video_decoder = .{ .policy = .portable, .telemetry = self.telemetry } }, self.gate, self.control, null) catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                }
+            };
+            var queued_items = items;
+            for (&queued_items) |*item| item.ahead = null;
+            var queued_telemetry = @import("antfly_video").decoding.Telemetry{};
+            // CPU sessions normally run without a global execution mutex;
+            // supply an explicit gate to qualify their queued-preparation path.
+            var native_gate: std.atomic.Mutex = .unlocked;
+            const gate = loaded.embeddingExecutionLock() orelse &native_gate;
+            try std.testing.expect(gate.tryLock());
+            var held = true;
+            defer if (held) gate.unlock();
+            var queued = Queued{ .session = loaded.session, .tokenizer = loaded.getTokenizer(), .items = &queued_items, .control = node.extractionExecutionControl(null), .gate = gate, .telemetry = &queued_telemetry };
+            defer if (queued.result) |batch| {
+                for (batch.vectors) |vector| a.free(vector);
+                a.free(batch.vectors);
+                a.free(batch.input_tokens);
+            };
+            const thread = try std.Thread.spawn(.{}, Queued.run, .{&queued});
+            var joined = false;
+            defer if (!joined) {
+                if (held) {
+                    gate.unlock();
+                    held = false;
+                }
+                thread.join();
+            };
+            var polls: usize = 0;
+            while (!queued.done.load(.acquire) and queued_telemetry.portable.load(.acquire) == 0 and polls < 10_000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            const prepared_while_queued = queued_telemetry.portable.load(.acquire) != 0;
+            gate.unlock();
+            held = false;
+            thread.join();
+            joined = true;
+            if (queued.failure) |err| return err;
+            try std.testing.expect(prepared_while_queued);
+            for (queued.result.?.vectors, expected_vectors) |actual, expected| for (actual, expected) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+            std.debug.print("queued cohort preparation metal={} before_gate=true\n", .{metal});
+            const CancelQueued = struct {
+                cancelled: std.atomic.Value(bool) = .init(false),
+                fn check(raw: ?*anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    return self.cancelled.load(.acquire);
+                }
+            };
+            var cancel = CancelQueued{};
+            var cancelled_control = node.extractionExecutionControl(null);
+            cancelled_control.cancellation = .{ .ptr = &cancel, .is_cancelled_fn = CancelQueued.check };
+            cancelled_control.deadline_ns = @import("antfly_platform").time.monotonicNs() + 10 * std.time.ns_per_s;
+            var cancel_telemetry = @import("antfly_video").decoding.Telemetry{};
+            var cancelled = Queued{ .session = loaded.session, .tokenizer = loaded.getTokenizer(), .items = &queued_items, .control = cancelled_control, .gate = gate, .telemetry = &cancel_telemetry };
+            try std.testing.expect(gate.tryLock());
+            held = true;
+            const cancelled_thread = try std.Thread.spawn(.{}, Queued.run, .{&cancelled});
+            var cancelled_joined = false;
+            defer if (!cancelled_joined) {
+                cancel.cancelled.store(true, .release);
+                cancelled_thread.join();
+            };
+            polls = 0;
+            while (!cancelled.done.load(.acquire) and cancel_telemetry.portable.load(.acquire) == 0 and polls < 10_000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            cancel.cancelled.store(true, .release);
+            // Teardown must finish while another request still owns the gate.
+            cancelled_thread.join();
+            cancelled_joined = true;
+            gate.unlock();
+            held = false;
+            try std.testing.expect(cancelled.result == null);
+            try std.testing.expectEqual(error.Cancelled, cancelled.failure.?);
+            try std.testing.expect(cancel_telemetry.portable.load(.acquire) != 0);
+            std.debug.print("queued cohort cancellation metal={} drained_before_gate=true\n", .{metal});
+        }
     }
 }
 

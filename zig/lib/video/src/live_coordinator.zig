@@ -38,6 +38,9 @@ pub const Options = struct {
     /// Optional pixel reuse; zero disables it. Pins share this bound even after
     /// coordinator eviction. Admission denial preserves strict validation.
     max_validated_frame_bytes: usize = 64 * 1024 * 1024,
+    /// Optional exact model preparation for large decoded frames. Raw pixels
+    /// remain the default for generic callers and unsupported policies.
+    validated_preparation: ?frames.PreparationPolicy = null,
 };
 pub const Prepared = struct {
     window: windows.Window,
@@ -259,6 +262,7 @@ pub const Coordinator = struct {
                 if (self.stream == null) self.stream = try pictures.Stream.init(self.allocator, reader, picture_options);
                 if (self.frame_cache == null and self.options.max_validated_frame_bytes != 0) self.frame_cache = frames.Cache.init(self.allocator, self.options.window.stream.admission_pool, self.options.max_validated_frame_bytes) catch null;
                 if (self.frame_cache) |*cache| {
+                    cache.preparation = if (self.options.validated_preparation) |policy| .{ .policy = policy, .track = reader.track, .control = reader.input.control } else null;
                     cache.configure(if (self.epoch_committed) self.start_ns.? else start.?, self.options.duration_ns, self.options.advance_ns orelse @as(u64, @intCast(self.options.duration_ns)), self.options.step_ns, self.options.max_frames, self.packet_base, reader.track.timescale);
                     self.stream.?.frames = cache.observer();
                 }

@@ -50,6 +50,7 @@ pub const Stream = struct {
     options: embedding.Options,
     task: []u8,
     context_permit: session_mod.RunPermit,
+    previous_preparation: ?@import("antfly_video").validated_frames.PreparationPolicy = null,
     lock: ?*std.atomic.Mutex,
     control: Control,
     cache: ?*embedding.FrameCache,
@@ -87,10 +88,11 @@ pub const Stream = struct {
         ahead: ?*embedding.VideoAhead = null,
         plan: ?video_model.Plan = null,
         pool: media.admission.Pool = .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } },
-        fn acquireDecoder(raw: *anyopaque) !*video_model.DecoderContinuation {
+        fn acquireDecoder(raw: *anyopaque, control: media.source.Control) !*video_model.DecoderContinuation {
             const self: *Slot = @ptrCast(@alignCast(raw));
+            try control.check();
             while (!self.stream.decoder_mutex.tryLock()) {
-                try self.stream.control.check();
+                try control.check();
                 std.Thread.yield() catch {};
             }
             errdefer self.stream.decoder_mutex.unlock();
@@ -139,6 +141,7 @@ pub const Stream = struct {
         started: bool = false,
         stop: std.atomic.Value(bool) = .init(false),
         fn startValidation(self: *@This()) void {
+            self.stop.store(false, .release);
             if (comptime @import("builtin").single_threaded) return;
             if (self.stream.validation != null) self.validation_thread = std.Thread.spawn(.{}, validate, .{self}) catch null;
         }
@@ -147,10 +150,11 @@ pub const Stream = struct {
         }
         fn ready(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.started) return;
-            self.started = true;
-            if (self.previous) |hook| try hook.ready(hook.context);
-            if (self.slot == null) return;
+            if (!self.started) {
+                self.started = true;
+                if (self.previous) |hook| try hook.ready(hook.context);
+            }
+            if (self.slot == null or self.thread != null or self.slot.?.ahead != null) return;
             if (comptime @import("builtin").single_threaded) return;
             self.thread = std.Thread.spawn(.{}, run, .{self}) catch null;
         }
@@ -301,8 +305,25 @@ pub const Stream = struct {
                     slot.ahead = null;
                 };
             };
+            // Serial execution needs the nearest successor, not the old
+            // post-batch preview. Cancel speculative decoder waiters before
+            // joining any owner; retained immutable slots remain reusable.
+            const future = [_]?*Slot{ self.next, self.later };
+            for (future, 0..) |entry, index| if (entry) |slot| {
+                if (first.ahead == null or index == 1) slot.cancelPreparation();
+            };
+            for (future, 0..) |entry, index| if (entry) |slot| {
+                if (first.ahead == null or index == 1) if (slot.ahead) |ahead| {
+                    ahead.deinit();
+                    slot.ahead = null;
+                };
+            };
+            schedule.slot = if (self.options.prepare_ahead and (self.session.backend() == .metal or self.session.backend() == .cuda)) if (self.next) |next| if (next.prepared.has_pictures and next.ahead == null) next else null else null else null;
             options.video_ahead = first.ahead;
             const parts = [_]embedding.Part{ .{ .sampled_video = first.movie() }, .{ .text = self.caption orelse "" } };
+            // The coordinator-derived slot changes above require a join, but
+            // serial policy/fallback still overlaps the actual model call.
+            schedule.startValidation();
             const result = try embedding.embedCached(first.allocation.allocator(), self.session, self.tokenizer, .{ .content = parts[0..if (self.caption != null) 2 else 1] }, options, self.lock, self.control, self.cache);
             schedule.join();
             self.pending = first.finish(result);
@@ -328,7 +349,9 @@ pub const Stream = struct {
         const owned_caption = if (caption) |value| try a.dupe(u8, value) else null;
         var owned_options = options;
         owned_options.task_type = task;
-        return .{ .allocator = a, .session = session, .tokenizer = tokenizer, .coordinator = coordinator, .caption = owned_caption, .options = owned_options, .task = task, .context_permit = context_permit, .lock = lock, .control = effective, .cache = cache };
+        const previous_preparation = coordinator.options.validated_preparation;
+        if (options.video_decoder.policy != .apple and (session.backend() == .native or session.backend() == .metal)) coordinator.options.validated_preparation = video_model.validatedPreparation;
+        return .{ .previous_preparation = previous_preparation, .allocator = a, .session = session, .tokenizer = tokenizer, .coordinator = coordinator, .caption = owned_caption, .options = owned_options, .task = task, .context_permit = context_permit, .lock = lock, .control = effective, .cache = cache };
     }
     pub fn deinit(self: *Stream) void {
         for (&self.retained) |*unit| if (unit.*) |*value| value.deinit();
@@ -343,6 +366,7 @@ pub const Stream = struct {
         if (self.caption) |caption| self.allocator.free(caption);
         self.allocator.free(self.task);
         self.context_permit.deinit();
+        self.coordinator.options.validated_preparation = self.previous_preparation;
         self.* = undefined;
     }
     fn drain(self: *Stream, context: *anyopaque, accept: *const fn (*anyopaque, *Delivery) anyerror!void) !void {
@@ -908,4 +932,76 @@ test "embeddinggemma2 live cache misses in both cohort rows retain the same deco
         try std.testing.expect(stream.decoder.?.continuation.decoded_packets > 0);
     }
     try std.testing.expect(stream.decoder.?.continuation.reused_windows > 0);
+}
+
+test "embeddinggemma2 live serial fallback restarts validation after its ownership join" {
+    const Probe = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        fn run(raw: *anyopaque, stop: *const std.atomic.Value(bool)) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (stop.load(.acquire)) return;
+            self.entered.store(true, .release);
+            while (!stop.load(.acquire)) std.Thread.yield() catch {};
+        }
+        fn wait(self: *@This()) !void {
+            var polls: usize = 0;
+            while (!self.entered.load(.acquire) and polls < 1000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            try std.testing.expect(self.entered.load(.acquire));
+        }
+    };
+    if (comptime @import("builtin").single_threaded) return error.SkipZigTest;
+    var probe = Probe{};
+    var stream: Stream = undefined;
+    stream.validation = .{ .context = &probe, .run = Probe.run };
+    var schedule = Stream.Schedule{ .stream = &stream, .slot = null };
+    defer schedule.join();
+    schedule.startValidation();
+    try probe.wait();
+    schedule.join();
+    probe.entered.store(false, .release);
+    schedule.startValidation();
+    try probe.wait();
+}
+
+test "embeddinggemma2 live decoder lease wait observes producer cancellation while another row holds the mutex" {
+    if (comptime @import("builtin").single_threaded) return error.SkipZigTest;
+    var stream: Stream = undefined;
+    stream.decoder_mutex = .unlocked;
+    try std.testing.expect(stream.decoder_mutex.tryLock());
+    defer stream.decoder_mutex.unlock();
+    var slot: Stream.Slot = undefined;
+    slot.stream = &stream;
+    const Worker = struct {
+        slot: *Stream.Slot,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        entered: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled.load(.acquire)) return error.Cancelled;
+            @constCast(self).entered.store(true, .release);
+        }
+        fn run(self: *@This()) void {
+            _ = Stream.Slot.acquireDecoder(self.slot, .{ .context = self, .check_fn = check }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.failure = error.UnexpectedDecoderAcquisition;
+        }
+    };
+    var worker = Worker{ .slot = &slot };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) {
+        worker.cancelled.store(true, .release);
+        thread.join();
+    };
+    var polls: usize = 0;
+    while (!worker.entered.load(.acquire) and polls < 1000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    try std.testing.expect(worker.entered.load(.acquire));
+    worker.cancelled.store(true, .release);
+    thread.join();
+    joined = true;
+    try std.testing.expectEqual(error.Cancelled, worker.failure.?);
+    try std.testing.expect(!stream.decoder_mutex.tryLock());
 }

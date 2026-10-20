@@ -18,6 +18,15 @@
 const std = @import("std");
 const media = @import("antfly_media");
 const h264 = @import("h264.zig");
+const preparation = @import("preparation.zig");
+/// Model-owned policy, evaluated against each frame's actual SPS metadata.
+/// Identity changes whenever rendering/normalization semantics change.
+pub const PreparationPolicy = struct {
+    identity: u64,
+    options: *const fn (media.mp4.Track, *const h264.Frame) anyerror!preparation.Options,
+};
+pub const Prepared = struct { patches: []const f32, options: preparation.Options, identity: u64 };
+pub const Preparation = struct { policy: PreparationPolicy, track: media.mp4.Track, control: media.source.Control };
 const capacity = 128;
 const spill_capacity = 32;
 const Budget = struct {
@@ -40,6 +49,10 @@ const Entry = struct {
     references: std.atomic.Value(usize) = .init(1),
     packet: usize,
     frame: h264.Frame,
+    prepared: ?Prepared = null,
+    fn bytes(self: *const Entry) usize {
+        return @sizeOf(Entry) + self.frame.nv12.len + if (self.prepared) |value| value.patches.len * @sizeOf(f32) else @as(usize, 0);
+    }
     fn retain(self: *Entry) *Entry {
         _ = self.references.fetchAdd(1, .monotonic);
         return self;
@@ -47,10 +60,11 @@ const Entry = struct {
     fn release(self: *Entry) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         const budget = self.budget;
-        const bytes = self.frame.nv12.len + @sizeOf(Entry);
+        const count = self.bytes();
+        if (self.prepared) |value| self.frame.allocator.free(value.patches);
         self.frame.deinit();
         budget.allocator.destroy(self);
-        _ = budget.used.fetchSub(bytes, .acq_rel);
+        _ = budget.used.fetchSub(count, .acq_rel);
         budget.release();
     }
 };
@@ -61,7 +75,13 @@ pub const View = struct {
         self.* = .{};
     }
     pub fn get(self: *const View, packet: usize) ?*const h264.Frame {
-        for (self.entries) |entry| if (entry) |owner| if (owner.packet == packet) return &owner.frame;
+        for (self.entries) |entry| if (entry) |owner| if (owner.packet == packet and owner.prepared == null) return &owner.frame;
+        return null;
+    }
+    pub fn getPrepared(self: *const View, packet: usize, identity: u64) ?Prepared {
+        for (self.entries) |entry| if (entry) |owner| if (owner.packet == packet) {
+            if (owner.prepared) |value| if (value.identity == identity) return value;
+        };
         return null;
     }
 };
@@ -89,6 +109,8 @@ pub const Cache = struct {
     scale: u32 = 1,
     hits: usize = 0,
     declined: usize = 0,
+    preparation: ?Preparation = null,
+    prepared_hits: usize = 0,
     pub fn init(a: std.mem.Allocator, pool: ?*media.admission.Pool, limit: usize) !Cache {
         var reservation = if (pool) |shared| try shared.acquire(.{ .host_bytes = @sizeOf(Budget) }) else media.admission.Token{};
         errdefer reservation.deinit();
@@ -203,7 +225,22 @@ pub const Cache = struct {
         };
     }
     fn capture(self: *Cache, picture: h264.Picture, frame: *const h264.Frame) !void {
-        const bytes = try std.math.add(usize, frame.nv12.len, @sizeOf(Entry));
+        var options: ?preparation.Options = null;
+        var geometry: ?preparation.Geometry = null;
+        if (self.preparation) |config| {
+            const candidate = config.policy.options(config.track, frame) catch null;
+            if (candidate) |value| {
+                const g = preparation.geometry(frame.width, frame.height, value) catch null;
+                // Keep small frames on the existing fast pixel path. Compact
+                // only when it at least halves retained storage.
+                if (g) |shape| if (shape.values() * @sizeOf(f32) <= frame.nv12.len / 2) {
+                    options = value;
+                    geometry = shape;
+                };
+            }
+        }
+        const payload_bytes = if (geometry) |g| g.values() * @sizeOf(f32) else frame.nv12.len;
+        const bytes = try std.math.add(usize, payload_bytes, @sizeOf(Entry));
         const packet = try std.math.add(usize, self.base, picture.first_packet);
         // Retire superseded provisional candidates before requesting replacement
         // storage. External pins keep their bytes charged and immutable.
@@ -218,7 +255,7 @@ pub const Cache = struct {
         if (future) {
             var spill_bytes: usize = 0;
             for (self.spill) |entry| if (entry) |owner| {
-                spill_bytes += owner.frame.nv12.len + @sizeOf(Entry);
+                spill_bytes += owner.bytes();
             };
             if (bytes > self.budget.limit / 4 -| spill_bytes) return error.ResourceLimitExceeded;
         } else {
@@ -256,11 +293,21 @@ pub const Cache = struct {
         errdefer reservation.deinit();
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
-        const pixels = try self.allocator.dupe(u8, frame.nv12);
-        errdefer self.allocator.free(pixels);
         entry.* = .{ .budget = self.budget, .packet = try std.math.add(usize, self.base, picture.first_packet), .frame = frame.* };
         entry.frame.allocator = self.allocator;
-        entry.frame.nv12 = pixels;
+        if (options) |value| {
+            const config = self.preparation.?;
+            var scratch = if (self.pool) |pool| try pool.acquire(.{ .host_bytes = geometry.?.scratch_bytes }) else media.admission.Token{};
+            defer scratch.deinit();
+            const patches = try preparation.referenceHost(self.allocator, frame.host(), value, config.control);
+            var retained_options = value;
+            retained_options.admission_pool = null;
+            entry.prepared = .{ .patches = patches, .options = retained_options, .identity = config.policy.identity };
+            entry.frame.nv12 = &.{};
+            self.prepared_hits += 1;
+        } else {
+            entry.frame.nv12 = try self.allocator.dupe(u8, frame.nv12);
+        }
         entry.frame.reservation = reservation;
         _ = self.budget.references.fetchAdd(1, .monotonic);
         _ = self.budget.used.fetchAdd(bytes, .acq_rel);
@@ -358,4 +405,58 @@ test "live coordinator cache prioritizes near selections over speculative and di
     try std.testing.expect(view.get(0) != null);
     try std.testing.expect(view.get(4) == null);
     try std.testing.expect(cache.budget.used.load(.acquire) <= bytes * 4);
+}
+
+test "live coordinator compact frame cache preserves exact prepared inputs and immutable budget ownership" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn options(_: media.mp4.Track, _: *const h264.Frame) !preparation.Options {
+            // Retain a genuine 4K coded buffer, with a cropped display, so the
+            // ownership/admission unit test does not benchmark RGB conversion.
+            return .{ .width = 576, .height = 336, .crop = .{ .right = 3264, .bottom = 1824 }, .matrix = .bt601, .torchvision = true, .rgb_rounding = .q13_components };
+        }
+    };
+    const pixels = try a.alloc(u8, 3840 * 2160 * 3 / 2);
+    defer a.free(pixels);
+    for (pixels, 0..) |*value, i| value.* = @intCast((i * 17 + i / 3840) % 256);
+    var frame = h264.Frame{ .allocator = a, .nv12 = pixels, .width = 3840, .height = 2160, .pts = 0, .duration = 1, .timescale = 1, .full_range = false, .decode_high_water = 0 };
+    const options = try Fixture.options(undefined, &frame);
+    const expected = try preparation.referenceHost(a, frame.host(), options, .{});
+    defer a.free(expected);
+    const limit = 2 * (@sizeOf(Entry) + expected.len * @sizeOf(f32));
+    try std.testing.expect(limit < pixels.len / 2);
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 128 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var cache = try Cache.init(a, &pool, limit);
+    defer cache.deinit();
+    cache.preparation = .{ .policy = .{ .identity = 7, .options = Fixture.options }, .track = undefined, .control = .{} };
+    cache.configure(0, std.time.ns_per_s, std.time.ns_per_s, std.time.ns_per_s, 1, 0, 1);
+    const observer = cache.observer();
+    const picture = h264.Picture{ .first_packet = 0, .pts = 0, .duration = 1, .width = 3840, .height = 2160, .bit_depth = 8, .chroma_format = 1 };
+    observer.accept(observer.context, picture, &frame);
+    var pins = cache.pin();
+    defer pins.deinit();
+    try std.testing.expect(pins.get(0) == null);
+    try std.testing.expect(pins.getPrepared(0, 8) == null);
+    try std.testing.expectEqualSlices(f32, expected, pins.getPrepared(0, 7).?.patches);
+    frame.pts = 1;
+    var second = picture;
+    second.first_packet = 1;
+    second.pts = 1;
+    observer.accept(observer.context, second, &frame);
+    try std.testing.expectEqual(@as(usize, 2), cache.prepared_hits);
+    try std.testing.expectEqual(limit, cache.budget.used.load(.acquire));
+    cache.clear();
+    try std.testing.expectEqualSlices(f32, expected, pins.getPrepared(0, 7).?.patches);
+    // Old immutable views remain valid after cache destruction too.
+    cache.configure(0, std.time.ns_per_s, std.time.ns_per_s, std.time.ns_per_s, 1, 0, 1);
+    cache.preparation.?.control = .{ .check_fn = struct {
+        fn check(_: ?*const anyopaque) anyerror!void {
+            return error.Timeout;
+        }
+    }.check };
+    frame.pts = 0;
+    observer.accept(observer.context, picture, &frame);
+    try std.testing.expectEqual(@as(usize, 1), cache.declined);
+    try std.testing.expectEqualSlices(f32, expected, pins.getPrepared(0, 7).?.patches);
 }
