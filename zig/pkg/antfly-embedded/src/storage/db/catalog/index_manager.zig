@@ -1372,6 +1372,7 @@ pub const IndexManager = struct {
     dense_storage_backend: hbc_mod.StorageBackend,
     dense_lsm_storage: ?lsm_backend_mod.Storage,
     vector_block_storage: ?lsm_backend_mod.Storage,
+    generation_storage: ?lsm_backend_mod.Storage,
     owned_vector_block_storage: ?*lsm_backend_mod.NativeStorage,
     dense_lsm_options: lsm_backend_mod.Options,
     sparse_backend: sparse_mod.SparseBackend,
@@ -3229,6 +3230,7 @@ pub const IndexManager = struct {
             .dense_storage_backend = opts.dense_storage_backend,
             .dense_lsm_storage = opts.dense_lsm_storage,
             .vector_block_storage = vector_block_storage,
+            .generation_storage = opts.generation_storage,
             .owned_vector_block_storage = owned_vector_block_storage,
             .dense_lsm_options = dense_lsm_options,
             .sparse_backend = opts.sparse_backend,
@@ -5166,7 +5168,15 @@ pub const IndexManager = struct {
                 entry,
                 entry.index.stats().active_count,
             ))
+        {
+            const current = self.acquireVectorBlockGeneration();
+            defer if (current) |lease| lease.release();
+            std.log.warn("shared vector-block publication incomplete index={s} sequence={} built_vectors={} expected_vectors={} covered_vectors={?}", .{
+                name,                                                                                  applied_sequence, stats.vectors, entry.index.stats().active_count,
+                if (current) |lease| denseVectorArtifactCoverageCount(&lease.opened, entry) else null,
+            });
             return error.VectorBlockPublishedGenerationNotReady;
+        }
         keep_native_cache_bypass = true;
     }
 
@@ -5378,12 +5388,7 @@ pub const IndexManager = struct {
         defer self.alloc.free(pointer_path);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        const raw = std.Io.Dir.cwd().readFileAlloc(
-            io_impl.io(),
-            pointer_path,
-            self.alloc,
-            .limited(16 * 1024),
-        ) catch |err| switch (err) {
+        const raw = self.readGenerationFileAlloc(io_impl.io(), pointer_path, 16 * 1024) catch |err| switch (err) {
             error.FileNotFound => return false,
             else => return err,
         };
@@ -6856,19 +6861,20 @@ pub const IndexManager = struct {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
 
-        var checkpoint = try apply_state.loadProjectionCheckpointWithSidecar(self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name);
+        var checkpoint = try apply_state.loadProjectionCheckpointWithSidecarWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name);
         checkpoint.status = .rebuilding;
         checkpoint.generation = std.math.add(u64, checkpoint.generation, 1) catch return error.ResourceLimitExceeded;
         checkpoint.config_hash = types.indexConfigHash(entry.config);
         // A crash anywhere after this boundary leaves explicit repair debt,
         // never an old clean watermark attached to an empty physical index.
-        try apply_state.saveProjectionCheckpointWithSidecar(self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name, checkpoint);
+        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name, checkpoint);
         try rebuild_state.updateWithIo(self.checkpointIo(), "");
         try entry.persistent.resetAllForRebuild();
         try self.backfillTextIndex(store, entry, null);
         try entry.persistent.sync(true);
         try self.saveBackfilledAppliedSequence(store, entry.config);
-        checkpoint = try apply_state.loadProjectionCheckpointWithSidecar(
+        checkpoint = try apply_state.loadProjectionCheckpointWithSidecarWithStorage(
+            self.generation_storage,
             self.alloc,
             self.checkpointIo(),
             store,
@@ -6877,7 +6883,8 @@ pub const IndexManager = struct {
         );
         checkpoint.status = .clean;
         checkpoint.config_hash = types.indexConfigHash(entry.config);
-        try apply_state.saveProjectionCheckpointWithSidecar(
+        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
+            self.generation_storage,
             self.alloc,
             self.checkpointIo(),
             store,
@@ -9467,7 +9474,7 @@ pub const IndexManager = struct {
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
         const checkpoint = self.denseProjectionCheckpointMetadata(index_name) orelse return error.InvalidDerivedApplyState;
         const certified = entry.certifiedEmptyNativeCheckpoint(checkpoint) orelse return;
-        try apply_state.saveProjectionCheckpointWithSidecar(alloc, self.checkpointIo(), store, checkpoint_path, index_name, certified);
+        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(self.generation_storage, alloc, self.checkpointIo(), store, checkpoint_path, index_name, certified);
         _ = entry.validateServingCertificate(certified);
     }
 
@@ -13075,7 +13082,7 @@ pub const IndexManager = struct {
                 return;
             }
         }
-        apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, name) catch |err| {
+        apply_state.clearAppliedSequenceWithCheckpointWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, name) catch |err| {
             std.log.warn("index removal committed with stale applied-sequence metadata name={s} err={s}", .{ name, @errorName(err) });
         };
     }
@@ -13689,7 +13696,8 @@ pub const IndexManager = struct {
         // The durable cleanup tombstone prevents same-name admission until
         // finalization succeeds, so checkpoint and filesystem I/O need not hold
         // the catalog lock used by unrelated indexes.
-        try apply_state.clearAppliedSequenceWithCheckpoint(
+        try apply_state.clearAppliedSequenceWithCheckpointWithStorage(
+            self.generation_storage,
             self.alloc,
             self.checkpointIo(),
             store,
@@ -13959,7 +13967,8 @@ pub const IndexManager = struct {
         if (!optionalBytesEqual(previous_pointer, expected_previous_pointer)) return error.IndexRootPointerChanged;
         const replacement_relative_path = try self.relativeRepairIndexRootForActivePath(cfg.name, replacement_index_path);
         defer self.alloc.free(replacement_relative_path);
-        _ = try index_generation_manifest.validateReady(
+        _ = try index_generation_manifest.validateReadyWithStorage(
+            self.generation_storage,
             self.alloc,
             replacement_index_path,
             null,
@@ -13968,7 +13977,7 @@ pub const IndexManager = struct {
         );
         switch (replacement.*) {
             .dense_vector => |*dense| {
-                var manifest = try index_generation_manifest.load(self.alloc, replacement_index_path);
+                var manifest = try index_generation_manifest.loadWithStorage(self.generation_storage, self.alloc, replacement_index_path);
                 defer manifest.deinit(self.alloc);
                 dense.native_physical_v2 = manifest.physical_format == .dense_native_v2 and
                     dense.index.experimentalPostingWalAuthoritative();
@@ -14311,20 +14320,14 @@ pub const IndexManager = struct {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
-        var dir = std.Io.Dir.cwd().openDir(io, self.base_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
-        };
-        defer dir.close(io);
-
-        var iter = dir.iterate();
-        while (try iter.next(io)) |entry| {
-            if (entry.kind != .directory) continue;
-            if (!std.mem.startsWith(u8, entry.name, repair_shadow_root_prefix)) continue;
-            if (active_roots.contains(entry.name)) continue;
-            const path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, entry.name });
+        const roots = try self.generationDirectoryNamesAlloc(self.base_path);
+        defer lsm_backend_mod.Storage.freeFileNames(self.alloc, roots);
+        for (roots) |name| {
+            if (!std.mem.startsWith(u8, name, repair_shadow_root_prefix)) continue;
+            if (active_roots.contains(name)) continue;
+            const path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, name });
             defer self.alloc.free(path);
-            if (repairShadowRootInProgress(path)) continue;
+            if (self.repairShadowInProgress(path)) continue;
             // The inventory above is only a scan optimization. A cooperating
             // manager may publish this root and durably clear its construction
             // marker after that scan. Re-read canonical publication authority
@@ -14332,9 +14335,9 @@ pub const IndexManager = struct {
             // primary or algebraic state. The publisher's marker -> pointer ->
             // marker-clear order makes one of these two checks protect every
             // live generation.
-            if (try self.publishedRepairShadowRootSelected(io, entry.name)) continue;
-            if (try self.cleanupAlgebraicNamespacesInRepairRootPage(io, path, entry.name)) return true;
-            deleteIndexDirIfPresent(path);
+            if (try self.publishedRepairShadowRootSelected(io, name)) continue;
+            if (try self.cleanupAlgebraicNamespacesInRepairRootPage(io, path, name)) return true;
+            try self.deleteIndexDirUsingIoIfPresentFallible(path);
         }
         return false;
     }
@@ -14347,14 +14350,11 @@ pub const IndexManager = struct {
     ) !bool {
         const indexes_path = try std.fmt.allocPrint(self.alloc, "{s}/indexes", .{shadow_path});
         defer self.alloc.free(indexes_path);
-        var indexes_dir = std.Io.Dir.cwd().openDir(io, indexes_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
-        };
-        defer indexes_dir.close(io);
-        var iter = indexes_dir.iterate();
-        while (try iter.next(io)) |entry| {
-            const storage_namespace = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ generation, entry.name });
+        _ = io;
+        const names = try self.generationDirectoryNamesAlloc(indexes_path);
+        defer lsm_backend_mod.Storage.freeFileNames(self.alloc, names);
+        for (names) |name| {
+            const storage_namespace = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ generation, name });
             defer self.alloc.free(storage_namespace);
             if (!try self.deleteAlgebraicStorageNamespacePage(storage_namespace)) return true;
         }
@@ -14379,7 +14379,7 @@ pub const IndexManager = struct {
             );
             defer self.alloc.free(storage_namespace);
             if (!try self.deleteAlgebraicStorageNamespacePage(storage_namespace)) return true;
-            try pruneCanonicalIndexRootAfterPointerInstall(target_path);
+            try self.pruneGenerationCanonicalRoot(target_path);
         }
         return false;
     }
@@ -14390,7 +14390,7 @@ pub const IndexManager = struct {
         const pointer = self.readActiveIndexRootPointer(target_path, name) catch return;
         if (pointer) |value| {
             self.alloc.free(value);
-            pruneCanonicalIndexRootAfterPointerInstall(target_path) catch |err| {
+            self.pruneGenerationCanonicalRoot(target_path) catch |err| {
                 std.log.warn("failed to prune previous canonical index root name={s} err={s}", .{ name, @errorName(err) });
             };
         }
@@ -20751,7 +20751,8 @@ pub const IndexManager = struct {
             // before opening it. Certify the unpublished construction root as
             // legacy first; completion atomically replaces this manifest with
             // dense_native_v2 only after native authority is durable.
-            try index_generation_manifest.writeReadyForPhysicalFormat(
+            try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
+                self.generation_storage,
                 self.alloc,
                 index_path,
                 generation_id,
@@ -20799,7 +20800,8 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
         sequence: u64,
     ) !void {
-        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
+        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
+            self.generation_storage,
             self.alloc,
             self.checkpointIo(),
             store,
@@ -20888,7 +20890,8 @@ pub const IndexManager = struct {
             .generation = projection_checkpoint.generation,
             .config_hash = projection_checkpoint.config_hash,
         });
-        try apply_state.saveProjectionCheckpointWithSidecar(
+        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
+            self.generation_storage,
             self.alloc,
             self.checkpointIo(),
             store,
@@ -20896,7 +20899,8 @@ pub const IndexManager = struct {
             cfg.name,
             projection_checkpoint,
         );
-        try index_generation_manifest.writeReadyForPhysicalFormat(
+        try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
+            self.generation_storage,
             self.alloc,
             generation.index_path,
             generation.generation_id,
@@ -20905,7 +20909,8 @@ pub const IndexManager = struct {
             ready_sequence,
             .dense_native_v2,
         );
-        const certified_sequence = try index_generation_manifest.validateReady(
+        const certified_sequence = try index_generation_manifest.validateReadyWithStorage(
+            self.generation_storage,
             self.alloc,
             generation.index_path,
             generation.generation_id,
@@ -20953,7 +20958,7 @@ pub const IndexManager = struct {
         self.invalidateIndexPathCaches(canonical_path);
         try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
         if (cfg.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, cfg.name);
-        try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, cfg.name);
+        try apply_state.clearAppliedSequenceWithCheckpointWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, cfg.name);
     }
 
     fn invalidateIndexPathCaches(self: *const IndexManager, path: []const u8) void {
@@ -20966,6 +20971,7 @@ pub const IndexManager = struct {
     }
 
     fn deleteIndexDirUsingIoIfPresentFallible(self: *const IndexManager, path: []const u8) !void {
+        if (self.generation_storage) |storage| return storage.deleteTree(path);
         if (is_hostless) return;
         if (self.io) |io| {
             try std.Io.Dir.cwd().deleteTree(io, path);
@@ -20978,6 +20984,112 @@ pub const IndexManager = struct {
 
     fn activeIndexRootPointerPath(self: *const IndexManager, canonical_path: []const u8) ![]u8 {
         return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ canonical_path, active_index_root_pointer_file });
+    }
+
+    pub fn createGenerationDirectory(self: *const IndexManager, path: []const u8) !void {
+        if (self.generation_storage) |storage| {
+            try storage.createDirPath(path);
+            const marker = try std.fs.path.join(self.alloc, &.{ path, ".antfly-generation-directory" });
+            defer self.alloc.free(marker);
+            try storage.writeFileAbsolute(marker, "");
+            try storage.syncFileContentsAbsolute(marker);
+            try storage.syncParentAbsolute(marker);
+            return;
+        }
+        try fs_paths.createDirPathPortable(self.checkpointIo(), path);
+    }
+
+    fn generationDirectoryNamesAlloc(self: *const IndexManager, path: []const u8) ![][]u8 {
+        if (self.generation_storage) |storage| return storage.listDirectoryNamesAlloc(self.alloc, path);
+        const io = self.checkpointIo();
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return self.alloc.alloc([]u8, 0),
+            else => return err,
+        };
+        defer dir.close(io);
+        var names = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (names.items) |name| self.alloc.free(name);
+            names.deinit(self.alloc);
+        }
+        var iter = dir.iterate();
+        while (try iter.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
+            const name = try self.alloc.dupe(u8, entry.name);
+            errdefer self.alloc.free(name);
+            try names.append(self.alloc, name);
+        }
+        return names.toOwnedSlice(self.alloc);
+    }
+
+    fn readGenerationFileAlloc(self: *const IndexManager, io: std.Io, path: []const u8, limit: usize) ![]u8 {
+        if (self.generation_storage) |storage| return storage.readFileAlloc(self.alloc, path, limit);
+        return std.Io.Dir.cwd().readFileAlloc(io, path, self.alloc, .limited(limit));
+    }
+
+    fn repairShadowInProgress(self: *const IndexManager, path: []const u8) bool {
+        if (self.generation_storage == null) return repairShadowRootInProgress(path);
+        const marker = std.fs.path.join(self.alloc, &.{ path, repair_shadow_in_progress_file }) catch return true;
+        defer self.alloc.free(marker);
+        const raw = self.readGenerationFileAlloc(self.checkpointIo(), marker, 4096) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return true,
+        };
+        defer self.alloc.free(raw);
+        return repairShadowMarkerInProgress(raw, path);
+    }
+
+    fn pruneGenerationCanonicalRoot(self: *const IndexManager, path: []const u8) !void {
+        const storage = self.generation_storage orelse return pruneCanonicalIndexRootAfterPointerInstall(path);
+        const files = try storage.listFileNamesAlloc(self.alloc, path);
+        defer lsm_backend_mod.Storage.freeFileNames(self.alloc, files);
+        for (files) |name| {
+            if (std.mem.eql(u8, name, active_index_root_pointer_file)) continue;
+            const child = try std.fs.path.join(self.alloc, &.{ path, name });
+            defer self.alloc.free(child);
+            storage.deleteFileAbsolute(child) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
+        const dirs = try storage.listDirectoryNamesAlloc(self.alloc, path);
+        defer lsm_backend_mod.Storage.freeFileNames(self.alloc, dirs);
+        for (dirs) |name| {
+            const child = try std.fs.path.join(self.alloc, &.{ path, name });
+            defer self.alloc.free(child);
+            try storage.deleteTree(child);
+        }
+    }
+
+    pub fn markRepairShadow(self: *const IndexManager, alloc: Allocator, path: []const u8) !void {
+        if (self.generation_storage) |storage| {
+            try storage.createDirPath(path);
+            const marker = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ path, repair_shadow_in_progress_file });
+            defer alloc.free(marker);
+            const payload = if (platform.process.currentId()) |pid|
+                try std.fmt.allocPrint(alloc, "{s}pid={d}\n", .{ repair_shadow_in_progress_magic, pid })
+            else
+                try std.fmt.allocPrint(alloc, "{s}pid=unknown\n", .{repair_shadow_in_progress_magic});
+            defer alloc.free(payload);
+            try storage.writeFileAbsolute(marker, payload);
+            try storage.syncFileContentsAbsolute(marker);
+            try storage.syncParentAbsolute(marker);
+            return;
+        }
+        try writeRepairShadowInProgressMarker(alloc, path);
+    }
+
+    pub fn clearRepairShadow(self: *const IndexManager, alloc: Allocator, path: []const u8) !void {
+        if (self.generation_storage) |storage| {
+            const marker = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ path, repair_shadow_in_progress_file });
+            defer alloc.free(marker);
+            storage.deleteFileAbsolute(marker) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            return;
+        }
+        try clearRepairShadowInProgressMarker(alloc, path);
     }
 
     pub fn writeRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
@@ -21027,7 +21139,10 @@ pub const IndexManager = struct {
 
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), marker_path, self.alloc, .limited(4096)) catch |err| switch (err) {
+        const raw = (if (self.generation_storage) |storage|
+            storage.readFileAlloc(self.alloc, marker_path, 4096)
+        else
+            std.Io.Dir.cwd().readFileAlloc(io_impl.io(), marker_path, self.alloc, .limited(4096))) catch |err| switch (err) {
             error.FileNotFound => return null,
             // A pointer larger than the complete framed format is corrupt
             // publication state, not a transient filesystem failure.
@@ -21077,7 +21192,7 @@ pub const IndexManager = struct {
         if (builtin.os.tag == .freestanding) return false;
         const index_path = try std.fs.path.join(self.alloc, &.{ self.base_path, relative_path });
         defer self.alloc.free(index_path);
-        var manifest = index_generation_manifest.load(self.alloc, index_path) catch |err| switch (err) {
+        var manifest = index_generation_manifest.loadWithStorage(self.generation_storage, self.alloc, index_path) catch |err| switch (err) {
             error.FileNotFound, error.InvalidIndexGenerationManifest => return false,
             else => return err,
         };
@@ -21141,7 +21256,9 @@ pub const IndexManager = struct {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
-        try fs_paths.createDirPathPortable(io, canonical_path);
+        if (self.generation_storage) |storage| {
+            try storage.createDirPath(canonical_path);
+        } else try fs_paths.createDirPathPortable(io, canonical_path);
         const marker_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(marker_path);
         const magic = if (try self.relativeIndexRootHasNativePhysicalAuthority(relative_active_path))
@@ -21150,7 +21267,15 @@ pub const IndexManager = struct {
             active_index_root_pointer_magic_v1;
         const payload = try std.fmt.allocPrint(self.alloc, "{s}{s}\n", .{ magic, relative_active_path });
         defer self.alloc.free(payload);
-        try writeFileAtomicallyDurable(self.alloc, io, marker_path, payload);
+        if (self.generation_storage) |storage| {
+            const staging = try std.fmt.allocPrint(self.alloc, "{s}.tmp", .{marker_path});
+            defer self.alloc.free(staging);
+            try storage.writeFileAbsolute(staging, payload);
+            errdefer storage.deleteFileAbsolute(staging) catch {};
+            try storage.syncFileContentsAbsolute(staging);
+            try storage.renameAbsolute(staging, marker_path);
+            try storage.syncParentAbsolute(marker_path);
+        } else try writeFileAtomicallyDurable(self.alloc, io, marker_path, payload);
     }
 
     fn clearActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8) !void {
@@ -21158,6 +21283,14 @@ pub const IndexManager = struct {
         const marker_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(marker_path);
 
+        if (self.generation_storage) |storage| {
+            storage.deleteFileAbsolute(marker_path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            try storage.syncParentAbsolute(marker_path);
+            return;
+        }
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -21201,6 +21334,11 @@ pub const IndexManager = struct {
         }
         const path = try self.activeIndexPath(name);
         defer self.alloc.free(path);
+        return self.generationStorageBytes(path);
+    }
+
+    pub fn generationStorageBytes(self: *const IndexManager, path: []const u8) !u64 {
+        if (self.generation_storage) |storage| return storage.treeBytes(self.alloc, path);
         if (is_hostless) return 0;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
@@ -21247,7 +21385,8 @@ pub const IndexManager = struct {
         if (comptime builtin.os.tag == .freestanding) {
             return error.UnsupportedPlatform;
         } else {
-            _ = try index_generation_manifest.validateReady(
+            _ = try index_generation_manifest.validateReadyWithStorage(
+                self.generation_storage,
                 self.alloc,
                 active_path,
                 null,
@@ -21292,20 +21431,14 @@ pub const IndexManager = struct {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
-        var indexes_dir = std.Io.Dir.cwd().openDir(io, indexes_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return,
-            else => return err,
-        };
-        defer indexes_dir.close(io);
-
-        var iter = indexes_dir.iterate();
-        while (try iter.next(io)) |entry| {
-            if (entry.kind != .directory) continue;
-            const canonical_path = try std.fs.path.join(self.alloc, &.{ indexes_path, entry.name });
+        const names = try self.generationDirectoryNamesAlloc(indexes_path);
+        defer lsm_backend_mod.Storage.freeFileNames(self.alloc, names);
+        for (names) |name| {
+            const canonical_path = try std.fs.path.join(self.alloc, &.{ indexes_path, name });
             defer self.alloc.free(canonical_path);
             const pointer_path = try self.activeIndexRootPointerPath(canonical_path);
             defer self.alloc.free(pointer_path);
-            const raw = std.Io.Dir.cwd().readFileAlloc(io, pointer_path, self.alloc, .limited(4096)) catch |err| switch (err) {
+            const raw = self.readGenerationFileAlloc(io, pointer_path, 4096) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 error.StreamTooLong => continue,
                 else => return err,
@@ -21319,7 +21452,7 @@ pub const IndexManager = struct {
             else
                 continue;
             const relative = std.mem.trim(u8, raw[magic.len..], "\r\n");
-            if (!validRelativeRepairIndexRoot(entry.name, relative)) continue;
+            if (!validRelativeRepairIndexRoot(name, relative)) continue;
             const separator = std.mem.indexOfScalar(u8, relative, '/') orelse continue;
             const root = relative[0..separator];
             if (active_roots.contains(root)) continue;
@@ -21340,6 +21473,14 @@ pub const IndexManager = struct {
             index_name,
         });
         defer self.alloc.free(candidate_index_path);
+        if (self.generation_storage) |storage| {
+            const files = try storage.listFileNamesAlloc(self.alloc, candidate_index_path);
+            defer lsm_backend_mod.Storage.freeFileNames(self.alloc, files);
+            if (files.len != 0) return true;
+            const dirs = try storage.listDirectoryNamesAlloc(self.alloc, candidate_index_path);
+            defer lsm_backend_mod.Storage.freeFileNames(self.alloc, dirs);
+            return dirs.len != 0;
+        }
         std.Io.Dir.cwd().access(io, candidate_index_path, .{}) catch |err| switch (err) {
             error.FileNotFound => return false,
             else => return err,
@@ -21358,23 +21499,17 @@ pub const IndexManager = struct {
         const indexes_path = try std.fs.path.join(self.alloc, &.{ self.base_path, "indexes" });
         defer self.alloc.free(indexes_path);
 
-        var indexes_dir = std.Io.Dir.cwd().openDir(io, indexes_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
-        };
-        defer indexes_dir.close(io);
-
-        var iter = indexes_dir.iterate();
-        while (try iter.next(io)) |entry| {
-            if (entry.kind != .directory) continue;
-            const canonical_path = try std.fs.path.join(self.alloc, &.{ indexes_path, entry.name });
+        const names = try self.generationDirectoryNamesAlloc(indexes_path);
+        defer lsm_backend_mod.Storage.freeFileNames(self.alloc, names);
+        for (names) |name| {
+            const canonical_path = try std.fs.path.join(self.alloc, &.{ indexes_path, name });
             defer self.alloc.free(canonical_path);
             const pointer_path = try self.activeIndexRootPointerPath(canonical_path);
             defer self.alloc.free(pointer_path);
-            const raw = std.Io.Dir.cwd().readFileAlloc(io, pointer_path, self.alloc, .limited(4096)) catch |err| switch (err) {
+            const raw = self.readGenerationFileAlloc(io, pointer_path, 4096) catch |err| switch (err) {
                 error.FileNotFound => continue,
                 error.StreamTooLong => {
-                    if (try self.repairShadowRootContainsIndex(io, candidate_root, entry.name)) return true;
+                    if (try self.repairShadowRootContainsIndex(io, candidate_root, name)) return true;
                     continue;
                 },
                 else => return err,
@@ -21386,16 +21521,16 @@ pub const IndexManager = struct {
             else if (std.mem.startsWith(u8, raw, active_index_root_pointer_magic_v1))
                 active_index_root_pointer_magic_v1
             else {
-                if (try self.repairShadowRootContainsIndex(io, candidate_root, entry.name)) return true;
+                if (try self.repairShadowRootContainsIndex(io, candidate_root, name)) return true;
                 continue;
             };
             const relative = std.mem.trim(u8, raw[magic.len..], "\r\n");
-            if (!validRelativeRepairIndexRoot(entry.name, relative)) {
-                if (try self.repairShadowRootContainsIndex(io, candidate_root, entry.name)) return true;
+            if (!validRelativeRepairIndexRoot(name, relative)) {
+                if (try self.repairShadowRootContainsIndex(io, candidate_root, name)) return true;
                 continue;
             }
             const separator = std.mem.indexOfScalar(u8, relative, '/') orelse {
-                if (try self.repairShadowRootContainsIndex(io, candidate_root, entry.name)) return true;
+                if (try self.repairShadowRootContainsIndex(io, candidate_root, name)) return true;
                 continue;
             };
             if (std.mem.eql(u8, relative[0..separator], candidate_root)) return true;
@@ -21531,7 +21666,8 @@ pub const IndexManager = struct {
         if (comptime storeSupportsLatestReplaySequenceForHint(@TypeOf(store))) {
             backfilled_sequence = try store.latestReplaySequenceForHint(replayHintForIndexKind(cfg.kind), backfilled_sequence);
         }
-        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
+        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
+            self.generation_storage,
             self.alloc,
             self.checkpointIo(),
             store,
@@ -22057,7 +22193,8 @@ pub const IndexManager = struct {
                             return error.PostingWalMutationStoreRequiresRebuild;
                         }
                     } else {
-                        const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpoint(
+                        const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
+                            self.generation_storage,
                             self.alloc,
                             self.checkpointIo(),
                             store,
@@ -22390,7 +22527,8 @@ pub const IndexManager = struct {
                 // projection and must not turn reopen into a full rebuild.
                 const reverse_edges = entry.index.edge_count;
 
-                const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpoint(
+                const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
+                    self.generation_storage,
                     self.alloc,
                     self.checkpointIo(),
                     store,
@@ -35021,12 +35159,19 @@ fn repairShadowRootInProgress(path: []const u8) bool {
         else => return true,
     };
     defer std.heap.page_allocator.free(raw);
+    return repairShadowMarkerInProgress(raw, path);
+}
+
+fn repairShadowMarkerInProgress(raw: []const u8, path: []const u8) bool {
     if (!std.mem.startsWith(u8, raw, repair_shadow_in_progress_magic)) return true;
     const body = raw[repair_shadow_in_progress_magic.len..];
     if (!std.mem.startsWith(u8, body, "pid=")) return true;
     const end = std.mem.indexOfAny(u8, body["pid=".len..], "\r\n") orelse body["pid=".len..].len;
     const pid_text = body["pid=".len..][0..end];
     const pid = std.fmt.parseUnsigned(u32, pid_text, 10) catch return true;
+    // Markers are untrusted recovery metadata. Do not truncate into a signed
+    // host pid_t or interpret zero as proof that an owner has died.
+    if (pid == 0 or pid > std.math.maxInt(i32)) return true;
     if (platform.process.alive(pid)) return true;
     std.log.warn("discarding stale repair shadow root for dead owner path={s} pid={d}", .{ path, pid });
     return false;
@@ -48869,4 +49014,41 @@ test "ordered artifact inventory TTL replacement retains temporary envelope with
             try Check.matches(&manager, &store);
         }
     }
+}
+
+test "backend repair shadow cleanup revalidates publication after inventory (#1210)" {
+    const a = std.testing.allocator;
+    var files = @import("../../lsm_backend/mod.zig").MemoryStorage.init(a);
+    defer files.deinit();
+    var publisher = try IndexManager.init(a, "/virtual/repair-publication");
+    defer publisher.deinit();
+    publisher.generation_storage = files.storage();
+    var cleaner = try IndexManager.init(a, publisher.base_path);
+    defer cleaner.deinit();
+    cleaner.generation_storage = files.storage();
+    const root = "/virtual/repair-publication/.repair-shadow-active";
+    const index_path = root ++ "/indexes/img";
+    try publisher.createGenerationDirectory(index_path);
+    try publisher.markRepairShadow(a, root);
+    try files.storage().writeFileAbsolute(index_path ++ "/payload", "live");
+    const Context = struct {
+        publisher: *IndexManager,
+        fn publish(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const canonical = try self.publisher.indexPath("img");
+            defer self.publisher.alloc.free(canonical);
+            try self.publisher.writeActiveIndexRootPointer(canonical, ".repair-shadow-active/indexes/img");
+            try self.publisher.clearRepairShadow(self.publisher.alloc, root);
+        }
+    };
+    var context: Context = .{ .publisher = &publisher };
+    test_repair_shadow_cleanup_after_pointer_snapshot = .{ .context = &context, .callback = Context.publish };
+    defer test_repair_shadow_cleanup_after_pointer_snapshot = null;
+    _ = try cleaner.cleanupInactiveRepairShadowRootsPage();
+    try std.testing.expectEqual(@as(u64, 4), try files.storage().fileSize(index_path ++ "/payload"));
+}
+
+test "repair shadow markers with invalid owner pids remain protected (#1210)" {
+    try std.testing.expect(repairShadowMarkerInProgress(repair_shadow_in_progress_magic ++ "pid=4294967295\n", "/virtual/shadow"));
+    try std.testing.expect(repairShadowMarkerInProgress(repair_shadow_in_progress_magic ++ "pid=0\n", "/virtual/shadow"));
 }
