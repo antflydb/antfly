@@ -1201,6 +1201,23 @@ def test_logical_scalable_work_profile(stateful_api):
     ]:
         table = f"logical_scalable_{name}_{time.time_ns()}"
         stateful_api.create_table(table)
+        # Native standalone timers/workers have nonzero idle CPU. Measure it
+        # before ingestion, independently of the workload's observed results.
+        idle_samples = []
+        for _ in range(3):
+            idle_before = read_process()["cpu_ns"]
+            idle_started = time.monotonic()
+            time.sleep(1)
+            idle_elapsed = time.monotonic() - idle_started
+            idle_samples.append(
+                {
+                    "elapsed_ms": idle_elapsed * 1000,
+                    "cpu_ms": (read_process()["cpu_ns"] - idle_before) / 1000000,
+                }
+            )
+        idle_cpu_ms_per_second = statistics.median(
+            sample["cpu_ms"] * 1000 / sample["elapsed_ms"] for sample in idle_samples
+        )
         documents = {f"{i:06}": {"title": title, **extra} for i in range(count)}
         corpus = json.dumps(documents, sort_keys=True, separators=(",", ":")).encode()
         for offset in range(0, count, 128):
@@ -1232,24 +1249,42 @@ def test_logical_scalable_work_profile(stateful_api):
                 "max_regex_work": 1000000000,
             },
         }
-        # Full-index acknowledgement does not wait for background compaction.
-        # Separate ingestion CPU from the query comparison, including under a
-        # small cgroup quota. Keep every observation instead of dropping slow
-        # query trials after seeing their results.
+        # Warm code and source caches explicitly; retain this observation and
+        # then wait for background ingestion/compaction CPU to settle. Ordinary
+        # queries have no retained predicate scope, and every timed trial below
+        # must still verify the full corpus under its exact work budget.
+        warm_cpu = read_process()["cpu_ns"]
+        warm_started = time.perf_counter_ns()
+        warm_response = requests.post(
+            stateful_api.url + f"/tables/{table}/query", json=query, timeout=90
+        )
+        warm_elapsed = (time.perf_counter_ns() - warm_started) / 1000000
+        assert warm_response.status_code == 200, warm_response.text
+        warm_result = warm_response.json()["responses"][0]
+        assert warm_result["hits"]["total"]["value"] == count, warm_result
+        warmup = {
+            "http_ms": warm_elapsed,
+            "cpu_ms": (read_process()["cpu_ns"] - warm_cpu) / 1000000,
+            "profile": warm_result["profile"]["value_search"],
+        }
+        assert warmup["profile"]["documents"] == count, warmup
+        # Use complete one-second windows so Linux's CPU-accounting tick is
+        # tolerated once per second, rather than in each short polling sample.
+        # Three consecutive quiet windows also span delayed maintenance timers.
         settling = []
         quiet = 0
         settle_started = time.monotonic()
         previous_time = settle_started
         tick_ms = 1000 / os.sysconf("SC_CLK_TCK") if platform.system() == "Linux" else 0
         previous = read_process()
-        while quiet < 3 and time.monotonic() - settle_started < 15:
-            time.sleep(0.2)
+        while quiet < 3 and time.monotonic() - settle_started < 30:
+            time.sleep(1)
             current = read_process()
             current_time = time.monotonic()
             cpu_ms = (current["cpu_ns"] - previous["cpu_ns"]) / 1000000
-            # Account for actual scheduling delay and one CPU-accounting tick.
-            # Linux commonly reports CPU in 10 ms steps, not nanoseconds.
-            cpu_limit_ms = (current_time - previous_time) * 1000 * 0.05 + tick_ms
+            cpu_limit_ms = (current_time - previous_time) * (
+                idle_cpu_ms_per_second + 50
+            ) + tick_ms
             settling.append(
                 {
                     "elapsed_ms": (current_time - settle_started) * 1000,
@@ -1262,7 +1297,10 @@ def test_logical_scalable_work_profile(stateful_api):
             previous_time = current_time
         if quiet != 3:
             Path(destination).with_suffix(".failed.json").write_text(
-                json.dumps({"workload": name, "settling": settling}, indent=2) + "\n"
+                json.dumps(
+                    {"workload": name, "warmup": warmup, "settling": settling}, indent=2
+                )
+                + "\n"
             )
         assert quiet == 3, ("server ingestion CPU did not settle", settling)
         runs = []
@@ -1283,6 +1321,9 @@ def test_logical_scalable_work_profile(stateful_api):
         watcher.start()
         try:
             for trial in range(9):
+                # Context for shared-host scheduling noise, outside timing.
+                # Load averages are host/VM-wide, not the server's CPU quota.
+                host_load = os.getloadavg() if hasattr(os, "getloadavg") else None
                 cpu_before = read_process()["cpu_ns"]
                 started = time.perf_counter_ns()
                 with requests.post(
@@ -1325,6 +1366,7 @@ def test_logical_scalable_work_profile(stateful_api):
                 runs.append(
                     {
                         "trial": trial,
+                        "host_load_average": host_load,
                         "http_ms": elapsed,
                         "first_byte_ms": first_byte_ms,
                         "first_result_ms": first_result_ms,
@@ -1369,6 +1411,9 @@ def test_logical_scalable_work_profile(stateful_api):
                 "name": name,
                 "documents": count,
                 "corpus_sha256": hashlib.sha256(corpus).hexdigest(),
+                "idle_samples": idle_samples,
+                "idle_cpu_ms_per_second": idle_cpu_ms_per_second,
+                "warmup": warmup,
                 "settling": settling,
                 "median_http_ms": statistics.median(r["http_ms"] for r in runs),
                 "median_first_result_ms": statistics.median(
@@ -1403,11 +1448,11 @@ def test_logical_scalable_work_profile(stateful_api):
     Path(destination).write_text(
         json.dumps(
             {
-                "benchmark_protocol_version": 3,
+                "benchmark_protocol_version": 4,
                 "benchmark_driver_sha256": hashlib.sha256(
                     Path(__file__).read_bytes()
                 ).hexdigest(),
-                "settling_rule": "three consecutive approximately 200 ms windows below 5% of one core plus one CPU-accounting tick, before timed queries; deadline 15 s",
+                "settling_rule": "three one-second pre-ingestion idle CPU samples; recorded untimed query, then three consecutive one-second windows below median idle CPU plus 5% of one core and one CPU-accounting tick per window; deadline 30 s",
                 "platform": platform.platform(),
                 "machine": platform.machine(),
                 "logical_cpus": os.cpu_count(),
