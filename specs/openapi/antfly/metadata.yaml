@@ -10481,7 +10481,8 @@ components:
                     nullable: true
                   verification:
                     type: string
-                    enum: [original_value]
+                    description: Membership proof; lossless_keyword uses literal postings without source loading or synonym expansion. Retained immutable cuts may reuse previously verified original-value membership.
+                    enum: [original_value, lossless_keyword]
                   fallback_reason:
                     type: string
                     nullable: true

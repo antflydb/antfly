@@ -21,7 +21,9 @@ class QueryProfileValueSearchPlansItem:
         field (str | Unset):
         candidate_field (None | str | Unset):
         index (None | str | Unset):
-        verification (QueryProfileValueSearchPlansItemVerification | Unset):
+        verification (QueryProfileValueSearchPlansItemVerification | Unset): Membership proof; lossless_keyword uses
+            literal postings without source loading or synonym expansion. Retained immutable cuts may reuse previously
+            verified original-value membership.
         fallback_reason (None | str | Unset):
     """
 

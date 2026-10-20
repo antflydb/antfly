@@ -679,6 +679,9 @@ def test_logical_keyword_and_autocomplete_use_source_fields(stateful_api):
         if "equals" in query:
             plan = result["profile"]["value_search"]["plans"][0]
             assert plan["field"] == "title" and plan["candidate_field"] is not None
+            assert plan["verification"] == "lossless_keyword"
+            assert result["profile"]["value_search"]["documents"] == 0
+            assert result["profile"]["value_search"]["bytes"] == 0
     capabilities = stateful_api.get(f"/tables/{table}")["field_capabilities"]
     title = [cap for cap in capabilities if cap.get("logical_field") == "title"]
     assert any("autocomplete" in cap.get("value_operations", []) for cap in title)
@@ -733,3 +736,224 @@ def test_logical_sort_uses_keyword_companion_at_public_boundary(stateful_api):
         "b",
         "a",
     ]
+
+
+def test_logical_named_autocomplete_keeps_declared_source_associations(stateful_api):
+    table = f"logical_named_{time.time_ns()}"
+    stateful_api.post(
+        f"/tables/{table}",
+        {
+            "num_shards": 1,
+            "schema": {
+                "default_type": "doc",
+                "document_schemas": {
+                    "doc": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "title": {
+                                    "type": "string",
+                                    "x-antfly-field": {
+                                        "type": "text",
+                                        "fields": {
+                                            "suggest": {"type": "search_as_you_type"}
+                                        },
+                                    },
+                                }
+                            },
+                        }
+                    }
+                },
+            },
+        },
+    )
+    stateful_api.batch_write(
+        table,
+        inserts={"a": {"title": "Distributed Systems"}},
+        sync_level="full_index",
+    )
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/query",
+        json={"query": {"autocomplete": "distributed sy", "field": "title"}},
+        timeout=60,
+    )
+    assert response.status_code == 200, response.text
+    assert [h["_id"] for h in response.json()["responses"][0]["hits"]["hits"]] == ["a"]
+    capabilities = stateful_api.get(f"/tables/{table}")["field_capabilities"]
+    assert any(
+        cap.get("logical_field") == "title"
+        and "autocomplete" in cap.get("value_operations", [])
+        for cap in capabilities
+    )
+    assert not any(cap.get("logical_field") == "title.suggest" for cap in capabilities)
+
+
+def test_logical_verification_reuses_sources_and_retained_predicate_facts(stateful_api):
+    table = f"logical_reuse_{time.time_ns()}"
+    stateful_api.create_table(table)
+    stateful_api.batch_write(
+        table,
+        inserts={f"{i:03}": {"title": "needle alpha beta"} for i in range(20)},
+        sync_level="full_index",
+    )
+    url = stateful_api.url + f"/tables/{table}/query"
+    payload = {
+        "query": {"contains": "needle", "field": "title"},
+        "value_search_execution": {"allow_scan": True},
+        "profile": True,
+        "limit": 1,
+        "order_by": [{"field": "_id", "desc": False}],
+    }
+    pages = []
+    for _ in range(3):
+        response = requests.post(url, json=payload, timeout=60)
+        assert response.status_code == 200, response.text
+        page = response.json()["responses"][0]
+        pages.append(page)
+        payload["search_after"] = page["hits"]["hits"][-1]["_sort"]
+        payload["remote_snapshot"] = page["remote_snapshot"]
+    assert [p["hits"]["hits"][0]["_id"] for p in pages] == ["000", "001", "002"]
+    assert [p["profile"]["value_search"]["documents"] for p in pages] == [20, 0, 0]
+    assert all(p["hits"]["total"]["value"] == 20 for p in pages)
+
+    # Reuse is predicate-specific, and excludes ordinary mutable queries.
+    payload.pop("search_after")
+    payload.pop("remote_snapshot")
+    payload.pop("order_by")
+    payload["query"] = {
+        "bool": {
+            "should": [
+                {"contains": term, "field": "title"}
+                for term in ("needle", "alpha", "beta")
+            ]
+        }
+    }
+    response = requests.post(url, json=payload, timeout=60)
+    assert response.status_code == 200, response.text
+    result = response.json()["responses"][0]
+    assert result["profile"]["value_search"]["documents"] == 20
+    assert result["profile"]["value_search"]["bytes"] == 580
+
+    payload["query"] = {"contains": "absent", "field": "title"}
+    payload["remote_snapshot"] = pages[0]["remote_snapshot"]
+    payload["order_by"] = [{"field": "_id", "desc": False}]
+    response = requests.post(url, json=payload, timeout=60)
+    assert response.status_code == 200, response.text
+    missing = response.json()["responses"][0]
+    assert missing["hits"]["total"]["value"] == 0
+    assert missing["profile"]["value_search"]["documents"] == 20
+
+    # A newer cut must observe writes rather than reuse the earlier membership.
+    stateful_api.batch_write(
+        table, inserts={"000": {"title": "absent"}}, sync_level="full_index"
+    )
+    payload.pop("remote_snapshot")
+    payload["query"] = {"contains": "needle", "field": "title"}
+    response = requests.post(url, json=payload, timeout=60)
+    assert response.status_code == 200, response.text
+    fresh = response.json()["responses"][0]
+    assert fresh["hits"]["total"]["value"] == 19
+    assert fresh["profile"]["value_search"]["documents"] == 20
+
+
+def test_logical_verification_work_profile(stateful_api):
+    """Optional comparable artifact: run this case against either server binary."""
+    import hashlib
+    import platform
+
+    report_path = os.environ.get("ANTFLY_LOGICAL_REUSE_REPORT")
+    if not report_path:
+        pytest.skip(
+            "set ANTFLY_LOGICAL_REUSE_REPORT to record the bounded work profile"
+        )
+    table = f"logical_profile_{time.time_ns()}"
+    stateful_api.create_table(table)
+    text = "needle alpha beta " + "padding " * 1024
+    documents = {f"{i:03}": {"title": text} for i in range(128)}
+    stateful_api.batch_write(table, inserts=documents, sync_level="full_index")
+    url = stateful_api.url + f"/tables/{table}/query"
+    base = {
+        "value_search_execution": {"allow_scan": True},
+        "profile": True,
+        "limit": 1,
+        "fields": ["title"],
+    }
+    records = []
+
+    def measured(name, payload):
+        started = time.perf_counter_ns()
+        response = requests.post(url, json=payload, timeout=60)
+        elapsed = time.perf_counter_ns() - started
+        assert response.status_code == 200, response.text
+        result = response.json()["responses"][0]
+        assert result["hits"]["total"]["value"] == 128
+        records.append(
+            {
+                "name": name,
+                "elapsed_ns": elapsed,
+                "value_search": result["profile"]["value_search"],
+            }
+        )
+        return result
+
+    payload = dict(
+        base,
+        query={"contains": "needle", "field": "title"},
+        order_by=[{"field": "_id"}],
+    )
+    for index in range(8):
+        result = measured(f"page_{index}", payload)
+        payload["remote_snapshot"] = result["remote_snapshot"]
+        payload["search_after"] = result["hits"]["hits"][-1]["_sort"]
+    for index in range(7):
+        measured(
+            "literal_or",
+            dict(
+                base,
+                count=True,
+                query={
+                    "bool": {
+                        "should": [
+                            {"contains": word, "field": "title"}
+                            for word in ("needle", "alpha", "beta")
+                        ]
+                    }
+                },
+            ),
+        )
+        # Mixed shapes exercise decoded-source sharing separately from fusion.
+        measured(
+            "mixed_or",
+            dict(
+                base,
+                count=True,
+                query={
+                    "bool": {
+                        "should": [
+                            {"contains": "needle", "field": "title"},
+                            {"matches": "alpha", "field": "title"},
+                        ]
+                    }
+                },
+            ),
+        )
+    binary = Path(os.environ["ANTFLY_BIN"])
+    with binary.open("rb") as stream:
+        binary_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+    Path(report_path).write_text(
+        json.dumps(
+            {
+                "binary_sha256": binary_sha256,
+                "host": platform.platform(),
+                "cpu_count": os.cpu_count(),
+                "documents": 128,
+                "source_sha256": hashlib.sha256(
+                    json.dumps(documents, sort_keys=True).encode()
+                ).hexdigest(),
+                "records": records,
+                "limitations": "Debug server, shared macOS host, warm caches; work counters are exact, wall times include HTTP and host contention.",
+            },
+            indent=2,
+        )
+        + "\n"
+    )

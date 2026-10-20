@@ -95,6 +95,63 @@ regex compilation for sensitive literals, intersect existing candidate membershi
 before source loads, and bound scratch and decoded-source lifetimes. Keep physical
 index representations out of client configuration.
 
+### Reusing exact verification work
+
+Three to 64 compatible case-sensitive `contains` leaves on the same source field
+can use a bounded multi-output byte automaton. It scans each source string once
+and retains each leaf's identity, boolean membership and boost, including
+independent matches across array elements. Construction admits at most 1 MiB of
+transition storage; larger or incompatible groups use ordinary matchers. Eager
+traversal that reaches a source limit falls back to the requested leaf, preserving
+its existing early-match behavior.
+
+Other multi-leaf requests share a bounded decoded-source owner. A document is loaded
+and decoded once while it fits the owner's 8 MiB allocation budget and 4,096-entry
+ceiling. The owner is tied to the stored-document loader, contains only original
+JSON, and ends with the request. Single-leaf queries keep their streaming scratch
+path. Capacity refusal uses ordinary per-document scratch; it never changes
+membership or permits incomplete results. Document and byte budgets charge actual
+source loads, including repeats after cache refusal; regex work is still charged
+for each predicate evaluation. Verification snapshots the segment tombstone mask
+before source I/O, excludes deleted postings, and jumps over deleted runs on scan
+fallback. Superseded physical slots do not consume document/byte budgets.
+
+Retained pagination may reuse verified positive **and negative** predicate facts
+from an admitted immutable query cut. A trusted storage scope binds the physical
+DB root, cut generation ID and document identity namespace. Entries additionally
+bind the selected index, immutable segment ID/document count, logical field,
+operation, literal/pattern, and case mode. Scores/boosts and output projections do
+not affect predicate membership. Each entry distinguishes verified nonmatches
+from documents never evaluated under an earlier candidate constraint; only known
+members may bypass verification. Completing an unconstrained conservative
+candidate evaluation also proves absence outside those candidates. That complete
+segment membership can bypass future candidate expansion; a partial membership
+can only be intersected with current candidates. Completeness is a scalar flag,
+so a billion-document segment with one matching ID never allocates a billion-bit
+coverage map. Completed facts cannot be displaced by a concurrent partial builder. Ordinary mutable DB searches cannot install a
+retained scope, even through internal request fields.
+
+This process-local cache retains ID bitmaps only: no source text, credentials,
+read capability, snapshot lease, output, or client-visible authorization decision.
+Every request still passes authorization, retained-cut validation/expiry, source
+read admission, projection readiness, and its own candidate constraints. A changed
+query or cut misses. Partial failed segment evaluations are never published.
+Concurrent builders may discard one another's cached subsets without changing
+results. LRU eviction, expiry and allocator refusal always fall back to exact
+verification. Storage is bounded to 128 entries / 16 MiB of bitmap allocations,
+with a 2 MiB entry ceiling; nothing is written to disk. Expired entries are
+reclaimed on subsequent cache access. Deployment restarts and owner moves may
+lose reuse, but preserve correctness.
+
+A declared lossless keyword representation can establish nonempty case-sensitive
+whole-string equality without loading source. The proof requires complete, ready
+primary coverage, agreed source associations across document schemas, string-only
+source extraction, and an effective built-in keyword analyzer. Only the original
+term postings participate; synonym expansion must never establish raw equality.
+Other mappings retain original-value verification. Profiles identify this plan as
+`lossless_keyword` and report zero source documents/bytes when no verification
+was needed.
+
 ## Capabilities, sorting, aggregations and explanation
 
 Field capabilities describes logical operations, semantics, and available
@@ -103,6 +160,12 @@ Physical emitted names and analyzer details remain diagnostic information. The
 same runtime representation resolver should serve queries, capabilities, sort,
 and aggregation planning. Coverage/readiness must be distinguished from declared
 support. Schema identity is necessary before clients cache this information.
+
+Observed physical fields with unknown source associations leave `logical_field`
+and logical operations absent. They must not invent a JSON source path from an
+emitted field name. Declared named search-as-you-type roots retain their configured
+analyzers; shorthand mappings may additionally resolve declared generated shingle
+representations. Conflicting roots are rejected rather than selected arbitrarily.
 
 Sort and aggregation requests should accept logical source fields and resolve
 compatible typed/keyword doc values. Preserve existing ordering, null and

@@ -2306,7 +2306,7 @@ fn generatedFieldCapabilityAlloc(alloc: std.mem.Allocator, capability: runtime_s
 
     // Synthetic identity/score metadata is not a JSON source string. Its
     // existing query modes remain explicit instead of advertising value ops.
-    const logical_field = if (std.mem.eql(u8, capability.provenance, "reserved")) null else capability.logical_field orelse capability.field;
+    const logical_field = if (std.mem.eql(u8, capability.provenance, "reserved")) null else capability.logical_field;
     owned.logical_field = try dupeOptionalString(alloc, logical_field);
     owned.value_operations = if (logical_field != null) switch (capability.field_type) {
         .text, .html, .keyword, .link, .substring => try dupeStringSlice(alloc, &.{ "equals", "contains", "matches" }),
@@ -6622,6 +6622,10 @@ test "logical field public capability ownership survives DTO conversion" {
     defer freeGeneratedFieldCapability(a, identity);
     try std.testing.expect(identity.logical_field == null);
     try std.testing.expect(identity.value_operations == null);
+    const unknown = try generatedFieldCapabilityAlloc(a, runtime_schema_mod.observedDynamicFieldCapability(null, "title.suggest", .{ .field_type = .search_as_you_type }));
+    defer freeGeneratedFieldCapability(a, unknown);
+    try std.testing.expect(unknown.logical_field == null);
+    try std.testing.expect(unknown.value_operations == null);
     var capabilities = std.ArrayListUnmanaged(GeneratedFieldCapability).empty;
     var capability = runtime_schema_mod.observedDynamicFieldCapability(null, "title._2gram", .{ .field_type = .search_as_you_type, .analyzer = "search_as_you_type" });
     capability.logical_field = "title";

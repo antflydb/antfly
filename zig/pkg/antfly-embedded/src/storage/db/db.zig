@@ -3085,6 +3085,8 @@ const DocumentPrimaryReadWindow = struct {
 const GraphReplacementProgress = struct { job: index_manager_mod.GraphReplacementBuild, checkpoint_ns: u64 };
 
 pub const DB = struct {
+    /// Installed only after immutable query-cut admission. Never persisted.
+    retained_value_scope: ?@import("../../search/value_membership.zig").Scope = null,
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
     native_query_warming: @import("native_query_warming.zig").Owner = .{},
@@ -19958,6 +19960,7 @@ pub const DB = struct {
                 });
                 errdefer readonly.close();
                 try control.token().check();
+                readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms);
                 readonly.retained_remote_query_lease = lease;
                 return readonly;
             }
@@ -19984,6 +19987,7 @@ pub const DB = struct {
         });
         errdefer readonly.close();
         try control.token().check();
+        readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms);
         readonly.retained_query_lease = reader;
         transferred = true;
         return readonly;
@@ -40681,6 +40685,8 @@ pub const DB = struct {
 
     fn searchLockedWithExecutionContextImpl(self: *DB, alloc: Allocator, req: types.SearchRequest, exec_ctx: types.ExecutionContext, externalize_artifact_ids: bool, dense_profile_sink: ?*db_query_search.DenseSearchProfile) !types.SearchResult {
         var request = req;
+        // A caller cannot promote a mutable DB into an immutable cache scope.
+        request.value_search_scope = self.retained_value_scope;
         if (requestHasLogicalValues(req)) if (self.core.textIndexEntry(req.index_name)) |entry| {
             // A declared mapping is not a completeness proof. Do not let a
             // lagging or partial projection exclude a newer primary value.
@@ -140826,7 +140832,7 @@ test "logical query primary and indexed searches preserve exact pages filters co
 
 fn recordLogicalScanPlans(a: Allocator, work: *@import("../../search/value_query.zig").Work, query: types.TextQuery) anyerror!void {
     switch (query) {
-        .value => |spec| try work.record(a, spec, null, null, "no_text_index"),
+        .value => |spec| try work.record(a, spec, null, null, "no_text_index", "original_value"),
         .bool_query => |b| {
             for (b.must) |child| try recordLogicalScanPlans(a, work, child);
             for (b.should) |child| try recordLogicalScanPlans(a, work, child);

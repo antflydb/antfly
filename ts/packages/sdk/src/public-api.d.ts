@@ -11282,8 +11282,11 @@ export interface components {
                     field?: string;
                     candidate_field?: string | null;
                     index?: string | null;
-                    /** @enum {string} */
-                    verification?: "original_value";
+                    /**
+                     * @description Membership proof; lossless_keyword uses literal postings without source loading or synonym expansion. Retained immutable cuts may reuse previously verified original-value membership.
+                     * @enum {string}
+                     */
+                    verification?: "original_value" | "lossless_keyword";
                     fallback_reason?: string | null;
                 }[];
             };

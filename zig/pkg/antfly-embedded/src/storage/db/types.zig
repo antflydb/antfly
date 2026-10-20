@@ -1890,6 +1890,7 @@ pub const SearchRequest = struct {
     /// Trusted request-local preparation, never decoded from public input.
     value_search_execution: @import("../../search/value_query.zig").Policy = .{},
     value_search_work: ?*@import("../../search/value_query.zig").Work = null,
+    value_search_scope: ?@import("../../search/value_membership.zig").Scope = null,
     native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
     text_navigation_plan: ?*const @import("../../search/search.zig").TextNavigationPlan = null,
     text_pattern_programs: ?*@import("../../search/query.zig").PatternPrograms = null,
@@ -2085,6 +2086,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
     "value_search_work",
+    "value_search_scope",
     "document_authority_mode",
     "document_authority_group",
     "document_output_allocator",

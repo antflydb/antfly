@@ -18673,7 +18673,10 @@ const ValueExecution = struct {
     load: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
     producers: std.ArrayListUnmanaged(*ValueProducer) = .empty,
     local_work: value_query.Work = .{},
+    literals: ?value_query.LiteralSet = null,
+    literals_checked: bool = false,
     fn deinit(self: *@This()) void {
+        if (self.literals) |*set| set.deinit();
         for (self.producers.items) |producer| {
             producer.matcher.deinit();
             producer.visited.deinit();
@@ -18682,6 +18685,37 @@ const ValueExecution = struct {
         }
         self.producers.deinit(self.a);
         self.local_work.deinit(self.a);
+    }
+    fn prepareLiterals(self: *@This()) void {
+        if (self.literals_checked) return;
+        self.literals_checked = true;
+        const producers = self.producers.items;
+        if (producers.len < 3 or producers.len > 64) return;
+        const field = producers[0].matcher.spec.field;
+        var needles: [64][]const u8 = undefined;
+        for (producers, 0..) |producer, i| {
+            const spec = producer.matcher.spec;
+            if (spec.kind != .contains or !spec.case_sensitive or !std.mem.eql(u8, field, spec.field)) return;
+            needles[i] = spec.text;
+        }
+        // This is optional admission, not a new failure mode for valid queries.
+        self.literals = value_query.LiteralSet.init(@import("../../../sql/memory_budget.zig").reclaimingAllocator(self.a), needles[0..producers.len]) catch return;
+    }
+    fn matchSource(self: *@This(), producer: *ValueProducer, global: u32, doc: std.json.Value) !bool {
+        if (self.literals) |*set| {
+            const bits = set.document(doc, producer.matcher.spec.field) catch |err| switch (err) {
+                // An optional eager group must not make a leaf fail when that
+                // leaf alone could finish before the traversal budget expires.
+                error.ValueSearchLimitExceeded => return producer.matcher.document(doc),
+                else => return err,
+            };
+            for (self.producers.items, 0..) |leaf, i| {
+                try leaf.visited.add(global);
+                if (bits & (@as(u64, 1) << @as(u6, @intCast(i))) != 0) try leaf.matched.add(global);
+            }
+            return producer.matched.contains(global);
+        }
+        return producer.matcher.document(doc);
     }
     fn prepare(self: *@This(), arena: Allocator, spec: value_query.Spec, analysis: introducer_mod.TextAnalysisConfig, schema: ?runtime_schema_mod.TableSchema) !search_mod.SearchQuery {
         const producer = try self.a.create(ValueProducer);
@@ -18696,13 +18730,14 @@ const ValueExecution = struct {
         var candidate: ?search_mod.SearchQuery = null;
         if (spec.case_sensitive and spec.text.len != 0) {
             if (spec.kind == .equals) {
-                if (try valueRepresentation(arena, schema, spec.field, "keyword")) |field| {
+                if (try valueRepresentation(arena, schema, analysis, spec.field, "keyword")) |field| {
                     candidate = .{ .term = .{ .field = field, .term = spec.text } };
+                    producer.exact_keyword = logicalKeywordProvesEquality(schema.?, spec.field, field);
                 }
             } else {
                 const literal = if (spec.kind == .contains) spec.text else producer.matcher.pattern.?.prefilter;
                 if (longestAsciiFragment(literal)) |fragment| {
-                    if (try valueRepresentation(arena, schema, spec.field, "substring")) |field| {
+                    if (try valueRepresentation(arena, schema, analysis, spec.field, "substring")) |field| {
                         const folded = try arena.dupe(u8, fragment);
                         for (folded) |*byte| byte.* = std.ascii.toLower(byte.*);
                         candidate = .{ .prefix = .{ .field = field, .prefix = folded } };
@@ -18710,7 +18745,6 @@ const ValueExecution = struct {
                 }
             }
         }
-        _ = analysis;
         if (candidate) |query| {
             producer.candidate = try search_mod.searchQueryToFilterArena(arena, query);
         } else if (!self.req.value_search_execution.allow_scan) return error.ValueSearchRequiresScan;
@@ -18721,10 +18755,14 @@ const ValueExecution = struct {
                 else => null,
             } else null;
             const work = self.req.value_search_work orelse &self.local_work;
-            try work.record(self.a, spec, physical, self.req.index_name, if (candidate == null) "no_safe_indexed_constraint" else null);
+            try work.record(self.a, spec, physical, self.req.index_name, if (candidate == null) "no_safe_indexed_constraint" else null, if (producer.exact_keyword) "lossless_keyword" else "original_value");
         }
         if (self.load == null) return error.UnsupportedQueryRequest;
         try self.producers.append(self.a, producer);
+        (self.req.value_search_work orelse &self.local_work).registerLeaf();
+        if (self.literals) |*set| set.deinit();
+        self.literals = null;
+        self.literals_checked = false;
         return .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = producer, .produce = ValueProducer.produce }, .boost = spec.boost } };
     }
 };
@@ -18735,9 +18773,11 @@ const ValueProducer = struct {
     candidate: ?@import("../../../search/query.zig").Filter = null,
     visited: roaring.RoaringBitmap,
     matched: roaring.RoaringBitmap,
+    exact_keyword: bool = false,
     fn produce(raw: *anyopaque, a: Allocator, offset: u32, count: u32, incoming: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const owner = self.owner;
+        owner.prepareLiterals();
         const control = @import("../../../search/query.zig").ExecutionControl{ .cancellation = owner.req.cancellation, .deadline_ns = owner.req.execution_deadline_ns, .pattern_programs = owner.req.text_pattern_programs, .pattern_cache = owner.req.text_pattern_membership };
         try control.check();
         var result = roaring.RoaringBitmap.init(a);
@@ -18746,39 +18786,117 @@ const ValueProducer = struct {
         const resolved = owner.snapshot.resolveDocId(offset) orelse return error.InvalidArgument;
         var lease = try owner.snapshot.leaseSegment(resolved.seg_idx);
         defer lease.deinit();
+        // Lossless keyword membership uses only the literal term. Ordinary term
+        // filters may expand synonyms, which cannot establish raw equality.
+        if (self.exact_keyword) {
+            const term = self.candidate.?.term;
+            var exact = try literalKeywordMembership(a, lease.entry, term.field, term.term);
+            errdefer exact.deinit();
+            if (incoming) |other| exact.andWith(other);
+            try control.check();
+            result.deinit();
+            return exact;
+        }
+        const scope = owner.req.value_search_scope;
+        const membership = value_query.membership;
+        const now = if (scope != null) @import("../native_query_cut.zig").nowMs() else 0;
+        const cache_key = if (scope) |cut| membership.key(cut, owner.req.index_name, lease.entry.id, count, self.matcher.spec) else null;
+        var facts = if (cache_key) |key| (try membership.retained.get(a, key, now)) orelse membership.Facts.init(a) else membership.Facts.init(a);
+        defer facts.deinit();
+        if (facts.complete) {
+            // A complete immutable predicate already includes the proof of
+            // absence outside its conservative candidate postings. It needs
+            // neither another term expansion nor a scan of cached IDs.
+            const reused = try facts.matched.clone(a);
+            result.deinit();
+            result = reused;
+            if (incoming) |other| result.andWith(other);
+            try control.check();
+            return result;
+        }
+        var changed = false;
+        // Snapshot deletion state once without holding its read lease across
+        // source I/O. Superseded physical slots must not consume scan budgets.
+        var deleted = try lease.entry.cloneDeleted(@import("../../../sql/memory_budget.zig").reclaimingAllocator(a));
+        defer if (deleted) |*bitmap| bitmap.deinit();
         var indexed = if (self.candidate) |filter| try filter.withControl(control).executeWithOffset(a, lease.entry, offset) else null;
         defer if (indexed) |*bitmap| bitmap.deinit();
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         if (indexed) |*bitmap| if (incoming) |other| bitmap.andWith(other);
+        if (indexed) |*bitmap| if (deleted) |*tombstones| bitmap.andNotWith(tombstones);
         const selected: ?*const roaring.RoaringBitmap = if (indexed) |*bitmap| bitmap else incoming;
-        var iterator = if (selected) |bitmap| bitmap.iterator() else null;
+        var pending: ?roaring.RoaringBitmap = null;
+        defer if (pending) |*bitmap| bitmap.deinit();
+        if (facts.known.cardinality() != 0) {
+            // Reuse whole bitmap runs rather than probing every cached document
+            // on every page. Only genuinely unverified candidates reach the loop.
+            const reused = try facts.matched.clone(a);
+            result.deinit();
+            result = reused;
+            if (selected) |bitmap| {
+                result.andWith(bitmap);
+                pending = try bitmap.clone(a);
+                pending.?.andNotWith(&facts.known);
+            }
+        }
+        var iterator = if (pending) |*bitmap| bitmap.iterator() else if (selected) |bitmap| bitmap.iterator() else null;
         var sequential: u32 = 0;
         while (true) {
             const local = if (iterator) |*it| it.next() orelse break else blk: {
+                if (deleted) |*tombstones| {
+                    sequential = @intCast(roaring.RoaringBitmap.candidateLowerBound(sequential, count, &.{}, &.{tombstones}));
+                }
                 if (sequential >= count) break;
                 const next = sequential;
                 sequential += 1;
                 break :blk next;
             };
             if (local >= count) return error.InvalidArgument;
+            if (deleted) |*tombstones| if (tombstones.contains(local)) continue;
             const global = offset + local;
             if (self.visited.contains(global)) {
-                if (self.matched.contains(global)) try result.add(local);
+                const yes = self.matched.contains(global);
+                if (yes) try result.add(local);
+                // Fusion can establish this leaf while another leaf is being
+                // evaluated. Publish only facts known for this exact predicate.
+                if (cache_key != null and !facts.known.contains(local)) {
+                    try facts.known.add(local);
+                    if (yes) try facts.matched.add(local);
+                    changed = true;
+                }
                 continue;
             }
             try control.check();
+            if (facts.known.contains(local)) {
+                if (facts.matched.contains(local)) try result.add(local);
+                continue;
+            }
             const work = owner.req.value_search_work orelse &owner.local_work;
-            try value_query.Work.charge(&work.documents, 1, owner.req.value_search_execution.max_documents);
             _ = scratch.reset(.retain_capacity);
             const id = (try owner.snapshot.storedIdScoped(scratch.allocator(), global)) orelse return error.StoredDocMissing;
-            // This loader is bound to the request's admitted primary read generation.
-            const stored = try owner.load.?(owner.load_ctx, scratch.allocator(), id);
             var matched = false;
-            if (stored) |bytes| {
-                try value_query.Work.charge(&work.bytes, bytes.len, owner.req.value_search_execution.max_bytes);
-                const parsed = try std.json.parseFromSlice(std.json.Value, scratch.allocator(), bytes, .{ .allocate = .alloc_if_needed });
-                matched = try self.matcher.document(parsed.value);
+            if (work.sources.get(owner.load_ctx, id)) |doc| {
+                matched = try owner.matchSource(self, global, doc);
+            } else {
+                try value_query.Work.charge(&work.documents, 1, owner.req.value_search_execution.max_documents);
+                // This loader is bound to the admitted primary read generation.
+                const stored = try owner.load.?(owner.load_ctx, scratch.allocator(), id);
+                if (stored) |bytes| {
+                    try value_query.Work.charge(&work.bytes, bytes.len, owner.req.value_search_execution.max_bytes);
+                    const shared = if (owner.literals == null) try work.sources.remember(owner.a, owner.load_ctx, id, bytes) else null;
+                    if (shared) |doc| {
+                        matched = try owner.matchSource(self, global, doc);
+                    } else {
+                        const parsed = try std.json.parseFromSlice(std.json.Value, scratch.allocator(), bytes, .{ .allocate = .alloc_if_needed });
+                        matched = try owner.matchSource(self, global, parsed.value);
+                    }
+                }
+            }
+            if (cache_key != null) {
+                try facts.known.add(local);
+                if (matched) try facts.matched.add(local);
+                changed = true;
             }
             try self.visited.add(global);
             if (matched) {
@@ -18786,9 +18904,46 @@ const ValueProducer = struct {
                 try result.add(local);
             }
         }
+        try control.check();
+        if (cache_key != null and incoming == null) {
+            // Full candidate evaluation plus the conservative index proof
+            // establishes the predicate for every document in this segment.
+            facts.complete = true;
+            facts.known.deinit();
+            facts.known = roaring.RoaringBitmap.init(a);
+            changed = true;
+        }
+        if (changed) membership.retained.put(cache_key.?, scope.?.expires_ms, @import("../native_query_cut.zig").nowMs(), facts);
         return result;
     }
 };
+
+fn literalKeywordMembership(a: Allocator, segment: *const index_mod.SegmentEntry, field: []const u8, text: []const u8) !roaring.RoaringBitmap {
+    var result = roaring.RoaringBitmap.init(a);
+    errdefer result.deinit();
+    var reader = (try segment.reader.invertedIndexScoped(a, field)) orelse return result;
+    defer reader.deinit();
+    if (try reader.lookup(text)) |lookup| switch (lookup) {
+        .one_hit => |hit| try result.add(hit.doc_num),
+        .postings => |postings| {
+            const bitmap = try postings.docBitmap(a);
+            result.deinit();
+            result = bitmap;
+        },
+    };
+    return result;
+}
+
+fn logicalKeywordProvesEquality(schema: runtime_schema_mod.TableSchema, source: []const u8, emitted: []const u8) bool {
+    // Explicit full-text source extraction indexes only strings and preserves
+    // array-element boundaries. Unknown/legacy mapping shapes still verify.
+    if (schema.full_text_documents.len == 0) return false;
+    for (schema.full_text_documents) |doc| for (doc.fields) |field| {
+        if (std.mem.eql(u8, field.emitted_name, emitted) and
+            (!std.mem.eql(u8, field.path, source) or !std.mem.eql(u8, field.analyzer, "keyword"))) return false;
+    };
+    return true;
+}
 
 fn longestAsciiFragment(text: []const u8) ?[]const u8 {
     var best: []const u8 = "";
@@ -18807,9 +18962,10 @@ fn longestAsciiFragment(text: []const u8) ?[]const u8 {
 
 /// Resolve by source mapping and analyzer, never by a guessed suffix. Every
 /// document schema must agree; otherwise use the explicitly permitted scan.
-fn valueRepresentation(a: Allocator, optional_schema: ?runtime_schema_mod.TableSchema, source: []const u8, analyzer: []const u8) !?[]const u8 {
+fn valueRepresentation(a: Allocator, optional_schema: ?runtime_schema_mod.TableSchema, analysis: introducer_mod.TextAnalysisConfig, source: []const u8, analyzer: []const u8) !?[]const u8 {
     const schema = optional_schema orelse return null;
     const field = runtime_schema_mod.resolveLogicalTextRepresentation(schema, source, analyzer) orelse return null;
+    if (!fieldUsesAnalyzer(analysis, schema, field, analyzer)) return null;
     return try a.dupe(u8, field);
 }
 
@@ -18832,10 +18988,10 @@ fn textQueryToSearchQueryWithValues(
     return switch (text_query) {
         .value => |spec| if (values) |execution| try execution.prepare(alloc, spec, text_analysis, runtime_schema) else return error.UnsupportedQueryRequest,
         .autocomplete => |query| blk: {
-            const companion = try std.fmt.allocPrint(alloc, "{s}._2gram", .{query.field});
-            if (!fieldUsesAnalyzer(text_analysis, runtime_schema, companion, "search_as_you_type_2gram")) return error.UnsupportedQueryRequest;
+            const schema = runtime_schema orelse return error.UnsupportedQueryRequest;
+            const root = runtime_schema_mod.resolveLogicalAutocompleteRoot(schema, query.field) orelse return error.UnsupportedQueryRequest;
             const fields = try alloc.alloc(types.TextMultiMatchField, 1);
-            fields[0] = .{ .field = query.field, .boost = 1 };
+            fields[0] = .{ .field = root, .boost = 1 };
             break :blk try multiMatchBoolPrefixToSearchQuery(alloc, .{ .query = query.text, .fields = fields, .boost = query.boost }, text_analysis, runtime_schema);
         },
         .match_none => .{ .match_none = {} },
@@ -33436,8 +33592,120 @@ test "logical value producers verify before counts negation and pagination and m
     try std.testing.expectEqual(@as(u32, 2), page.hits[0].doc_id);
     const equals = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .equals, .field = "content", .text = "connection-refused" } }, .{}, schema, &execution);
     try std.testing.expectEqual(@as(u32, 1), try search_mod.countMatches(a, writer.snapshot(), equals));
+    try std.testing.expectEqual(@as(usize, 3), loader.calls);
     try std.testing.expectError(error.ValueSearchRequiresScan, textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "-" } }, .{}, schema, &execution));
     execution.req.value_search_execution = .{ .allow_scan = true, .max_documents = 1 };
     const scan = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "-" } }, .{}, schema, &execution);
     try std.testing.expectError(error.ValueSearchLimitExceeded, search_mod.countMatches(a, writer.snapshot(), scan));
+}
+
+test "logical value fusion preserves per-leaf scores and constrained retained facts" {
+    const a = std.testing.allocator;
+    const documents = [_]mapper_mod.MapperDoc{
+        .{ .key = "a", .value = "{\"content\":\"ushers\"}" },
+        .{ .key = "b", .value = "{\"content\":\"he\"}" },
+        .{ .key = "c", .value = "{\"content\":\"absent\"}" },
+        .{ .key = "d", .value = "{\"content\":[\"s\",\"he\"]}" },
+        .{ .key = "e", .value = "{\"content\":42}" },
+    };
+    const bytes = (try mapper_mod.buildTextSegmentFromDocuments(a, &documents, .{}, null)).?;
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try std.testing.expect(try writer.deleteById("c"));
+    const Loader = struct {
+        calls: usize = 0,
+        fn load(raw: ?*anyopaque, alloc: Allocator, id: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            for (documents) |doc| if (std.mem.eql(u8, doc.key, id)) return try alloc.dupe(u8, doc.value);
+            return null;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var loader: Loader = .{};
+    var execution: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true, .max_documents = 4 } }, .load_ctx = &loader, .load = Loader.load };
+    defer execution.deinit();
+    const source: types.TextQuery = .{ .bool_query = .{ .should = &.{
+        .{ .value = .{ .kind = .contains, .field = "content", .text = "she", .boost = 10 } },
+        .{ .value = .{ .kind = .contains, .field = "content", .text = "he", .boost = 2 } },
+        .{ .value = .{ .kind = .contains, .field = "content", .text = "hers", .boost = 1 } },
+    } } };
+    const query = try textQueryToSearchQueryWithValues(arena.allocator(), source, .{}, null, &execution);
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), query));
+    try std.testing.expectEqual(@as(usize, 4), loader.calls);
+    var page = try search_mod.execute(a, writer.snapshot(), .{ .query = query, .k = 5, .include_stored = false });
+    defer page.deinit();
+    try std.testing.expectEqual(@as(u32, 0), page.hits[0].doc_id);
+    try std.testing.expect(page.hits[0].score > page.hits[1].score);
+    try std.testing.expectEqual(@as(usize, 4), loader.calls);
+
+    // A cached subset, including a verified nonmatch, cannot stand for an
+    // entire segment when a subsequent request has a broader candidate set.
+    const now = @import("../native_query_cut.zig").nowMs();
+    const scope = value_query.membership.Scope.init("fusion-partial-test", "cut", @as(u64, 77), now + 60000);
+    const request: types.SearchRequest = .{ .value_search_execution = .{ .allow_scan = true }, .value_search_scope = scope };
+    var partial: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = request, .load_ctx = &loader, .load = Loader.load };
+    defer partial.deinit();
+    const leaf: types.TextQuery = .{ .value = .{ .kind = .contains, .field = "content", .text = "he" } };
+    const partial_query = try textQueryToSearchQueryWithValues(arena.allocator(), leaf, .{}, null, &partial);
+    var incoming = roaring.RoaringBitmap.init(a);
+    defer incoming.deinit();
+    try incoming.add(0);
+    try incoming.add(2);
+    const producer = partial_query.doc_num.producer.?;
+    var first = try producer.produce(producer.ptr, a, 0, 5, &incoming);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.cardinality());
+    loader.calls = 0;
+    var resumed: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = request, .load_ctx = &loader, .load = Loader.load };
+    defer resumed.deinit();
+    const resumed_query = try textQueryToSearchQueryWithValues(arena.allocator(), leaf, .{}, null, &resumed);
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), resumed_query));
+    try std.testing.expectEqual(@as(usize, 3), loader.calls);
+    loader.calls = 0;
+    var complete: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = request, .load_ctx = &loader, .load = Loader.load };
+    defer complete.deinit();
+    const complete_query = try textQueryToSearchQueryWithValues(arena.allocator(), leaf, .{}, null, &complete);
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), complete_query));
+    try std.testing.expectEqual(@as(usize, 0), loader.calls);
+}
+
+test "logical value lossless keyword equality bypasses synonym expansion" {
+    const a = std.testing.allocator;
+    const inverted = @import("../../../section/inverted.zig");
+    var inv = inverted.InvertedIndexBuilder.init(a, .{});
+    defer inv.deinit();
+    try inv.addDocument(0, &.{.{ .term = "fast", .freq = 1, .norm = 1 }});
+    try inv.addDocument(1, &.{.{ .term = "quick", .freq = 1, .norm = 1 }});
+    const postings = try inv.build();
+    defer a.free(postings);
+    var synonyms = @import("../../../section/synonyms.zig").SynonymWriter.init(a);
+    defer synonyms.deinit();
+    try synonyms.addGroup(&.{ "fast", "quick" }, &.{ 0, 1 });
+    const aliases = try synonyms.build();
+    defer a.free(aliases);
+    var builder = segment_mod.SegmentWriter.init(a);
+    defer builder.deinit();
+    const field = try builder.addField("value.keyword");
+    try builder.addSection(field, .inverted_text, postings);
+    try builder.addSection(field, .synonym, aliases);
+    try builder.addStoredDoc("a", "{}");
+    try builder.addStoredDoc("b", "{}");
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const schema: runtime_schema_mod.TableSchema = .{ .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "value", .emitted_name = "value.keyword", .analyzer = "keyword" }} }} };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var execution: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{}, .load_ctx = null, .load = testUnexpectedLoadStoredCallback };
+    defer execution.deinit();
+    const query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .equals, .field = "value", .text = "fast" } }, .{}, schema, &execution);
+    try std.testing.expectEqual(@as(u32, 1), try search_mod.countMatches(a, writer.snapshot(), query));
+    const ordinary: search_mod.SearchQuery = .{ .term = .{ .field = "value.keyword", .term = "fast" } };
+    try std.testing.expectEqual(@as(u32, 2), try search_mod.countMatches(a, writer.snapshot(), ordinary));
 }

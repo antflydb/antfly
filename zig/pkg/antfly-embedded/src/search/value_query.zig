@@ -19,6 +19,8 @@
 const std = @import("std");
 const regex = @import("antfly_regex").search;
 const A = std.mem.Allocator;
+pub const LiteralSet = @import("value_literals.zig").Set;
+pub const membership = @import("value_membership.zig");
 pub const Kind = enum { equals, contains, matches };
 pub const Spec = struct {
     kind: Kind,
@@ -49,9 +51,15 @@ pub const Work = struct {
     bytes: std.atomic.Value(u64) = .init(0),
     regex_work: std.atomic.Value(u64) = .init(0),
 
+    sources: Sources = .{},
+    prepared_leaves: std.atomic.Value(u32) = .init(0),
+
     mutex: std.atomic.Mutex = .unlocked,
     plans: std.ArrayListUnmanaged(Plan) = .empty,
-    pub fn record(self: *Work, a: A, spec: Spec, candidate: ?[]const u8, index: ?[]const u8, reason: ?[]const u8) !void {
+    pub fn registerLeaf(self: *Work) void {
+        if (self.prepared_leaves.fetchAdd(1, .monotonic) != 0) self.sources.enabled.store(true, .release);
+    }
+    pub fn record(self: *Work, a: A, spec: Spec, candidate: ?[]const u8, index: ?[]const u8, reason: ?[]const u8, verification: []const u8) !void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         const field = try a.dupe(u8, spec.field);
@@ -60,9 +68,10 @@ pub const Work = struct {
         errdefer if (physical) |name| a.free(name);
         const index_name = if (index) |name| try a.dupe(u8, name) else null;
         errdefer if (index_name) |name| a.free(name);
-        try self.plans.append(a, .{ .operation = spec.kind, .field = field, .candidate_field = physical, .index = index_name, .fallback_reason = reason });
+        try self.plans.append(a, .{ .operation = spec.kind, .field = field, .candidate_field = physical, .index = index_name, .fallback_reason = reason, .verification = verification });
     }
     pub fn deinit(self: *Work, a: A) void {
+        self.sources.deinit();
         for (self.plans.items) |plan| {
             a.free(plan.field);
             if (plan.candidate_field) |name| a.free(name);
@@ -83,6 +92,90 @@ pub const Work = struct {
         }
     }
 };
+
+/// Request-owned decoded sources shared by value clauses. No eviction means a
+/// borrowed Value remains stable until Work.deinit; refusal simply uses scratch.
+/// Actual allocator capacity, including parser arenas and map keys, is bounded.
+pub const Sources = struct {
+    const Entry = std.json.Parsed(std.json.Value);
+    enabled: std.atomic.Value(bool) = .init(false),
+    budget: @import("../sql/memory_budget.zig") = .{ .backing = undefined, .limit = 8 * 1024 * 1024 },
+    initialized: bool = false,
+    context: ?*anyopaque = null,
+    entries: std.StringHashMapUnmanaged(Entry) = .empty,
+    mutex: std.atomic.Mutex = .unlocked,
+    fn lock(self: *Sources) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+    }
+    pub fn get(self: *Sources, context: ?*anyopaque, id: []const u8) ?std.json.Value {
+        if (!self.enabled.load(.acquire)) return null;
+        self.lock();
+        defer self.mutex.unlock();
+        if (!self.initialized or self.context != context) return null;
+        return if (self.entries.get(id)) |entry| entry.value else null;
+    }
+    pub fn remember(self: *Sources, a: A, context: ?*anyopaque, id: []const u8, bytes: []const u8) !?std.json.Value {
+        if (!self.enabled.load(.acquire)) return null;
+        self.lock();
+        defer self.mutex.unlock();
+        if (!self.initialized) {
+            self.budget.backing = @import("../sql/memory_budget.zig").reclaimingAllocator(a);
+            self.context = context;
+            self.initialized = true;
+        }
+        if (self.context != context) return null;
+        if (self.entries.get(id)) |entry| return entry.value;
+        if (self.entries.count() >= 4096 or bytes.len > (self.budget.limit - self.budget.live) / 4) return null;
+        const ca = self.budget.allocator();
+        var parsed = std.json.parseFromSlice(std.json.Value, ca, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return null,
+            else => return err,
+        };
+        const owned = ca.dupe(u8, id) catch {
+            parsed.deinit();
+            return null;
+        };
+        self.entries.put(ca, owned, parsed) catch {
+            ca.free(owned);
+            parsed.deinit();
+            return null;
+        };
+        return parsed.value;
+    }
+    fn deinit(self: *Sources) void {
+        if (!self.initialized) return;
+        const ca = self.budget.allocator();
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+            ca.free(entry.key_ptr.*);
+        }
+        self.entries.deinit(ca);
+        std.debug.assert(self.budget.live == 0);
+    }
+};
+
+test "logical value decoded sources are owned bounded and loader scoped" {
+    const a = std.testing.allocator;
+    var sources: Sources = .{ .enabled = .init(true) };
+    defer sources.deinit();
+    const bytes = try a.dupe(u8, "{\"body\":\"needle\"}");
+    _ = (try sources.remember(a, null, "doc", bytes)).?;
+    a.free(bytes);
+    try std.testing.expectEqualStrings("needle", sources.get(null, "doc").?.object.get("body").?.string);
+    var other: u8 = 0;
+    try std.testing.expect(sources.get(&other, "doc") == null);
+    try std.testing.expect(try sources.remember(a, &other, "doc", "{}") == null);
+    sources.budget.limit = sources.budget.live;
+    try std.testing.expect(try sources.remember(a, null, "new", "{}") == null);
+    try std.testing.expect(sources.get(null, "doc") != null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var scoped: Sources = .{ .enabled = .init(true) };
+    defer scoped.deinit();
+    _ = try scoped.remember(arena.allocator(), null, "owned", "{\"body\":\"needle\"}");
+    try std.testing.expectEqual(@as(usize, 0), arena.queryCapacity());
+}
 
 /// Prepared once per leaf, with span-only scratch reused across documents.
 /// Sensitive literal operations never compile a regex or allocate VM scratch.
