@@ -19,6 +19,41 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Retained preparation agreements (2026-10-19)
+
+Commit `bb9088a5ef0e84a0dc3c9c8e89b86f5d39a8916e` stores the original
+preparation mode atomically with required BEGIN in a fixed 54-byte v7 transaction
+record. Legacy records keep their previous encoding. Resolution deletes effect
+and requirement sidecars while preserving the agreed mode in the existing history
+record; no extra history key or later allocation growth is needed. Existing retry
+retention, participant acknowledgements and expiry cleanup govern its lifetime.
+A typed status read validates unresolved sidecars and returns durable contract
+evidence after resolution. Legacy records never acquire this evidence from a
+sidecar alone. Missing or conflicting evidence cannot authorize commit, and abort
+can still retire damaged preparation metadata.
+
+Permanent reader floor and catalog envelope 6 fence this record format, including
+when the last sidecar retires. Native ABI is 37; storage owner ABI remains 101.
+Files at reader 5 remain readable, but active old preparation metadata must be
+resolved or explicitly migrated before enabling new required BEGIN. Peer readiness
+also requires reader floor, permanent baseline and envelope at least 6.
+
+The six-target `native-retained-contract-v3-verified.json` receipt covers all
+prepared-effect codec/storage cases, 22 required-preparation DB cases, coordinator
+and participant fanout, inference checkpoints and independent native ownership.
+New cases check both modes through persistent resolution/reopen/retry/expiry,
+reader-5 migration refusal, damaged evidence, legacy refusal and every original
+admission rejection. Existing allocation-failure coverage now checks atomic mode
+publication too. The immutable package passes 25 ReleaseSafe consumer checks.
+These are focused checks; full Linux qualification remains waived.
+
+Production activation remains pending. Next are strict RPC and replicated
+BEGIN/PREPARE/seal adapters, real participant providers and eligible producers,
+ordered-catalog/import/downgrade migration and distributed fault/restart tests.
+The retained-history storage prerequisite is implemented; it does not establish
+end-to-end provider readiness. Completion resource bundles, future replay/output
+credit and the remaining original scheduler scope remain open.
+
 ## Required-preparation coordinator foundation (2026-10-19)
 
 Commit `3542715d2d636ccf0a97497a0f46992a22a1a57a` adds an explicit opt-in
@@ -48,7 +83,7 @@ These are focused checks; full Linux qualification remains waived.
 This is a coordinator and codec foundation. Production participant providers do
 not advertise readiness, existing entry points do not select the new policy, and
 the binary wrapper is not yet wired into HTTP or replicated batches. Next are
-durable retained-contract history after intent/effect retirement, actual strict
+the production transport and storage integration described above: strict
 RPC/Raft BEGIN/PREPARE/seal adapters and eligible predecision producers, followed
 by ordered-catalog/import/downgrade migration and real distributed restart and
 failure tests. Future replay/output credit, minimum completion resource bundles
