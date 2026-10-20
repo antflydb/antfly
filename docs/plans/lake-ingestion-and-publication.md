@@ -3161,3 +3161,54 @@ license/boundary and source catalogue checks pass; the inference error catalogue
 was regenerated for the merged main's new video errors. Deterministic fixture
 observations are recorded in
 [`native-lake-leased-navigation-and-publication.json`](../../zig/bench/baselines/native-lake-leased-navigation-and-publication.json).
+
+### Prefix navigation, interval reduction, and publication I/O phases
+
+Prefix-compressed Parquet strings retain a compact range-minimum index over
+64-row prefix blocks. Reconstruction jumps to the preceding row that actually
+contributes bytes instead of walking every intervening prefix. The index contains
+lengths only; rejected rows do not acquire cached decoded strings. Forward pulls
+still reuse the scratch prefix, while backward access and repeated predicates
+have bounded history work per contributing suffix. Independent mixed-string
+oracles, allocation failures, and a statless real Parquet restart test cover the
+same selected-column path. In the deterministic 65,536-row repeated-predicate
+fixture, reconstruction work falls from 8,617,727 to 163,967 steps with 8,192
+bytes of navigation state. These counts measure reconstruction work, not SQL
+latency.
+
+Cold aggregate merges now zip authenticated routing intervals. Complete
+nonoverlapping subtrees are spliced into a sorted output at their original
+height, retaining references, attempt ownership and reduction summaries. Only
+boundary leaves and overlapping ranges need record decoding; equal keys still
+run the exact typed reducer, including when both inputs name the same tree.
+Historical layouts retain their explicit upgrade path. A 24,000-group fixture
+with one shared key writes 69,098 bytes and reads four pages. Reversed inputs,
+unequal heights, old-root reachability, allocation failures, cancellation and
+upload failure are checked independently of the aggregate codec.
+
+Each admitted publication worker owns an operation-local I/O capability, borrowed
+through a pointer so compact read descriptors do not carry inline callback state.
+Artifact uploads, retention bookkeeping and durable checkpoint waits
+release CPU admission and acquire shared I/O slots. Retained-state admission
+continues to cover live buffers throughout the wait. An upload batch reserves
+its full fan-out before starting children, removes the worker capability from
+child store copies, and drains all children before reacquiring CPU admission.
+No scheduler pointer is installed on a shared backend. Recoverable failures release
+I/O slots and restore CPU admission before callers handle them; canceled
+resumption also releases returned payloads and metadata. Explicitly disabled I/O lanes preserve required inline
+execution. Checkpoint serialization happens after the worker releases its CPU
+slot, allowing other admitted consumers and queries to run during storage waits.
+
+These changes require no persisted-format or reader-protocol change. Controlled
+archive-scale HN and live-provider throughput qualification remain outstanding;
+the unavailable archive fixture and deferred cloud tests do not supply latency
+claims for these deterministic improvements.
+
+Deterministic observations are recorded in
+[`native-lake-prefix-interval-and-io.json`](../../zig/bench/baselines/native-lake-prefix-interval-and-io.json).
+Validation passes nine codec tests, ten scheduler tests, 74 page/upload tests,
+and 23 real Parquet/Iceberg HTTP/pgwire/restart E2Es (216.54 seconds), including
+the 65,536-row statless repeated-predicate case. The stripped Debug server builds
+with Zig 0.17.0; formatting, license/boundary and generated-catalogue checks pass.
+The final full lake run passes 231 shared and 381 native cases with zero leaks,
+including the unchanged 16 KiB compact-reader retention test.

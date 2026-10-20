@@ -751,6 +751,8 @@ pub const SortedBuilder = struct {
     store: Store,
     target_bytes: usize = target_page_bytes,
     previous: ?[]u8 = null,
+    previous_is_upper: bool = false,
+    closed: bool = false,
     pending: [max_write_batch]Write = undefined,
     pending_count: usize = 0,
     // The extra slot holds the final root ref, never another persisted page.
@@ -774,12 +776,34 @@ pub const SortedBuilder = struct {
     pub fn add(self: *SortedBuilder, key: []const u8, value: []const u8) !void {
         try self.store.check(self.store.ptr);
         if (key.len == 0 or key.len > max_key_bytes or value.len > max_record_bytes - 8 - key.len) return error.GraphPageRecordTooLarge;
-        if (self.previous) |previous| if (!less(previous, key)) return error.UnsortedGraphPageMutations;
+        try self.checkOrder(key);
         const previous = try self.alloc.dupe(u8, key);
         errdefer self.alloc.free(previous);
         try self.append(0, .{ .key = key, .value = value });
         if (self.previous) |old| self.alloc.free(old);
         self.previous = previous;
+        self.previous_is_upper = false;
+    }
+    fn checkOrder(self: *SortedBuilder, key: []const u8) !void {
+        if (self.closed) return error.UnsortedGraphPageMutations;
+        if (self.previous) |previous| if (if (self.previous_is_upper) less(key, previous) else !less(previous, key)) return error.UnsortedGraphPageMutations;
+    }
+    /// Adopt a verified, complete half-open routing interval. Flush preceding
+    /// lower levels before splicing the ref at its native height. Descendants
+    /// keep their original attempts and authenticated reduction summaries.
+    fn addSubtree(self: *SortedBuilder, first: []const u8, upper: ?[]const u8, ref: Ref, aggregate: []const u8) !void {
+        try self.store.check(self.store.ptr);
+        try ref.validate();
+        try self.checkOrder(first);
+        if (upper) |bound| if (!less(first, bound)) return error.InvalidGraphPage;
+        const previous = if (upper) |bound| try self.alloc.dupe(u8, bound) else null;
+        errdefer if (previous) |bytes| self.alloc.free(bytes);
+        for (0..@as(usize, ref.height) + 1) |height| if (self.levels[height].entries.items.len != 0) try self.flush(height);
+        try self.append(@as(usize, ref.height) + 1, .{ .key = first, .child = ref, .aggregate = aggregate });
+        if (self.previous) |old| self.alloc.free(old);
+        self.previous = previous;
+        self.previous_is_upper = true;
+        self.closed = upper == null;
     }
     pub fn finish(self: *SortedBuilder) !?Ref {
         try self.store.check(self.store.ptr);
@@ -846,6 +870,111 @@ pub const SortedBuilder = struct {
         try self.store.put_many.?(self.store.ptr, self.pending[0..self.pending_count]);
         for (self.pending[0..self.pending_count]) |page| self.alloc.free(page.bytes);
         self.pending_count = 0;
+    }
+};
+
+/// Merge sorted immutable trees while adopting nonoverlapping routing ranges.
+/// The reducer is called only for equal keys; the supplied scratch arena is
+/// reset after each record. Memory is bounded by two ancestor paths and one
+/// sorted-builder page per height, independent of the number of groups.
+pub fn mergeSorted(alloc: Allocator, store: Store, left: Ref, right: Ref, reducer: anytype) !Ref {
+    var l = try MergeFrontier.init(alloc, store, left);
+    defer l.deinit();
+    var r = try MergeFrontier.init(alloc, store, right);
+    defer r.deinit();
+    var builder: SortedBuilder = .{ .alloc = alloc, .store = store };
+    defer builder.deinit();
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    while (true) {
+        try store.check(store.ptr);
+        const lp = l.peek();
+        const rp = r.peek();
+        if (lp == null and rp == null) break;
+        const order = if (lp == null) std.math.Order.gt else if (rp == null) std.math.Order.lt else std.mem.order(u8, lp.?.first, rp.?.first);
+        if (order == .eq) {
+            if (lp.?.ref != null) {
+                try l.expand();
+                continue;
+            }
+            if (rp.?.ref != null) {
+                try r.expand();
+                continue;
+            }
+            _ = scratch.reset(.free_all);
+            try builder.add(lp.?.first, try reducer.merge(scratch.allocator(), lp.?.value, rp.?.value));
+            l.consume();
+            r.consume();
+        } else {
+            const stream = if (order == .lt) &l else &r;
+            const item = if (order == .lt) lp.? else rp.?;
+            const other = if (order == .lt) rp else lp;
+            if (item.ref) |ref| {
+                const disjoint = other == null or (if (item.end) |end| !less(other.?.first, end) else false);
+                if (!disjoint) {
+                    try stream.expand();
+                    continue;
+                }
+                try builder.addSubtree(item.first, item.end, ref, item.aggregate);
+            } else try builder.add(item.first, item.value);
+            stream.consume();
+        }
+    }
+    return (try builder.finish()) orelse error.InvalidGraphPage;
+}
+const MergeFrontier = struct {
+    alloc: Allocator,
+    store: Store,
+    frames: [max_height + 1]Frame = undefined,
+    depth: usize = 0,
+    const Frame = struct { page: Page, next: usize = 0, end: ?[]const u8, whole: bool = true };
+    const Item = struct { first: []const u8, end: ?[]const u8, ref: ?Ref, value: []const u8 = "", aggregate: []const u8 = "" };
+    fn init(alloc: Allocator, store: Store, root: Ref) !MergeFrontier {
+        var self: MergeFrontier = .{ .alloc = alloc, .store = store };
+        self.frames[0] = .{ .page = try load(alloc, store, root), .end = null };
+        self.depth = 1;
+        return self;
+    }
+    fn deinit(self: *MergeFrontier) void {
+        for (self.frames[0..self.depth]) |*frame| frame.page.deinit(self.alloc);
+        self.depth = 0;
+    }
+    fn peek(self: *MergeFrontier) ?Item {
+        while (self.depth != 0) {
+            const frame = &self.frames[self.depth - 1];
+            if (frame.whole) return .{ .first = frame.page.entries[0].key, .end = frame.end, .ref = frame.page.ref, .aggregate = frame.page.aggregate };
+            if (frame.next == frame.page.entries.len) {
+                frame.page.deinit(self.alloc);
+                self.depth -= 1;
+                continue;
+            }
+            const entry = frame.page.entries[frame.next];
+            return .{ .first = entry.key, .end = if (frame.next + 1 < frame.page.entries.len) frame.page.entries[frame.next + 1].key else frame.end, .ref = entry.child, .value = entry.value, .aggregate = entry.aggregate };
+        }
+        return null;
+    }
+    fn consume(self: *MergeFrontier) void {
+        const frame = &self.frames[self.depth - 1];
+        if (frame.whole) {
+            frame.page.deinit(self.alloc);
+            self.depth -= 1;
+        } else frame.next += 1;
+    }
+    fn expand(self: *MergeFrontier) !void {
+        const frame = &self.frames[self.depth - 1];
+        if (frame.whole) {
+            frame.whole = false;
+            return;
+        }
+        const item = self.peek().?;
+        if (self.depth == self.frames.len) return error.InvalidGraphPage;
+        var page = try load(self.alloc, self.store, item.ref.?);
+        errdefer page.deinit(self.alloc);
+        if (!std.mem.eql(u8, item.first, page.entries[0].key)) return error.InvalidGraphPage;
+        if (item.end) |end| if (!less(page.entries[page.entries.len - 1].key, end)) return error.InvalidGraphPage;
+        frame.next += 1;
+        self.frames[self.depth] = .{ .page = page, .end = item.end };
+        self.depth += 1;
     }
 };
 
@@ -2430,4 +2559,145 @@ test "serverless graph disjoint joins preserve descendants overlap fallback and 
 fn disjointJoinFaultScenario(a: Allocator, store: Store, left: Ref, right: Ref) !void {
     const root = (try joinDisjoint(a, store, left, right)).?;
     try std.testing.expectEqual(left.records + right.records, root.records);
+}
+
+const MergeTestReducer = struct {
+    pub fn merge(_: @This(), a: Allocator, left: []const u8, right: []const u8) ![]const u8 {
+        const value = try a.dupe(u8, left);
+        std.mem.writeInt(u64, value[0..8], std.mem.readInt(u64, left[0..8], .little) + std.mem.readInt(u64, right[0..8], .little), .little);
+        return value;
+    }
+};
+fn mergeSortedFaultScenario(a: Allocator, store: Store, left: Ref, right: Ref, count: u64) !void {
+    const root = try mergeSorted(a, store, left, right, MergeTestReducer{});
+    try std.testing.expectEqual(count, root.records);
+}
+test "serverless graph interval merge reuses partial overlaps and retains old attempts" {
+    const a = std.testing.allocator;
+    var memory: TestStore = .{ .alloc = a };
+    defer memory.deinit();
+    const Source = struct {
+        position: u64,
+        end: u64,
+        stride: u64 = 1,
+        key: [8]u8 = undefined,
+        value: [128]u8 = @splat(0),
+        pub fn next(self: *@This()) !?Cursor.Record {
+            if (self.position >= self.end) return null;
+            std.mem.writeInt(u64, &self.key, self.position, .big);
+            std.mem.writeInt(u64, self.value[0..8], 1, .little);
+            self.position += self.stride;
+            return .{ .key = &self.key, .value = &self.value };
+        }
+    };
+    var ls: Source = .{ .position = 0, .end = 12000 };
+    var rs: Source = .{ .position = 11999, .end = 24000 };
+    var backing = memory.store();
+    backing.attempt = @splat(1);
+    const left = (try buildSorted(a, backing, &ls)).?;
+    backing.attempt = @splat(2);
+    const right = (try buildSorted(a, backing, &rs)).?;
+    backing.attempt = @splat(3);
+    const before = memory.written_bytes;
+    const reads = memory.reads;
+    const root = try mergeSorted(a, backing, left, right, MergeTestReducer{});
+    const bytes = memory.written_bytes - before;
+    const loaded = memory.reads - reads;
+    try std.testing.expectEqual(@as(u64, 24000), root.records);
+    try std.testing.expect(bytes < 128 * 1024);
+    try std.testing.expect(loaded < 30);
+    var cursor = try Cursor.init(a, backing, root, "", null);
+    defer cursor.deinit();
+    var count: u64 = 0;
+    while (try cursor.next()) |item| {
+        try std.testing.expectEqual(count, std.mem.readInt(u64, item.key[0..8], .big));
+        try std.testing.expectEqual(@as(u64, if (count == 11999) 2 else 1), std.mem.readInt(u64, item.value[0..8], .little));
+        count += 1;
+    }
+    try std.testing.expectEqual(root.records, count);
+    const Retained = struct {
+        attempts: [3]bool = @splat(false),
+        pub fn skip(_: *@This(), _: Ref) !bool {
+            return false;
+        }
+        pub fn visit(self: *@This(), ref: Ref) !void {
+            if (ref.attempt[0] >= 1 and ref.attempt[0] <= 3) self.attempts[ref.attempt[0] - 1] = true;
+        }
+    };
+    var retained: Retained = .{};
+    try walkPostOrder(a, backing, root, &retained, false);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &retained.attempts);
+    // Reversed inputs and repeated equal roots preserve reducer multiplicity.
+    const reverse = try mergeSorted(a, backing, right, left, MergeTestReducer{});
+    try std.testing.expectEqual(root.records, reverse.records);
+    const doubled = try mergeSorted(a, backing, left, left, MergeTestReducer{});
+    try std.testing.expectEqual(left.records, doubled.records);
+    var dc = try Cursor.init(a, backing, doubled, "", null);
+    defer dc.deinit();
+    while (try dc.next()) |item| try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, item.value[0..8], .little));
+    var tiny: Source = .{ .position = 11999, .end = 12003, .stride = 2 };
+    const small = (try buildSorted(a, backing, &tiny)).?;
+    try std.testing.expect(left.height > small.height);
+    try std.testing.checkAllAllocationFailures(a, mergeSortedFaultScenario, .{ backing, small, small, small.records });
+    try mergeSortedFaultScenario(a, backing, left, small, 12001);
+    memory.fail_put = memory.writes;
+    try std.testing.expectError(error.InjectedUploadFailure, mergeSorted(a, backing, left, small, MergeTestReducer{}));
+    memory.fail_put = null;
+    memory.canceled = true;
+    try std.testing.expectError(error.Canceled, mergeSorted(a, backing, left, right, MergeTestReducer{}));
+    std.debug.print("overlap tree merge: records=24000 written_bytes={} page_reads={}\n", .{ bytes, loaded });
+}
+
+test "serverless graph interval merge preserves interleaved keys and authenticated summaries" {
+    const a = std.testing.allocator;
+    var memory: TestStore = .{ .alloc = a };
+    defer memory.deinit();
+    const Summary = struct {
+        fn reduce(alloc: Allocator, entries: []const Entry, height: u8) ![]u8 {
+            var sum: u64 = 0;
+            for (entries) |entry| sum += std.mem.readInt(u64, (if (height == 0) entry.value else entry.aggregate)[0..8], .little);
+            const bytes = try alloc.alloc(u8, 8);
+            std.mem.writeInt(u64, bytes[0..8], sum, .little);
+            return bytes;
+        }
+    };
+    const Source = struct {
+        position: u64 = 0,
+        divisor: u64,
+        key: [8]u8 = undefined,
+        value: [8]u8 = undefined,
+        pub fn next(self: *@This()) !?Cursor.Record {
+            while (self.position < 1000 and self.position % self.divisor == 0) self.position += 1;
+            if (self.position == 1000) return null;
+            std.mem.writeInt(u64, &self.key, self.position, .big);
+            std.mem.writeInt(u64, &self.value, 1, .little);
+            self.position += 1;
+            return .{ .key = &self.key, .value = &self.value };
+        }
+    };
+    var backing = memory.store();
+    backing.reduce = Summary.reduce;
+    var ls: Source = .{ .divisor = 4 };
+    var rs: Source = .{ .divisor = 3 };
+    const left = (try buildSortedWithOptions(a, backing, &ls, .{ .target_bytes = 512 })).?;
+    const right = (try buildSortedWithOptions(a, backing, &rs, .{ .target_bytes = 2048 })).?;
+    const root = try mergeSorted(a, backing, left, right, MergeTestReducer{});
+    var cursor = try Cursor.init(a, backing, root, "", null);
+    defer cursor.deinit();
+    var groups: u64 = 0;
+    var sum: u64 = 0;
+    for (0..1000) |i| {
+        const expected: u64 = @as(u64, @intFromBool(i % 4 != 0)) + @intFromBool(i % 3 != 0);
+        if (expected == 0) continue;
+        const item = (try cursor.next()).?;
+        try std.testing.expectEqual(@as(u64, i), std.mem.readInt(u64, item.key[0..8], .big));
+        try std.testing.expectEqual(expected, std.mem.readInt(u64, item.value[0..8], .little));
+        groups += 1;
+        sum += expected;
+    }
+    try std.testing.expect((try cursor.next()) == null);
+    try std.testing.expectEqual(groups, root.records);
+    var page = try readPage(a, backing, root);
+    defer page.deinit(a);
+    try std.testing.expectEqual(sum, std.mem.readInt(u64, page.aggregate[0..8], .little));
 }

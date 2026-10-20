@@ -37,6 +37,7 @@ pub const Provider = struct {
     enrichment_columns: bool = false,
     vector_memo: ?@import("lake_vector_enrichment.zig").Memo = null,
     progress: ?BuildProgress = null,
+    io_phase: ?*const stores.IoPhase = null,
     embedding_options: ?local.inference_managed_embedder.InitOptions = null,
     context: Context,
     limits: stream_api.Limits = .{},
@@ -101,7 +102,16 @@ pub const Provider = struct {
     };
     pub fn checkpoint(self: *Provider, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
         try self.context.ensureActive();
-        if (self.progress) |progress| try progress.save(progress.ptr, declaration);
+        if (self.progress) |progress| {
+            var phase: stores.IoGuard = .{};
+            if (self.io_phase) |io| {
+                try io.begin(io.ptr, 1);
+                phase.phase = io;
+            }
+            defer phase.abort();
+            progress.save(progress.ptr, declaration) catch |err| return phase.failed(err);
+            try phase.finish();
+        }
     }
     /// Builders that complete a declaration set together checkpoint it once.
     /// Per-file builders keep their individual resumable boundaries.
@@ -109,7 +119,14 @@ pub const Provider = struct {
         try self.context.ensureActive();
         const progress = self.progress orelse return;
         if (progress.save_batch) |save_batch| {
-            try save_batch(progress.ptr, declarations);
+            var phase: stores.IoGuard = .{};
+            if (self.io_phase) |io| {
+                try io.begin(io.ptr, 1);
+                phase.phase = io;
+            }
+            defer phase.abort();
+            save_batch(progress.ptr, declarations) catch |err| return phase.failed(err);
+            try phase.finish();
         } else {
             for (declarations) |declaration| try self.checkpoint(declaration);
         }

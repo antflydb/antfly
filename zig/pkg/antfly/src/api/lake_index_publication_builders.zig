@@ -53,6 +53,36 @@ pub const Args = struct {
     scheduler: ?*local.sql_parallel_scheduler.Scheduler = null,
     unindexed_aggregates: bool = false,
 };
+/// One capability per serial worker execution. Retained-state reservation
+/// outlives both CPU and I/O phases; no shared backend stores this pointer.
+const PublicationIo = struct {
+    execution: *local.sql_parallel_scheduler.Execution,
+    io: std.Io,
+    pending: ?local.sql_parallel_scheduler.Execution.Io = null,
+    bridge: stores.IoPhase = undefined,
+    fn capability(self: *PublicationIo) ?*const stores.IoPhase {
+        // Disabling I/O lanes retains the established required-inline fallback.
+        if (self.execution.scheduler.max_io_workers == 0) return null;
+        self.bridge = .{ .ptr = self, .max_parallel = @min(8, self.execution.scheduler.max_io_workers), .begin = begin, .finish = finish, .abort = abort };
+        return &self.bridge;
+    }
+    fn begin(raw: *anyopaque, count: usize) !void {
+        const self: *PublicationIo = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.pending == null);
+        self.pending = try self.execution.beginIo(self.io, count);
+    }
+    fn finish(raw: *anyopaque) !void {
+        const self: *PublicationIo = @ptrCast(@alignCast(raw));
+        var pending = self.pending.?;
+        self.pending = null;
+        try pending.finish();
+    }
+    fn abort(raw: *anyopaque) void {
+        const self: *PublicationIo = @ptrCast(@alignCast(raw));
+        if (self.pending) |*pending| pending.abort();
+        self.pending = null;
+    }
+};
 const Job = struct {
     args: Args,
     kind: Kind,
@@ -64,6 +94,7 @@ const Job = struct {
     start: *std.Io.Event,
     admitted: *bool,
     execution: local.sql_parallel_scheduler.Execution,
+    publication_io: PublicationIo = undefined,
     result: Result = .{},
     fn check(raw: *anyopaque) !void {
         const self: *Job = @ptrCast(@alignCast(raw));
@@ -84,6 +115,9 @@ const Job = struct {
     fn executeAdmitted(self: *Job) !void {
         self.execution.checkpoint = .{ .ptr = self, .check = check };
         try self.execution.enter(self.pipeline.io);
+        self.publication_io = .{ .execution = &self.execution, .io = self.pipeline.io };
+        self.store.io_phase = self.publication_io.capability();
+        self.provider.io_phase = self.store.io_phase;
         try self.execute();
     }
     fn execute(self: *Job) !void {
@@ -248,6 +282,7 @@ const FileJob = struct {
     source: local.serverless_query_lake_serving.ServingSource,
     store: stores.ArtifactStore,
     execution: local.sql_parallel_scheduler.Execution,
+    publication_io: PublicationIo = undefined,
     fn check(raw: *anyopaque) !void {
         const self: *FileJob = @ptrCast(@alignCast(raw));
         const code = self.failure.load(.acquire);
@@ -266,6 +301,9 @@ const FileJob = struct {
         self.execution.checkpoint = .{ .ptr = self, .check = check };
         defer self.execution.pause();
         try self.execution.enter(io);
+        self.publication_io = .{ .execution = &self.execution, .io = io };
+        self.store.io_phase = self.publication_io.capability();
+        self.provider.io_phase = self.store.io_phase;
         var next = std.heap.ArenaAllocator.init(self.args.a);
         defer next.deinit();
         var stage = self.args;
@@ -1108,4 +1146,46 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(usize, 0), file_major.pull_workers);
     try std.testing.expectEqual(@as(usize, 0), file_major.workers);
     try std.testing.expectEqual(@as(usize, 0), file_major.io_workers);
+}
+
+test "external lake publication checkpoints park CPU and unwind failed durable saves" {
+    const Checkpoint = struct {
+        execution: *local.sql_parallel_scheduler.Execution,
+        io: std.Io,
+        fail: bool = false,
+        fn save(raw: *anyopaque, _: Declared) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.execution.active);
+            try std.testing.expectEqual(@as(usize, 1), self.execution.scheduler.io_workers);
+            var competing: local.sql_parallel_scheduler.Execution = .{ .scheduler = self.execution.scheduler, .bytes = 32 };
+            try competing.enter(self.io);
+            competing.pause();
+            if (self.fail) return error.InjectedUploadFailure;
+        }
+    };
+    const io = std.testing.io;
+    var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = 2, .max_bytes = 128, .max_io_bytes = 64 };
+    try std.testing.expect(scheduler.reservePull(1, 4096));
+    defer scheduler.releasePull(1, 4096);
+    var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 32 };
+    defer execution.pause();
+    try execution.enter(io);
+    var phase: PublicationIo = .{ .execution = &execution, .io = io };
+    var checkpoint: Checkpoint = .{ .execution = &execution, .io = io };
+    var provider: Provider = .{ .source = undefined, .context = .{}, .io_phase = phase.capability(), .progress = .{ .ptr = &checkpoint, .save = Checkpoint.save } };
+    const declaration: Declared = .{
+        .name = "count",
+        .binding = .{ .sidecar_kind = .algebraic, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "config" },
+        .artifact = .{ .kind = .algebraic_segment, .artifact_id = "test", .byte_len = 0, .checksum = "test" },
+    };
+    try provider.checkpoint(declaration);
+    try std.testing.expect(execution.active);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    checkpoint.fail = true;
+    try std.testing.expectError(error.InjectedUploadFailure, provider.checkpointBatch(&.{declaration}));
+    try std.testing.expect(execution.active);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    try std.testing.expectEqual(@as(usize, 4096), scheduler.pull_bytes);
+    scheduler.max_io_workers = 0;
+    try std.testing.expect(phase.capability() == null);
 }

@@ -6666,3 +6666,90 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+def test_prefix_compressed_repeated_predicates_without_statistics_survive_restart(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    count = 65536
+    path = tmp_path / "prefixes.parquet"
+    pq.write_table(
+        pa.table({"label": ["abcdefg"] * count}),
+        path,
+        use_dictionary=False,
+        column_encoding={"label": "DELTA_BYTE_ARRAY"},
+        write_statistics=False,
+        write_page_index=False,
+        row_group_size=count,
+        write_batch_size=count,
+        data_page_size=8 * 1024 * 1024,
+    )
+    metadata = pq.ParquetFile(path).metadata.row_group(0).column(0)
+    assert "DELTA_BYTE_ARRAY" in metadata.encodings
+    assert metadata.statistics is None
+    objects = tmp_path / "lake" / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    payload = path.read_bytes()
+    (objects / "part.parquet").write_bytes(
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+        + payload
+    )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+        response = _request_with_idle_ddl_retry(
+            server,
+            "POST",
+            "/tables/prefix_predicates",
+            {
+                "num_shards": 1,
+                "indexes": {},
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "prefix-predicates",
+                        "format": "parquet",
+                        "uri": (tmp_path / "lake").as_uri(),
+                    },
+                },
+            },
+            retry_ddl=True,
+        )
+        assert response.ok, response.text + server.debug_logs()
+        for cold in (False, True):
+            if cold:
+                server.restart()
+            for statement, expected in (
+                # Both ranges are valid together; every row fails only after
+                # its column has been traversed by the first predicate.
+                (
+                    "SELECT COUNT(*) FROM prefix_predicates "
+                    "WHERE label >= 'a' AND label < 'ab'",
+                    [["0"]],
+                ),
+                (
+                    "SELECT COUNT(*) FROM prefix_predicates "
+                    "WHERE label >= 'a' AND label < 'b'",
+                    [[str(count)]],
+                ),
+                (
+                    "SELECT label FROM prefix_predicates "
+                    "WHERE label >= 'a' AND label < 'b' LIMIT 3",
+                    [["abcdefg"]] * 3,
+                ),
+            ):
+                response = _request_with_idle_ddl_retry(
+                    server, "POST", "/sql", {"statement": statement}
+                )
+                assert response.ok, response.text + server.debug_logs()
+                assert response.json()["rows"] == expected
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

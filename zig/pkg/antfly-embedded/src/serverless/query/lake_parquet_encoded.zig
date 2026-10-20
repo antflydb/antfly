@@ -297,6 +297,12 @@ pub const Strings = struct {
     scratch: []u8 = &.{},
     scratch_row: ?usize = null,
     scratch_len: usize = 0,
+    // A range-minimum tree over 64-row prefix blocks. It skips history that
+    // cannot contribute bytes, including backward/repeated predicate passes.
+    prefix_minima: []u32 = &.{},
+    prefix_leaves: usize = 0,
+    reconstruction_steps: usize = 0,
+    const prefix_block = 64;
     pub fn init(a: A, bytes: []const u8, count: usize, prefix: bool) !Strings {
         var prefixes: ?Delta = if (prefix) try Delta.init(a, bytes, count, 32) else null;
         const skip = if (prefixes) |p| p.consumed else 0;
@@ -304,6 +310,9 @@ pub const Strings = struct {
         const data = bytes[skip + lengths.consumed ..];
         const offsets = try a.alloc(u32, count + 1);
         offsets[0] = 0;
+        const leaves = if (prefix and count != 0) try std.math.ceilPowerOfTwo(usize, std.math.divCeil(usize, count, prefix_block) catch unreachable) else 0;
+        const minima = try a.alloc(u32, leaves * 2);
+        @memset(minima, std.math.maxInt(u32));
         var previous: u64 = 0;
         for (0..count) |i| {
             const len = try lengths.at(i);
@@ -311,11 +320,17 @@ pub const Strings = struct {
             offsets[i + 1] = offsets[i] + @as(u32, @intCast(len));
             const p = if (prefixes) |*values| try values.at(i) else 0;
             if (p < 0 or p > previous) return error.InvalidParquetPage;
+            if (prefix) minima[leaves + i / prefix_block] = @min(minima[leaves + i / prefix_block], @as(u32, @intCast(p)));
             previous = @as(u64, @intCast(p + len));
             if (previous > std.math.maxInt(u32)) return error.ParquetPageTooLarge;
         }
         if (offsets[count] != data.len) return error.InvalidParquetPage;
-        return .{ .a = a, .lengths = lengths, .prefixes = prefixes, .offsets = offsets, .data = data };
+        var node = leaves;
+        while (node > 1) {
+            node -= 1;
+            minima[node] = @min(minima[node * 2], minima[node * 2 + 1]);
+        }
+        return .{ .a = a, .lengths = lengths, .prefixes = prefixes, .offsets = offsets, .data = data, .prefix_minima = minima, .prefix_leaves = leaves };
     }
     pub fn at(self: *Strings, index: usize) ![]const u8 {
         if (index >= self.lengths.count) return error.InvalidParquetPage;
@@ -339,6 +354,7 @@ pub const Strings = struct {
         var row = index;
         var remaining = size;
         while (remaining != 0) {
+            if (@import("builtin").is_test) self.reconstruction_steps += 1;
             if (self.scratch_row == row and remaining <= self.scratch_len) break;
             if (self.materialized.get(row)) |value| {
                 @memcpy(output[0..remaining], value[0..remaining]);
@@ -353,11 +369,37 @@ pub const Strings = struct {
             }
             if (remaining == 0) break;
             if (row == 0) return error.InvalidParquetPage;
-            row -= 1;
+            if (self.scratch_row == row - 1 and remaining <= self.scratch_len) break;
+            const next = try self.contributor(row, remaining);
+            if (self.scratch_row) |cached| if (cached < row and next <= cached and remaining <= self.scratch_len) break;
+            row = next;
         }
         self.scratch_row = index;
         self.scratch_len = size;
         return output;
+    }
+    fn contributor(self: *Strings, before: usize, needed: usize) !usize {
+        var row = before;
+        const block = (before - 1) / prefix_block;
+        while (row > block * prefix_block) {
+            row -= 1;
+            if (@import("builtin").is_test) self.reconstruction_steps += 1;
+            if (try self.prefixes.?.at(row) < needed) return row;
+        }
+        const found = self.findPrefixBlock(1, 0, self.prefix_leaves, block, needed) orelse return error.InvalidParquetPage;
+        row = @min(self.lengths.count, (found + 1) * prefix_block);
+        while (row > found * prefix_block) {
+            row -= 1;
+            if (@import("builtin").is_test) self.reconstruction_steps += 1;
+            if (try self.prefixes.?.at(row) < needed) return row;
+        }
+        return error.InvalidParquetPage;
+    }
+    fn findPrefixBlock(self: *const Strings, node: usize, begin: usize, end: usize, before: usize, needed: usize) ?usize {
+        if (begin >= before or self.prefix_minima[node] >= needed) return null;
+        if (end - begin == 1) return begin;
+        const mid = begin + (end - begin) / 2;
+        return self.findPrefixBlock(node * 2 + 1, mid, end, before, needed) orelse self.findPrefixBlock(node * 2, begin, mid, before, needed);
     }
 };
 
@@ -544,4 +586,62 @@ test "parquet sequential delta decoding shares kernels without allocating checkp
     try stream.finish();
     stream = try DeltaStream.init(&.{ 128, 1, 4, 0, 0, 1 }, 0, 64);
     try std.testing.expectError(error.InvalidParquetPage, stream.finish());
+}
+
+test "parquet compact prefix navigation bounds repeated and backward reconstruction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const count = 65536;
+    const prefixes = try a.alloc(i64, count);
+    const lengths = try a.alloc(i64, count);
+    @memset(prefixes, 7);
+    @memset(lengths, 0);
+    prefixes[0] = 0;
+    lengths[0] = 7;
+    const encoded = try std.mem.concat(a, u8, &.{ try testDelta(a, prefixes), try testDelta(a, lengths), "abcdefg" });
+    var strings = try Strings.init(a, encoded, count, true);
+    var begin: usize = 0;
+    while (begin < count) : (begin += 256) for (0..2) |_| {
+        for (begin..begin + 256) |row| try std.testing.expectEqualStrings("abcdefg", try strings.borrow(row));
+    };
+    const repeated_steps = strings.reconstruction_steps;
+    try std.testing.expect(repeated_steps < count * 8);
+    try std.testing.expectEqual(@as(usize, 0), strings.materialized.count());
+    try std.testing.expect(strings.prefix_minima.len * @sizeOf(u32) <= count / 4);
+    for (0..count) |i| try std.testing.expectEqualStrings("abcdefg", try strings.borrow(count - i - 1));
+    try std.testing.expect(strings.reconstruction_steps - repeated_steps < count * 132);
+    std.debug.print("prefix navigation: rows={} repeated_steps={} reverse_steps={} navigation_bytes={}\n", .{ count, repeated_steps, strings.reconstruction_steps - repeated_steps, strings.prefix_minima.len * @sizeOf(u32) });
+}
+
+test "parquet compact prefix navigation agrees with independently reconstructed mixed strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const count = 1025;
+    var prefixes: [count]i64 = undefined;
+    var lengths: [count]i64 = undefined;
+    var expected: [count][]const u8 = undefined;
+    var suffixes: std.ArrayList(u8) = .empty;
+    var previous: []const u8 = "";
+    for (0..count) |i| {
+        const prefix = if (i % 71 == 0) 0 else (i *% 73) % (previous.len + 1);
+        const length = if (i % 19 == 0) 0 else i % 13;
+        const value = try a.alloc(u8, prefix + length);
+        @memcpy(value[0..prefix], previous[0..prefix]);
+        for (value[prefix..], 0..) |*byte, j| byte.* = @intCast('a' + (i + j) % 26);
+        prefixes[i] = @intCast(prefix);
+        lengths[i] = @intCast(length);
+        try suffixes.appendSlice(a, value[prefix..]);
+        expected[i] = value;
+        previous = value;
+    }
+    const encoded = try std.mem.concat(a, u8, &.{ try testDelta(a, &prefixes), try testDelta(a, &lengths), suffixes.items });
+    var strings = try Strings.init(a, encoded, count, true);
+    for (0..count) |i| try std.testing.expectEqualStrings(expected[count - 1 - i], try strings.borrow(count - 1 - i));
+    for (0..count) |i| {
+        const row = i * 37 % count;
+        try std.testing.expectEqualStrings(expected[row], try strings.borrow(row));
+        if (i % 8 == 0) try std.testing.expectEqualStrings(expected[row], try strings.at(row));
+    }
 }

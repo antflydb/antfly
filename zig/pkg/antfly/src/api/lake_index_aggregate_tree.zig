@@ -217,6 +217,15 @@ pub fn merge(a: A, store: *stores.ArtifactStore, recipe: Recipe, left: Index, ri
     // descendants and rewrite only the connecting boundary, in either order.
     // Historical layouts still pass through the normal one-time upgrade.
     if (left.layout == 2 and right.layout == 2) if (try tree.joinDisjoint(a, backing, left.page.?, right.page.?)) |page| return .{ .domain = scope.domain, .layout = 2, .page = page };
+    if (left.layout == 2 and right.layout == 2) {
+        const Reducer = struct {
+            layout: *const record.Layout,
+            pub fn merge(self: @This(), scratch: A, l: []const u8, r: []const u8) ![]const u8 {
+                return record.merge(scratch, l, r, self.layout);
+            }
+        };
+        return .{ .domain = scope.domain, .layout = 2, .page = try tree.mergeSorted(a, backing, left.page.?, right.page.?, Reducer{ .layout = &layout }) };
+    }
     var builder: tree.SortedBuilder = .{ .alloc = a, .store = backing };
     defer builder.deinit();
     var lc = try tree.Cursor.init(a, backing, left.page, "", null);

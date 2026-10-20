@@ -267,13 +267,47 @@ pub const Execution = struct {
     }
     pub fn enter(self: *Execution, io: std.Io) !void {
         std.debug.assert(!self.active);
+        try self.waitAdmission(io, .cpu, 1);
+        self.active = true;
+    }
+    /// Publication buffers are covered by retained-state admission. Reserve
+    /// only I/O slots while their owner parks, including bounded upload batches.
+    pub fn beginIo(self: *Execution, io: std.Io, count: usize) !Io {
+        self.pause();
+        try self.waitAdmission(io, .io, count);
+        return .{ .execution = self, .io = io, .slots = count };
+    }
+    pub const Io = struct {
+        execution: *Execution,
+        io: std.Io,
+        slots: usize,
+        pub fn abort(self: *Io) void {
+            for (0..self.slots) |_| self.execution.scheduler.releaseClass(.io, 0);
+            self.slots = 0;
+        }
+        pub fn finish(self: *Io) !void {
+            self.abort();
+            try self.execution.enter(self.io);
+        }
+    };
+    fn acquire(self: *Execution, class: Class, count: usize) bool {
+        const scheduler = self.scheduler;
+        if (class == .cpu) return scheduler.acquireLocked(.cpu, self.bytes, true, false);
+        if (count > scheduler.max_io_workers -| scheduler.io_workers) return false;
+        for (0..count) |_| {
+            const acquired = scheduler.acquireLocked(.io, 0, false, false);
+            std.debug.assert(acquired);
+        }
+        return true;
+    }
+    fn waitAdmission(self: *Execution, io: std.Io, class: Class, count: usize) !void {
+        if (class == .io and (count == 0 or count > self.scheduler.max_io_workers)) return error.ConcurrencyUnavailable;
         var waiter: Waiter = .{ .io = io };
         const scheduler = self.scheduler;
         if (self.checkpoint) |hook| try hook.check(hook.ptr);
         scheduler.lock();
-        if (scheduler.acquireLocked(.cpu, self.bytes, true, false)) {
+        if (self.acquire(class, count)) {
             scheduler.mutex.unlock();
-            self.active = true;
             return;
         }
         waiter.next = scheduler.waiters;
@@ -290,10 +324,9 @@ pub const Execution = struct {
             if (self.checkpoint) |hook| try hook.check(hook.ptr);
             scheduler.lock();
             waiter.ready.reset();
-            const acquired = scheduler.acquireLocked(.cpu, self.bytes, true, false);
+            const acquired = self.acquire(class, count);
             scheduler.mutex.unlock();
             if (acquired) {
-                self.active = true;
                 return;
             }
             waiter.ready.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
@@ -574,4 +607,43 @@ test "SQL shared retained admission reserves required work before optional buffe
     scheduler.releasePull(2, 400);
     try std.testing.expectEqual(@as(usize, 0), scheduler.pull_workers);
     try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+}
+
+test "SQL publication IO phases release CPU retain memory and fence canceled resumption" {
+    const Check = struct {
+        canceled: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.canceled) return error.Canceled;
+        }
+    };
+    const io = std.testing.io;
+    var scheduler: Scheduler = .{ .max_workers = 1, .max_io_workers = 2, .max_bytes = 100, .max_io_bytes = 50 };
+    try std.testing.expect(scheduler.reservePull(1, 200));
+    defer scheduler.releasePull(1, 200);
+    var check: Check = .{};
+    var first: Execution = .{ .scheduler = &scheduler, .bytes = 50, .checkpoint = .{ .ptr = &check, .check = Check.check } };
+    defer first.pause();
+    try first.enter(io);
+    var pending = try first.beginIo(io, 2);
+    defer pending.abort();
+    try std.testing.expectEqual(@as(usize, 2), scheduler.io_workers);
+    try std.testing.expectEqual(@as(usize, 200), scheduler.pull_bytes);
+    // A single CPU lane remains available while the upload batch is blocked.
+    var second: Execution = .{ .scheduler = &scheduler, .bytes = 50 };
+    try second.enter(io);
+    try std.testing.expectEqual(@as(usize, 3), scheduler.workers);
+    second.pause();
+    try pending.finish();
+    try std.testing.expect(first.active);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    pending = try first.beginIo(io, 1);
+    check.canceled = true;
+    try std.testing.expectError(error.Canceled, pending.finish());
+    try std.testing.expect(!first.active);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    check.canceled = false;
+    try first.enter(io);
+    try std.testing.expectError(error.ConcurrencyUnavailable, first.beginIo(io, 3));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
 }
