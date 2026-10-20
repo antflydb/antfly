@@ -244,6 +244,7 @@ pub fn writeBlockPartsTo(writer: *std.Io.Writer, block_type: BlockType, parts: [
 pub const SliceReader = struct {
     data: []const u8,
     pos: usize,
+    max_block_bytes: usize = max_block_payload_bytes,
 
     pub fn init(data: []const u8) SliceReader {
         return .{ .data = data, .pos = 0 };
@@ -289,11 +290,19 @@ pub const SliceReader = struct {
     }
 
     pub fn readBlock(self: *SliceReader, alloc: Allocator) !Block {
+        return self.readBlockLimited(alloc, self.max_block_bytes);
+    }
+
+    /// Bound logical output before allocating it; stored bytes retain the
+    /// format's independent framing limit.
+    pub fn readBlockLimited(self: *SliceReader, alloc: Allocator, max_bytes: usize) !Block {
+        const limit = @min(max_bytes, self.max_block_bytes);
         const env = try self.readExact(6);
         const block_type: BlockType = @fromBackingInt(@intCast(env[0]));
         const flags = env[1];
         const payload_len = std.mem.readInt(u32, env[2..6], .little);
         if (payload_len > max_block_payload_bytes) return error.BackupBlockTooLarge;
+        if (flags & block_flag_compressed == 0 and payload_len > limit) return error.BackupExpansionLimitExceeded;
 
         const payload = try self.readExact(payload_len);
         const crc_bytes = try self.readExact(4);
@@ -309,7 +318,10 @@ pub const SliceReader = struct {
 
         // Decompress if needed
         if (flags & block_flag_compressed != 0) {
-            const decompressed = try decompressZstd(alloc, payload);
+            const decompressed = decompressZstdLimited(alloc, payload, limit) catch |err| switch (err) {
+                error.StreamTooLong => if (limit < max_block_payload_bytes) return error.BackupExpansionLimitExceeded else return err,
+                else => return err,
+            };
             return .{ .block_type = block_type, .payload = decompressed };
         }
 
@@ -336,6 +348,7 @@ pub const FileReader = struct {
     hasher: Blake3 = Blake3.init(.{}),
     completed_pass_fingerprint: ?Fingerprint = null,
     generation_changed: bool = false,
+    max_block_bytes: usize = max_block_payload_bytes,
 
     pub fn init(io: std.Io, file: std.Io.File, size: u64) FileReader {
         return .{ .io = io, .file = file, .size = size };
@@ -410,12 +423,20 @@ pub const FileReader = struct {
     }
 
     pub fn readBlock(self: *FileReader, alloc: Allocator) !Block {
+        return self.readBlockLimited(alloc, self.max_block_bytes);
+    }
+
+    /// Bound logical output before allocating it; stored bytes retain the
+    /// format's independent framing limit.
+    pub fn readBlockLimited(self: *FileReader, alloc: Allocator, max_bytes: usize) !Block {
+        const limit = @min(max_bytes, self.max_block_bytes);
         var env: [6]u8 = undefined;
         try self.readExact(&env);
         const block_type: BlockType = @fromBackingInt(@intCast(env[0]));
         const flags = env[1];
         const payload_len = std.mem.readInt(u32, env[2..6], .little);
         if (payload_len > max_block_payload_bytes) return error.BackupBlockTooLarge;
+        if (flags & block_flag_compressed == 0 and payload_len > limit) return error.BackupExpansionLimitExceeded;
 
         const payload = try alloc.alloc(u8, payload_len);
         errdefer alloc.free(payload);
@@ -428,7 +449,10 @@ pub const FileReader = struct {
         if (crc.final() != std.mem.readInt(u32, &crc_bytes, .little)) return error.BlockCrcMismatch;
 
         if (flags & block_flag_compressed != 0) {
-            const decompressed = try decompressZstd(alloc, payload);
+            const decompressed = decompressZstdLimited(alloc, payload, limit) catch |err| switch (err) {
+                error.StreamTooLong => if (limit < max_block_payload_bytes) return error.BackupExpansionLimitExceeded else return err,
+                else => return err,
+            };
             alloc.free(payload);
             return .{ .block_type = block_type, .payload = decompressed };
         }
@@ -441,6 +465,10 @@ pub const FileReader = struct {
 };
 
 pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
+    return decompressZstdLimited(alloc, compressed, max_block_payload_bytes);
+}
+
+pub fn decompressZstdLimited(alloc: Allocator, compressed: []const u8, max_bytes: usize) ![]u8 {
     const Reader = std.Io.Reader;
     var input = Reader.fixed(compressed);
     // The window is about 8 MiB, so keep it off the stack: embedded callers
@@ -448,7 +476,7 @@ pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
     const window_buf = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
     defer alloc.free(window_buf);
     var decomp = std.compress.zstd.Decompress.init(&input, window_buf, .{});
-    return decomp.reader.allocRemaining(alloc, .limited(max_block_payload_bytes));
+    return decomp.reader.allocRemaining(alloc, .limited(@min(max_bytes, max_block_payload_bytes)));
 }
 
 /// Count nested document expansion without retaining decoded output. Enforce the
@@ -1586,4 +1614,33 @@ test "relationship key value decoding releases truncated and failed allocations"
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, Case.decode, .{payload});
+}
+
+test "bounded block readers reject stored payload before allocation and accept exact limits" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var data: ArrayList(u8) = .empty;
+    defer data.deinit(a);
+    try writeBlock(&data, a, .document_batch, "payload");
+    var empty: [0]u8 = .{};
+    var bounded = std.heap.FixedBufferAllocator.init(&empty);
+    var slice = SliceReader.init(data.items);
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, slice.readBlockLimited(bounded.allocator(), 6));
+    slice.reset();
+    const exact = try slice.readBlockLimited(a, 7);
+    defer a.free(exact.payload);
+    try std.testing.expectEqualStrings("payload", exact.payload);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(io, "block", .{ .read = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, data.items, 0);
+    var reader = FileReader.init(io, file, data.items.len);
+    reader.max_block_bytes = 6;
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, reader.readBlock(bounded.allocator()));
+    reader = FileReader.init(io, file, data.items.len);
+    reader.max_block_bytes = 7;
+    const from_file = try reader.readBlock(a);
+    defer a.free(from_file.payload);
+    try std.testing.expectEqualStrings("payload", from_file.payload);
 }

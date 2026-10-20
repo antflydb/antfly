@@ -2268,12 +2268,16 @@ fn PortableArchiveReader(comptime RawReader: type) type {
         }
 
         pub fn readBlock(self: *Self, alloc: Allocator) !backup_codec.Block {
+            return self.readBlockLimited(alloc, backup_codec.max_block_payload_bytes);
+        }
+
+        pub fn readBlockLimited(self: *Self, alloc: Allocator, max_bytes: usize) !backup_codec.Block {
             if (self.header.format_version == backup_codec.legacy_format_version)
-                return try self.raw.readBlock(alloc);
+                return try self.raw.readBlockLimited(alloc, max_bytes);
             if (self.done) return error.EndOfStream;
 
             if (self.manifest_pending) {
-                const manifest_block = try self.raw.readBlock(alloc);
+                const manifest_block = try self.raw.readBlockLimited(alloc, max_bytes);
                 errdefer alloc.free(manifest_block.payload);
                 if (manifest_block.block_type != .bundle_manifest) return error.InvalidBackupManifest;
                 var manifest = try backup_bundle.parseManifest(alloc, manifest_block.payload);
@@ -2303,6 +2307,7 @@ fn PortableArchiveReader(comptime RawReader: type) type {
             const manifest = &(self.manifest orelse return error.InvalidBackupManifest).value;
             if (self.next_ordinal >= manifest.objects.len) return error.IncompleteBackupInventory;
             const descriptor = manifest.objects[self.next_ordinal];
+            if (descriptor.size_bytes > max_bytes) return error.BackupExpansionLimitExceeded;
             const blob_index = backup_bundle.blobIndex(manifest.blobs, descriptor.sha256) orelse
                 return error.IncompleteBackupInventory;
             try self.ensureIndex(alloc);
@@ -2936,6 +2941,7 @@ pub fn inspectPortableFileBlocks(
     if (initial_stat.kind != .file) return error.InvalidBackupRequest;
     if (initial_stat.size > options.max_input_bytes) return error.BackupInputLimitExceeded;
     var raw = backup_codec.FileReader.init(io, file, initial_stat.size);
+    raw.max_block_bytes = std.math.cast(usize, options.max_logical_bytes) orelse std.math.maxInt(usize);
     var reader: InspectionReader = .{
         .inner = try PortableArchiveReader(backup_codec.FileReader).init(&raw),
         .options = options,
@@ -2986,7 +2992,8 @@ const InspectionReader = struct {
 
     fn readBlock(self: *@This(), alloc: Allocator) !backup_codec.Block {
         try self.options.cancellation.check();
-        const block = try self.inner.readBlock(alloc);
+        const remaining_bytes = std.math.cast(usize, self.options.max_logical_bytes -| self.logical_bytes) orelse std.math.maxInt(usize);
+        const block = try self.inner.readBlockLimited(alloc, remaining_bytes);
         errdefer alloc.free(block.payload);
         if (block.payload.len > self.options.max_logical_bytes -| self.logical_bytes)
             return error.BackupExpansionLimitExceeded;

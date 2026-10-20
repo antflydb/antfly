@@ -668,7 +668,7 @@ pub const Inspector = struct {
                 }
             } else if (eq(key, "connection") or eq(key, "credential") or eq(key, "credential_name") or eq(key, "credentials") or eq(key, "connection_id") or eq(key, "connection_name")) {
                 if (v == .string and v.string.len > 0) try self.report.add(self.options, .connection, v.string, "", key, 0);
-            } else if (eq(key, "api_key") or eq(key, "api_token") or eq(key, "password") or eq(key, "authorization") or eq(key, "headers")) {
+            } else if (@import("../../common/credential_safety.zig").fieldNameIsSensitive(key) or eq(key, "headers")) {
                 if (v != .null and (v != .string or v.string.len > 0)) {
                     const binding = try canonical.canonicalJsonValueAlloc(self.allocator, v);
                     defer self.allocator.free(binding);
@@ -1915,5 +1915,52 @@ test "backup preflight whitespace control matches runtime" {
         defer a.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"verdict\":\"blocked\"") != null);
         try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
+    }
+}
+
+test "backup preflight reader credential aliases require separate destination evidence" {
+    const a = std.testing.allocator;
+    inline for (.{ "api_key", "bearer_token", "capability_token" }) |field_name| {
+        const producer = try std.fmt.allocPrint(a, "{{\"type\":\"reader\",\"config\":{{\"provider\":\"antfly\",\"model\":\"mock\",\"api_url\":\"https://inference.example\",\"{s}\":\"TEST_TOKEN\"}}}}", .{field_name});
+        defer a.free(producer);
+        const parsed_producer = try std.json.parseFromSlice(Value, a, producer, .{});
+        defer parsed_producer.deinit();
+        const runtime_config = try std.json.parseFromValue(@import("antfly_readers").Config, a, get(parsed_producer.value, "config"), .{});
+        defer runtime_config.deinit();
+        try runtime_config.value.validate();
+        try std.testing.expectEqualStrings("TEST_TOKEN", @field(runtime_config.value, field_name).?);
+        try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "read", .kind = .asset, .field = "image", .producer_json = producer });
+        const metadata = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "read", .kind = .asset, .source_field = "image", .producer_json = producer }});
+        defer a.free(metadata);
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", "{\"image\":\"data:image/png;base64,YQ==\"}", "");
+        try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
+        var caps: std.ArrayListUnmanaged(Capability) = .empty;
+        defer caps.deinit(a);
+        for (report.requirements.items) |*r| if (r.kind != .connection) {
+            try caps.append(a, .{ .requirement_sha256 = &r.sha256, .supported = true, .future_ingestion = true, .model_revision_verified = true });
+        };
+        const missing = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "no-credentials", .requirements = caps.items }, .{});
+        defer a.free(missing);
+        const unknown = try report.jsonAlloc(missing);
+        defer a.free(unknown);
+        try std.testing.expect(std.mem.indexOf(u8, unknown, "\"compatibility\":{\"verdict\":\"unknown\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, unknown, "TEST_TOKEN") == null);
+        for (report.requirements.items) |*r| if (r.kind == .connection) {
+            try caps.append(a, .{ .requirement_sha256 = &r.sha256, .supported = true });
+        };
+        const supplied = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "with-credentials", .requirements = caps.items }, .{});
+        defer a.free(supplied);
+        const verified = try report.jsonAlloc(supplied);
+        defer a.free(verified);
+        try std.testing.expect(std.mem.indexOf(u8, verified, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+        caps.items[caps.items.len - 1].supported = false;
+        for (report.requirements.items) |*r| if (r.kind == .connection) {
+            try std.testing.expectEqual(Verdict.blocked, evaluate(r, .{ .version = 1, .configuration_id = "revoked", .requirements = caps.items }).verdict);
+        };
     }
 }

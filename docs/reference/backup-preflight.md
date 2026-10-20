@@ -43,10 +43,16 @@ The default library limits are 64 GiB input, 128 GiB scratch/expansion admission
 4,096 selectors and requirement groups, 16 MiB retained selector bytes, 64 MiB
 per materialized document, and 32 total examples (at most four per group).
 The expansion budget includes per-document compression inside decoded portable
-blocks and is checked before dependency callbacks. Exceeding a limit produces an
-incomplete report. Examples identify affected fields and document IDs; unsafe/long identifiers become `sha256:...` labels.
+blocks and is checked before dependency callbacks. Block readers enforce the
+remaining output budget while decompressing, rather than materializing an
+over-budget block first. Exceeding a limit produces an incomplete report. Examples
+identify affected fields and document IDs; unsafe/long identifiers become
+`sha256:...` labels.
 Source URLs, query strings, passwords, producer configuration and credentials
-are never emitted. Digests are identity bindings, not encrypted secret storage.
+are never emitted. Credential inventory uses the shared credential-field
+policy, including bearer and capability tokens, and requires separate destination
+evidence in addition to endpoint and model evidence. Digests are identity
+bindings, not encrypted secret storage.
 
 The inspector uses the restore format readers and schema decoders. It validates
 all portable records, primes metadata before visiting rows, and decodes
