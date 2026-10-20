@@ -18674,9 +18674,11 @@ const ValueExecution = struct {
     producers: std.ArrayListUnmanaged(*ValueProducer) = .empty,
     local_work: value_query.Work = .{},
     literals: ?value_query.LiteralSet = null,
+    fused_known: ?roaring.RoaringBitmap = null,
     literals_checked: bool = false,
     fn deinit(self: *@This()) void {
         if (self.literals) |*set| set.deinit();
+        if (self.fused_known) |*known| known.deinit();
         for (self.producers.items) |producer| {
             producer.matcher.deinit();
             producer.visited.deinit();
@@ -18700,6 +18702,7 @@ const ValueExecution = struct {
         }
         // This is optional admission, not a new failure mode for valid queries.
         self.literals = value_query.LiteralSet.init(@import("../../../sql/memory_budget.zig").reclaimingAllocator(self.a), needles[0..producers.len]) catch return;
+        self.fused_known = roaring.RoaringBitmap.init(self.a);
     }
     fn matchSource(self: *@This(), producer: *ValueProducer, global: u32, doc: std.json.Value) !bool {
         if (self.literals) |*set| {
@@ -18709,9 +18712,15 @@ const ValueExecution = struct {
                 error.ValueSearchLimitExceeded => return producer.matcher.document(doc),
                 else => return err,
             };
-            for (self.producers.items, 0..) |leaf, i| {
-                try leaf.visited.add(global);
-                if (bits & (@as(u64, 1) << @as(u6, @intCast(i))) != 0) try leaf.matched.add(global);
+            // One coverage set represents negative knowledge for the group.
+            // Sparse matches retain only their own positive leaf IDs, avoiding
+            // clauses × union-candidates bitmap growth on broad miss workloads.
+            try self.fused_known.?.add(global);
+            var remaining = bits;
+            while (remaining != 0) {
+                const i: usize = @intCast(@ctz(remaining));
+                try self.producers.items[i].matched.add(global);
+                remaining &= remaining - 1;
             }
             return producer.matched.contains(global);
         }
@@ -18761,7 +18770,9 @@ const ValueExecution = struct {
         try self.producers.append(self.a, producer);
         (self.req.value_search_work orelse &self.local_work).registerLeaf();
         if (self.literals) |*set| set.deinit();
+        if (self.fused_known) |*known| known.deinit();
         self.literals = null;
+        self.fused_known = null;
         self.literals_checked = false;
         return .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = producer, .produce = ValueProducer.produce }, .boost = spec.boost } };
     }
@@ -18856,7 +18867,7 @@ const ValueProducer = struct {
             if (local >= count) return error.InvalidArgument;
             if (deleted) |*tombstones| if (tombstones.contains(local)) continue;
             const global = offset + local;
-            if (self.visited.contains(global)) {
+            if (self.visited.contains(global) or (if (owner.fused_known) |*known| known.contains(global) else false)) {
                 const yes = self.matched.contains(global);
                 if (yes) try result.add(local);
                 // Fusion can establish this leaf while another leaf is being
@@ -18898,7 +18909,7 @@ const ValueProducer = struct {
                 if (matched) try facts.matched.add(local);
                 changed = true;
             }
-            try self.visited.add(global);
+            if (!(if (owner.fused_known) |*known| known.contains(global) else false)) try self.visited.add(global);
             if (matched) {
                 try self.matched.add(global);
                 try result.add(local);

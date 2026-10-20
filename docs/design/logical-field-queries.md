@@ -100,7 +100,9 @@ index representations out of client configuration.
 Three to 64 compatible case-sensitive `contains` leaves on the same source field
 can use a bounded multi-output byte automaton. It scans each source string once
 and retains each leaf's identity, boolean membership and boost, including
-independent matches across array elements. Construction admits at most 1 MiB of
+independent matches across array elements. The group shares one coverage bitmap;
+only positive matches are stored per leaf, so negative knowledge does not grow
+as clauses multiplied by the union of candidates. Construction admits at most 1 MiB of
 transition storage; larger or incompatible groups use ordinary matchers. Eager
 traversal that reaches a source limit falls back to the requested leaf, preserving
 its existing early-match behavior.
