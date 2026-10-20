@@ -437,6 +437,20 @@ pub const PreparedEffects = struct {
     }
 };
 
+/// Accepted effects and the exact owned input revision used to validate their
+/// contract. Resolution must consume this batch rather than recollecting inputs
+/// after validation. The caller retains apply/catalog/route ownership separately.
+pub const PreparedResolutionInputs = struct {
+    effects: PreparedEffects,
+    inputs: PreparedIntentSnapshot,
+
+    pub fn deinit(self: *@This()) void {
+        self.effects.deinit();
+        self.inputs.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const ReplicationOutboxKind = enum { batch, replay };
 
 pub const ReplayAppend = struct {
@@ -1726,6 +1740,15 @@ pub const TxnManager = struct {
     /// materialization scratch. This load does not invoke a producer or infer
     /// its mode from the retry's acknowledgement level.
     pub fn loadPreparedEffects(self: *TxnManager, alloc: Allocator, txn_id: TxnId, original: ?read_control.Port) !?PreparedEffects {
+        var captured = (try self.loadPreparedEffectsWithInputs(alloc, txn_id, original)) orelse return null;
+        defer captured.inputs.deinit();
+        return captured.effects;
+    }
+
+    /// Caller holds the external apply fence while capturing. Both owners
+    /// survive that short fence and feed the canonical request construction;
+    /// final publication still revalidates the revision/catalog contract.
+    pub fn loadPreparedEffectsWithInputs(self: *TxnManager, alloc: Allocator, txn_id: TxnId, original: ?read_control.Port) !?PreparedResolutionInputs {
         var trace: MutationAdmissionTrace = .{};
         const result = self.loadPreparedEffectsInner(alloc, txn_id, trace.bind(original)) catch |err| return trace.failure orelse err;
         if (trace.failure) |cause| {
@@ -1738,7 +1761,7 @@ pub const TxnManager = struct {
         return result;
     }
 
-    fn loadPreparedEffectsInner(self: *TxnManager, alloc: Allocator, txn_id: TxnId, control: ?read_control.Port) !?PreparedEffects {
+    fn loadPreparedEffectsInner(self: *TxnManager, alloc: Allocator, txn_id: TxnId, control: ?read_control.Port) !?PreparedResolutionInputs {
         const key = makePreparedEffectsKey(txn_id);
         const raw = self.getAllocWithAdmission(alloc, &key, control) catch |err| switch (err) {
             error.NotFound => return null,
@@ -1747,8 +1770,9 @@ pub const TxnManager = struct {
         defer alloc.free(raw);
         const inspection = try prepared_effects.inspect(raw, control);
         if (try self.loadPreparationRequirementInner(txn_id, control)) |required| if (required.mode != inspection.contract.mode) return error.PreparationContractConflict;
-        const expected = try self.preparedEffectsContractInner(txn_id, inspection.contract.catalog_digest, inspection.contract.mode, control);
-        return .{ .decoded = try prepared_effects.decode(alloc, raw, expected, control), .fingerprint = inspection.fingerprint };
+        var inputs = try self.capturePreparedIntentsInner(alloc, txn_id, inspection.contract.catalog_digest, inspection.contract.mode, control);
+        errdefer inputs.deinit();
+        return .{ .effects = .{ .decoded = try prepared_effects.decode(alloc, raw, inputs.contract, control), .fingerprint = inspection.fingerprint }, .inputs = inputs };
     }
 
     pub fn collectIntentBatch(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !IntentBatch {
@@ -7620,4 +7644,97 @@ test "prepared transaction effects snapshot refuses terminal decisions and confl
     record.status = .aborted;
     try manager.saveTransactionRecord(makeRecordKey(id), record);
     try std.testing.expectError(error.DecisionConflict, manager.capturePreparedIntents(no_allocations.allocator(), id, @splat(2), .synchronous, null));
+}
+
+test "prepared transaction effects paired resolution retains validated inputs after backend close" {
+    const a = std.testing.allocator;
+    const id: TxnId = @splat(154);
+    var captured: PreparedResolutionInputs = blk: {
+        var backend = mem_backend.Backend.init(a, .{});
+        defer backend.close();
+        var runtime = try backend.runtimeStore(a, .{});
+        defer runtime.deinit();
+        var manager = try TxnManager.init(a, &runtime);
+        defer manager.deinit();
+        try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+        try manager.writeIntentsExtraBatch(id, &.{
+            .{ .key = "row", .value = "original", .prepared_row = "schema-bound-row" },
+            .{ .key = "removed", .value = null },
+        }, &.{}, .{ .schema_binding = .{ .version = 21 } });
+        const contract = try manager.preparedEffectsContract(id, @splat(4), .synchronous, null);
+        const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{
+            .artifact_writes = @constCast(&[_]@import("db/types.zig").BatchWrite{.{ .key = "accepted-key", .value = "accepted-value" }}),
+        } }, null);
+        defer a.free(frame);
+        try manager.sealPreparedEffects(id, frame, @splat(4), .synchronous, null);
+        // Recovery after the decision still owns the original inputs; it must
+        // not use the producer-only capture which rejects terminal decisions.
+        var record = try manager.loadTransactionRecord(id);
+        record.status = .committed;
+        record.commit_version = 2;
+        try manager.saveTransactionRecord(makeRecordKey(id), record);
+        const owned = (try manager.loadPreparedEffectsWithInputs(a, id, null)).?;
+        try std.testing.expectEqualDeep(contract, owned.inputs.contract);
+        try std.testing.expectEqualDeep(contract, owned.effects.decoded.plan.contract);
+        break :blk owned;
+    };
+    defer captured.deinit();
+    try std.testing.expectEqualStrings("original", captured.inputs.batch.writes[0].value);
+    try std.testing.expectEqualStrings("schema-bound-row", captured.inputs.batch.prepared_rows[0].?);
+    try std.testing.expectEqualStrings("removed", captured.inputs.batch.deletes[0]);
+    try std.testing.expectEqualStrings("accepted-value", captured.effects.decoded.plan.effects.artifact_writes[0].value);
+}
+
+test "prepared transaction effects paired resolution unwinds allocations and every original rejection" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(155);
+    try manager.initTransaction(id, 1);
+    try manager.writeIntents(id, &.{.{ .key = "row", .value = "original" }}, &.{});
+    const contract = try manager.preparedEffectsContract(id, @splat(4), .deferred, null);
+    const frame = try prepared_effects.encode(a, .{ .contract = contract, .effects = .{} }, null);
+    defer a.free(frame);
+    try manager.sealPreparedEffects(id, frame, @splat(4), .deferred, null);
+    const Checks = struct {
+        count: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        cause: anyerror = error.DeadlineExceeded,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            if (self.count == self.stop) return self.cause;
+        }
+        fn capture(alloc: Allocator, mgr: *TxnManager, txn_id: TxnId) !void {
+            var owned = (try mgr.loadPreparedEffectsWithInputs(alloc, txn_id, null)).?;
+            defer owned.deinit();
+            try std.testing.expectEqualDeep(owned.inputs.contract, owned.effects.decoded.plan.contract);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Checks.capture, .{ &manager, id });
+    var checks: Checks = .{};
+    var payload: read_control.Payload = .{ .ptr = &checks, .vtable = &.{ .checkpoint = Checks.check } };
+    var complete = (try manager.loadPreparedEffectsWithInputs(a, id, read_control.Port.init(&payload))).?;
+    complete.deinit();
+    const checkpoints = checks.count;
+    try std.testing.expect(checkpoints > 8);
+    for ([_]anyerror{ error.DeadlineExceeded, error.NotFound }) |cause| {
+        for (1..checkpoints + 1) |stop| {
+            checks = .{ .stop = stop, .cause = cause };
+            try std.testing.expectError(cause, manager.loadPreparedEffectsWithInputs(a, id, read_control.Port.init(&payload)));
+            try std.testing.expectEqual(stop, checks.count);
+        }
+    }
+    try Checks.capture(a, &manager, id);
+    // The decoder must reject an intent contract mismatch rather than pair a
+    // newly collected revision with the old accepted effect slab.
+    var record = try manager.loadTransactionRecord(id);
+    record.intent_revision += 1;
+    try manager.saveTransactionRecord(makeRecordKey(id), record);
+    try std.testing.expectError(error.PreparedEffectsMismatch, manager.loadPreparedEffectsWithInputs(a, id, null));
+    try std.testing.expect(try manager.hasPreparedEffects(id));
 }

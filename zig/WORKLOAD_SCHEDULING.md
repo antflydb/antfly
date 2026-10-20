@@ -803,3 +803,36 @@ allocation failures and original checkpoints, and refuse terminal/mode conflicts
 before allocating an input snapshot. Opaque seals are also rejected. Full Linux
 qualification remains waived; this run does not requalify public source packaging
 or the full storage archive.
+
+
+### Resolution consumes the validated input owner
+
+Accepted-effect resolution now retains `PreparedResolutionInputs`: the decoded
+accepted effects and the exact `PreparedIntentSnapshot` used to validate their
+contract. The DB resolver builds its writes, deletes, durable relational-row map,
+known intent keys and expected revision from that retained batch. It no longer
+validates against one snapshot and collects a second input batch for application.
+Legacy transactions retain their existing collection path. The convenience
+`loadPreparedEffects` API uses the same validation and releases only the input
+owner before returning its independently owned decoded effects.
+
+The paired load is captured under the existing apply fence and retains both
+allocator-owned inputs across staging. Final revision/catalog/fingerprint checks
+remain in force; a durable COMMIT awaiting application uses this recovery path
+without reopening producer admission. No ABI, reader version or durable format
+changes are introduced. The new tests cover ownership after backend close,
+allocation failures, every enumerated original checkpoint (including NotFound),
+contract mismatch, and relational update/delete plus accepted output across
+restart and idempotent retry. The protocol cancellation matrix now distinguishes
+an injected rejection from an ordinal not reached by a shorter lock-wait path;
+all actually injected rejections must retain their original identity.
+
+`prepared-resolution-inputs-v3.json` and its raw log record 103 test executions
+across prepared effects, required DB preparation and canonical replay encoding:
+79/79 build steps, zero skips, failures or leaks. This establishes the resolution
+input handoff, not predecision capture of every auxiliary/group physical and
+replay mutation. Complete request preparation under retained schema/catalog/route
+leases, atomic replay grants, derived-log quota and executable recovery bundles
+remain required before normal PREPARE driver activation. The full scheduling
+objective remains incomplete. Full Linux qualification is waived; public source
+packaging and the full storage archive were not requalified by this run.

@@ -125675,7 +125675,17 @@ test "db prepared transaction effects required protocol preserves every admissio
             for (0..baseline.calls) |fail_at| {
                 var control: Control = .{ .fail_at = fail_at, .rejection = rejection };
                 const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
-                try std.testing.expectError(rejection, db.core.requirePreparedTransactionProtocol(.init(&payload)));
+                const attempt = db.core.requirePreparedTransactionProtocol(.init(&payload));
+                // Import/payload policy locks may add checkpoints to the
+                // baseline. An uncontended retry can finish before that ordinal;
+                // only a reached injection must replace the semantic result.
+                if (control.calls > fail_at) {
+                    try std.testing.expectError(rejection, attempt);
+                } else if (enabled) {
+                    try attempt;
+                } else {
+                    try std.testing.expectError(error.PreparedTransactionProtocolDisabled, attempt);
+                }
             }
         }
     }
@@ -144961,4 +144971,53 @@ test "db prepared transaction effects required captures producer bytes with the 
         try db.core.sealPreparedTransactionEffects(id, frame, .deferred, null);
     }
     try db.resolveTransactionIntents(id, .aborted, 2);
+}
+
+test "db prepared transaction effects required paired resolution preserves canonical rows and deletes after reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("prepared-paired-relational");
+    defer directory.cleanup();
+    const id: types.TxnId = @splat(0xf4);
+    const artifact = try internal_keys.artifactNamedPrefixAlloc(a, "row", "asset", "accepted");
+    defer a.free(artifact);
+    var row_digest: [32]u8 = undefined;
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const columns = [_]schema_mod.RelationalColumn{.{ .name = "body", .path = "body", .column_type = .string }};
+        try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+        try db.enablePreparedTransactionProtocol();
+        try db.batch(.{ .writes = &.{.{ .key = "removed", .value = "{\"body\":\"old\"}" }} });
+        {
+            db.core.lockApply();
+            defer db.core.unlockApply();
+            _ = try db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .deferred }, .{}, null);
+        }
+        try db.writeTransaction(id, .{ .writes = &.{.{ .key = "row", .value = "{\"body\":\"prepared\"}" }}, .deletes = &.{"removed"} });
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        var snapshot = try db.core.capturePreparedTransactionInputs(a, id, .deferred, null);
+        defer snapshot.deinit();
+        row_digest = try relational_row_codec.rowSemanticHash(snapshot.batch.prepared_rows[0].?);
+        const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = snapshot.contract, .effects = .{
+            .artifact_writes = @constCast(&[_]types.BatchWrite{.{ .key = artifact, .value = "accepted-output" }}),
+        } }, null);
+        defer a.free(frame);
+        try db.core.sealPreparedTransactionEffects(id, frame, .deferred, null);
+    }
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 2, .propose);
+    const physical_row = try internal_keys.relationalRowKeyAlloc(a, "row");
+    defer a.free(physical_row);
+    const row = try db.core.store.get(a, physical_row);
+    defer a.free(row);
+    try std.testing.expectEqualDeep(row_digest, try relational_row_codec.rowSemanticHash(row));
+    try std.testing.expect((try db.get(a, "removed")) == null);
+    const output = try db.core.store.get(a, artifact);
+    defer a.free(output);
+    try std.testing.expectEqualStrings("accepted-output", output);
+    const next_sequence = db.core.nextDerivedAppendSequence();
+    try db.resolveTransactionIntentsWithSyncLevel(id, .committed, 99, .propose);
+    try std.testing.expectEqual(next_sequence, db.core.nextDerivedAppendSequence());
 }

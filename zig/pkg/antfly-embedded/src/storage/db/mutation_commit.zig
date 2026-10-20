@@ -4394,20 +4394,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             while (attempts < 8) : (attempts += 1) {
                 try admission.checkLifetime(retained);
                 const schema_namespace = S.ownerField(self, "core").*.schemaNamespaceGeneration();
-                var accepted: ?transactions_mod.PreparedEffects = blk: {
+                var prepared_inputs: ?transactions_mod.PreparedResolutionInputs = blk: {
                     try admission.lockApplyForCompletion(self, retained);
                     defer S.ownerField(self, "core").*.unlockApply();
                     var manager = try S.ownerField(self, "core").*.initTxnManager();
                     defer manager.deinit();
                     // Preserve authoritative terminal conflict priority.
                     if (try manager.getTransactionStatusWithAdmission(txn_id, collection_control) == .aborted) return transactions_mod.TxnError.DecisionConflict;
-                    const result = try manager.loadPreparedEffects(alloc, txn_id, collection_control);
+                    const result = try manager.loadPreparedEffectsWithInputs(alloc, txn_id, collection_control);
                     if (result == null and (try manager.loadPreparationRequirement(txn_id, collection_control)) != null) return error.PreparedEffectsRequired;
                     break :blk result;
                 };
-                defer if (accepted) |*plan| plan.deinit();
-                var intents = try S.ownerField(self, "core").*.collectTransactionIntentBatchWithAdmission(alloc, txn_id, collection_control);
-                defer intents.deinit(alloc);
+                defer if (prepared_inputs) |*plan| plan.deinit();
+                const accepted: ?*const transactions_mod.PreparedEffects = if (prepared_inputs) |*plan| &plan.effects else null;
+                var legacy_intents: transactions_mod.IntentBatch = .{};
+                defer legacy_intents.deinit(alloc);
+                // Accepted effects and application input share the same owned
+                // witness. Only legacy transactions collect a separate batch.
+                const intents = if (prepared_inputs) |*plan| &plan.inputs.batch else blk: {
+                    legacy_intents = try S.ownerField(self, "core").*.collectTransactionIntentBatchWithAdmission(alloc, txn_id, collection_control);
+                    break :blk &legacy_intents;
+                };
                 try admission.checkLifetime(retained);
                 const intent_keys = try alloc.alloc([]const u8, intents.writes.len + intents.deletes.len);
                 defer alloc.free(intent_keys);
@@ -4487,7 +4494,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .ordered_apply_receipt = ordered_receipt,
                     .durable_rows = &durable_rows,
                     .transaction_resolution = .{
-                        .accepted_effects = if (accepted) |*plan| plan else null,
+                        .accepted_effects = accepted,
                         .txn_id = txn_id,
                         .status = status,
                         .commit_version = commit_version,
