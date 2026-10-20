@@ -37,6 +37,7 @@ pub const api_local_query_contract = @import("api/query_execution_contract.zig")
 pub const api_local_table_writes = @import("api/table_writes.zig");
 pub const api_local_tables = @import("api/tables.zig");
 pub const api_local_transaction_contract = @import("api/transaction_contract.zig");
+pub const api_prepared_transaction_protocol = @import("api/prepared_transaction_protocol.zig");
 pub const api_local_write_contract = @import("api/write_contract.zig");
 pub const api_local_write_test_hooks = @import("api/write_test_hooks.zig");
 pub const api_operation = @import("api/operation.zig");

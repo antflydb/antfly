@@ -69,7 +69,8 @@ const builtin = @import("builtin");
 // the combined native contract, beyond either pre-merge owner layout.
 // DocStore transactions and catalog publishers carry revision witnesses.
 // Reject earlier layouts before reading mutation flags or publication stamps.
-pub const abi_version: u32 = 35;
+// Participant workers carry negotiated preparation and seal callbacks.
+pub const abi_version: u32 = 36;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

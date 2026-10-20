@@ -7044,7 +7044,12 @@ test "distributed txn SQL range guards survive durability and savepoint rollback
             try std.testing.expect(std.mem.indexOf(u8, public, "range_guards") == null);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    // Reallocation can succeed in place depending on the backing heap's
+    // current layout. Force growth/shrink to allocate so failure enumeration
+    // visits a deterministic set of allocation points on every invocation.
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Case.run, .{});
+    try std.testing.expectEqual(stable.allocated_bytes, stable.freed_bytes);
 }
 
 test "distributed txn SQL conflict guards retain first native observation through clone and durable round trip" {

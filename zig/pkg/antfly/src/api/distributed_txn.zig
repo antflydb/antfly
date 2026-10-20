@@ -42,6 +42,8 @@ const table_participant_v3_prefix = @import("antfly_local_sources").api_local_tr
 
 pub const group_participant_marker = @import("antfly_local_sources").api_local_transaction_contract.group_participant_marker;
 
+pub const preparation_protocol = @import("antfly_local_sources").api_prepared_transaction_protocol;
+
 pub const TxnBeginRequest = struct {
     txn_id: db_mod.types.TxnId,
     begin_timestamp: u64,
@@ -216,17 +218,25 @@ pub const ParticipantWorker = struct {
     /// One call-local worker authority. Parallel tasks replace this with their
     /// independent child token; the original coordinator is never shared.
     execution_runnable: ?runnable_abi.Borrowed = null,
+    preparation: ?preparation_protocol.Requirement = null,
+    preparation_context: PreDecisionContext = .{},
 
     fn checkExecution(self: ParticipantWorker) !void {
         if (self.execution_runnable) |borrow| try borrow.checkLifetime();
     }
 
     fn supportsIndependent(self: ParticipantWorker) bool {
+        if (self.preparation != null) return self.vtable.required_begin_group != null and self.vtable.required_prepare_group != null and self.vtable.resolve_group_with_execution != null;
         return self.vtable.begin_group_with_execution != null and self.vtable.prepare_group_with_execution != null and
             self.vtable.resolve_group_with_execution != null;
     }
 
     pub const VTable = struct {
+        preparation_capabilities: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, PreDecisionContext, ?runnable_abi.Borrowed) anyerror!preparation_protocol.Capabilities = null,
+        required_begin_group: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnBeginRequest, preparation_protocol.Requirement, PreDecisionContext, ?runnable_abi.Borrowed) anyerror!void = null,
+        required_prepare_group: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnPrepareRequest, preparation_protocol.Requirement, PreDecisionContext, ?runnable_abi.Borrowed) anyerror!void = null,
+        seal_group: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, preparation_protocol.SealRequest, PreDecisionContext, ?runnable_abi.Borrowed) anyerror!preparation_protocol.SealReceipt = null,
+        preparation_status_group: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnStatusRequest, u64, ?runnable_abi.Borrowed) anyerror!PreparationDecision = null,
         status_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnStatusRequest, ?u64, runnable_abi.Borrowed) anyerror!db_mod.types.TxnStatus = null,
         resolve_group_until_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnResolveRequest, u64, runnable_abi.Borrowed) anyerror!void = null,
         acknowledge_group_with_execution: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, TxnAcknowledgeRequest, runnable_abi.Borrowed) anyerror!void = null,
@@ -301,8 +311,62 @@ pub const ParticipantWorker = struct {
         ) anyerror!db_mod.types.TxnStatus = null,
     };
 
+    pub const PreparationDecision = struct { status: db_mod.types.TxnStatus, requirement: ?preparation_protocol.Requirement };
+
+    fn forPreparationParticipant(self: ParticipantWorker, participant: *const ParticipantTxn) ParticipantWorker {
+        var worker = self;
+        if (worker.preparation != null) {
+            worker.preparation_context.restore_staging_scope = participant.restore_staging_scope;
+            worker.preparation_context.restore_staging_plan_id = participant.restore_staging_plan_id;
+            worker.preparation_context.route_fence = participant.route_fence;
+        }
+        return worker;
+    }
+
+    fn preparationContext(self: ParticipantWorker) PreDecisionContext {
+        var context = self.preparation_context;
+        context.execution_runnable = self.execution_runnable;
+        return context;
+    }
+
+    fn negotiatePreparation(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8) !void {
+        try self.checkExecution();
+        const requirement = self.preparation orelse return error.InvalidPreparationRequirement;
+        if (self.vtable.required_begin_group == null or self.vtable.required_prepare_group == null or self.vtable.seal_group == null or self.vtable.preparation_status_group == null) return error.PreparedTransactionProtocolUnavailable;
+        if (self.execution_runnable != null and (self.vtable.resolve_group_with_execution == null or self.vtable.resolve_group_until_with_execution == null)) return error.PreparedTransactionProtocolUnavailable;
+        const callback = self.vtable.preparation_capabilities orelse return error.PreparedTransactionProtocolUnavailable;
+        const capabilities = try callback(self.ptr, alloc, group_id, table_name, self.preparationContext(), self.preparationContext().execution_runnable);
+        try self.checkExecution();
+        try capabilities.require(requirement);
+    }
+
+    fn statusForPreparation(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TxnStatusRequest, deadline: u64) !db_mod.types.TxnStatus {
+        const requirement = self.preparation orelse return self.statusGroupWithRequest(alloc, group_id, table_name, request, deadline);
+        try self.checkExecution();
+        const callback = self.vtable.preparation_status_group orelse return error.PreparedTransactionProtocolUnavailable;
+        const decision = try callback(self.ptr, alloc, group_id, table_name, request, deadline, self.preparationContext().execution_runnable);
+        try self.checkExecution();
+        // An abort remains terminal even after its preparation sidecar retires.
+        if (decision.status == .aborted) return .aborted;
+        const accepted = decision.requirement orelse return error.PreparationRequirementMismatch;
+        if (accepted.mode != requirement.mode) return error.PreparationRequirementMismatch;
+        return decision.status;
+    }
+
+    fn sealGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: preparation_protocol.SealRequest) !void {
+        try self.checkExecution();
+        const callback = self.vtable.seal_group orelse return error.PreparedTransactionProtocolUnavailable;
+        const receipt = try callback(self.ptr, alloc, group_id, table_name, request, self.preparationContext(), self.preparationContext().execution_runnable);
+        try self.checkExecution();
+        try receipt.validate(request);
+    }
+
     pub fn beginGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
         try self.checkExecution();
+        if (self.preparation) |requirement| {
+            const callback = self.vtable.required_begin_group orelse return error.PreparedTransactionProtocolUnavailable;
+            return callback(self.ptr, alloc, group_id, table_name, req, requirement, self.preparationContext(), self.preparationContext().execution_runnable);
+        }
         if (self.execution_runnable) |borrow| {
             const callback = self.vtable.begin_group_with_execution orelse return error.UnsupportedOperation;
             return callback(self.ptr, alloc, group_id, table_name, req, borrow);
@@ -313,6 +377,10 @@ pub const ParticipantWorker = struct {
 
     pub fn prepareGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
         try self.checkExecution();
+        if (self.preparation) |requirement| {
+            const callback = self.vtable.required_prepare_group orelse return error.PreparedTransactionProtocolUnavailable;
+            return callback(self.ptr, alloc, group_id, table_name, req, requirement, self.preparationContext(), self.preparationContext().execution_runnable);
+        }
         if (self.execution_runnable) |borrow| {
             const callback = self.vtable.prepare_group_with_execution orelse return error.UnsupportedOperation;
             return callback(self.ptr, alloc, group_id, table_name, req, borrow);
@@ -1457,6 +1525,11 @@ test "distributed txn local participant prepare preserves the guarded catalog ro
 pub const ExecuteResult = contract.ExecuteResult;
 
 pub const ExecuteOptions = struct {
+    /// Internal opt-in only. Production entry points must establish migration,
+    /// participant readiness and producer support before selecting this policy.
+    // Derive once from the original request with forSyncLevel, then retain it
+    // independently of later acknowledgement/visibility levels.
+    preparation_requirement: ?preparation_protocol.Requirement = null,
     /// Preserve the terminal coordinator decision for an externally supplied
     /// transaction ID's retry window.
     retain_terminal: bool = false,
@@ -1687,6 +1760,13 @@ fn executeMultiTableCommitOnce(
 ) !CommitOutcome {
     var options = requested_options;
     var worker = original_worker;
+    worker.preparation = options.preparation_requirement;
+    worker.preparation_context = options.pre_decision_context;
+    worker.preparation_context.execution_runnable = null;
+    if (worker.preparation != null) {
+        if (worker.execution_runnable == null) worker.execution_runnable = options.pre_decision_context.execution_runnable;
+        try worker.checkExecution();
+    }
     options.independent_participants = false;
     options.participant_owners = null;
     options.reusable_participants = false;
@@ -1789,6 +1869,29 @@ fn executeMultiTableCommitOnce(
         }
         for (participants.items) |*participant| {
             if (!std.mem.eql(u8, participant.table_name, table.table_name)) continue;
+            if (worker.preparation != null) {
+                // Required preparation needs a pinned routing capability; an
+                // administrative snapshot cannot manufacture its revision.
+                if (catalog.vtable.route_fence == null or catalog.vtable.route_identity == null) return error.PreparedTransactionProtocolUnavailable;
+                try routing_budget.checkpoint();
+                var routes = try table_catalog.routedGroupsSnapshotUntil(alloc, catalog, table.table_name, &.{participant.group_id}, catalog.deadlineFrom(routing_budget));
+                defer routes.deinit(alloc);
+                try routing_budget.checkpoint();
+                const fence = routes.fenceAt(0);
+                if (fence.metadata_group_id != routing.snapshot.status.metadata_group_id or
+                    !std.meta.eql(fence.metadata_incarnation, routing.snapshot.status.metadata_incarnation) or fence.topology_epoch != topology_epoch)
+                    return error.TopologyChanged;
+                const range = for (routing.ranges) |candidate| {
+                    if (candidate.group_id == participant.group_id) break candidate;
+                } else return error.TopologyChanged;
+                const manager = @import("../metadata/table_manager.zig");
+                if (range.table_id != fence.table_id or manager.rangeDocIdentityRangeId(range.*) != fence.route.range_id or
+                    manager.rangeDocIdentityShardId(range.*) != fence.route.identity_namespace.shard_id) return error.TopologyChanged;
+                if (participant.route_fence) |prior| {
+                    if (prior.catalog_revision != fence.catalog_revision or !std.meta.eql(prior.route, fence.route)) return error.TopologyChanged;
+                }
+                participant.route_fence = fence;
+            }
             if (participant.row_policy_principal_proof.len != 0 and
                 (!std.mem.eql(u8, participant.row_policy_principal_proof, table.row_policy_principal_proof) or
                     !std.mem.eql(u8, participant.row_policy_database, table.row_policy_database) or
@@ -1877,6 +1980,35 @@ fn executeMultiTableCommitOnce(
     var begun_count: usize = 0;
     var abort_on_error = true;
     var resume_committed = false;
+    if (worker.preparation != null) {
+        // A retained retry must establish the durable contract before asking
+        // for fresh admission. Matching committed decisions propagate even if
+        // a participant can no longer admit a new required transaction.
+        if (options.retain_terminal and participants.items.len != 0) {
+            try routing_budget.checkpoint();
+            try worker.checkExecution();
+            const first = participants.items[0];
+            const deadline = try recovery_budget.deadline(if (options.team) |team| team.borrow else null);
+            const decision = worker.statusForPreparation(alloc, first.group_id, first.table_name, first.statusRequest(txn_id), deadline) catch |err| switch (err) {
+                error.TxnNotFound => null,
+                error.PreparationRequirementMismatch => return err,
+                else => return error.CommitDecisionUnknown,
+            };
+            if (decision) |durable| switch (durable) {
+                .committed => {
+                    resume_committed = true;
+                    abort_on_error = false;
+                },
+                .aborted => return .{ .conflict = participantDecisionConflict(first, .begin) },
+                .pending => {},
+            };
+        }
+        if (!resume_committed) for (participants.items) |participant| {
+            try routing_budget.checkpoint();
+            if (participant.route_fence == null) return error.PreparedTransactionProtocolUnavailable;
+            try worker.forPreparationParticipant(&participant).negotiatePreparation(alloc, participant.group_id, participant.table_name);
+        };
+    }
     errdefer {
         if (abort_on_error) {
             if (trace_writer) |tw| {
@@ -1887,9 +2019,9 @@ fn executeMultiTableCommitOnce(
     }
 
     try routing_budget.checkpoint();
-    if (participants.items.len > 0) coordinator_begin: {
+    if (participants.items.len > 0 and !resume_committed) coordinator_begin: {
         const participant = participants.items[0];
-        worker.beginGroup(alloc, participant.group_id, participant.table_name, .{
+        worker.forPreparationParticipant(&participant).beginGroup(alloc, participant.group_id, participant.table_name, .{
             .txn_id = txn_id,
             .begin_timestamp = begin_timestamp,
             .topology_epoch = participant.topology_epoch,
@@ -1911,7 +2043,7 @@ fn executeMultiTableCommitOnce(
                     abort_on_error = false;
                     return error.CommitDecisionUnknown;
                 };
-                const status = worker.statusGroupWithRequest(
+                const status = worker.statusForPreparation(
                     alloc,
                     participant.group_id,
                     participant.table_name,
@@ -2052,6 +2184,14 @@ fn executeMultiTableCommitOnce(
                 },
             }
         }
+    }
+
+    if (!resume_committed and worker.preparation != null) {
+        sealPreparedParticipants(alloc, worker, txn_id, participants.items, participant_ids, routing_budget) catch |err| {
+            abort_on_error = false;
+            try abortParticipantsWithOptions(alloc, worker, txn_id, commit_version, participants.items, participant_ids, participants.items.len, fanout_slots, options);
+            return err;
+        };
     }
 
     // Preparing can overlap metadata publication. Recheck both transition
@@ -2461,10 +2601,11 @@ const BeginFanoutTask = struct {
         slot: *ParticipantFanoutSlot,
         owner: ?*runnable_fanout.Owner,
     ) void {
-        const worker = activateParticipant(original_worker, owner) catch |err| {
+        var worker = activateParticipant(original_worker, owner) catch |err| {
             slot.err = err;
             return;
         };
+        worker = worker.forPreparationParticipant(participant);
         defer if (owner) |child| child.park();
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -2560,10 +2701,11 @@ const PrepareFanoutTask = struct {
         slot: *ParticipantFanoutSlot,
         owner: ?*runnable_fanout.Owner,
     ) void {
-        const worker = activateParticipant(original_worker, owner) catch |err| {
+        var worker = activateParticipant(original_worker, owner) catch |err| {
             slot.err = err;
             return;
         };
+        worker = worker.forPreparationParticipant(participant);
         defer if (owner) |child| child.park();
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -2764,6 +2906,31 @@ fn runResolveFollowerFanout(
             );
         }
         acknowledgeFollowerWindow(options.participantAllocator(), worker, txn_id, participants, participant_ids, slots, start, end, true);
+    }
+}
+
+fn sealPreparedParticipants(alloc: std.mem.Allocator, worker: ParticipantWorker, txn_id: db_mod.types.TxnId, participants: []const ParticipantTxn, participant_ids: []const []const u8, budget: table_catalog.RoutingBudget) !void {
+    for (participants, participant_ids) |participant, locator| {
+        try budget.checkpoint();
+        var hash = std.crypto.hash.Blake3.init(.{});
+        var offset: usize = 0;
+        while (offset < locator.len) {
+            try budget.checkpoint();
+            const n = @min(@as(usize, 4096), locator.len - offset);
+            hash.update(locator[offset..][0..n]);
+            offset += n;
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        const route_digest = preparation_protocol.routeDigest(participant.route_fence orelse return error.PreparedTransactionProtocolUnavailable);
+        try worker.forPreparationParticipant(&participant).sealGroup(alloc, participant.group_id, participant.table_name, .{
+            .txn_id = txn_id,
+            .group_id = participant.group_id,
+            .topology_epoch = participant.topology_epoch,
+            .participant_digest = digest,
+            .route_digest = route_digest,
+            .requirement = worker.preparation.?,
+        });
     }
 }
 
@@ -6606,7 +6773,8 @@ fn consumerTests() type {
                 if (remaining_ns != null and remaining_ns.? > 0) {
                     try std.testing.expect((try outcome) == .committed);
                     try std.testing.expectEqual(@as(usize, 1), recorder.status_calls);
-                    try std.testing.expectEqual(@as(usize, 1), recorder.resolve_calls);
+                    // Revisit coordinator materialization, then its follower.
+                    try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
                 } else {
                     try std.testing.expectError(error.CommitDecisionUnknown, outcome);
                     try std.testing.expectEqual(@as(usize, 0), recorder.status_calls);
@@ -8257,4 +8425,367 @@ test "distributed txn independently scheduled coordinator rejects legacy unscope
     try std.testing.expectError(error.UnsupportedOperation, worker.acknowledgeGroup(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .participant = "table2:00000004:docs:2" }));
     try std.testing.expectError(error.UnsupportedOperation, worker.acknowledgeManyGroup(std.testing.allocator, 1, "docs", .{ .txn_id = @splat(1), .participants = &.{"table2:00000004:docs:2"} }));
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
+}
+const PreparedCoordinatorFixture = struct {
+    const ready: preparation_protocol.Capabilities = .{
+        .protocol = 1,
+        .requirement_format = 1,
+        .effects_format = 1,
+        .minimum_reader = 5,
+        .permanent_reader = 5,
+        .catalog_envelope = 5,
+        .durable_begin = true,
+        .durable_seal = true,
+        .recovery_consumes_effects = true,
+        .retained_contract = true,
+        .catalog_migration_complete = true,
+        .import_policy_fenced = true,
+        .deferred = true,
+        .synchronous = true,
+    };
+    const Event = enum { capability, begin, prepare, seal, commit, abort };
+    events: [64]Event = undefined,
+    count: usize = 0,
+    states: [2]db_mod.types.TxnStatus = .{ .pending, .pending },
+    begins: usize = 0,
+    prepares: usize = 0,
+    seals: usize = 0,
+    commits: usize = 0,
+    aborts: usize = 0,
+    blocked: u64 = 0,
+    race_legacy_after_begin: bool = false,
+    fail_prepare: u64 = 0,
+    fail_seal: u64 = 0,
+    mismatch_seal: bool = false,
+    mode: preparation_protocol.Mode = .synchronous,
+    decision: ?ParticipantWorker.PreparationDecision = null,
+    fn event(self: *@This(), e: Event) void {
+        self.events[self.count] = e;
+        self.count += 1;
+    }
+    fn cast(raw: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw));
+    }
+    fn catalog() table_catalog.CatalogSource {
+        return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .route_fence = routeFence, .route_identity = routeIdentity } };
+    }
+    fn snapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+        return .{
+            .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .metrics = .{} },
+            .tables = @constCast((&[_]@import("../metadata/table_manager.zig").TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data" }})[0..]),
+            .ranges = @constCast((&[_]@import("../metadata/table_manager.zig").RangeRecord{
+                .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+                .{ .group_id = 7002, .table_id = 7, .start_key = "doc:m", .end_key = null },
+            })[0..]),
+            .stores = @constCast((&[_]@import("../metadata/table_manager.zig").StoreRecord{})[0..]),
+            .placement_intents = @constCast((&[_]@import("../raft/reconciler.zig").PlacementIntent{})[0..]),
+            .split_transitions = @constCast((&[_]@import("../metadata/transition_state.zig").SplitTransitionRecord{})[0..]),
+            .merge_transitions = @constCast((&[_]@import("../metadata/transition_state.zig").MergeTransitionRecord{})[0..]),
+        };
+    }
+    fn freeSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+    fn routeFence(_: *anyopaque, group: u64) !?@import("../metadata/api.zig").CatalogRouteFence {
+        var captured = (try table_catalog.transactionRoutingSnapshot(std.testing.allocator, catalog(), "docs")).?;
+        defer captured.deinit(std.testing.allocator);
+        return .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 1, .table_id = 7, .topology_epoch = captured.topology_epoch, .route = .{ .group_id = group, .range_id = group, .identity_namespace = .{ .table_id = 7, .shard_id = group, .range_id = group } } };
+    }
+    fn routeIdentity(_: *anyopaque, table: []const u8, group: u64) !?@import("../metadata/api.zig").CatalogIdentityNamespace {
+        if (!std.mem.eql(u8, table, "docs")) return null;
+        return .{ .table_id = 7, .shard_id = group, .range_id = group };
+    }
+
+    fn capability(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: PreDecisionContext, _: ?runnable_abi.Borrowed) !preparation_protocol.Capabilities {
+        const self = cast(raw);
+        self.event(.capability);
+        if (group == self.blocked) return .{ .protocol = 1 };
+        return ready;
+    }
+    fn beginLegacy(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {
+        return error.TestLegacyFallback;
+    }
+    fn prepareLegacy(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
+        return error.TestLegacyFallback;
+    }
+    fn begin(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest, requirement: preparation_protocol.Requirement, _: PreDecisionContext, _: ?runnable_abi.Borrowed) !void {
+        const self = cast(raw);
+        try std.testing.expectEqual(self.mode, requirement.mode);
+        try std.testing.expectEqual(@as(usize, 2), self.count - self.begins);
+        self.event(.begin);
+        self.begins += 1;
+        if (self.race_legacy_after_begin) return error.DecisionConflict;
+    }
+    fn prepare(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: TxnPrepareRequest, requirement: preparation_protocol.Requirement, _: PreDecisionContext, _: ?runnable_abi.Borrowed) !void {
+        const self = cast(raw);
+        try std.testing.expectEqual(self.mode, requirement.mode);
+        self.event(.prepare);
+        self.prepares += 1;
+        if (group == self.fail_prepare) return error.TestProducerFailed;
+    }
+    fn seal(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, request: preparation_protocol.SealRequest, _: PreDecisionContext, _: ?runnable_abi.Borrowed) !preparation_protocol.SealReceipt {
+        const self = cast(raw);
+        try std.testing.expectEqual(@as(usize, 2), self.prepares);
+        try std.testing.expectEqual(self.mode, request.requirement.mode);
+        self.event(.seal);
+        if (group == self.fail_seal) return error.TestSealFailed;
+        self.seals += 1;
+        var receipt: preparation_protocol.SealReceipt = .{ .request = request, .intent_revision = 1, .intent_digest = @splat(1), .catalog_digest = @splat(2), .frame_digest = @splat(3) };
+        if (self.mismatch_seal) receipt.request.topology_epoch +%= 1;
+        return receipt;
+    }
+    fn resolve(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, request: TxnResolveRequest) !void {
+        const self = cast(raw);
+        self.states[if (group == 7001) 0 else 1] = request.status;
+        if (request.status == .committed) {
+            if (self.decision == null or self.decision.?.status != .committed) try std.testing.expectEqual(@as(usize, 2), self.seals);
+            self.event(.commit);
+            self.commits += 1;
+        } else {
+            self.event(.abort);
+            self.aborts += 1;
+            self.decision = .{ .status = .aborted, .requirement = null };
+        }
+    }
+    fn status(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+        const self = cast(raw);
+        return if (group == 7001 and self.decision != null) self.decision.?.status else self.states[if (group == 7001) 0 else 1];
+    }
+    fn resolveUntil(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: TxnResolveRequest, _: u64) !void {
+        return resolve(raw, alloc, group, table, request);
+    }
+    fn statusUntil(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, txn_id: db_mod.types.TxnId, _: u64) !db_mod.types.TxnStatus {
+        return status(raw, alloc, group, table, txn_id);
+    }
+    fn resolveExecution(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: TxnResolveRequest, _: db_mod.types.CancellationToken, borrow: runnable_abi.Borrowed) !void {
+        try borrow.checkLifetime();
+        return resolve(raw, alloc, group, table, request);
+    }
+    fn resolveUntilExecution(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: TxnResolveRequest, _: u64, borrow: runnable_abi.Borrowed) !void {
+        try borrow.checkLifetime();
+        return resolve(raw, alloc, group, table, request);
+    }
+    fn preparedStatus(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnStatusRequest, _: u64, _: ?runnable_abi.Borrowed) !ParticipantWorker.PreparationDecision {
+        const self = cast(raw);
+        if (self.race_legacy_after_begin and self.begins != 0) return .{ .status = .committed, .requirement = null };
+        return self.decision orelse return error.TxnNotFound;
+    }
+    fn acknowledge(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnAcknowledgeRequest) !void {}
+    fn worker(self: *@This()) ParticipantWorker {
+        return .{ .ptr = self, .vtable = &.{ .begin_group = beginLegacy, .prepare_group = prepareLegacy, .resolve_group = resolve, .status_group = status, .acknowledge_group = acknowledge, .resolve_group_until = resolveUntil, .status_group_until = statusUntil, .resolve_group_with_execution = resolveExecution, .resolve_group_until_with_execution = resolveUntilExecution, .preparation_capabilities = capability, .required_begin_group = begin, .required_prepare_group = prepare, .seal_group = seal, .preparation_status_group = preparedStatus } };
+    }
+    fn run(self: *@This(), level: db_mod.types.SyncLevel, retained: bool) !CommitOutcome {
+        return executeMultiTableCommitWithOptions(std.testing.allocator, catalog(), self.worker(), @splat(1), 10000, 10001, &.{.{ .table_name = "docs", .writes = &.{ .{ .key = "doc:a", .value = "{}" }, .{ .key = "doc:z", .value = "{}" } } }}, level, null, .{ .preparation_requirement = .{ .mode = self.mode }, .retain_terminal = retained, .report_post_commit_failure = false });
+    }
+};
+
+test "distributed txn prepared protocol negotiates every peer and seals all before first commit" {
+    for (std.meta.tags(db_mod.types.SyncLevel)) |level| {
+        var fixture: PreparedCoordinatorFixture = .{ .mode = preparation_protocol.forSyncLevel(level).mode };
+        const result = try fixture.run(level, false);
+        try std.testing.expect(result == .committed);
+        try std.testing.expectEqual(level == .propose, result.committed.propagation_pending);
+        try std.testing.expectEqual(@as(usize, 2), fixture.begins);
+        try std.testing.expectEqual(@as(usize, 2), fixture.prepares);
+        try std.testing.expectEqual(@as(usize, 2), fixture.seals);
+        try std.testing.expectEqual(@as(usize, 2), fixture.commits);
+        try std.testing.expectEqual(@as(usize, 0), fixture.aborts);
+    }
+}
+
+test "distributed txn prepared protocol refuses codec-only peers before begin" {
+    var fixture: PreparedCoordinatorFixture = .{ .blocked = 7002 };
+    try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, fixture.run(.enrichments, false));
+    try std.testing.expectEqual(@as(usize, 0), fixture.begins);
+    try std.testing.expectEqual(@as(usize, 0), fixture.aborts);
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+}
+
+test "distributed txn prepared protocol producer seal failure and stale receipt precede decision" {
+    for (0..3) |failure| {
+        var fixture: PreparedCoordinatorFixture = .{ .fail_prepare = if (failure == 0) 7002 else 0, .fail_seal = if (failure == 1) 7002 else 0, .mismatch_seal = failure == 2 };
+        const result = fixture.run(.full_index, false);
+        if (failure == 0) try std.testing.expectError(error.TestProducerFailed, result) else if (failure == 1) try std.testing.expectError(error.TestSealFailed, result) else try std.testing.expectError(error.PreparedEffectsMismatch, result);
+        try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+        try std.testing.expect(fixture.aborts != 0);
+    }
+}
+
+test "distributed txn prepared protocol retained terminal decisions never upgrade or require new readiness" {
+    var committed: PreparedCoordinatorFixture = .{ .blocked = 7001, .decision = .{ .status = .committed, .requirement = .{ .mode = .synchronous } } };
+    try std.testing.expect((try committed.run(.full_index, true)) == .committed);
+    try std.testing.expectEqual(@as(usize, 0), committed.begins);
+    try std.testing.expectEqual(@as(usize, 0), committed.prepares);
+    try std.testing.expectEqual(@as(usize, 0), committed.seals);
+    try std.testing.expectEqual(@as(usize, 2), committed.commits);
+    var weaker: PreparedCoordinatorFixture = .{ .blocked = 7001, .decision = .{ .status = .committed, .requirement = .{ .mode = .synchronous } } };
+    try std.testing.expect((try weaker.run(.write, true)) == .committed);
+    try std.testing.expectEqual(@as(usize, 0), weaker.begins);
+    try std.testing.expectEqual(@as(usize, 2), weaker.commits);
+    for ([_]?preparation_protocol.Requirement{ null, .{ .mode = .deferred } }) |requirement| {
+        var legacy: PreparedCoordinatorFixture = .{ .decision = .{ .status = .committed, .requirement = requirement } };
+        try std.testing.expectError(error.PreparationRequirementMismatch, legacy.run(.full_index, true));
+        try std.testing.expectEqual(@as(usize, 0), legacy.count);
+    }
+    var aborted: PreparedCoordinatorFixture = .{ .decision = .{ .status = .aborted, .requirement = null } };
+    try std.testing.expect((try aborted.run(.full_index, true)) == .conflict);
+    try std.testing.expectEqual(@as(usize, 0), aborted.count);
+}
+
+test "distributed txn prepared protocol framing rejects stripped JSON altered phase and corrupt bytes" {
+    const alloc = std.testing.allocator;
+    const payload = try encodeTxnBeginRequest(alloc, .{ .txn_id = @splat(0), .begin_timestamp = 1, .participants = &.{} });
+    defer alloc.free(payload);
+    for (std.meta.tags(preparation_protocol.Phase)) |phase| {
+        const bytes = try preparation_protocol.encode(alloc, phase, .{ .mode = .synchronous }, payload, null);
+        defer alloc.free(bytes);
+        const decoded = try preparation_protocol.decode(bytes, phase, null);
+        try std.testing.expectEqual(preparation_protocol.Mode.synchronous, decoded.requirement.mode);
+        try std.testing.expectEqualStrings(payload, decoded.payload);
+        try std.testing.expectError(error.InvalidPreparationRequirement, preparation_protocol.decode(payload, phase, null));
+        if (parseTxnBeginRequest(alloc, bytes)) |value| {
+            var unexpected = value;
+            freeTxnBeginRequest(alloc, &unexpected);
+            return error.TestExpectedError;
+        } else |_| {}
+        for (0..bytes.len) |i| {
+            const corrupted = try alloc.dupe(u8, bytes);
+            defer alloc.free(corrupted);
+            corrupted[i] ^= 1;
+            if (preparation_protocol.decode(corrupted, phase, null)) |_| return error.TestExpectedError else |_| {}
+            if (preparation_protocol.decode(bytes[0..i], phase, null)) |_| return error.TestExpectedError else |_| {}
+        }
+        const other: preparation_protocol.Phase = if (phase == .begin) .prepare else .begin;
+        try std.testing.expectError(error.InvalidPreparationRequirement, preparation_protocol.decode(bytes, other, null));
+    }
+}
+
+test "distributed txn prepared protocol framing preserves every original rejection and allocation failure" {
+    const admission = @import("antfly_local_sources").common_read_admission;
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.NotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const n = self.calls;
+            self.calls += 1;
+            if (n == self.fail_at) return self.cause;
+        }
+    };
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const encoded = try preparation_protocol.encode(alloc, .prepare, .{ .mode = .deferred }, "payload", null);
+            defer alloc.free(encoded);
+            _ = try preparation_protocol.decode(encoded, .prepare, null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    const payload: [10000]u8 = @splat('x');
+    var baseline: Control = .{};
+    const initial: admission.Payload = .{ .ptr = &baseline, .vtable = &.{ .checkpoint = Control.check } };
+    const encoded = try preparation_protocol.encode(std.testing.allocator, .prepare, .{ .mode = .deferred }, &payload, admission.Port.init(&initial));
+    defer std.testing.allocator.free(encoded);
+    _ = try preparation_protocol.decode(encoded, .prepare, admission.Port.init(&initial));
+    for ([_]anyerror{ error.NotFound, error.Canceled, error.MemoryLimitExceeded }) |cause| for (0..baseline.calls) |fail_at| {
+        var state: Control = .{ .fail_at = fail_at, .cause = cause };
+        const control: admission.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = Control.check } };
+        const result = preparation_protocol.encode(std.testing.allocator, .prepare, .{ .mode = .deferred }, &payload, admission.Port.init(&control));
+        if (result) |bytes| {
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expectError(cause, preparation_protocol.decode(bytes, .prepare, admission.Port.init(&control)));
+        } else |err| try std.testing.expectEqual(cause, err);
+    };
+}
+
+test "distributed txn prepared protocol honors supplied authority and detaches it deliberately for recovery" {
+    const runtime = @import("antfly_runtime_abi");
+    const Stop = struct {
+        fn check(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.Canceled);
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            @panic("stopped caller cannot enter or park");
+        }
+    };
+    var fixture: PreparedCoordinatorFixture = .{};
+    const borrow: runnable_abi.Borrowed = .{ .context = &fixture, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.write), .check_lifetime = Stop.check, .checkpoint = Stop.check, .park = Stop.phase, .enter = Stop.phase };
+    try std.testing.expectError(error.Canceled, executeMultiTableCommitWithOptions(std.testing.allocator, undefined, fixture.worker(), @splat(1), 1, 2, &.{}, .write, null, .{ .preparation_requirement = .{ .mode = .synchronous }, .pre_decision_context = .{ .execution_runnable = borrow } }));
+    try std.testing.expectEqual(@as(usize, 0), fixture.count);
+    var detached = fixture.worker();
+    detached.preparation = .{ .mode = .synchronous };
+    detached.preparation_context.execution_runnable = borrow;
+    detached.execution_runnable = null;
+    try detached.checkExecution();
+    try std.testing.expect(detached.preparationContext().execution_runnable == null);
+}
+
+test "distributed txn prepared protocol requires each migration and durable capability" {
+    inline for (.{ "durable_begin", "durable_seal", "recovery_consumes_effects", "retained_contract", "catalog_migration_complete", "import_policy_fenced", "synchronous" }) |field| {
+        var capabilities = PreparedCoordinatorFixture.ready;
+        @field(capabilities, field) = false;
+        try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, capabilities.require(.{ .mode = .synchronous }));
+    }
+    inline for (.{ "minimum_reader", "permanent_reader", "catalog_envelope" }) |field| {
+        var capabilities = PreparedCoordinatorFixture.ready;
+        @field(capabilities, field) = 4;
+        try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, capabilities.require(.{ .mode = .synchronous }));
+    }
+}
+
+test "distributed txn prepared protocol seal binds transaction participant route and exact mode" {
+    const request: preparation_protocol.SealRequest = .{ .txn_id = @splat(1), .group_id = 2, .topology_epoch = 3, .participant_digest = @splat(4), .route_digest = @splat(5), .requirement = .{ .mode = .synchronous } };
+    const receipt: preparation_protocol.SealReceipt = .{ .request = request, .intent_revision = 0, .intent_digest = @splat(6), .catalog_digest = @splat(7), .frame_digest = @splat(8) };
+    try receipt.validate(request);
+    for (0..6) |field| {
+        var wrong = receipt;
+        switch (field) {
+            0 => wrong.request.txn_id[0] ^= 1,
+            1 => wrong.request.group_id += 1,
+            2 => wrong.request.topology_epoch += 1,
+            3 => wrong.request.participant_digest[0] ^= 1,
+            4 => wrong.request.route_digest[0] ^= 1,
+            5 => wrong.request.requirement.mode = .deferred,
+            else => unreachable,
+        }
+        try std.testing.expectError(error.PreparedEffectsMismatch, wrong.validate(request));
+    }
+}
+
+test "distributed txn prepared protocol missing aware callbacks cannot reach legacy begin" {
+    inline for (.{ "required_begin_group", "required_prepare_group", "seal_group", "preparation_status_group", "preparation_capabilities" }) |field| {
+        var fixture: PreparedCoordinatorFixture = .{};
+        var worker = fixture.worker();
+        var callbacks = worker.vtable.*;
+        @field(callbacks, field) = null;
+        worker.vtable = &callbacks;
+        worker.preparation = .{ .mode = .synchronous };
+        try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, worker.negotiatePreparation(std.testing.allocator, 7001, "docs"));
+        try std.testing.expectEqual(@as(usize, 0), fixture.count);
+    }
+}
+
+test "distributed txn prepared protocol header is fixed and route digest excludes local admission" {
+    const encoded = try preparation_protocol.encode(std.testing.allocator, .prepare, .{ .mode = .synchronous }, "abc", null);
+    defer std.testing.allocator.free(encoded);
+    const header = [_]u8{ 'A', 'T', 'P', 'W', 1, 0, 2, 1, 3, 0, 0, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(@as(usize, 51), encoded.len);
+    try std.testing.expectEqualSlices(u8, &header, encoded[0..16]);
+    try std.testing.expectEqualStrings("abc", encoded[16..19]);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(encoded[0..19], &digest, .{});
+    try std.testing.expectEqualSlices(u8, &digest, encoded[19..]);
+    var fence = (try PreparedCoordinatorFixture.routeFence(undefined, 7001)).?;
+    const expected = preparation_protocol.routeDigest(fence);
+    fence.admission_deadline_ns = 1234;
+    try std.testing.expectEqualSlices(u8, &expected, &preparation_protocol.routeDigest(fence));
+    fence.catalog_revision += 1;
+    try std.testing.expect(!std.mem.eql(u8, &expected, &preparation_protocol.routeDigest(fence)));
+}
+
+test "distributed txn prepared protocol ambiguous begin cannot recover through legacy status" {
+    var fixture: PreparedCoordinatorFixture = .{ .race_legacy_after_begin = true };
+    try std.testing.expectError(error.CommitDecisionUnknown, fixture.run(.full_index, true));
+    try std.testing.expectEqual(@as(usize, 1), fixture.begins);
+    try std.testing.expectEqual(@as(usize, 0), fixture.prepares);
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 0), fixture.aborts);
 }
