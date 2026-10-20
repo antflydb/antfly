@@ -60,8 +60,20 @@ pub const RequestContext = struct {
     /// Never forward its callbacks to watchdogs or parallel children.
     runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
 
+    /// A finite deadline, execution owner or fallible authority requires a
+    /// provider that accepts the actual controls. A transport-only atomic
+    /// cancellation token retains the legacy compatibility path.
+    pub fn requiresControlledProvider(self: RequestContext) bool {
+        return self.deadline_ns != null or self.runnable != null or
+            (if (self.cancellation) |token| token.check_fn != null else false);
+    }
+
     pub fn check(self: RequestContext) !void {
-        if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        if (self.cancellation) |value| value.check() catch |err| return switch (err) {
+            error.Canceled => error.Cancelled,
+            error.DeadlineExceeded => error.Timeout,
+            else => err,
+        };
         // Physical borrowers may poll while the parent is parked. This
         // optional owner capability observes retained lifetime without a CPU
         // checkpoint or phase transition.

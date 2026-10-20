@@ -165,6 +165,7 @@ pub const DenseEmbedder = struct {
         const embed = self.dense_embed_with_context_fn orelse return error.UncancellableInferenceProvider;
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "dense embedder");
         defer sanitized.deinit(alloc);
+        try context.check();
         const vector = try embed(self.ptr, alloc, embedding_name, sanitized.text, dims, context);
         context.check() catch |err| {
             alloc.free(vector);
@@ -184,6 +185,7 @@ pub const DenseEmbedder = struct {
         try context.check();
         var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
         defer sanitized.deinit(alloc);
+        try context.check();
         const safe_texts = sanitized.texts();
         const vectors = if (self.dense_embed_batch_with_context_fn) |embed_batch|
             try embed_batch(self.ptr, alloc, embedding_name, safe_texts, dims, context)
@@ -199,15 +201,15 @@ pub const DenseEmbedder = struct {
     }
 
     pub fn supportsParts(self: DenseEmbedder) bool {
-        return self.dense_embed_parts_fn != null;
+        return self.dense_embed_parts_fn != null or (self.part_request_context != null and self.dense_embed_parts_with_context_fn != null);
     }
 
     pub fn supportsPartItems(self: DenseEmbedder) bool {
-        return self.dense_embed_part_items_fn != null;
+        return self.dense_embed_part_items_fn != null or self.dense_embed_part_items_planned_fn != null or (self.part_request_context != null and self.dense_embed_part_items_with_context_fn != null);
     }
 
     pub fn supportsRasterItems(self: DenseEmbedder) bool {
-        return self.dense_embed_raster_items_fn != null;
+        return self.dense_embed_raster_items_fn != null or (self.part_request_context != null and self.dense_embed_raster_items_with_context_fn != null);
     }
 
     pub fn mediaPartLimit(self: DenseEmbedder, embedding_name: []const u8) ?usize {
@@ -306,6 +308,8 @@ pub const DenseEmbedder = struct {
         parts: []const template_mod.ContentPart,
         dims: u32,
     ) ![]f32 {
+        if (self.part_request_context) |context|
+            return self.embedDensePartsWithContext(alloc, embedding_name, parts, dims, context);
         const dense_embed_parts_fn = self.dense_embed_parts_fn orelse return error.UnsupportedEmbeddingProvider;
         var sanitized = try sanitizeContentPartsForEmbeddingAlloc(alloc, parts);
         defer sanitized.deinit(alloc);
@@ -319,7 +323,9 @@ pub const DenseEmbedder = struct {
         items: []const template_mod.ContentPart,
         dims: u32,
     ) ![]const []const f32 {
-        const embed_items = self.dense_embed_part_items_fn orelse return error.UnsupportedEmbeddingProvider;
+        const embed_items = self.dense_embed_part_items_fn;
+        if (self.part_request_context == null and self.dense_embed_part_items_planned_fn == null and embed_items == null)
+            return error.UnsupportedEmbeddingProvider;
         if (self.part_request_context) |context| try context.check();
         var planned = self;
         if (planned.part_lease == null and (self.resolve_part_lease_fn != null or self.capabilities_fn != null))
@@ -368,7 +374,7 @@ pub const DenseEmbedder = struct {
         var bounded = inference_work.BoundedInvocationAllocator.init(alloc, invocation_limit);
         const invocation_alloc = bounded.allocator();
         var sanitized = sanitizeContentPartsForEmbeddingAlloc(invocation_alloc, items) catch |err| {
-            if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+            if (err == error.OutOfMemory and bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
             return err;
         };
         defer sanitized.deinit(invocation_alloc);
@@ -379,8 +385,8 @@ pub const DenseEmbedder = struct {
             try context.check();
             const call = self.dense_embed_part_items_with_context_fn orelse return error.UncancellableInferenceProvider;
             break :blk call(self.ptr, invocation_alloc, embedding_name, safe_items, dims, context);
-        } else embed_items(self.ptr, invocation_alloc, embedding_name, safe_items, dims)) catch |err| {
-            if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+        } else embed_items.?(self.ptr, invocation_alloc, embedding_name, safe_items, dims)) catch |err| {
+            if (err == error.OutOfMemory and bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
             return err;
         };
         if (vectors.len != items.len) {
@@ -432,14 +438,14 @@ pub const DenseEmbedder = struct {
         items: []const antfly_image.BorrowedRasterAttachment,
         dims: u32,
     ) ![]const []const f32 {
-        const embed_items = self.dense_embed_raster_items_fn orelse
-            return error.UnsupportedEmbeddingProvider;
+        const embed_items = self.dense_embed_raster_items_fn;
+        if (self.part_request_context == null and embed_items == null) return error.UnsupportedEmbeddingProvider;
         for (items) |item| try item.validate();
         const vectors = if (self.part_request_context) |context| blk: {
             try context.check();
             const call = self.dense_embed_raster_items_with_context_fn orelse return error.UncancellableInferenceProvider;
             break :blk try call(self.ptr, alloc, embedding_name, items, dims, context);
-        } else try embed_items(self.ptr, alloc, embedding_name, items, dims);
+        } else try embed_items.?(self.ptr, alloc, embedding_name, items, dims);
         errdefer freeDenseEmbeddingBatch(alloc, vectors);
         if (self.part_request_context) |context| try context.check();
         if (vectors.len != items.len) return error.InvalidEmbeddingResponse;
@@ -463,6 +469,7 @@ pub const DenseEmbedder = struct {
         const embed = self.dense_embed_parts_with_context_fn orelse return error.UncancellableInferenceProvider;
         var sanitized = try sanitizeContentPartsForEmbeddingAlloc(alloc, parts);
         defer sanitized.deinit(alloc);
+        try context.check();
         const vector = try embed(self.ptr, alloc, embedding_name, sanitized.partsSlice(), dims, context);
         context.check() catch |err| {
             alloc.free(vector);
@@ -628,6 +635,7 @@ pub const SparseEmbedder = struct {
         const embed = self.sparse_embed_with_context_fn orelse return error.UncancellableInferenceProvider;
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "sparse embedder");
         defer sanitized.deinit(alloc);
+        try context.check();
         var result = try embed(self.ptr, alloc, embedding_name, sanitized.text, context);
         context.check() catch |err| {
             result.deinit(alloc);
@@ -646,6 +654,7 @@ pub const SparseEmbedder = struct {
         try context.check();
         var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
         defer sanitized.deinit(alloc);
+        try context.check();
         const safe_texts = sanitized.texts();
         const embeddings = if (self.sparse_embed_batch_with_context_fn) |embed_batch|
             try embed_batch(self.ptr, alloc, embedding_name, safe_texts, context)
@@ -1440,4 +1449,106 @@ test "context-aware embedder receives the request lifetime and fails closed when
         error.UncancellableInferenceProvider,
         legacy.embedDenseWithContext(std.testing.allocator, "model", "text", 3, context),
     );
+}
+
+test "provider controls reject original authority lost during sanitization before dispatch" {
+    const State = struct {
+        rejected: bool = false,
+        calls: usize = 0,
+        allocations: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.rejected) return error.OriginalProviderAuthorityRejected;
+        }
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn allocate(raw: *anyopaque, size: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = std.testing.allocator.rawAlloc(size, alignment, ra) orelse return null;
+            self.allocations += 1;
+            self.rejected = true;
+            return bytes;
+        }
+        fn resize(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, size: usize, ra: usize) bool {
+            return std.testing.allocator.rawResize(bytes, alignment, size, ra);
+        }
+        fn remap(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, size: usize, ra: usize) ?[*]u8 {
+            return std.testing.allocator.rawRemap(bytes, alignment, size, ra);
+        }
+        fn free(_: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(bytes, alignment, ra);
+        }
+        fn dense(raw: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+        fn denseContext(raw: *anyopaque, a: Allocator, name: []const u8, text: []const u8, dims: u32, _: RequestContext) ![]f32 {
+            return dense(raw, a, name, text, dims);
+        }
+        fn batch(raw: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8, _: u32, _: RequestContext) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+        fn parts(raw: *anyopaque, _: Allocator, _: []const u8, _: []const template_mod.ContentPart, _: u32, _: RequestContext) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+        fn sparse(raw: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+        fn sparseContext(raw: *anyopaque, a: Allocator, name: []const u8, text: []const u8, _: RequestContext) !SparseEmbedding {
+            return sparse(raw, a, name, text);
+        }
+        fn sparseBatch(raw: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8, _: RequestContext) ![]SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+    };
+    var state: State = .{};
+    const context: RequestContext = .{ .io = std.testing.io, .deadline_ns = null, .cancellation = .{ .ptr = &state, .check_fn = State.check } };
+    const dense = DenseEmbedder{ .ptr = &state, .dense_embed_fn = State.dense, .dense_embed_with_context_fn = State.denseContext, .dense_embed_batch_with_context_fn = State.batch, .dense_embed_parts_with_context_fn = State.parts, .part_request_context = context };
+    const sparse = SparseEmbedder{ .ptr = &state, .sparse_embed_fn = State.sparse, .sparse_embed_with_context_fn = State.sparseContext, .sparse_embed_batch_with_context_fn = State.sparseBatch };
+    const invalid = &[_]u8{0xff};
+    for (0..5) |family| {
+        state.rejected = false;
+        const before = state.allocations;
+        switch (family) {
+            0 => try std.testing.expectError(error.OriginalProviderAuthorityRejected, dense.embedDenseWithContext(state.allocator(), "model", invalid, 1, context)),
+            1 => try std.testing.expectError(error.OriginalProviderAuthorityRejected, dense.embedDenseBatchWithContext(state.allocator(), "model", &.{invalid}, 1, context)),
+            2 => try std.testing.expectError(error.OriginalProviderAuthorityRejected, dense.embedDenseParts(state.allocator(), "model", &.{.{ .text = invalid }}, 1)),
+            3 => try std.testing.expectError(error.OriginalProviderAuthorityRejected, sparse.embedSparseWithContext(state.allocator(), "model", invalid, context)),
+            4 => try std.testing.expectError(error.OriginalProviderAuthorityRejected, sparse.embedSparseBatchWithContext(state.allocator(), "model", &.{invalid}, context)),
+            else => unreachable,
+        }
+        try std.testing.expect(state.allocations > before);
+        try std.testing.expectEqual(@as(usize, 0), state.calls);
+    }
+}
+
+test "provider controls accept contextual raster callbacks without a legacy implementation" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn legacy(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UncontrolledProviderDispatched;
+        }
+        fn raster(raw: *anyopaque, a: Allocator, _: []const u8, _: []const antfly_image.BorrowedRasterAttachment, _: u32, context: RequestContext) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.check();
+            self.calls += 1;
+            return a.alloc([]const f32, 0);
+        }
+    };
+    var probe: Probe = .{};
+    const provider = DenseEmbedder{ .ptr = &probe, .dense_embed_fn = Probe.legacy, .dense_embed_raster_items_with_context_fn = Probe.raster, .part_request_context = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) } };
+    try std.testing.expect(provider.supportsRasterItems());
+    const output = try provider.embedDenseRasterItems(std.testing.allocator, "model", &.{}, 1);
+    defer freeDenseEmbeddingBatch(std.testing.allocator, output);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }

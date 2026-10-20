@@ -3491,11 +3491,20 @@ const AssetInvocationCancellation = struct {
     lifecycle: CancellationToken,
     request: CancellationToken,
     inherited: CancellationToken,
+    rejection: @import("antfly_cancellation").Rejection = .{},
+
+    fn check(ptr: *const anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+        try self.rejection.check();
+        self.lifecycle.check() catch |err| return self.rejection.remember(err);
+        self.request.check() catch |err| return self.rejection.remember(err);
+        self.inherited.check() catch |err| return self.rejection.remember(err);
+        try self.rejection.check();
+    }
 
     fn isCancelled(ptr: *const anyopaque) bool {
-        const self: *const @This() = @ptrCast(@alignCast(ptr));
-        return self.lifecycle.isCancelled() or self.request.isCancelled() or
-            self.inherited.isCancelled();
+        check(ptr) catch return true;
+        return false;
     }
 };
 
@@ -3526,6 +3535,7 @@ fn scopedAssetProducer(
         .cancellation = .{
             .ptr = cancellation,
             .is_cancelled_fn = AssetInvocationCancellation.isCancelled,
+            .check_fn = if (cancellation.lifecycle.check_fn != null or cancellation.request.check_fn != null or cancellation.inherited.check_fn != null) AssetInvocationCancellation.check else null,
         },
         .max_response_bytes = producer.invocation_context.max_response_bytes,
         .progress = producer.invocation_context.progress orelse

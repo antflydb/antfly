@@ -31,6 +31,20 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const provider_control_filters = [_][]const u8{
+        "storage.db.enrichment.embedder.test.",
+        "storage.db.enrichment.asset_producer.test.",
+        "asset producer runtime invocation context can only tighten configured controls",
+    };
+    const provider_control_tests = b.addTest(.{
+        .name = "precommit-provider-control-tests",
+        .root_module = antfly_test_mod,
+        .filters = &provider_control_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-precommit-provider-control-test", "Verify original provider authority, checked dispatch and late result retirement")
+        .dependOn(&addCuratedTestRunArtifact(b, provider_control_tests, &provider_control_filters).step);
     const producer_funding_filters = [_][]const u8{
         "shared PDF",
         "db document extraction skips stable unit local rewrites while replaying full text from stored artifacts",
