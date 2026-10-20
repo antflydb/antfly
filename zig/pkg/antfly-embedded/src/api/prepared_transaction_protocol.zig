@@ -44,6 +44,7 @@ pub const Capabilities = struct {
     durable_seal: bool = false,
     recovery_consumes_effects: bool = false,
     retained_contract: bool = false,
+    bound_retained_contract: bool = false,
     catalog_migration_complete: bool = false,
     import_policy_fenced: bool = false,
     deferred: bool = false,
@@ -53,9 +54,33 @@ pub const Capabilities = struct {
         if (self.protocol != wire_version or self.requirement_format != 1 or self.effects_format != 1 or
             self.minimum_reader < 7 or self.permanent_reader < 7 or self.catalog_envelope < 7 or
             !self.durable_begin or !self.durable_seal or !self.recovery_consumes_effects or !self.retained_contract or
-            !self.catalog_migration_complete or !self.import_policy_fenced or
+            !self.bound_retained_contract or !self.catalog_migration_complete or !self.import_policy_fenced or
             !(if (requirement.mode == .deferred) self.deferred else self.synchronous))
             return error.PreparedTransactionProtocolUnavailable;
+    }
+};
+
+/// A status observation contains actual durable metadata, including after
+/// accepted frames retire. Expected routing is never copied into the evidence.
+pub const Decision = struct {
+    status: @import("../storage/db/types.zig").TxnStatus,
+    requirement: ?Requirement,
+    binding: ?@import("../storage/db/prepared_transaction_effects.zig").Binding = null,
+
+    pub fn fromDurable(value: @import("../storage/transactions.zig").TxnManager.PreparationDecision) @This() {
+        return .{ .status = value.status, .requirement = value.requirement, .binding = value.binding };
+    }
+
+    pub fn validate(self: @This(), requirement: Requirement, expected: @import("../storage/db/prepared_transaction_effects.zig").Binding) !@import("../storage/db/types.zig").TxnStatus {
+        // Legacy aborts stay terminal after their sidecars retire. A bound
+        // abort must still refer to the observed original participant.
+        if (self.status != .aborted) {
+            const accepted = self.requirement orelse return error.PreparationRequirementMismatch;
+            if (accepted.mode != requirement.mode) return error.PreparationRequirementMismatch;
+            if (self.binding == null) return error.PreparationContractConflict;
+        }
+        if (self.binding) |binding| if (!std.meta.eql(binding, expected)) return error.PreparationContractConflict;
+        return self.status;
     }
 };
 

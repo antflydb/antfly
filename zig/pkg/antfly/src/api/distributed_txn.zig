@@ -311,7 +311,7 @@ pub const ParticipantWorker = struct {
         ) anyerror!db_mod.types.TxnStatus = null,
     };
 
-    pub const PreparationDecision = struct { status: db_mod.types.TxnStatus, requirement: ?preparation_protocol.Requirement };
+    pub const PreparationDecision = preparation_protocol.Decision;
 
     fn forPreparationParticipant(self: ParticipantWorker, participant: *const ParticipantTxn) ParticipantWorker {
         var worker = self;
@@ -340,17 +340,17 @@ pub const ParticipantWorker = struct {
         try capabilities.require(requirement);
     }
 
-    fn statusForPreparation(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TxnStatusRequest, deadline: u64) !db_mod.types.TxnStatus {
-        const requirement = self.preparation orelse return self.statusGroupWithRequest(alloc, group_id, table_name, request, deadline);
+    fn statusForPreparation(self: ParticipantWorker, alloc: std.mem.Allocator, participant: ParticipantTxn, txn_id: db_mod.types.TxnId, deadline: u64) !db_mod.types.TxnStatus {
+        const request = participant.statusRequest(txn_id);
+        const requirement = self.preparation orelse return self.statusGroupWithRequest(alloc, participant.group_id, participant.table_name, request, deadline);
         try self.checkExecution();
         const callback = self.vtable.preparation_status_group orelse return error.PreparedTransactionProtocolUnavailable;
-        const decision = try callback(self.ptr, alloc, group_id, table_name, request, deadline, self.preparationContext().execution_runnable);
+        const locator = try participantIdForGroupScoped(alloc, participant.table_name, participant.group_id, participant.restore_staging_scope, participant.restore_staging_plan_id);
+        defer alloc.free(locator);
+        const expected = try preparationRequest(txn_id, requirement, participant, locator, .{ .deadline_ns = deadline });
+        const decision = try callback(self.ptr, alloc, participant.group_id, participant.table_name, request, deadline, self.preparationContext().execution_runnable);
         try self.checkExecution();
-        // An abort remains terminal even after its preparation sidecar retires.
-        if (decision.status == .aborted) return .aborted;
-        const accepted = decision.requirement orelse return error.PreparationRequirementMismatch;
-        if (accepted.mode != requirement.mode) return error.PreparationRequirementMismatch;
-        return decision.status;
+        return decision.validate(requirement, expected.binding());
     }
 
     fn sealGroup(self: ParticipantWorker, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: preparation_protocol.SealRequest) !void {
@@ -2128,9 +2128,9 @@ fn executeMultiTableCommitOnce(
             try worker.checkExecution();
             const first = participants.items[0];
             const deadline = try recovery_budget.deadline(if (options.team) |team| team.borrow else null);
-            const decision = worker.statusForPreparation(alloc, first.group_id, first.table_name, first.statusRequest(txn_id), deadline) catch |err| switch (err) {
+            const decision = worker.statusForPreparation(alloc, first, txn_id, deadline) catch |err| switch (err) {
                 error.TxnNotFound => null,
-                error.PreparationRequirementMismatch => return err,
+                error.PreparationRequirementMismatch, error.PreparationContractConflict => return err,
                 else => return error.CommitDecisionUnknown,
             };
             if (decision) |durable| switch (durable) {
@@ -2184,9 +2184,8 @@ fn executeMultiTableCommitOnce(
                 };
                 const status = worker.statusForPreparation(
                     alloc,
-                    participant.group_id,
-                    participant.table_name,
-                    participant.statusRequest(txn_id),
+                    participant,
+                    txn_id,
                     recovery_deadline,
                 ) catch |status_err| switch (status_err) {
                     error.TxnNotFound => null,
@@ -2639,13 +2638,16 @@ fn resolveCoordinatorDecisionAfterFailureChecked(
     var last_status_error: ?anyerror = null;
     while (true) {
         if (budget) |retained| deadline_ns = try retained.deadline(completion);
-        const status: ?db_mod.types.TxnStatus = worker.statusGroupWithRequest(
+        const status: ?db_mod.types.TxnStatus = worker.statusForPreparation(
             alloc,
-            participant.group_id,
-            participant.table_name,
-            participant.statusRequest(txn_id),
+            participant,
+            txn_id,
             deadline_ns,
         ) catch |status_err| status_failure: {
+            if (worker.preparation != null) switch (status_err) {
+                error.PreparationRequirementMismatch, error.PreparationContractConflict, error.PreparedTransactionProtocolUnavailable => return error.CommitDecisionUnknown,
+                else => {},
+            };
             last_status_error = status_err;
             break :status_failure null;
         };
@@ -3048,28 +3050,28 @@ fn runResolveFollowerFanout(
     }
 }
 
+fn preparationRequest(txn_id: db_mod.types.TxnId, requirement: preparation_protocol.Requirement, participant: ParticipantTxn, locator: []const u8, budget: table_catalog.RoutingBudget) !preparation_protocol.SealRequest {
+    try budget.checkpoint();
+    var hash = std.crypto.hash.Blake3.init(.{});
+    var offset: usize = 0;
+    while (offset < locator.len) {
+        try budget.checkpoint();
+        const n = @min(@as(usize, 4096), locator.len - offset);
+        hash.update(locator[offset..][0..n]);
+        offset += n;
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    const fence = participant.route_fence orelse return error.PreparedTransactionProtocolUnavailable;
+    try fence.validate();
+    if (fence.route.group_id != participant.group_id or fence.topology_epoch != participant.topology_epoch) return error.PreparationContractConflict;
+    return .{ .txn_id = txn_id, .group_id = participant.group_id, .topology_epoch = participant.topology_epoch, .participant_digest = digest, .route_digest = preparation_protocol.routeDigest(fence), .requirement = requirement };
+}
+
 fn sealPreparedParticipants(alloc: std.mem.Allocator, worker: ParticipantWorker, txn_id: db_mod.types.TxnId, participants: []const ParticipantTxn, participant_ids: []const []const u8, budget: table_catalog.RoutingBudget) !void {
     for (participants, participant_ids) |participant, locator| {
-        try budget.checkpoint();
-        var hash = std.crypto.hash.Blake3.init(.{});
-        var offset: usize = 0;
-        while (offset < locator.len) {
-            try budget.checkpoint();
-            const n = @min(@as(usize, 4096), locator.len - offset);
-            hash.update(locator[offset..][0..n]);
-            offset += n;
-        }
-        var digest: [32]u8 = undefined;
-        hash.final(&digest);
-        const route_digest = preparation_protocol.routeDigest(participant.route_fence orelse return error.PreparedTransactionProtocolUnavailable);
-        try worker.forPreparationParticipant(&participant).sealGroup(alloc, participant.group_id, participant.table_name, .{
-            .txn_id = txn_id,
-            .group_id = participant.group_id,
-            .topology_epoch = participant.topology_epoch,
-            .participant_digest = digest,
-            .route_digest = route_digest,
-            .requirement = worker.preparation.?,
-        });
+        const request = try preparationRequest(txn_id, worker.preparation.?, participant, locator, budget);
+        try worker.forPreparationParticipant(&participant).sealGroup(alloc, participant.group_id, participant.table_name, request);
     }
 }
 
@@ -8577,6 +8579,7 @@ const PreparedCoordinatorFixture = struct {
         .durable_seal = true,
         .recovery_consumes_effects = true,
         .retained_contract = true,
+        .bound_retained_contract = true,
         .catalog_migration_complete = true,
         .import_policy_fenced = true,
         .deferred = true,
@@ -8598,6 +8601,11 @@ const PreparedCoordinatorFixture = struct {
     mismatch_seal: bool = false,
     mode: preparation_protocol.Mode = .synchronous,
     decision: ?ParticipantWorker.PreparationDecision = null,
+    saved_bindings: [2]?@import("antfly_local_sources").storage_prepared_transaction_effects.Binding = .{ null, null },
+    status_override: ?ParticipantWorker.PreparationDecision = null,
+    typed_status_calls: usize = 0,
+    legacy_status_calls: usize = 0,
+    fail_commit_reply: bool = false,
     plan_store: ?contract.ParticipantPlanStore = null,
     catalog_override: ?table_catalog.CatalogSource = null,
     fn event(self: *@This(), e: Event) void {
@@ -8647,12 +8655,25 @@ const PreparedCoordinatorFixture = struct {
     fn prepareLegacy(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {
         return error.TestLegacyFallback;
     }
-    fn begin(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest, requirement: preparation_protocol.Requirement, _: PreDecisionContext, _: ?runnable_abi.Borrowed) !void {
+    fn savedBinding(group: u64) !@import("antfly_local_sources").storage_prepared_transaction_effects.Binding {
+        const locator = try participantIdForGroup(std.testing.allocator, "docs", group);
+        defer std.testing.allocator.free(locator);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(locator, &digest, .{});
+        const fence = (try routeFence(undefined, group)).?;
+        return .{ .group_id = group, .topology_epoch = fence.topology_epoch, .participant_digest = digest, .route_digest = preparation_protocol.routeDigest(fence) };
+    }
+    fn begin(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: TxnBeginRequest, requirement: preparation_protocol.Requirement, context: PreDecisionContext, _: ?runnable_abi.Borrowed) !void {
         const self = cast(raw);
         try std.testing.expectEqual(self.mode, requirement.mode);
         try std.testing.expectEqual(@as(usize, 2), self.count - self.begins);
         self.event(.begin);
         self.begins += 1;
+        const locator = try participantIdForGroupScoped(alloc, table, group, request.restore_staging_scope, request.restore_staging_plan_id);
+        defer alloc.free(locator);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(locator, &digest, .{});
+        self.saved_bindings[if (group == 7001) 0 else 1] = .{ .group_id = group, .topology_epoch = request.topology_epoch, .participant_digest = digest, .route_digest = preparation_protocol.routeDigest(context.route_fence.?) };
         if (self.race_legacy_after_begin) return error.DecisionConflict;
     }
     fn prepare(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: TxnPrepareRequest, requirement: preparation_protocol.Requirement, _: PreDecisionContext, _: ?runnable_abi.Borrowed) !void {
@@ -8680,6 +8701,14 @@ const PreparedCoordinatorFixture = struct {
             if (self.decision == null or self.decision.?.status != .committed) try std.testing.expectEqual(@as(usize, 2), self.seals);
             self.event(.commit);
             self.commits += 1;
+            if (group == 7001) {
+                const prior = self.decision;
+                self.decision = .{ .status = .committed, .requirement = if (prior) |old| old.requirement else .{ .mode = self.mode }, .binding = self.saved_bindings[0] orelse if (prior) |old| old.binding else null };
+                if (self.fail_commit_reply) {
+                    self.fail_commit_reply = false;
+                    return error.Timeout;
+                }
+            }
         } else {
             self.event(.abort);
             self.aborts += 1;
@@ -8688,6 +8717,7 @@ const PreparedCoordinatorFixture = struct {
     }
     fn status(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
         const self = cast(raw);
+        self.legacy_status_calls += 1;
         return if (group == 7001 and self.decision != null) self.decision.?.status else self.states[if (group == 7001) 0 else 1];
     }
     fn resolveUntil(raw: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, request: TxnResolveRequest, _: u64) !void {
@@ -8706,6 +8736,8 @@ const PreparedCoordinatorFixture = struct {
     }
     fn preparedStatus(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnStatusRequest, _: u64, _: ?runnable_abi.Borrowed) !ParticipantWorker.PreparationDecision {
         const self = cast(raw);
+        self.typed_status_calls += 1;
+        if (self.status_override) |value| return value;
         if (self.race_legacy_after_begin and self.begins != 0) return .{ .status = .committed, .requirement = null };
         return self.decision orelse return error.TxnNotFound;
     }
@@ -8751,13 +8783,13 @@ test "distributed txn prepared protocol producer seal failure and stale receipt 
 }
 
 test "distributed txn prepared protocol retained terminal decisions never upgrade or require new readiness" {
-    var committed: PreparedCoordinatorFixture = .{ .blocked = 7001, .decision = .{ .status = .committed, .requirement = .{ .mode = .synchronous } } };
+    var committed: PreparedCoordinatorFixture = .{ .blocked = 7001, .decision = .{ .status = .committed, .requirement = .{ .mode = .synchronous }, .binding = try PreparedCoordinatorFixture.savedBinding(7001) } };
     try std.testing.expect((try committed.run(.full_index, true)) == .committed);
     try std.testing.expectEqual(@as(usize, 0), committed.begins);
     try std.testing.expectEqual(@as(usize, 0), committed.prepares);
     try std.testing.expectEqual(@as(usize, 0), committed.seals);
     try std.testing.expectEqual(@as(usize, 2), committed.commits);
-    var weaker: PreparedCoordinatorFixture = .{ .blocked = 7001, .decision = .{ .status = .committed, .requirement = .{ .mode = .synchronous } } };
+    var weaker: PreparedCoordinatorFixture = .{ .blocked = 7001, .decision = .{ .status = .committed, .requirement = .{ .mode = .synchronous }, .binding = try PreparedCoordinatorFixture.savedBinding(7001) } };
     try std.testing.expect((try weaker.run(.write, true)) == .committed);
     try std.testing.expectEqual(@as(usize, 0), weaker.begins);
     try std.testing.expectEqual(@as(usize, 2), weaker.commits);
@@ -8860,7 +8892,7 @@ test "distributed txn prepared protocol honors supplied authority and detaches i
 }
 
 test "distributed txn prepared protocol requires each migration and durable capability" {
-    inline for (.{ "durable_begin", "durable_seal", "recovery_consumes_effects", "retained_contract", "catalog_migration_complete", "import_policy_fenced", "synchronous" }) |field| {
+    inline for (.{ "durable_begin", "durable_seal", "recovery_consumes_effects", "retained_contract", "bound_retained_contract", "catalog_migration_complete", "import_policy_fenced", "synchronous" }) |field| {
         var capabilities = PreparedCoordinatorFixture.ready;
         @field(capabilities, field) = false;
         try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, capabilities.require(.{ .mode = .synchronous }));
@@ -8971,7 +9003,7 @@ test "distributed txn original cohort survives routing loss and failed publicati
         try std.testing.expectEqual(@as(u64, 7001), durable.value.participants[0].group_id);
         try std.testing.expectEqual(@as(u64, 7002), durable.value.participants[1].group_id);
         const unavailable: table_catalog.CatalogSource = .{ .ptr = &store, .vtable = &.{ .admin_snapshot = Store.unavailable, .free_admin_snapshot = PreparedCoordinatorFixture.freeSnapshot } };
-        var retry: PreparedCoordinatorFixture = .{ .mode = mode, .plan_store = store.port(), .catalog_override = unavailable, .blocked = 7001, .decision = .{ .status = .committed, .requirement = .{ .mode = mode } } };
+        var retry: PreparedCoordinatorFixture = .{ .mode = mode, .plan_store = store.port(), .catalog_override = unavailable, .blocked = 7001, .decision = .{ .status = .committed, .requirement = .{ .mode = mode }, .binding = try PreparedCoordinatorFixture.savedBinding(7001) } };
         const result = try retry.run(.write, true);
         try std.testing.expect(result == .committed);
         // The returned label still borrows the caller's request after the
@@ -9053,4 +9085,90 @@ test "distributed txn original cohort resumes legacy commits without fresh admis
     try std.testing.expectEqual(@as(usize, 2), fixture.commits);
     try std.testing.expectEqual(@as(usize, 0), fixture.begins);
     try std.testing.expectEqual(@as(usize, 0), fixture.aborts);
+}
+
+test "distributed txn prepared protocol retained decisions reject every binding drift before mutation" {
+    const good = try PreparedCoordinatorFixture.savedBinding(7001);
+    for (std.meta.tags(preparation_protocol.Mode)) |mode| {
+        for (0..5) |failure| {
+            var changed = good;
+            switch (failure) {
+                0 => {},
+                1 => changed.group_id += 1,
+                2 => changed.topology_epoch +%= 1,
+                3 => changed.participant_digest[0] ^= 1,
+                4 => changed.route_digest[0] ^= 1,
+                else => unreachable,
+            }
+            for ([_]db_mod.types.TxnStatus{ .pending, .committed }) |state| {
+                var fixture: PreparedCoordinatorFixture = .{ .mode = mode, .decision = .{ .status = state, .requirement = .{ .mode = mode }, .binding = if (failure == 0) null else changed } };
+                try std.testing.expectError(error.PreparationContractConflict, fixture.run(.write, true));
+                try std.testing.expectEqual(@as(usize, 0), fixture.begins);
+                try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+                try std.testing.expectEqual(@as(usize, 0), fixture.aborts);
+                try std.testing.expectEqual(@as(usize, 0), fixture.legacy_status_calls);
+            }
+        }
+    }
+}
+
+test "distributed txn prepared protocol ambiguous commit requires saved binding and never falls back to legacy status" {
+    const good = try PreparedCoordinatorFixture.savedBinding(7001);
+    for (std.meta.tags(preparation_protocol.Mode)) |mode| {
+        var accepted: PreparedCoordinatorFixture = .{ .mode = mode, .fail_commit_reply = true };
+        try std.testing.expect((try accepted.run(.write, false)) == .committed);
+        try std.testing.expectEqual(@as(usize, 1), accepted.typed_status_calls);
+        try std.testing.expectEqual(@as(usize, 0), accepted.legacy_status_calls);
+        try std.testing.expectEqualDeep(good, accepted.decision.?.binding.?);
+        try std.testing.expectEqual(@as(usize, 2), accepted.commits);
+        for (0..6) |failure| {
+            var changed = good;
+            switch (failure) {
+                0, 1 => {},
+                2 => changed.group_id += 1,
+                3 => changed.topology_epoch +%= 1,
+                4 => changed.participant_digest[0] ^= 1,
+                5 => changed.route_digest[0] ^= 1,
+                else => unreachable,
+            }
+            var rejected: PreparedCoordinatorFixture = .{ .mode = mode, .fail_commit_reply = true, .status_override = .{ .status = .committed, .requirement = if (failure == 0) null else .{ .mode = mode }, .binding = if (failure == 1) null else changed } };
+            try std.testing.expectError(error.CommitDecisionUnknown, rejected.run(.write, false));
+            try std.testing.expectEqual(@as(usize, 1), rejected.commits);
+            try std.testing.expectEqual(@as(usize, 0), rejected.aborts);
+            try std.testing.expectEqual(@as(usize, 0), rejected.legacy_status_calls);
+            try std.testing.expectEqual(@as(usize, 1), rejected.typed_status_calls);
+        }
+    }
+}
+
+test "distributed txn prepared protocol recovery status binds hidden scope and keeps terminal aborts" {
+    const alloc = std.testing.allocator;
+    const fence = (try PreparedCoordinatorFixture.routeFence(undefined, 7001)).?;
+    var participant: ParticipantTxn = .{ .table_name = "docs", .group_id = 7001, .topology_epoch = fence.topology_epoch, .route_fence = fence, .restore_staging_scope = @splat(1), .restore_staging_plan_id = @splat(2) };
+    const locator = try participantIdForGroupScoped(alloc, participant.table_name, participant.group_id, participant.restore_staging_scope, participant.restore_staging_plan_id);
+    defer alloc.free(locator);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(locator, &digest, .{});
+    const saved: @import("antfly_local_sources").storage_prepared_transaction_effects.Binding = .{ .group_id = 7001, .topology_epoch = fence.topology_epoch, .participant_digest = digest, .route_digest = preparation_protocol.routeDigest(fence) };
+    for (std.meta.tags(preparation_protocol.Mode)) |mode| {
+        var fixture: PreparedCoordinatorFixture = .{ .decision = .{ .status = .committed, .requirement = .{ .mode = mode }, .binding = saved } };
+        var worker = fixture.worker();
+        worker.preparation = .{ .mode = mode };
+        const deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+        try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try worker.statusForPreparation(alloc, participant, @splat(1), deadline));
+        participant.restore_staging_plan_id.?[0] ^= 1;
+        try std.testing.expectError(error.PreparationContractConflict, worker.statusForPreparation(alloc, participant, @splat(1), deadline));
+        participant.restore_staging_plan_id.?[0] ^= 1;
+        participant.restore_staging_scope.?[0] ^= 1;
+        try std.testing.expectError(error.PreparationContractConflict, worker.statusForPreparation(alloc, participant, @splat(1), deadline));
+        participant.restore_staging_scope.?[0] ^= 1;
+        fixture.decision = .{ .status = .aborted, .requirement = null, .binding = saved };
+        try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try worker.statusForPreparation(alloc, participant, @splat(1), deadline));
+        participant.restore_staging_scope.?[0] ^= 1;
+        try std.testing.expectError(error.PreparationContractConflict, worker.statusForPreparation(alloc, participant, @splat(1), deadline));
+        participant.restore_staging_scope.?[0] ^= 1;
+        fixture.decision = .{ .status = .aborted, .requirement = null };
+        try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try worker.statusForPreparation(alloc, participant, @splat(1), deadline));
+        try std.testing.expectEqual(@as(usize, 0), fixture.legacy_status_calls);
+    }
 }

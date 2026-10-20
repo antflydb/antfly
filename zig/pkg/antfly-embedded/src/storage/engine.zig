@@ -204,6 +204,7 @@ pub const VTable = struct {
     beginTransactionWithParticipants: *const fn (self: *DB, timestamp_ns: u64, participants: []const []const u8) Outcome(@import("transactions.zig").TxnId),
     writeReplicatedTransactionWithRequirementAtOrderedReceipt: *const fn (self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt, requirement: ?@import("db/prepared_transaction_effects.zig").Requirement) Outcome(void),
     writeReplicatedTransactionAtOrderedReceipt: *const fn (self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, identity: db.OrderedApplyReceipt) Outcome(void),
+    getTransactionPreparationDecision: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, original: ?@import("../common/read_admission.zig").Port) Outcome(@import("transactions.zig").TxnManager.PreparationDecision),
     getTransactionStatus: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId) Outcome(@import("transactions.zig").TxnStatus),
     transactionDefersCoordinatorAcknowledgement: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId) Outcome(bool),
     transactionRetainsCoordinatorAcknowledgement: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId) Outcome(bool),
@@ -536,7 +537,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 27,
+    version: u32 = 28,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,

@@ -1409,6 +1409,10 @@ fn writeReplicatedTransactionWithRequirementAtOrderedReceipt(self: *DB, txn_id: 
     return .{ .value = self.writeReplicatedTransactionWithRequirementAtOrderedReceipt(txn_id, req, identity, requirement) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn getTransactionPreparationDecision(self: *DB, txn_id: @import("transactions.zig").TxnId, original: ?@import("../common/read_admission.zig").Port) engine.Outcome(@import("transactions.zig").TxnManager.PreparationDecision) {
+    return .{ .value = self.getTransactionPreparationDecision(txn_id, original) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn getTransactionStatus(self: *DB, txn_id: @import("transactions.zig").TxnId) engine.Outcome(@import("transactions.zig").TxnStatus) {
     return .{ .value = self.getTransactionStatus(txn_id) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

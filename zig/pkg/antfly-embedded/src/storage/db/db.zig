@@ -24958,6 +24958,21 @@ pub const DB = struct {
         return try self.core.getTransactionStatus(txn_id);
     }
 
+    /// One coherent status/mode/binding observation. The caller establishes
+    /// its quorum/owner read barrier before entering this local storage read.
+    pub fn getTransactionPreparationDecision(self: *DB, txn_id: transactions_mod.TxnId, original: ?@import("../../common/read_admission.zig").Port) !transactions_mod.TxnManager.PreparationDecision {
+        if (comptime storage_engine.enabled) return storage_engine.call("getTransactionPreparationDecision", .{ self, txn_id, original });
+        var trace: transactions_mod.MutationAdmissionTrace = .{};
+        const control = trace.bind(original);
+        if (control) |owner| try @import("../../common/read_admission.zig").lockShared(self.core.apply_mutex, owner) else self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        var manager = try self.core.initTxnManager();
+        defer manager.deinit();
+        const decision = manager.getPreparationDecision(txn_id, control) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| return cause;
+        return decision;
+    }
+
     pub fn getCommitVersion(self: *DB, txn_id: transactions_mod.TxnId) !u64 {
         return try self.core.getCommitVersion(txn_id);
     }

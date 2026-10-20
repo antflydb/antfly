@@ -331,6 +331,8 @@ test "required replicated begin bound seal receipts survive restart and reject r
             const durable = try manager.getBoundPreparedSealReceipt(id, binding, null);
             const receipt = sources.api_prepared_transaction_protocol.SealReceipt.fromDurable(durable);
             try receipt.validate(expected);
+            const decision = sources.api_prepared_transaction_protocol.Decision.fromDurable(try db.getTransactionPreparationDecision(id, null));
+            try std.testing.expectEqual(sources.storage_transactions.TxnStatus.pending, try decision.validate(expected.requirement, binding));
             fingerprint = receipt.frame_digest;
         }
         var reopened = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
@@ -342,9 +344,50 @@ test "required replicated begin bound seal receipts survive restart and reject r
         try std.testing.expectEqualSlices(u8, &fingerprint, &receipt.frame_digest);
         try reopened.resolveReplicatedTransactionAtOrderedReceipt(id, .committed, 100, .write, .none, .{ .term = 1, .index = 4 }, null);
         try std.testing.expectEqualDeep(binding, (try manager.getPreparationDecision(id, null)).binding.?);
+        const decision = sources.api_prepared_transaction_protocol.Decision.fromDurable(try reopened.getTransactionPreparationDecision(id, null));
+        try std.testing.expectEqual(sources.storage_transactions.TxnStatus.committed, try decision.validate(expected.requirement, binding));
+        try assertPreparationStatusAdmission(&reopened, id);
         try std.testing.expectError(error.PreparedEffectsRequired, manager.getBoundPreparedSealReceipt(id, binding, null));
         var read = try reopened.core.store.beginReadTxn();
         defer read.abort();
         try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, sources.storage_db_catalog_resolver_catalog.readMinimumReaderVersion(&read, 6));
+    }
+}
+
+fn assertPreparationStatusAdmission(db: *db_mod.DB, id: [16]u8) !void {
+    const admission = sources.common_read_admission;
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ordinal = self.calls;
+            self.calls += 1;
+            if (ordinal == self.fail_at) return self.cause;
+        }
+        fn port(self: *@This()) admission.Payload {
+            return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .check_lifetime = check, .wait_for_progress = check } };
+        }
+    };
+    var baseline: Control = .{};
+    const initial = baseline.port();
+    _ = try db.getTransactionPreparationDecision(id, admission.Port.init(&initial));
+    for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.MemoryLimitExceeded }) |cause| {
+        for (0..baseline.calls) |ordinal| {
+            var original: Control = .{ .fail_at = ordinal, .cause = cause };
+            const payload = original.port();
+            try std.testing.expectError(cause, db.getTransactionPreparationDecision(id, admission.Port.init(&payload)));
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApplyExclusive();
+        }
+        // A control read yields while a writer holds publication authority;
+        // the wait's original rejection cannot become missing transaction.
+        db.core.lockApplyExclusive();
+        var original: Control = .{ .fail_at = 1, .cause = cause };
+        const payload = original.port();
+        const observed = db.getTransactionPreparationDecision(id, admission.Port.init(&payload));
+        db.core.unlockApplyExclusive();
+        try std.testing.expectError(cause, observed);
     }
 }
