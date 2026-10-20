@@ -4184,6 +4184,11 @@ test "producer summaries and scalar seeds release every failed allocation" {
         "WITH reverse([x IN range(1,3)|toString(x)]) AS xs RETURN head(xs),last(xs),size(xs)",
         "UNWIND range(1,3) AS x RETURN EXISTS { MATCH(n:Document) WHERE n.rank=x },head([(a:Document {rank:x})-[:CITES]->(b)|b.title]) ORDER BY x DESC LIMIT 2",
         "UNWIND range(1,1000000000) AS x RETURN count(*)",
+        "WITH range(1,1000000000) AS xs WITH xs AS ys UNWIND ys AS x RETURN count(x),count(DISTINCT x)",
+        "WITH range(1,1000000000) AS xs WITH xs AS ys UNWIND ys AS x RETURN count(*),count(1)",
+        "WITH [x IN range(1,3)|toString(x)]+[4] AS xs RETURN head(xs),last(xs),size(xs)",
+        "UNWIND [1,2,3] AS n RETURN n IN [x IN [1,null]|x]",
+        "MATCH(a:Document {id:'a'}) UNWIND [1,2,3] AS n RETURN 'Beta' IN [(a)-[:CITES]->(b)|b.title]",
         "MATCH(a:Document {id:'a'}) RETURN [(a)-[:CITES]->(b)|[(b)-[:CITES]->(d)|d.title]]",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as([]const u8, text)});
 }
@@ -4260,5 +4265,67 @@ test "unobserved range axes reduce arithmetic multiplicity with checked lazy res
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.rows.len);
         if (std.mem.indexOf(u8, text, "count(*)") != null) try std.testing.expectEqual(@as(i64, 1000000000), result.rows[0][0].integer);
+    }
+}
+
+test "range domains reduce value counts without leaking uniqueness across axes" {
+    try check("UNWIND range(1,3) AS x RETURN count(x),count(DISTINCT x)", "[[3,3]]");
+    try check("UNWIND range(-2,-5,-1) AS x RETURN count(x),count(DISTINCT x)", "[[4,4]]");
+    try check("UNWIND range(1,0) AS x RETURN count(x),count(DISTINCT x)", "[[0,0]]");
+    try check("UNWIND [1,2] AS seed UNWIND range(1,3) AS x RETURN count(x),count(DISTINCT x)", "[[6,3]]");
+    try check("UNWIND [1,1] AS seed UNWIND range(1,3) AS x RETURN seed,count(x),count(DISTINCT x)", "[[1,6,3]]");
+    try check("UNWIND range(1,3) AS x WITH null AS x RETURN count(x),count(DISTINCT x)", "[[0,0]]");
+    try check("WITH {} AS n UNWIND range(1,3) AS x RETURN n{x},count(x) ORDER BY n{x}", "[[{\"x\":1},1],[{\"x\":2},1],[{\"x\":3},1]]");
+    for ([_][]const u8{
+        "UNWIND range(1,1000000000) AS x RETURN count(x),count(DISTINCT x)",
+        "WITH range(1,1000000000) AS xs WITH xs AS ys UNWIND ys AS x RETURN count(x),count(DISTINCT x)",
+        "WITH range(1,1000000000) AS xs WITH xs AS ys UNWIND ys AS x RETURN count(*),count(1)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 1000000000), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 1000000000), result.rows[0][1].integer);
+    }
+}
+
+test "producer forwarding captures one binding and preserves alias escapes and shadows" {
+    try check("WITH range(1,count(*)) AS xs UNWIND xs AS x RETURN x", "[[1]]");
+    try check("WITH 3 AS n WITH range(1,n) AS xs UNWIND xs AS x RETURN collect(x)", "[[[1,2,3]]]");
+    try check("WITH [n IN range(1,3)|toString(n)] AS xs WITH xs AS ys UNWIND ys AS x RETURN collect(x)", "[[[\"1\",\"2\",\"3\"]]]");
+    try check("WITH range(1,2) AS xs UNWIND xs AS x RETURN xs,x", "[[[1,2],1],[[1,2],2]]");
+    try check("WITH range(1,3) AS xs UNWIND xs AS x WITH null AS xs,x AS x RETURN count(xs),sum(x)", "[[0,6]]");
+    try check("WITH [x IN null|x] AS xs UNWIND xs AS x RETURN count(*)", "[[0]]");
+    try check("MATCH(a:Document {id:'a'}) WITH [(a)-[:CITES]->(b)|b.title] AS xs UNWIND xs AS title RETURN collect(title)", "[[[\"Beta\",\"Beta\"]]]");
+}
+
+test "concatenation composes list windows scalar overloads NULLs and aliases" {
+    try check("RETURN head([x IN range(1,3)|x]+[]),last([]+[x IN range(1,3)|x]),size([x IN range(1,3)|x]+[4,5])", "[[1,3,5]]");
+    try check("WITH [x IN range(1,3)|x]+[y IN range(4,6)|y] AS xs RETURN head(xs),last(xs),size(xs),xs[1..4],xs[-3..]", "[[1,6,6,[2,3,4],[4,5,6]]]");
+    try check("RETURN head(0+[x IN range(1,3)|x]),last([x IN range(1,3)|x]+4),head('a'+[1]),size([1]+{})", "[[0,4,\"a\",2]]");
+    try check("RETURN head([x IN range(1,3)|x]+null),size(null+[1]),head(reverse([1,2]+[3,4])),last([1]+reverse([2,3]))", "[[null,null,4,2]]");
+    try check("RETURN ([1]+[2])[0..10],([1]+[2])[-10..],head([]+[])", "[[[1,2],[1,2],null]]");
+}
+
+test "streaming membership preserves NULL eager errors and repeated invariant probes" {
+    try check("RETURN null IN [x IN []|x],null IN [x IN [1]|x],1 IN [x IN [null,2]|x],1 IN [x IN [null,1]|x]", "[[false,null,null,true]]");
+    try check("UNWIND range(1,3) AS n RETURN n IN [x IN [1,null]|x]", "[[true],[null],[null]]");
+    try check("MATCH(a:Document {id:'a'}) UNWIND [1,2,3] AS n RETURN 'Beta' IN [(a)-[:CITES]->(b)|b.title]", "[[true],[true],[true]]");
+    try check("MATCH(a:Document {id:'a'}) UNWIND [1,2,3] AS n RETURN n IN [(a)-[:CITES]->(b)|b.rank]", "[[false],[true],[false]]");
+    try check("RETURN 1 IN [x IN null|x],{x:null} IN [x IN [{x:null}]|x]", "[[null,null]]");
+    for ([_][]const u8{
+        "RETURN 1 IN [x IN [1,0]|1/x]",
+        "RETURN head([x IN [1,0]|1/x]+[])",
+        "RETURN head([1]+[x IN [1,0]|1/x])",
+        "WITH [x IN [1,0]|1/x] AS xs UNWIND xs AS x RETURN x LIMIT 1",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
     }
 }

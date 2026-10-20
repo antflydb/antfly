@@ -164,10 +164,19 @@ pub fn reversedList(expression: *const ast.Expr) ?*const ast.Expr {
     if (c.star or c.distinct or c.args.len != 1 or !std.ascii.eqlIgnoreCase(c.name, "reverse")) return null;
     return if (knownList(c.args[0])) c.args[0] else null;
 }
+pub fn concatenatedList(expression: *const ast.Expr) ?@FieldType(@FieldType(ast.Expr, "value"), "binary") {
+    if (expression.value != .binary or expression.value.binary.op != .add) return null;
+    const b = expression.value.binary;
+    return if (knownList(b.left) or knownList(b.right)) b else null;
+}
+pub fn composedList(expression: *const ast.Expr) bool {
+    return reversedList(expression) != null or concatenatedList(expression) != null;
+}
 fn knownList(expression: *const ast.Expr) bool {
     return switch (expression.value) {
         .list, .comprehension, .pattern_comprehension => true,
         .call => |c| reversedList(expression) != null or (!c.star and !c.distinct and (c.args.len == 2 or c.args.len == 3) and std.ascii.eqlIgnoreCase(c.name, "range")),
+        .binary => concatenatedList(expression) != null,
         else => false,
     };
 }

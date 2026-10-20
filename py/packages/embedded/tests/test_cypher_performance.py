@@ -5151,3 +5151,81 @@ def test_unobserved_range_axes_use_exact_arithmetic_bag_counts(graph_db):
             "g", {"query": f"UNWIND $xs AS x {tail}", "parameters": {"xs": list(range(1, 1001))}}
         )
         assert optimized["rows"] == explicit["rows"]
+
+
+def test_range_value_counts_use_domain_cardinality(graph_db):
+    for query in (
+        "UNWIND range(1,1000000000) AS x RETURN count(x),count(DISTINCT x)",
+        "WITH range(1,1000000000) AS xs WITH xs AS ys UNWIND ys AS x RETURN count(x),count(DISTINCT x)",
+    ):
+        response = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000}}
+        )
+        assert [cell["value"] for cell in response["rows"][0]] == ["1000000000", "1000000000"]
+    response = graph_db.cypher_json(
+        "g", {"query": "UNWIND [1,2] AS seed UNWIND range(1,3) AS x RETURN count(x),count(DISTINCT x)"}
+    )
+    assert [cell["value"] for cell in response["rows"][0]] == ["6", "3"]
+
+
+def test_unwind_aliases_forward_producers_without_materialization(graph_db):
+    for query, expected in (
+        ("WITH range(1,1000000000) AS xs UNWIND xs AS x RETURN x LIMIT 1", "1"),
+        ("WITH range(1,1000000000) AS xs WITH xs AS ys UNWIND ys AS x RETURN count(*)", "1000000000"),
+    ):
+        response = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000}}
+        )
+        assert response["rows"][0][0]["value"] == expected
+    word = "A" * 4096
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "WITH [y IN range(1,2000)|$word+toString(y)] AS xs WITH xs AS ys UNWIND ys AS x RETURN x LIMIT 1",
+            "parameters": {"word": word},
+            "limits": {"memory_bytes": 1 << 20},
+        },
+    )
+    assert response["rows"][0][0]["value"] == word + "1"
+
+
+def test_single_probe_membership_does_not_retain_source_or_index(graph_db):
+    mapped = "[y IN range(1,2000)|$word+toString(y)]"
+    for needle, expected in (("$word+'1'", True), ("'absent'", False)):
+        response = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"RETURN ({needle}) IN {mapped}",
+                "parameters": {"word": "A" * 4096},
+                "limits": {"memory_bytes": 1 << 20},
+            },
+        )
+        assert response["rows"][0][0]["value"] is expected
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,500) AS n RETURN count(CASE WHEN toString(n) IN [x IN range(1,1000)|toString(x)] THEN 1 END)",
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 100000},
+        },
+    )
+    assert response["rows"][0][0]["value"] == "500"
+
+
+def test_concatenation_consumers_propagate_cardinality_windows(graph_db):
+    mapped = "[y IN range(1,2000)|$word+toString(y)]"
+    word = "A" * 4096
+    for query, expected in (
+        (f"RETURN head({mapped}+[])", word + "1"),
+        (f"RETURN last([]+{mapped})", word + "2000"),
+        (f"RETURN size({mapped}+{mapped})", "4000"),
+        (f"WITH {mapped}+[] AS xs RETURN head(xs),last(xs),size(xs),xs[-2..]", word + "1"),
+        (f"RETURN head(0+{mapped})", "0"),
+        (f"RETURN head({mapped}+null)", None),
+    ):
+        response = graph_db.cypher_json(
+            "g", {"query": query, "parameters": {"word": word}, "limits": {"memory_bytes": 1 << 20}}
+        )
+        if expected is None:
+            assert response["rows"][0][0]["type"] == "null"
+        else:
+            assert response["rows"][0][0]["value"] == expected

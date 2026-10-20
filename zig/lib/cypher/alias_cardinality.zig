@@ -33,7 +33,7 @@ fn rangeProducer(expression: *const ast.Expr) bool {
     return expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "range") and !expression.value.call.star and !expression.value.call.distinct and (expression.value.call.args.len == 2 or expression.value.call.args.len == 3);
 }
 fn producer(expression: *const ast.Expr) bool {
-    return collectProducer(expression) or rangeProducer(expression) or expression.value == .comprehension or expression.value == .pattern_comprehension or @import("reduction.zig").reversedList(expression) != null;
+    return collectProducer(expression) or rangeProducer(expression) or expression.value == .comprehension or expression.value == .pattern_comprehension or @import("reduction.zig").composedList(expression);
 }
 fn directRange(expression: *const ast.Expr) ?*const ast.Expr {
     const input = switch (expression.value) {
@@ -91,6 +91,10 @@ const Flow = struct {
     fn scanProducer(self: *@This(), input: *const ast.Expr, names: Names, locals: ?*const expressions.Local, index: ?*Index) anyerror!void {
         switch (input.value) {
             .call => |call| try self.scan(call.args, names, locals, index),
+            .binary => |b| {
+                try self.scan(b.left, names, locals, index);
+                try self.scan(b.right, names, locals, index);
+            },
             .comprehension => |c| {
                 try self.scan(c.input, names, locals, index);
                 const local: expressions.Local = .{ .name = c.alias, .parent = locals };
