@@ -340,15 +340,19 @@ pub const ParticipantWorker = struct {
         try capabilities.require(requirement);
     }
 
-    fn statusForPreparation(self: ParticipantWorker, alloc: std.mem.Allocator, participant: ParticipantTxn, txn_id: db_mod.types.TxnId, deadline: u64) !db_mod.types.TxnStatus {
+    fn statusForPreparation(self: ParticipantWorker, alloc: std.mem.Allocator, participant: ParticipantTxn, txn_id: db_mod.types.TxnId, deadline: ?u64) !db_mod.types.TxnStatus {
         const request = participant.statusRequest(txn_id);
         const requirement = self.preparation orelse return self.statusGroupWithRequest(alloc, participant.group_id, participant.table_name, request, deadline);
         try self.checkExecution();
+        const bounded_deadline = deadline orelse recovery_deadline: {
+            var budget: @import("decision_recovery_budget.zig").Budget = .{ .now = platform_time.monotonicNs, .maximum_ns = coordinator_resolution_timeout_ns };
+            break :recovery_deadline try budget.deadline(self.execution_runnable);
+        };
         const callback = self.vtable.preparation_status_group orelse return error.PreparedTransactionProtocolUnavailable;
         const locator = try participantIdForGroupScoped(alloc, participant.table_name, participant.group_id, participant.restore_staging_scope, participant.restore_staging_plan_id);
         defer alloc.free(locator);
-        const expected = try preparationRequest(txn_id, requirement, participant, locator, .{ .deadline_ns = deadline });
-        const decision = try callback(self.ptr, alloc, participant.group_id, participant.table_name, request, deadline, self.preparationContext().execution_runnable);
+        const expected = try preparationRequest(txn_id, requirement, participant, locator, .{ .deadline_ns = bounded_deadline });
+        const decision = try callback(self.ptr, alloc, participant.group_id, participant.table_name, request, bounded_deadline, self.preparationContext().execution_runnable);
         try self.checkExecution();
         return decision.validate(requirement, expected.binding());
     }
@@ -4244,13 +4248,7 @@ fn abortParticipantsWithOptions(
         // applied; follower delivery remains recoverable from that record.
         .sync_level = .write,
     }) catch {
-        const status = worker.statusGroupWithRequest(
-            alloc,
-            coordinator.group_id,
-            coordinator.table_name,
-            coordinator.statusRequest(txn_id),
-            null,
-        ) catch return error.AbortDecisionNotDurable;
+        const status = worker.statusForPreparation(alloc, coordinator, txn_id, null) catch return error.AbortDecisionNotDurable;
         if (status != .aborted) return error.AbortDecisionNotDurable;
     };
 
@@ -4285,7 +4283,7 @@ fn abortParticipantsWithContactMask(
         .commit_version = timestamp,
         .sync_level = .write,
     }) catch {
-        const status = worker.statusGroupWithRequest(alloc, coordinator.group_id, coordinator.table_name, coordinator.statusRequest(txn_id), null) catch
+        const status = worker.statusForPreparation(alloc, coordinator, txn_id, null) catch
             return error.AbortDecisionNotDurable;
         if (status != .aborted) return error.AbortDecisionNotDurable;
     };
@@ -8606,6 +8604,8 @@ const PreparedCoordinatorFixture = struct {
     typed_status_calls: usize = 0,
     legacy_status_calls: usize = 0,
     fail_commit_reply: bool = false,
+    fail_abort_reply: bool = false,
+    fail_begin: u64 = 0,
     plan_store: ?contract.ParticipantPlanStore = null,
     catalog_override: ?table_catalog.CatalogSource = null,
     fn event(self: *@This(), e: Event) void {
@@ -8675,6 +8675,7 @@ const PreparedCoordinatorFixture = struct {
         std.crypto.hash.Blake3.hash(locator, &digest, .{});
         self.saved_bindings[if (group == 7001) 0 else 1] = .{ .group_id = group, .topology_epoch = request.topology_epoch, .participant_digest = digest, .route_digest = preparation_protocol.routeDigest(context.route_fence.?) };
         if (self.race_legacy_after_begin) return error.DecisionConflict;
+        if (group == self.fail_begin) return error.TestBeginFailed;
     }
     fn prepare(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: TxnPrepareRequest, requirement: preparation_protocol.Requirement, _: PreDecisionContext, _: ?runnable_abi.Borrowed) !void {
         const self = cast(raw);
@@ -8712,7 +8713,13 @@ const PreparedCoordinatorFixture = struct {
         } else {
             self.event(.abort);
             self.aborts += 1;
-            self.decision = .{ .status = .aborted, .requirement = null };
+            if (group == 7001) {
+                self.decision = .{ .status = .aborted, .requirement = if (self.saved_bindings[0] != null) .{ .mode = self.mode } else null, .binding = self.saved_bindings[0] };
+                if (self.fail_abort_reply) {
+                    self.fail_abort_reply = false;
+                    return error.Timeout;
+                }
+            }
         }
     }
     fn status(raw: *anyopaque, _: std.mem.Allocator, group: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
@@ -9170,5 +9177,39 @@ test "distributed txn prepared protocol recovery status binds hidden scope and k
         fixture.decision = .{ .status = .aborted, .requirement = null };
         try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try worker.statusForPreparation(alloc, participant, @splat(1), deadline));
         try std.testing.expectEqual(@as(usize, 0), fixture.legacy_status_calls);
+    }
+}
+
+test "distributed txn prepared protocol abort confirmation verifies binding before follower cleanup" {
+    const saved = try PreparedCoordinatorFixture.savedBinding(7001);
+    for (std.meta.tags(preparation_protocol.Mode)) |mode| {
+        for (0..2) |phase| {
+            // Exercise both the BEGIN contact-mask abort and the later full
+            // prepared-cohort abort. Legacy terminal aborts remain final.
+            for (0..2) |legacy| {
+                var accepted: PreparedCoordinatorFixture = .{ .mode = mode, .fail_abort_reply = true, .fail_begin = if (phase == 0) 7002 else 0, .fail_prepare = if (phase == 1) 7002 else 0, .status_override = if (legacy == 1) .{ .status = .aborted, .requirement = null } else null };
+                if (phase == 0) try std.testing.expectError(error.TransactionBeginFailed, accepted.run(.write, false)) else try std.testing.expectError(error.TestProducerFailed, accepted.run(.write, false));
+                try std.testing.expectEqual(@as(usize, 2), accepted.aborts);
+                try std.testing.expectEqual(@as(usize, 1), accepted.typed_status_calls);
+                try std.testing.expectEqual(@as(usize, 0), accepted.legacy_status_calls);
+                try std.testing.expectEqual(@as(usize, 0), accepted.commits);
+            }
+            for (0..4) |field| {
+                var drift = saved;
+                switch (field) {
+                    0 => drift.group_id += 1,
+                    1 => drift.topology_epoch +%= 1,
+                    2 => drift.participant_digest[0] ^= 1,
+                    3 => drift.route_digest[0] ^= 1,
+                    else => unreachable,
+                }
+                var rejected: PreparedCoordinatorFixture = .{ .mode = mode, .fail_abort_reply = true, .fail_begin = if (phase == 0) 7002 else 0, .fail_prepare = if (phase == 1) 7002 else 0, .status_override = .{ .status = .aborted, .requirement = null, .binding = drift } };
+                try std.testing.expectError(error.AbortDecisionNotDurable, rejected.run(.write, false));
+                try std.testing.expectEqual(@as(usize, 1), rejected.aborts);
+                try std.testing.expectEqual(@as(usize, 1), rejected.typed_status_calls);
+                try std.testing.expectEqual(@as(usize, 0), rejected.legacy_status_calls);
+                try std.testing.expectEqual(@as(usize, 0), rejected.commits);
+            }
+        }
     }
 }
