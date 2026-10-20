@@ -9162,7 +9162,8 @@ test "capi native memory decision explanation provenance survives reopen and scr
     defer if (id != null) antfly_db_close(id);
     const Calls = struct {
         fn validate(_: *anyopaque, _: @import("../memory/service.zig").types.Config) !void {}
-        fn decide(_: *anyopaque, alloc: Allocator, _: @import("../memory/service.zig").types.Config, _: @import("../memory/service.zig").types.Assertion, prior: []const @import("../memory/service.zig").types.StoredAssertion) !@import("../memory/service.zig").types.ReconciliationDecision {
+        fn decide(_: *anyopaque, alloc: Allocator, config: @import("../memory/service.zig").types.Config, incoming: @import("../memory/service.zig").types.Assertion, prior: []const @import("../memory/service.zig").types.StoredAssertion) !@import("../memory/service.zig").types.ReconciliationDecision {
+            if (std.mem.eql(u8, config.policy_version, "v2")) return .{ .supersedes = &.{}, .reason = try alloc.dupe(u8, incoming.reconciliation_reason orelse "No replacement") };
             return .{ .supersedes = try alloc.dupe([]const u8, &.{prior[0].assertion.id}), .reason = try std.fmt.allocPrint(alloc, "Replaces {s}", .{prior[0].assertion.statement}) };
         }
         fn call(handle: ?*anyopaque, body: []const u8) ![]u8 {
@@ -9199,6 +9200,18 @@ test "capi native memory decision explanation provenance survives reopen and scr
         _ = try service.execute(alloc, .assertions, "", "{\"assertions\":[{\"id\":\"old\",\"subject\":\"production\",\"predicate\":\"credential\",\"value\":\"old\",\"statement\":\"Retired secret\",\"evidence\":[{\"id\":\"old-source\"}]}]}", "old");
         service.context.now_ms = 4;
         _ = try service.execute(alloc, .assertions, "", "{\"assertions\":[{\"id\":\"new\",\"subject\":\"production\",\"predicate\":\"credential\",\"value\":\"new\",\"statement\":\"Rotated\",\"evidence\":[{\"id\":\"new-source\"}]}]}", "new");
+        service.context.now_ms = 5;
+        const memory_types = engine.service.types;
+        const competitor: memory_types.Assertion = .{ .id = "competitor-41", .subject = "production", .predicate = "credential", .value = "third", .statement = "Independent third value", .stability = .provisional, .evidence = &.{.{ .id = "new-source" }} };
+        _ = try service.execute(alloc, .assertions, "", try std.json.Stringify.valueAlloc(alloc, .{ .assertions = &.{competitor} }, .{}), "competitor");
+        const current = try std.json.parseFromSliceLeaky(memory_types.StoredAssertion, alloc, try service.execute(alloc, .get, competitor.id, "{}", ""), .{});
+        const correction: memory_types.Correction = .{ .id = competitor.id, .expected_revision = current.revision, .lifecycle = .active, .stability = .settled, .reason = "Verified", .evidence = &.{.{ .id = "new-source" }} };
+        _ = try service.execute(alloc, .correct, "", try std.json.Stringify.valueAlloc(alloc, correction, .{}), "settle");
+        const inspected = try std.json.parseFromSliceLeaky(memory_types.Inspection, alloc, try service.execute(alloc, .inspect, "", "{}", ""), .{});
+        var config = inspected.state.config;
+        config.policy_version = "v2";
+        service.context.now_ms = 6;
+        _ = try service.execute(alloc, .configure, "", try std.json.Stringify.valueAlloc(alloc, .{ .expected_revision = inspected.state.revision, .config = config }, .{}), "rebuild");
     }
     antfly_db_close(id);
     id = null;

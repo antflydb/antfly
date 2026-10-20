@@ -106,9 +106,15 @@ explicit disposition explanation independently. Forgetting or expiry of an input
 redacts affected explanations across point reads, history, enumeration and recall;
 cleanup scrubs the stored text while preserving the supported fact and accepted
 lifecycle decision. New inference receives only authorized, already redacted
-candidate explanations. A manual correction replaces disposition provenance without
-removing the original assertion explanation's fences. Lifecycle edits inherit
-bindings; recomputation publishes a new artifact instead of rewriting old history.
+incoming and candidate explanations. Rebuilds capture the incoming explanation's
+previous immutable artifact before replacing its text, so repeated policy/identity
+re-evaluation preserves transitive forgetting fences. This edge refers directly to
+the previous artifact, not to an assertion history row rewritten in the same
+transaction. Redacted incoming explanations contribute neither text nor an inherited
+explanation edge to new inference. A manual correction replaces disposition
+provenance without removing the original assertion explanation's fences. Lifecycle
+edits inherit bindings; recomputation publishes a new artifact instead of rewriting
+old history.
 Entity cleanup retains a durable identity tombstone. A retired entity ID cannot
 become an untyped raw ID or be reused for a different entity after its payload is
 removed; typed identity dependencies remain fenced through cleanup and restart.

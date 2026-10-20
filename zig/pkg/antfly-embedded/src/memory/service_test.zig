@@ -1339,3 +1339,67 @@ test "memory decision inputs retain correction evidence before same-revision pro
         try std.testing.expect(std.mem.indexOf(u8, raw, "Sensitive justification") == null);
     }
 }
+
+fn repeatIncomingExplanation(_: *anyopaque, a: A, _: m.types.Config, incoming: m.types.Assertion, _: []const m.types.StoredAssertion) !m.types.ReconciliationDecision {
+    return .{ .supersedes = &.{}, .reason = try a.dupe(u8, incoming.reconciliation_reason orelse "No replacement") };
+}
+fn requireRedactedIncomingExplanation(ptr: *anyopaque, a: A, config: m.types.Config, incoming: m.types.Assertion, prior: []const m.types.StoredAssertion) !m.types.ReconciliationDecision {
+    if (incoming.reconciliation_reason) |reason| try std.testing.expect(std.mem.indexOf(u8, reason, "secret-123") == null);
+    try std.testing.expect(std.mem.indexOf(u8, try std.json.Stringify.valueAlloc(a, prior, .{}), "secret-123") == null);
+    return repeatIncomingExplanation(ptr, a, config, incoming, prior);
+}
+test "memory rebuilt incoming explanations preserve provenance across forgetting and cleanup" {
+    for ([_]usize{ 1, 2 }) |rebuild_count| {
+        for ([_][]const u8{ "competitor-0", "competitor-41" }) |competitor| {
+            for (0..4) |mode| {
+                var store = Store.init();
+                defer store.deinit();
+                const a = store.arena.allocator();
+                try decisionSetup(&store, mode == 2);
+                var service = decisionService(&store, 5);
+                service.backend.decide = repeatIncomingExplanation;
+                const claim: m.types.Assertion = .{ .id = competitor, .subject = "production", .predicate = "credential", .value = competitor, .statement = "Independent third value", .stability = .provisional, .valid_from = 300, .evidence = &.{.{ .id = "new" }} };
+                _ = try service.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{claim} }, .{}), "competitor");
+                const current = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 5).execute(a, .get, competitor, "{}", ""), .{});
+                const correction: m.types.Correction = .{ .id = competitor, .expected_revision = current.revision, .lifecycle = .active, .stability = .settled, .reason = "Verified", .evidence = &.{.{ .id = "new" }} };
+                _ = try store.service("alice", true, 6).execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, correction, .{}), "settle");
+                const inspected = try std.json.parseFromSliceLeaky(m.types.Inspection, a, try store.service("alice", true, 6).execute(a, .inspect, "", "{}", ""), .{});
+                var config = decisionConfig();
+                var expected_revision = inspected.state.revision;
+                const versions = [_][]const u8{ "v2", "v3" };
+                for (versions[0..rebuild_count]) |version| {
+                    config.policy_version = version;
+                    service = decisionService(&store, 7);
+                    service.backend.decide = repeatIncomingExplanation;
+                    _ = try service.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = expected_revision, .config = config }, .{}), version);
+                    expected_revision += 1;
+                }
+                const before = try store.service("alice", true, 8).execute(a, .get, "new", "{}", "");
+                try std.testing.expect(std.mem.indexOf(u8, before, "secret-123") != null);
+                if (mode != 2) _ = try store.service("alice", true, 11).execute(a, .forget, "", if (mode == 0) "{\"evidence_ids\":[\"old-source\"]}" else if (mode == 1) "{\"assertion_ids\":[\"old\"]}" else "{\"source_ids\":[\"old\"]}", "forget");
+                const after = try store.service("alice", true, 11).execute(a, .get, "new", "{}", "");
+                try std.testing.expect(std.mem.indexOf(u8, after, "secret-123") == null);
+                for ([_]m.Action{ .history, .list, .recall }) |action| {
+                    const raw = try store.service("alice", true, 11).execute(a, action, if (action == .history) "new" else "", if (action == .history) "{}" else "{\"valid_at\":400,\"token_budget\":8192}", "");
+                    try std.testing.expect(std.mem.indexOf(u8, raw, "secret-123") == null);
+                }
+                for (0..32) |step| _ = try store.service("alice", true, @intCast(step + 12)).execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{step}));
+                const cleaned = try store.service("alice", true, 50).execute(a, .get, "new", "{}", "");
+                const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, cleaned, .{});
+                try std.testing.expectEqual(m.types.Lifecycle.active, record.lifecycle);
+                try std.testing.expect(record.assertion.reconciliation_reason == null);
+                var rows = store.values.iterator();
+                while (rows.next()) |row| if (std.mem.startsWith(u8, row.key_ptr.*, "assertion/") or std.mem.startsWith(u8, row.key_ptr.*, "history/")) {
+                    try std.testing.expect(std.mem.indexOf(u8, row.value_ptr.*, "secret-123") == null);
+                };
+                const latest = try std.json.parseFromSliceLeaky(m.types.Inspection, a, try store.service("alice", true, 51).execute(a, .inspect, "", "{}", ""), .{});
+                config.policy_version = "v4";
+                service = decisionService(&store, 52);
+                service.backend.decide = requireRedactedIncomingExplanation;
+                _ = try service.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = latest.state.revision, .config = config }, .{}), "rebuild-after-forget");
+                const refreshed = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 53).execute(a, .get, "new", "{}", ""), .{});
+                try std.testing.expectEqualStrings("No replacement", refreshed.assertion.reconciliation_reason.?);
+            }
+        }
+    }
+}
