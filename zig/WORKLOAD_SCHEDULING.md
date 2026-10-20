@@ -25,6 +25,16 @@ cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
 
+Source `4c8ab4ee1a7143dc0e06b1e887475e7b0cb5afb7` adds key-plan derivation from canonical prepared requests
+and every accepted-effect family, with field/action coverage guards, conservative
+graph/tombstone bounds and owned deduplicated document prefixes. The new writer
+entry derives its reservation from the stored frame and checks original lifetime
+and file eligibility before payload lookup. The 66-case native run and 25/25
+unchanged-consumer composition checks pass. The prepared request still needs its
+authoritative intent/catalog provenance binding; this does not enable normal
+PREPARE or supply derived-log/recovery resources. See the implementation ledger
+for the exact proof and remaining full-design work.
+
 Source `28afa047da9b0f97af35f9e5bdc80c866bc02c38` adds internal durable HA replay grants bound to stored
 prepared frames and known physical inventory. Background writes atomically update
 inventory and reserved publication bytes; materialization keeps credit until HA

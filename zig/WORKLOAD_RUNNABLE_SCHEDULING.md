@@ -19,6 +19,64 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Canonical prepared replay key plans (2026-10-20)
+
+Source `4c8ab4ee1a7143dc0e06b1e887475e7b0cb5afb7` derives replay wire costs and owned physical document-prefix
+roots from the canonical prepared request batch and all seven accepted-effect
+families. The request walker classifies every DerivedBatch field; the accepted
+walker classifies every PrecomputedGeneratedBatch field. Compile-time field
+coverage and an exhaustive document-action switch require an explicit decision
+when either contract grows. Upserts, document deletes and preserved base documents
+have separate contributions. Preserved graph-only rows do not invent primary-row
+notifications.
+
+The estimate includes explicit artifact tombstones in both deletion/artifact
+lanes, graph owner/source/target wake-ups, generated documents outside the request,
+vector artifact owners and parents, deferred enrichment references and coverage
+roots. Alias roots share one encoded-prefix identity. A mixed deletion lane can
+contain a public binary ID that looks like a physical artifact: the conservative
+plan retains both possible owners rather than guessing. Costs may overestimate
+canonical deduplication and roots need not be minimal. Existing retirement costs
+still come from the durable credit owner's known physical inventory.
+
+Normal DocStore transactions, batches and batch adapters now have an internal
+reservePreparedReplayPlan entry. It checks the original lifetime and file reader
+eligibility before looking up frame payloads, decodes the exact stored frame
+against the expected full transaction/catalog/schema contract, derives the key
+plan, and reserves through the existing atomic HA credit primitive. The decoded
+frame and temporary root plan have explicit cleanup owners; failed work poisons
+the writer. No scalar base estimate or manually selected root list is accepted by
+this entry. Existing lower-level credit APIs remain internal primitives.
+
+The 78-step native run passes 66 executions: ten new plan
+cases, ten existing credit cases and 46 encoder/boundary cases, with zero skips,
+failures or leaks. New cases compare against actual thin and materialized request
+builders and canonical CJ2 encoding, exercise every accepted family, cover absent
+graph tombstones and binary ID ambiguity, exhaust allocation failures, preserve
+original rejection, reject mismatched frame contracts and block disabled files
+before payload lookup. A real writer reserves generated roots outside the request,
+saturates the publication pool, and materializes/acknowledges its exactly bounded
+record without another retention grant.
+
+`prepared-replay-plan-verified.json` binds 5286 native/schema
+inputs and 4559 matching immutable public sources.
+The unchanged consumer main/build pass 25/25 ReleaseSafe composition steps. Its
+cache workspace was recreated after GC; checked-in consumer bodies were preserved.
+This is not provider-image, full archive-product or cold-source runtime
+qualification. Private ABI versions, reader floors and durable wire formats are
+unchanged; full Linux qualification remains waived.
+
+This plan is complete for the supplied canonical preparation inputs, not yet a
+certificate that those inputs are the real transaction. The driver must derive
+and bind that prepared request to the authoritative intent/catalog witness and
+include every auxiliary physical and replay effect, including grouped-source
+changes, before sealing a vote. That provenance
+check is not inferred from a matching accepted-effects frame alone. Derived-log
+quota, minimum executable RAM/CPU/I/O/dependency recovery ownership, restart debt
+reconstruction, confirmed-abort authority, legacy/import/raw migration rules and
+normal PREPARE orchestration still need integration. Strong required providers
+remain disabled; broader scheduler/default rollout and the full goal are open.
+
 ## Durable HA replay retention and atomic inventory credit (2026-10-20)
 
 Source `28afa047da9b0f97af35f9e5bdc80c866bc02c38` adds internal DocStore writer primitives for durable HA replay
