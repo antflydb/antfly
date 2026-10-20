@@ -34,6 +34,7 @@ extern fn av_prepare_rgba_into_submit(*anyopaque, [*]const u8, usize, [*]const u
 extern fn av_prepare_rgba_submit(*anyopaque, [*]const u8, usize, [*]const u32, *anyopaque, *?*anyopaque) i32;
 extern fn av_prepared_gpu_seconds(*anyopaque) f64;
 extern fn av_preparer_device_bytes(*anyopaque) u64;
+extern fn av_prepared_notify(*anyopaque, ?*anyopaque, ?*const fn (?*anyopaque) callconv(.c) void) void;
 extern fn av_prepared_poll(*anyopaque) c_int;
 extern fn av_prepared_wait(*anyopaque, u64) c_int;
 extern fn av_prepared_buffer(*anyopaque) *anyopaque;
@@ -849,7 +850,7 @@ pub const Metal = struct {
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.format.bitDepth(), 1, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_submit(self.handle, surface.handle, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .coefficient_staging_bytes = uploaded };
+        return .{ .reservation = reservation, .retained_output_bytes = if (self.output_slab_bytes == 0) std.mem.alignForward(usize, g.values() * @sizeOf(f32), 16384) else 0, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .coefficient_staging_bytes = uploaded };
     }
     /// Caller-owned integer Metal plane textures on this preparer's device.
     /// R8/RG8Uint or R16/RG16Uint contain right-aligned native samples. The
@@ -878,7 +879,7 @@ pub const Metal = struct {
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.sample_shift, @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_native_submit(self.handle, surface.y, surface.uv, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .coefficient_staging_bytes = uploaded };
+        return .{ .reservation = reservation, .retained_output_bytes = if (self.output_slab_bytes == 0) std.mem.alignForward(usize, g.values() * @sizeOf(f32), 16384) else 0, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .coefficient_staging_bytes = uploaded };
     }
     /// Upload native planes directly, without host RGB conversion. Metal owns
     /// its copies before return; padded byte strides remain explicit.
@@ -896,7 +897,7 @@ pub const Metal = struct {
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_host_submit(self.handle, surface.planes[0].bytes.ptr, surface.planes[0].stride, surface.planes[1].bytes.ptr, surface.planes[1].stride, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .native_staging_bytes = size, .coefficient_staging_bytes = uploaded };
+        return .{ .reservation = reservation, .retained_output_bytes = if (self.output_slab_bytes == 0) std.mem.alignForward(usize, g.values() * @sizeOf(f32), 16384) else 0, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .native_staging_bytes = size, .coefficient_staging_bytes = uploaded };
     }
     /// Copies tightly packed RGBA into owned Metal storage before returning.
     /// The producer may free its input immediately. Alpha/matrix are ignored
@@ -936,12 +937,15 @@ pub const Metal = struct {
         var out: ?*anyopaque = null;
         const rc = if (destination) |target| av_prepare_rgba_into_submit(self.handle, view.data.ptr, size, &params, self.coefficients.?, target, offset, &out) else av_prepare_rgba_submit(self.handle, view.data.ptr, size, &params, self.coefficients.?, &out);
         if (rc != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .rgba_staging_bytes = size, .coefficient_staging_bytes = uploaded };
+        return .{ .reservation = reservation, .retained_output_bytes = if (destination == null and self.output_slab_bytes == 0) std.mem.alignForward(usize, g.values() * @sizeOf(f32), 16384) else 0, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .rgba_staging_bytes = size, .coefficient_staging_bytes = uploaded };
     }
 };
 /// Owns input import/staging, GPU command, and patch buffer. Destroy fences in-flight
 /// work, including after deadline/cancellation. No pixel readback on submit.
 pub const Prepared = struct {
+    /// Only individually owned outputs remain charged here after completion.
+    /// Shared slabs and caller destinations keep their original owner lease.
+    retained_output_bytes: usize = 0,
     reservation: media.admission.Token = .{},
     handle: *anyopaque,
     geometry: Geometry,
@@ -952,6 +956,12 @@ pub const Prepared = struct {
     rgba_staging_bytes: usize = 0,
     native_staging_bytes: usize = 0,
     coefficient_staging_bytes: usize = 0,
+    /// Notification may run immediately or on the Metal completion thread.
+    /// The callback must not reenter this preparation. Replacement and deinit
+    /// fence any running callback before its context can be released.
+    pub fn notify(self: *const Prepared, context: ?*anyopaque, callback: ?*const fn (?*anyopaque) callconv(.c) void) void {
+        if (supported) av_prepared_notify(self.handle, context, callback);
+    }
     pub fn isReady(self: *const Prepared) !bool {
         if (!supported) return error.UnsupportedVideoBackend;
         return switch (av_prepared_poll(self.handle)) {
@@ -984,7 +994,7 @@ pub const Prepared = struct {
     pub fn releaseSource(self: *Prepared) !void {
         if (!supported) return error.UnsupportedVideoBackend;
         if (av_prepared_release_source(self.handle) != 0) return error.MetalPreparationNotReady;
-        try self.reservation.resize(.{ .device_bytes = self.geometry.values() * @sizeOf(f32) });
+        try self.reservation.resize(.{ .device_bytes = self.retained_output_bytes });
     }
     /// Borrowed id<MTLBuffer>; wait before consuming on another queue. For a
     /// resident inference consumer this is the handoff, not a host tensor copy.

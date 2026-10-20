@@ -53,6 +53,7 @@ int32_t av_prepare_rgba_submit(void *, const uint8_t *, size_t, const uint32_t *
 int32_t av_prepare_native_submit(void *, void *, void *, const uint32_t *, void *, void *, void **);
 int32_t av_prepare_host_submit(void *, const uint8_t *, size_t, const uint8_t *, size_t, const uint32_t *, void *, void *, void **);
 int32_t av_prepare_rgba_into_submit(void *, const uint8_t *, size_t, const uint32_t *, void *, void *, size_t, void **);
+void av_prepared_notify(void *, void *, void (*)(void *));
 int av_prepared_poll(void *);
 void *av_prepared_buffer(void *);
 size_t av_prepared_offset(void *);

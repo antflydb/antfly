@@ -221,3 +221,71 @@ test "embeddinggemma2 frame calibration learns partial ready cohorts without wai
     // instead of repeatedly executing its slower clipped width.
     try std.testing.expectEqual(@as(usize, 2), pressure.choose(5));
 }
+
+// Window costs include preparation, vision, composition, completed backbone and
+// output readback. Keep them separate from frame/layer kernel observations.
+const WindowEntry = struct {
+    cost: Entry = .{},
+    retry_at: u64 = 0,
+    declines: u6 = 0,
+};
+var window_entries: [64]WindowEntry = @splat(.{});
+var window_eviction: usize = 0;
+fn windowEntry(key: u128) *WindowEntry {
+    for (&window_entries) |*item| if (item.cost.key == key) return item;
+    const item = &window_entries[window_eviction];
+    window_eviction = (window_eviction + 1) % window_entries.len;
+    item.* = .{ .cost = .{ .key = key } };
+    return item;
+}
+pub fn windowCapacity(key: u128, maximum: usize) usize {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    defer mutex.unlock();
+    const item = windowEntry(key);
+    return item.cost.chooseDepth(if (item.cost.decisions < item.retry_at) 1 else @min(maximum, 2));
+}
+pub fn windowCompleted(key: u128, count: usize, elapsed: u64) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    defer mutex.unlock();
+    const item = windowEntry(key);
+    item.cost.observe(count, elapsed);
+    if (count > 1) {
+        item.declines = 0;
+        item.retry_at = 0;
+    }
+}
+
+/// Back off unavailable cohorts without treating a failed admission as a
+/// completed batch observation. Retry eventually as shared pressure changes.
+pub fn windowDeclined(key: u128) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    defer mutex.unlock();
+    const item = windowEntry(key);
+    item.declines = @min(item.declines +| 1, 6);
+    item.retry_at = item.cost.decisions +| (@as(u64, 1) << item.declines);
+}
+
+test "embeddinggemma2 window calibration learns completed CPU and GPU cost independently" {
+    const cpu_key = std.math.maxInt(u128) - 1;
+    const gpu_key = std.math.maxInt(u128) - 2;
+    for (0..2) |_| {
+        windowCompleted(cpu_key, 1, 100);
+        windowCompleted(cpu_key, 2, 240);
+        windowCompleted(gpu_key, 1, 100);
+        windowCompleted(gpu_key, 2, 140);
+    }
+    try std.testing.expectEqual(@as(usize, 1), windowCapacity(cpu_key, 2));
+    try std.testing.expectEqual(@as(usize, 2), windowCapacity(gpu_key, 2));
+    try std.testing.expectEqual(@as(usize, 1), windowCapacity(gpu_key, 1));
+}
+
+test "embeddinggemma2 window admission backoff retries without learning failed batch cost" {
+    const key = std.math.maxInt(u128) - 3;
+    try std.testing.expectEqual(@as(usize, 2), windowCapacity(key, 2));
+    windowDeclined(key);
+    try std.testing.expectEqual(@as(usize, 1), windowCapacity(key, 2));
+    try std.testing.expectEqual(@as(usize, 1), windowCapacity(key, 2));
+    try std.testing.expectEqual(@as(usize, 2), windowCapacity(key, 2));
+    windowCompleted(key, 2, 100);
+    try std.testing.expectEqual(@as(usize, 2), windowCapacity(key, 2));
+}
