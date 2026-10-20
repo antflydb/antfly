@@ -32,13 +32,15 @@ pub const InvocationContext = struct {
     cancellation: CancellationToken = .none,
     max_response_bytes: ?usize = null,
     progress: ?request_context.ProgressSink = null,
+    runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
 
     pub fn requiresControlledProvider(self: InvocationContext) bool {
-        return self.deadline_ns != null or self.cancellation.check_fn != null;
+        return self.deadline_ns != null or self.runnable != null or self.cancellation.check_fn != null;
     }
 
     pub fn check(self: InvocationContext) !void {
         try self.cancellation.check();
+        if (self.runnable) |borrow| try borrow.checkLifetime();
         if (self.deadline_ns) |deadline| {
             if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
         }
@@ -50,6 +52,7 @@ pub const InvocationContext = struct {
             .deadline_ns = context.deadline_ns,
             .cancellation = context.cancellation orelse .none,
             .progress = context.progress,
+            .runnable = context.runnable,
         };
     }
 };

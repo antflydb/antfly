@@ -1180,7 +1180,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preplanned: ?*const GeneratedBatchWritePlan,
             generated_memo: ?*GeneratedEmbeddingMemo,
         ) !PrecomputedGeneratedBatch {
-            return prepareGeneratedEnrichmentsWithContext(self, alloc, req, extracted, precompute_mode, force_generated_artifact_names, preplanned, generated_memo, null);
+            return prepareGeneratedEnrichmentsWithContext(self, alloc, req, extracted, precompute_mode, force_generated_artifact_names, preplanned, generated_memo, null, null);
         }
 
         pub fn prepareGeneratedEnrichmentsWithContext(
@@ -1193,12 +1193,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preplanned: ?*const GeneratedBatchWritePlan,
             generated_memo: ?*GeneratedEmbeddingMemo,
             context: ?@import("antfly_inference_execution_context").RequestContext,
+            stage: ?*const @import("preparation_execution.zig").Stage,
         ) !PrecomputedGeneratedBatch {
-            if (context) |original| {
+            const selected = if (stage) |execution| try execution.requestContext() else context;
+            if (selected) |original| {
                 try original.check();
                 if (preplanned == null and !S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets()) return .{};
                 if (S.ownerField(self, "enrichment_runtime").*) |parent| {
-                    const invocation = try enrichment_runtime_mod.PrecommitDocumentExecution.createWithContext(parent, alloc, &.{}, "", original);
+                    const invocation = if (stage != null and stage.?.active)
+                        try enrichment_runtime_mod.PrecommitDocumentExecution.createWithIndependentContext(parent, alloc, &.{}, "", original)
+                    else
+                        try enrichment_runtime_mod.PrecommitDocumentExecution.createWithContext(parent, alloc, &.{}, "", original);
                     defer invocation.destroy();
                     // The enclosing scope carries provider controls only. A real
                     // document invocation installs its own nonempty PDF scheduler.
@@ -1212,7 +1217,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return result;
                 }
             }
-            return prepareGeneratedEnrichmentsImpl(self, alloc, req, extracted, precompute_mode, force_generated_artifact_names, preplanned, generated_memo, context);
+            return prepareGeneratedEnrichmentsImpl(self, alloc, req, extracted, precompute_mode, force_generated_artifact_names, preplanned, generated_memo, selected);
         }
 
         fn prepareGeneratedEnrichmentsImpl(

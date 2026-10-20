@@ -104,8 +104,53 @@ pub const Completion = struct {
         value.borrow.enter = enter;
         value.borrow.enter_checked = enterChecked;
         value.borrow.reserve_child = reserveChild;
+        value.borrow.producer_parent = producerParent;
         return value;
     }
+
+    /// The storage producer stage calls this only after physical service
+    /// retirement. Ordinary completion callbacks keep their activation guard.
+    fn producerParent(raw: *anyopaque, out: *runtime.runnable_abi.Borrowed) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        const base = initTeam(self.execution, self.allocator) catch |err| return runtime.error_abi.statusFromError(err);
+        out.* = base.borrow;
+        out.context = self;
+        out.resize_team = null;
+        out.checkpoint = Producer.check;
+        out.park = Producer.park;
+        out.enter = Producer.enter;
+        out.enter_checked = Producer.enterChecked;
+        out.reserve_child = Producer.reserve;
+        out.check_lifetime = Completion.lifetime;
+        out.current_class = Completion.currentClass;
+        return .ok;
+    }
+    const Producer = struct {
+        fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            from(raw).execution.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+            return .ok;
+        }
+        fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+            const wait = std.enums.fromInt(runtime.runnable_abi.Wait, reason) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+            from(raw).execution.park(if (wait == .resource) .resource_blocked else .output_blocked) catch |err| return runtime.error_abi.statusFromError(err);
+            return .ok;
+        }
+        fn enter(raw: *anyopaque, next: c_int) callconv(.c) runtime.error_abi.Status {
+            const class = std.enums.fromInt(scheduler.Class, next) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+            from(raw).execution.enter(class) catch |err| return runtime.error_abi.statusFromError(err);
+            return .ok;
+        }
+        fn enterChecked(raw: *anyopaque, next: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+            const class = std.enums.fromInt(scheduler.Class, next) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+            @import("runnable_reentry.zig").enter(from(raw).execution, class, restriction) catch |err| return runtime.error_abi.statusFromError(err);
+            return .ok;
+        }
+        fn reserve(raw: *anyopaque, options: *const runtime.runnable_abi.ChildStart) callconv(.c) runtime.error_abi.Status {
+            const self = from(raw);
+            @import("runnable_local_child.zig").reserve(self.execution, self.allocator, options) catch |err| return runtime.error_abi.statusFromError(err);
+            return .ok;
+        }
+    };
 
     fn reserveChild(raw: *anyopaque, options: *const runtime.runnable_abi.ChildStart) callconv(.c) runtime.error_abi.Status {
         const self = from(raw);

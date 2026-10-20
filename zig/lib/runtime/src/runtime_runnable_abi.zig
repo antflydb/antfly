@@ -21,7 +21,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 16;
+pub const abi_version: u32 = 17;
 /// Synchronous, non-yielding restriction on the original CPU-return wait.
 /// Borrowed only until enterChecked returns; never retained by the owner.
 /// Rejection stops that execution and does not retire physical ownership.
@@ -389,6 +389,20 @@ pub const Borrowed = extern struct {
     /// complete bundle with CPU, and detaches the participant on every return.
     /// The caller retains granted physical resources through their actual joins.
     enter_resources: ?*const fn (*anyopaque, *const ResourceBundle, ?*const Reentry) callconv(.c) errors.Status = null,
+
+    /// A foreground producer may request a scoped parent only after retiring
+    /// service holders. This does not activate durable completion authority.
+    producer_parent: ?*const fn (*anyopaque, *Borrowed) callconv(.c) errors.Status = null,
+
+    pub fn producerParent(self: Borrowed) !Borrowed {
+        try self.validate();
+        const callback = self.producer_parent orelse return self;
+        var parent: Borrowed = undefined;
+        const status = callback(self.context, &parent);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+        try parent.validate();
+        return parent;
+    }
 
     pub fn enterWithResources(self: Borrowed, resources: *const ResourceBundle, restriction: ?*const Reentry) !void {
         try self.validate();

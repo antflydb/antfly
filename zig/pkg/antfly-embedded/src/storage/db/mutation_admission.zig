@@ -53,6 +53,14 @@ pub const SpeculativePreparation = struct {
     restore_current: bool,
     restore_enclosing: bool,
     active: bool = true,
+    producer_active: bool = false,
+
+    pub fn validateRetired(self: *const @This()) !void {
+        if (!self.active or self.producer_active or self.current.* != null) return error.InvalidRunnableTransition;
+        if (self.enclosing) |outer| if (outer.* != null) return error.InvalidRunnableTransition;
+        if (self.root) |root| if (root.held or root.borrowers.load(.acquire) != 0) return error.InvalidRunnableTransition;
+        if (self.policy) |policy| if (!policy.lease.released) return error.InvalidRunnableTransition;
+    }
 
     pub fn begin(current: *?Barrier.SharedLease, enclosing: ?*?Barrier.SharedLease, root: ?*Barrier.RootSharedLease, policy: ?*@import("row_policy_gate.zig").Gate.Lease, controls: ?lock.ApplyRwLock.Acquisition) !@This() {
         try checkLifetime(controls);
@@ -83,7 +91,7 @@ pub const SpeculativePreparation = struct {
     pub fn reenter(self: *@This(), owner: anytype) !void {
         const root = self.root;
         const controls = self.controls;
-        if (!self.active) return error.InvalidRunnableTransition;
+        if (!self.active or self.producer_active) return error.InvalidRunnableTransition;
         self.active = false;
         try checkLifetime(controls);
         // Reacquire capture without waiting while the original CPU is held.

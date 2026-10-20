@@ -695,6 +695,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try mutation_admission.SpeculativePreparation.begin(&replication_mutation, opts.enclosing_mutation_retirement, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self), opts.row_policy_retirement, opts.admission_controls)
                         else
                             null;
+                        var producer_stage: @import("preparation_execution.zig").Stage = .{};
+                        defer producer_stage.deinit();
+                        if (preparation_holders) |*holders| try producer_stage.begin(holders, opts.provider_execution, opts.provider_context);
                         preprepared_generated = try prepareGeneratedEnrichmentsWithContext(
                             self,
                             preparation_alloc,
@@ -705,7 +708,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             &preprepared_generated_plan.?,
                             generated_memo,
                             opts.provider_context,
+                            if (preparation_holders != null) &producer_stage else null,
                         );
+                        try producer_stage.complete();
                         if (preparation_holders) |*holders| {
                             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
                             try holders.reenter(self);
@@ -793,6 +798,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         try mutation_admission.SpeculativePreparation.begin(&replication_mutation, opts.enclosing_mutation_retirement, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self), opts.row_policy_retirement, opts.admission_controls)
                     else
                         null;
+                    var producer_stage: @import("preparation_execution.zig").Stage = .{};
+                    defer producer_stage.deinit();
+                    if (preparation_holders) |*holders| try producer_stage.begin(holders, opts.provider_execution, opts.provider_context);
                     preprepared_document_generated = try prepareGeneratedEnrichmentsWithContext(
                         self,
                         preparation_alloc,
@@ -803,7 +811,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         null,
                         generated_memo,
                         opts.provider_context,
+                        if (preparation_holders != null) &producer_stage else null,
                     );
+                    try producer_stage.complete();
                     if (preparation_holders) |*holders| {
                         if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
                         try holders.reenter(self);
@@ -2283,6 +2293,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         null,
                         generated_memo,
                         opts.provider_context,
+                        null,
                     );
                 }
 

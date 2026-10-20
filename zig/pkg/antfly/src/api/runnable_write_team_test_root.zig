@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 const runtime = @import("antfly_runtime_abi");
@@ -297,4 +309,51 @@ test "SQL write team completion child uses independent bounded receiver and orig
 
 test {
     _ = @import("runnable_participant_window.zig");
+}
+
+test "SQL write team producer borrow admits a foreground child without activating completion" {
+    var owner = try scheduler.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer owner.close();
+    var memory: allocation.Shared = .{ .child = std.testing.allocator, .limit = 64 * 1024 };
+    var execution: scheduler.Execution = .{};
+    defer execution.finish();
+    try execution.start(&owner, .{ .io = std.testing.io, .allow_wait = false }, .write);
+    var completion = try writes.Completion.init(&execution, memory.allocator());
+    var team = try completion.team();
+    try std.testing.expect(!execution.entry.?.completion_active);
+    try std.testing.expectError(error.ExecutionWaitUnsupported, checked(team.borrow.park(team.borrow.context, @backingInt(runtime.runnable_abi.Wait.resource))));
+    const parent = try team.borrow.producerParent();
+    const io = std.testing.io;
+    const borrowed_io = runtime.native_abi.IoBorrow.init(&io);
+    var child: runtime.runnable_abi.Child = undefined;
+    try parent.reserveChild(&.{ .io = &borrowed_io, .out_child = &child });
+    defer child.deinit();
+    try std.testing.expect(memory.stats().used_bytes > 0);
+    try checked(parent.park(parent.context, @backingInt(runtime.runnable_abi.Wait.resource)));
+    try child.activate();
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+    try std.testing.expect(!execution.entry.?.completion_active);
+    try checked(child.borrow.park(child.borrow.context, @backingInt(runtime.runnable_abi.Wait.resource)));
+    {
+        var peer: scheduler.Execution = .{};
+        defer peer.finish();
+        try peer.start(&owner, .{ .io = std.testing.io, .allow_wait = false }, .query);
+        var health: scheduler.Execution = .{};
+        defer health.finish();
+        try health.start(&owner, .{ .io = std.testing.io, .allow_wait = false }, .control);
+        try std.testing.expectEqual(@as(usize, 2), owner.stats().runnable_slots);
+    }
+    child.deinit();
+    var marker: u8 = 0;
+    const Check = struct {
+        fn check(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return .ok;
+        }
+    };
+    try parent.enterChecked(.write, &.{ .context = &marker, .check = Check.check });
+    try std.testing.expectEqual(@as(usize, 0), memory.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expect(!execution.entry.?.completion_active);
+    try std.testing.expectError(error.ExecutionWaitUnsupported, checked(team.borrow.park(team.borrow.context, @backingInt(runtime.runnable_abi.Wait.resource))));
 }

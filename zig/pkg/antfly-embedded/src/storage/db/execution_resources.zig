@@ -1047,6 +1047,8 @@ pub const PreparationProviderScope = struct {
 pub const BatchExecutionOptions = struct {
     /// Pre-decision only. Never used to veto accepted durability or visibility.
     provider_context: ?@import("antfly_inference_execution_context").RequestContext = null,
+    /// Used only after owned service holders retire, never passed to providers.
+    provider_execution: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
     /// Resolver-owned reader, borrowed until the batch orders its local tails.
     /// The batch retires its nested reader first and nulls this slot before waits.
     enclosing_mutation_retirement: ?*?MutationBarrier.SharedLease = null,

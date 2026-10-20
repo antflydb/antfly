@@ -5721,7 +5721,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .root = if (capture_root) |*root| root else null,
                 .retirement = if (capture_root != null) &replication_mutation else null,
                 .committed_visibility = execution_admission.committedVisibilityBoundary(),
-                .producer = .{ .io = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&producer_io.?), .deadline_ns = producer_deadline },
+                .producer = .{ .io = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&producer_io.?), .deadline_ns = producer_deadline, .execution = original_runnable },
             },
         } else null;
         var batch_port: ?batch_admission.Port = if (batch_payload) |*payload| batch_admission.Port.init(payload) else null;

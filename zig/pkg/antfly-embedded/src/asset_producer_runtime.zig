@@ -410,6 +410,7 @@ pub const Runtime = struct {
     capability_cache: remote_capabilities.Cache,
     execution: execution_context.Context = .{},
     request_progress: ?execution_context.ProgressSink = null,
+    request_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
     owned_http: ?*httpx.Client = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
@@ -551,6 +552,7 @@ pub const Runtime = struct {
             else
                 null,
             .progress = self.request_progress,
+            .runnable = self.request_runnable,
         };
     }
 
@@ -1094,6 +1096,7 @@ pub const Runtime = struct {
         else
             self.execution.max_response_bytes;
         scoped.request_progress = context.progress orelse self.request_progress;
+        scoped.request_runnable = context.runnable orelse self.request_runnable;
         return scoped;
     }
 
@@ -3717,6 +3720,32 @@ test "asset producer runtime invocation context can only tighten configured cont
         try std.testing.expectError(expected, controlled.requestContext().check());
         try std.testing.expect(controlled.execution.cancellation.isCancelled());
     }
+    const runtime_abi = @import("antfly_runtime_abi");
+    const Child = struct {
+        calls: usize = 0,
+        reject: bool = false,
+        fn check(raw: *anyopaque) callconv(.c) runtime_abi.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return if (self.reject) runtime_abi.error_abi.statusFromError(error.SchedulerClosed) else .ok;
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime_abi.error_abi.Status {
+            return .ok;
+        }
+    };
+    var child: Child = .{};
+    const child_borrow: runtime_abi.runnable_abi.Borrowed = .{ .context = &child, .cpu_slots = 1, .parent_class = @backingInt(runtime_abi.runnable_abi.Class.write), .checkpoint = Child.check, .park = Child.phase, .enter = Child.phase, .check_lifetime = Child.check };
+    const invocation = asset_producer.InvocationContext.fromRequestContext(.{ .io = std.testing.io, .deadline_ns = null, .runnable = child_borrow });
+    try std.testing.expect(invocation.requiresControlledProvider());
+    var scoped_cancellation: Runtime.RuntimeInvocationCancellation = undefined;
+    const child_scoped = Runtime.invocationRuntime(&runtime, invocation, &scoped_cancellation);
+    try std.testing.expect(child_scoped.requestContext().runnable.?.context == @as(*anyopaque, &child));
+    try child_scoped.requestContext().check();
+    try std.testing.expectEqual(@as(usize, 1), child.calls);
+    try std.testing.expect(runtime.request_runnable == null);
+    child.reject = true;
+    try std.testing.expectError(error.SchedulerClosed, child_scoped.requestContext().check());
+    try std.testing.expectError(error.SchedulerClosed, invocation.check());
 }
 
 const producer_config = @import("generating/producer_config.zig");

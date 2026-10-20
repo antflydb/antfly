@@ -4939,6 +4939,8 @@ const UnsupportedEnrichmentRuntime = struct {
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
     /// Invocation-local only; never installed on the shared lifecycle runtime.
     provider_request_context: ?inference_request_context.RequestContext = null,
+    /// Only scoped, independently admitted producer children can populate runnable.
+    provider_independent_execution: bool = false,
     /// Request counters use the resident runtime; provider controls stay local.
     request_telemetry_parent: ?*EnrichmentRuntime = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
@@ -5459,6 +5461,8 @@ const PlatformEnrichmentRuntime = struct {
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
     /// Invocation-local only; never installed on the shared lifecycle runtime.
     provider_request_context: ?inference_request_context.RequestContext = null,
+    /// Only scoped, independently admitted producer children can populate runnable.
+    provider_independent_execution: bool = false,
     /// Request counters use the resident runtime; provider controls stay local.
     request_telemetry_parent: ?*EnrichmentRuntime = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
@@ -15075,14 +15079,29 @@ pub const PrecommitDocumentExecution = struct {
     /// It owns invocation and coordinator metadata; separately granted native
     /// windows/results retain raw backing and their existing resource ledger.
     pub fn createWithAllocator(parent: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !*@This() {
-        return createWithContext(parent, alloc, requests, raw, parent.provider_request_context);
+        return createWithContextMode(parent, alloc, requests, raw, parent.provider_request_context, parent.provider_independent_execution);
     }
 
     /// Original lifetime is borrowed through all physical joins. CPU stays
     /// retained by the caller; a parent's runnable is never lent under holders.
     pub fn createWithContext(parent: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8, context: ?inference_request_context.RequestContext) !*@This() {
+        return createWithContextMode(parent, alloc, requests, raw, context, false);
+    }
+
+    /// Called only by a retired-holder stage that owns an independent child.
+    /// Parallel producers remain disabled for every scoped request context.
+    pub fn createWithIndependentContext(parent: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8, context: inference_request_context.RequestContext) !*@This() {
+        if (context.runnable == null) return error.InvalidRunnableTransition;
+        return createWithContextMode(parent, alloc, requests, raw, context, true);
+    }
+
+    fn createWithContextMode(parent: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8, context: ?inference_request_context.RequestContext, independent: bool) !*@This() {
         if (context) |original| {
-            if (original.runnable != null) return error.InvalidRunnableTransition;
+            if (original.runnable) |borrow| {
+                if (!independent or borrow.cpu_slots != 1) return error.InvalidRunnableTransition;
+                try borrow.validate();
+                try borrow.checkLifetime();
+            }
             try original.check();
         }
         if (builtin.os.tag == .freestanding) return error.UnsupportedPrecommitDocumentExecution;
@@ -15107,6 +15126,7 @@ pub const PrecommitDocumentExecution = struct {
                 .notify_fn = ignoreNotification,
                 .config = parent.config,
                 .request_telemetry_parent = parent.request_telemetry_parent orelse (if (context != null) parent else null),
+                .provider_independent_execution = independent,
                 .ownership = try ownership_mod.State.init(alloc, parent.store, "precommit-no-lease", .{}),
             },
             .scheduler = undefined,
@@ -15125,7 +15145,9 @@ pub const PrecommitDocumentExecution = struct {
     }
 
     fn mergeProviderContext(self: *@This(), slot: usize, original: inference_request_context.RequestContext, inherited: ?inference_request_context.RequestContext) !inference_request_context.RequestContext {
-        if (inherited) |value| if (value.runnable != null) return error.InvalidRunnableTransition;
+        if (inherited) |value| if (value.runnable) |borrow| {
+            if (!self.runtime.provider_independent_execution or original.runnable == null or !std.meta.eql(borrow, original.runnable.?)) return error.InvalidRunnableTransition;
+        };
         self.provider_cancellations[slot] = .{
             .lifecycle = self.runtime.config.cancellation,
             .request = original.cancellation orelse .none,
@@ -15152,7 +15174,7 @@ pub const PrecommitDocumentExecution = struct {
         if (self.runtime.config.sparse_embedder) |*provider| provider.request_context = try self.mergeProviderContext(2, original, provider.request_context);
         if (self.runtime.config.asset_producer) |*provider| {
             const inherited = provider.invocation_context;
-            const scoped = try self.mergeProviderContext(3, original, .{ .io = context.io, .deadline_ns = inherited.deadline_ns, .cancellation = inherited.cancellation, .progress = inherited.progress });
+            const scoped = try self.mergeProviderContext(3, original, .{ .io = context.io, .deadline_ns = inherited.deadline_ns, .cancellation = inherited.cancellation, .progress = inherited.progress, .runnable = inherited.runnable });
             var invocation = asset_producer_mod.InvocationContext.fromRequestContext(scoped);
             invocation.max_response_bytes = inherited.max_response_bytes;
             provider.* = provider.withInvocationContext(invocation);

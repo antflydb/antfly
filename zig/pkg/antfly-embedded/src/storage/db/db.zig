@@ -7520,6 +7520,7 @@ pub const DB = struct {
         const provider_context = try provider_scope.bind(controls, roots.producer, self.backend_runtime.io() orelse std.Options.debug_io);
         const opts: BatchExecutionOptions = .{
             .provider_context = provider_context,
+            .provider_execution = if (roots.producer) |producer| producer.execution else null,
             .mutation_root = root,
             .enclosing_mutation_retirement = roots.retirement,
             .committed_visibility_wait = roots.committed_visibility,
@@ -63202,6 +63203,196 @@ test "db controlled generated providers retain original controls and retire reje
             }
         }
     }
+}
+
+test "db controlled generated providers independently admit CPU at one ordinary slot" {
+    const native = @import("../../common/runnable_scheduler.zig");
+    const runtime = @import("antfly_runtime_abi");
+    const abi = runtime.runnable_abi;
+    const Context = @import("antfly_inference_execution_context").RequestContext;
+    const Fixture = struct {
+        scheduler: *native.Scheduler,
+        db: ?*DB = null,
+        parent: native.Execution = .{},
+        child: native.Execution = .{},
+        child_io: ?runtime.io_abi.Receiver = null,
+        cancelled: bool = false,
+        scenario: usize,
+        calls: usize = 0,
+        releases: usize = 0,
+        child_capsule: ?*Capsule = null,
+        const Self = @This();
+        const Capsule = struct {
+            fixture: *Self,
+            execution: *native.Execution,
+            fn from(raw: *anyopaque) *@This() {
+                return @ptrCast(@alignCast(raw));
+            }
+            fn borrow(self: *@This()) abi.Borrowed {
+                return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(abi.Class.write), .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .reserve_child = reserve, .activate_child = activate, .check_lifetime = lifetime, .current_class = currentClass };
+            }
+            fn checkpoint(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                from(raw).execution.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                from(raw).execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+                out.* = @backingInt(from(raw).execution.retainedClass() catch |err| return runtime.error_abi.statusFromError(err));
+                return .ok;
+            }
+            fn park(raw: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+                from(raw).execution.park(.resource_blocked) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
+                from(raw).execution.enter(@fromBackingInt(@intCast(class))) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn checkRestriction(raw: *anyopaque) !void {
+                const restriction: *const abi.Reentry = @ptrCast(@alignCast(raw));
+                try restriction.checkpoint();
+            }
+            fn enterChecked(raw: *anyopaque, class: c_int, restriction: *const abi.Reentry) callconv(.c) runtime.error_abi.Status {
+                const self = from(raw);
+                if (self.execution == &self.fixture.parent and self.fixture.scenario == 3) return runtime.error_abi.statusFromError(error.SchedulerClosed);
+                self.execution.enterWithCheck(@fromBackingInt(@intCast(class)), .{ .context = @constCast(restriction), .check = checkRestriction }) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn reserve(raw: *anyopaque, options: *const abi.ChildStart) callconv(.c) runtime.error_abi.Status {
+                const self = from(raw);
+                if (self.fixture.scenario == 2) return runtime.error_abi.statusFromError(error.ResourceTemporarilyUnavailable);
+                self.fixture.child_io = options.io.receive() catch |err| return runtime.error_abi.statusFromError(err);
+                self.fixture.child.reserveChild(self.execution, self.fixture.child_io.?.io(), @sizeOf(native.Execution)) catch |err| return runtime.error_abi.statusFromError(err);
+                options.out_child.* = .{ .borrow = self.fixture.child_capsule.?.borrow(), .finish = finish };
+                return .ok;
+            }
+            fn activate(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                from(raw).execution.activateChild() catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn finish(raw: *anyopaque) callconv(.c) void {
+                const self = from(raw);
+                self.execution.finish();
+                self.fixture.releases += 1;
+            }
+        };
+        fn requested(raw: *const anyopaque) bool {
+            return (@as(*const @This(), @ptrCast(@alignCast(raw)))).cancelled;
+        }
+        fn original(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            try self.parent.checkLifetime();
+        }
+        fn legacy(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UncontrolledProviderDispatched;
+        }
+        fn exercise(self: *@This(), borrow: abi.Borrowed) !void {
+            self.calls += 1;
+            try std.testing.expect(borrow.context == @as(*anyopaque, self.child_capsule.?));
+            try std.testing.expectEqual(native.State.resource_blocked, self.parent.entry.?.state);
+            try std.testing.expectEqual(@as(usize, 2), self.scheduler.stats().operations);
+            try std.testing.expect(self.db.?.local_execution.row_policy_gate.quiesced());
+            try std.testing.expect(self.child.entry.?.options.deadline_ns == self.parent.entry.?.options.deadline_ns);
+            try std.testing.expect(borrow.park(borrow.context, @backingInt(abi.Wait.resource)).isOk());
+            {
+                var peer: native.Execution = .{};
+                defer peer.finish();
+                try peer.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query);
+                var health: native.Execution = .{};
+                defer health.finish();
+                try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                try std.testing.expectEqual(@as(usize, 2), self.scheduler.stats().runnable_slots);
+            }
+            try std.testing.expect(borrow.enter(borrow.context, @backingInt(abi.Class.write)).isOk());
+        }
+        fn produce(raw: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, dims: u32, context: Context) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.exercise(context.runnable orelse return error.InvalidRunnableTransition);
+            const output = try alloc.alloc(f32, dims);
+            @memset(output, 1);
+            if (self.scenario == 1) self.cancelled = true;
+            return output;
+        }
+        fn sparseLegacy(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            return error.UncontrolledProviderDispatched;
+        }
+        fn sparse(raw: *anyopaque, alloc: Allocator, name: []const u8, text: []const u8, context: Context) !embedder_mod.SparseEmbedding {
+            const indices = try alloc.alloc(u32, 1);
+            errdefer alloc.free(indices);
+            indices[0] = 1;
+            return .{ .indices = indices, .values = try produce(raw, alloc, name, text, 1, context) };
+        }
+        fn assetMemory(_: *anyopaque, _: Allocator, requests: []const @import("enrichment/asset_producer.zig").Request, context: @import("enrichment/asset_producer.zig").InvocationContext) !@import("antfly_inference_work").InvocationMemoryPlan {
+            try context.check();
+            return .{ .attachment_transport = .borrowed_binary, .fixed_bytes = 4096, .allocator_limit_bytes = 4096, .max_result_bytes_per_item = 64, .max_result_bytes = 64 * requests.len };
+        }
+        fn assetLegacy(_: *anyopaque, _: Allocator, _: @import("enrichment/asset_producer.zig").Request) ![]u8 {
+            return error.UncontrolledProviderDispatched;
+        }
+        fn asset(raw: *anyopaque, alloc: Allocator, _: @import("enrichment/asset_producer.zig").Request, context: @import("enrichment/asset_producer.zig").InvocationContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.exercise(context.runnable orelse return error.InvalidRunnableTransition);
+            const output = try alloc.dupe(u8, "summary");
+            if (self.scenario == 1) self.cancelled = true;
+            return output;
+        }
+    };
+    for ([_]bool{ false, true }) |relational| for (0..3) |kind| for (0..4) |scenario| {
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var fixture: Fixture = .{ .scheduler = &scheduler, .scenario = scenario };
+        defer fixture.parent.finish();
+        defer fixture.child.finish();
+        try fixture.parent.start(&scheduler, .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64), .cancellation = .{ .ptr = &fixture, .requested = Fixture.requested } }, .write);
+        var parent_capsule: Fixture.Capsule = .{ .fixture = &fixture, .execution = &fixture.parent };
+        var child_capsule: Fixture.Capsule = .{ .fixture = &fixture, .execution = &fixture.child };
+        fixture.child_capsule = &child_capsule;
+        var directory = try TestDirectory.init("independent-producer-cpu");
+        defer directory.cleanup();
+        var db = try DB.open(std.testing.allocator, directory.path(), .{ .enrichment = .{
+            .owner_id = "independent-producer",
+            .dense_embedder = if (kind == 0) .{ .ptr = &fixture, .dense_embed_fn = Fixture.legacy, .dense_embed_with_context_fn = Fixture.produce, .foreground_bounded = true } else null,
+            .sparse_embedder = if (kind == 1) .{ .ptr = &fixture, .sparse_embed_fn = Fixture.sparseLegacy, .sparse_embed_with_context_fn = Fixture.sparse, .foreground_bounded = true } else null,
+            .asset_producer = if (kind == 2) .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.assetLegacy, .produce_with_context = Fixture.asset, .foreground_bounded = true, .invocation_memory_for_requests_with_context = Fixture.assetMemory } } else null,
+        } });
+        defer db.close();
+        fixture.db = &db;
+        if (relational) try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "body", .path = "body", .column_type = .string }} });
+        if (kind == 0) {
+            try db.addIndex(.{ .name = "dv_controls", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}" });
+        } else if (kind == 1) {
+            try db.addIndex(.{ .name = "sp_controls", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}" });
+        } else {
+            // Two assets exercise nested document runtime/context ownership.
+            for ([_][]const u8{ "asset_a", "asset_b" }) |name| try db.addEnrichment(.{ .name = name, .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
+        }
+        const io = std.testing.io;
+        const roots: @import("../../api/batch_execution_admission.zig").RootContext = .{ .producer = .{ .io = runtime.native_abi.IoBorrow.init(&io), .deadline_ns = std.math.maxInt(u64), .execution = parent_capsule.borrow() } };
+        const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &fixture, .check_fn = Fixture.original } };
+        const result = db.batchWithAdmissionControlsAndRootContext(.{ .writes = &.{.{ .key = "doc:cpu", .value = "{\"body\":\"alpha\"}" }}, .sync_level = .enrichments }, controls, .none, roots, null, null);
+        if (scenario == 0) {
+            try result;
+            try std.testing.expectEqual(native.State.running, fixture.parent.entry.?.state);
+        } else try std.testing.expectError(switch (scenario) {
+            1 => error.Canceled,
+            2 => error.ResourceTemporarilyUnavailable,
+            3 => error.SchedulerClosed,
+            else => unreachable,
+        }, result);
+        if (scenario == 2) try std.testing.expectEqual(@as(usize, 0), fixture.calls) else {
+            try std.testing.expect(fixture.calls >= 1 and fixture.calls <= (if (kind == 2) @as(usize, 2) else 1));
+        }
+        try std.testing.expectEqual(@as(usize, if (scenario == 2) 0 else 1), fixture.releases);
+        try std.testing.expect(fixture.child.entry == null);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expect(db.local_execution.row_policy_gate.quiesced());
+        const value = try db.get(std.testing.allocator, "doc:cpu");
+        defer if (value) |bytes| std.testing.allocator.free(bytes);
+        try std.testing.expectEqual(scenario == 0, value != null);
+    };
 }
 
 test "db controlled generated providers policy preparation preserves identity and original expiry" {
