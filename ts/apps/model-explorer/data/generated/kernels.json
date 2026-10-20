@@ -738,6 +738,14 @@
    }
   },
   {
+   "name": "antfly_video_position",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "dt_dkdv",
    "family": "other",
    "generated": false,

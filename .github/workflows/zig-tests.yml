@@ -453,8 +453,22 @@ jobs:
             --strip-components=1
           echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
       - name: Prepare verified Zig source dependencies
-        uses: ./.github/actions/prepare-zig-dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         env:
@@ -545,8 +559,22 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
       - name: Prepare verified Zig source dependencies
-        uses: ./.github/actions/prepare-zig-dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         run: zig version
@@ -839,8 +867,22 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
       - name: Prepare verified Zig source dependencies
-        uses: ./.github/actions/prepare-zig-dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         run: zig version
@@ -935,8 +977,22 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
       - name: Prepare verified Zig source dependencies
-        uses: ./.github/actions/prepare-zig-dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         run: zig version
@@ -1078,8 +1134,22 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
           mkdir -p "$local_cache" "$global_cache"
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
       - name: Prepare verified Zig source dependencies
-        uses: ./.github/actions/prepare-zig-dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Verify Zig version
         run: zig version
@@ -1444,8 +1514,22 @@ jobs:
       # Each shard gets its own runner and PVC. Physical storage ownership has
       # several production rebuilds, so give it the full job budget separately
       # from the cold host-generator and linked-cache contract fixtures.
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
       - name: Prepare verified Zig source dependencies
-        uses: ./.github/actions/prepare-zig-dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Test runtime compilation and cache contracts
         if: startsWith(matrix.shard, 'runtime-')
@@ -1618,8 +1702,22 @@ jobs:
             echo "TMPDIR=$cache_root/tmp"
           } >> "$GITHUB_ENV"
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
       - name: Prepare verified Zig source dependencies
-        uses: ./.github/actions/prepare-zig-dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -2281,8 +2379,22 @@ jobs:
             echo "TMPDIR=$cache_root/tmp"
           } >> "$GITHUB_ENV"
 
+      # The admitted branch can predate this action. Bootstrap tooling from
+      # the same immutable revision as the executing approval workflow.
+      - name: Check out executing dependency policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .ci-dependency-policy
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions/prepare-zig-dependencies
+            scripts/ci/prepare_zig_dependencies.py
+            scripts/ci/zig-dependencies.json
+          sparse-checkout-cone-mode: false
+
       - name: Prepare verified Zig source dependencies
-        uses: ./.github/actions/prepare-zig-dependencies
+        uses: ./.ci-dependency-policy/.github/actions/prepare-zig-dependencies
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -2364,7 +2476,7 @@ jobs:
         uses: ./.github/actions/load-toolchain-policy
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb libopenblas0-pthread
 
       - name: Prepare ARC test cache dirs
         run: |
@@ -2473,6 +2585,11 @@ jobs:
         if: startsWith(matrix.suite, 'inference-')
         working-directory: zig
         env:
+          # CPU inference qualifies the shipped optional LP64 pthread backend.
+          # Fail fast if the artifact/runner cannot load it instead of silently
+          # exercising Debug scalar kernels under a serving-latency deadline.
+          ANTFLY_INFERENCE_BLAS: openblas
+          OPENBLAS_NUM_THREADS: "2"
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_REPORT_DIR: ${{ runner.temp }}/inference-reports
           ANTFLY_INFERENCE_SERVER_LOG_DIR: ${{ runner.temp }}/inference-server-logs

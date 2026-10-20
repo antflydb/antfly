@@ -63,7 +63,7 @@ class OpenApiBuildPathsTest(unittest.TestCase):
         self.assertIn("second-highest", acceptance["min_margin"]["description"])
         answer_refs = schemas["InferenceDecideAnswer"]["oneOf"]
         self.assertCountEqual(
-            [ref["$ref"].rsplit("/", 1)[-1] for ref in answer_refs],
+            [answer["$ref"].rsplit("/", 1)[-1] for answer in answer_refs],
             [
                 "GeneratedChoiceAnswer",
                 "GeneratedMultiChoiceAnswer",

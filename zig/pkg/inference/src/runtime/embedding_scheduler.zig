@@ -54,6 +54,16 @@ pub const Scheduler = struct {
         }
         try control.check();
     }
+    /// Called by the current owner at a completed work boundary. A peer that
+    /// arrives after this check gets the next bounded wave's handoff.
+    pub fn hasPeer(waiter: *const Waiter) bool {
+        const self = waiter.owner orelse return true;
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        std.debug.assert(waiter.acquired and self.head == waiter);
+        return waiter.next != null;
+    }
+
     pub fn leave(waiter: *Waiter) void {
         const self = waiter.owner orelse return;
         @import("antfly_platform").sync.lockYielding(&self.mutex);

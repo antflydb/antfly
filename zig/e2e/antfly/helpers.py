@@ -113,6 +113,39 @@ def create_index_payload(payload: dict, index_name: str) -> dict:
     return body
 
 
+def create_index_with_retry(api, table_name: str, index_name: str, payload: dict):
+    """Retry only the server's explicitly uncommitted table-definition CAS."""
+    body = create_index_payload(payload, index_name)
+    deadline = time.monotonic() + 10.0
+    delay = 0.05
+    while True:
+        try:
+            return api.post(f"/tables/{table_name}/indexes/{index_name}", body)
+        except requests.HTTPError as error:
+            response = error.response
+            if response is None or response.status_code != 409:
+                raise
+            if response.headers.get("X-Antfly-Raft-Mutation-Outcome") is not None:
+                raise
+            try:
+                detail = response.json()
+            except ValueError:
+                raise error
+            if (
+                not isinstance(detail, dict)
+                or detail.get("error") != "table_mutation_conflict"
+                or detail.get("retryable") is not True
+            ):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+            if time.monotonic() >= deadline:
+                raise
+            delay = min(delay * 2, 0.25)
+
+
 def query_hits_total_value(hits: dict) -> int:
     total = hits["total"]
     assert isinstance(total, dict), (

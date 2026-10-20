@@ -19,7 +19,7 @@ const media = @import("antfly_media");
 const video = @import("antfly_video");
 const Case = struct { id: []const u8, path: []const u8, sha256: ?[]const u8 = null, init_end: usize = 0, fragment_ends: []const usize = &.{}, packet_units: bool = false, normalize_clock: bool = false, duration_ns: i64 = 2 * std.time.ns_per_s };
 const Suite = struct { cases: []const Case };
-const Sample = struct { completed_ns: u64, windows: usize, validation_walks: usize, metadata_snapshots: ?usize, admitted_peak_bytes: u64, digest: [32]u8 };
+const Sample = struct { append_ns: u64, prepare_ns: u64, digest_ns: u64, commit_ns: u64, completed_ns: u64, windows: usize, validation_walks: usize, metadata_snapshots: ?usize, admitted_peak_bytes: u64, digest: [32]u8 };
 const Result = struct { case: []const u8, packet_units: bool, normalized_clock: bool, samples: []Sample };
 var observed_walks: usize = 0;
 // Benchmark-only source instrumentation resolves this private Zig symbol.
@@ -56,6 +56,10 @@ fn run(a: std.mem.Allocator, io: std.Io, case: Case, bytes: []const u8) !Sample 
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var count: usize = 0;
+    var append_ns: u64 = 0;
+    var prepare_ns: u64 = 0;
+    var digest_ns: u64 = 0;
+    var commit_ns: u64 = 0;
     var walks: usize = 0;
     var snapshots: ?usize = null;
     observed_walks = 0;
@@ -66,7 +70,11 @@ fn run(a: std.mem.Allocator, io: std.Io, case: Case, bytes: []const u8) !Sample 
         defer if (packet_reader) |*reader| reader.deinit();
         var ingest: ?media.live_mp4.Ingest = if (case.packet_units) null else try media.live_mp4.Ingest.init(a, case.id, bytes[0..case.init_end], .{ .stream = .{ .admission_pool = &pool } });
         defer if (ingest) |*reader| reader.deinit();
-        var flow = try video.live_coordinator.Coordinator.init(a, .{ .duration_ns = case.duration_ns, .window = .{ .stream = .{ .admission_pool = &pool } } });
+        var flow_options = video.live_coordinator.Options{ .duration_ns = case.duration_ns, .window = .{ .stream = .{ .admission_pool = &pool } } };
+        // This benchmark consumes metadata/encoded bytes, never prepared pixels.
+        // Keep optional model frame reuse out of both comparison subjects.
+        if (@hasField(@TypeOf(flow_options), "max_validated_frame_bytes")) flow_options.max_validated_frame_bytes = 0;
+        var flow = try video.live_coordinator.Coordinator.init(a, flow_options);
         defer flow.deinit();
         const units = if (packet_reader) |reader| reader.packets.len else case.fragment_ends.len;
         var begin = case.init_end;
@@ -80,11 +88,17 @@ fn run(a: std.mem.Allocator, io: std.Io, case: Case, bytes: []const u8) !Sample 
                     break :blk try ingest.?.finishSegment();
                 };
                 defer if (unit) |*owner| owner.deinit();
+                const append_at = now(io);
                 try flow.append(&unit);
+                append_ns += now(io) - append_at;
             }
-            while (try flow.prepare()) |value| {
-                var prepared = value;
+            while (true) {
+                const prepare_at = now(io);
+                const value = try flow.prepare();
+                prepare_ns += now(io) - prepare_at;
+                var prepared = value orelse break;
                 defer prepared.deinit();
+                const digest_at = now(io);
                 integer(&hash, prepared.ordinal);
                 integer(&hash, prepared.source_start_ns);
                 integer(&hash, prepared.source_end_ns);
@@ -99,7 +113,10 @@ fn run(a: std.mem.Allocator, io: std.Io, case: Case, bytes: []const u8) !Sample 
                     defer payload.deinit();
                     hash.update(payload.bytes);
                 }
+                digest_ns += now(io) - digest_at;
+                const commit_at = now(io);
                 try flow.commit(&prepared);
+                commit_ns += now(io) - commit_at;
                 count += 1;
             }
         }
@@ -113,7 +130,7 @@ fn run(a: std.mem.Allocator, io: std.Io, case: Case, bytes: []const u8) !Sample 
         }
     }
     if (pool.snapshot().host_bytes != 0 or count == 0) return error.IncompleteBenchmark;
-    return .{ .completed_ns = now(io) - started, .windows = count, .validation_walks = walks, .metadata_snapshots = snapshots, .admitted_peak_bytes = pool.high_water.host_bytes, .digest = hash.finalResult() };
+    return .{ .append_ns = append_ns, .prepare_ns = prepare_ns, .digest_ns = digest_ns, .commit_ns = commit_ns, .completed_ns = now(io) - started, .windows = count, .validation_walks = walks, .metadata_snapshots = snapshots, .admitted_peak_bytes = pool.high_water.host_bytes, .digest = hash.finalResult() };
 }
 pub fn main(init: std.process.Init) !void {
     const a = std.heap.c_allocator;

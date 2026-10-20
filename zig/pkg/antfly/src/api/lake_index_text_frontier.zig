@@ -160,6 +160,8 @@ pub fn prepareRecentObserved(a: A, root: corpus.Root, store: stores.ArtifactStor
     return initialize(a, root, store, cached, token, text, analysis, schema, metrics, false, recent);
 }
 fn initialize(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Token, text: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema, metrics: ?*Metrics, routed: bool, recent: ?*const local.index.IndexSnapshot) !?*Self {
+    const started = @import("antfly_platform").time.monotonicNs();
+    defer if (metrics) |observed| observed.record(.text_term_plan, started);
     if (root.inventory_version != 3 or root.collection == null or root.term_statistics == null or (routed and (root.term_directory.version != 2 or root.term_directory.leaves == null))) return null;
     const self = try a.create(Self);
     self.* = .{ .a = a, .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 }, .root = root, .store = store, .cached = cached, .token = token, .metrics = metrics, .recent = recent };
@@ -707,6 +709,8 @@ pub fn nextWindow(self: *Self, output: []Id, cutoff: ?f32, max_bytes: u64) !?[]c
     return self.nextWindowRanked(output, cutoff, null, max_bytes);
 }
 pub fn nextWindowRanked(self: *Self, output: []Id, cutoff: ?f32, position: ?Position, max_bytes: u64) !?[]const Id {
+    const started = @import("antfly_platform").time.monotonicNs();
+    defer if (self.metrics) |metrics| metrics.record(.text_navigation, started);
     if (output.len == 0 or max_bytes == 0) return error.InvalidNativeLakeTextCorpus;
     var count: usize = 0;
     var bytes: u64 = 0;

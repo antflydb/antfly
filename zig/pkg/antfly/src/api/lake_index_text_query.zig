@@ -315,10 +315,14 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     try context.ensureActive();
     // Retain only immutable serving metadata and recent row images. The archive
     // files/indexes remain shared, protected by their durable reader protocols.
-    const serving_token: []const u8 = if (retained != null) req.remote_snapshot.? else if (req.remote_snapshot != null) &snapshot_token else cut: {
-        var artifacts = store.artifactStore();
-        if (cut_expires_ms <= @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) return error.DeadlineExceeded;
-        break :cut try retained_api.saveCached(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = retained_pending, .catalog_metadata = retained_metadata, .published_only = published_only, .recent = owner.recent_declarations, .recent_cloud = owner.recent_cloud, .recent_runs = owner.recent_runs }, retained_cancellation, &server.lake_retained_payloads);
+    const serving_token: []const u8 = cursor: {
+        const cursor_started = @import("antfly_platform").time.monotonicNs();
+        defer server.lake_query_metrics.record(.cursor_retention, cursor_started);
+        break :cursor if (retained != null) req.remote_snapshot.? else if (req.remote_snapshot != null) &snapshot_token else cut: {
+            var artifacts = store.artifactStore();
+            if (cut_expires_ms <= @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) return error.DeadlineExceeded;
+            break :cut try retained_api.saveCached(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = retained_pending, .catalog_metadata = retained_metadata, .published_only = published_only, .recent = owner.recent_declarations, .recent_cloud = owner.recent_cloud, .recent_runs = owner.recent_runs }, retained_cancellation, &server.lake_retained_payloads);
+        };
     };
     var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = serving_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
@@ -349,7 +353,11 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         hit.stored_data = null;
     };
     meta.took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms);
-    const response = try local.api_query.encodeQueryResponsesWithDelivery(a, table.name, effective, meta, result, prepared_delivery);
+    const response = delivery_result: {
+        const delivery_started = @import("antfly_platform").time.monotonicNs();
+        defer server.lake_query_metrics.record(.result_delivery, delivery_started);
+        break :delivery_result try local.api_query.encodeQueryResponsesWithDelivery(a, table.name, effective, meta, result, prepared_delivery);
+    };
     const finished = @import("antfly_platform").time.monotonicNs();
     server.lake_read_cache.recordQuery(.{
         .total_ns = finished -| total_started,
@@ -737,7 +745,7 @@ const Execution = struct {
     const HighlightPlan = struct { query: search.HighlightQuery, name: []const u8, stores_source: bool };
     fn highlightPlan(self: *Execution, name: ?[]const u8, text: types.TextQuery) !?HighlightPlan {
         const selected = (try self.textDeclaration(name)) orelse return null;
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
         const token: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, token, corpus.loadDirectory);
         defer metadata.release();
@@ -782,7 +790,7 @@ const Execution = struct {
             return try overlay_api.Overlay.window(pin, &empty, preparation.root.collection.?, preparation.plan.?, self.context);
         }
         const selected = (try self.textDeclaration(name)) orelse return null;
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
         const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
@@ -908,7 +916,7 @@ const Execution = struct {
         defer a.free(winners);
         var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
         defer live.deinit(a);
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
         var input = std.heap.ArenaAllocator.init(a);
         defer input.deinit();
         for (hits, winners, 0..) |hit, *winner, index| {
@@ -1405,7 +1413,7 @@ const Execution = struct {
             if (declaration.artifact.kind == .text_segment and corpus.supportsBuildMetadata(declaration.artifact.metadata_version) and
                 (if (req.index_name) |name| std.mem.eql(u8, declaration.name, name) else indexes == 1 or std.mem.eql(u8, declaration.name, local.common_full_text_index_defaults.default_full_text_index_name))) break declaration;
         } else return null;
-        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
         const cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
         const metadata = try @import("lake_index_decoded_metadata.zig").acquire(corpus.Directory, cached, self.store.artifactStore(), selected.artifact, cancellation, corpus.loadDirectory);
         defer metadata.release();
@@ -1663,7 +1671,11 @@ const Execution = struct {
             request.text_navigation_plan = if (frontier orelse preparation) |value| value.plan else null;
             if (scoreFrontierEligible(req, if (ordering) |*order| order else null)) request.minimum_competitive_score = competitive_cutoff;
             const previous_cutoff = winners.cutoff();
-            var page = try searchText(&child, wa, request, text);
+            var page = postings: {
+                const posting_started = @import("antfly_platform").time.monotonicNs();
+                defer self.server.lake_query_metrics.record(.text_postings, posting_started);
+                break :postings try searchText(&child, wa, request, text);
+            };
             defer page.deinit();
             if (req.evaluation_matches and page.total_hits_relation != .exact) {
                 // Local WAND may report a lower bound even when this window's
@@ -1705,6 +1717,8 @@ const Execution = struct {
         if (frontier) |value| if (value.pruned) {
             relation = .gte;
         };
+        const cursor_started = @import("antfly_platform").time.monotonicNs();
+        defer self.server.lake_query_metrics.record(.text_cursor, cursor_started);
         var result: types.SearchResult = .{ .alloc = a, .hits = try winners.finishLocated(paging.offset, if (self.use_stored_highlights) &self.highlight_locations else null, self.arena), .total_hits = total, .total_hits_relation = relation, .ordered_window_complete = ordering != null };
         if (req.profile) {
             result.sort_profile = profiled.sort_profile orelse .{};
@@ -1944,7 +1958,7 @@ const Execution = struct {
             const identities = self.text_identities.get(@intFromPtr(candidate_pin.?.snapshot)) orelse return error.InvalidNativeLakeTextCorpus;
             var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
             defer live.deinit(a);
-            const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
+            const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context, .metrics = &self.server.lake_query_metrics };
             const membership = if (self.ordered_membership) |memo| if (req.text_navigation_plan) |plan| try memo.get(self.forced_selection.?[0], candidate_pin.?.snapshot, plan, .{ .ptr = self, .is_cancelled_fn = canceled }) else null else null;
             if (self.ordered_membership) |memo| effective.text_pattern_membership = memo.patternCache(self.forced_selection.?[0]);
             for (rows) |row| if (try identities.ordinal(a, &live, self.store.artifactStore(), cached, row)) |number| {

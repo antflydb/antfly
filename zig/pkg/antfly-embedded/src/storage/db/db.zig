@@ -4715,10 +4715,15 @@ pub const DB = struct {
             zig017_return_error = error.VectorMigrationIdempotencyConflict;
             break :zig017_failure error.VectorMigrationIdempotencyConflict;
         };
-        if (observed.value.phase == .serving) {
+        // Reopening can restore a post-publication receipt before optional
+        // serving projections are ready. Resume their bounded publication in
+        // every destructive phase, not just the first serving transition.
+        if (observed.value.phase == .serving or observed.value.phase == .cleanup or observed.value.phase == .reclaiming) {
             const legacy = blk: {
                 var lease = self.tryAcquireIndexCatalogReadLease() orelse return;
                 defer lease.release();
+                if (self.core.index_manager.dense_indexes.items.len != 0 and
+                    self.core.index_manager.source_payload_store == null) return;
                 for (self.core.index_manager.dense_indexes.items) |entry| {
                     if ((self.core.index_manager.denseNativePhysicalMigrationRequired(entry.config.name) catch |zig017_err| {
                         zig017_return_error = zig017_err;
@@ -4786,6 +4791,11 @@ pub const DB = struct {
             error.VectorMigrationTemporaryBudgetExceeded, error.VectorMigrationDiskReserve, error.VectorMigrationRowExceedsBudget => {},
             else => self.requireVectorMigrationRecovery(),
         };
+        // The durable phase alone is not a proof about this owner lifetime.
+        // Preserve source data and the active receipt until all loaded ANN
+        // indexes can serve from the converted storage after recovery.
+        if ((job.value.phase == .cleanup or job.value.phase == .reclaiming) and
+            !self.core.index_manager.sourceMigrationServingComplete()) return;
         if (job.value.phase == .reclaiming) {
             const backend = self.core.primary_store_owner.lsm.handle.backend;
             if (!job.value.primary_reclamation_requested) {
@@ -132961,6 +132971,7 @@ test "source vector migration consolidates ANN serving while preserving queries 
     const request: vector_migration.contract.Request = .{ .job_id = "ann", .mode = .online, .budget = .{ .batch_rows = 3 } };
     try db.startVectorMigration(request);
     try std.testing.expectError(error.VectorMigrationActive, db.deleteIndex(cfg.name));
+    var checked_reclamation_admission = false;
     for (0..256) |_| {
         var status = (try vector_migration.load(alloc, db.core.store)).?;
         defer status.deinit();
@@ -132969,8 +132980,25 @@ test "source vector migration consolidates ANN serving while preserving queries 
         try std.testing.expectEqual(@as(u32, 2), result.total_hits);
         try std.testing.expectEqualStrings("a", result.hits[0].id);
         if (status.value.phase == .complete) break;
+        if (status.value.phase == .reclaiming and !status.value.primary_reclamation_requested and !checked_reclamation_admission) {
+            // Model the recovery interval before the source binding is ready.
+            // A persisted serving phase must not authorize destructive work
+            // against an unavailable projection in the new owner lifetime.
+            const manager = db.core.index_manager;
+            const source = manager.source_payload_store;
+            manager.source_payload_store = null;
+            defer manager.source_payload_store = source;
+            try db.advanceVectorMigration(request.job_id);
+            var pending = (try vector_migration.load(alloc, db.core.store)).?;
+            defer pending.deinit();
+            try std.testing.expectEqual(vector_migration.contract.Phase.reclaiming, pending.value.phase);
+            try std.testing.expect(!pending.value.primary_reclamation_requested);
+            checked_reclamation_admission = true;
+            continue;
+        }
         if (status.value.phase == .ready) try db.publishVectorMigration(request.job_id) else try db.advanceVectorMigration(request.job_id);
     } else return error.VectorMigrationDidNotFinish;
+    try std.testing.expect(checked_reclamation_admission);
     try std.testing.expect(db.core.index_manager.sourceMigrationServingComplete());
     try std.testing.expect(try db.deleteIndex(cfg.name));
     const key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "a", "shared");
@@ -141295,6 +141323,68 @@ fn testLiteExternalDenseLifecycle(recreate: bool) !void {
     try std.testing.expect(found_later);
     // Logical generation paths must never create host-side shadow directories.
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, db.core.index_manager.base_path, .{}));
+}
+
+test "lite external dense dimension replacement keeps writes available (#1216)" {
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/dimension.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = true, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    _ = try db.admitManagedIndex(.{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+    var keys: [20][32]u8 = undefined;
+    var old_writes: [20]types.BatchWrite = undefined;
+    for (&old_writes, &keys, 0..) |*write, *key, i| write.* = .{
+        .key = try std.fmt.bufPrint(key, "old-{d}", .{i}),
+        .value = "{\"body\":\"old document\",\"_embeddings\":{\"img\":[1,0,0]}}",
+    };
+    try db.batch(.{ .writes = &old_writes });
+    try db.runUntilIdle();
+    try std.testing.expect(try db.deleteIndex("img"));
+    var pages: usize = 0;
+    while (try db.advanceGeneratedArtifactCleanupPage("img") != .idle) : (pages += 1) try std.testing.expect(pages < 10_000);
+    const repair = try db.admitManagedIndex(.{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":4,\"external\":true}" });
+    // Admission must not block either vector or ordinary writes while its
+    // new generation is still rebuilding from retained authored artifacts.
+    try db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"body\":\"new document\",\"_embeddings\":{\"img\":[0,1,0,0]}}" }} });
+    try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{\"body\":\"no vector\"}" }} });
+    if (repair) |id| {
+        var complete = false;
+        for (0..20) |_| {
+            if ((try db.advanceIndexRepairIntent(a, id, repair_completion_test_options)).repaired) {
+                complete = true;
+                break;
+            }
+        }
+        try std.testing.expect(complete);
+    }
+    for (0..2) |round| {
+        if (round == 1) {
+            db.close();
+            handle.deinit();
+            handle = try lite.Handle.open(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+            opts = .{ .start_index_workers = true, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+            try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+            db = try DB.open(a, path, opts);
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"body\":\"new document\",\"_embeddings\":{\"img\":[0,1,0,0]}}" }} });
+        try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{\"body\":\"no vector\"}" }} });
+        try db.runUntilIdle();
+        var result = try db.search(a, .{ .index_name = "img", .query = .{ .dense_knn = .{ .vector = &.{ 0, 1, 0, 0 }, .k = 8 } }, .limit = 8 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqualStrings("new", result.hits[0].id);
+        try std.testing.expectEqual(@as(?u64, 1), try DB.loadDenseArtifactTargetCounter(a, db.core.store, "img"));
+        const checkpoint = try db.core.loadProjectionCheckpoint(a, "img");
+        try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    }
 }
 
 test "lite generation cleanup and capacity accounting survive reopen (#1210)" {

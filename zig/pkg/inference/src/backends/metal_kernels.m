@@ -996,6 +996,7 @@ typedef struct termite_metal_decode_runtime {
     // The legacy precise slot may contain a fast fallback. Strict consumers
     // must require provenance of an actual safe compilation, not its name.
     BOOL precise_library_safe;
+    id<MTLComputePipelineState> video_position_pipeline;
     id<MTLComputePipelineState> embed_absolute_position_pipeline;
     id<MTLComputePipelineState> embedding_lookup_pipeline;
     id<MTLComputePipelineState> embedding_lookup_bf16_pipeline;
@@ -13724,6 +13725,10 @@ static NSString *termite_metal_shader_source(void) {
            "    float max_abs = tg_max[0]; float scale = max_abs == 0.0f ? 1.0f : max_abs / 127.0f; float inv_scale = 1.0f / scale;\n"
            "    if (tid.x == 0u) { uint scale_bits = as_type<uint>(scale); out[out_base + 0u] = uchar(scale_bits & 0xffu); out[out_base + 1u] = uchar((scale_bits >> 8u) & 0xffu); out[out_base + 2u] = uchar((scale_bits >> 16u) & 0xffu); out[out_base + 3u] = uchar((scale_bits >> 24u) & 0xffu); }\n"
            "    if (d < head_dim) { int q = int(clamp(round(val * inv_scale), -127.0f, 127.0f)); out[out_base + 4u + d] = uchar(q); }\n"
+           "}\n"
+           "kernel void antfly_video_position(device const float *input [[buffer(0)]], device const float *positions [[buffer(1)]], device float *output [[buffer(2)]], constant uint4 &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if (gid >= p.x) return; uint row=gid/768u, h=gid%768u; uint x=row%p.y, y=(row/p.y)%p.z;\n"
+           "    output[gid]=input[gid]+(positions[x*768u+h]+positions[(p.w+y)*768u+h]);\n"
            "}\n"
            "kernel void termite_embed_absolute_position(device const float *token_embedding [[buffer(0)]], device const float *position_embedding [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_embed_absolute_position_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p.hidden_size) return;\n"
@@ -28776,6 +28781,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->mrope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_mrope");
         runtime->packed_gelu_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_packed_gelu");
         runtime->embedding_head_prepare_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_embedding_head_prepare");
+        runtime->video_position_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_video_position");
         runtime->rotary_table_pipeline = termite_metal_make_pipeline(device, precise_library, @"antfly_rotary_table");
         runtime->vision_norm_rope_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_vision_norm_rope");
         runtime->rope_pair_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_apply_rope_pair");
@@ -29856,6 +29862,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->mrope_pipeline = nil;
     runtime->packed_gelu_pipeline = nil;
     runtime->embedding_head_prepare_pipeline = nil;
+    runtime->video_position_pipeline = nil;
     runtime->rotary_table_pipeline = nil;
     runtime->vision_norm_rope_pipeline = nil;
     runtime->rope_pair_pipeline = nil;
@@ -67765,6 +67772,77 @@ int termite_metal_buffer_copy(
     }
 }
 
+// A bounded gather owns every staging buffer until its single completion
+// fence. Host memory is copied once, directly into Shared upload storage.
+typedef struct {
+    void *device;
+    const void *host;
+    size_t source_offset;
+    size_t destination_offset;
+    size_t length;
+} termite_metal_buffer_gather_source;
+int termite_metal_buffer_gather(termite_metal_decode_runtime *runtime, void *destination,
+    const termite_metal_buffer_gather_source *sources, size_t count) {
+    if (!runtime || !runtime->device || !runtime->queue || !destination || !sources || !count || count > 8) return -1;
+    // Join the input phase when owned by the caller. Submitted-only work is
+    // rejected; staging/source owners must follow this exact frame's fence.
+    if (runtime->submitted_frame_cb) return -2;
+    @autoreleasepool {
+        id<MTLBuffer> dst = (__bridge id<MTLBuffer>)destination;
+        if (dst.device != runtime->device) return -3;
+        id<MTLBuffer> inputs[8];
+        NSMutableArray * __attribute__((objc_precise_lifetime)) owners = [NSMutableArray new];
+        size_t offsets[8];
+        size_t host_bytes = 0;
+        // Validate the whole request before allocating or encoding anything.
+        for (size_t i = 0; i < count; ++i) {
+            const termite_metal_buffer_gather_source *source = sources + i;
+            if (!source->length || source->destination_offset > dst.length || source->length > dst.length - source->destination_offset) return -3;
+            if ((source->device != NULL) == (source->host != NULL)) return -4;
+            if (source->device) {
+                inputs[i] = (__bridge id<MTLBuffer>)source->device;
+                if (inputs[i].device != runtime->device || source->source_offset > inputs[i].length || source->length > inputs[i].length - source->source_offset) return -5;
+                offsets[i] = source->source_offset;
+                [owners addObject:inputs[i]];
+            } else {
+                if (source->source_offset != 0 || source->length > SIZE_MAX - host_bytes) return -6;
+                host_bytes += source->length;
+            }
+        }
+        if (host_bytes) {
+            id<MTLBuffer> staging = antfly_observe_metal_buffer([runtime->device newBufferWithLength:host_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+            if (!staging || !staging.contents) return -7;
+            [owners addObject:staging];
+            size_t cursor = 0;
+            for (size_t i = 0; i < count; ++i) if (sources[i].host) {
+                memcpy((uint8_t *)staging.contents + cursor, sources[i].host, sources[i].length);
+                inputs[i] = staging; offsets[i] = cursor; cursor += sources[i].length;
+            }
+        }
+        const bool owned = runtime->active_frame_cb == nil;
+        if (!owned) {
+            [owners addObject:dst];
+            for (id buffer in owners) if (termite_metal_decode_runtime_retain_frame_resource(runtime, buffer) != 0) return -8;
+            termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
+        }
+        id<MTLCommandBuffer> command = owned ? termite_metal_new_command_buffer(runtime->queue, __func__) : runtime->active_frame_cb;
+        if (!command) return -8;
+        id<MTLBlitCommandEncoder> encoder = termite_metal_tracked_blit_command_encoder(command);
+        if (!encoder) return -9;
+        for (size_t i = 0; i < count; ++i) {
+            [encoder copyFromBuffer:inputs[i] sourceOffset:offsets[i] toBuffer:dst destinationOffset:sources[i].destination_offset size:sources[i].length];
+        }
+        [encoder endEncoding];
+        if (owned && termite_metal_commit_and_wait(command, __func__, -10) != 0) return -10;
+        for (size_t i = 0; i < count; ++i) {
+            const bool host = sources[i].host != NULL;
+            termite_metal_telemetry_copy(host ? TERMITE_METAL_UPLOAD_BYTES : TERMITE_METAL_COPY_BYTES,
+                host ? TERMITE_METAL_UPLOAD_CALLS : TERMITE_METAL_COPY_CALLS, sources[i].length);
+        }
+        return 0;
+    }
+}
+
 int termite_metal_buffer_copy_pair(
     termite_metal_decode_runtime *runtime,
     void *src_a_handle,
@@ -70624,4 +70702,24 @@ int antfly_metal_rotary_table(termite_metal_decode_runtime *runtime, void *outpu
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(cb, owned, -5);
     }
+}
+
+// Precise addition matches x/y lookup + add + patch add, with no index buffers
+// or intermediate position tensors. The audio dispatcher tracks frame hazards.
+int antfly_metal_video_position(termite_metal_decode_runtime *r, void *input, size_t io,
+    void *output, size_t oo, uint32_t rows,
+    uint32_t grid_x, uint32_t grid_y, uint32_t axis) {
+    if (!r || !r->precise_library_safe || !r->video_position_pipeline || !rows ||
+        !grid_x || !grid_y || grid_x > axis || grid_y > axis || rows > UINT32_MAX / 768u ||
+        r->generic_embedding_table_buffer == nil || r->generic_embedding_dim != 768u || r->generic_embedding_rows != (size_t)axis * 2u) return -1;
+    size_t table_bytes;
+    if (!termite_metal_size_mul3(axis, 2u * 768u, sizeof(float), &table_bytes)) return -1;
+    const size_t bytes = (size_t)rows * 768u * sizeof(float);
+    const termite_metal_gemma4_audio_binding b[3] = {
+        {(__bridge id<MTLBuffer>)input, io, bytes, false},
+        {r->generic_embedding_table_buffer, r->generic_embedding_buffer_offset, table_bytes, false},
+        {(__bridge id<MTLBuffer>)output, oo, bytes, true}};
+    const uint32_t params[4] = {rows * 768u, grid_x, grid_y, axis};
+    return termite_metal_decode_runtime_gemma4_audio_dispatch(r, r->video_position_pipeline,
+        b, 3, params, sizeof(params), rows * 768u, 1, 256, __func__);
 }
