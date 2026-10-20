@@ -19,6 +19,58 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Original request controls in generated preparation (2026-10-20)
+
+Merged `origin/main` at `51cfaa8f6ef8ccc8b14f7c7b3201b84a36863449` in
+`9b633a4125766c95a42bf80e75f2cc3599cce691`, retaining the same worktree,
+branch and PR. Source `fc34f7465f4bd2d8019ee59fac80de149bb8fa8b` carries original request lifetime,
+IO and the projected monotonic deadline through the controlled native batch
+boundary into ordinary generated-effect preparation. The scope latches the
+first rejection. Native errors retain their original identity after inference
+transport aliases, using only the already latched cause when returning failure;
+that translation never polls foreground authority after durability.
+
+Preparation owns a runtime/config copy, intersects inherited dense, sparse and
+asset provider controls, checks memo and document work, and retires rejected
+outputs. The shared lifecycle guard and provider configuration stay unchanged.
+Tracked request embedding/chunk counters still reach the resident runtime,
+without overwriting its overlapping replay snapshot. Existing caller-funded
+metadata and independently budgeted native backing keep their ownership rules.
+
+The caller retains CPU while mutation/capture holders live. Its runnable is
+never copied to a provider child. Controlled preparation does not launch
+provider fanout or PDF prefetch; independent execution grants must first be
+supplied outside those holders. This does not implement the full producer CPU handoff.
+Native ABI 48 fences the added private descriptors and scoped provider fields;
+API 55, storage-owner 109, runnable 16, failure 66, engine descriptor 29 and
+reader floor 10 remain unchanged. No durable format changes.
+
+`preparation-provider-controls-v6` passes 76/76 build steps, including 42
+provider/admission/telemetry cases and 21 PDF/funding cases. The two cached private error-name round trips
+retain the prior passing evidence with identical table, compiler and joinable-IO
+inputs. The new actual batch fixture exercises dense and sparse providers with expiration before
+dispatch, inherited deadline intersection, borrowed original IO, caller-thread
+execution without a child runnable, late output rejection, source absence,
+released fences, unchanged resident configuration, retained counters and a
+successful new request after the rejected scope retires. It covers original
+custom, cancellation, deadline and scheduler rejections. The expanded BEGIN/PREPARE fixture uses full-width transaction IDs;
+transient backend backpressure retries occur only between returned operations,
+with each rejection checkpoint reset and terminal cleanup still checked.
+The native source-controller check is semantic analysis; the full linked
+archive/cold-source runtime remain unqualified.
+
+`preparation-provider-controls-verified.json` binds 5261 unchanged native
+inputs, 4545 matching immutable public sources and 25 passing ReleaseSafe
+consumer steps to this source commit and merged main. The generated error-name
+and source-boundary catalogs pass without new shared status numbers.
+
+Required-mode distributed providers remain unwired and disabled. Complete
+producer computation outside holders, independently funded child CPU, durable
+accepted effects and completion reservations before PREPARE, readiness from
+observed durable state, hidden-owner authority and the remaining route/backend,
+fault and default-policy work are still required. The full design remains
+incomplete; full Linux qualification is waived.
+
 ## Original authority through provider control boundaries (2026-10-20)
 
 Source `aec0358112df715a12fac03bd0184a82df57a60d` preserves fallible request authority through
@@ -63,9 +115,9 @@ three test names; shared numeric status identities remain unchanged.
 4544 matching immutable public sources, generated-name/source-boundary checks
 and all 25 passing ReleaseSafe consumer steps.
 
-Original generated-effect preparation still needs its per-request provider
-context and independently funded CPU/child handoff. These boundary repairs do
-not wire that scope or authorize copying a parent's runnable to parallel children.
+At this checkpoint, generated-effect preparation still needed its per-request
+provider context and independently funded CPU/child handoff. The preparation
+context is now wired as described above; independent CPU/children remain open.
 Durable completion reservations before voting prepared, required-mode providers,
 hidden-owner authority and the remaining scheduler/fault/default-policy work
 remain open. The full design remains incomplete; full Linux qualification is

@@ -15,15 +15,33 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The current merge includes `origin/main` at `d227ec2811235d618b8e50d86ab4b1472b207cc4`
-(merge commit `b81563cddd6bd86941e40ebcdf2b1bf805113605`).
+The current merge includes `origin/main` at `51cfaa8f6ef8ccc8b14f7c7b3201b84a36863449`
+(merge commit `9b633a4125766c95a42bf80e75f2cc3599cce691`).
 
-Native ABI 47, storage-owner ABI 109, engine descriptor 29, required preparation
+Native ABI 48, storage-owner ABI 109, engine descriptor 29, required preparation
 file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
+
+Source `fc34f7465f4bd2d8019ee59fac80de149bb8fa8b` carries original lifetime,
+IO and projected deadlines through ordinary controlled native batch preparation.
+Owned runtime/config copies intersect inherited provider controls; rejected
+outputs retire without changing the shared lifecycle guard or configuration.
+Native error translation preserves the already latched original cause without
+polling foreground authority after durability. Request counters still reach the
+resident runtime. The caller retains CPU while holders live; controlled
+preparation leaves provider fanout and PDF prefetch disabled until independent
+producer execution is funded.
+
+The merged source passes 76/76 focused build steps with 42 provider/admission/
+telemetry cases and 21 PDF/funding cases. Two cached private error-name round trips
+retain unchanged-source evidence. The immutable package has 4545 matching public
+sources and passes 25/25 ReleaseSafe consumer build steps. Qualification binds
+5261 unchanged native inputs in `preparation-provider-controls-verified.json`.
+Source-controller coverage is semantic only; the full linked archive/cold-source
+runtime remain unqualified. The same worktree, branch and PR remain in use.
 
 Source `aec0358112df715a12fac03bd0184a82df57a60d` hardens provider control boundaries. Fallible
 original authority survives composed cancellation and boolean transport polling;
@@ -31,8 +49,10 @@ input preparation and returned output remain fenced. Scoped asset dispatch canno
 select an unscoped batch or planner, while controlled scalar fallback and atomic
 transport compatibility remain available. The focused 88-step run, two private name round-trip cases and 25-step
 immutable-package ReleaseSafe consumer pass.
-Original generated-effect provider context/CPU handoff, durable completion
-reservations and required-mode activation remain unfinished.
+Original provider contexts now reach ordinary controlled generated preparation.
+Independent producer CPU/children outside holders, durable accepted effects and
+completion reservations before PREPARE, and required-mode activation remain
+unfinished. The full design remains incomplete.
 
 Source `7ca0f1d0b40aa424d5de9ca8ebfe8881772706cb` funds precommit producer invocation and
 coordinator planning metadata from the original preparation allocator, retained
