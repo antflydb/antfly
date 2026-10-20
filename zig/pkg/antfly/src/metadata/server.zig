@@ -1078,6 +1078,7 @@ fn metadataDataBearingStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Al
 }
 
 fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.Allocator, group_ids: []const u64, policy: api_table_router.RoutePolicy, budget: api_table_router.RouteBudget) !?[]api_table_router.GroupRoute {
+    try budget.check();
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     // Metadata nodes never own data replicas, so both policies use the same
     // remote ordering: the comparator prefers a leader and otherwise returns

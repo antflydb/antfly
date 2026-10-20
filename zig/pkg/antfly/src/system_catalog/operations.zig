@@ -103,6 +103,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
     var object_create = false;
+    var resolver_create = false;
     if (request.create_table_json) |json| {
         var create_req = try tables_api.parseStoredCreateTableRequest(alloc, json);
         defer create_req.deinit(alloc);
@@ -110,8 +111,17 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         try storage_settings.validateCreate(create_req.num_shards, if (create_req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
         try tables_api.validateObjectCreateDefinition(alloc, create_req);
         object_create = storage_settings.engine == .object;
+        resolver_create = protocol.usesResolverNamespaces(create_req.indexes_json orelse tables_api.default_indexes_json);
+        // Catalog CREATE bypasses TableWorkflow. Run the same resolver and
+        // decoder preflight before taking its mutation gate, then recheck the
+        // actual admitted identity below while holding that gate.
+        try @import("../metadata/table_workflow.zig").preflightTableRecordWithContext(svc, context, .{
+            .table_id = 0,
+            .name = request.physical_name orelse "",
+            .indexes_json = create_req.indexes_json orelse tables_api.default_indexes_json,
+        });
     }
-    const required_version = if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
+    const required_version = @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version);
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
@@ -132,6 +142,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, req.indexes_json.?);
         try managed_embedder.validateEmbeddingProducerOwnershipJson(a, req.indexes_json.?);
         var table = tables_api.deriveTableRecord(storage_name, req);
+        if (!try store.resolverProjectionValid(a, svc.metadata_group_id, table)) return error.ResolverCurationConflict;
         if (try fk_publication.schemaHasForeignKeys(a, table.schema_json)) return error.ForeignKeyGenerationPublicationRequired;
         const policy = admission.placement_policy;
         try policy.validate();
@@ -514,6 +525,14 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
 
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) anyerror![]u8 {
     return switch (input) {
+        .resolver_catalog_read => |read| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const bytes = try store.resolverCatalogRead(alloc, svc.metadata_group_id, read);
+            errdefer alloc.free(bytes);
+            try context.ensureActive();
+            break :blk bytes;
+        },
         .lake_index_lifecycle_read => |table_id| @import("../metadata/lake_index_lifecycle.zig").readOnService(svc, alloc, table_id, context),
         .lake_index_lifecycle_work => |after| @import("../metadata/lake_index_lifecycle.zig").workOnService(svc, alloc, after, context),
         .lake_index_lifecycle_mutate => |write| blk: {

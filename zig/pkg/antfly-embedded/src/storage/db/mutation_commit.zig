@@ -34,6 +34,7 @@ const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
 const enrichment_worker = @import("enrichment/enrichment_worker.zig");
 const execution_resources = @import("execution_resources.zig");
+const group_mutations = @import("group_source_mutations.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_edge_contender = @import("graph_edge_contender.zig");
 const graph_edge_ttl_tombstone = @import("graph_edge_ttl_tombstone.zig");
@@ -793,6 +794,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
+            for (effective_req.writes) |write| if ((@import("group_source_identity.zig").isAnchor(write.key) or @import("group_source_transfer.zig").isKey(write.key))) return error.InvalidBatchRequest;
+            for (effective_req.deletes) |document| if ((@import("group_source_identity.zig").isAnchor(document) or @import("group_source_transfer.zig").isKey(document))) return error.InvalidBatchRequest;
+
             // hot-standby encoding is a pure function of the admitted request and can be
             // proportional to the entire batch. Prepare it before the serialized
             // apply section, then reuse the exact bytes for durable outboxes and
@@ -887,6 +891,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const publication_control = publication_admission.bind(snapshot_controls, S.ownerField(self, "core").*.apply_mutex.io);
             var prepared_artifacts = try self.prepareMergeArtifactEffects(preparation_alloc, req);
             defer prepared_artifacts.deinit();
+            if (write_plan_snapshot == null and (S.ownerField(self, "core").*.index_manager.hasGroupSources() or opts.group_source_command != null) and
+                (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or opts.group_source_command != null))
+                write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
             const apply_lock_wait_start_ns = monotonicTimeNs();
             if (opts.avoid_admission_capacity_cycle)
                 try mutation_admission.lockApplyPreDecision(self, mutation_admission.retainedLeaseControls(snapshot_controls))
@@ -1062,6 +1069,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (!observed.ready or !std.meta.eql(observed.ordered, @as(?inventory.Binding, prepared_binding))) return error.ArtifactCatalogDrift;
                 }
                 if (req.merge_page) |page| for (page.artifact_effects) |effect| {
+                    if (@import("group_source_transfer.zig").isKey(effect.key)) {
+                        try @import("merge_page_contract.zig").validateArtifactEffect(page.source, effect.key, effect.value);
+                        continue;
+                    }
                     if (@import("online_graph_artifacts.zig").isKey(effect.key)) {
                         if (prepared_artifacts.receiver_binding == null) return error.PreparedGenerationChanged;
                         continue;
@@ -1210,6 +1221,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Coalescer draining above can release/reacquire apply. An index-only
             // publication need not change the schema or managed-index generation.
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
+            if (write_plan_snapshot) |pinned| if (pinned.plan().group_sources) |group_plan| {
+                if (group_plan.entries.len > 0 and pinned.generation() != S.ownerField(self, "core").*.index_manager.writePlanGeneration()) return error.PreparedGenerationChanged;
+            };
             const use_preprepared_rows = blk: {
                 const rows = preprepared_rows orelse break :blk false;
                 const pinned = request_schema_view orelse break :blk false;
@@ -1555,6 +1569,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 effective_req.merge_artifacts = filtered_cleanup_replay_writes.?;
             }
 
+            const group_plan: ?*const group_mutations.Plan = if (write_plan_snapshot) |pinned|
+                if (pinned.plan().group_sources) |*plan| if (plan.entries.len > 0) plan else null else null
+            else
+                null;
+            const group_alloc = prepared_effects_arena.allocator();
+            const group_changes: []?[]const group_mutations.Plan.Change = if (group_plan != null) try group_alloc.alloc(?[]const group_mutations.Plan.Change, effective_req.writes.len) else &.{};
+            @memset(group_changes, null);
             for (effective_req.writes, 0..) |write, i| {
                 if (isMetadataKey(write.key)) {
                     extracted[i] = .{
@@ -1602,6 +1623,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     active_profile.relational_rows_prepared += 1;
                     active_profile.relational_logical_bytes += @intCast(write.value.len);
                     active_profile.relational_encoded_bytes += @intCast(prepared.packed_row.len);
+                };
+                // Consume logical grouping while the parse is still owned. Worker
+                // preparations carry only the bounded projection beyond this point.
+                if (group_plan) |plan| if (prepared_relational) |*prepared| {
+                    group_changes[i] = prepared.group_changes orelse try plan.prepareRow(group_alloc, write.key, prepared.parsedValue());
                 };
                 const mapper_extract_start_ns = monotonicTimeNs();
                 const semantic_hash = if (prepared_relational) |*prepared| prepared.semantic_hash else null;
@@ -1692,6 +1718,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // Only the document-mode branch consumes JSON here. Relational
                     // persistence and timestamps use the prepared typed authority.
                     const cleaned = if (prepared_relational == null) extracted[i].cleaned_value.? else "";
+                    if (prepared_relational == null) if (group_plan) |plan| {
+                        const logical = try std.json.parseFromSliceLeaky(std.json.Value, group_alloc, cleaned, .{});
+                        group_changes[i] = try plan.prepareRow(group_alloc, write.key, logical);
+                    };
                     const resolved_write_timestamp_ns: ?u64 = if (!use_preprepared_rows and shouldWriteTimestamp(write.key))
                         (if (opts.restore_timestamps) |timestamps| timestamps.get(write.key) else null) orelse if (prepared_relational) |*prepared|
                             try resolveWriteTimestampFromValue(self, batch_timestamp_ns, prepared.parsedValue())
@@ -2034,6 +2064,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var receiver_artifact_namespace: @import("artifact_publication.zig").Namespace = undefined;
             doc_identity.encodeNamespace(&receiver_artifact_namespace, S.ownerField(self, "core").*.identity_namespace);
             for (transferred_artifacts) |effect| {
+                if (@import("group_source_transfer.zig").isKey(effect.key)) continue;
                 const revision_key = @import("artifact_publication.zig").artifactRevisionKey(receiver_artifact_namespace, effect.key);
                 const owned_revision_key = try S.ownerField(self, "alloc").*.dupe(u8, &revision_key);
                 owned_store_keys.append(S.ownerField(self, "alloc").*, owned_revision_key) catch |err| {
@@ -2324,7 +2355,98 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // instead of reserving a sequence that would either be lost (and make
             // the in-memory generation move backwards after restart) or require a
             // synthetic replay item that every managed consumer must drain.
-            const elide_semantic_noop_replay = use_thin_replay_fast_path and
+            var group_overlay = group_mutations.Overlay{ .completion_root = S.ownerField(self, "root_incarnation").*, .source_revision = if (opts.ordered_apply_receipt) |receipt| receipt.index else null, .owner_incarnation = @import("group_source_owner_identity.zig").fromNamespace(S.ownerField(self, "core").*.identity_namespace, S.ownerField(self, "root_incarnation").*), .allocator = group_alloc, .reader = group_mutations.Reader.fromStore(S.ownerField(self, "core").*.store) };
+            const review_plan = if (opts.resolver_review_command) |command| try @import("resolver_review.zig").plan(group_alloc, S.ownerField(self, "core").*, command.*, true) else null;
+            if (review_plan) |review| if (review.source_key) |key| try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
+            var group_staged = @import("group_source_snapshot.zig").Staged{ .changed = &.{}, .deleted = &.{}, .sequence = 0 };
+            var transferred_group_changed: std.ArrayList([]const u8) = .empty;
+            var transferred_group_deleted: std.ArrayList([]const u8) = .empty;
+            for (transferred_artifacts) |effect| {
+                const transfer = @import("group_source_transfer.zig");
+                if (!transfer.isKey(effect.key)) continue;
+                const table = try group_mutations.tableIdentity(&group_overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
+                try transfer.stage(group_alloc, &group_overlay, table, effect.key, effect.value);
+                const info = try transfer.info(group_alloc, effect.key);
+                if (info.kind == @import("group_source_identity.zig").primary_kind) {
+                    if (effect.value != null) try transferred_group_changed.append(group_alloc, info.document) else try transferred_group_deleted.append(group_alloc, info.document);
+                }
+            }
+            // Reserve exactly once before inspecting replica-local maintenance
+            // candidates. Every replica consumes the same portable clock tick,
+            // even if a stale covering hint is absent on one of them. Imported
+            // clocks may be ahead of this owner's Raft log after range handoff.
+            if (group_plan) |plan| if (plan.entries.len != 0 and (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or (if (opts.group_source_command) |command| command.action == .backfill else false))) {
+                const table = try group_mutations.tableIdentity(&group_overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
+                _ = try group_overlay.eventRevision(.{ .table_incarnation = table, .configuration = plan.entries[0].configuration });
+            };
+            if (opts.group_source_command) |command| {
+                const empty_groups = group_mutations.Plan{ .arena = undefined, .entries = &.{} };
+                const plan = group_plan orelse &empty_groups;
+                var matched = false;
+                var matched_entry: ?group_mutations.Plan.Entry = null;
+                for (plan.entries) |entry| if (std.mem.eql(u8, entry.name, command.artifact) and std.mem.eql(u8, &entry.configuration, &command.definition.configuration)) {
+                    matched = true;
+                    matched_entry = entry;
+                    break;
+                };
+                if (!matched and command.action != .retire and command.action != .activate) return error.PreparedGenerationChanged;
+                const table = try group_mutations.tableIdentity(&group_overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
+                if (table != command.definition.table_incarnation) return error.InvalidGroupedSourceCommand;
+                var namespace: [24]u8 = undefined;
+                doc_identity.encodeNamespace(&namespace, S.ownerField(self, "core").*.identity_namespace);
+                if (!std.mem.eql(u8, &namespace, &command.namespace)) return error.InvalidGroupedSourceCommand;
+                if (command.finish) |finish| {
+                    if (opts.ordered_apply_receipt == null and opts.legacy_group_plan_generation == write_plan_snapshot.?.generation() and opts.legacy_group_completed_through != null and opts.legacy_group_completed_through.? >= finish.through_sequence) group_overlay.legacy_completion = true;
+                }
+                const route = try command.routeAlloc(group_alloc);
+                if (!S.ownerField(self, "core").*.byteRange().contains(route)) return error.KeyOutOfRange;
+                if (command.action == .activate) {
+                    const entry = opts.ordered_apply_receipt orelse return error.InvalidGroupedSourceCommand;
+                    const inventory = @import("artifact_inventory.zig");
+                    const publication = @import("artifact_publication.zig");
+                    const catalogs = try inventory.catalogs(&group_overlay);
+                    const active = try publication.authority(&group_overlay);
+                    const status = try inventory.status(group_alloc, &group_overlay, namespace);
+                    const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
+                    if (!ready) {
+                        try @import("artifact_catalog_mutability.zig").requireMutable(group_alloc, &group_overlay, namespace, null);
+                        const ordered = if (status.ready and status.ordered.?.effect_protocol == 16) blk: {
+                            var installed = (try inventory.load(group_alloc, &group_overlay)).?;
+                            defer installed.deinit();
+                            var current = installed.value.command;
+                            current.catalogs = catalogs;
+                            break :blk current;
+                        } else inventory.Command{ .namespace = namespace, .previous = status.ordered, .catalogs = catalogs, .binding = .{ .epoch = try std.math.add(u64, if (status.ordered) |previous| previous.epoch else 0, 1), .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(group_alloc), .effect_protocol = 16 } };
+                        try inventory.stageOrdered(group_alloc, &group_overlay, ordered, entry.index);
+                    }
+                } else if (command.action == .retire) {
+                    // Never prune source-owned unit pointers from an incomplete
+                    // immutable copy; membership arrives atomically at admission.
+                    try @import("artifact_catalog_mutability.zig").requireMutable(group_alloc, &group_overlay, namespace, null);
+                    const retired = try @import("group_source_retirement.zig").applyPage(internal_keys, group_alloc, &group_overlay, plan, table, @import("group_source_baseline.zig").retirementGeneration(@import("group_source_baseline.zig").sourceGeneration(S.ownerField(self, "core").*.index_manager.activeSchemaVersion() orelse 0, namespace, S.ownerField(self, "core").*.byteRange().start, S.ownerField(self, "core").*.byteRange().end, S.ownerField(self, "root_incarnation").*), try (try @import("artifact_inventory.zig").catalogs(&group_overlay)).semanticDigest(group_alloc)), command.backfill.?.page.?, .{ .start = S.ownerField(self, "core").*.byteRange().start, .end = S.ownerField(self, "core").*.byteRange().end });
+                    group_staged.deleted = retired.deleted_sources;
+                    for (retired.changed_artifacts) |key| try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
+                } else if (command.action == .backfill) {
+                    const Owner = @TypeOf(S.ownerField(self, "core").*);
+                    const Materializer = struct {
+                        fn read(ptr: *anyopaque, a: Allocator, document: []const u8) !?std.json.Value {
+                            const owner: Owner = @ptrCast(@alignCast(ptr));
+                            return group_mutations.currentRow(owner, a, document);
+                        }
+                    };
+                    try @import("group_source_baseline.zig").applyPage(internal_keys, group_alloc, &group_overlay, command.definition, @import("group_source_baseline.zig").sourceGeneration(S.ownerField(self, "core").*.index_manager.activeSchemaVersion() orelse 0, namespace, S.ownerField(self, "core").*.byteRange().start, S.ownerField(self, "core").*.byteRange().end, S.ownerField(self, "root_incarnation").*), command.backfill.?.page.?, .{ .ptr = S.ownerField(self, "core").*, .read_fn = Materializer.read }, group_mutations.Plan.Projector{ .entry = matched_entry.?, .bounds = .{ .start = S.ownerField(self, "core").*.byteRange().start, .end = S.ownerField(self, "core").*.byteRange().end } });
+                } else group_staged = @import("group_source_apply.zig").stage(group_alloc, &group_overlay, command.*, S.ownerField(self, "core").*.nextDerivedAppendSequence(), matched_entry.?.horizons) catch |err| switch (err) {
+                    error.EnrichmentSourceChanged, error.ArtifactPublicationPending, error.GroupedSourceRetirementPending, error.GroupedSourceBusy, error.GroupedSourceEarlierWorkPending => blk: {
+                        // A committed control race is an ordered rejection. No
+                        // partial effects survive; its applied watermark does.
+                        group_overlay.effects.clearRetainingCapacity();
+                        break :blk .{ .changed = &.{}, .deleted = &.{}, .sequence = 0 };
+                    },
+                    else => return err,
+                };
+            }
+            const group_control_without_replay = opts.group_source_command != null and !group_staged.hasReplay() and changed_graph_artifact_keys.items.len == 0;
+            const elide_semantic_noop_replay = group_control_without_replay or (opts.resolver_review_command == null and group_plan == null and use_thin_replay_fast_path and
                 opts.extra_store_writes.len == 0 and
                 opts.transaction_resolution == null and
                 opts.replication_applied_lsn_marker == null and
@@ -2334,11 +2456,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     deleted_artifact_keys,
                     changed_graph_artifact_keys.items,
                     derived_changed_flags,
-                );
+                ));
             const sequence = if (elide_semantic_noop_replay)
                 S.ownerField(self, "core").*.nextDerivedSequence()
             else
                 S.ownerField(self, "core").*.reserveDerivedAppendSequence();
+            if (group_plan) |plan| {
+                const overlay = &group_overlay;
+                const table = try group_mutations.tableIdentity(overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
+                for (effective_req.writes, group_changes) |write, maybe_changes| if (maybe_changes) |changes| try group_mutations.stagePrepared(overlay, plan, table, write.key, sequence, changes);
+                for (effective_req.deletes) |document| {
+                    if (isMetadataKey(document)) continue;
+                    try overlay.stage(plan, table, document, sequence, null);
+                }
+            }
+            if (group_overlay.effects.count() != 0) {
+                const overlay = &group_overlay;
+                var retained_deletes: usize = 0;
+                for (delete_keys.items) |deleted| {
+                    if (overlay.effects.getEntry(deleted)) |effect| if (effect.value_ptr.* != null) continue;
+                    delete_keys.items[retained_deletes] = deleted;
+                    retained_deletes += 1;
+                }
+                delete_keys.shrinkRetainingCapacity(retained_deletes);
+                var effects = overlay.effects.iterator();
+                while (effects.next()) |effect| {
+                    if (effect.value_ptr.*) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key_ptr.*, .value = value }) else try delete_keys.append(S.ownerField(self, "alloc").*, effect.key_ptr.*);
+                }
+            }
+            if (review_plan) |review| {
+                // Plan strings live in the bounded transaction arena. KV list
+                // storage uses the writer allocator, so copy only its entries.
+                var review_writes: std.ArrayList(docstore_mod.KVPair) = .empty;
+                try review.stage(group_alloc, &review_writes, sequence);
+                try store_writes.appendSlice(S.ownerField(self, "alloc").*, review_writes.items);
+            }
             if (profile) |active_profile| active_profile.source_sequence = sequence;
             const identity_metadata_start_ns = monotonicTimeNs();
             const identity_live_before = if (identity_upsert_keys.items.len != 0 or effective_req.deletes.len != 0)
@@ -2464,7 +2616,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &owned_child_range_outbox_values,
             );
             const build_derived_start_ns = monotonicTimeNs();
-            const replay_payload = if (use_thin_replay_fast_path)
+            var replay_payload = if (opts.group_source_command != null)
+                try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, .{ .sequence = sequence, .changed_doc_keys = try group_staged.replayDocuments(group_alloc), .deleted_doc_keys = group_staged.deleted, .changed_artifact_keys = changed_graph_artifact_keys.items, .target_hints = &.{ .enrichment, .graph, .dense_vector, .sparse_vector } })
+            else if (use_thin_replay_fast_path)
                 try encodeThinReplayRecordPayloadWithAdmission(
                     S.ownerField(self, "alloc").*,
                     effective_req,
@@ -2511,6 +2665,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 break :blk payload;
             };
             defer S.ownerField(self, "alloc").*.free(replay_payload);
+            if (transferred_group_changed.items.len != 0 or transferred_group_deleted.items.len != 0) {
+                var decoded = try change_journal_mod.decodeRecord(group_alloc, replay_payload);
+                defer decoded.deinit();
+                var changed: std.ArrayList([]const u8) = .empty;
+                try changed.appendSlice(group_alloc, decoded.record.changed_doc_keys);
+                try changed.appendSlice(group_alloc, transferred_group_changed.items);
+                // Imported private tombstones need the same producer retirement
+                // replay as locally retired units.
+                try changed.appendSlice(group_alloc, transferred_group_deleted.items);
+                var deleted: std.ArrayList([]const u8) = .empty;
+                try deleted.appendSlice(group_alloc, decoded.record.deleted_doc_keys);
+                try deleted.appendSlice(group_alloc, transferred_group_deleted.items);
+                var hints: std.ArrayList(change_journal_mod.TargetHint) = .empty;
+                try hints.appendSlice(group_alloc, decoded.record.target_hints);
+                if (std.mem.indexOfScalar(change_journal_mod.TargetHint, hints.items, .enrichment) == null) try hints.append(group_alloc, .enrichment);
+                var record = decoded.record;
+                record.changed_doc_keys = changed.items;
+                record.deleted_doc_keys = deleted.items;
+                record.target_hints = hints.items;
+                const encoded = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, record);
+                S.ownerField(self, "alloc").*.free(replay_payload);
+                replay_payload = encoded;
+            }
             const append_derived_replay = !opts.suppress_derived_replay_append and
                 !elide_semantic_noop_replay;
             if (append_derived_replay) {
@@ -2995,6 +3172,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             index_read = null;
             if (graph_publication) |*lease| lease.release();
             if (!transaction_applied.applied) {
+                // Recovery may have committed this participant before the
+                // requesting owner retries it. Its visibility wait must yield
+                // the foreground maintenance deferral just like a fresh commit.
+                foreground_write.release();
                 unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
                 const retirement: mutation_admission.MutationRetirement = .{
                     .current = &replication_mutation,
@@ -3008,6 +3189,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try self.waitForResolvedTransactionSync(effective_req.sync_level, transaction_applied.replay_sequence);
                 return;
             }
+            if (review_plan) |review| if (review.accepted) S.ownerField(self, "core").*.index_manager.minimum_reader_version.store(review.minimum_reader, .release);
             if (next_table_catalog) |catalog| S.ownerField(self, "core").*.table_catalog = catalog;
             if (persisted_range != null) {
                 S.ownerField(self, "core").*.adoptPersistedRangeOwned(persisted_range_start_owned.?, persisted_range_end_owned.?);
@@ -4133,6 +4315,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var collection: admission.IntentCollection = .{};
             const collection_control = collection.bind(retained, S.ownerField(self, "core").*.apply_mutex.io);
             const alloc = preparation.allocator();
+            // Ordered apply must never await work whose publication needs a
+            // subsequent Raft entry. The request coordinator owns the derived
+            // visibility barrier after primary resolution is acknowledged.
+            const commit_sync_level: types.SyncLevel = if (ordered_receipt != null) .write else sync_level;
             var staging_progress = if (S.ownerField(self, "local_execution").*.restore_staging_required.load(.acquire)) try self.restoreStagingStatus(alloc) else null;
             defer if (staging_progress) |*progress| progress.deinit();
             const restore_scope: ?[32]u8 = if (staging_progress) |progress| progress.value.scope.digest() else null;
@@ -4234,7 +4420,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     };
                     S.ownerField(self, "core").*.unlockApply();
                     try flushTransactionReplicationOutboxWithRetirement(self, txn_id, .{ .current = &replication_mutation }, admission.receiverMutationRoot(self));
-                    try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
+                    try self.waitForResolvedTransactionSyncWithCancellation(commit_sync_level, outcome.replay_sequence, visibility_cancellation);
                     return;
                 }
 
@@ -4254,7 +4440,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .writes = writes,
                     .deletes = intents.deletes,
                     .timestamp_ns = commit_version,
-                    .sync_level = sync_level,
+                    .sync_level = commit_sync_level,
                     .restore_staging_scope = restore_scope,
                 }, null, .{
                     .visibility_cancellation = visibility_cancellation,

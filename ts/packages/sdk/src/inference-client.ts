@@ -19,6 +19,7 @@ import type {
   ChunkResponse,
   ClassificationResult,
   DecideRequest,
+  GeneratedExtractRequest,
   DecideResponse,
   EmbedInput,
   EmbedResponse,
@@ -572,6 +573,16 @@ export class InferenceClient {
     if (expectedIds !== undefined) {
       validateExtractionV2Response(data, expectedModel, expectedIds);
     }
+    return data;
+  }
+
+  /** Extract source-grounded mentions with a registered generator. */
+  async extractGenerated(request: GeneratedExtractRequest): Promise<ExtractResponse> {
+    const { data, error, response } = await this.client.POST("/ai/v1/extract", {
+      body: request,
+    });
+    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!data) throw new Error("Extract failed: unexpected empty response");
     return data;
   }
 

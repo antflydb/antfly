@@ -102,6 +102,7 @@ pub const BoundTableWriteSource = struct {
                 .graph_metric_action = graphMetricAction,
                 .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
+                .resolver_operation_group_local = resolverOperationGroupLocal,
                 .backup_table = backupTable,
                 .backup_pin_control = backupPinControl,
                 .restore_table = restoreTable,
@@ -1154,6 +1155,12 @@ pub const BoundTableWriteSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         if (cancellation.isCancelled()) return error.Canceled;
         return try applyGraphMetricActionToDb(alloc, try self.activeDb(), index_name, metric_name, action);
+    }
+
+    pub fn resolverOperationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, table_name: []const u8, body: []const u8) !?[]u8 {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try (try self.activeDb()).resolverReviewsJsonAlloc(alloc, body);
     }
 
     pub fn graphMetricMaintenanceGroupLocal(

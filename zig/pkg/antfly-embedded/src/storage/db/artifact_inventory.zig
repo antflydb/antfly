@@ -72,9 +72,14 @@ pub const Binding = struct {
     effect_protocol: u16 = 14,
 
     pub fn valid(self: Binding) bool {
-        return self.epoch != 0 and (self.effect_protocol == 14 or self.effect_protocol == 15);
+        return self.epoch != 0 and (self.effect_protocol >= 14 and self.effect_protocol <= 16);
     }
 
+    /// Protocol 16 extends protocol 15's receipt-backed stream witnesses.
+    /// Keep this a capability check so compatible extensions retain them.
+    pub fn supportsProducerWitnesses(self: Binding) bool {
+        return self.valid() and self.effect_protocol >= 15;
+    }
     pub fn compatible(a: Binding, b: Binding) bool {
         return a.valid() and b.valid() and a.effect_protocol == b.effect_protocol and std.mem.eql(u8, &a.semantic_digest, &b.semantic_digest);
     }
@@ -83,6 +88,31 @@ pub const Catalogs = struct {
     indexes: []const u8 = "",
     enrichments: []const u8 = "",
     resolvers: []const u8 = "",
+
+    /// Select capabilities from this immutable definition cut, independently
+    /// of the database's monotonic reader floor. Resolver/producer receipts
+    /// need protocol 15; grouped producer ownership needs protocol 16.
+    pub fn requiredEffectProtocol(self: Catalogs, alloc: std.mem.Allocator) !u16 {
+        var required: u16 = 14;
+        if (self.resolvers.len != 0) {
+            const configs = try @import("catalog/resolver_catalog.zig").deserializeCatalog(alloc, self.resolvers);
+            defer {
+                for (configs) |*cfg| cfg.deinit(alloc);
+                alloc.free(configs);
+            }
+            if (configs.len != 0) required = 15;
+        }
+        if (self.enrichments.len != 0) {
+            const configs = try @import("catalog/enrichment_catalog.zig").deserializeCatalog(alloc, self.enrichments);
+            defer {
+                for (configs) |*cfg| cfg.deinit(alloc);
+                alloc.free(configs);
+            }
+            if (configs.len != 0) required = 15;
+            for (configs) |cfg| if (cfg.group_source_json.len != 0 or cfg.prior_context_json.len != 0) return 16;
+        }
+        return required;
+    }
 
     pub fn jsonStringify(self: Catalogs, stream: anytype) @TypeOf(stream.*).Error!void {
         // AIDX contains arbitrary generation/count bytes, not UTF-8. Catalog
@@ -138,14 +168,20 @@ pub const Ordered = struct { command: Command, applied_index: u64 };
 pub const LocalBinding = struct { epoch: u64, digest: [32]u8 };
 pub const Status = struct { ordered: ?Binding, applied_index: u64, local: LocalBinding, ready: bool };
 
-test "ordered artifact inventory compatibility binds the complete effect protocol" {
+test "grouped sources production ordered artifact inventory compatibility binds the complete effect protocol" {
     const direct: Binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3) };
     var extended = direct;
     extended.effect_protocol = 15;
     try std.testing.expect(direct.valid() and extended.valid());
     try std.testing.expect(!direct.compatible(extended));
     try std.testing.expect(extended.compatible(extended));
+    try std.testing.expect(!direct.supportsProducerWitnesses());
+    try std.testing.expect(extended.supportsProducerWitnesses());
     extended.effect_protocol = 16;
+    try std.testing.expect(extended.supportsProducerWitnesses());
+    try std.testing.expect(!direct.compatible(extended));
+    extended.effect_protocol = 17;
+    try std.testing.expect(!extended.supportsProducerWitnesses());
     try std.testing.expect(!extended.valid() and !extended.compatible(extended));
 }
 
@@ -234,9 +270,10 @@ pub fn load(alloc: std.mem.Allocator, txn: anytype) !?std.json.Parsed(Ordered) {
     return parsed;
 }
 pub fn stageOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, applied_index: u64) !void {
-    const raw = try prepareOrdered(alloc, txn, command, applied_index) orelse return;
-    defer alloc.free(raw);
-    try txn.put(ordered_key, raw);
+    const raw = try prepareOrdered(alloc, txn, command, applied_index);
+    defer if (raw) |value| alloc.free(value);
+    if (raw) |value| try txn.put(ordered_key, value);
+    try @import("artifact_catalog_activation.zig").stage(alloc, txn, command);
 }
 
 pub fn prepareOrdered(alloc: std.mem.Allocator, txn: anytype, command: Command, applied_index: u64) !?[]u8 {

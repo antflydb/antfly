@@ -26,18 +26,28 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Specifica
     errdefer parsed.deinit();
     _ = try d.text(.{ .string = parsed.value.version });
     try parsed.value.decider.validate();
-    parsed.value.questions = try d.publicQuestions(parsed.arena.allocator(), parsed.value.questions);
+    parsed.value.questions = if (parsed.value.decider.decision_method == .generated) try d.generatedQuestions(parsed.arena.allocator(), parsed.value.questions, parsed.value.decider.instructions) else try d.publicQuestions(parsed.arena.allocator(), parsed.value.questions);
     try d.validateQuestions(parsed.value.questions, parsed.value.decider.resolvedCapabilities());
+    if (parsed.value.decider.generator) |generator| if (generator.provider != .antfly) {
+        const c = @import("antfly_structured");
+        try c.validateProviderSchema(generator, try c.hostedCapabilities(generator).select(parsed.value.decider.output, parsed.value.decider.probabilities), try @import("generated.zig").questionSchema(parsed.arena.allocator(), parsed.value.questions));
+    };
     return parsed;
 }
 pub fn provenance(a: std.mem.Allocator, spec: Specification, source_fingerprint: ?[]const u8) !d.Json {
-    const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = spec.version, .provider = spec.decider.provider, .decision_method = spec.decider.decision_method, .model = spec.decider.modelName(), .model_identity = spec.decider.model_identity, .embedding_options = spec.decider.embedding_options, .url = spec.decider.baseUrl(), .questions = spec.questions }, .{});
+    return provenanceWithRevision(a, spec, source_fingerprint, null);
+}
+pub fn provenanceWithRevision(a: std.mem.Allocator, spec: Specification, source_fingerprint: ?[]const u8, revision: ?d.Json) !d.Json {
+    var generator = spec.decider.generator;
+    if (generator) |*config| config.api_key = null;
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .model_revision = revision, .generator = generator, .instructions = spec.decider.instructions, .output = spec.decider.output, .probabilities = spec.decider.probabilities, .batch = spec.decider.batch, .version = spec.version, .provider = spec.decider.provider, .decision_method = spec.decider.decision_method, .model = spec.decider.modelName(), .model_identity = spec.decider.model_identity, .embedding_options = spec.decider.embedding_options, .url = spec.decider.baseUrl(), .questions = spec.questions }, .{});
     defer a.free(bytes);
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
     var value = d.jsonObject();
+    if (revision) |actual| try d.put(a, &value, "model_revision", actual);
     try d.put(a, &value, "version", .{ .string = spec.version });
-    try d.put(a, &value, "provider", .{ .string = @tagName(spec.decider.provider) });
+    try d.put(a, &value, "provider", .{ .string = if (spec.decider.generator) |cfg| @tagName(cfg.provider) else @tagName(spec.decider.provider) });
     try d.put(a, &value, "specification_hash", .{ .string = try std.fmt.allocPrint(a, "{x}", .{&hash}) });
     try d.put(a, &value, "source_fingerprint", if (source_fingerprint) |fingerprint| .{ .string = fingerprint } else .null);
     return value;

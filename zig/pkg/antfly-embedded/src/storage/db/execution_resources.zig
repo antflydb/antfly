@@ -1022,6 +1022,11 @@ pub const BatchExecutionOptions = struct {
     /// Set only by the foreground admission entrypoint, before this write has
     /// a decision. Mandatory replay/resolution keeps the default wait policy.
     avoid_admission_capacity_cycle: bool = false,
+    resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
+    group_source_command: ?*const @import("group_source_contract.zig").Command = null,
+    /// Native-only completion observation; never encoded in a replicated command.
+    legacy_group_completed_through: ?u64 = null,
+    legacy_group_plan_generation: ?u64 = null,
     row_policy_principal: ?*const row_policy_authority_mod.Payload = null,
     row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease = null,
     /// The DB wrapper explicitly transfers retirement of its own write lease
@@ -1184,6 +1189,7 @@ pub fn encodeStoreLookupKeyWithPinnedSchemaAlloc(
         return error.PortableImportPublicationInProgress;
     if (internal_keys.isInternalUserKey(key) or std.mem.startsWith(u8, key, "\x00\x00__metadata__:") or isSplitMetadataKey(key))
         return try alloc.dupe(u8, key);
+    if (@import("group_source_identity.zig").isAnchor(key)) return try internal_keys.documentKeyAlloc(alloc, key);
     if (schema_view) |view| {
         if (view.storageMode() == .relational) return try relational_store.keyAlloc(alloc, key);
     }

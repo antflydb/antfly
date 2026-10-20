@@ -301,6 +301,12 @@ pub const storage_db_artifact_publication_owner = @import("storage/db/artifact_p
 pub const storage_db_artifact_publication_resolution = @import("storage/db/artifact_publication_resolution.zig");
 pub const storage_db_artifact_publication_transport = @import("storage/db/artifact_publication_transport.zig");
 pub const storage_db_artifact_publication_transport_codec = @import("storage/db/artifact_publication_transport_codec.zig");
+pub const storage_db_group_sources = @import("storage/db/group_sources.zig");
+pub const storage_db_group_source_contract = @import("storage/db/group_source_contract.zig");
+pub const storage_db_group_source_index = @import("storage/db/group_source_index.zig");
+pub const storage_db_group_source_reads = @import("storage/db/group_source_reads.zig");
+pub const storage_db_group_source_worker = @import("storage/db/group_source_worker.zig");
+
 pub const storage_db_artifact_publication_wire = @import("storage/db/artifact_publication_wire.zig");
 pub const storage_db_artifact_reconcile = @import("storage/db/artifact_reconcile.zig");
 pub const storage_db_artifact_reconcile_intent = @import("storage/db/artifact_reconcile_intent.zig");
@@ -488,6 +494,8 @@ pub const storage_db_replication_effects = @import("storage/db/replication_effec
 pub const storage_db_replication_ingress = @import("storage/db/replication_ingress.zig");
 pub const storage_db_replication_record = @import("storage/db/replication_record.zig");
 pub const storage_db_resolution_handoff = @import("storage/db/resolution_handoff.zig");
+pub const storage_db_entity_alias_curation = @import("storage/db/entity_alias_curation.zig");
+pub const storage_db_resolver_curation = @import("storage/db/resolver_curation.zig");
 pub const storage_db_resolution_runtime = @import("storage/db/resolution_runtime.zig");
 pub const storage_db_restore_generation_admissions = @import("storage/db/restore_generation_admissions.zig");
 pub const storage_db_restore_staging = @import("storage/db/restore_staging.zig");
@@ -661,6 +669,7 @@ comptime {
 }
 pub const functions_query_eval = @import("functions/query_eval.zig");
 pub const functions_runtime = @import("functions/runtime.zig");
+pub const functions_resolver_adjudication = @import("functions/resolver_adjudication.zig");
 pub const functions_materialization = @import("functions/materialization.zig");
 pub const functions_decisions = @import("functions/decisions.zig");
 pub const functions_expressions = @import("functions/expressions.zig");

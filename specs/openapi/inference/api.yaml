@@ -1148,7 +1148,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/DecideRequest'
+              $ref: '../ai/decision.yaml#/components/schemas/DecisionRequest'
       responses:
         '200':
           description: Named decision answers, diagnostics and aggregate token usage
@@ -1202,7 +1202,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '../ai/extraction.yaml#/components/schemas/ExtractionRequest'
+              $ref: '../ai/extraction.yaml#/components/schemas/ExtractionInputRequest'
       responses:
         '200':
           description: Extraction completed successfully
@@ -3126,11 +3126,20 @@ components:
             and cache bytes. Independent of model token limits and object length.
             Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>.
             Scoped and unscoped embedding discovery expose the same values.
+        inference_capabilities:
+          type: object
+          additionalProperties: true
+          description: Resolved executor/task facts; generation bits are false when the selected executor does not implement them.
+          properties:
+            version: { type: integer }
+            task: { type: string }
+            generation_grammar_v1: { type: boolean }
+            generation_token_logprobs_v1: { type: boolean }
         model_revision:
           type: string
           minLength: 64
           maxLength: 64
-          description: Immutable resolved embedding generation, returned for scoped model/task discovery without loading weights.
+          description: Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights.
         qualified_limits:
           type: object
           additionalProperties: true
@@ -3392,6 +3401,16 @@ components:
           items:
             $ref: '#/components/schemas/ChatMessage'
           description: Conversation messages (OpenAI-compatible format)
+        logprobs:
+          type: boolean
+          default: false
+          description: Return actual token log-probabilities for non-streaming native grammar decoding. Incompatible routes reject the request.
+        top_logprobs:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 64
+          description: Bounded alternatives per decoded token; retained evidence also has a hard byte ceiling.
         max_tokens:
           type: integer
           minimum: 1

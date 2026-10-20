@@ -77,7 +77,10 @@ const builtin = @import("builtin");
 // CommitControl retains a lease-fenced original participant-plan store.
 // Required status evidence carries the saved participant/route binding.
 // Typed status callbacks distinguish successful absence from original errors.
-pub const abi_version: u32 = 43;
+// Tokenizer vtables include additive token-byte decoding. Reject older
+// native handles before interpreting the added callback slot.
+pub const abi_version: u32 = 44;
+
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

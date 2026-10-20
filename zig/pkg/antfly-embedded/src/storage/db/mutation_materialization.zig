@@ -7101,6 +7101,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .new => "new",
                 .match => "match",
                 .review => "review",
+                .suppressed => "suppressed",
             };
         }
 
@@ -10168,6 +10169,32 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     cfg,
                 );
                 defer freeGraphWrites(alloc, mention_edge_writes);
+                if (source.mapping.source_template.len > 0) {
+                    const raw_doc = try storeDocumentValueForGraphSource(alloc, store, index_manager, parsed_key.doc_key, if (options.repair_ctx) |ctx| ctx.relational_base_rows else false);
+                    defer if (raw_doc) |value| alloc.free(value);
+                    var parsed_doc = if (raw_doc) |value| try std.json.parseFromSlice(std.json.Value, alloc, value, .{}) else null;
+                    defer if (parsed_doc) |*value| value.deinit();
+                    const doc_value: ?std.json.Value = if (parsed_doc) |value| value.value else null;
+                    const renderer = @import("graph_restore_materialization.zig").renderGraphArtifactTemplateAlloc;
+                    for (mention_edge_writes, 0..) |*write, item_index| {
+                        var item: std.json.ObjectMap = .empty;
+                        defer item.deinit(alloc);
+                        try item.put(alloc, "id", .{ .string = write.target });
+                        try item.put(alloc, "target", .{ .string = write.target });
+                        try item.put(alloc, "source", .{ .string = parsed_key.doc_key });
+                        const endpoint = try renderer(alloc, source.mapping.source_template, parsed_key.doc_key, doc_value, .{ .object = item }, item_index, source.artifact_name, "application/json", .null);
+                        errdefer alloc.free(endpoint);
+                        if (endpoint.len == 0) return error.InvalidGraphEdges;
+                        const edge_id = try renderer(alloc, source.mapping.edge_id_template, parsed_key.doc_key, doc_value, .{ .object = item }, item_index, source.artifact_name, "application/json", .null);
+                        errdefer alloc.free(edge_id);
+                        if (edge_id.len == 0) return error.InvalidGraphEdges;
+                        const owner = try alloc.dupe(u8, parsed_key.doc_key);
+                        alloc.free(write.source);
+                        write.source = endpoint;
+                        write.owner_document = owner;
+                        write.edge_id = edge_id;
+                    }
+                }
                 for (mention_edge_writes) |write| {
                     const key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
                     var key_owned = true;
@@ -11560,7 +11587,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn resolutionDecisionCreatesCanonicalEdge(decision: resolver_lib.Decision) bool {
             return switch (decision) {
                 .new, .match => true,
-                .review => false,
+                .review, .suppressed => false,
             };
         }
 
@@ -12124,7 +12151,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             doc_key: []const u8,
             relational_base_rows: bool,
         ) !?[]u8 {
-            const internal_doc_key = if (relational_base_rows)
+            const internal_doc_key = if (relational_base_rows and !@import("group_source_identity.zig").isAnchor(doc_key))
                 try relational_store.keyAlloc(alloc, doc_key)
             else
                 try internal_keys.documentKeyAlloc(alloc, doc_key);

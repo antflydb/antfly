@@ -46,6 +46,7 @@ test {
     _ = @import("api/runnable_read_resources.zig");
     _ = @import("api/internal_query_owner.zig");
     _ = @import("api/sql_read_lane.zig");
+    _ = @import("api/resolvers.zig");
     _ = @import("api/protected_future.zig");
     _ = @import("api/sql_connection_record.zig");
     _ = @import("api/sql_connections.zig");

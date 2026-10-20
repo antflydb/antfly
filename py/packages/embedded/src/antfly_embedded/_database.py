@@ -463,13 +463,100 @@ class Database:
         finally:
             self._release()
 
-    def merge_resolver_keys(self, resolver: str, key: str, target: str) -> None:
+    def merge_resolver_keys(
+        self, resolver: str, key: str, target: str, *, replace: bool = False, pin_distinct: bool = False
+    ) -> None:
         """Persist a key redirect; run_until_idle re-keys existing resolution edges."""
         handle = self._acquire()
         try:
             name, keep_name = _ffi.make_slice(encode_text(resolver))
-            data, keep_data = _ffi.make_slice(encode_json_input({"key": key, "target": target}))
+            data, keep_data = _ffi.make_slice(
+                encode_json_input({"key": key, "target": target, "replace": replace, "pin_distinct": pin_distinct})
+            )
             errors.raise_for_code(self._lib.antfly_db_merge_resolver_keys_json(ctypes.c_void_p(handle), name, data))
+        finally:
+            self._release()
+
+    def unmerge_resolver_key(self, resolver: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_text(resolver))
+            arg1, keep1 = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_unmerge_resolver_key_json(ctypes.c_void_p(handle), arg0, arg1, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def suppress_resolver_keys(self, resolver: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_text(resolver))
+            arg1, keep1 = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_suppress_resolver_keys_json(ctypes.c_void_p(handle), arg0, arg1, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def unsuppress_resolver_key(self, resolver: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_text(resolver))
+            arg1, keep1 = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_unsuppress_resolver_key_json(ctypes.c_void_p(handle), arg0, arg1, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def resolver_curation(self, resolver: str = "", *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_text(resolver))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_resolver_curation_json(ctypes.c_void_p(handle), arg0, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def resolver_reviews(self, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_resolver_reviews_json(ctypes.c_void_p(handle), arg0, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
+        finally:
+            self._release()
+
+    def curate_entity(self, table: str, key: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute durable resolver curation; the response reports accepted replay."""
+        handle = self._acquire()
+        try:
+            arg0, keep0 = _ffi.make_slice(encode_text(table))
+            arg1, keep1 = _ffi.make_slice(encode_text(key))
+            arg2, keep2 = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_code(
+                self._lib.antfly_db_curate_entity_json(ctypes.c_void_p(handle), arg0, arg1, arg2, ctypes.byref(out))
+            )
+            return decode_json_response(_ffi.take_buffer(out), raw)
         finally:
             self._release()
 

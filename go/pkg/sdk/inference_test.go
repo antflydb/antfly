@@ -1276,3 +1276,40 @@ func TestClient_Generate_PreservesUnifiedAuthAndRemoteContentErrors(t *testing.T
 		})
 	}
 }
+
+func TestGeneratedInferenceRequestsPreserveNestedConfiguration(t *testing.T) {
+	for _, extraction := range []bool{false, true} {
+		t.Run(fmt.Sprint(extraction), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+				assert.NotContains(t, body, "model")
+				assert.Equal(t, "registered", body["generator"].(map[string]any)["model"])
+				assert.Equal(t, "verdict_only", body["probabilities"])
+				w.Header().Set("Content-Type", "application/json")
+				if extraction {
+					assert.Equal(t, "/ai/v1/extract", r.URL.Path)
+					assert.Equal(t, "generated", body["method"])
+					_, _ = io.WriteString(w, `{"object":"extraction","model":"registered","data":[]}`)
+				} else {
+					assert.Equal(t, "/ai/v1/decisions", r.URL.Path)
+					assert.Equal(t, "generated", body["decision_method"])
+					_, _ = io.WriteString(w, `{"model":"registered","answers":[],"usage":{"input_tokens":0,"output_tokens":0}}`)
+				}
+			}))
+			defer server.Close()
+			client, err := NewInferenceClient(server.URL, nil)
+			require.NoError(t, err)
+			if extraction {
+				var request oapi.GeneratedExtractionRequest
+				require.NoError(t, json.Unmarshal([]byte(`{"method":"generated","generator":{"provider":"antfly","model":"registered"},"probabilities":"verdict_only","inputs":[{"content":"source"}],"schema":{"entities":["person"]}}`), &request))
+				_, err = client.ExtractGenerated(context.Background(), request)
+			} else {
+				var request oapi.GeneratedDecideRequest
+				require.NoError(t, json.Unmarshal([]byte(`{"decision_method":"generated","generator":{"provider":"antfly","model":"registered"},"probabilities":"verdict_only","input":"source","questions":[{"name":"answer","type":"predicate","instructions":"Is it present?"}]}`), &request))
+				_, err = client.DecideGenerated(context.Background(), request)
+			}
+			require.NoError(t, err)
+		})
+	}
+}

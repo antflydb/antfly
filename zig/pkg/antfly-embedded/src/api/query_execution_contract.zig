@@ -3519,6 +3519,7 @@ pub const StorageKernelLookupWireRequest = struct {
     relational_integrity_jobs_json: []const u8 = "",
     relational_activation_json: []const u8 = "",
     relational_index_status_json: []const u8 = "",
+    group_source_query_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
 
     pub fn options(self: StorageKernelLookupWireRequest) db_mod.types.LookupOptions {
@@ -3536,6 +3537,7 @@ pub const StorageKernelLookupWireRequest = struct {
             .relational_integrity_jobs_json = self.relational_integrity_jobs_json,
             .relational_activation_json = self.relational_activation_json,
             .relational_index_status_json = self.relational_index_status_json,
+            .group_source_query_json = self.group_source_query_json,
             .relational_topology_json = self.relational_topology_json,
         };
     }
@@ -3553,7 +3555,7 @@ pub const StorageKernelLookupWireRequest = struct {
 };
 
 pub fn integrityLookupMode(opts: db_mod.types.LookupOptions) bool {
-    return opts.row_policy_receipt != null or opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
+    return opts.group_source_query_json.len != 0 or opts.row_policy_receipt != null or opts.relational_integrity_catalog or opts.relational_integrity_action or opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or opts.relational_activation_json.len != 0 or opts.relational_topology_json.len != 0;
 }
 
 test "compiled lookup wire preserves binary scope and every integrity control" {
@@ -3620,6 +3622,7 @@ pub fn encodeStorageKernelLookupRequest(
         .relational_integrity_jobs_json = opts.relational_integrity_jobs_json,
         .relational_activation_json = opts.relational_activation_json,
         .relational_index_status_json = opts.relational_index_status_json,
+        .group_source_query_json = opts.group_source_query_json,
         .relational_topology_json = opts.relational_topology_json,
     }, .{});
 }

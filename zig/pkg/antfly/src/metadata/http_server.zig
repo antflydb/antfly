@@ -2845,6 +2845,10 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.ResolverCurationConflict) {
+            try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
+            return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err));
+        }
         if (err == error.MetadataMutationNotApplied) {
             try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_applied);
             try ctx.setHeader("Retry-After", "1");

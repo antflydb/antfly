@@ -35,6 +35,8 @@ from antfly.client_generated.models import (
     CreateRelationalIndexRequest,
     ExtractionRequest,
     ExtractionResponse,
+    GeneratedDecideRequest,
+    GeneratedExtractionRequest,
     GraphKShortestPathsQuery,
     GraphMatchQuery,
     GraphQueries,
@@ -806,6 +808,10 @@ class AntflyClient:
                 httpx_args=httpx_args,
             )
         self.indexes = IndexOperations(self)
+        from .resolvers import EntityOperations, ResolverOperations
+
+        self.resolvers = ResolverOperations(self)
+        self.entities = EntityOperations(self)
 
     def close(self) -> None:
         """Release this client's pooled HTTP connections. May be called repeatedly."""
@@ -979,9 +985,15 @@ class AntflyClient:
             )
         return encoded
 
-    def decide(self, request: InferenceDecideRequest | Mapping[str, Any]) -> InferenceDecideResponse:
+    def decide(
+        self, request: InferenceDecideRequest | GeneratedDecideRequest | Mapping[str, Any]
+    ) -> InferenceDecideResponse:
         """Answer named choice, multi-choice, score, and predicate questions."""
-        body = request.to_dict() if isinstance(request, InferenceDecideRequest) else dict(request)
+        body = (
+            request.to_dict()
+            if isinstance(request, (InferenceDecideRequest, GeneratedDecideRequest))
+            else dict(request)
+        )
         with self._stream("POST", "/ai/v1/decisions", json=body, headers={"Accept": "application/json"}) as response:
             if response.status_code < 200 or response.status_code >= 300:
                 _raise_inference_error(response)
@@ -996,14 +1008,18 @@ class AntflyClient:
             except (KeyError, TypeError, ValueError, AttributeError) as exc:
                 raise AntflyException(f"decision returned invalid JSON: {exc}") from exc
 
-    def extract(self, request: ExtractionRequest | Mapping[str, Any]) -> ExtractionResponse:
+    def extract(
+        self, request: ExtractionRequest | GeneratedExtractionRequest | Mapping[str, Any]
+    ) -> ExtractionResponse:
         """Run canonical atomic extraction, preserving explicit schema versions.
 
         Mapping input preserves omitted options, explicit null and empty
         replacements. For generated model inputs, use ``from_dict`` or UNSET
         for omitted fields so legacy constructor defaults remain explicit.
         """
-        body = request.to_dict() if isinstance(request, ExtractionRequest) else dict(request)
+        body = (
+            request.to_dict() if isinstance(request, (ExtractionRequest, GeneratedExtractionRequest)) else dict(request)
+        )
         with self._stream("POST", "/ai/v1/extract", json=body, headers={"Accept": "application/json"}) as response:
             if response.status_code < 200 or response.status_code >= 300:
                 _raise_inference_error(response)
@@ -1015,7 +1031,7 @@ class AntflyClient:
                 payload = json.loads(raw)
                 if not isinstance(payload, dict) or payload.get("object") != "extraction":
                     raise ValueError("response must be a canonical extraction object")
-                if body.get("schema_version") == 2:
+                if body.get("schema_version") == 2 and body.get("method") != "generated":
                     _validate_extraction_v2_response(payload, body)
                 return ExtractionResponse.from_dict(payload)
             except (KeyError, TypeError, ValueError) as exc:

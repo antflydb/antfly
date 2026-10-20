@@ -95,6 +95,8 @@ pub const ContainerStorage = struct {
         .rename_absolute = renameAbsolute,
         .delete_file_absolute = deleteFileAbsolute,
         .delete_tree = deleteTree,
+        .list_file_names_alloc = listFileNamesAlloc,
+        .list_directory_names_alloc = listDirectoryNamesAlloc,
         .sync_contents_absolute = syncContentsAbsolute,
         .sync_parent_absolute = syncParentAbsolute,
         .now_ns = nowNs,
@@ -716,6 +718,20 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     try self.deleteTreeDurable(path);
 }
 
+fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+    const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
+    const locked = lockAtomic(&self.mutex);
+    defer if (locked) self.mutex.unlock();
+    return storage_io.listMapNamesAlloc(allocator, path, &self.files, false);
+}
+
+fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+    const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
+    const locked = lockAtomic(&self.mutex);
+    defer if (locked) self.mutex.unlock();
+    return storage_io.listMapNamesAlloc(allocator, path, &self.files, true);
+}
+
 fn syncContentsAbsolute(ptr: *anyopaque, _: []const u8) !void {
     const self: *ContainerStorage = @ptrCast(@alignCast(ptr));
     const locked = lockAtomic(&self.mutex);
@@ -1142,4 +1158,30 @@ test "aflite container stable executor retains the managed budget after a value 
     const bytes = try moved.storage().readFileAlloc(a, "/proof", 64);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("stable", bytes);
+}
+
+test "aflite bridge generation inventory and bytes survive reopen (#1210)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "maintenance.aflite");
+    defer a.free(path);
+    {
+        var container = try ContainerStorage.open(a, path);
+        defer container.deinit();
+        const storage = container.storage();
+        try storage.writeFileAbsolute("/generations/old/indexes/img/payload", "1234");
+        try storage.writeFileAbsolute("/generations/old/indexes/img/nested/payload", "56789");
+        try storage.writeFileAbsolute("/generations/old-other/keep", "untouched");
+    }
+    var container = try ContainerStorage.open(a, path);
+    defer container.deinit();
+    const storage = container.storage();
+    const roots = try storage.listDirectoryNamesAlloc(a, "/generations");
+    defer Storage.freeFileNames(a, roots);
+    try std.testing.expectEqual(@as(usize, 2), roots.len);
+    try std.testing.expectEqual(@as(u64, 9), try storage.treeBytes(a, "/generations/old"));
+    try storage.deleteTree("/generations/old");
+    try std.testing.expectEqual(@as(u64, 0), try storage.treeBytes(a, "/generations/old"));
+    try std.testing.expectEqual(@as(u64, 9), try storage.treeBytes(a, "/generations/old-other"));
 }

@@ -123,6 +123,7 @@ pub const Routes = struct {
     pub const graph_hydrate_suffix = "/graph-hydrate";
     pub const graph_edges_suffix = "/graph-edges";
     pub const graph_edges_batch_suffix = "/graph-edges-batch";
+    pub const resolver_operation_suffix = "/resolver-operation";
     pub const graph_metric_maintenance_suffix = "/graph-metric-maintenance";
     pub const vector_worker_suffix = "/vector-worker";
     pub const txn_begin_suffix = "/txn-begin";
