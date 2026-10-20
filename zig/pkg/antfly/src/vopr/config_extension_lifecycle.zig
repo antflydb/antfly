@@ -126,7 +126,7 @@ pub const Scenario = struct {
             access_reference: []const u8,
             resolved_access: []const u8,
         ) !bool {
-            var snapshot = facade.acquire();
+            var snapshot = try facade.acquire();
             defer snapshot.deinit();
             const actual_name = snapshot.config.default_s3 orelse "";
             if (!std.mem.eql(u8, actual_name, name_value)) return false;
@@ -249,7 +249,7 @@ pub const Scenario = struct {
             defer runtime.deinit();
             var facade = scraping.RemoteContentConfig{};
             runtime.attach(&facade);
-            var held = facade.acquire();
+            var held = try facade.acquire();
             defer held.deinit();
 
             try self.writeFile(config_path, archive_config, true);
