@@ -944,6 +944,24 @@ pub const DocStore = struct {
 
         /// Internal preparation primitive; the complete accepted execution bundle
         /// must be funded separately before a required PREPARE vote is enabled.
+        /// Derive costs/roots from canonical request preparation and the exact
+        /// durable frame. The caller must hold its request/catalog intent witness.
+        /// Complete recovery working resources remain a separate prerequisite.
+        pub fn reservePreparedReplayPlan(self: *Txn, expected: @import("db/prepared_transaction_effects.zig").Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
+            errdefer self.artifact_inventory.poisoned = true;
+            if (original) |port| try port.checkpoint();
+            try self.publication_backlog.acquireMutationGate(if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null);
+            const credit = @import("prepared_replay_credit.zig");
+            try credit.requireFloors(self);
+            const raw = self.get(&(@import("publication_backlog.zig").prepared_effects_prefix.* ++ expected.txn_id)) catch |err| return if (err == error.NotFound) error.PreparedEffectsRequired else err;
+            var decoded = try @import("db/prepared_transaction_effects.zig").decode(self.alloc, raw, expected, original);
+            defer decoded.deinit();
+            const fingerprint = raw[raw.len - 32 ..][0..32].*;
+            var plan = try @import("prepared_replay_plan.zig").derive(self.alloc, request, decoded.plan.effects, original);
+            defer plan.deinit();
+            try credit.reserve(self, self.alloc, &self.artifact_inventory, expected.txn_id, fingerprint, plan.base, plan.roots, original);
+        }
+
         pub fn reservePreparedReplayCredit(self: *Txn, id: [16]u8, frame: [32]u8, base: @import("replay_record_shape.zig").Record, roots: []const []const u8, original: ?@import("../common/read_admission.zig").Port) !void {
             errdefer self.artifact_inventory.poisoned = true;
             try self.publication_backlog.acquireMutationGate(if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null);
@@ -1266,6 +1284,24 @@ pub const DocStore = struct {
 
             /// Internal preparation primitive; the complete accepted execution bundle
             /// must be funded separately before a required PREPARE vote is enabled.
+            /// Derive costs/roots from canonical request preparation and the exact
+            /// durable frame. The caller must hold its request/catalog intent witness.
+            /// Complete recovery working resources remain a separate prerequisite.
+            pub fn reservePreparedReplayPlan(self: @This(), expected: @import("db/prepared_transaction_effects.zig").Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
+                errdefer self.artifact_inventory.poisoned = true;
+                if (original) |port| try port.checkpoint();
+                try self.publication_backlog.acquireMutationGate(self.publication_gate);
+                const credit = @import("prepared_replay_credit.zig");
+                try credit.requireFloors(self);
+                const raw = self.get(&(@import("publication_backlog.zig").prepared_effects_prefix.* ++ expected.txn_id)) catch |err| return if (err == error.NotFound) error.PreparedEffectsRequired else err;
+                var decoded = try @import("db/prepared_transaction_effects.zig").decode(self.alloc, raw, expected, original);
+                defer decoded.deinit();
+                const fingerprint = raw[raw.len - 32 ..][0..32].*;
+                var plan = try @import("prepared_replay_plan.zig").derive(self.alloc, request, decoded.plan.effects, original);
+                defer plan.deinit();
+                try credit.reserve(self, self.alloc, self.artifact_inventory, expected.txn_id, fingerprint, plan.base, plan.roots, original);
+            }
+
             pub fn reservePreparedReplayCredit(self: @This(), id: [16]u8, frame: [32]u8, base: @import("replay_record_shape.zig").Record, roots: []const []const u8, original: ?@import("../common/read_admission.zig").Port) !void {
                 errdefer self.artifact_inventory.poisoned = true;
                 try self.publication_backlog.acquireMutationGate(self.publication_gate);
@@ -1385,6 +1421,9 @@ pub const DocStore = struct {
             if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
         }
 
+        pub fn reservePreparedReplayPlan(self: *Batch, expected: @import("db/prepared_transaction_effects.zig").Contract, request: @import("db/derived/derived_types.zig").DerivedBatch, original: ?@import("../common/read_admission.zig").Port) !void {
+            try self.asTxn().reservePreparedReplayPlan(expected, request, original);
+        }
         pub fn reservePreparedReplayCredit(self: *Batch, id: [16]u8, frame: [32]u8, base: @import("replay_record_shape.zig").Record, roots: []const []const u8, original: ?@import("../common/read_admission.zig").Port) !void {
             try self.asTxn().reservePreparedReplayCredit(id, frame, base, roots, original);
         }
@@ -8213,4 +8252,105 @@ test "docstore prepared replay credit sorts distinct roots and rejects changed o
     defer a.free(excessive);
     @memset(excessive, one);
     try std.testing.expectError(error.Backpressured, fixture.reserve(@splat(2), excessive));
+}
+
+test "docstore prepared replay plan derives a frame-bound reservation and claims generated roots" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const id: [16]u8 = @splat(29);
+    const physical = try internal_keys.artifactNamedPrefixAlloc(a, "outside-intents", "asset", "result");
+    defer a.free(physical);
+    var writes = [_]@import("db/types.zig").BatchWrite{.{ .key = physical, .value = "accepted" }};
+    const contract: F.effects.Contract = .{ .txn_id = id, .intent_revision = 1, .intent_digest = @splat(3), .catalog_digest = @splat(4), .mode = .synchronous };
+    const frame = try F.effects.encode(a, .{ .contract = contract, .effects = .{
+        .artifact_writes = &writes,
+        .documents = &.{.{ .key = "generated-document" }},
+        .generated_enrichment_refs = &.{.{ .kind = .asset, .index_name = "asset", .artifact_name = "a", .embedding_name = "", .doc_key = "generated-ref" }},
+    } }, null);
+    defer a.free(frame);
+    const request: @import("db/derived/derived_types.zig").DerivedBatch = .{ .documents = &.{.{ .key = "request" }}, .overwritten_doc_keys = &.{"request"}, .deleted_keys = &.{"removed"} };
+    {
+        var txn = try fixture.store.beginWriteBatch();
+        errdefer txn.abort();
+        try txn.put(&(F.backlog.prepared_effects_prefix.* ++ id), frame);
+        try txn.reservePreparedReplayPlan(contract, request, null);
+        try txn.commit();
+    }
+    const grant = try fixture.grant(id);
+    try std.testing.expectEqual(@as(u64, 5), grant.root_count);
+    {
+        var read = try fixture.store.beginReadTxn();
+        defer read.abort();
+        for ([_][]const u8{ "request", "removed", "outside-intents", "generated-document", "generated-ref" }) |logical| {
+            const key = try internal_keys.documentKeyAlloc(a, logical);
+            defer a.free(key);
+            try std.testing.expectEqual(id, (try F.credit.owner(&read, try F.credit.documentHash(key))).?);
+        }
+    }
+    try fixture.saturate();
+    const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{
+        .changed_doc_keys = &.{ "request", "generated-document", "generated-ref" },
+        .overwritten_doc_keys = &.{"request"},
+        .deleted_doc_keys = &.{"removed"},
+        .changed_artifact_keys = &.{physical},
+    });
+    defer a.free(payload);
+    try std.testing.expectEqual(payload.len, try grant.budget());
+    try fixture.store.put(&(F.credit.replay_prefix.* ++ id), payload);
+    try fixture.store.delete(&(F.credit.replay_prefix.* ++ id));
+}
+
+test "docstore prepared replay plan refuses mismatched intent contracts before credit publication" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const id: [16]u8 = @splat(29);
+    const frame = try F.frame(id);
+    defer a.free(frame);
+    var contract = (try F.effects.inspect(frame, null)).contract;
+    contract.intent_revision += 1;
+    var txn = try fixture.store.beginWriteTxn();
+    defer txn.abort();
+    try txn.put(&(F.backlog.prepared_effects_prefix.* ++ id), frame);
+    try std.testing.expectError(error.PreparedEffectsMismatch, txn.reservePreparedReplayPlan(contract, .{}, null));
+    try std.testing.expectError(error.InvalidArtifactReplayInventory, txn.commit());
+}
+
+test "docstore prepared replay plan checks original lifetime before frame lookup" {
+    const F = PreparedReplayCreditFixture;
+    const controls = @import("../common/read_admission.zig");
+    const Reject = struct {
+        fn check(_: *anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+    };
+    var unused: u8 = 0;
+    const source: controls.Payload = .{ .ptr = &unused, .vtable = &.{ .checkpoint = Reject.check } };
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const contract: F.effects.Contract = .{ .txn_id = @splat(29), .intent_revision = 1, .intent_digest = @splat(3), .catalog_digest = @splat(4), .mode = .synchronous };
+    var txn = try fixture.store.beginWriteTxn();
+    defer txn.abort();
+    try std.testing.expectError(error.DeadlineExceeded, txn.reservePreparedReplayPlan(contract, .{}, controls.Port.init(&source)));
+    try std.testing.expectError(error.InvalidArtifactReplayInventory, txn.commit());
+}
+
+test "docstore prepared replay plan refuses disabled protocol before reading frame values" {
+    const F = PreparedReplayCreditFixture;
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.store.put(F.floors.minimum_reader_key, "10");
+    const contract: F.effects.Contract = .{ .txn_id = @splat(29), .intent_revision = 1, .intent_digest = @splat(3), .catalog_digest = @splat(4), .mode = .synchronous };
+    // No stored frame: eligibility must fail first, without a payload lookup.
+    var batch = try fixture.store.beginWriteBatch();
+    defer batch.abort();
+    try std.testing.expectError(error.PreparedTransactionProtocolDisabled, batch.reservePreparedReplayPlan(contract, .{}, null));
+    try std.testing.expectError(error.InvalidArtifactReplayInventory, batch.commit());
 }

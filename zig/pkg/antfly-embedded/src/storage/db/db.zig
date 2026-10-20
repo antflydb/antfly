@@ -144878,3 +144878,45 @@ test "db change journal inventory retirement bound includes duplicate lanes and 
         try std.testing.expect(found);
     }
 }
+
+test "db prepared replay plan bounds actual thin and materialized request builders" {
+    const a = std.testing.allocator;
+    const edge: types.GraphEdgeDelete = .{ .index_name = "g", .edge_type = "R", .owner_document = "absent-owner", .source = "old-source", .target = "old-target", .edge_id = "absent" };
+    const req: types.BatchRequest = .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dv_v1\":[1,0],\"sp_v1\":{\"indices\":[1,5],\"values\":[0.5,0.75]}}}" }},
+        .deletes = &.{"doc:gone"},
+        .graph_writes = &.{.{ .index_name = "g", .edge_type = "R", .owner_document = "owner", .source = "source", .target = "target", .edge_id = "one" }},
+        .graph_deletes = &.{edge},
+    };
+    var extracted = try mapper.extractWrite(a, req.writes[0].key, req.writes[0].value);
+    defer extracted.deinit(a);
+    extracted.dense_embeddings[0].artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc:a", "dv_v1");
+    extracted.sparse_embeddings[0].artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc:a", "sp_v1");
+    const removed = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc:a", "removed");
+    defer a.free(removed);
+    const graph = try internal_keys.graphRelationshipArtifactKeyAlloc(a, edge.owner_document, edge.index_name, edge.edge_type, edge.target, edge.source, edge.edge_id);
+    defer a.free(graph);
+    const tombstones = [_][]u8{ removed, graph };
+    var prepared = try buildDerivedBatch(a, req, &.{extracted}, &tombstones, &.{});
+    defer derived_types.deinitDerivedBatch(a, &prepared);
+    var plan = try @import("../prepared_replay_plan.zig").derive(a, prepared, .{}, null);
+    defer plan.deinit();
+    const thin = try encodeThinReplayRecordPayload(a, req, &.{extracted}, &tombstones, &.{}, &.{true}, &.{true}, 42, false, null, null, null);
+    defer a.free(thin);
+    var record = try change_journal_mod.recordFromDerivedBatch(a, prepared, 42);
+    defer change_journal_mod.deinitRecord(a, &record);
+    const materialized = try change_journal_mod.encodeRecord(a, record);
+    defer a.free(materialized);
+    const bound = try plan.base.encodedBytes();
+    try std.testing.expect(thin.len <= bound);
+    try std.testing.expect(materialized.len <= bound);
+    // Both endpoint routing directions can add wake-ups. They are already
+    // reserved even when this test's catalog does not request neighbor context.
+    const changed = try std.mem.concat(a, []const u8, &.{ record.changed_doc_keys, &.{ "source", "target", "old-source", "old-target" } });
+    defer a.free(changed);
+    var with_endpoints = record;
+    with_endpoints.changed_doc_keys = changed;
+    const notified = try change_journal_mod.encodeRecord(a, with_endpoints);
+    defer a.free(notified);
+    try std.testing.expect(notified.len <= bound);
+}
