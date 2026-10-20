@@ -619,6 +619,7 @@ const EntityValidation = struct {
 /// transport bytes, table schemas and parsed configs; callbacks retain only
 /// output identities or the folded namespace policy.
 fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anytype, entity_table: anytype, key: []const u8, request: operation.RequestContext, adoption_revision: ?u64, stored: curation.Namespaces, context: anytype) !void {
+    const ConsumerConfig = struct { source_name: []const u8, config: Config };
     if (server.source.vtable.supports_resolver_catalog_read) {
         var cursor: ?[]const u8 = null;
         defer if (cursor) |value| owner.free(value);
@@ -629,20 +630,25 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
             defer arena.deinit();
             const scratch = arena.allocator();
             const page = try readResolverCatalog(server, scratch, .{ .table_name = entity_table.name, .mode = .consumers, .key = key, .expected_revision = adoption_revision, .cursor = cursor }, request);
+            var pending: std.ArrayList(ConsumerConfig) = .empty;
+            var source_reads: std.ArrayList([]const u8) = .empty;
             for (page.consumers) |consumer| {
                 if ((try seen.getOrPut(owner, consumer.table.table_id)).found_existing) continue;
+                var needs_source_read = false;
                 for (try configs(scratch, consumer.table.indexes_json)) |cfg| {
                     for (consumer.names) |name| if (std.mem.eql(u8, cfg.name, name)) {
-                        // Before adoption, the aggregate contains source-owned
-                        // policy. Preserve the caller's source scopes while
-                        // folding it; destination authority only owns adopted
-                        // namespaces, even on the bounded catalog read path.
-                        if (!namespaceAdopted(stored, cfg.key_template)) try server.authorizeTableReads(scratch, request, &.{consumer.table.name});
-                        try context.consume(scratch, consumer.table.name, cfg);
+                        needs_source_read = needs_source_read or !namespaceAdopted(stored, cfg.key_template);
+                        try pending.append(scratch, .{ .source_name = consumer.table.name, .config = cfg });
                         break;
                     };
                 }
+                if (needs_source_read) try source_reads.append(scratch, consumer.table.name);
             }
+            // Legacy policy remains source-owned. Authorize each page in one
+            // bounded reverse-binding batch before folding any private policy;
+            // adopted namespaces need no source reads or per-consumer RPCs.
+            if (source_reads.items.len != 0) try server.authorizeTableReads(scratch, request, source_reads.items);
+            for (pending.items) |consumer| try context.consume(scratch, consumer.source_name, consumer.config);
             const next = if (page.next_cursor) |value| try owner.dupe(u8, value) else null;
             if (cursor) |value| owner.free(value);
             cursor = next;
@@ -675,11 +681,19 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
                 offset = end;
             }
         }
-        for (snapshot.tables, source_configs) |source, all| for (all) |cfg| {
-            if (!std.mem.eql(u8, destinations.get(cfg.table).?, entity_table.name) or !curation.keyInNamespace(cfg.key_template, key)) continue;
-            if (!namespaceAdopted(stored, cfg.key_template)) try server.authorizeTableReads(a, request, &.{source.name});
-            try context.consume(a, source.name, cfg);
-        };
+        var pending: std.ArrayList(ConsumerConfig) = .empty;
+        var source_reads: std.ArrayList([]const u8) = .empty;
+        for (snapshot.tables, source_configs) |source, all| {
+            var needs_source_read = false;
+            for (all) |cfg| {
+                if (!std.mem.eql(u8, destinations.get(cfg.table).?, entity_table.name) or !curation.keyInNamespace(cfg.key_template, key)) continue;
+                needs_source_read = needs_source_read or !namespaceAdopted(stored, cfg.key_template);
+                try pending.append(a, .{ .source_name = source.name, .config = cfg });
+            }
+            if (needs_source_read) try source_reads.append(a, source.name);
+        }
+        if (source_reads.items.len != 0) try server.authorizeTableReads(a, request, source_reads.items);
+        for (pending.items) |consumer| try context.consume(a, consumer.source_name, consumer.config);
     }
 }
 

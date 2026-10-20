@@ -58106,6 +58106,8 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         observation_failure: ?anyerror = null,
         fail_after_commit: ?anyerror = null,
         stress_pages: usize = 0,
+        stress_width: usize = 1,
+        reverse_read_batches: usize = 0,
         stress_reads: usize = 0,
         incompatible_last_page: bool = false,
         destination_cut_changed: bool = false,
@@ -58147,6 +58149,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             if (call == .resolve_many) {
                 const input = call.resolve_many;
                 if (input.storage_names.len != 0) {
+                    self.reverse_read_batches += 1;
                     if (input.expected_revision) |revision| try std.testing.expectEqual(self.commits, revision);
                     const logical = try a.alloc(?[]const u8, input.storage_names.len);
                     for (input.storage_names, logical) |name, *out| out.* = name;
@@ -58170,17 +58173,22 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
                 try std.testing.expectEqual(@as(?u64, self.commits), input.expected_revision);
                 self.stress_reads += 1;
                 var consumer = self.tables[0];
-                consumer.table_id = 100 + page_index;
+                consumer.table_id = 100 + page_index * self.stress_width;
                 if (self.incompatible_last_page and page_index + 1 == self.stress_pages) consumer.indexes_json =
                     \\{"knowledge":{"name":"knowledge","type":"graph","resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{uslug _entity.text}}","promote":false,"aliases":[{"key":"concept/cycle-target","target":"concept/cycle-source"}]}]}}
                 ;
                 consumer.schema_json = try a.alloc(u8, 512 * 1024);
                 @memset(@constCast(consumer.schema_json), 'x');
+                const consumers = try a.alloc(wire.Consumer, self.stress_width);
+                for (consumers, 0..) |*out, ordinal| {
+                    out.* = .{ .table = consumer, .names = &.{"concepts"} };
+                    out.table.table_id += ordinal;
+                }
                 return std.json.Stringify.valueAlloc(a, wire.Page{
                     .version = 1,
                     .revision = self.commits,
                     .table = self.tables[1],
-                    .consumers = &.{.{ .table = consumer, .names = &.{"concepts"} }},
+                    .consumers = consumers,
                     .next_cursor = if (page_index + 1 < self.stress_pages) try std.fmt.allocPrint(a, "{d}", .{page_index + 1}) else null,
                     .indexed = true,
                 }, .{});
@@ -58261,6 +58269,26 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             try std.testing.expect(std.mem.indexOf(u8, denied_legacy.body, "private source text") == null);
         }
         source.forbid_snapshot = true;
+    }
+    // Multiple consumers on one page share one reverse-binding authorization
+    // batch. Destination authorization remains a separate admitted resource.
+    {
+        const AllowAll = struct {
+            fn allows(_: *const anyopaque, _: []const u8) bool {
+                return true;
+            }
+        };
+        var read_context: u8 = 0;
+        source.stress_pages = 2;
+        source.stress_width = 2;
+        source.reverse_read_batches = 0;
+        var legacy = try resources.handle(&server, alloc, .entity_redirects, "entities", "", "concept/noise", "", "", .{ .principal = .{ .kind = .user, .subject = "all-sources" }, .table_read_authorization = .{ .ptr = &read_context, .allows = AllowAll.allows } });
+        defer legacy.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), legacy.status);
+        try std.testing.expectEqual(@as(usize, 3), source.reverse_read_batches);
+        source.stress_pages = 0;
+        source.stress_width = 1;
+        source.stress_reads = 0;
     }
     // Initial adoption folds borrowed legacy policy from independent page arenas.
     server.source = source.narrowIface();
