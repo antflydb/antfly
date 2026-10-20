@@ -3833,3 +3833,42 @@ storage and larger production workloads remain unqualified.
 Profiles identify JSON decoding/validation as the main cost of these indexed
 workloads. This change extends no regex/JIT path; it makes no additional
 ripgrep/PCRE2 compatibility or local-search throughput claim.
+
+### Enforcing analyzer upgrades and reducing verification costs
+
+Named-autocomplete semantics now participate in the physical generation's durable
+text-projection witness. Existing nonempty prefix-only generations are quarantined
+with `TextProjectionProvenanceMismatch` until explicitly rebuilt; reopening cannot
+silently relabel their postings. Unaffected analyzers keep their existing witness.
+The native upgrade regression creates real legacy terms, checks refusal, then
+builds and reopens a private replacement containing complete short and long words.
+
+Retained membership expiry uses an indexed min-heap within the same 16 MiB budget.
+Replacement and eviction remove their heap nodes immediately, so stale deadline
+records cannot accumulate. A 4,096-entry staggered-expiry test requires fewer than
+122,880 heap comparisons while preserving active reader pins. This removes the
+full-directory walk at each distinct expiration; it does not eliminate the lock
+or allocation cost of maintaining retained facts.
+
+Source-read adaptation now measures scalar and bounded batch provider costs on
+required reads. It samples 16-, 32- and 64-row classes, keeps a bounded decayed
+history, periodically probes alternatives and may choose scalar reads. Learned
+byte limits clamp to size classes; allocator admission, document/byte budgets and
+scalar fallback retain their existing authority. Calibration does no duplicate I/O.
+
+The JSON adapter borrows plain selected ASCII strings using a vector-assisted
+scan and validates skipped escaped/Unicode strings without producing a token for
+every fragment. All source syntax and duplicate keys are still checked. Standard
+scanner paths remain responsible for keys, diagnostics, streaming and decoding
+escaped selected strings. Generated mutations and truncations compare rejection
+and structural continuation with the standard scanner. Allocation-failure tests
+force deterministic growth so Linux remapping differences cannot change their
+failure enumeration.
+
+`zig/lib/json/bench_value_strings.zig` isolates the two string paths with nine
+alternating standard/native samples and checked results. Its gains describe
+scanner throughput; complete-query timings must also include storage reads,
+matching, authorization and response work. The shared
+[design](../../../docs/design/logical-field-queries.md) documents the migration and
+dataflow contracts, including requirements for a future versioned stored-field
+layout that could avoid validating unrelated source bytes.

@@ -18686,7 +18686,7 @@ const ValueExecution = struct {
     load_many: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
     projection: ?@import("../../../search/value_source.zig").Plan = null,
     projection_attempted: bool = false,
-    source_rows: usize = 16,
+    source_tuner: SourceReadTuner = .{},
     literal_groups: std.ArrayListUnmanaged(LiteralGroup) = .empty,
     cohorts: std.ArrayListUnmanaged(Cohort) = .empty,
     active_cohort: ?usize = null,
@@ -18921,6 +18921,100 @@ const ValueExecution = struct {
 
 /// Bounded read-ahead over candidates this leaf actually owes. Returned bytes
 /// never outlive the window and are consumed in original iterator order.
+/// Query-local bounded exploration of provider cost, independent of parser or
+/// output work. Every sample is a required read: no duplicate benchmark I/O.
+/// Byte limits and allocator admission remain authoritative over learned sizes.
+const SourceReadTuner = struct {
+    const sizes = [_]usize{ 16, 1, 32, 64 };
+    ns: [4]u64 = @splat(0),
+    rows: [4]usize = @splat(0),
+    choice: usize = 0,
+    exploring: bool = true,
+    calls: usize = 0,
+    probe: usize = 0,
+    max_rows: usize = 64,
+    average_bytes: u64 = 1,
+    fn allowedRows(self: *const @This()) usize {
+        const byte_rows = (256 * 1024) / @max(1, self.average_bytes);
+        var allowed: usize = 1;
+        // Keep storage windows aligned to a bounded size class, rather than
+        // oscillating through arbitrary row counts as average bytes change.
+        for ([_]usize{ 16, 32, 64 }) |size| if (size <= byte_rows and size <= self.max_rows) {
+            allowed = size;
+        };
+        return allowed;
+    }
+    fn desired(self: *const @This()) usize {
+        return @min(sizes[self.choice], self.allowedRows());
+    }
+    fn best(self: *const @This()) usize {
+        var result: usize = 0;
+        var cost: u64 = std.math.maxInt(u64);
+        for (self.rows, 0..) |rows, i| {
+            if (rows == 0 or sizes[i] > self.allowedRows()) continue;
+            const candidate = self.ns[i] / rows;
+            if (candidate < cost) {
+                cost = candidate;
+                result = i;
+            }
+        }
+        return result;
+    }
+    fn observe(self: *@This(), rows: usize, bytes: u64, elapsed_ns: u64) void {
+        if (rows == 0) return;
+        // Attribute a clamped observation to the effective size class, never
+        // teach a 64-row arm using scalar I/O forced by its byte ceiling.
+        const effective = for (sizes, 0..) |size, i| {
+            if (size == self.desired()) break i;
+        } else unreachable;
+        // Decay completed epochs to adapt without retaining unbounded history.
+        if (self.rows[effective] >= 1024) {
+            self.rows[effective] /= 2;
+            self.ns[effective] /= 2;
+        }
+        self.rows[effective] += rows;
+        self.ns[effective] +|= elapsed_ns;
+        const average = @max(1, bytes / rows);
+        self.average_bytes = (self.average_bytes *| 3 +| average) / 4;
+        self.calls += 1;
+        if (self.exploring and self.rows[effective] >= 16) {
+            self.choice += 1;
+            if (self.choice == sizes.len) {
+                self.exploring = false;
+                self.choice = self.best();
+                self.calls = 0;
+            }
+        } else if (!self.exploring) {
+            if (self.calls >= 64) {
+                self.probe = (self.probe + 1) % sizes.len;
+                self.choice = self.probe;
+                self.calls = 0;
+            } else self.choice = self.best();
+        }
+    }
+};
+
+test "logical value source tuner learns scalar or batch cost and respects byte bounds" {
+    for ([_]bool{ false, true }) |batch_wins| {
+        var tuner: SourceReadTuner = .{};
+        for (0..256) |_| {
+            const rows = tuner.desired();
+            const elapsed: u64 = if (batch_wins) 1000 + rows * 10 else if (rows == 1) 10 else rows * 100;
+            tuner.observe(rows, rows * 4096, elapsed);
+        }
+        try std.testing.expectEqual(if (batch_wins) @as(usize, 64) else @as(usize, 1), SourceReadTuner.sizes[tuner.best()]);
+        tuner.average_bytes = 32 * 1024;
+        try std.testing.expectEqual(@as(usize, 1), tuner.desired());
+        const old_scalar_rows = tuner.rows[1];
+        tuner.observe(1, 32 * 1024, 1000);
+        try std.testing.expect(tuner.rows[1] > old_scalar_rows);
+        try std.testing.expectEqual(@as(usize, 1), SourceReadTuner.sizes[tuner.best()]);
+        tuner.average_bytes = 1;
+        tuner.max_rows = 16;
+        try std.testing.expect(tuner.desired() <= 16);
+    }
+}
+
 const ValueSourceWindow = struct {
     const limit = 8 * 1024 * 1024;
     const capacity = 64;
@@ -18955,7 +19049,7 @@ const ValueSourceWindow = struct {
             const attempted = if (self.count == 0) self.rows else @min(self.rows, self.count);
             self.reset(true);
             self.rows = attempted / 2;
-            producer.owner.source_rows = @max(2, self.rows);
+            producer.owner.source_tuner.max_rows = @max(1, self.rows);
             if (producer.owner.req.profile) {
                 const work = producer.owner.req.value_search_work orelse &producer.owner.local_work;
                 _ = work.batch_refusals.fetchAdd(1, .monotonic);
@@ -18990,7 +19084,9 @@ const ValueSourceWindow = struct {
             self.budget.limit = @min(limit, room.? / 4);
             self.admitted = true;
         }
+        if (self.adaptive) self.rows = owner.source_tuner.desired();
         self.reset(false);
+        if (self.rows < 2) return;
         const work = owner.req.value_search_work orelse &owner.local_work;
         defer if (owner.req.profile) {
             _ = work.batch_peak_bytes.fetchMax(self.budget.peak, .monotonic);
@@ -19023,7 +19119,7 @@ const ValueSourceWindow = struct {
             };
         }
         if (self.count < 2) return;
-        const start = if (owner.req.profile) platform_time.monotonicNs() else 0;
+        const start = platform_time.monotonicNs();
         defer if (owner.req.profile) {
             _ = work.source_read_ns.fetchAdd(platform_time.monotonicNs() - start, .monotonic);
         };
@@ -19041,9 +19137,7 @@ const ValueSourceWindow = struct {
         };
         try value_query.Work.charge(&work.bytes, source_bytes, owner.req.value_search_execution.max_bytes);
         if (self.adaptive) {
-            const average = @max(1, source_bytes / self.count + @intFromBool(source_bytes % self.count != 0));
-            self.rows = @intCast(@max(2, @min(capacity, (256 * 1024) / average)));
-            owner.source_rows = self.rows;
+            owner.source_tuner.observe(self.count, source_bytes, platform_time.monotonicNs() - start);
         }
         if (owner.req.profile) {
             _ = work.source_batches.fetchAdd(1, .monotonic);
@@ -19120,7 +19214,7 @@ const ValueProducer = struct {
         defer if (indexed) |*bitmap| bitmap.deinit();
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
-        var source_window: ValueSourceWindow = .{ .rows = owner.source_rows, .budget = .{ .backing = @import("../../../sql/memory_budget.zig").reclaimingAllocator(a), .limit = ValueSourceWindow.limit } };
+        var source_window: ValueSourceWindow = .{ .rows = owner.source_tuner.desired(), .budget = .{ .backing = @import("../../../sql/memory_budget.zig").reclaimingAllocator(a), .limit = ValueSourceWindow.limit } };
         source_window.arena = .init(source_window.budget.allocator());
         defer source_window.arena.deinit();
         if (indexed) |*bitmap| if (incoming) |other| bitmap.andWith(other);
@@ -19187,12 +19281,15 @@ const ValueProducer = struct {
                 // Both scalar and batch loaders share the admitted provider.
                 const stored = if (buffered) |row| row.bytes else scalar: {
                     try value_query.Work.charge(&work.documents, 1, owner.req.value_search_execution.max_documents);
-                    const start = if (owner.req.profile) platform_time.monotonicNs() else 0;
-                    defer if (owner.req.profile) {
-                        _ = work.source_read_ns.fetchAdd(platform_time.monotonicNs() - start, .monotonic);
+                    const start = platform_time.monotonicNs();
+                    const loaded = try owner.load.?(owner.load_ctx, scratch.allocator(), id);
+                    const elapsed = platform_time.monotonicNs() - start;
+                    if (source_window.enabled and source_window.adaptive) owner.source_tuner.observe(1, if (loaded) |bytes| bytes.len else 0, elapsed);
+                    if (owner.req.profile) {
+                        _ = work.source_read_ns.fetchAdd(elapsed, .monotonic);
                         _ = work.source_scalar_reads.fetchAdd(1, .monotonic);
-                    };
-                    break :scalar try owner.load.?(owner.load_ctx, scratch.allocator(), id);
+                    }
+                    break :scalar loaded;
                 };
                 if (stored) |bytes| {
                     if (buffered == null) try value_query.Work.charge(&work.bytes, bytes.len, owner.req.value_search_execution.max_bytes);

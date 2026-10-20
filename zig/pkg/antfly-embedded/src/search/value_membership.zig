@@ -65,6 +65,7 @@ pub const Cache = struct {
         facts: Facts,
         key: [32]u8,
         expires_ms: u64,
+        expiry_index: usize = 0,
         previous: ?*Shared = null,
         next: ?*Shared = null,
         hot: bool = false,
@@ -85,7 +86,8 @@ pub const Cache = struct {
     entries: std.AutoHashMapUnmanaged([32]u8, *Shared) = .empty,
     cold: Queue = .{},
     hot: Queue = .{},
-    next_expiry_ms: u64 = std.math.maxInt(u64),
+    expiry: std.ArrayListUnmanaged(*Shared) = .empty,
+    expiry_comparisons: usize = 0, // Test instrumentation; no production increments.
     mutex: std.atomic.Mutex = .unlocked,
     fn lock(self: *Cache) void {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
@@ -109,6 +111,7 @@ pub const Cache = struct {
     }
     fn remove(self: *Cache, shared: *Shared) void {
         self.unlink(shared);
+        self.removeExpiry(shared.expiry_index);
         std.debug.assert(self.entries.remove(shared.key));
         self.release(shared);
     }
@@ -125,28 +128,61 @@ pub const Cache = struct {
         }
         return false;
     }
-    fn expire(self: *Cache, now_ms: u64) void {
-        if (now_ms < self.next_expiry_ms) return;
-        self.next_expiry_ms = std.math.maxInt(u64);
-        for ([_]?*Shared{ self.cold.first, self.hot.first }) |first| {
-            var node = first;
-            while (node) |shared| {
-                node = shared.next;
-                if (shared.expires_ms <= now_ms) self.remove(shared) else self.next_expiry_ms = @min(self.next_expiry_ms, shared.expires_ms);
-            }
+    fn earlier(self: *Cache, left: *Shared, right: *Shared) bool {
+        if (@import("builtin").is_test) self.expiry_comparisons += 1;
+        return left.expires_ms < right.expires_ms;
+    }
+    fn swapExpiry(self: *Cache, left: usize, right: usize) void {
+        std.mem.swap(*Shared, &self.expiry.items[left], &self.expiry.items[right]);
+        self.expiry.items[left].expiry_index = left;
+        self.expiry.items[right].expiry_index = right;
+    }
+    fn riseExpiry(self: *Cache, start: usize) void {
+        var index = start;
+        while (index != 0) {
+            const parent = (index - 1) / 2;
+            if (!self.earlier(self.expiry.items[index], self.expiry.items[parent])) break;
+            self.swapExpiry(index, parent);
+            index = parent;
         }
+    }
+    fn removeExpiry(self: *Cache, index: usize) void {
+        const last = self.expiry.pop().?;
+        if (index == self.expiry.items.len) return;
+        self.expiry.items[index] = last;
+        last.expiry_index = index;
+        if (index != 0 and self.earlier(last, self.expiry.items[(index - 1) / 2])) {
+            self.riseExpiry(index);
+            return;
+        }
+        var current = index;
+        while (current * 2 + 1 < self.expiry.items.len) {
+            var child = current * 2 + 1;
+            if (child + 1 < self.expiry.items.len and self.earlier(self.expiry.items[child + 1], self.expiry.items[child])) child += 1;
+            if (!self.earlier(self.expiry.items[child], self.expiry.items[current])) break;
+            self.swapExpiry(current, child);
+            current = child;
+        }
+    }
+    fn expire(self: *Cache, now_ms: u64) void {
+        // Indexed heap removal also covers replacement and eviction: no stale
+        // tombstones accumulate, and staggered deadlines never scan live facts.
+        while (self.expiry.items.len != 0 and self.expiry.items[0].expires_ms <= now_ms) self.remove(self.expiry.items[0]);
         if (self.entries.count() == 0) {
             self.entries.deinit(self.budget.allocator());
             self.entries = .empty;
+            self.expiry.deinit(self.budget.allocator());
+            self.expiry = .empty;
         }
     }
     pub fn deinit(self: *Cache) void {
         while (self.cold.first) |shared| self.remove(shared);
         while (self.hot.first) |shared| self.remove(shared);
         self.entries.deinit(self.budget.allocator());
+        self.expiry.deinit(self.budget.allocator());
     }
     /// Lookup and pin are O(1), with no allocations or bitmap copies. Expiry
-    /// walks the directory only when its earliest deadline has actually passed.
+    /// removes only expired entries, with O(log N) work per removal.
     /// The cache must outlive leases, including leases retired by deinit.
     pub fn borrow(self: *Cache, identity: [32]u8, now_ms: u64) ?Lease {
         self.lock();
@@ -175,6 +211,10 @@ pub const Cache = struct {
             return;
         };
         // Optional metadata growth cannot flush useful entries on failure.
+        self.expiry.ensureUnusedCapacity(self.budget.allocator(), 1) catch {
+            self.mutex.unlock();
+            return;
+        };
         self.entries.ensureUnusedCapacity(self.budget.allocator(), 1) catch {
             self.mutex.unlock();
             return;
@@ -221,13 +261,19 @@ pub const Cache = struct {
             self.remove(held);
         }
         // Other builders may have used the spare hash capacity while copying.
+        self.expiry.ensureUnusedCapacity(self.budget.allocator(), 1) catch {
+            self.release(shared);
+            return;
+        };
         self.entries.ensureUnusedCapacity(self.budget.allocator(), 1) catch {
             self.release(shared);
             return;
         };
         self.entries.putAssumeCapacity(identity, shared);
         self.append(shared);
-        self.next_expiry_ms = @min(self.next_expiry_ms, expires_ms);
+        shared.expiry_index = self.expiry.items.len;
+        self.expiry.appendAssumeCapacity(shared);
+        self.riseExpiry(shared.expiry_index);
     }
 };
 // Storage callers must supply a scope installed by openQueryCut *after*
@@ -394,4 +440,32 @@ test "logical value byte budget admits thousands of tiny retained facts" {
         try std.testing.expect(cache.borrow(digest(.{@as(usize, 0)}), 100) == null);
         try std.testing.expectEqual(@as(usize, 0), cache.budget.live);
     }
+}
+
+test "logical value staggered expiry is logarithmic and keeps pins alive" {
+    const a = std.testing.allocator;
+    var cache: Cache = .{ .budget = .{ .backing = a, .limit = 4 * 1024 * 1024 } };
+    defer cache.deinit();
+    var facts = Facts.init(a);
+    defer facts.deinit();
+    try facts.known.add(7);
+    const count = 4096;
+    // Reverse insertion exercises both heap directions, independent of LRU.
+    for (0..count) |i| cache.put(digest(.{i}), count - i + 10, 1, facts);
+    var pin = cache.borrow(digest(.{count - 1}), 2).?;
+    defer pin.deinit();
+    cache.expiry_comparisons = 0;
+    for (0..count) |i| {
+        cache.expire(i + 11);
+        try std.testing.expectEqual(count - i - 1, cache.entries.count());
+        try std.testing.expectEqual(cache.entries.count(), cache.expiry.items.len);
+        if (i + 1 < count) {
+            var live = cache.borrow(digest(.{@as(usize, 0)}), i + 11).?;
+            live.deinit();
+        }
+    }
+    try std.testing.expect(cache.expiry_comparisons < count * 30);
+    std.debug.print("logical_membership_expiry keys={d} comparisons={d} peak_bytes={d}\n", .{ count, cache.expiry_comparisons, cache.budget.peak });
+    try std.testing.expect(pin.facts().known.contains(7));
+    try std.testing.expect(cache.budget.live != 0);
 }

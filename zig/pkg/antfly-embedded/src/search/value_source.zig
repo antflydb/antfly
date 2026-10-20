@@ -133,12 +133,13 @@ pub const Plan = struct {
             },
             .string => {
                 if (selected) |index| if (self.nodes.items[index].terminal) {
+                    if (@import("antfly-json").value_strings.borrow(scanner)) |bytes| return .{ .string = bytes };
                     return switch (try scanner.nextAllocMax(a, .alloc_if_needed, max_len)) {
                         .string, .allocated_string => |s| .{ .string = s },
                         else => error.UnexpectedToken,
                     };
                 };
-                try scanner.skipValue();
+                if (!try @import("antfly-json").value_strings.skip(scanner)) try scanner.skipValue();
                 return .null;
             },
             .number, .true, .false, .null => {

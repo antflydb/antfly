@@ -271,7 +271,9 @@ cold-storage or platform-parity qualification.
 
 Named `search_as_you_type` roots index complete Unicode word tokens with lowercase normalization. The bounded 2–20 character edge-prefix representation is an accelerator, not the root dictionary. Root prefix expansion remains available for one-character words, long prefixes, and full tokens beyond the accelerator window. Query analysis never expands edge n-grams. Generated shorthand mappings retain their independently verified shingle and prefix companions.
 
-Indexes built with the prior prefix-only named analyzer, including earlier development builds of this PR, require reindexing before relying on long-token completeness. Changing query/index normalization cannot recreate terms omitted from existing segments. The corrected named analyzer indexes complete root words; its former edge-prefix terms belong to the separate prefix accelerator.
+Indexes built with the prior prefix-only named analyzer require a replacement generation. The physical generation's existing text-projection provenance now incorporates named-autocomplete index semantics revision 2. This is independent of public schema versions and the provenance envelope codec version. Both `search_as_you_type` and `search_as_you_type_analyzer` aliases participate, whether selected by index configuration, exact mappings, dynamic templates or document-schema variants. Unaffected analyzers retain their historical witness.
+
+Opening a nonempty generation with the old witness fails closed with `TextProjectionProvenanceMismatch`, preserving the configured index and its load failure for operator inspection. It cannot accept new writes under a different normalization or serve partially upgraded results. The normal explicit index-repair/rebuild flow builds a private replacement and publishes it through the existing activation fences. Opening a physically empty writable generation can install the current witness; read-only opens cannot relabel it. Changing query normalization or updating metadata alone cannot recreate missing terms. Upgrade tests create actual prefix-only postings, verify refusal without changing schema/configuration identity, and admit a freshly built replacement.
 
 ### Bounded verification dataflow
 
@@ -280,14 +282,12 @@ the existing 16 MiB process allocation budget. New facts enter the cold queue;
 reuse promotes them. Directory metadata, immutable bitmap blocks, reader pins
 and unpublished builders all count against that budget. There is no fixed entry
 count. Lookup does not copy bitmaps, and construction occurs outside the directory
-lock. Expiry releases the empty directory too. This is optional memory-only
+lock. An indexed min-heap owns one deadline node per resident entry, sharing the same byte budget. Removal on expiry, replacement and eviction updates both indexes; there are no accumulated expiry tombstones. Lookup checks only the earliest deadline and expiry costs O(log N) per removed entry, rather than scanning surviving entries for each staggered deadline. Expiry releases the empty directory and heap too. Tests interleave 4,096 distinct expirations with live lookups, bound heap comparisons, and keep a reader pin across removal. This is optional memory-only
 acceleration; it never persists document bodies or bypasses read authorization,
 snapshot validation or revision isolation.
 
 Indexed producers read original values through the existing multi-read callback
-under the same read generation. Windows adapt between two and 64 candidate rows,
-target roughly 256 KiB of source payload, and carry the learned size across
-segments. Window allocations have an 8 MiB ceiling and may use at most a quarter
+under the same read generation. A query-local controller measures required provider reads in scalar, 16-, 32- and 64-row size classes. It starts with a bounded 16-row window, samples each feasible class using real work, then selects the lowest observed read time per row. Periodic bounded probes and decayed samples allow adjustment; there are no duplicate reads or synthetic calibration requests. Measurements exclude parsing and output, and byte-clamped observations are attributed to their effective class. The controller targets at most roughly 256 KiB of source payload using the learned average and carries its bounded state across segments. It may choose scalar reads when batching is more expensive. Fixed-size benchmark controls bypass learning. Window allocations have an 8 MiB ceiling and may use at most a quarter
 of provable reusable allocator headroom. Unknown, monotonic and externally
 reserved budgets retain scalar reads. Failed optional windows shrink, release
 their memory and restore document reservations before scalar fallback. Deleted,
@@ -305,8 +305,7 @@ allocator without stripping constraints.
 Large originals use a query-local field-path trie and sparse JSON projection.
 The parser validates the complete input, including duplicate keys and unused
 values, while materializing only selected string paths and their array/object
-structure. Unselected values use iterative validation, so deeply nested unused
-data does not force recursive DOM construction. Tiny documents use the standard
+structure. Plain selected ASCII strings use a vector-assisted delimiter/validation scan and borrow the original bytes. Skipped value strings validate escapes, UTF-8 and UTF-16 surrogate pairs directly without generating a temporary token for every fragment. These adapters are confined to complete-input value positions; keys, diagnostics, streaming modes and escaped selected-string decoding retain the standard scanner. Generated Unicode/escape/truncation cases and byte mutations compare acceptance and structural continuation with that scanner. Unselected values use iterative validation, so deeply nested unused data does not force recursive DOM construction. Tiny documents use the standard
 parser directly; excessive selected depth or unavailable compilation retains
 the ordinary full-DOM path. Sparse projections never enter the full-document
 source cache. Matcher semantics and work limits remain authoritative.
@@ -326,3 +325,10 @@ It retains the initial observations and benchmark-settling correction. Linux use
 a native ARM64 VM with a two-CPU quota; its selected-string control remains mixed.
 These are warm-cache observations, not independent physical Linux or cold-storage
 qualification.
+
+
+### Remaining storage work and performance qualification
+
+Eliminating unrelated source-byte validation would require a durable stored-field contract, rather than trusting arbitrary JSON or silently skipping malformed data. A future layout should version original-value extraction, bind offsets or columns to the authenticated document revision and schema, preserve array-element boundaries and source normalization, and keep authorization, corruption detection and work accounting consistent across scalar and batch readers. Old generations need explicit rebuilding or the current full-validation fallback. This remains a separate storage-format project; this implementation keeps complete JSON validation.
+
+The value-string microbenchmark is reproducible with `zig/lib/json/bench_value_strings.zig` and alternates standard/native order over nine samples. Its scanner-only gains must not be presented as complete-query gains. End-to-end qualification must compare optimized binaries with source hashes and identical corpora, include default/scalar/fixed-size controls, and retain CPU, first-result latency, memory and all raw trials. Warm ARM64 Linux VM measurements remain distinct from independent hardware or cold-storage qualification.
