@@ -730,6 +730,11 @@ pub fn encodeEmbeddingGemma2VideoBatchTensorResident(cb: *const ComputeBackend, 
     return encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb, allocator, input, width, height, frames, false);
 }
 pub fn encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32, frames: usize, required: bool) !EncodedDeviceImage {
+    return encodeEmbeddingGemma2VideoBatchTensorInto(cb, allocator, input, width, height, frames, required, null);
+}
+
+/// An optional output is borrowed; the caller owns it on success and failure.
+pub fn encodeEmbeddingGemma2VideoBatchTensorInto(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32, frames: usize, required: bool, output: ?CT) !EncodedDeviceImage {
     var cfg = embeddingGemma2ImageConfig();
     cfg.max_image_tokens = 140;
     cfg.require_prepared_vision = required;
@@ -750,7 +755,7 @@ pub fn encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb: *const ComputeBackend, 
         const positions = try store.weightCt("v.position_embd.weight");
         defer cb.free(positions);
         const positioned = try addPositionEmbeddingsDevice(cb, allocator, projected, positions, cfg.vision_hidden, g);
-        const result = try encodePositionedBatchResident(cb, allocator, &store, cfg, positioned, singleGeometry(g), frames);
+        const result = try encodePositionedBatchResidentInto(cb, allocator, &store, cfg, positioned, singleGeometry(g), frames, output);
         return .{ .tensor = result.embeddings, .tokens = frames * result.tokens };
     }
     const data = try cb.toFloat32(projected, allocator);
@@ -758,7 +763,7 @@ pub fn encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb: *const ComputeBackend, 
     const positioned = try addPositionEmbeddings(allocator, &store, cfg, data, g);
     defer allocator.free(positioned);
     const hidden = try cb.fromFloat32Shape(positioned, &.{ @intCast(frames * g.grid_x * g.grid_y), @intCast(cfg.vision_hidden) });
-    const result = try encodePositionedBatchResident(cb, allocator, &store, cfg, hidden, singleGeometry(g), frames);
+    const result = try encodePositionedBatchResidentInto(cb, allocator, &store, cfg, hidden, singleGeometry(g), frames, output);
     return .{ .tensor = result.embeddings, .tokens = frames * result.tokens };
 }
 
@@ -2934,6 +2939,10 @@ fn encodeVisionHiddenResident(cb: *const ComputeBackend, allocator: std.mem.Allo
 }
 
 fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, positioned: CT, geometry: Geometry, batch: usize) !ResidentImage {
+    return encodePositionedBatchResidentInto(cb, allocator, store, cfg, positioned, geometry, batch, null);
+}
+
+fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, positioned: CT, geometry: Geometry, batch: usize, output: ?CT) !ResidentImage {
     var hidden = positioned;
     var hidden_live = true;
     errdefer if (hidden_live) cb.free(hidden);
@@ -3024,8 +3033,11 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
     defer cb.free(normed_pooled);
 
     const projection_w = try projectorLinearWeightCt(cb, allocator, store, "mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
-    const projected = try cb.linearNoBias(normed_pooled, projection_w, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
-    errdefer cb.free(projected);
+    const projected = if (output) |target| blk: {
+        try cb.linearNoBiasInto(allocator, normed_pooled, projection_w, target, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
+        break :blk target;
+    } else try cb.linearNoBias(normed_pooled, projection_w, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
+    errdefer if (output == null) cb.free(projected);
     if (projector_frame) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         projector_frame = false;

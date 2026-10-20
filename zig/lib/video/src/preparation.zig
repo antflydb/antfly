@@ -34,6 +34,7 @@ extern fn av_prepare_rgba_into_submit(*anyopaque, [*]const u8, usize, [*]const u
 extern fn av_prepare_rgba_submit(*anyopaque, [*]const u8, usize, [*]const u32, *anyopaque, *?*anyopaque) i32;
 extern fn av_prepared_gpu_seconds(*anyopaque) f64;
 extern fn av_preparer_device_bytes(*anyopaque) u64;
+extern fn av_prepared_notify(*anyopaque, ?*anyopaque, ?*const fn (?*anyopaque) callconv(.c) void) void;
 extern fn av_prepared_poll(*anyopaque) c_int;
 extern fn av_prepared_wait(*anyopaque, u64) c_int;
 extern fn av_prepared_buffer(*anyopaque) *anyopaque;
@@ -952,6 +953,12 @@ pub const Prepared = struct {
     rgba_staging_bytes: usize = 0,
     native_staging_bytes: usize = 0,
     coefficient_staging_bytes: usize = 0,
+    /// Notification may run immediately or on the Metal completion thread.
+    /// The callback must not reenter this preparation. Replacement and deinit
+    /// fence any running callback before its context can be released.
+    pub fn notify(self: *const Prepared, context: ?*anyopaque, callback: ?*const fn (?*anyopaque) callconv(.c) void) void {
+        if (supported) av_prepared_notify(self.handle, context, callback);
+    }
     pub fn isReady(self: *const Prepared) !bool {
         if (!supported) return error.UnsupportedVideoBackend;
         return switch (av_prepared_poll(self.handle)) {

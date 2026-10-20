@@ -948,5 +948,10 @@ path: prepared patches need upload/vision storage, raw pixels also need conversi
 and only decoder misses retain decoder storage. Qualified Metal rows compose into
 one persistent final input, preserving caller order through a pooled-result
 permutation rather than copying composed rows. Singleton and cohort consumers
-share ready-frame batching. See `../video/VIDEO.md` for ownership, policy matching,
+share bounded ready-frame batching with a reserved pending share per source.
+Only shared decoder continuations impose producer ordering; validated inputs and
+independent sources can publish ahead. Ready geometry-compatible host and device
+frames share tower calls while unfinished preparations remain pending. Persistent
+projection outputs provide retained frame views without stage escape copies.
+See `../video/VIDEO.md` for ownership, policy matching,
 scratch admission and fallback behavior.

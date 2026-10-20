@@ -2234,6 +2234,7 @@ pub const ComputeBackend = struct {
 
         /// Y = X @ W^T (no bias). X:[rows, in_dim], W:[out_dim, in_dim] → Y:[rows, out_dim]
         linearNoBias: *const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT,
+        linearNoBiasInto: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, output: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!bool = null,
 
         /// Planned no-bias linear variant. This is the hot path for quantized
         /// graph command execution because the partitioner can carry row-bucket
@@ -3575,6 +3576,14 @@ pub const ComputeBackend = struct {
 
     pub fn linearNoBias(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
         return self.vtable.linearNoBias(self.ptr, input, weight, rows, in_dim, out_dim);
+    }
+
+    /// Writes to caller-owned storage, preserving it across recyclable frames.
+    pub fn linearNoBiasInto(self: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, weight: CT, output: CT, rows: usize, in_dim: usize, out_dim: usize) !void {
+        if (self.vtable.linearNoBiasInto) |apply| if (try apply(self.ptr, input, weight, output, rows, in_dim, out_dim)) return;
+        const temporary = try self.linearNoBias(input, weight, rows, in_dim, out_dim);
+        defer self.free(temporary);
+        if (!try self.copyRows2D(allocator, output, 0, temporary, 0, rows, out_dim)) return error.UnsupportedPrimitiveOp;
     }
 
     pub fn linearNoBiasWithPlan(

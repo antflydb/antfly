@@ -38695,6 +38695,31 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
                 }
                 for (host.vectors, expected_vectors) |actual, expected| for (actual, expected) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
                 std.debug.print("host patch cohort metal=true parity=true shared_batches={d}\n", .{host.shared_vision_batches});
+                // Publish one host row and one device row before consumption,
+                // qualifying mixed ready sources under measured wave sizing.
+                var mixed_items = items;
+                var mixed_rows: [2]?*stream_embedding.VideoAhead = @splat(null);
+                defer for (mixed_rows) |entry| if (entry) |ahead| ahead.deinit();
+                for (&mixed_items, &mixed_rows, 0..) |*item, *owner, index| {
+                    const ahead = (try stream_embedding.VideoAhead.start(loaded.session, item.movie, node.extractionExecutionControl(null), null, &pools[index], .{})).?;
+                    owner.* = ahead;
+                    if (index == 0) {
+                        ahead.producer.?.deinit();
+                        ahead.producer = null;
+                        ahead.producer = try @import("../pipelines/embedding_gemma2_video.zig").Prefetch.startConfigured(ahead.bounded.allocator(), std.testing.io, null, item.movie.bytes, item.movie.reader, node.extractionExecutionControl(null), .{ .sampling = item.movie.sampling, .selection = item.movie.selection, .cache_pins = ahead.pins, .inspection_scope = ahead.inspection_scope, .pool = &ahead.pool });
+                    }
+                    item.ahead = ahead;
+                }
+                for (mixed_rows) |entry| entry.?.producer.?.finished.waitUncancelable(std.testing.io);
+                const mixed = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &mixed_items, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (mixed.vectors) |vector| a.free(vector);
+                    a.free(mixed.vectors);
+                    a.free(mixed.input_tokens);
+                }
+                for (mixed.vectors, expected_vectors) |actual, expected| for (actual, expected) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+                std.debug.print("mixed host device cohort metal=true parity=true shared_batches={d}\n", .{mixed.shared_vision_batches});
+
                 // A single window with two ready host frames uses the same
                 // consumer as a multiwindow cohort, including its caption.
                 const singleton_movie = stream_embedding.SampledVideo{ .bytes = bytes, .sampling = .{ .source_timestamps = .{ .end_ns = 2 * std.time.ns_per_s, .step_ns = std.time.ns_per_s, .max_frames = 2 } } };

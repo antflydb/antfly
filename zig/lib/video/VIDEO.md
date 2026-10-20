@@ -1031,15 +1031,24 @@ Video cohorts start their bounded decode/preparation producers after shared
 admission and immutable inspection, before waiting for the model gate. Queued
 cancellation cancels and joins every producer before releasing its inspection,
 cache pins or memory reservation. Decoder continuations retain coded-order
-serialization; this does not introduce concurrent access to a decoder. Adaptive
+serialization only between producers sharing the same mutable continuation or
+lease owner. Independent clips prepare concurrently. Prepared/raw validated hits
+publish before the decoder dependency wait; only actual misses wait, checking
+cancellation between bounded event waits. This preserves exclusive decoder access. Adaptive
 singleton execution restarts validation after its ownership handoff and prepares
 the nearest successor. Decoder-lease waits observe producer cancellation, so
 retiring a farther speculative window cannot block on a current row's full queue.
 
 Completed windows can compose while remaining windows prepare or project.
-Composition consumes host projection ownership and escaped per-frame Metal
-owners directly. Segmented device composition scatters compact wrapper rows and
-frame rows into token order without a concatenated media table or intermediate
+Composition consumes host projection ownership and retained per-frame Metal
+views directly. Final vision projections write into an independently allocated
+device output, outside recyclable activation storage. Splitting that output into
+frame views needs no stage escape or projection copy. Prepared-plan fallback writes
+bounded subcohorts into slices of the same owner. The frame cache charges each
+physical backing allocation once across its retained views. Borrowed tickets keep
+the full allocation admitted until the final cache reference is evicted; sharing
+views neither multiplies cache charges nor undercounts retained storage.
+Segmented device composition scatters compact wrapper rows and frame rows into token order without a concatenated media table or intermediate
 window projection tensor. Repeated frames preserve their source mapping. Every
 row retains independent captions, masks, attention and pooling. Qualified Metal
 video batches allocate their final input outside the recyclable embedding stage,
@@ -1052,6 +1061,15 @@ Other backends and disabled compact policies retain the ordinary packing path.
 Singleton and multiwindow Metal consumers share the same ready-frame batching
 lane, including host patches from compact validation entries. Geometry, measured
 capacity and live admission bound each upload/tower wave without a fill delay.
+The consumer retains at most eight pending jobs, reserving a share for every row
+and polling sources in rotating order. Unfinished GPU preparations stay pending
+while ready cached, host or device work executes. Exact width/height compatibility
+can combine nonadjacent host/device inputs in one tower wave; all-device contiguous
+spans keep the direct import path. When no pending job is ready, producer publication
+and native GPU completion wake the same event immediately; a bounded timeout only
+checks cancellation while the model gate is released. Preparation destruction
+unregisters completion notification and fences any callback using that event.
+No end-to-end speedup is implied without paired completed-time measurements.
 
 Live validation optionally accepts a model preparation policy with a versioned
 identity. For frames whose exact F32 patch inputs consume at most half the raw

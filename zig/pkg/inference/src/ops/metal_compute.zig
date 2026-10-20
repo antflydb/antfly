@@ -18739,6 +18739,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return input.retainedView(0, input.deviceByteLen(), &shape);
     }
 
+    fn linearNoBiasIntoOp(ctx: *anyopaque, input: CT, weight: CT, output: CT, rows: usize, in_dim: usize, out_dim: usize) !bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.audio_capture != null) return false;
+        if (bufElemCount(toBuf(input)) != rows * in_dim) return error.InvalidTensorShape;
+        const out = toBuf(output);
+        const tensor = if (out.metal_tensor) |*value| value else return false;
+        if (!deviceTensorMatchesLinearRows(tensor, rows, out_dim)) return error.InvalidTensorShape;
+        if (!self.provider_impl.hasDecoderRuntime()) return false;
+        const bias = try self.cachedZeroBiasBuf(out_dim);
+        defer freeOp(ctx, bias);
+        const slot = (try self.ensureDynamicLinearSlot(weight, bias, in_dim, out_dim)) orelse return false;
+        if (!try decoderRuntimeApplyLinearIntoOp(ctx, &.{ .slot = slot, .input = input, .in_dim = in_dim, .out_dim = out_dim }, output)) return false;
+        tensor.invalidateHostMirror();
+        return true;
+    }
+
     fn linearNoBiasOpWithPlannedDispatch(
         ctx: *anyopaque,
         input: CT,
@@ -35927,6 +35943,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.denseMlp2 = denseMlp2Op;
         vt.denseFfnLayerNorm = denseFfnLayerNormOp;
         vt.linearPlanned = linearPlannedOp;
+        vt.linearNoBiasInto = linearNoBiasIntoOp;
         vt.linearNoBias = audioTapeLinearNoBias;
         vt.linearNoBiasPlanned = linearNoBiasPlannedOp;
         vt.loraLinearBranch = loraLinearBranchOp;
@@ -45849,7 +45866,30 @@ test "embeddinggemma2 Metal video buffer survives producer destruction and enter
     var prepared = try preparer.submitRgba(a, &rgba, 13, 7, options, .{});
     var live = true;
     defer if (live) prepared.deinit();
+    const Completion = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        event: std.Io.Event = .unset,
+        fn wake(raw: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            self.event.set(std.testing.io);
+        }
+    };
+    var completion = Completion{};
+    prepared.notify(&completion, Completion.wake);
+    try completion.event.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
     try prepared.wait(std.testing.io, .{});
+    try std.testing.expectEqual(@as(usize, 1), completion.calls.load(.acquire));
+    prepared.notify(null, null);
+    prepared.notify(&completion, Completion.wake);
+    try std.testing.expectEqual(@as(usize, 2), completion.calls.load(.acquire));
+    prepared.notify(null, null);
+    var abandoned = try preparer.submitRgba(a, &rgba, 13, 7, options, .{});
+    abandoned.notify(&completion, Completion.wake);
+    abandoned.notify(null, null);
+    const fenced_calls = completion.calls.load(.acquire);
+    abandoned.deinit();
+    try std.testing.expectEqual(fenced_calls, completion.calls.load(.acquire));
     const input = try MetalCompute.importVideoBuffer(&cb, try prepared.buffer(), prepared.geometry.values());
     defer cb.free(input);
     prepared.deinit();
@@ -47703,4 +47743,42 @@ test "metal_compute: ClipClap chained masks materialize pending lazy products" {
     try std.testing.expectEqual(@as(usize, 77 * 77), actual.len);
     for (actual) |value| try std.testing.expectEqual(@as(f32, 4), value);
     try std.testing.expect(MetalCompute.toBuf(product).lazy_multiply != null);
+}
+
+test "embeddinggemma2 video Metal projection writes persistent output across frame recycling" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.MetalUnavailable;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.initWithIo(a, &store, null, std.testing.io);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 }));
+    defer cb.free(input);
+    const weight = try cb.fromFloat32Shape(&.{ 2, 3, -1, 4 }, &.{ 2, 2 });
+    defer cb.free(weight);
+    const output = (try cb.allocUninitF32Shape(&.{ 3, 2 })).?;
+    var output_live = true;
+    defer if (output_live) cb.free(output);
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    errdefer cb.decoderRuntimeCancelFrame() catch {};
+    try std.testing.expect(try MetalCompute.linearNoBiasIntoOp(&compute, input, weight, output, 3, 2, 2));
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    const view = try cb.sliceRows2D(a, output, 1, 1, 2);
+    defer cb.free(view);
+    cb.free(output);
+    output_live = false;
+    for (0..3) |_| {
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        const temporary = try cb.linearNoBias(input, weight, 3, 2, 2);
+        defer cb.free(temporary);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+    }
+    const values = try cb.toFloat32(view, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 18, 13 }, values);
 }

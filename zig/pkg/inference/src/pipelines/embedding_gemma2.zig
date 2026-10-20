@@ -1180,7 +1180,16 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         };
         for (items, 0..) |item, index| {
             const movie = item.movie;
-            producers[index] = if (item.ahead) |ahead| ahead.producer.? else try video_model.Prefetch.startConfigured(a, cohort_io.?, context.device, movie.bytes, movie.reader, control, .{ .predecessor = if (index == 0) null else producers[index - 1], .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins, .inspection_scope = &inspection_scope, .pool = &pool, .cache = cache, .coefficients = context.coefficients });
+            const predecessor: ?*video_model.Prefetch = dependency: {
+                var previous = index;
+                while (previous != 0) {
+                    previous -= 1;
+                    const candidate = items[previous].movie;
+                    if (video_model.sharesDecoder(movie.selection, movie.webm, candidate.selection, candidate.webm)) break :dependency producers[previous];
+                }
+                break :dependency null;
+            };
+            producers[index] = if (item.ahead) |ahead| ahead.producer.? else try video_model.Prefetch.startConfigured(a, cohort_io.?, context.device, movie.bytes, movie.reader, control, .{ .predecessor = predecessor, .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins, .inspection_scope = &inspection_scope, .pool = &pool, .cache = cache, .coefficients = context.coefficients });
             producer_count += 1;
         }
     }

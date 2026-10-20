@@ -66,6 +66,21 @@ pub const WebmInput = struct {
     continuation: ?*video.webm_pictures.Continuation = null,
     apple_continuation: ?*WebmDecoderContinuation = null,
 };
+/// Mutable continuation identity, independent of source bytes and cache identity.
+pub fn sharesDecoder(left: ?*const ReaderSelection, left_webm: ?WebmInput, right: ?*const ReaderSelection, right_webm: ?WebmInput) bool {
+    if (left) |l| if (right) |r| {
+        if (l.continuation_lease) |ll| if (r.continuation_lease) |rr| {
+            if (ll.context == rr.context and ll.acquire == rr.acquire) return true;
+        };
+        if (l.continuation) |lc| if (r.continuation) |rc| if (lc == rc) return true;
+    };
+    if (left_webm) |l| if (right_webm) |r| {
+        if (l.continuation) |lc| if (r.continuation) |rc| if (lc == rc) return true;
+        if (l.apple_continuation) |lc| if (r.apple_continuation) |rc| if (lc == rc) return true;
+    };
+    return false;
+}
+
 pub const WebmDecoderContinuation = struct {
     allocator: std.mem.Allocator,
     reader: *const media.webm.Reader,
@@ -1435,9 +1450,6 @@ pub const Prefetch = struct {
             missing += 1;
         }
         if (missing == 0) return;
-        // Publish every header before waiting: the consumer needs all row
-        // identities before it can drain a predecessor's bounded frame queue.
-        if (self.predecessor) |previous| previous.finished.waitUncancelable(self.io);
         try check(self);
         var prepare_packets: [32]usize = undefined;
         var prepare_count: usize = 0;
@@ -1460,6 +1472,41 @@ pub const Prefetch = struct {
         } else try decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     }
 
+    fn waitForDecoder(self: *Prefetch) !void {
+        const previous = self.predecessor orelse return;
+        while (true) {
+            try check(self);
+            previous.finished.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+            try check(self);
+            return;
+        }
+    }
+
+    fn jobOptions(job: Job) video.preparation.Options {
+        return switch (job) {
+            .native => |value| value.options,
+            .metal => |value| value.options,
+            else => unreachable,
+        };
+    }
+
+    fn readySelection(jobs: []const Job, ready: []const bool, metal: bool) [8]bool {
+        var selected: [8]bool = @splat(false);
+        const first = std.mem.indexOfScalar(bool, ready, true) orelse return selected;
+        selected[first] = true;
+        if (!metal or jobs[first] == .cached) return selected;
+        const geometry = jobOptions(jobs[first]);
+        for (jobs, 0..) |job, index| {
+            if (!ready[index] or job == .cached) continue;
+            const options = jobOptions(job);
+            selected[index] = options.width == geometry.width and options.height == geometry.height;
+        }
+        return selected;
+    }
+
     /// Consume ready jobs from up to four windows through one projection lane.
     /// Frame identities remain scoped to their source row, while compatible
     /// geometry shares vision calls. No delay is introduced to fill a cohort.
@@ -1477,6 +1524,15 @@ pub const Prefetch = struct {
         if (producers.len == 0 or producers.len > 4 or outputs.len != producers.len) return error.InvalidInputShape;
         const io = producers[0].io;
         var wake: std.Io.Event = .unset;
+        const Completion = struct {
+            event: *std.Io.Event,
+            io: std.Io,
+            fn signal(raw: ?*anyopaque) callconv(.c) void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.event.set(self.io);
+            }
+        };
+        var completion = Completion{ .event = &wake, .io = io };
         for (producers) |producer| producer.wake.store(&wake, .release);
         defer for (producers) |producer| producer.wake.store(null, .release);
         errdefer {
@@ -1531,80 +1587,110 @@ pub const Prefetch = struct {
         defer capture.discardNativePending();
         var closed: [4]bool = @splat(false);
         var remaining = producers.len;
-        while (remaining != 0) {
+        // Bounded lookahead, with a reserved share for every source. A slow
+        // preparation cannot occupy every slot and hide another row's work.
+        var jobs: [8]Job = undefined;
+        var owners: [8]*Prefetch = undefined;
+        var rows: [8]usize = undefined;
+        var owned: [8]bool = @splat(true);
+        var count: usize = 0;
+        var poll_row: usize = 0;
+        defer for (jobs[0..count], owners[0..count], owned[0..count]) |*job, owner, live| if (live) owner.discard(job);
+        while (remaining != 0 or count != 0) {
             try producers[0].control.check();
             if (cb.embedding_stage) |stage| try stage.pause();
             wake.reset();
-            var jobs: [8]Job = undefined;
-            var owners: [8]*Prefetch = undefined;
-            var count: usize = 0;
-            var owned: [8]bool = @splat(true);
-            defer for (jobs[0..count], owners[0..count], 0..) |*job, owner, index| if (owned[index]) owner.discard(job);
-            for (producers, 0..) |producer, row| {
-                if (closed[row] or count == jobs.len) continue;
-                const begin = count;
-                const got = producer.queue.getUncancelable(io, jobs[count..], 0) catch {
+            var active: [4]bool = @splat(false);
+            for (closed[0..producers.len], 0..) |done, row| active[row] = !done;
+            for (rows[0..count]) |row| active[row] = true;
+            var active_count: usize = 0;
+            for (active[0..producers.len]) |value| active_count += @intFromBool(value);
+            var quotas: [4]usize = @splat(0);
+            var rank: usize = 0;
+            if (active_count != 0) for (0..producers.len) |delta| {
+                const row = (poll_row + delta) % producers.len;
+                if (!active[row]) continue;
+                quotas[row] = jobs.len / active_count + @intFromBool(rank < jobs.len % active_count);
+                rank += 1;
+            };
+            for (0..jobs.len) |_| for (0..producers.len) |delta| {
+                const row = (poll_row + delta) % producers.len;
+                const producer = producers[row];
+                var queued: usize = 0;
+                for (rows[0..count]) |r| if (r == row) {
+                    queued += 1;
+                };
+                if (closed[row] or queued >= quotas[row] or count == jobs.len) continue;
+                const got = producer.queue.getUncancelable(io, jobs[count..][0..1], 0) catch {
                     producer.join();
                     if (producer.failure) |err| return err;
                     closed[row] = true;
                     remaining -= 1;
                     continue;
                 };
-                count += got;
-                for (jobs[begin..count], owners[begin..count]) |*job, *owner| {
-                    owner.* = producer;
-                    switch (job.*) {
-                        .native => |*value| value.slot += offsets[row],
-                        .metal => |*value| value.slot += offsets[row],
-                        .cached => |*value| value.slot += offsets[row],
-                        .header => unreachable,
-                    }
+                if (got == 0) continue;
+                owners[count] = producer;
+                rows[count] = row;
+                owned[count] = true;
+                switch (jobs[count]) {
+                    .native => |*value| value.slot += offsets[row],
+                    .metal => |*value| {
+                        value.slot += offsets[row];
+                        value.prepared.notify(&completion, Completion.signal);
+                    },
+                    .cached => |*value| value.slot += offsets[row],
+                    .header => unreachable,
                 }
-            }
-            if (count == 0) {
-                if (remaining != 0) try wake.wait(io);
+                count += 1;
+            };
+            poll_row = (poll_row + 1) % producers.len;
+            var ready_mask: [8]bool = @splat(false);
+            for (jobs[0..count], 0..) |job, index| ready_mask[index] = switch (job) {
+                .metal => |value| try value.prepared.isReady(),
+                .header => unreachable,
+                else => true,
+            };
+            const first = std.mem.indexOfScalar(bool, ready_mask[0..count], true) orelse {
+                if (remaining != 0 or count != 0) wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    else => return err,
+                };
                 continue;
+            };
+            const selected = readySelection(jobs[0..count], ready_mask[0..count], cb.kind() == .metal);
+            if (cb.embedding_stage) |stage| try stage.acquire();
+            if (jobs[first] == .cached) {
+                const value = jobs[first].cached;
+                try capture.loadCached(value.slot, value.ticket);
+            } else if (cb.kind() == .metal) {
+                var batch: [8]Job = undefined;
+                var take: usize = 0;
+                for (jobs[0..count], 0..) |job, index| {
+                    if (!selected[index]) continue;
+                    batch[take] = job;
+                    take += 1;
+                    // The projection helper consumes preparations on all paths.
+                    if (job == .metal) owned[index] = false;
+                }
+                try capture.projectReadyBatchNow(batch[0..take]);
+            } else {
+                const value = jobs[first].native;
+                try capture.project(value.slot, value.patches, value.options);
             }
-            // Pause while GPU preparation completes; all model operations stay
-            // on this consumer lane and obey the existing workspace admission.
-            var cursor: usize = 0;
-            while (cursor < count) {
-                if (jobs[cursor] == .native and cb.kind() == .metal) {
-                    var host: [8]NativeProjectionJob = undefined;
-                    var take: usize = 0;
-                    while (cursor < count and jobs[cursor] == .native) : (cursor += 1) {
-                        host[take] = jobs[cursor].native;
-                        take += 1;
-                    }
-                    if (cb.embedding_stage) |stage| try stage.acquire();
-                    try capture.projectHostBatchNow(host[0..take]);
-                    continue;
+            var kept: usize = 0;
+            for (0..count) |index| {
+                if (selected[index]) {
+                    if (owned[index]) owners[index].discard(&jobs[index]);
+                } else {
+                    jobs[kept] = jobs[index];
+                    owners[kept] = owners[index];
+                    rows[kept] = rows[index];
+                    owned[kept] = owned[index];
+                    kept += 1;
                 }
-
-                if (jobs[cursor] == .metal) {
-                    if (cb.embedding_stage) |stage| try stage.pause();
-                    try jobs[cursor].metal.prepared.wait(io, capture.control);
-                    var gpu: [8]ProjectionJob = undefined;
-                    var take: usize = 0;
-                    while (cursor < count and jobs[cursor] == .metal) : (cursor += 1) {
-                        if (take != 0 and !try jobs[cursor].metal.prepared.isReady()) break;
-                        gpu[take] = jobs[cursor].metal;
-                        owned[cursor] = false;
-                        take += 1;
-                    }
-                    if (cb.embedding_stage) |stage| try stage.acquire();
-                    try capture.projectGpuBatchNow(gpu[0..take]);
-                    continue;
-                }
-                if (cb.embedding_stage) |stage| try stage.acquire();
-                switch (jobs[cursor]) {
-                    .native => |value| try capture.project(value.slot, value.patches, value.options),
-                    .cached => |value| try capture.loadCached(value.slot, value.ticket),
-                    else => unreachable,
-                }
-                cursor += 1;
             }
-            // Completed windows can compose while later windows are still decoding.
+            count = kept;
+            // Completed windows compose while later windows are still decoding.
             try emitter.emit();
         }
         for (producers) |producer| {
@@ -1988,6 +2074,7 @@ fn decodeAppleWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: vi
     return video.apple_webm.decodeTo(a, reader, indexed, selected, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .pool = capture.pool, .device_surfaces = capture.metal != null }, .{ .context = capture, .accept = Capture.publishAppleWebm });
 }
 fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture, input: ?WebmInput) !void {
+    if (capture.prefetch) |producer| try producer.waitForDecoder();
     const estimate = if (indexed.pictures.len != 0) try video.apple.surfaceAdmissionBytesForDepth(indexed.pictures[0].width, indexed.pictures[0].height, selected.len, indexed.pictures[0].bit_depth) else 0;
     if (capture.decoder.policy == .automatic and estimate > 512 * 1024 * 1024) capture.decoder.fallback();
     if (capture.decoder.policy != .portable and (capture.decoder.policy == .apple or estimate <= 512 * 1024 * 1024)) {
@@ -2020,6 +2107,7 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, requested: [
     const original_slots = capture.decode_slots;
     defer capture.decode_slots = original_slots;
     if (reader.track.codec == .mjpeg) {
+        if (capture.prefetch) |producer| try producer.waitForDecoder();
         if (capture.decoder.policy == .apple) return error.UnsupportedVideoProfile;
         capture.decoder.record(.portable);
         for (selected) |index| {
@@ -2069,6 +2157,7 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, requested: [
                 capture.decode_slots = slots[0..count];
             }
         };
+        if (capture.prefetch) |producer| try producer.waitForDecoder();
         // Binding and decoding share one lease: another producer cannot rebind
         // the retained reader while callbacks or source controls still use it.
         const lease = if (capture.reader_selection) |selection| selection.continuation_lease else null;
@@ -2336,8 +2425,7 @@ const Capture = struct {
             const started = batch_clock.monotonicNs();
             const encoded = try self.encodeGpu(input, options, 1);
             errdefer self.cb.free(encoded.tensor);
-            const tensor = if (self.cb.embedding_stage != null) try MetalCompute.escapeEmbeddingStage(self.cb, encoded.tensor) else encoded.tensor;
-            if (self.cb.embedding_stage != null) self.cb.free(encoded.tensor);
+            const tensor = encoded.tensor;
             tensors[slot] = tensor;
             self.frame_tokens[slot] = encoded.tokens;
             self.storeDevice(slot, tensor, encoded.tokens);
@@ -2390,40 +2478,115 @@ const Capture = struct {
             const scratch = try visionScratch(options, frames, required);
             if (self.cb.embedding_stage) |lane| try lane.workspace(scratch);
         }
-        return projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(self.cb, self.a, input, options.width, options.height, frames, required) catch |err| {
+        const tokens = frames * @as(usize, options.width / 48) * (options.height / 48);
+        const output = (try self.cb.allocUninitF32Shape(&.{ @intCast(tokens), 512 })) orelse return error.UnsupportedPrimitiveOp;
+        errdefer self.cb.free(output);
+        _ = projector.encodeEmbeddingGemma2VideoBatchTensorInto(self.cb, self.a, input, options.width, options.height, frames, required, output) catch |err| fallback: {
             if (err != error.PreparedVisionUnavailable or !required) return err;
             // The failed required plan has fenced every command. The original
             // input is still live; no producer job is consumed a second time.
             if (self.cb.decoderRuntimeHasActiveFrame() or self.cb.decoderRuntimeHasSubmittedFrame()) return error.PreparedVisionFallbackBusy;
             try self.control.check();
             self.last_prepared = false;
-            return self.encodeLegacyGpu(input, options, frames);
+            try self.encodeLegacyGpu(input, options, frames, output);
+            break :fallback .{ .tensor = output, .tokens = tokens };
         };
+        return .{ .tensor = output, .tokens = tokens };
     }
-    fn encodeLegacyGpu(self: *Capture, input: CT, options: video.preparation.Options, frames: usize) !projector.EncodedDeviceImage {
+    fn encodeLegacyGpu(self: *Capture, input: CT, options: video.preparation.Options, frames: usize, output: CT) !void {
         const capacity = try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024);
         var take = try self.admitGpuFrames(options, @min(capacity, frames), false);
-        if (take == frames) return projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(self.cb, self.a, input, options.width, options.height, frames, false);
+        if (take == frames) {
+            _ = try projector.encodeEmbeddingGemma2VideoBatchTensorInto(self.cb, self.a, input, options.width, options.height, frames, false, output);
+            return;
+        }
         const patches = @as(usize, options.width / 16) * (options.height / 16);
         const tokens = @as(usize, options.width / 48) * (options.height / 48);
         // Input and final projections remain owned across live-pressure retries.
         // No partial projection is published and no source is decoded again.
-        const output = (try self.cb.allocUninitF32Shape(&.{ @intCast(frames * tokens), 512 })) orelse return error.UnsupportedPrimitiveOp;
-        errdefer self.cb.free(output);
         var first: usize = 0;
         while (first < frames) {
             try self.control.check();
             if (first != 0) take = try self.admitGpuFrames(options, @min(capacity, frames - first), false);
             const slice = try self.cb.sliceRows2D(self.a, input, first * patches, take * patches, 768);
             defer self.cb.free(slice);
-            const encoded = try projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(self.cb, self.a, slice, options.width, options.height, take, false);
-            defer self.cb.free(encoded.tensor);
-            if (encoded.tokens != take * tokens) return error.InvalidTensorShape;
-            if (!try self.cb.copyRows2D(self.a, output, first * tokens, encoded.tensor, 0, encoded.tokens, 512)) return error.UnsupportedPrimitiveOp;
+            const target = try self.cb.sliceRows2D(self.a, output, first * tokens, take * tokens, 512);
+            defer self.cb.free(target);
+            _ = try projector.encodeEmbeddingGemma2VideoBatchTensorInto(self.cb, self.a, slice, options.width, options.height, take, false, target);
             first += take;
         }
-        return .{ .tensor = output, .tokens = frames * tokens };
     }
+    /// Compatible ready host and device frames share one tower invocation.
+    /// Host patches are uploaded directly, without packing another host slab.
+    /// Every device preparation is consumed, including on admission failure.
+    fn projectReadyBatchNow(self: *Capture, jobs: []Prefetch.Job) !void {
+        var gpu: [8]ProjectionJob = undefined;
+        var host: [8]NativeProjectionJob = undefined;
+        var gpu_count: usize = 0;
+        var host_count: usize = 0;
+        for (jobs) |job| switch (job) {
+            .metal => |value| {
+                gpu[gpu_count] = value;
+                gpu_count += 1;
+            },
+            .native => |value| {
+                host[host_count] = value;
+                host_count += 1;
+            },
+            else => unreachable,
+        };
+        if (host_count == 0) return self.projectGpuBatchNow(gpu[0..gpu_count]);
+        if (gpu_count == 0) return self.projectHostBatchNow(host[0..host_count]);
+        defer for (jobs) |*job| if (job.* == .metal) job.metal.prepared.deinit();
+        const options = Prefetch.jobOptions(jobs[0]);
+        const rows = @as(usize, options.width / 16) * (options.height / 16);
+        var first: usize = 0;
+        while (first < jobs.len) {
+            const required = self.preparedVision();
+            const geometry_capacity = if (required) try projector.embeddingGemma2VideoPreparedCapacity(options.width, options.height, 768 * 1024 * 1024) else try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024);
+            var ceiling = @min(jobs.len - first, geometry_capacity);
+            const take = while (true) {
+                const capacity = batch_policy.capacityForPlan(true, options.width, options.height, ceiling, required);
+                const admitted = try self.admitGpuFrames(options, capacity, required);
+                if (admitted == capacity) break admitted;
+                ceiling = admitted;
+            };
+            const started = batch_clock.monotonicNs();
+            const input = (try self.cb.allocUninitF32Shape(&.{ @intCast(take * rows), 768 })) orelse return error.UnsupportedPrimitiveOp;
+            defer self.cb.free(input);
+            var destinations: [8]NativeProjectionJob = undefined;
+            for (jobs[first..][0..take], 0..) |job, index| {
+                const part = switch (job) {
+                    .native => |value| blk: {
+                        if (value.patches.len != rows * 768) return error.InvalidTensorShape;
+                        break :blk try self.cb.fromFloat32Shape(value.patches, &.{ @intCast(rows), 768 });
+                    },
+                    .metal => |value| if (comptime build_options.enable_metal) blk: {
+                        if (value.prepared.geometry.values() != rows * 768) return error.InvalidTensorShape;
+                        break :blk try MetalCompute.importVideoBufferSpan(self.cb, try value.prepared.buffer(), value.prepared.output_byte_offset, rows * 768);
+                    } else return error.UnsupportedVideoBackend,
+                    else => unreachable,
+                };
+                defer self.cb.free(part);
+                if (!try self.cb.copyRows2D(self.a, input, index * rows, part, 0, rows, 768)) return error.UnsupportedPrimitiveOp;
+                destinations[index] = .{ .slot = switch (job) {
+                    .native => |v| v.slot,
+                    .metal => |v| v.slot,
+                    else => unreachable,
+                }, .patches = &.{}, .options = options };
+            }
+            const encoded = try self.encodeGpuAdmitted(input, options, take, true);
+            defer self.cb.free(encoded.tensor);
+            try self.saveResidentBatch(encoded, destinations[0..take]);
+            if (!required or self.last_prepared) batch_policy.completedForPlan(true, options.width, options.height, take, batch_clock.monotonicNs() -| started, self.last_prepared);
+            first += take;
+            if (first < jobs.len) if (self.cb.embedding_stage) |stage| {
+                try stage.pause();
+                try stage.acquire();
+            };
+        }
+    }
+
     /// Consumes every preparation even when imports or projection fail.
     fn projectGpuBatchNow(self: *Capture, jobs: []ProjectionJob) !void {
         var consumed: usize = 0;
@@ -2503,27 +2666,14 @@ const Capture = struct {
         if (encoded.tokens % jobs.len != 0) return error.InvalidTensorShape;
         const per_frame = encoded.tokens / jobs.len;
         self.recordCohort(jobs);
-        if (jobs.len == 1 and self.cb.embedding_stage != null) {
-            const tensor = try MetalCompute.escapeEmbeddingStage(self.cb, encoded.tensor);
-            self.resident.?[jobs[0].slot] = tensor;
-            self.frame_tokens[jobs[0].slot] = per_frame;
-            self.storeDevice(jobs[0].slot, tensor, per_frame);
-            return;
-        }
-        const shape = [_]i64{ @intCast(encoded.tokens), 512 };
         // Slice both before publishing either: an allocation failure cannot
         // leave one slot with a partially committed batched result.
         var outputs: [8]CT = undefined;
         var sliced: usize = 0;
         errdefer for (outputs[0..sliced]) |output| self.cb.free(output);
         for (0..jobs.len) |i| {
-            outputs[i] = try self.cb.primSlice(encoded.tensor, &.{ @intCast(i * per_frame), 0 }, &.{ @intCast((i + 1) * per_frame), 512 }, &.{ 1, 1 }, &shape);
+            outputs[i] = try self.cb.sliceRows2D(self.a, encoded.tensor, i * per_frame, per_frame, 512);
             sliced += 1;
-            if (self.cb.embedding_stage != null) {
-                const old = outputs[i];
-                outputs[i] = try MetalCompute.escapeEmbeddingStage(self.cb, old);
-                self.cb.free(old);
-            }
         }
         const tensors = self.resident orelse return error.UnsupportedVideoBackend;
         for (jobs, 0..) |job, i| {
@@ -2585,11 +2735,7 @@ const Capture = struct {
             live = false;
             const encoded = try self.encodeGpuAdmitted(input, options, 1, admitted);
             if (self.resident) |tensors| {
-                const tensor = if (self.cb.embedding_stage != null) MetalCompute.escapeEmbeddingStage(self.cb, encoded.tensor) catch |err| {
-                    self.cb.free(encoded.tensor);
-                    return err;
-                } else encoded.tensor;
-                if (self.cb.embedding_stage != null) self.cb.free(encoded.tensor);
+                const tensor = encoded.tensor;
                 tensors[slot] = tensor;
                 self.frame_tokens[slot] = encoded.tokens;
                 self.storeDevice(slot, tensor, encoded.tokens);
@@ -4872,6 +5018,13 @@ test "embeddinggemma2 video ordered cohort publishes headers before waiting for 
     }
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(@as(usize, 12), header[0].header.len);
+    // An independent decoder does not inherit the full first row's dependency.
+    const independent = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, &borrowed, .{}, configuration);
+    defer independent.deinit();
+    polls = 0;
+    while (independent.published.load(.acquire) < 2 and polls < 1000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    try std.testing.expect(independent.published.load(.acquire) >= 2);
+    try std.testing.expectEqual(@as(usize, 1), second.?.published.load(.acquire));
 }
 
 test "embeddinggemma2 video cohort body failure releases already dequeued jobs from other rows" {
@@ -5009,6 +5162,20 @@ test "embeddinggemma2 video admission follows pinned prepared raw and decoder pa
     const selected = [_]usize{ 0, 1, 2 };
     const keys: [3]CacheKey = @splat(.{ .clip = @splat(0), .picture = 0 });
     var selection = ReaderSelection{ .allocator = a, .selected = &selected, .projection_keys = &keys, .binding = @splat(0), .validated = &view, .validated_packet_base = 100 };
+    // A ready validated input publishes while its shared decoder predecessor
+    // remains unfinished. A deadline makes regressions fail instead of hang.
+    var predecessor = Prefetch{ .a = a, .io = std.testing.io, .bytes = &.{}, .control = .{}, .sampling = .reference, .pool = null, .device = null };
+    var producer = predecessor;
+    producer.predecessor = &predecessor;
+    producer.control.deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+    producer.queue = .init(&producer.storage);
+    var counts = [_]usize{0};
+    var capture = Capture{ .reader_selection = &selection, .a = a, .cb = undefined, .track = reader.track, .control = .{}, .output = &.{}, .frame_tokens = &counts, .selected = &.{0}, .prefetch = &producer };
+    try decodeSelection(a, &reader, &.{0}, null, &capture);
+    var ready: [1]Prefetch.Job = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try producer.queue.getUncancelable(std.testing.io, &ready, 0));
+    defer producer.discard(&ready[0]);
+    try std.testing.expect(ready[0] == .native);
     const patch_bytes = view.getPrepared(100, validatedPreparation.identity).?.patches.len * 4;
     const resource = PictureResources{ .host = 1024 * 1024, .device = 2 * 1024 * 1024, .patches = patch_bytes, .vision = 1024, .capacity = 8 };
     var original = Plan{ .pictures = 3, .commands = 3, .metal_preparation = true, .decoder_host_bytes = 128 * 1024 * 1024, .preparation_bytes = resource.host, .device_preparation_bytes = resource.device, .patch_output_bytes = 3 * patch_bytes, .apple_surface_bytes = 27 * 1024, .vision_workspace_bytes = 3 * resource.vision };
@@ -5044,4 +5211,44 @@ test "embeddinggemma2 video admission follows pinned prepared raw and decoder pa
     try std.testing.expectEqual(@as(u64, 1), raw.preparation_commands.?);
     try std.testing.expectEqual(resource.host, raw.preparation_bytes);
     try std.testing.expectEqual(@as(usize, 0), raw.host_patch_bytes);
+}
+
+test "embeddinggemma2 video ready selection skips unfinished work and batches mixed nonadjacent sources" {
+    const landscape = video.preparation.Options{ .width = 96, .height = 48, .matrix = .bt709 };
+    const portrait = video.preparation.Options{ .width = 48, .height = 96, .matrix = .bt709 };
+    const jobs = [_]Prefetch.Job{
+        .{ .metal = .{ .slot = 0, .prepared = undefined, .options = landscape } },
+        .{ .native = .{ .slot = 1, .patches = &.{}, .options = landscape } },
+        .{ .native = .{ .slot = 2, .patches = &.{}, .options = portrait } },
+        .{ .metal = .{ .slot = 3, .prepared = undefined, .options = landscape } },
+        .{ .cached = .{ .slot = 4, .ticket = undefined } },
+    };
+    const readiness = [_]bool{ false, true, true, true, true };
+    const selected = Prefetch.readySelection(&jobs, &readiness, true);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, true, false }, selected[0..jobs.len]);
+    const native = Prefetch.readySelection(&jobs, &readiness, false);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, false, false }, native[0..jobs.len]);
+    const blocked = Prefetch.readySelection(&jobs, &@as([5]bool, @splat(false)), true);
+    try std.testing.expectEqualSlices(bool, &@as([8]bool, @splat(false)), &blocked);
+    const cached = Prefetch.readySelection(jobs[4..], &.{true}, true);
+    try std.testing.expect(cached[0]);
+}
+
+test "embeddinggemma2 video decoder dependency uses continuation identity and waiter cancellation" {
+    var first: DecoderContinuation = undefined;
+    var other: DecoderContinuation = undefined;
+    const selection = ReaderSelection{ .allocator = std.testing.allocator, .selected = &.{}, .projection_keys = &.{}, .binding = @splat(0), .continuation = &first };
+    var independent = selection;
+    independent.continuation = &other;
+    try std.testing.expect(sharesDecoder(&selection, null, &selection, null));
+    try std.testing.expect(!sharesDecoder(&selection, null, &independent, null));
+    try std.testing.expect(!sharesDecoder(null, null, null, null));
+    var predecessor = Prefetch{ .a = std.testing.allocator, .io = std.testing.io, .bytes = &.{}, .control = .{}, .sampling = .reference, .pool = null, .device = null };
+    var waiter = predecessor;
+    waiter.predecessor = &predecessor;
+    waiter.aborted.store(true, .release);
+    try std.testing.expectError(error.Cancelled, waiter.waitForDecoder());
+    waiter.aborted.store(false, .release);
+    predecessor.finished.set(std.testing.io);
+    try waiter.waitForDecoder();
 }
