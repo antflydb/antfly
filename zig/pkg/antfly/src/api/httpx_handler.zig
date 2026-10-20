@@ -1016,6 +1016,7 @@ pub const AntflyApiHandler = struct {
         establishInternalTxnPreDecisionDeadline(ctx);
         establishInternalTxnStatusDeadline(ctx);
         establishInternalBackupDeadline(ctx);
+        establishInternalOnlineMergeDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
         const response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
         try self.api_server.reachRequestLifecycle(.response_ready, null);
@@ -1116,6 +1117,24 @@ pub const AntflyApiHandler = struct {
             return;
         }
         tightenApplicationDeadline(ctx, budget_ms, .native);
+    }
+
+    fn establishInternalOnlineMergeDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_invalid) return;
+        const contract = @import("online_merge_io.zig").contract;
+        const path = ctx.request.uri.path;
+        if (!std.mem.startsWith(u8, path, routes.internal_groups_prefix) or
+            !std.mem.endsWith(u8, path, routes.online_merge_io_suffix)) return;
+        const raw = ctx.header(contract.remaining_ms_header) orelse return;
+        const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        if (budget_ms == 0 or budget_ms > contract.max_server_budget_ms) {
+            ctx.application_deadline_invalid = true;
+            return;
+        }
+        tightenApplicationDeadline(ctx, budget_ms, .transport);
     }
 
     fn establishInternalBackupDeadline(ctx: *httpx.Context) void {
@@ -4414,11 +4433,13 @@ pub const AntflyApiHandler = struct {
         return identity;
     }
 
-    fn requestMethod(ctx: *httpx.Context) ?http_common.Method {
+    fn requestMethod(ctx: *httpx.Context) ?http_server_mod.AuthorizationMethod {
         return switch (ctx.request.method) {
             .GET => .GET,
+            .HEAD => .HEAD,
             .POST => .POST,
             .PUT => .PUT,
+            .PATCH => .PATCH,
             .DELETE => .DELETE,
             else => null,
         };
@@ -4664,7 +4685,10 @@ pub const AntflyApiHandler = struct {
         if (http_server_mod.requiresAdminPermission(path) and !http_server_mod.permissionsAllow(authenticated.permissions, .@"*", "*", .admin)) {
             return try jsonErrorResponse(ctx, 403, "forbidden");
         }
-        const method = requestMethod(ctx) orelse return null;
+        // Every method that reaches a public handler must have explicit RBAC
+        // semantics. Treating an unmapped method as "no permission required"
+        // turns newly routed methods into authorization bypasses.
+        const method = requestMethod(ctx) orelse return try jsonErrorResponse(ctx, 405, "method not allowed");
         const required_permission = http_server_mod.requiredPermissionForRequest(ctx.allocator, method, path) catch |err| switch (err) {
             error.InvalidArgument => return try textResponse(ctx, 400, "invalid path parameter"),
             else => return err,
@@ -11950,6 +11974,7 @@ test "HTTP ingress deadline composition preserves original clock and shorter for
         establish: *const fn (*httpx.Context) void,
     };
     const cases = [_]Case{
+        .{ .path = "/internal/v1/groups/7/tables/docs/online-merge-io", .header = @import("online_merge_io.zig").contract.remaining_ms_header, .establish = AntflyApiHandler.establishInternalOnlineMergeDeadline },
         .{ .path = "/internal/v1/groups/7/tables/docs/batch-routed-v1", .header = internal_batch_forwarding.remaining_ms_header, .establish = AntflyApiHandler.establishInternalRoutedBatchDeadline },
         .{ .path = "/internal/v1/groups/7/tables/docs/txn-begin", .header = distributed_txn_contract.pre_decision_remaining_ms_header, .establish = AntflyApiHandler.establishInternalTxnPreDecisionDeadline },
         .{ .path = "/internal/v1/groups/7/tables/docs/txn-status", .header = distributed_txn_contract.status_remaining_ms_header, .establish = AntflyApiHandler.establishInternalTxnStatusDeadline },
@@ -11999,6 +12024,7 @@ test "HTTP ingress deadline composition preserves original clock and shorter for
 test "HTTP ingress deadline composition validates metadata after an original deadline is installed" {
     const Case = struct { path: []const u8, header: []const u8, establish: *const fn (*httpx.Context) void };
     const cases = [_]Case{
+        .{ .path = "/internal/v1/groups/7/tables/docs/online-merge-io", .header = @import("online_merge_io.zig").contract.remaining_ms_header, .establish = AntflyApiHandler.establishInternalOnlineMergeDeadline },
         .{ .path = "/internal/v1/groups/7/tables/docs/batch-routed-v1", .header = internal_batch_forwarding.remaining_ms_header, .establish = AntflyApiHandler.establishInternalRoutedBatchDeadline },
         .{ .path = "/internal/v1/groups/7/tables/docs/txn-prepare", .header = distributed_txn_contract.pre_decision_remaining_ms_header, .establish = AntflyApiHandler.establishInternalTxnPreDecisionDeadline },
         .{ .path = "/internal/v1/groups/7/tables/docs/txn-status", .header = distributed_txn_contract.status_remaining_ms_header, .establish = AntflyApiHandler.establishInternalTxnStatusDeadline },
@@ -12017,6 +12043,45 @@ test "HTTP ingress deadline composition validates metadata after an original dea
         try std.testing.expectEqual(original, ctx.application_deadline_ns.?);
         try std.testing.expect(ctx.application_deadline_io == null);
     };
+}
+
+test "online merge ingress bounds owner work using the transport clock" {
+    const contract = @import("online_merge_io.zig").contract;
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    for ([_][]const u8{ "250", "0", "5001", "invalid" }) |value| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/internal/v1/groups/7/tables/docs/online-merge-io");
+        defer request.deinit();
+        try request.setHeader(contract.remaining_ms_header, value);
+        var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+        defer ctx.deinit();
+        AntflyApiHandler.establishInternalOnlineMergeDeadline(&ctx);
+        if (!std.mem.eql(u8, value, "250")) {
+            try std.testing.expect(ctx.application_deadline_invalid);
+            try std.testing.expect(ctx.application_deadline_ns == null);
+            continue;
+        }
+        const control = AntflyApiHandler.operationContext(&ctx, null);
+        try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), control.deadline_ns.?);
+        try control.ensureActive();
+        sim.monotonic_ns = 250 * std.time.ns_per_ms;
+        try std.testing.expectError(error.DeadlineExceeded, control.ensureActive());
+        sim.monotonic_ns = 0;
+        // An already-admitted shorter budget must survive middleware unchanged.
+        ctx.application_deadline_ns = 100 * std.time.ns_per_ms;
+        AntflyApiHandler.establishInternalOnlineMergeDeadline(&ctx);
+        try std.testing.expectEqual(@as(?u64, 100 * std.time.ns_per_ms), ctx.application_deadline_ns);
+        ctx.application_deadline_ns = 1000 * std.time.ns_per_ms;
+        AntflyApiHandler.establishInternalOnlineMergeDeadline(&ctx);
+        try std.testing.expectEqual(@as(?u64, 250 * std.time.ns_per_ms), ctx.application_deadline_ns);
+    }
+    var public_request = try httpx.Request.init(std.testing.allocator, .GET, "http://node/tables/docs");
+    defer public_request.deinit();
+    try public_request.setHeader(contract.remaining_ms_header, "250");
+    var public_ctx = httpx.Context.init(std.testing.allocator, sim.io(), &public_request);
+    defer public_ctx.deinit();
+    AntflyApiHandler.establishInternalOnlineMergeDeadline(&public_ctx);
+    try std.testing.expect(public_ctx.application_deadline_ns == null);
 }
 
 test "internal transaction ingress establishes and validates pre-decision deadline" {
@@ -19118,10 +19183,27 @@ test "httpx schema rewrite authorizes incoming dependencies before source admiss
 
 test "httpx schema patch merges at the authority and accepts version zero ETag" {
     const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var read_permission = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer read_permission.deinit(alloc);
+    var reader = try auth.manager.createUser("schema_reader", "secret", &.{read_permission});
+    defer reader.deinit(alloc);
+    var admin_permission = try usermgr.Permission.initOwned(alloc, .table, "docs", .admin);
+    defer admin_permission.deinit(alloc);
+    var admin = try auth.manager.createUser("schema_admin", "secret", &.{admin_permission});
+    defer admin.deinit(alloc);
+    const reader_authorization = try encodeBasicAuthorization(alloc, "schema_reader", "secret");
+    defer alloc.free(reader_authorization);
+    const admin_authorization = try encodeBasicAuthorization(alloc, "schema_admin", "secret");
+    defer alloc.free(admin_authorization);
     var source = SchemaUpdateStatusSource{ .schema_allocator = alloc };
     defer source.deinit(alloc);
     var writes = SchemaReconcileWriteSource{};
-    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.iface());
+    var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, writes.iface());
     defer api_server.deinit();
 
     var e2e_server: HttpxE2eServer = undefined;
@@ -19135,15 +19217,62 @@ test "httpx schema patch merges at the authority and accepts version zero ETag" 
     defer alloc.free(base_url);
     const schema_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/schema", .{base_url});
     defer alloc.free(schema_url);
-    const headers = [_][2][]const u8{
+    const reader_headers = [_][2][]const u8{
         .{ "content-type", "application/merge-patch+json" },
+        .{ "authorization", reader_authorization },
         .{ "if-match", "\"schema-0\"" },
     };
-    var resp = try requestWithRetry(&client, client_io.io(), .PATCH, schema_url, "{\"description\":\"patched\"}", &headers, 20);
+    var denied = try requestWithRetry(&client, client_io.io(), .PATCH, schema_url, "{\"description\":\"forbidden\"}", &reader_headers, 20);
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    try std.testing.expect(source.schema_json == null);
+
+    const admin_headers = [_][2][]const u8{
+        .{ "content-type", "application/merge-patch+json" },
+        .{ "authorization", admin_authorization },
+        .{ "if-match", "\"schema-0\"" },
+    };
+    var resp = try requestWithRetry(&client, client_io.io(), .PATCH, schema_url, "{\"description\":\"patched\"}", &admin_headers, 20);
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp.status.code);
     try std.testing.expectEqualStrings("\"schema-1\"", resp.headers.get("etag").?);
     try std.testing.expect(std.mem.indexOf(u8, source.schema_json.?, "\"description\":\"patched\"") != null);
+}
+
+test "httpx HEAD fallback enforces GET table permission" {
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer permission.deinit(alloc);
+    var reader = try auth.manager.createUser("head_reader", "secret", &.{permission});
+    defer reader.deinit(alloc);
+    const authorization = try encodeBasicAuthorization(alloc, "head_reader", "secret");
+    defer alloc.free(authorization);
+
+    var source = SchemaUpdateStatusSource{};
+    defer source.deinit(alloc);
+    var api_server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.iface(), null, null);
+    defer api_server.deinit();
+    var e2e_server: HttpxE2eServer = undefined;
+    try e2e_server.init(alloc, &api_server);
+    defer e2e_server.deinit();
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base_url = try e2e_server.baseUrl(alloc);
+    defer alloc.free(base_url);
+    const headers = [_][2][]const u8{.{ "authorization", authorization }};
+
+    const denied_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/private", .{base_url});
+    defer alloc.free(denied_url);
+    var denied = try requestWithRetry(&client, client_io.io(), .HEAD, denied_url, null, &headers, 20);
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied.status.code);
 }
 
 test "schema ETags are strong and preserve version zero" {

@@ -3479,6 +3479,10 @@ pub const ApiHttpClient = struct {
     }
 
     pub fn fetchGroupOnlineMergeIo(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("online_merge_io.zig").contract.Request, timeout_ms: u32, cancellation: ?*const http_common.RequestCancellation) !QueryResponse {
+        const contract = @import("online_merge_io.zig").contract;
+        const budget_ms = try contract.serverBudgetMs(timeout_ms);
+        var budget_buffer: [16]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&budget_buffer, "{d}", .{budget_ms});
         try request.validate();
         if (group_id != request.ownerGroup()) return error.OnlineSourceScopeChanged;
         const table = try percentEncodePathComponent(self.alloc, table_name);
@@ -3490,7 +3494,7 @@ pub const ApiHttpClient = struct {
         const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
         defer self.alloc.free(body);
         if (body.len > @import("online_merge_io.zig").contract.max_request_bytes) return error.InvalidMergePage;
-        var resp = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = timeout_ms, .cancellation = cancellation, .max_response_bytes = @import("online_merge_io.zig").contract.max_response_bytes });
+        var resp = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .headers = &.{.{ .name = contract.remaining_ms_header, .value = budget }}, .timeout_ms = timeout_ms, .cancellation = cancellation, .max_response_bytes = @import("online_merge_io.zig").contract.max_response_bytes });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
@@ -5439,6 +5443,10 @@ fn consumerTests() type {
                         try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
                     }
                     try std.testing.expectEqual(@as(usize, if (self.expected_internal) 1 else 0), service_headers);
+                    if (std.mem.endsWith(u8, req.uri, routes.Routes.online_merge_io_suffix)) {
+                        try std.testing.expectEqual(@as(?u32, 1000), req.timeout_ms);
+                        try std.testing.expectEqualStrings("950", req.header(@import("online_merge_io.zig").contract.remaining_ms_header).?);
+                    }
                     return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
                 }
             };
