@@ -1095,3 +1095,23 @@ test "template numeric equality never rounds integer operands through float" {
     defer a.free(rendered);
     try std.testing.expectEqualStrings("distinct|distinct|equal|typed", rendered);
 }
+
+test "template numeric literals compare exactly with document numbers" {
+    const a = std.testing.allocator;
+    const doc = "{\"n\":9007199254740993.0,\"big\":18446744073709551615,\"fraction\":0.10000000000000001}";
+    const source = "{{#if (eq n 9007199254740993.0)}}equal{{else}}bad{{/if}}|" ++
+        "{{#if (eq 9007199254740993.0 n)}}equal{{else}}bad{{/if}}|" ++
+        "{{#if (eq n 9007199254740992.0)}}bad{{else}}distinct{{/if}}|" ++
+        "{{#if (eq big 18446744073709551615)}}large{{else}}bad{{/if}}|" ++
+        "{{#if (eq fraction 0.10000000000000001)}}fraction{{else}}bad{{/if}}|" ++
+        "{{#if (eq fraction 0.1)}}bad{{else}}distinct{{/if}}|" ++
+        "{{#if (eq 001. 1)}}normalized{{else}}bad{{/if}}";
+    const expected = "equal|equal|distinct|large|fraction|distinct|normalized";
+    const rendered = try renderDocument(a, source, doc);
+    defer a.free(rendered);
+    try std.testing.expectEqualStrings(expected, rendered);
+    const helpers: HelperMap = .{};
+    const with_helpers = try renderDocumentWithHelpers(a, source, doc, &helpers);
+    defer a.free(with_helpers);
+    try std.testing.expectEqualStrings(expected, with_helpers);
+}

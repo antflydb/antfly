@@ -777,17 +777,30 @@ pub const Eval = struct {
             .path => |p| self.resolvePath(&p),
             .string_literal => |s| Value.str(s.value),
             .boolean_literal => |b| Value.bln(b.value),
-            // Parse integers from the source text: the f64 value loses
-            // precision near the i64 limits and may not convert at all.
-            .number_literal => |n| if (!n.is_int)
-                Value.flt(n.value)
-            else if (std.fmt.parseInt(i64, n.original, 10)) |int|
-                Value.int(int)
-            else |_|
-                Value.flt(n.value),
+            .number_literal => |n| try self.evalNumberLiteral(n.original),
             .sub_expression => |s| self.evalExpressionValue(&s.expression.expression),
             else => .undefined,
         };
+    }
+
+    fn evalNumberLiteral(self: *Eval, raw: []const u8) EvalError!Value {
+        if (std.mem.indexOfScalar(u8, raw, '.') == null) {
+            if (std.fmt.parseInt(i64, raw, 10)) |integer| return Value.int(integer) else |_| {}
+        }
+        // Keep decimals and large integers exact, just like document numbers.
+        // Handlebars also accepts leading zeroes and a trailing decimal point;
+        // normalize those spellings so number_string remains valid JSON.
+        const negative = raw[0] == '-';
+        const unsigned = raw[@intFromBool(negative)..];
+        var start: usize = 0;
+        while (start + 1 < unsigned.len and unsigned[start] == '0' and std.ascii.isDigit(unsigned[start + 1])) : (start += 1) {}
+        const trailing_dot = unsigned[unsigned.len - 1] == '.';
+        if (start == 0 and !trailing_dot) return .{ .number_string = raw };
+        return .{ .number_string = try std.fmt.allocPrint(self.arena, "{s}{s}{s}", .{
+            if (negative) "-" else "",
+            unsigned[start..],
+            if (trailing_dot) "0" else "",
+        }) };
     }
 
     fn callHelper(self: *Eval, helper: Helper, expr: *const ast.Expression) EvalError!Value {
