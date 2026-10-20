@@ -25,6 +25,18 @@ cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
 
+Source `28afa047da9b0f97af35f9e5bdc80c866bc02c38` adds internal durable HA replay grants bound to stored
+prepared frames and known physical inventory. Background writes atomically update
+inventory and reserved publication bytes; materialization keeps credit until HA
+ACK and final validation avoids cold frame/replay value reads. Six focused suites
+qualify 163 executions, with the required-DB fixture-only
+correction and exact source comparison recorded in the implementation ledger.
+The unchanged consumer passes 25/25 composition steps. Reader floor 11 and private
+owner version fences do not enable the full preparation protocol: complete plan
+sizing, derived-log/recovery resource grants, legacy migration and normal drivers
+remain open. Strong required providers and automatic scheduling defaults remain
+unqualified; the full design is incomplete.
+
 Source `65194cc0a474e11f500a5b7c64737322de64f69e` derives a conservative retirement wire shape from
 known physical artifact inventory and shares canonical CJ2 sizing with the live
 encoder. It covers both deletion/artifact copies and graph owner/endpoint hints,

@@ -4,6 +4,67 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Durable HA replay retention and atomic inventory credit (2026-10-20)
+
+Source `28afa047da9b0f97af35f9e5bdc80c866bc02c38` adds internal DocStore writer primitives for durable HA replay
+retention. A grant binds one transaction ID, the exact stored prepared-effects
+frame fingerprint, an immutable caller-supplied base shape and a sorted set of
+physical document-prefix hashes. Codec inspection checks the frame's transaction
+identity before installation. Per-document claims retain known physical inventory;
+unknown or invalidated inventory cannot become a zero estimate. Conflicting
+owners, changed plan identities and impossible wire shapes fail before publication.
+
+The existing logical publication pool reserves the CJ2 wire bound, fixed grant
+record and both grant/outbox keys. Claim and owner-index rows charge their own
+retained keys and values. Normal transactions, batches and append writers stage
+physical inventory, claim totals, the grant and publication debt in one atomic
+commit under the shared mutation gate. Final deltas admit replacement regardless
+of insertion/deletion order. Saturated growth leaves physical data, inventory and
+debt unchanged. Raw grant changes cannot replace the accepted base/roots/frame;
+only trusted inventory staging can adjust its current-inventory contribution.
+Ignored reservation or obligation failures poison the writer.
+
+Materialization validates the supplied CJ2 bytes against existing credit, releases
+inventory claims and retains the original reservation until explicit HA replay
+acknowledgement. Repeated identical payloads are idempotent; a different payload
+cannot replace the first. Ordinary frame cleanup cannot forgive replay debt.
+Prepared credit cannot be acknowledged, and materialized credit cannot be canceled.
+Cancellation is an internal primitive for a future participant driver to bind to
+a confirmed abort; phase alone does not prove that no COMMIT decision exists.
+Final writer-view validation uses fixed metadata and key presence rather than
+rereading cold frame or replay values. Tests cover both possible outcomes of an
+uncertain materialization commit and native reopen through all three phases.
+
+The primitive requires both reader floor and permanent replacement baseline 11.
+First use installs a permanent protocol marker that prevents later floor deletion
+or lowering through DocStore, including after all grants drain. There is no new
+full-protocol activation or legacy migration API. Native ABI 52, API ABI 58 and
+storage-owner ABI 110 fence older private owners; runnable ABI 18 and failure ABI
+66 are unchanged. Existing required-preparation reader version remains 10.
+
+`durable-replay-credit-verified.json` binds 5285 native/schema
+inputs, 4558 matching immutable public sources and
+25/25 ReleaseSafe unchanged-consumer build steps. Six focused suites cover
+163 successful test executions, including ten new credit
+cases, with zero skips, failures or leaks in their qualifying results. Five suites
+passed in the combined run; its required-DB suite exposed stale version/provider
+fixtures. After changing only six named fixture bodies, all 22 required-DB cases
+passed on rerun. The verifier proves every production byte and every other test
+body stayed identical across that correction; it preserves the failed receipt
+and does not claim a single all-green combined invocation. Consumer evidence is
+module composition, not full archive products or cold-source runtime. Full Linux
+qualification remains waived.
+
+This does not yet fund a complete accepted transaction. The caller's base shape
+and affected root set still need derivation and completeness checks from the full
+request and accepted generated effects. Legacy transactions without grants retain
+their original resolution policy, so legacy replay debt has no new complete bound.
+Derived-log quota, backend working RAM/CPU/I/O/dependency recovery bundles, restart
+reconstruction before ordinary admission, peer/import/raw migration eligibility,
+and normal PREPARE/seal/abort driver integration remain required. Strong required
+providers remain disabled. Broader scheduling, default rollout and whole-design
+qualification remain incomplete.
+
 ## Inventory-backed retirement wire bounds (2026-10-20)
 
 Source `65194cc0a474e11f500a5b7c64737322de64f69e` adds a low-level canonical CJ2 shape model and uses it
