@@ -3345,6 +3345,10 @@ transport under the parent's reservation, without
 nested scheduler admission; single-slot execution uses the required serial path.
 Backend failures drain every child and restore admission before returning.
 Serving readers and their speculative workers retain independent capabilities.
+Publication selection belongs to the private source owner; the shared `Read`
+layout stays unchanged. The retained-reader regression still admits twelve
+serving sources under its original 16 KiB heap budget while directory leases
+evict independently and pinned readers remain usable.
 
 Emitted serving groups feed bounded file/segment/routing reducers directly,
 alongside ownership, source-route, tie and term reducers. Separate deletion and

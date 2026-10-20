@@ -87,10 +87,6 @@ pub const Read = struct {
     /// Generation-owned descriptor routing. Shared physical sources never
     /// decide which generation's file manifest a reader must retain.
     descriptors: ?*const Descriptors = null,
-    /// Serial operation-owned compaction only. Shared serving readers and their
-    /// speculative workers never borrow the publication CPU capability.
-    publication: bool = false,
-    transport_allocator: ?A = null,
     store: stores.ArtifactStore,
     cache: ?artifacts.CachedRead,
     context: local.serverless_query_lake_read_context.Context,
@@ -251,8 +247,11 @@ pub fn publishWithOpeningCollector(a: A, out: A, store: *stores.ArtifactStore, b
     return ref;
 }
 pub fn loadDirectory(a: A, read: Read, ref: Ref) !Directory {
+    return loadDirectoryInner(a, read, ref, false);
+}
+fn loadDirectoryInner(a: A, read: Read, ref: Ref, publication: bool) !Directory {
     if (ref.byte_len > 4 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
-    const bytes = if (read.publication) try artifacts.readPublicationArtifact(a, read.store, ref, read.cancellation) else try artifacts.readArtifact(a, read.store, ref, read.cancellation, read.cache);
+    const bytes = if (publication) try artifacts.readPublicationArtifact(a, read.store, ref, read.cancellation) else try artifacts.readArtifact(a, read.store, ref, read.cancellation, read.cache);
     defer a.free(bytes);
     const directory = try std.json.parseFromSliceLeaky(Directory, a, bytes, .{ .allocate = .alloc_always });
     try directory.validate();
@@ -588,6 +587,9 @@ const Owner = struct {
     manifest_ordinal: usize = 0,
     fallback: ?Read,
     query_scoped: bool = false,
+    // Only the operation-owned loadPublication factory opts in. Keep the
+    // shared Read capability and retained serving-owner footprint unchanged.
+    publication: bool = false,
     metadata_bundle: []u8 = &.{},
     metadata_resident_bytes: std.atomic.Value(usize) = .init(0),
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
@@ -887,7 +889,7 @@ const Owner = struct {
         defer pin.release();
         const directory = pin.value;
         if (start > directory.bytes or out.len > directory.bytes - start) return error.InvalidNativeLakeTextCorpus;
-        if (capability.publication) return self.readPublication(directory, capability, start, out);
+        if (self.publication) return self.readPublication(directory, capability, start, out);
         const io = capability.context.io orelse return self.readSerial(directory, capability, start, out);
         if (out.len <= pack_bytes) return self.readSerial(directory, capability, start, out);
         var tasks: [3]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
@@ -926,17 +928,15 @@ const Owner = struct {
         try capability.check();
     }
     fn readPublication(self: *@This(), directory: Directory, capability: Read, start: u64, out: []u8) !void {
-        const phase_cap = capability.store.io_phase orelse return self.readSerial(directory, capability, start, out);
-        const scratch = capability.transport_allocator orelse self.a;
+        const phase_cap = capability.store.io_phase orelse return self.readSerialPhase(directory, capability, start, out, true);
+        const scratch = self.a;
         const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(scratch);
         const memory_width = if (available) |bytes| @max(1, bytes / (pack_bytes * 3)) else 1;
         const width = @max(1, @min(4, phase_cap.max_parallel, memory_width));
-        if (out.len <= pack_bytes) return self.readSerial(directory, capability, start, out);
+        if (out.len <= pack_bytes) return self.readSerialPhase(directory, capability, start, out, true);
         // Reserve the whole bounded wave while parking its CPU owner. Children
         // use raw transport, so a one-slot scheduler cannot nest I/O admission.
         var worker = capability;
-        worker.publication = false;
-        worker.transport_allocator = scratch;
         worker.store.io_phase = null;
         const Worker = struct {
             fn run(owner: *Owner, dir: Directory, cap: Read, offset: u64, target: []u8, failure: *?anyerror) void {
@@ -968,13 +968,13 @@ const Owner = struct {
         }
         try capability.check();
     }
-    fn metadataBytes(self: *@This(), directory: Directory, capability: Read) !?[]const u8 {
+    fn metadataBytes(self: *@This(), directory: Directory, capability: Read, publication: bool) !?[]const u8 {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         try capability.check();
         if (self.metadata_bundle.len == 0) {
             const pack = directory.metadata_bundle orelse return null;
-            const encoded = (if (capability.publication) artifacts.readPublicationArtifact(self.a, capability.store, pack, capability.cancellation) else artifacts.readArtifact(self.a, capability.store, pack, capability.cancellation, capability.cache)) catch |err| switch (err) {
+            const encoded = (if (publication) artifacts.readPublicationArtifact(self.a, capability.store, pack, capability.cancellation) else artifacts.readArtifact(self.a, capability.store, pack, capability.cancellation, capability.cache)) catch |err| switch (err) {
                 // Navigation residency is optional; continue through bounded
                 // verified range leases when this physical owner is full.
                 error.OutOfMemory => return null,
@@ -1004,9 +1004,12 @@ const Owner = struct {
         return self.metadata_bundle;
     }
     fn readSerial(self: *@This(), directory: Directory, capability: Read, start: u64, out: []u8) anyerror!void {
+        return self.readSerialPhase(directory, capability, start, out, false);
+    }
+    fn readSerialPhase(self: *@This(), directory: Directory, capability: Read, start: u64, out: []u8, publication: bool) anyerror!void {
         try capability.check();
         if (start > directory.bytes or out.len > directory.bytes - start) return error.InvalidNativeLakeTextCorpus;
-        const transport = capability.transport_allocator orelse if (capability.publication) self.a else std.heap.page_allocator;
+        const transport = if (self.publication) self.a else std.heap.page_allocator;
         var offset: usize = @intCast(start);
         var done: usize = 0;
         var group: ?CoalescedRead = null;
@@ -1016,7 +1019,7 @@ const Owner = struct {
             const metadata = containing(directory.metadata, offset);
             const block = if (metadata == null) containing(directory.blocks, offset) else null;
             const piece = if (metadata) |index| directory.metadata[index] else if (block) |index| directory.blocks[index] else return error.InvalidNativeLakeTextCorpus;
-            if (metadata != null and directory.metadata_bundle != null) if (try self.metadataBytes(directory, capability)) |bytes| {
+            if (metadata != null and directory.metadata_bundle != null) if (try self.metadataBytes(directory, capability, publication)) |bytes| {
                 const within = offset - piece.offset;
                 const take = @min(out.len - done, @as(usize, @intCast(piece.ref.byte_len)) - within);
                 try capability.check();
@@ -1039,10 +1042,10 @@ const Owner = struct {
                         if (following.offset != piece.offset + length or following.offset >= requested_end or following.pack == null or !std.mem.eql(u8, following.pack.?.artifact_id, pack.artifact_id) or following.pack_offset != piece.pack_offset + length) break;
                         length += @intCast(following.ref.byte_len);
                     }
-                    group = .{ .publication = capability.publication, .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = transport, .pieces = directory.blocks[index..next] };
+                    group = .{ .publication = publication, .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = transport, .pieces = directory.blocks[index..next] };
                 };
             }
-            var lease = try readPieceLeaseCoalesced(transport, capability.store, piece, capability.cancellation, capability.cache, if (group) |*value| value else null, capability.publication);
+            var lease = try readPieceLeaseCoalesced(transport, capability.store, piece, capability.cancellation, capability.cache, if (group) |*value| value else null, publication);
             defer lease.deinit();
             const data = lease.bytes();
             try capability.check();
@@ -1112,16 +1115,16 @@ pub fn routedReader(a: A, source: local.index.SegmentSource) !local.segment.Segm
 /// It must not publish it into a shared serving corpus.
 pub fn loadPublication(a: A, read: Read, ref: Ref) !local.index.SegmentData {
     std.debug.assert(read.cache == null);
-    var capability = read;
-    capability.publication = true;
-    capability.transport_allocator = a;
-    return load(a, capability, ref);
+    return loadInner(a, read, ref, true);
 }
 pub fn load(a: A, read: Read, ref: Ref) !local.index.SegmentData {
+    return loadInner(a, read, ref, false);
+}
+fn loadInner(a: A, read: Read, ref: Ref, publication: bool) !local.index.SegmentData {
     const owner = try a.create(Owner);
-    owner.* = .{ .a = a, .arena = .init(a), .directory = undefined, .loaded = &.{}, .fallback = read, .resource_manager = read.resource_manager };
+    owner.* = .{ .a = a, .arena = .init(a), .directory = undefined, .loaded = &.{}, .fallback = read, .resource_manager = read.resource_manager, .publication = publication };
     errdefer Owner.release(owner);
-    owner.directory = try loadDirectory(owner.arena.allocator(), read, ref);
+    owner.directory = try loadDirectoryInner(owner.arena.allocator(), read, ref, publication);
     owner.directory_bytes = owner.directory.bytes;
     owner.loaded = try owner.arena.allocator().alloc(bool, owner.directory.blocks.len);
     @memset(owner.loaded, false);
@@ -1938,7 +1941,7 @@ test "external lake required pack reads overlap and return every scheduler reser
     // owner for every provider read, then resume it before decoding continues.
     for ([_]usize{ 1, 3, 3 }, 0..) |width, case| {
         var build = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = pack_bytes * 12 });
-        var memory: local.sql_memory_budget = .{ .backing = build.allocator(), .limit = pack_bytes * 3 * (if (case == 2) @as(usize, 1) else width) };
+        var memory: local.sql_memory_budget = .{ .backing = build.allocator(), .limit = pack_bytes + pack_bytes * 3 * (if (case == 2) @as(usize, 1) else width) };
         const expected_width: usize = if (case == 2) 1 else width;
         var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = width };
         var phase: Phase = .{ .execution = .{ .scheduler = &scheduler, .bytes = 1 } };
@@ -1946,30 +1949,36 @@ test "external lake required pack reads overlap and return every scheduler reser
         defer phase.execution.pause();
         const capability: stores.IoPhase = .{ .io = io, .ptr = &phase, .max_parallel = width, .begin = Phase.begin, .finish = Phase.finish, .abort = Phase.abort };
         var publication = read;
-        publication.publication = true;
-        publication.transport_allocator = memory.allocator();
         publication.store.io_phase = &capability;
         provider.execution = &phase.execution;
         defer provider.execution = null;
         provider.fail = false;
         provider.peak.store(0, .release);
-        try owner.read(publication, 0, output);
-        try std.testing.expectEqualSlices(u8, bytes, output);
-        try std.testing.expect(phase.execution.active);
-        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
-        if (expected_width > 1) try std.testing.expect(provider.peak.load(.acquire) > 1);
-        try std.testing.expect(provider.peak.load(.acquire) <= expected_width);
-        try std.testing.expect(memory.peak > 0 and memory.peak <= memory.limit);
+        {
+            var publication_data = try loadPublication(memory.allocator(), .{ .store = store, .cache = null, .context = .{ .io = io }, .cancellation = .none }, ref);
+            defer publication_data.deinit(memory.allocator());
+            const publication_owner: *Owner = @ptrCast(@alignCast(publication_data.native.ranges.ptr));
+            const retained = memory.live;
+            try publication_owner.read(publication, 0, output);
+            try std.testing.expectEqualSlices(u8, bytes, output);
+            try std.testing.expect(phase.execution.active);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+            if (expected_width > 1) try std.testing.expect(provider.peak.load(.acquire) > 1);
+            try std.testing.expect(provider.peak.load(.acquire) <= expected_width);
+            try std.testing.expect(memory.peak > retained and memory.peak <= memory.limit);
+            try std.testing.expectEqual(retained, memory.live);
+
+            // Small reads and broad backend failures restore the same admission.
+            try publication_owner.read(publication, 17, output[0..97]);
+            try std.testing.expectEqualSlices(u8, bytes[17..][0..97], output[0..97]);
+            provider.fail = true;
+            try std.testing.expectError(error.TestRemoteUnavailable, publication_owner.read(publication, 0, output));
+            try std.testing.expect(phase.execution.active);
+            try std.testing.expectEqual(@as(usize, 0), provider.active.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        }
         try std.testing.expectEqual(@as(usize, 0), memory.live);
         try std.testing.expectEqual(@as(usize, 0), build.live_bytes);
-        // Small reads and broad backend failures restore the same admission.
-        try owner.read(publication, 17, output[0..97]);
-        try std.testing.expectEqualSlices(u8, bytes[17..][0..97], output[0..97]);
-        provider.fail = true;
-        try std.testing.expectError(error.TestRemoteUnavailable, owner.read(publication, 0, output));
-        try std.testing.expect(phase.execution.active);
-        try std.testing.expectEqual(@as(usize, 0), provider.active.load(.acquire));
-        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
     }
 }
 
