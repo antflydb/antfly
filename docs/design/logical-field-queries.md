@@ -103,10 +103,14 @@ boost, case mode and source path. Regex, equality and different-field clauses no
 longer disable compatible literal groups in that cohort. AND/nested branches keep
 their incoming-candidate scope; only cheap same-field literal cohorts speculate
 across AND siblings. Indexed regex/equality siblings retain their own selective
-candidate iterator instead of expanding to a broader sibling's source domain. Groups of at least three case-sensitive
+candidate iterator instead of expanding to a broader sibling's source domain.
+Groups of at least three case-sensitive
 `contains` leaves on the same field use a bounded multi-output byte automaton;
 construction admits at most 1 MiB of transition storage. Larger literal groups or
-allocation refusal fall back to individual matchers within the cohort.
+allocation refusal fall back to individual matchers within the cohort. Wholly
+literal cohorts retain a direct automaton path, bypassing generic sibling dispatch.
+Coverage ownership is resolved once per segment invocation, and already evaluated
+siblings do not repeat deadline/cancellation checks inside the cohort loop.
 
 The demanded predicate runs first. Optional siblings reuse that same parsed
 source, under the same regex-work budget and cancellation/deadline control. A
@@ -162,8 +166,8 @@ smaller of incoming candidates and cached membership before intersecting.
 Partial builders clone mutable facts outside the lock. If all capacity is pinned,
 new admission falls back to verification without exceeding the memory bound.
 Admission counts only reclaimable, unpinned entries as available eviction space;
-a doomed insertion under pin pressure cannot flush unrelated useful entries. Expired entries are
-reclaimed on subsequent cache access. Deployment restarts and owner moves may
+a doomed insertion under pin pressure cannot flush unrelated useful entries.
+Expired entries are reclaimed on subsequent cache access. Deployment restarts and owner moves may
 lose reuse, but preserve correctness.
 
 A declared lossless keyword representation can establish nonempty case-sensitive
@@ -253,3 +257,11 @@ Named detailed search-as-you-type representations use a plain lowercase query
 analyzer, not the prefix-expanding index analyzer. A query for `distributed` must
 not match `Dinosaur Bones` through the generated `di` token. Existing generated
 shingle/root analyzers retain their configured semantics.
+
+[Mixed streaming qualification](../../zig/pkg/antfly-grep/bench/results/logical-stream-validation.json)
+pins the merged source and artifacts, every trial, the initial slower literal
+control and the final optimized comparison. It covers the one-pass 4,096-document
+policy, both named autocomplete aliases, immutable pins across eviction/expiry,
+non-destructive admission under pin pressure, and allocation-bounded selective
+intersection. These shared-host Debug measurements are not a production memory,
+cold-storage or platform-parity qualification.

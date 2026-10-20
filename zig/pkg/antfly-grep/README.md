@@ -3643,8 +3643,7 @@ can additionally share originals under an 8 MiB / 4,096-entry limit. Single-leaf
 queries retain streaming scratch. Cache readers pin immutable entries; bitmap
 copies occur outside the directory lock, completed hits copy only the result,
 and oversized entries are rejected before eviction. Retired pinned entries remain
-charged against the same 16 MiB allocation budget. Verification
-skips tombstoned physical slots before loading source and checks cancellation
+charged against the same 16 MiB allocation budget. Verification skips tombstoned physical slots before loading source and checks cancellation
 while advancing over deleted runs. Query output hydration still has its own work;
 zero verification loads does not imply a zero-cost API request.
 
@@ -3668,6 +3667,49 @@ workloads use Debug servers on a shared macOS host with warm caches. They do not
 establish native Linux hardware, cold-storage, production-scale latency or RSS
 parity. The design and memory/ownership rules are in
 [logical field queries](../../../docs/design/logical-field-queries.md).
+
+### Mixed predicate streaming and immutable cache ownership
+
+Direct OR siblings now evaluate the same streamed original and retain compact
+membership, including mixed regex/equality/different-field queries. Wholly literal
+cohorts keep their direct automaton path. AND/nested branches and indexed siblings
+retain selective candidate scopes. Optional sibling failures stay unknown until
+demanded; work budgets and cancellation remain enforced.
+
+Cache readers pin immutable entries, and bitmap copying occurs outside the
+cache directory lock. Completed hits copy only their result; constrained hits
+copy the smaller operand. Oversized or unreclaimable insertions are rejected
+before eviction. Retired pinned entries and in-flight construction stay within
+the same 16 MiB allocation cap. Named autocomplete uses whole query tokens for
+both built-in analyzer aliases rather than matching shared short index prefixes.
+
+The [streaming qualification](bench/results/logical-stream-validation.json)
+compares seven trials per workload/binary over 4,096 documents / 16.9 MB of
+canonical source. All results have exact counts and matching corpus identities.
+
+| Workload | Source loads before → after | Median HTTP time before → after |
+| --- | ---: | ---: |
+| Three literals | 4,096 → 4,096 | 142.79 → 138.17 ms |
+| Three literals + regex | 14,293 → 4,096 | 440.99 → 152.19 ms |
+| Three literals + regex + another field | 17,692 → 4,096 | 524.64 → 155.87 ms |
+
+Mixed workloads reduce verification bytes to 16.9 MB per query. The regular HTTP
+regression permits exactly 4,096 source loads and 20 MiB of verification, proving
+one-pass behavior beyond the decoded-source cache ceiling. A narrow immutable
+intersection succeeds under a 256-byte allocator even against millions of cached
+IDs. Native tests also cover expiry/eviction with concurrent pins, admission under
+pin pressure, deferred sibling failures and pruned AND branches doing no regex work.
+
+The report retains the initial control observation, including its slower literal
+case, before restoring the direct literal path and hoisting coverage ownership.
+Qualification passes 43 native logical/storage cases without leaks, 143 query
+contracts, eight schema cases, runtime/decision wire checks, 15 real-server HTTP
+cases (one optional profile skipped there and run separately), and 253 CLI cases
+(two skipped). SDK, source-ownership, generation and license checks pass.
+
+Timings use Debug servers, warm caches and a shared macOS host, and include a
+substantial main merge. They do not isolate every optimization or establish
+production RSS, cold-storage or native Linux hardware performance guarantees.
 
 ### Qualification of namespace and tuple changes
 
