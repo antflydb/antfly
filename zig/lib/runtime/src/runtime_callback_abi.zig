@@ -82,7 +82,7 @@ fn BoundaryImpl(comptime VTable: type) type {
             const Function = functionType(Callback);
             const Args = std.meta.ArgsTuple(Function);
             const Payload = payloadType(Callback);
-            _ = std.meta.fieldIndex(VTable, field_name) orelse
+            if (!@hasField(VTable, field_name))
                 @compileError("unknown boundary vtable field: " ++ field_name);
             var typed_args: Args = args;
 

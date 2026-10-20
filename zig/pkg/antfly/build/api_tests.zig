@@ -3329,6 +3329,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-preparation-status-owner-check", "Analyze resident status leases and quorum admission without the full storage archive")
         .dependOn(&preparation_status_owner_check.step);
+    const owner_control_funding_check = b.addTest(.{
+        .name = "owner-control-funding-check",
+        .root_module = owner_preflight_context_root,
+        .filters = &.{ "committed owner apply never opens or closes storage under the raft apply lock", "funded owner control startup" },
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-owner-control-funding-check", "Analyze production cold apply opening with independently funded execution")
+        .dependOn(&owner_control_funding_check.step);
     const owner_preflight_context_check = b.addTest(.{
         .name = "owner-preflight-context-check",
         .root_module = owner_preflight_context_root,

@@ -6328,7 +6328,9 @@ pub const DataServer = struct {
             if (self.storageKernelContextHandle()) |handle|
                 _ = owner_source.withStorageContextHandle(handle);
             if (self.data_raft != null or owner_source.close_execution_owner != null) {
-                staged_control_lease = try (try self.ensureBackendRuntime()).acquireWorkers(.{ .capacity = 1 });
+                // Cold-open admission may wait on ordinary capacity while a
+                // second bounded worker continues release/close progress.
+                staged_control_lease = try (try self.ensureBackendRuntime()).acquireWorkers(.{ .capacity = 2 });
                 try owner_source.startApplyControl(staged_control_lease.?.io());
             }
         }

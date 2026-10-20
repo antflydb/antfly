@@ -306,9 +306,11 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// apply. The bounded queue holds owned, exact committed descriptors.
     apply_control_io: ?std.Io = null,
     apply_control_future: ?std.Io.Future(void) = null,
+    apply_open_future: ?std.Io.Future(void) = null,
     apply_control_started: std.atomic.Value(bool) = .init(false),
     close_execution_owner: ?@import("antfly_runtime_abi").runnable_abi.Lease = null,
     apply_control_wake: std.Io.Event = .unset,
+    apply_open_wake: std.Io.Event = .unset,
     apply_control_pending: std.ArrayListUnmanaged(*ApplyOpen) = .empty,
     apply_control_active: ?*ApplyOpen = null,
     apply_control_stopping: bool = false,
@@ -339,6 +341,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: descriptor_contract.Descriptor,
         retry_delay_ms: u32 = 2,
         next_log_ns: u64 = 0,
+
+        fn retainedBytes(self: *const ApplyOpen) !u64 {
+            var total: u64 = @sizeOf(ApplyOpen) + @sizeOf(Entry);
+            for ([_][]const u8{ self.table_name, self.path, self.descriptor.schema_json, self.descriptor.indexes_json, self.descriptor.restore_bootstrap_json, self.descriptor.initial_child_bootstrap_json }) |bytes|
+                total = try std.math.add(u64, total, bytes.len);
+            if (self.descriptor.initial_range) |range| {
+                total = try std.math.add(u64, total, range.start.len);
+                total = try std.math.add(u64, total, range.end.len);
+            }
+            if (self.descriptor.restore) |restore| inline for (.{ "backup_id", "location", "snapshot_path", "artifact_sha256", "native_manifest_sha256" }) |field| {
+                total = try std.math.add(u64, total, @field(restore, field).len);
+            };
+            // Both the durable queued descriptor and the installed owner's
+            // descriptor can coexist through physical return.
+            return std.math.mul(u64, total, 2);
+        }
 
         fn init(alloc: std.mem.Allocator, replica_root_dir: []const u8, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor) !*ApplyOpen {
             const pending = try alloc.create(ApplyOpen);
@@ -557,8 +575,9 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     /// Called on the hosting control path before linked data-Raft apply starts.
-    /// The borrowed lane is independent of Raft progress and is joined before
-    /// its worker lease is released.
+    /// Retain this scheduler authority for both ordinary background cold opens
+    /// and protected cleanup. The independent worker joins before its I/O and
+    /// scheduler leases are released.
     pub fn withCloseExecutionOwner(self: *ProvisionedKernelOwnerSource, owner: @import("antfly_runtime_abi").runnable_abi.Owner) !*ProvisionedKernelOwnerSource {
         std.debug.assert(self.entries.items.len == 0 and self.close_execution_owner == null);
         self.close_execution_owner = try @import("antfly_runtime_abi").runnable_abi.Lease.init(owner);
@@ -569,12 +588,23 @@ pub const ProvisionedKernelOwnerSource = struct {
         lock(&self.mutex);
         defer self.mutex.unlock();
         if (self.apply_control_future != null) return;
-        if (self.quiescing) return error.Canceled;
+        if (self.quiescing or self.apply_control_stopping) return error.Canceled;
         // Apply admission never grows the queue under the Raft mutex.
         try self.apply_control_pending.ensureTotalCapacity(self.alloc, apply_control_max_pending);
         self.apply_control_io = io;
         errdefer self.apply_control_io = null;
         self.apply_control_future = try io.concurrent(applyControlMain, .{self});
+        self.apply_open_future = io.concurrent(applyOpenMain, .{self}) catch |err| {
+            // Roll back the first task before returning a partially started
+            // source. Joining must release the registry lock used by that task.
+            self.apply_control_stopping = true;
+            self.apply_control_wake.set(io);
+            self.mutex.unlock();
+            self.apply_control_future.?.await(io);
+            lock(&self.mutex);
+            self.apply_control_future = null;
+            return err;
+        };
         self.apply_control_started.store(true, .release);
     }
 
@@ -597,13 +627,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         self.apply_control_stopping = true;
         self.apply_control_started.store(false, .release);
         const io = self.apply_control_io;
-        if (io) |control_io| self.apply_control_wake.set(control_io);
+        if (io) |control_io| {
+            self.apply_control_wake.set(control_io);
+            self.apply_open_wake.set(control_io);
+        }
         self.mutex.unlock();
     }
 
     fn stopApplyControl(self: *ProvisionedKernelOwnerSource) void {
         self.beginApplyControlShutdown();
         const io = self.apply_control_io;
+        if (self.apply_open_future) |*future| future.await(io.?);
+        self.apply_open_future = null;
         if (self.apply_control_future) |*future| future.await(io.?);
         self.apply_control_future = null;
         // Keep the borrowed Io value stable until source destruction: an
@@ -634,6 +669,22 @@ pub const ProvisionedKernelOwnerSource = struct {
                 if (!closed) io.sleep(.fromMilliseconds(1), .awake) catch {};
                 continue;
             }
+            self.mutex.unlock();
+            self.apply_control_wake.wait(io) catch {};
+        }
+    }
+
+    // Waiting for ordinary admission must never occupy the worker that drains
+    // releases and closes. Both tasks borrow the same bounded node worker lease.
+    fn applyOpenMain(self: *ProvisionedKernelOwnerSource) void {
+        const io = self.apply_control_io.?;
+        while (true) {
+            lock(&self.mutex);
+            self.apply_open_wake.reset();
+            if (self.apply_control_stopping) {
+                self.mutex.unlock();
+                return;
+            }
             const pending: ?*ApplyOpen = if (self.apply_control_pending.items.len != 0)
                 self.apply_control_pending.orderedRemove(0)
             else
@@ -641,14 +692,11 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.apply_control_active = pending;
             self.mutex.unlock();
             const request = pending orelse {
-                self.apply_control_wake.wait(io) catch {};
+                self.apply_open_wake.wait(io) catch {};
                 continue;
             };
-            if (@import("builtin").is_test) if (self.test_apply_control_hooks) |hooks| {
-                if (hooks.before_open) |before_open| before_open(hooks.ptr);
-            };
             const opened = blk: {
-                var lease = self.acquireDescriptorOnce(request.group_id, request.table_name, request.path, request.descriptor, .shared, .resident, .{ .historical_raft_apply = true }) catch |err| {
+                self.openApplyControlRequest(request, io) catch |err| {
                     switch (err) {
                         error.StorageKernelOwnerTransitionRequired,
                         error.StorageReadTemporarilyUnavailable,
@@ -666,7 +714,6 @@ pub const ProvisionedKernelOwnerSource = struct {
                     }
                     break :blk false;
                 };
-                lease.deinit();
                 break :blk true;
             };
             if (opened) {
@@ -697,6 +744,50 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.mutex.unlock();
             io.sleep(.fromMilliseconds(request.retry_delay_ms), .awake) catch {};
         }
+    }
+
+    fn applyPreparationCanceled(raw: ?*const anyopaque) callconv(.c) u8 {
+        const self: *const ProvisionedKernelOwnerSource = @ptrCast(@alignCast(raw.?));
+        return @intFromBool(!self.apply_control_started.load(.acquire));
+    }
+
+    fn openApplyControlRequest(self: *ProvisionedKernelOwnerSource, request: *const ApplyOpen, io: std.Io) !void {
+        const execution = @import("runnable_status_refresh.zig");
+        // This independent producer waits fairly for ordinary background
+        // capacity, never the health or cleanup reserve. The separate control
+        // worker keeps draining releases and closes throughout this wait.
+        var pass = try execution.Pass.initWithOptions(
+            if (self.close_execution_owner) |lease| lease.owner else null,
+            &io,
+            platform_time.monotonicNs() +| 30 * std.time.ns_per_s,
+            .{ .context = self, .is_cancelled = applyPreparationCanceled },
+            .{ .retained_bytes = try request.retainedBytes() },
+        );
+        defer pass.deinit();
+        if (@import("builtin").is_test) if (self.test_apply_control_hooks) |hooks| {
+            if (hooks.before_open) |before_open| before_open(hooks.ptr);
+        };
+        try pass.check();
+        const Cancel = struct {
+            fn check(raw: *const anyopaque) !void {
+                const original: *const execution.Pass = @ptrCast(@alignCast(raw));
+                try original.checkLifetime();
+            }
+        };
+        var lease = self.acquireDescriptorOnce(request.group_id, request.table_name, request.path, request.descriptor, .shared, .resident, .{
+            .historical_raft_apply = true,
+            .retain_cpu = true,
+            .execution_runnable = pass.borrow,
+            .execution_deadline_ns = pass.deadline_ns,
+            .cancellation = .{ .ptr = &pass, .check_fn = Cancel.check },
+        }) catch |err| {
+            // Native cancellation is a bool; restore the original deadline or
+            // scheduler rejection before translating the native operation.
+            try pass.check();
+            return err;
+        };
+        defer lease.deinit();
+        try pass.check();
     }
 
     pub fn withGroupVisibleRootGeneration(
@@ -4034,7 +4125,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             return error.RaftApplyWriterUnavailable;
         self.apply_control_pending.appendAssumeCapacity(pending);
         pending_owned = false;
-        self.apply_control_wake.set(self.apply_control_io.?);
+        self.apply_open_wake.set(self.apply_control_io.?);
         return error.RaftApplyWriterUnavailable;
     }
 
@@ -4082,6 +4173,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         residency: Residency,
         controls: ReadControls,
     ) !Lease {
+        try controls.check();
         const exclusive = admission != .shared;
         if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
         defer self.mutex.unlock();
@@ -4189,6 +4281,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             .deadline_io = controls.execution_io,
             .cancellation = cancellation,
         });
+        var lifetime_controls = controls;
+        lifetime_controls.retain_cpu = true;
+        try lifetime_controls.check();
         var catalog_deferred: u8 = 0;
         var owner = client.Owner.open(.{
             .context = self.context.handle,
@@ -4243,6 +4338,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             return err;
         };
         errdefer owner.deinit();
+        // Register a physically completed open even if the caller expired
+        // during native I/O. Its caller observes that rejection after release;
+        // the retained owner lets durable replay retry without a cold-open loop.
         entry.* = .{
             .group_id = group_id,
             .table_name = owned_table_name,
@@ -8320,4 +8418,17 @@ test "distributed txn typed native status requires an independent release worker
     };
     try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, txnPreparationStatusGroupLocalForTest(&source, .{ .txn_id = @splat(1) }, context));
     try std.testing.expect(source.context.handle == null and source.entries.items.len == 0);
+}
+
+test "funded owner control startup rolls back when its second bounded worker is unavailable" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{ .concurrent_limit = .limited(1) });
+    defer threaded.deinit();
+    var source = ProvisionedKernelOwnerSource.init(a, "unused", table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, source.startApplyControl(threaded.io()));
+    try std.testing.expect(source.apply_control_future == null and source.apply_open_future == null);
+    try std.testing.expect(source.apply_control_io == null);
+    try std.testing.expect(!source.apply_control_started.load(.acquire));
+    try std.testing.expectError(error.Canceled, source.startApplyControl(threaded.io()));
 }
