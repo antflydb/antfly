@@ -24,4 +24,8 @@ pub const grouped_sources_reader_version: u32 = 8;
 pub const namespace_curation_reader_version: u32 = 9;
 /// Required preparation retains exact participant and route bindings.
 pub const prepared_transaction_reader_version: u32 = 10;
-pub const supported_reader_version: u32 = prepared_transaction_reader_version;
+/// Per-transaction replay retention claims and atomic inventory adjustment.
+pub const replay_credit_reader_version: u32 = 11;
+pub const supported_reader_version: u32 = replay_credit_reader_version;
+pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
+pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";

@@ -29,7 +29,8 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 57;
+// Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
+pub const abi_version: u32 = 58;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

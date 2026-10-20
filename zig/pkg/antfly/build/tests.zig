@@ -5977,6 +5977,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-transaction-publication-test", "Run prepare-funded transaction HA batch publication regressions")
         .dependOn(&addCuratedTestRunArtifact(b, transaction_publication_tests, &.{"transaction batch publication"}).step);
+    const replay_credit_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"prepared replay credit"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("docstore-prepared-replay-credit-test", "Verify durable replay credit ownership and atomic inventory admission")
+        .dependOn(&addCuratedTestRunArtifact(b, replay_credit_tests, &.{"prepared replay credit"}).step);
     const artifact_inventory_filters = [_][]const u8{ "artifact replay inventory", "artifact footprint", "db graph fact projections survive logical snapshot restore and reopen", "db portable restore rebuilds multi-source graph contender provenance" };
     const artifact_inventory_tests = b.addTest(.{
         .root_module = antfly_test_mod,

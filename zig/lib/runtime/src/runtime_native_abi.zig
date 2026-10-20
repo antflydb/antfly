@@ -79,7 +79,8 @@ const builtin = @import("builtin");
 // Typed status callbacks distinguish successful absence from original errors.
 // Tokenizer vtables include additive token-byte decoding. Reject older
 // native handles before interpreting the added callback slot.
-pub const abi_version: u32 = 51;
+// Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
+pub const abi_version: u32 = 52;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

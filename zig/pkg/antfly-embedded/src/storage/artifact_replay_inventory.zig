@@ -117,7 +117,7 @@ fn currentMarker(txn: anytype) !?Marker {
     // refreshing this marker. Their unobserved mutations invalidate all totals.
     return if (std.meta.eql(marker.epochs, current.epochs)) marker else null;
 }
-fn docPrefix(physical: []const u8) ![]const u8 {
+pub fn docPrefix(physical: []const u8) ![]const u8 {
     if (!keys.isInternalUserKey(physical)) return error.InvalidArgument;
     const end = (keys.findComponentTerminator(physical, 1) orelse return error.InvalidArgument) + 2;
     return physical[0..end];
@@ -139,6 +139,19 @@ pub fn loadDocument(txn: anytype, physical: []const u8) !?State {
     const marker = (try currentMarker(txn)) orelse return null;
     return loadState(txn, marker, physical);
 }
+/// Fixed-size address lookup for a document whose prefix hash is already owned.
+pub fn loadDocumentHash(txn: anytype, hash: [32]u8) !?State {
+    const marker = (try currentMarker(txn)) orelse return null;
+    var key: [state_prefix.len + 40]u8 = undefined;
+    @memcpy(key[0..state_prefix.len], state_prefix);
+    std.mem.writeInt(u64, key[state_prefix.len..][0..8], marker.generation, .little);
+    @memcpy(key[state_prefix.len + 8 ..], &hash);
+    const raw = txn.get(&key) catch |err| if (err == error.NotFound) return if (marker.complete) State{} else null else return err;
+    return try State.decode(raw);
+}
+const replay_credit = @import("prepared_replay_credit.zig");
+const reader_floors = @import("db/catalog/reader_versions.zig");
+
 pub fn isTrackedKey(candidate: []const u8) bool {
     return footprint.classify(candidate) != null;
 }
@@ -158,8 +171,37 @@ pub const Capture = struct {
         while (iter.next()) |key| a.free(key.*);
         self.touched.deinit(a);
     }
-    pub fn touch(self: *Capture, a: std.mem.Allocator, txn: anytype, debt: anytype, gate: ?*std.atomic.Mutex, candidate: []const u8, present: bool) !void {
+    pub fn touch(self: *Capture, a: std.mem.Allocator, txn: anytype, debt: anytype, gate: ?*std.atomic.Mutex, candidate: []const u8, present: bool, value: ?[]const u8) !void {
         if (self.staging) return;
+        if (replay_credit.isGrant(candidate) or replay_credit.isClaim(candidate) or replay_credit.isOwner(candidate)) {
+            errdefer self.poisoned = true;
+            try debt.acquireMutationGate(gate);
+            if (self.staged or self.poisoned) return error.InvalidHAOutbox;
+            if (replay_credit.isGrant(candidate)) {
+                _ = try replay_credit.idFromKey(candidate, replay_credit.grant_prefix);
+                try self.remember(a, candidate);
+            } else if (replay_credit.isClaim(candidate)) {
+                if (candidate.len != replay_credit.claim_prefix.len + 48) return error.InvalidHAOutbox;
+                const id = candidate[replay_credit.claim_prefix.len..][0..16].*;
+                try self.remember(a, &replay_credit.grantKey(id));
+            } else {
+                if (candidate.len != replay_credit.owner_prefix.len + 32) return error.InvalidHAOutbox;
+                const hash = candidate[replay_credit.owner_prefix.len..][0..32].*;
+                if (try replay_credit.owner(txn, hash)) |id| try self.remember(a, &replay_credit.grantKey(id));
+                if (value) |raw| {
+                    if (raw.len != 16) return error.InvalidHAOutbox;
+                    try self.remember(a, &replay_credit.grantKey(raw[0..16].*));
+                }
+                try self.remember(a, candidate);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, candidate, reader_floors.minimum_reader_key) or std.mem.eql(u8, candidate, reader_floors.replacement_reader_base_key) or std.mem.eql(u8, candidate, replay_credit.feature_key)) {
+            errdefer self.poisoned = true;
+            try debt.acquireMutationGate(gate);
+            try replay_credit.checkFloorMutation(txn, candidate, value);
+            return;
+        }
         if (isMetadataKey(candidate)) {
             if (!present and !std.mem.eql(u8, candidate, marker_key)) {
                 try debt.acquireMutationGate(gate);
@@ -173,7 +215,9 @@ pub const Capture = struct {
         // Invalidation/reconciliation writes share this serialization too:
         // a concurrent certificate update must not be overwritten at commit.
         if (footprint.isKey(candidate)) {
+            errdefer self.poisoned = true;
             try debt.acquireMutationGate(gate);
+            if (try replay_credit.hasClaims(txn)) return error.Backpressured;
             return;
         }
         if (!isTrackedKey(candidate)) return;
@@ -185,7 +229,13 @@ pub const Capture = struct {
             self.marker = try currentMarker(txn);
             self.checked = true;
         }
-        if (self.marker == null) return;
+        if (self.marker == null) {
+            if (try replay_credit.owner(txn, try replay_credit.documentHash(candidate)) != null) return error.InvalidArtifactReplayInventory;
+            return;
+        }
+        try self.remember(a, candidate);
+    }
+    fn remember(self: *Capture, a: std.mem.Allocator, candidate: []const u8) !void {
         if (self.touched.contains(candidate)) return;
         const owned = try a.dupe(u8, candidate);
         errdefer a.free(owned);
@@ -200,38 +250,57 @@ pub const Capture = struct {
         if (self.poisoned) return error.InvalidArtifactReplayInventory;
         if (self.staged or self.touched.count() == 0) return;
         errdefer self.poisoned = true;
-        const selected = self.marker orelse return error.InvalidArtifactReplayInventory;
-        const current = (try loadMarker(txn)) orelse return error.InvalidArtifactReplayInventory;
-        if (!std.meta.eql(selected, current)) return error.InvalidArtifactReplayInventory;
-        const observed = try footprint.load(txn);
-        var families: u8 = 0;
-        var owners = self.touched.keyIterator();
-        while (owners.next()) |physical| families |= footprint.bit(footprint.classify(physical.*).?);
-        for (selected.epochs, observed.epochs, 0..) |old, now, i| {
-            const expected = if (families & (@as(u8, 1) << @as(u3, @intCast(i))) != 0)
-                std.math.add(u64, old, 1) catch return error.InvalidArtifactReplayInventory
-            else
-                old;
-            if (now != expected) return error.InvalidArtifactReplayInventory;
+        var physical_keys: usize = 0;
+        var selected_keys = self.touched.keyIterator();
+        while (selected_keys.next()) |key| if (isTrackedKey(key.*)) {
+            physical_keys += 1;
+        };
+        if (physical_keys != 0) {
+            const selected = self.marker orelse return error.InvalidArtifactReplayInventory;
+            const current = (try loadMarker(txn)) orelse return error.InvalidArtifactReplayInventory;
+            if (!std.meta.eql(selected, current)) return error.InvalidArtifactReplayInventory;
+            const observed = try footprint.load(txn);
+            var families: u8 = 0;
+            var owners = self.touched.keyIterator();
+            while (owners.next()) |physical| if (footprint.classify(physical.*)) |family| {
+                families |= footprint.bit(family);
+            };
+            for (selected.epochs, observed.epochs, 0..) |old, now, i| {
+                const expected = if (families & (@as(u8, 1) << @as(u3, @intCast(i))) != 0)
+                    std.math.add(u64, old, 1) catch return error.InvalidArtifactReplayInventory
+                else
+                    old;
+                if (now != expected) return error.InvalidArtifactReplayInventory;
+            }
+            const store = base orelse return error.InvalidArtifactReplayInventory;
+            var probe = try store.beginProbeWithBlockCacheAdmission(.transient);
+            defer probe.abort();
+            var iter = self.touched.keyIterator();
+            while (iter.next()) |physical| {
+                if (!isTrackedKey(physical.*)) continue;
+                // A late Unsupported can be handled by fallback, or ignored by a
+                // low-level caller. Only actual staged membership is authoritative.
+                const after = try txn.contains(physical.*);
+                const before = try probe.contains(physical.*);
+                if (before == after) continue;
+                const old = (try loadState(txn, selected, physical.*)) orelse {
+                    if (try replay_credit.owner(txn, try replay_credit.documentHash(physical.*)) != null) return error.InvalidArtifactReplayInventory;
+                    continue;
+                };
+                const next = try old.change(physical.*.len, after);
+                const key = try address(state_prefix, selected.generation, physical.*);
+                try self.putMetadata(txn, &key, &next.encode());
+                try replay_credit.inventoryChanged(txn, self, try replay_credit.documentHash(physical.*), old, next);
+            }
+            var next = selected;
+            next.epochs = observed.epochs;
+            try self.putMetadata(txn, marker_key, &next.encode());
         }
-        const store = base orelse return error.InvalidArtifactReplayInventory;
-        var probe = try store.beginProbeWithBlockCacheAdmission(.transient);
-        defer probe.abort();
-        var iter = self.touched.keyIterator();
-        while (iter.next()) |physical| {
-            // A late Unsupported can be handled by fallback, or ignored by a
-            // low-level caller. Only actual staged membership is authoritative.
-            const after = try txn.contains(physical.*);
-            const before = try probe.contains(physical.*);
-            if (before == after) continue;
-            const old = (try loadState(txn, selected, physical.*)) orelse continue;
-            const next = try old.change(physical.*.len, after);
-            const key = try address(state_prefix, selected.generation, physical.*);
-            try self.putMetadata(txn, &key, &next.encode());
+        var validations = self.touched.keyIterator();
+        while (validations.next()) |key| {
+            if (replay_credit.isGrant(key.*)) try replay_credit.validateGrant(txn, try replay_credit.idFromKey(key.*, replay_credit.grant_prefix));
+            if (replay_credit.isOwner(key.*)) try replay_credit.validateOwner(txn, key.*);
         }
-        var next = selected;
-        next.epochs = observed.epochs;
-        try self.putMetadata(txn, marker_key, &next.encode());
         self.staged = true;
     }
 };
@@ -260,6 +329,7 @@ fn initializeWithAdmission(store: anytype, control: ?read_control.Port) !void {
         write.abort();
         return;
     }
+    if (try replay_credit.hasClaims(&write)) return error.Backpressured;
     const old = try loadMarker(&write);
     const observed = try footprint.load(&write);
     const marker: Marker = .{
@@ -464,6 +534,20 @@ test "artifact replay inventory capture owns all allocation failures and refuses
         const Fake = struct {
             marker: [80]u8,
             footprint_raw: [80]u8,
+            const EmptyCursor = struct {
+                const Row = struct { key: []const u8 };
+                pub fn close(_: *@This()) void {}
+                pub fn setKeysOnly(_: *@This()) void {}
+                pub fn seekAtOrAfter(_: *@This(), _: []const u8) !?Row {
+                    return null;
+                }
+                pub fn next(_: *@This()) !?Row {
+                    return null;
+                }
+            };
+            pub fn openCursor(_: *@This()) !EmptyCursor {
+                return .{};
+            }
             pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
                 if (std.mem.eql(u8, key, marker_key)) return &self.marker;
                 try std.testing.expectEqualStrings(footprint.key, key);
@@ -488,12 +572,12 @@ test "artifact replay inventory capture owns all allocation failures and refuses
             };
             const one = "\x01owner\x00\x00\x20artifact-one";
             const two = "\x01owner\x00\x00\x20artifact-two";
-            for ([_][]const u8{ one, two, one }) |key| capture.touch(a, &txn, &debt, &gate, key, true) catch |cause| {
+            for ([_][]const u8{ one, two, one }) |key| capture.touch(a, &txn, &debt, &gate, key, true, "x") catch |cause| {
                 try std.testing.expectError(error.InvalidArtifactReplayInventory, capture.stage(&txn, null));
                 return cause;
             };
             try std.testing.expectEqual(@as(usize, 2), capture.touched.count());
-            try std.testing.expectError(error.InvalidArtifactReplayInventory, capture.touch(a, &txn, &debt, &gate, marker_key, true));
+            try std.testing.expectError(error.InvalidArtifactReplayInventory, capture.touch(a, &txn, &debt, &gate, marker_key, true, "x"));
             try std.testing.expectError(error.InvalidArtifactReplayInventory, capture.stage(&txn, null));
         }
     };

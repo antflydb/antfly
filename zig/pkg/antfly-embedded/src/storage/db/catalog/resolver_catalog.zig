@@ -62,8 +62,8 @@ fn cloneLabels(alloc: Allocator, labels: []const []const u8) ![]const []const u8
 }
 
 /// Monotonic feature epoch, published with catalog mutations and checked before parsing.
-pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
-pub const replacement_reader_base_key = "\x00\x00__metadata__:replacement_reader_base_v1";
+pub const minimum_reader_key = reader_versions.minimum_reader_key;
+pub const replacement_reader_base_key = reader_versions.replacement_reader_base_key;
 const reader_versions = @import("reader_versions.zig");
 pub const graph_expiration_namespace_reader_version = reader_versions.graph_expiration_namespace_reader_version;
 pub const adjudication_reader_version = reader_versions.adjudication_reader_version;
@@ -86,6 +86,7 @@ pub fn readerVersionBytes(version: u32) ![]const u8 {
         8 => "8",
         9 => "9",
         10 => "10",
+        11 => "11",
         else => error.UnsupportedDatabaseReaderVersion,
     };
 }

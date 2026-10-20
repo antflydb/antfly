@@ -17,6 +17,7 @@
 //! the backend writer transaction: abort, uncertain commit, and reopen cannot
 //! retire a credit independently of its record. No postcommit reservation exists.
 const std = @import("std");
+const replay_credit = @import("prepared_replay_credit.zig");
 const outbox = @import("db/durable_outbox.zig");
 pub const state_key = "\x00\x00__metadata__:ha_publication_backlog_v1";
 pub const size_prefix = "\x00\x00__metadata__:ha_publication_size_v1:";
@@ -53,7 +54,7 @@ pub const default_max_bytes: u64 = 256 * 1024 * 1024;
 pub fn isObligation(key: []const u8) bool {
     // Conservatively include malformed v2 keys: corruption must not escape
     // accounting simply because recovery cannot decode its kind or identity.
-    return std.mem.startsWith(u8, key, preparation_requirement_prefix) or
+    return replay_credit.isObligation(key) or std.mem.startsWith(u8, key, preparation_requirement_prefix) or
         std.mem.startsWith(u8, key, prepared_effects_prefix) or
         std.mem.startsWith(u8, key, transaction_credit_prefix) or
         std.mem.startsWith(u8, key, transaction_batch_prefix) or
@@ -114,7 +115,7 @@ fn hasObligations(txn: anytype) !bool {
     }
     if (try cursor.seekAtOrAfter(outbox.replication_outbox_v2_prefix)) |entry|
         if (std.mem.startsWith(u8, entry.key, outbox.replication_outbox_v2_prefix)) return true;
-    for ([_][]const u8{ transaction_credit_prefix, transaction_batch_prefix, prepared_effects_prefix, preparation_requirement_prefix }) |prefix| {
+    for ([_][]const u8{ transaction_credit_prefix, transaction_batch_prefix, prepared_effects_prefix, preparation_requirement_prefix, replay_credit.grant_prefix, replay_credit.claim_prefix, replay_credit.owner_prefix }) |prefix| {
         if (try cursor.seekAtOrAfter(prefix)) |entry| if (std.mem.startsWith(u8, entry.key, prefix)) return true;
     }
     return false;
@@ -166,6 +167,24 @@ pub const Capture = struct {
         errdefer self.poisoned = true;
         if (self.poisoned) return error.InvalidHAOutbox;
         try self.acquire(gate);
+        if (replay_credit.isReplay(key)) {
+            const id = try replay_credit.idFromKey(key, replay_credit.replay_prefix);
+            if (value) |payload| {
+                _ = try replay_credit.materialize(txn, id, payload);
+            } else try replay_credit.acknowledge(txn, id);
+            // Legacy transactions keep their original policy. A tracked replay
+            // consumes its preexisting reservation; it is never charged twice.
+            return;
+        }
+        if (std.mem.startsWith(u8, key, prepared_effects_prefix) and key.len == prepared_effects_prefix.len + 16) {
+            if (try replay_credit.load(txn, key[prepared_effects_prefix.len..][0..16].*)) |grant| {
+                if (value) |raw| {
+                    const inspection = try @import("db/prepared_transaction_effects.zig").inspect(raw, null);
+                    if (!std.meta.eql(inspection.fingerprint, grant.frame)) return error.PreparedEffectsConflict;
+                } else if (grant.phase == .prepared) return error.PreparedEffectsRequired;
+            }
+        }
+        if (replay_credit.isGrant(key) or replay_credit.isClaim(key) or replay_credit.isOwner(key)) try replay_credit.requireProtocol(txn);
         if (std.mem.startsWith(u8, key, transaction_batch_prefix) and key.len == transaction_batch_prefix.len + 16) {
             if (value) |payload| {
                 const credit_key = transactionCreditKey(key[transaction_batch_prefix.len..][0..16].*);
@@ -183,7 +202,15 @@ pub const Capture = struct {
             return;
         }
         const credit = std.mem.startsWith(u8, key, transaction_credit_prefix);
-        const charged_size: ?u64 = if (value) |raw| if (credit) blk: {
+        const charged_size: ?u64 = if (value) |raw| if (replay_credit.isGrant(key)) blk: {
+            const id = try replay_credit.idFromKey(key, replay_credit.grant_prefix);
+            const grant = try replay_credit.Grant.decode(raw);
+            if (!std.meta.eql(grant.owner, id)) return error.InvalidHAOutbox;
+            try replay_credit.checkGrantMutation(txn, id, grant);
+            // The grant and raw outbox coexist until HA ACK. Reserve both
+            // retained values and both keys before payload materialization.
+            break :blk std.math.add(u64, try grant.budget(), replay_credit.Grant.bytes + replay_credit.replay_prefix.len + 16) catch return error.InvalidHAOutbox;
+        } else if (credit) blk: {
             if (key.len != transaction_credit_prefix.len + 16 or raw.len != 8) return error.InvalidHAOutbox;
             const budget = std.mem.readInt(u64, raw[0..8], .little);
             if (budget == 0) return error.InvalidHAOutbox;

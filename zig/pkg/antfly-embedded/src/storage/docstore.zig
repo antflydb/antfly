@@ -659,7 +659,11 @@ pub const DocStore = struct {
                 self.retained.staging = true;
                 defer self.retained.staging = false;
                 try self.artifact_inputs.stage(self, self.retained.staged);
-                try self.artifact_footprint.stage(self);
+                {
+                    self.artifact_inventory.staging = true;
+                    defer self.artifact_inventory.staging = false;
+                    try self.artifact_footprint.stage(self);
+                }
                 try self.document_revisions.stage(self);
                 try self.artifact_inventory.stage(self, if (self.columnar_owner) |owner| &owner.runtime_store else null);
             }
@@ -880,7 +884,7 @@ pub const DocStore = struct {
             try requireGraphEndpointWritable(self, self.alloc, key, value);
             if (try graphRelationshipRetiredCached(self, self.alloc, key, &self.graph_retirements_maybe)) return;
 
-            try self.trackArtifactInventory(key, true);
+            try self.trackArtifactInventory(key, true, value);
             try maintainGraphIncoming(self, self.alloc, key, value, false, false);
             try self.document_revisions.touchValue(self.alloc, key, value);
             try self.artifact_footprint.touch(key, value);
@@ -905,7 +909,7 @@ pub const DocStore = struct {
         }
 
         fn deleteInventoryTracked(self: *Txn, key: []const u8) anyerror!void {
-            try self.trackArtifactInventory(key, false);
+            try self.trackArtifactInventory(key, false, null);
             errdefer if (@import("publication_backlog.zig").isObligation(key)) {
                 self.publication_backlog.poisoned = true;
             };
@@ -938,8 +942,21 @@ pub const DocStore = struct {
             }
         }
 
-        fn trackArtifactInventory(self: *Txn, key: []const u8, present: bool) !void {
-            try self.artifact_inventory.touch(self.alloc, self, &self.publication_backlog, if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null, key, present);
+        /// Internal preparation primitive; the complete accepted execution bundle
+        /// must be funded separately before a required PREPARE vote is enabled.
+        pub fn reservePreparedReplayCredit(self: *Txn, id: [16]u8, frame: [32]u8, base: @import("replay_record_shape.zig").Record, roots: []const []const u8, original: ?@import("../common/read_admission.zig").Port) !void {
+            errdefer self.artifact_inventory.poisoned = true;
+            try self.publication_backlog.acquireMutationGate(if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null);
+            try @import("prepared_replay_credit.zig").reserve(self, self.alloc, &self.artifact_inventory, id, frame, base, roots, original);
+        }
+        pub fn cancelPreparedReplayCredit(self: *Txn, id: [16]u8) !void {
+            errdefer self.artifact_inventory.poisoned = true;
+            try self.publication_backlog.acquireMutationGate(if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null);
+            try @import("prepared_replay_credit.zig").cancel(self, &self.artifact_inventory, id);
+        }
+
+        fn trackArtifactInventory(self: *Txn, key: []const u8, present: bool, value: ?[]const u8) !void {
+            try self.artifact_inventory.touch(self.alloc, self, &self.publication_backlog, if (self.columnar_owner) |owner| owner.runtime_store.publication_gate orelse &owner.publication_backlog_mutex else null, key, present, value);
         }
 
         fn markColumnarDirty(self: *Txn, key: []const u8, value: ?[]const u8) anyerror!void {
@@ -1124,7 +1141,7 @@ pub const DocStore = struct {
                 try requireGraphEndpointWritable(self, self.alloc, key, value);
                 if (try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
-                try self.trackArtifactInventory(key, true);
+                try self.trackArtifactInventory(key, true, value);
                 try maintainGraphIncoming(self, self.alloc, key, value, false, false);
                 try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
@@ -1171,7 +1188,7 @@ pub const DocStore = struct {
                 try requireGraphEndpointWritable(self, self.alloc, key, value);
                 if (!retirement_checked and try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
-                try self.trackArtifactInventory(key, true);
+                try self.trackArtifactInventory(key, true, value);
                 try maintainGraphIncoming(self, self.alloc, key, value, true, retirement_checked);
                 try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
@@ -1208,7 +1225,7 @@ pub const DocStore = struct {
             }
 
             fn deleteInventoryTracked(self: @This(), key: []const u8) anyerror!void {
-                try self.trackArtifactInventory(key, false);
+                try self.trackArtifactInventory(key, false, null);
                 errdefer if (@import("publication_backlog.zig").isObligation(key)) {
                     self.publication_backlog.poisoned = true;
                 };
@@ -1247,8 +1264,21 @@ pub const DocStore = struct {
                 return present[0];
             }
 
-            fn trackArtifactInventory(self: @This(), key: []const u8, present: bool) !void {
-                try self.artifact_inventory.touch(self.alloc, self, self.publication_backlog, self.publication_gate, key, present);
+            /// Internal preparation primitive; the complete accepted execution bundle
+            /// must be funded separately before a required PREPARE vote is enabled.
+            pub fn reservePreparedReplayCredit(self: @This(), id: [16]u8, frame: [32]u8, base: @import("replay_record_shape.zig").Record, roots: []const []const u8, original: ?@import("../common/read_admission.zig").Port) !void {
+                errdefer self.artifact_inventory.poisoned = true;
+                try self.publication_backlog.acquireMutationGate(self.publication_gate);
+                try @import("prepared_replay_credit.zig").reserve(self, self.alloc, self.artifact_inventory, id, frame, base, roots, original);
+            }
+            pub fn cancelPreparedReplayCredit(self: @This(), id: [16]u8) !void {
+                errdefer self.artifact_inventory.poisoned = true;
+                try self.publication_backlog.acquireMutationGate(self.publication_gate);
+                try @import("prepared_replay_credit.zig").cancel(self, self.artifact_inventory, id);
+            }
+
+            fn trackArtifactInventory(self: @This(), key: []const u8, present: bool, value: ?[]const u8) !void {
+                try self.artifact_inventory.touch(self.alloc, self, self.publication_backlog, self.publication_gate, key, present, value);
             }
 
             fn markColumnarDirty(self: @This(), key: []const u8, value: ?[]const u8) anyerror!void {
@@ -1322,7 +1352,11 @@ pub const DocStore = struct {
                 self.retained.staging = true;
                 defer self.retained.staging = false;
                 try self.artifact_inputs.stage(self.asTxn(), self.retained.staged);
-                try self.artifact_footprint.stage(self.asTxn());
+                {
+                    self.artifact_inventory.staging = true;
+                    defer self.artifact_inventory.staging = false;
+                    try self.artifact_footprint.stage(self.asTxn());
+                }
                 try self.document_revisions.stage(self.asTxn());
                 try self.artifact_inventory.stage(self.asTxn(), if (self.columnar_owner) |owner| &owner.runtime_store else null);
             }
@@ -1349,6 +1383,13 @@ pub const DocStore = struct {
             self.publication_backlog.release();
             self.* = undefined;
             if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
+        }
+
+        pub fn reservePreparedReplayCredit(self: *Batch, id: [16]u8, frame: [32]u8, base: @import("replay_record_shape.zig").Record, roots: []const []const u8, original: ?@import("../common/read_admission.zig").Port) !void {
+            try self.asTxn().reservePreparedReplayCredit(id, frame, base, roots, original);
+        }
+        pub fn cancelPreparedReplayCredit(self: *Batch, id: [16]u8) !void {
+            try self.asTxn().cancelPreparedReplayCredit(id);
         }
 
         pub fn asTxn(self: *Batch) BatchTxn {
@@ -7744,4 +7785,432 @@ test "docstore artifact replay inventory counts actual staged presence after lat
         try std.testing.expectEqual(@as(u64, if (fallback) artifact.len else 0), state.key_bytes);
         try std.testing.expectEqual(fallback, try read.contains(artifact));
     }
+}
+
+const PreparedReplayCreditFixture = struct {
+    native: lsm_backend.Backend = undefined,
+    store: DocStore = undefined,
+    const credit = @import("prepared_replay_credit.zig");
+    const backlog = @import("publication_backlog.zig");
+    const effects = @import("db/prepared_transaction_effects.zig");
+    const floors = @import("db/catalog/reader_versions.zig");
+    fn init(self: *@This()) !void {
+        return self.initAt(null);
+    }
+    fn initAt(self: *@This(), path: ?[]const u8) !void {
+        const a = std.testing.allocator;
+        self.native = if (path) |directory| try lsm_backend.Backend.open(a, directory, .{ .flush_threshold_bytes = 4096 }) else lsm_backend.Backend.init(a, .{});
+        errdefer self.native.close();
+        self.store = try DocStore.openRuntime(a, try self.native.runtimeStore(a, .{}));
+        errdefer self.store.close();
+        try @import("artifact_footprint.zig").initializeEmpty(&self.store);
+        try artifact_replay_inventory.initialize(&self.store);
+        try self.store.put(floors.minimum_reader_key, "11");
+        try self.store.put(floors.replacement_reader_base_key, "11");
+    }
+    fn deinit(self: *@This()) void {
+        self.store.close();
+        self.native.close();
+    }
+    fn frame(id: [16]u8) ![]u8 {
+        return effects.encode(std.testing.allocator, .{ .contract = .{ .txn_id = id, .intent_revision = 1, .intent_digest = @splat(3), .catalog_digest = @splat(4), .mode = .synchronous }, .effects = .{} }, null);
+    }
+    fn reserve(self: *@This(), id: [16]u8, roots: []const []const u8) !void {
+        const raw = try frame(id);
+        defer std.testing.allocator.free(raw);
+        const accepted = try effects.inspect(raw, null);
+        var txn = try self.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(&(backlog.prepared_effects_prefix.* ++ id), raw);
+        try txn.reservePreparedReplayCredit(id, accepted.fingerprint, .{}, roots, null);
+        try txn.commit();
+    }
+    fn debt(self: *@This()) !backlog.State {
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        return (try backlog.load(&read)).?;
+    }
+    fn grant(self: *@This(), id: [16]u8) !credit.Grant {
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        return (try credit.load(&read, id)).?;
+    }
+    fn saturate(self: *@This()) !void {
+        const initial = try self.debt();
+        const key = backlog.transactionCreditKey(@splat(253));
+        var raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &raw, backlog.default_max_bytes - initial.bytes - key.len, .little);
+        try self.store.put(&key, &raw);
+        try std.testing.expectEqual(backlog.default_max_bytes, (try self.debt()).bytes);
+    }
+};
+
+test "docstore prepared replay credit reserves exact roots and atomically funds background inventory" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const id: [16]u8 = @splat(1);
+    const first = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "b");
+    defer a.free(first);
+    const second = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "c");
+    defer a.free(second);
+    try fixture.store.put(first, "existing");
+    try fixture.reserve(id, &.{ first, second, first });
+    const accepted = try fixture.grant(id);
+    try std.testing.expectEqual(@as(u64, 1), accepted.root_count);
+    try std.testing.expectEqualDeep(try (artifact_replay_inventory.State{ .count = 1, .key_bytes = first.len }).retirementReplayShape(), accepted.current);
+    try fixture.saturate();
+    const full = try fixture.debt();
+    {
+        var refused = try fixture.store.beginWriteBatch();
+        defer refused.abort();
+        try refused.put(second, "must not publish");
+        try std.testing.expectError(error.Backpressured, refused.commit());
+    }
+    try std.testing.expectError(error.NotFound, fixture.store.get(a, second));
+    try std.testing.expectEqualDeep(accepted, try fixture.grant(id));
+    try std.testing.expectEqual(full, try fixture.debt());
+    // Final atomic deltas reuse the reservation despite insertion first.
+    {
+        var replace = try fixture.store.beginWriteBatch();
+        errdefer replace.abort();
+        try replace.asTxn().appendPut(second, "new");
+        try replace.delete(first);
+        try replace.commit();
+    }
+    try std.testing.expectEqualDeep(accepted, try fixture.grant(id));
+    try std.testing.expectEqual(full, try fixture.debt());
+    const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{});
+    defer a.free(payload);
+    try fixture.store.put(&(F.credit.replay_prefix.* ++ id), payload);
+    const materialized = try fixture.grant(id);
+    try std.testing.expectEqual(F.credit.Phase.materialized, materialized.phase);
+    try std.testing.expectEqual(try accepted.budget(), try materialized.budget());
+    {
+        var read = try fixture.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(!try F.credit.hasClaims(&read));
+        try std.testing.expect((try F.credit.owner(&read, try F.credit.documentHash(first))) == null);
+    }
+    const retained = try fixture.debt();
+    try fixture.store.put(&(F.credit.replay_prefix.* ++ id), payload);
+    try std.testing.expectEqual(retained, try fixture.debt());
+    // Prepared-frame cleanup cannot release an unacknowledged HA replay.
+    try fixture.store.delete(&(F.backlog.prepared_effects_prefix.* ++ id));
+    const after_cleanup = try fixture.debt();
+    try std.testing.expectEqualDeep(materialized, try fixture.grant(id));
+    try fixture.store.delete(&(F.credit.replay_prefix.* ++ id));
+    try std.testing.expect((try fixture.debt()).bytes < after_cleanup.bytes);
+    var read = try fixture.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect((try F.credit.load(&read, id)) == null);
+}
+
+test "docstore prepared replay credit rejects conflicting owners pending ACK and ignored failures" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "one");
+    defer a.free(key);
+    const id: [16]u8 = @splat(1);
+    try fixture.reserve(id, &.{key});
+    const accepted = try fixture.grant(id);
+    const before = try fixture.debt();
+    try fixture.reserve(id, &.{ key, key });
+    try std.testing.expectEqual(before, try fixture.debt());
+    try std.testing.expectError(error.Backpressured, fixture.reserve(@splat(2), &.{key}));
+    try std.testing.expectEqualDeep(accepted, try fixture.grant(id));
+    try std.testing.expectError(error.InvalidHAOutbox, fixture.store.delete(&(F.credit.replay_prefix.* ++ id)));
+    try std.testing.expectError(error.PreparedEffectsRequired, fixture.store.delete(&(F.backlog.prepared_effects_prefix.* ++ id)));
+    {
+        var poisoned = try fixture.store.beginWriteTxn();
+        defer poisoned.abort();
+        try std.testing.expectError(error.InvalidHAOutbox, poisoned.put(F.floors.minimum_reader_key, "10"));
+        try poisoned.put("unrelated", "must not commit");
+        try std.testing.expectError(error.InvalidArtifactReplayInventory, poisoned.commit());
+    }
+    try std.testing.expectError(error.NotFound, fixture.store.get(a, "unrelated"));
+    {
+        var txn = try fixture.store.beginWriteBatch();
+        errdefer txn.abort();
+        try txn.cancelPreparedReplayCredit(id);
+        try txn.delete(&(F.backlog.prepared_effects_prefix.* ++ id));
+        try txn.commit();
+    }
+    var read = try fixture.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect((try F.credit.load(&read, id)) == null);
+    try std.testing.expect(!try F.credit.hasClaims(&read));
+    // The permanent floor survives draining the last credit.
+    try std.testing.expectError(error.InvalidHAOutbox, fixture.store.delete(F.floors.replacement_reader_base_key));
+}
+
+test "docstore prepared replay credit requires reader floors known inventory and the exact durable frame" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "one");
+    defer a.free(key);
+    const id: [16]u8 = @splat(1);
+    try std.testing.expectError(error.PreparedEffectsRequired, missing: {
+        var txn = try fixture.store.beginWriteTxn();
+        defer txn.abort();
+        break :missing txn.reservePreparedReplayCredit(id, @splat(9), .{}, &.{key}, null);
+    });
+    {
+        const raw = try F.frame(id);
+        defer a.free(raw);
+        var mismatch = try fixture.store.beginWriteTxn();
+        defer mismatch.abort();
+        try mismatch.put(&(F.backlog.prepared_effects_prefix.* ++ id), raw);
+        try std.testing.expectError(error.PreparedEffectsMismatch, mismatch.reservePreparedReplayCredit(id, @splat(9), .{}, &.{key}, null));
+    }
+    try fixture.store.put(F.floors.minimum_reader_key, "10");
+    try std.testing.expectError(error.PreparedTransactionProtocolDisabled, fixture.reserve(id, &.{key}));
+    try fixture.store.put(F.floors.minimum_reader_key, "11");
+    try fixture.store.put(@import("artifact_footprint.zig").key, "invalid");
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, fixture.reserve(id, &.{key}));
+    const footprint = @import("artifact_footprint.zig");
+    try fixture.store.put(footprint.key, &(footprint.State{ .certified = footprint.all, .epochs = .{ 1, 0, 0, 0 } }).encode());
+    try std.testing.expectError(error.InvalidArtifactReplayInventory, fixture.reserve(id, &.{key}));
+}
+
+test "docstore prepared replay credit survives native reopen through prepared materialized and acknowledged phases" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "one");
+    defer a.free(key);
+    const id: [16]u8 = @splat(9);
+    const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{});
+    defer a.free(payload);
+    var saved: F.credit.Grant = undefined;
+    var debt: F.backlog.State = undefined;
+    for (0..3) |phase| {
+        var fixture: F = .{};
+        try fixture.initAt(path);
+        defer fixture.deinit();
+        if (phase == 0) {
+            try fixture.reserve(id, &.{key});
+            try fixture.store.put(key, "background growth after preparation");
+            saved = try fixture.grant(id);
+            try fixture.saturate();
+            debt = try fixture.debt();
+        } else {
+            try std.testing.expectEqualDeep(saved, try fixture.grant(id));
+            try std.testing.expectEqual(debt, try fixture.debt());
+            if (phase == 1) {
+                try fixture.store.put(&(F.credit.replay_prefix.* ++ id), payload);
+                saved = try fixture.grant(id);
+                debt = try fixture.debt();
+            } else {
+                try fixture.store.delete(&(F.credit.replay_prefix.* ++ id));
+                try std.testing.expect((try fixture.debt()).bytes < debt.bytes);
+                var read = try fixture.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expect((try F.credit.load(&read, id)) == null);
+            }
+        }
+    }
+}
+
+test "docstore prepared replay credit freezes plan identity rejects overrun and retains the first payload until ACK" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "one");
+    defer a.free(key);
+    const id: [16]u8 = @splat(1);
+    try fixture.reserve(id, &.{key});
+    const accepted = try fixture.grant(id);
+    var forged = accepted;
+    forged.base.changed_doc_keys = .{ .count = 1 };
+    try std.testing.expectError(error.PreparedEffectsConflict, fixture.store.put(&F.credit.grantKey(id), &try forged.encode()));
+    const journal = @import("db/derived/change_journal.zig");
+    const too_large = try journal.encodeRecord(a, .{ .changed_doc_keys = &.{"unreserved"} });
+    defer a.free(too_large);
+    try std.testing.expectError(error.InvalidHAOutbox, fixture.store.put(&(F.credit.replay_prefix.* ++ id), too_large));
+    try std.testing.expectEqualDeep(accepted, try fixture.grant(id));
+    const payload = try journal.encodeRecord(a, .{});
+    defer a.free(payload);
+    try fixture.store.put(&(F.credit.replay_prefix.* ++ id), payload);
+    const changed = try journal.encodeRecord(a, .{ .sequence = 1 });
+    defer a.free(changed);
+    try std.testing.expectError(error.PreparedEffectsConflict, fixture.store.put(&(F.credit.replay_prefix.* ++ id), changed));
+    {
+        var cancel = try fixture.store.beginWriteTxn();
+        defer cancel.abort();
+        try std.testing.expectError(error.DecisionConflict, cancel.cancelPreparedReplayCredit(id));
+    }
+    // Removing the grant alone cannot silently forgive pending delivery debt.
+    {
+        var drop = try fixture.store.beginWriteBatch();
+        defer drop.abort();
+        try drop.delete(&F.credit.grantKey(id));
+        try std.testing.expectError(error.InvalidHAOutbox, drop.commit());
+    }
+    const stored = try fixture.store.get(a, &(F.credit.replay_prefix.* ++ id));
+    defer a.free(stored);
+    try std.testing.expectEqualSlices(u8, payload, stored);
+    try fixture.store.delete(&(F.credit.replay_prefix.* ++ id));
+}
+
+test "docstore prepared replay credit guards footprint invalidation and shares mutation ownership across views" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    var other = try DocStore.openRuntime(a, try fixture.native.runtimeStore(a, .{}));
+    defer other.close();
+    const id: [16]u8 = @splat(1);
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "one");
+    defer a.free(key);
+    try fixture.reserve(id, &.{key});
+    try std.testing.expectError(error.Backpressured, other.put(@import("artifact_footprint.zig").key, "must not invalidate"));
+    {
+        var held = try fixture.store.beginWriteTxn();
+        defer held.abort();
+        try held.reservePreparedReplayCredit(id, (try fixture.grant(id)).frame, .{}, &.{key}, null);
+        try std.testing.expectError(error.Backpressured, other.put(key, "blocked"));
+    }
+    try other.put(key, "admitted after abort");
+    try std.testing.expectEqual(@as(u64, 1), (try fixture.grant(id)).current.deleted_doc_keys.count);
+}
+
+test "docstore prepared replay credit preserves original cancellation and poisons ignored reservation failures" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    const controls = @import("../common/read_admission.zig");
+    const Reject = struct {
+        calls: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.Canceled;
+        }
+    };
+    var reject: Reject = .{};
+    const source: controls.Payload = .{ .ptr = &reject, .vtable = &.{ .checkpoint = Reject.check } };
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const id: [16]u8 = @splat(1);
+    const raw = try F.frame(id);
+    defer a.free(raw);
+    const frame = (try F.effects.inspect(raw, null)).fingerprint;
+    var txn = try fixture.store.beginWriteTxn();
+    defer txn.abort();
+    try txn.put(&(F.backlog.prepared_effects_prefix.* ++ id), raw);
+    try std.testing.expectError(error.Canceled, txn.reservePreparedReplayCredit(id, frame, .{}, &.{}, controls.Port.init(&source)));
+    try std.testing.expectEqual(@as(usize, 1), reject.calls);
+    try std.testing.expectError(error.InvalidArtifactReplayInventory, txn.commit());
+}
+
+test "docstore prepared replay credit uncertain materialization is atomic without rereading cold frame or replay values" {
+    const F = PreparedReplayCreditFixture;
+    const Guard = struct {
+        inner: ?backend_erased.WriteTxn,
+        commit_first: bool,
+        fn unbox(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn abort(_: Allocator, raw: *anyopaque) void {
+            const self = unbox(raw);
+            if (self.inner) |*txn| txn.abort();
+            self.inner = null;
+        }
+        fn commit(_: Allocator, raw: *anyopaque) !void {
+            const self = unbox(raw);
+            if (self.commit_first) {
+                try self.inner.?.commit();
+                self.inner = null;
+            }
+            return error.TestUncertainCommit;
+        }
+        fn get(raw: *anyopaque, key: []const u8) ![]const u8 {
+            if (std.mem.startsWith(u8, key, F.backlog.prepared_effects_prefix) or F.credit.isReplay(key)) return error.TestOutboxValueReadForbidden;
+            return unbox(raw).inner.?.get(key);
+        }
+        fn put(raw: *anyopaque, key: []const u8, value: []const u8) !void {
+            return unbox(raw).inner.?.put(key, value);
+        }
+        fn delete(raw: *anyopaque, key: []const u8) !void {
+            return unbox(raw).inner.?.delete(key);
+        }
+        fn contains(raw: *anyopaque, key: []const u8) !bool {
+            return unbox(raw).inner.?.contains(key);
+        }
+        fn openCursor(_: Allocator, raw: *anyopaque) !backend_erased.Cursor {
+            return unbox(raw).inner.?.openCursor();
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |commit_first| {
+        var fixture: F = .{};
+        try fixture.init();
+        defer fixture.deinit();
+        const id: [16]u8 = @splat(5);
+        const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "owner", "one");
+        defer a.free(key);
+        try fixture.reserve(id, &.{key});
+        try fixture.saturate();
+        const prepared = try fixture.grant(id);
+        const before = try fixture.debt();
+        const payload = try @import("db/derived/change_journal.zig").encodeRecord(a, .{});
+        defer a.free(payload);
+        var txn = try fixture.store.beginWriteTxn();
+        var guarded: Guard = .{ .inner = txn.write.?, .commit_first = commit_first };
+        txn.write = .{ .allocator = a, .ptr = &guarded, .vtable = &.{ .abort = Guard.abort, .commit = Guard.commit, .get = Guard.get, .put = Guard.put, .delete = Guard.delete, .contains = Guard.contains, .open_cursor = Guard.openCursor } };
+        try txn.put(&(F.credit.replay_prefix.* ++ id), payload);
+        try std.testing.expectError(error.TestUncertainCommit, txn.commit());
+        txn.abort();
+        const observed = try fixture.grant(id);
+        if (commit_first) {
+            try std.testing.expectEqual(F.credit.Phase.materialized, observed.phase);
+            try std.testing.expectEqual(try prepared.budget(), try observed.budget());
+            try std.testing.expect((try fixture.debt()).bytes < before.bytes);
+            try fixture.store.put(&(F.credit.replay_prefix.* ++ id), payload);
+        } else {
+            try std.testing.expectEqualDeep(prepared, observed);
+            try std.testing.expectEqual(before, try fixture.debt());
+            try std.testing.expectError(error.NotFound, fixture.store.get(a, &(F.credit.replay_prefix.* ++ id)));
+        }
+    }
+}
+
+test "docstore prepared replay credit sorts distinct roots and rejects changed or excessive root sets" {
+    const F = PreparedReplayCreditFixture;
+    const a = std.testing.allocator;
+    var fixture: F = .{};
+    try fixture.init();
+    defer fixture.deinit();
+    const one = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "first", "one");
+    defer a.free(one);
+    const two = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "second", "one");
+    defer a.free(two);
+    const id: [16]u8 = @splat(1);
+    try fixture.reserve(id, &.{ two, one, two });
+    const saved = try fixture.grant(id);
+    const debt = try fixture.debt();
+    try std.testing.expectEqual(@as(u64, 2), saved.root_count);
+    try fixture.reserve(id, &.{ one, two });
+    try std.testing.expectEqualDeep(saved, try fixture.grant(id));
+    try std.testing.expectEqual(debt, try fixture.debt());
+    try std.testing.expectError(error.PreparedEffectsConflict, fixture.reserve(id, &.{one}));
+    const excessive = try a.alloc([]const u8, F.backlog.default_max_records + 1);
+    defer a.free(excessive);
+    @memset(excessive, one);
+    try std.testing.expectError(error.Backpressured, fixture.reserve(@splat(2), excessive));
 }
