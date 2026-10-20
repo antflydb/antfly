@@ -137,7 +137,8 @@ pub const Coordinator = struct {
         // Recheck it in the child before sealing, and pass it unchanged to the
         // participant coordinator even after independent completion activates.
         try self.context.ensureActive();
-        const commit_control = distributed_txn.CommitControl.fromRequest(self.context);
+        var commit_control = distributed_txn.CommitControl.fromRequest(self.context);
+        commit_control.participant_plan_store = server.txn_sessions.participantPlanStore();
         var plan = (server.txn_sessions.sealExecutionPlan(alloc, id, signed) catch
             // Persistence may have succeeded before a later publication error.
             // Preserve this ID for authoritative reconciliation on every such

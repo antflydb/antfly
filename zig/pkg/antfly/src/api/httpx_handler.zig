@@ -12227,8 +12227,12 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
         ) anyerror!?distributed_txn.CommitOutcome {
             try std.testing.expect(control.participant_plan_store != null);
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.cancellation_commit_calls += 1;
-            try std.testing.expect(cancellation.ptr != null);
+            if (cancellation.ptr != null) {
+                self.cancellation_commit_calls += 1;
+            } else {
+                // Maintenance retains the cohort but has independent lifetime.
+                try std.testing.expect(control.pre_decision.cancellation.ptr == null);
+            }
             return commitTransactionWithId(ptr, alloc_, txn_id, begin_timestamp, tables, sync_level);
         }
 
