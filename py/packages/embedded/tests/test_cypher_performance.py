@@ -4694,3 +4694,82 @@ def test_collection_summaries_combine_counts_windows_and_filters(graph_db):
     )
     assert sql["rows"][0][0] == "3000"
     assert sql["rows"][0][1].startswith("000000000999")
+
+
+def test_invariant_membership_has_bounded_work_for_parameters_and_aliases(graph_db):
+    db = graph_db
+    populate(db, 3000)
+    for query in (
+        "MATCH(n:D) RETURN sum(CASE WHEN n.score IN $xs THEN 1 ELSE 0 END)",
+        "WITH $xs AS ys MATCH(n:D) RETURN sum(CASE WHEN n.score IN ys THEN 1 ELSE 0 END)",
+        "MATCH(n:D) RETURN sum(CASE WHEN n.score IN range(0,511) THEN 1 ELSE 0 END)",
+    ):
+        result = db.cypher_json(
+            "g",
+            {"query": query, "parameters": {"xs": list(range(512))}, "limits": {"intermediate_states": 200_000}},
+        )
+        assert int(result["rows"][0][0]["value"]) == 512
+    # Reuse one syntactic RHS across recycled producer pages and correlated calls.
+    result = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH(n:D) CALL { WITH n RETURN n.score IN $xs AS present } RETURN sum(CASE WHEN present THEN 1 ELSE 0 END)",
+            "parameters": {"xs": list(range(128))},
+        },
+    )
+    assert int(result["rows"][0][0]["value"]) == 128
+
+
+def test_parameterized_collection_bounds_keep_only_their_window(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092, unique=True)
+    for query, parameters, expected in (
+        ("RETURN collect(n.payload)[$i]", {"i": 0}, "000000000000"),
+        ("RETURN collect(n.payload)[$i]", {"i": -1}, "000000000999"),
+        ("RETURN collect(n.payload)[-$k]", {"k": 1}, "000000000999"),
+        ("RETURN collect(n.payload)[..$k]", {"k": 1}, "000000000000"),
+        ("RETURN collect(n.payload)[$start..$end]", {"start": -2, "end": -1}, "000000000998"),
+    ):
+        result = db.cypher_json(
+            "payloads",
+            {"query": "MATCH(n:W) " + query, "parameters": parameters, "limits": {"memory_bytes": 8 << 20}},
+        )
+        cell = result["rows"][0][0]
+        if cell["type"] == "list":
+            assert len(cell["value"]) == 1
+            cell = cell["value"][0]
+        assert cell["value"].startswith(expected)
+    result = db.cypher_json(
+        "payloads",
+        {
+            "query": "MATCH(n:W) WITH collect(n.payload) AS xs WITH xs AS ys RETURN size(ys),ys[$i]",
+            "parameters": {"i": -1},
+            "limits": {"memory_bytes": 8 << 20},
+        },
+    )
+    assert int(result["rows"][0][0]["value"]) == 3000
+    assert result["rows"][0][1]["value"].startswith("000000000999")
+
+
+def test_boolean_collection_consumers_have_bounded_payload_retention(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092, unique=True)
+    result = db.cypher_json(
+        "payloads",
+        {
+            "query": 'MATCH(n:W) WITH collect(n.payload) AS xs WITH xs AS ys RETURN any(x IN ys WHERE x STARTS WITH "000000000000"),all(x IN ys WHERE x ENDS WITH "x"),none(x IN ys WHERE x STARTS WITH "missing"),single(x IN ys WHERE x STARTS WITH "000000000001"),size(ys),head(ys),last(ys)',
+            "limits": {"memory_bytes": 8 << 20},
+        },
+    )
+    assert [cell["value"] for cell in result["rows"][0][:4]] == [True, True, True, True]
+    assert int(result["rows"][0][4]["value"]) == 3000
+    assert result["rows"][0][5]["value"].startswith("000000000000")
+    assert result["rows"][0][6]["value"].startswith("000000000999")
+    direct = db.cypher_json(
+        "payloads",
+        {
+            "query": 'MATCH(n:W) RETURN any(x IN collect(n.payload) WHERE x STARTS WITH "000000000000")',
+            "limits": {"memory_bytes": 8 << 20},
+        },
+    )
+    assert direct["rows"][0][0]["value"] is True

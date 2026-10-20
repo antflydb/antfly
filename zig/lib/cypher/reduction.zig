@@ -155,10 +155,12 @@ pub const Bounds = struct {
 };
 pub const CollectionDemand = struct { input: *const ast.Expr, bounds: Bounds };
 fn nonnegative(expression: *const ast.Expr) ?usize {
+    if (expression.execution_integer) |integer| return std.math.cast(usize, integer);
     if (expression.value != .literal or expression.value.literal != .integer) return null;
     return std.math.cast(usize, expression.value.literal.integer);
 }
 fn negativeMagnitude(expression: *const ast.Expr) ?usize {
+    if (expression.execution_integer) |integer| if (integer < 0) return std.math.cast(usize, -@as(i128, integer));
     if (expression.value == .literal and expression.value.literal == .integer and expression.value.literal.integer < 0)
         return std.math.cast(usize, -@as(i128, expression.value.literal.integer));
     if (expression.value == .unary and expression.value.unary.op == .negative) {
@@ -318,6 +320,69 @@ const Cardinality = struct {
         }
     }
 };
+const BoundSpecialization = struct {
+    a: A,
+    parameters: []const @import("value.zig").Entry,
+    invariants: Index = .{},
+    fn lower(self: *@This(), value: anytype) anyerror!@TypeOf(value) {
+        const T = @TypeOf(value);
+        if (T == *const ast.Expr) {
+            var expression = value.*;
+            if (value.value == .parameter) for (self.parameters) |entry| {
+                if (std.mem.eql(u8, entry.name, value.value.parameter)) {
+                    if (entry.value == .integer) expression.execution_integer = entry.value.integer;
+                    break;
+                }
+            };
+            expression.value = try self.lower(value.value);
+            if (expression.value == .binary and expression.value.binary.op == .in) {
+                const right = expression.value.binary.right;
+                if (!expressions.aggregates(right) and expressions.rowLocal(right, struct {
+                    pub fn permits(_: @This(), _: []const u8) bool {
+                        return false;
+                    }
+                }{})) {
+                    const owned = try self.a.create(ast.Expr);
+                    owned.* = right.*;
+                    owned.execution_invariant = @intCast(try self.invariants.intern(self.a, right, self.invariants.entries.items.len));
+                    expression.value.binary.right = owned;
+                }
+            }
+            if (std.meta.eql(expression, value.*)) return value;
+            const result = try self.a.create(ast.Expr);
+            result.* = expression;
+            return result;
+        }
+        switch (@typeInfo(T)) {
+            .pointer => |p| {
+                if (p.size == .slice and p.child != u8) {
+                    var result: ?[]p.child = null;
+                    for (value, 0..) |child, i| {
+                        const next = try self.lower(child);
+                        if (result == null and !std.meta.eql(child, next)) result = try self.a.dupe(p.child, value);
+                        if (result) |items| items[i] = next;
+                    }
+                    return result orelse value;
+                }
+                return value;
+            },
+            .@"struct" => |info| {
+                var result = value;
+                inline for (info.field_names) |name| @field(result, name) = try self.lower(@field(value, name));
+                return result;
+            },
+            .@"union" => return switch (value) {
+                inline else => |payload, tag| @unionInit(T, @tagName(tag), try self.lower(payload)),
+            },
+            .optional => return if (value) |child| try self.lower(child) else null,
+            else => return value,
+        }
+    }
+};
+pub fn lowerCardinalityParameters(a: A, query: ast.Query, parameters: []const @import("value.zig").Entry) !ast.Query {
+    var specialization: BoundSpecialization = .{ .a = a, .parameters = parameters };
+    return lowerCardinality(a, try specialization.lower(query));
+}
 pub fn lowerCardinality(a: A, query: ast.Query) !ast.Query {
     var lower: Cardinality = .{ .a = a, .source = query.source };
     const direct = try lower.lower(query, null, null);

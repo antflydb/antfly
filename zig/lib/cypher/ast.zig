@@ -23,6 +23,11 @@ pub const Expr = struct {
     /// Cached tree depth bounds subsequent binding/evaluation recursion,
     /// including postfix and associative expressions parsed with loops.
     depth: usize = 1,
+    /// Invocation-local bound inference. Evaluation still reads the original
+    /// expression; prepared/public ASTs never contain parameter values.
+    execution_integer: ?i64 = null,
+    /// Stable invocation-local ownership key for a proved invariant IN RHS.
+    execution_invariant: ?u64 = null,
     value: union(enum) {
         literal: Value,
         variable: []const u8,
@@ -63,7 +68,13 @@ pub const Function = struct {
 };
 /// Private physical summary access; never emitted by the parser or exposed on wire.
 pub const CollectionExtract = union(enum) { cardinality, window: usize, filtered: usize };
-pub const CollectionFilter = struct { alias: []const u8, predicate: ?*const Expr, projection: ?*const Expr };
+pub const CollectionFilter = struct {
+    pub const Kind = enum { count, all, any, none, single };
+    alias: []const u8,
+    predicate: ?*const Expr,
+    projection: ?*const Expr,
+    kind: Kind = .count,
+};
 pub const Procedure = struct { name: []const u8, args: []const *const Expr, yields: []const Yield, predicate: ?*const Expr = null };
 pub const Branch = struct { condition: *const Expr, value: *const Expr };
 pub const Node = struct { span: Span, alias: ?[]const u8, labels: []const []const u8, properties: []const Entry };

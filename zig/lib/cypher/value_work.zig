@@ -31,6 +31,9 @@ pub const Work = struct {
     // in Cypher but behave differently in integer division and nested values.
     // This mode has its own Work/cache and never changes GROUP BY semantics.
     binding_identity: bool = false,
+    /// Only immutable statement-owned metadata may be inherited by a shorter
+    /// evaluation scope. Transient probe metadata is never inserted there.
+    parent: ?*Work = null,
     cache: std.AutoHashMapUnmanaged(Key, Info) = .empty,
     fields: std.AutoHashMapUnmanaged(Key, std.StringHashMapUnmanaged(usize)) = .empty,
     order_depths: std.AutoHashMapUnmanaged(Key, usize) = .empty,
@@ -43,6 +46,9 @@ pub const Work = struct {
             .string => |item| .{ .address = @intFromPtr(item.ptr), .length = item.len, .kind = .string },
             else => null,
         };
+    }
+    pub fn hasMetadata(self: *const Work, value: v.Value) bool {
+        return if (key(value)) |k| self.cache.contains(k) else false;
     }
     pub fn lookup(self: *Work, entries: []const v.Entry, name: []const u8) !?v.Value {
         try self.charge(self.ptr, 1 + name.len / 64);
@@ -97,10 +103,13 @@ pub const Work = struct {
         if (depth > 64) return error.CypherValueDepthExceeded;
         try self.charge(self.ptr, 1);
         const cache_key = key(value);
-        if (cache_key) |k| if (self.cache.get(k)) |cached| {
-            if (depth + cached.depth > 64) return error.CypherValueDepthExceeded;
-            return cached;
-        };
+        if (cache_key) |k| {
+            var owner: ?*Work = self;
+            while (owner) |current| : (owner = current.parent) if (current.cache.get(k)) |cached| {
+                if (depth + cached.depth > 64) return error.CypherValueDepthExceeded;
+                return cached;
+            };
+        }
         var result: Info = .{ .hash = if (self.binding_identity) @backingInt(std.meta.activeTag(value)) else v.Value.rank(value) };
         switch (value) {
             .null => result.unknown = true,

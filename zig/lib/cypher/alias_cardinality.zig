@@ -145,6 +145,24 @@ const Flow = struct {
                     try self.scan(c.projection, names, &local, index);
                 },
                 .list_predicate => |c| {
+                    if (try self.consumerInput(c.input, names, locals, index)) |id| {
+                        const Context = struct {
+                            alias: []const u8,
+                            pub fn permits(context: @This(), name: []const u8) bool {
+                                return std.mem.eql(u8, context.alias, name);
+                            }
+                        };
+                        if (!expressions.aggregates(c.predicate) and expressions.rowLocal(c.predicate, Context{ .alias = c.alias })) {
+                            const kind: ast.CollectionFilter.Kind = switch (c.kind) {
+                                .all => .all,
+                                .any => .any,
+                                .none => .none,
+                                .single => .single,
+                            };
+                            try self.candidates.items[id].filters.append(self.a, .{ .expression = value, .input = c.input, .filter = .{ .alias = c.alias, .predicate = c.predicate, .projection = null, .kind = kind } });
+                            return;
+                        }
+                    }
                     try self.scan(c.input, names, locals, index);
                     const local: expressions.Local = .{ .name = c.alias, .parent = locals };
                     try self.scan(c.predicate, names, &local, index);
@@ -291,8 +309,7 @@ const Flow = struct {
                         var consumer = use.expression.*;
                         const args = try self.a.alloc(*const ast.Expr, 1);
                         args[0] = use.input;
-                        consumer.value.call.args = args;
-                        consumer.value.call.collection_extract = .{ .filtered = filter_slot };
+                        consumer.value = .{ .call = .{ .name = "head", .args = args, .collection_extract = .{ .filtered = filter_slot } } };
                         filter_slot += 1;
                         try rewrites.put(self.a, use.expression, consumer);
                     }

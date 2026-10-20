@@ -1928,8 +1928,29 @@ its input collection. Predicate and projection evaluation preserves NULL exclusi
 counts NULL projections, and records each consumer's first scalar error for its
 original evaluation site; lazy branches and earlier aggregate argument failures
 retain their error precedence. Resource/cancellation failures propagate immediately.
+ANY/ALL/NONE/SINGLE consumers use per-consumer three-valued state in the same
+summary. Each predicate stops at its own decisive answer (or first error), while
+every original COLLECT argument continues to evaluate. SINGLE caps true
+multiplicity at two, including promoted weighted bags; empty inputs and unknown
+answers retain ordinary Cypher semantics.
+
+Invocation-local integer parameter bounds specialize front/back retention without
+replacing the original bound expressions. Invalid, NULL, missing and unproved
+bounds retain their original evaluation behavior. Private annotations and stable
+invariant-expression IDs never mutate a prepared/public AST or cross executions.
 Full escapes, unknown/unbounded windows, scope barriers and
 correlated or effectful consumers conservatively retain the complete list.
+
+Read execution builds collision-checked membership indexes for proved invariant
+IN lists at their first reached evaluation site. Immutable parameter lists also
+retain their metadata across row scopes and follow transparent aliases by owned
+allocation identity. Temporary row/AST addresses never become statement cache
+keys. Equality-only keys preserve shared value DAGs and entity identity; wide
+strings use reclaimable byte pools. Null-free domains use hash probes, while
+nullable structures retain tri-valued comparisons and unknown-result fallback.
+Left-hand expressions still evaluate before the RHS; writes and unproved dynamic
+inputs retain ordinary evaluation. Index construction and probes share statement
+work, allocation and cancellation accounting.
 
 Compatible repeatable DISTINCT arguments also share a collision-checked value
 store across different reducers (for example COUNT and COLLECT). Ordinary row

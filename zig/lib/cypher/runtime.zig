@@ -452,7 +452,8 @@ pub const NodeCursor = struct {
         var arena_moved = false;
         errdefer if (arena_moved) self.arena.deinit() else arena.deinit();
         const a = arena.allocator();
-        const lowered_query = try @import("path_summaries.zig").lower(a, try std.json.parseFromSliceLeaky(ast.Query, a, try std.json.Stringify.valueAlloc(a, query, .{}), .{}));
+        const copied_query = try std.json.parseFromSliceLeaky(ast.Query, a, try std.json.Stringify.valueAlloc(a, query, .{}), .{});
+        const lowered_query = try @import("path_summaries.zig").lower(a, try reduction_plan.lowerCardinalityParameters(a, copied_query, parameters));
         const owned_query = try @import("length_constraints.zig").normalize(a, lowered_query, parameters);
         const owned_parameters = try a.alloc(v.Entry, parameters.len);
         for (parameters, owned_parameters) |parameter, *out| out.* = .{ .name = try a.dupe(u8, parameter.name), .value = try parameter.value.clone(a) };
@@ -470,6 +471,7 @@ pub const NodeCursor = struct {
         engine.values = .{ .a = a, .ptr = engine, .charge = Engine.chargeWork };
         engine.strings = .{ .a = a, .ptr = engine, .charge = Engine.chargeWork };
         errdefer engine.regex.deinit();
+        errdefer if (engine.invariants) |state_value| state_value.deinit();
         const columns = try a.alloc([]const u8, projection.items.len);
         for (owned_query.clauses[1].operation.project.value.items, columns) |item, *out| out.* = item.alias orelse try engine.expressionName(item.expression);
         const fields = try @import("read_fields.zig").required(a, owned_query, graph);
@@ -981,6 +983,7 @@ pub const NodeCursor = struct {
         if (self.weighted_seeds) |*seeds| if (seeds.arena) |*arena| arena.deinit();
         self.adjacency_cache.deinit();
         self.engine.regex.deinit();
+        if (self.engine.invariants) |state_value| state_value.deinit();
         if (self.engine.expression_memo) |*memo| memo.deinit();
         self.arena.deinit();
         allocator.destroy(budget);
@@ -995,6 +998,7 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
     engine.strings = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
     defer engine.regex.deinit();
+    defer if (engine.invariants) |state_value| state_value.deinit();
     defer if (engine.expression_memo) |*memo| memo.deinit();
     for (compiled.parameters) |name| {
         _ = lookup(parameters, name) orelse return error.MissingCypherParameter;
@@ -1023,7 +1027,7 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
         engine.stats.scanned_anchors = initial.scanned_anchors;
         engine.stats.explored_edges = initial.explored_edges;
     };
-    const reductions = try reduction_plan.lowerCardinality(engine.a, compiled.query);
+    const reductions = try reduction_plan.lowerCardinalityParameters(engine.a, compiled.query, parameters);
     const query = if (writes) reductions else try @import("length_constraints.zig").normalize(engine.a, try @import("path_summaries.zig").lower(engine.a, reductions), parameters);
     // Opaque projection callbacks may require complete trusted input content.
     // Writes retain full snapshots across all mutation/postimage boundaries.
@@ -1111,9 +1115,21 @@ pub fn queryHasWrites(query: ast.Query) bool {
 const aggregateName = @import("expressions.zig").aggregateName;
 const aggregates = @import("expressions.zig").aggregates;
 const Engine = struct {
+    const Invariants = struct {
+        const Identity = struct { address: usize, length: usize };
+        work: value_work.Work,
+        bytes: ?*v.BytePool = null,
+        lists: std.AutoHashMapUnmanaged(u64, @import("invariant_membership.zig").Membership) = .empty,
+        owned_lists: std.AutoHashMapUnmanaged(Identity, @import("invariant_membership.zig").Membership) = .empty,
+        fn deinit(self: *@This()) void {
+            if (self.bytes) |pool| pool.deinit();
+        }
+    };
+
     a: A,
     scratch_allocator: A,
     planning_allocator: A = undefined,
+    invariants: ?*Invariants = null,
     anchor_estimates: std.StringHashMapUnmanaged(?usize) = .empty,
     regex: @import("regex.zig").Runtime,
     backend: backend_mod.Backend,
@@ -1386,19 +1402,37 @@ const Engine = struct {
         filter_states: []FilterState = &.{},
         collection_count: u64 = 0,
         collection_overflow: bool = false,
-        const FilterState = struct { count: u64 = 0, failure: ?anyerror = null };
-        fn filterItem(engine: *Engine, filter: ast.CollectionFilter, value: v.Value) !bool {
+        const FilterState = struct {
+            count: u64 = 0,
+            failure: ?anyerror = null,
+            unknown: bool = false,
+            decided: ?bool = null,
+            fn result(self: @This(), kind: ast.CollectionFilter.Kind) v.Value {
+                if (kind == .count) return .{ .integer = @intCast(self.count) };
+                if (self.decided) |answer| return .{ .boolean = answer };
+                if (self.unknown) return .null;
+                return .{ .boolean = switch (kind) {
+                    .all, .none => true,
+                    .any => false,
+                    .single => self.count == 1,
+                    .count => unreachable,
+                } };
+            }
+        };
+        fn filterItem(engine: *Engine, filter: ast.CollectionFilter, value: v.Value) !?bool {
             const previous = engine.projection_locals;
             const local: @import("expressions.zig").Local = .{ .name = filter.alias, .parent = previous };
             engine.projection_locals = &local;
             defer engine.projection_locals = previous;
             const row = &.{v.Entry{ .name = filter.alias, .value = value }};
+            if (filter.kind != .count) return (try engine.eval(filter.predicate.?, row, null)).truth();
             if (filter.predicate) |predicate| if ((try (try engine.eval(predicate, row, null)).truth()) != true) return false;
             // SIZE still observes projection errors and counts NULL projections.
             if (filter.projection) |projection| _ = try engine.eval(projection, row, null);
             return true;
         }
         fn addSummary(self: *@This(), engine: *Engine, value: v.Value, weight: Count) !void {
+            if (weight.cap(1) == 0) return;
             if (!self.collection_overflow) self.collection_count = addPathCount(self.collection_count, weight.cap(std.math.maxInt(u64))) catch blk: {
                 self.collection_overflow = true;
                 break :blk 0;
@@ -1411,7 +1445,7 @@ const Engine = struct {
             var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
             defer scratch.deinit();
             for (self.function.collect_filters, self.filter_states) |filter, *state_value| {
-                if (state_value.failure != null) continue;
+                if (state_value.failure != null or state_value.decided != null) continue;
                 _ = scratch.reset(.free_all);
                 const scope = EvalScope.enter(engine, scratch.allocator());
                 defer scope.leave(engine);
@@ -1422,10 +1456,24 @@ const Engine = struct {
                     },
                     else => return err,
                 };
-                if (selected) state_value.count = addPathCount(state_value.count, weight.cap(std.math.maxInt(u64))) catch |err| blk: {
-                    state_value.failure = err;
-                    break :blk 0;
-                };
+                if (filter.kind == .count) {
+                    if (selected == true) state_value.count = addPathCount(state_value.count, weight.cap(std.math.maxInt(u64))) catch |err| blk: {
+                        state_value.failure = err;
+                        break :blk 0;
+                    };
+                } else if (selected) |answer| {
+                    if (answer) {
+                        state_value.count = @min(2, state_value.count + weight.cap(2));
+                        switch (filter.kind) {
+                            .any => state_value.decided = true,
+                            .none => state_value.decided = false,
+                            .single => if (state_value.count > 1) {
+                                state_value.decided = false;
+                            },
+                            else => {},
+                        }
+                    } else if (filter.kind == .all) state_value.decided = false;
+                } else state_value.unknown = true;
             }
         }
         fn consumedOrdinal(self: *const @This(), ordinal: usize) bool {
@@ -1690,9 +1738,9 @@ const Engine = struct {
             const tuple = try engine.a.alloc(v.Value, header + window.list.len);
             tuple[0] = .{ .integer = if (self.collection_overflow) -1 else @intCast(self.collection_count) };
             @memcpy(tuple[header..], window.list);
-            for (self.function.collect_filters, 0..) |_, i| {
+            for (self.function.collect_filters, 0..) |filter, i| {
                 const state_value: FilterState = if (self.filter_states.len == 0) .{} else self.filter_states[i];
-                tuple[1 + i * 2] = .{ .integer = @intCast(state_value.count) };
+                tuple[1 + i * 2] = state_value.result(filter.kind);
                 tuple[2 + i * 2] = .{ .integer = if (state_value.failure) |err| @intFromError(err) else 0 };
             }
             return .{ .list = tuple };
@@ -8025,8 +8073,52 @@ const Engine = struct {
         }
         const result = try self.evalInner(expression, row, group);
         if (memoizable) try self.expression_memo.?.put(self, key, @intFromPtr(expression), .{ .rows = &.{&.{.{ .name = "value", .value = result }}}, .weights = &.{Count.one} });
-        _ = try self.values.info(result);
+        if (expression.value == .parameter) {
+            _ = try (try self.invariantState()).work.info(result);
+        } else _ = try self.values.info(result);
         return result;
+    }
+    fn invariantState(self: *Engine) !*Invariants {
+        if (self.invariants == null) {
+            const state_value = try self.planning_allocator.create(Invariants);
+            state_value.* = .{ .work = .{ .a = self.planning_allocator, .ptr = self, .charge = chargeWork } };
+            self.invariants = state_value;
+        }
+        self.values.parent = &self.invariants.?.work;
+        return self.invariants.?;
+    }
+    fn evalMembership(self: *Engine, left: v.Value, right: *const ast.Expr, row: Row, group: ?[]const Row) !v.Value {
+        const invariant = self.read_only and right.execution_invariant != null;
+        if (!invariant) {
+            const value = try self.eval(right, row, group);
+            if (self.read_only and value == .list) if (self.invariants) |owner| if (owner.work.hasMetadata(value)) {
+                // Forwarded parameter lists have statement-owned provenance.
+                // Key by allocation, since one row variable can alternate lists.
+                const id: Invariants.Identity = .{ .address = @intFromPtr(value.list.ptr), .length = value.list.len };
+                if (owner.owned_lists.getPtr(id)) |cached| return cached.contains(&self.values, left);
+                const built = try @import("invariant_membership.zig").Membership.init(self.planning_allocator, self.scratch_allocator, &owner.bytes, &owner.work, value);
+                try owner.owned_lists.put(self.planning_allocator, id, built);
+                return owner.owned_lists.getPtr(id).?.contains(&self.values, left);
+            };
+            return self.binary(.in, left, value);
+        }
+        const state_value = try self.invariantState();
+        if (state_value.lists.getPtr(right.execution_invariant.?)) |cached| return cached.contains(&self.values, left);
+        // Evaluate in its original position, then acquire independent ownership
+        // before producer pages or nested expression arenas can be recycled.
+        const value = try self.eval(right, row, group);
+        if (value != .null and value != .list) return error.CypherTypeMismatch;
+        const source: ?Invariants.Identity = if (value == .list and state_value.work.hasMetadata(value)) .{ .address = @intFromPtr(value.list.ptr), .length = value.list.len } else null;
+        if (source) |id| if (state_value.owned_lists.get(id)) |cached| {
+            // Cache headers are immutable views of statement-owned allocations;
+            // direct uses and forwarded aliases share one physical membership.
+            try state_value.lists.put(self.planning_allocator, right.execution_invariant.?, cached);
+            return state_value.lists.getPtr(right.execution_invariant.?).?.contains(&self.values, left);
+        };
+        const built = try @import("invariant_membership.zig").Membership.init(self.planning_allocator, self.scratch_allocator, &state_value.bytes, &state_value.work, value);
+        if (source) |id| try state_value.owned_lists.put(self.planning_allocator, id, built);
+        try state_value.lists.put(self.planning_allocator, right.execution_invariant.?, built);
+        return state_value.lists.getPtr(right.execution_invariant.?).?.contains(&self.values, left);
     }
     fn evalInner(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) anyerror!v.Value {
         if (expression.value != .variable) if (self.projection_overrides) |overrides| for (overrides.items, overrides.row) |item, entry| {
@@ -8105,7 +8197,7 @@ const Engine = struct {
                     else => unreachable,
                 };
             },
-            .binary => |b| try self.binary(b.op, try self.eval(b.left, row, group), try self.eval(b.right, row, group)),
+            .binary => |b| if (b.op == .in) try self.evalMembership(try self.eval(b.left, row, group), b.right, row, group) else try self.binary(b.op, try self.eval(b.left, row, group), try self.eval(b.right, row, group)),
             .comparison => |c| blk: {
                 var previous = try self.eval(c.operands[0], row, group);
                 var result: v.Value = .{ .boolean = true };
@@ -8744,7 +8836,7 @@ const Engine = struct {
         fn enter(engine: *Engine, a: A) EvalScope {
             const scope: EvalScope = .{ .a = engine.a, .values = engine.values, .strings = engine.strings, .regex = engine.regex, .reads = engine.read_nodes, .cache_reads = engine.cache_reads };
             engine.a = a;
-            engine.values = .{ .a = a, .ptr = engine, .charge = chargeWork };
+            engine.values = .{ .a = a, .ptr = engine, .charge = chargeWork, .parent = if (engine.invariants) |state_value| &state_value.work else null };
             engine.strings = .{ .a = a, .ptr = engine, .charge = chargeWork };
             engine.regex = .{ .a = a, .scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator) };
             engine.read_nodes = .empty;
@@ -9710,4 +9802,28 @@ test "collection suffix runs cap promoted weights and trim overlapping windows" 
     try std.testing.expectEqual(@as(usize, 5), result.list.len);
     for (result.list, [_]i64{ 7, 7, 7, 8, 8 }) |value, expected| try std.testing.expectEqual(expected, value.integer);
     try std.testing.expectError(error.UnboundCypherVariable, collector.addWeighted(&engine, &.{}, huge));
+}
+
+test "boolean collection summaries cap promoted multiplicities and ignore empty runs" {
+    const Noop = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dummy: u8 = 0;
+    var engine: Engine = .{ .a = arena.allocator(), .scratch_allocator = std.testing.allocator, .regex = .{ .a = arena.allocator(), .scratch = std.heap.ArenaAllocator.init(std.testing.allocator) }, .backend = .{ .ptr = &dummy, .vtable = &.{ .bind = undefined, .checkpoint = Noop.checkpoint, .scan = undefined, .get = undefined, .expand = undefined } }, .graph = undefined, .source = "", .parameters = &.{}, .limits = .{} };
+    defer engine.regex.deinit();
+    engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
+    engine.strings = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
+    const input: ast.Expr = .{ .span = .{}, .value = .{ .variable = "x" } };
+    const predicate: ast.Expr = .{ .span = .{}, .value = .{ .variable = "y" } };
+    const huge = try Count.parse(engine.a, "1180591620717411303424");
+    for ([_]ast.CollectionFilter.Kind{ .all, .any, .none, .single }) |kind| {
+        var collector: Engine.StreamingAggregate = .{ .function = .{ .name = "collect", .args = &.{&input}, .collect_limit = 0, .collect_summary = true, .collect_filters = &.{.{ .alias = "y", .predicate = &predicate, .projection = null, .kind = kind }} }, .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .distinct_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+        defer collector.deinit();
+        try collector.addWeighted(&engine, &.{.{ .name = "x", .value = .{ .boolean = true } }}, Count.init(0));
+        try std.testing.expectEqual(kind == .all or kind == .none, (try collector.finish(&engine)).list[1].boolean);
+        try collector.addWeighted(&engine, &.{.{ .name = "x", .value = .{ .boolean = true } }}, huge);
+        try std.testing.expectEqual(kind == .all or kind == .any, (try collector.finish(&engine)).list[1].boolean);
+    }
 }

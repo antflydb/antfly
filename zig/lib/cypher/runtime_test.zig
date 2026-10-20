@@ -3716,3 +3716,111 @@ test "collection summaries and ordered distinct windows release every failed all
         "UNWIND [1,2] AS x WITH collect(DISTINCT x) AS xs RETURN size([y IN xs WHERE y>1]),CASE WHEN true THEN 7 ELSE size([y IN xs WHERE y/0>1]) END",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as([]const u8, text)});
 }
+
+test "invariant IN membership preserves nullable structures numeric identity and recycled rows" {
+    try check("UNWIND [0,1,2,null] AS x RETURN x IN [1,null]", "[[null],[true],[null],[null]]");
+    try check("UNWIND [[1],[2],[null],[1,null],[]] AS x RETURN x IN [[1],[null]]", "[[true],[null],[null],[false],[false]]");
+    try check("UNWIND [{x:1},{x:2},{x:null},{y:1}] AS x RETURN x IN [{x:1},{x:null}]", "[[true],[null],[null],[false]]");
+    try check("UNWIND [9007199254740992,9007199254740993] AS x RETURN x IN [9007199254740992.0]", "[[true],[false]]");
+    try check("UNWIND [[0],[1],[2]] AS xs RETURN 1 IN xs", "[[false],[true],[false]]");
+    try check("RETURN null IN [],null IN [1],1 IN null", "[[false,null,null]]");
+    try check("MATCH(n:Document) RETURN n IN [n]", "[[true],[true],[true]]");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [$a,$b] AS xs UNWIND [0,2] AS x RETURN x IN xs", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{ .{ .name = "a", .value = .{ .list = &.{.{ .integer = 0 }} } }, .{ .name = "b", .value = .{ .list = &.{.{ .integer = 2 }} } } }, .{});
+    defer result.deinit();
+    for (result.rows, [_]bool{ true, false, false, true }) |row, expected| try std.testing.expectEqual(expected, row[0].boolean);
+}
+
+test "invariant IN membership has bounded work through parameter aliases" {
+    var values: [512]v.Value = undefined;
+    for (&values, 0..) |*value, i| value.* = .{ .integer = @intCast(i) };
+    for ([_][]const u8{
+        "UNWIND range(0,2999) AS x RETURN sum(CASE WHEN x IN $xs THEN 1 ELSE 0 END)",
+        "WITH $xs AS ys UNWIND range(0,2999) AS x RETURN sum(CASE WHEN x IN ys THEN 1 ELSE 0 END)",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = &values } }}, .{ .intermediate_states = 200_000 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 512), result.rows[0][0].integer);
+    }
+}
+
+test "parameter collection bounds specialize each execution without mutating prepared AST" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [1,2,3] AS x WITH collect(x) AS xs RETURN xs[$i],xs[..$k],size(xs)", .{}, &diagnostic);
+    defer compiled.deinit();
+    for ([_]i64{ 0, -1, 20 }) |index| {
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{ .{ .name = "i", .value = .{ .integer = index } }, .{ .name = "k", .value = .{ .integer = 1 } } }, .{});
+        defer result.deinit();
+        if (index == 20) try std.testing.expect(result.rows[0][0] == .null) else try std.testing.expectEqual(@as(i64, if (index == 0) 1 else 3), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 1), result.rows[0][1].list[0].integer);
+        try std.testing.expectEqual(@as(i64, 3), result.rows[0][2].integer);
+    }
+    const bound = compiled.query.clauses[2].operation.project.value.items[0].expression.value.index.index;
+    try std.testing.expect(bound.execution_integer == null);
+    var fixture: Fixture = .{};
+    var null_result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{ .{ .name = "i", .value = .null }, .{ .name = "k", .value = .{ .integer = 1 } } }, .{});
+    defer null_result.deinit();
+    try std.testing.expect(null_result.rows[0][0] == .null);
+    try std.testing.expectError(error.CypherTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{ .{ .name = "i", .value = .{ .string = "bad" } }, .{ .name = "k", .value = .{ .integer = 1 } } }, .{}));
+}
+
+test "boolean collection summaries preserve three valued results short circuiting and lazy errors" {
+    try check("UNWIND [] AS x WITH collect(x) AS xs RETURN all(y IN xs WHERE true),any(y IN xs WHERE true),none(y IN xs WHERE true),single(y IN xs WHERE true)", "[[true,false,true,false]]");
+    try check("UNWIND [0,1] AS x WITH collect(x) AS xs RETURN all(y IN xs WHERE CASE WHEN y=0 THEN null ELSE true END),any(y IN xs WHERE CASE WHEN y=0 THEN null ELSE true END),none(y IN xs WHERE CASE WHEN y=0 THEN null ELSE true END),single(y IN xs WHERE CASE WHEN y=0 THEN null ELSE true END)", "[[null,true,false,null]]");
+    try check("UNWIND [1,0] AS x WITH collect(x) AS xs RETURN any(y IN xs WHERE 1/y>0),none(y IN xs WHERE 1/y>0)", "[[true,false]]");
+    try check("UNWIND [-1,0] AS x WITH collect(x) AS xs RETURN all(y IN xs WHERE 1/y>0)", "[[false]]");
+    try check("UNWIND [1,1,0] AS x RETURN single(y IN collect(x) WHERE 1/y>0)", "[[false]]");
+    try check("UNWIND [0,1] AS x WITH collect(x) AS xs RETURN CASE WHEN true THEN 7 ELSE any(y IN xs WHERE 1/y>0) END", "[[7]]");
+    try check("UNWIND [1,1,2,null] AS x WITH collect(DISTINCT x) AS xs WITH xs AS ys RETURN size(ys),head(ys),last(ys),single(y IN ys WHERE y=1),size([y IN ys WHERE y>1])", "[[2,1,2,true,1]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs,1 AS k RETURN any(y IN xs WHERE y>k),xs", "[[true,[1,2]]]");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [0,1] AS x WITH collect(x) AS xs RETURN any(y IN xs WHERE 1/y>0)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+}
+
+test "invariant membership preserves shared value DAGs and cancellation" {
+    try check("RETURN 0 IN [reduce(a=[1],x IN range(1,24)|[a,a])]", "[[false]]");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND range(1,1000) AS x RETURN x IN range(1,1000)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{ .cancel_after = 10 };
+    try std.testing.expectError(error.Canceled, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+}
+
+test "invariant membership bound specialization and boolean summaries release failed allocations" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, kind: u1) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            const wide: [512]u8 = @splat('x');
+            const parameters = [_]v.Entry{
+                .{ .name = "xs", .value = .{ .list = &.{ .{ .string = &wide }, .null, .{ .list = &.{.null} } } } },
+                .{ .name = "word", .value = .{ .string = &wide } },
+                .{ .name = "i", .value = .{ .integer = -1 } },
+            };
+            var diagnostic: c.Diagnostic = .{};
+            const text = if (kind == 0)
+                "WITH $xs AS ys UNWIND [$word,'other'] AS x RETURN x IN $xs,x IN ys"
+            else
+                "UNWIND [1,1,2,null] AS x WITH collect(DISTINCT x) AS xs RETURN xs[$i],size(xs),any(y IN xs WHERE y>1),all(y IN xs WHERE y>0),single(y IN xs WHERE y=2)";
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &parameters, .{});
+            defer result.deinit();
+        }
+    };
+    inline for (.{ @as(u1, 0), @as(u1, 1) }) |kind| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{kind});
+}
