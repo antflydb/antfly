@@ -3624,17 +3624,26 @@ its proof excludes synonym expansion and requires compatible, complete mappings.
 Retained pages can reuse exact predicate membership in a process-local 16 MiB
 cache with 128 slots, 2 MiB per entry, and the admitted cut's expiry. The cache
 stores ID bitmaps and a scalar completeness flag; no source bodies, credentials,
-leases, output, or authorization decisions are retained. Every request still
-passes authorization, cut admission/expiry and projection readiness. Current
+snapshot leases, output, or authorization decisions are retained. Every request
+still passes authorization, cut admission/expiry and projection readiness. Current
 candidate constraints apply before using partial facts. Full membership also
 includes the conservative index's proof of absence outside its candidates.
 A different cut or predicate misses; cache refusal and eviction preserve exact
 verification. These cache entries are never written to disk.
 
-Within one request, compatible literal groups share one bounded multi-output
-automaton and one coverage set, while preserving each clause's positive matches
-and boost. Other multi-leaf queries can share decoded originals under an 8 MiB /
-4,096-entry limit. Single-leaf queries retain streaming scratch. Verification
+Within one execution, two to 64 direct original-value OR siblings evaluate the
+same streamed document, retaining compact membership rather than a decoded corpus.
+AND/nested branches keep their candidate scope and cheap literal fusion; indexed
+siblings retain their selective iterator rather than expanding regex work.
+Regex, equality and different-field clauses preserve compatible literal groups;
+each group uses a bounded multi-output automaton. Demanded leaf errors propagate;
+optional sibling errors remain unknown until that leaf is demanded. Regex work
+is budgeted and cancellation/deadlines remain active. Separate execution components
+can additionally share originals under an 8 MiB / 4,096-entry limit. Single-leaf
+queries retain streaming scratch. Cache readers pin immutable entries; bitmap
+copies occur outside the directory lock, completed hits copy only the result,
+and oversized entries are rejected before eviction. Retired pinned entries remain
+charged against the same 16 MiB allocation budget. Verification
 skips tombstoned physical slots before loading source and checks cancellation
 while advancing over deleted runs. Query output hydration still has its own work;
 zero verification loads does not imply a zero-cost API request.

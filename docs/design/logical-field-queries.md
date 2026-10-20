@@ -97,26 +97,37 @@ index representations out of client configuration.
 
 ### Reusing exact verification work
 
-Three to 64 compatible case-sensitive `contains` leaves on the same source field
-can use a bounded multi-output byte automaton. It scans each source string once
-and retains each leaf's identity, boolean membership and boost, including
-independent matches across array elements. The group shares one coverage bitmap;
-only positive matches are stored per leaf, so negative knowledge does not grow
-as clauses multiplied by the union of candidates. Construction admits at most 1 MiB of
-transition storage; larger or incompatible groups use ordinary matchers. Eager
-traversal that reaches a source limit falls back to the requested leaf, preserving
-its existing early-match behavior.
+Two to 64 direct original-value OR siblings stream through each loaded document
+as one bounded execution cohort. Each predicate keeps independent membership,
+boost, case mode and source path. Regex, equality and different-field clauses no
+longer disable compatible literal groups in that cohort. AND/nested branches keep
+their incoming-candidate scope; only cheap same-field literal cohorts speculate
+across AND siblings. Indexed regex/equality siblings retain their own selective
+candidate iterator instead of expanding to a broader sibling's source domain. Groups of at least three case-sensitive
+`contains` leaves on the same field use a bounded multi-output byte automaton;
+construction admits at most 1 MiB of transition storage. Larger literal groups or
+allocation refusal fall back to individual matchers within the cohort.
 
-Other multi-leaf requests share a bounded decoded-source owner. A document is loaded
-and decoded once while it fits the owner's 8 MiB allocation budget and 4,096-entry
-ceiling. The owner is tied to the stored-document loader, contains only original
-JSON, and ends with the request. Single-leaf queries keep their streaming scratch
-path. Capacity refusal uses ordinary per-document scratch; it never changes
-membership or permits incomplete results. Document and byte budgets charge actual
-source loads, including repeats after cache refusal; regex work is still charged
-for each predicate evaluation. Verification snapshots the segment tombstone mask
-before source I/O, excludes deleted postings, and jumps over deleted runs on scan
-fallback. Superseded physical slots do not consume document/byte budgets.
+The demanded predicate runs first. Optional siblings reuse that same parsed
+source, under the same regex-work budget and cancellation/deadline control. A
+sibling evaluation failure is unknown, never a negative fact: its own candidate
+iterator must evaluate it normally if demanded. Eager traversal reaching a source
+limit falls back to individual leaf semantics, preserving early matches. Successful
+cohorts retain one shared coverage bitmap plus each leaf's positive matches;
+partially evaluated documents retain only the facts actually established. Source
+bodies are discarded after the document. This bounds working memory by a source
+scratch buffer, matcher state and compact membership, rather than expanded
+corpus size. Preparing another leaf after execution preserves existing coverage
+before regrouping.
+
+Separate execution components can additionally share a loader-scoped decoded
+source owner bounded to 8 MiB and 4,096 entries. Single-leaf execution uses scratch;
+cohort execution does not populate this body cache. Refusal preserves ordinary
+exact verification. Document/byte budgets count actual source loads; regex work
+counts actual evaluations, including optional successful sibling evaluations.
+Verification snapshots segment tombstones before source I/O, excludes deleted
+postings and jumps over deleted runs on fallback. Superseded slots do not consume
+document/byte budgets.
 
 Retained pagination may reuse verified positive **and negative** predicate facts
 from an admitted immutable query cut. A trusted storage scope binds the physical
@@ -140,8 +151,18 @@ read admission, projection readiness, and its own candidate constraints. A chang
 query or cut misses. Partial failed segment evaluations are never published.
 Concurrent builders may discard one another's cached subsets without changing
 results. LRU eviction, expiry and allocator refusal always fall back to exact
-verification. Storage is bounded to 128 entries / 16 MiB of bitmap allocations,
-with a 2 MiB entry ceiling; nothing is written to disk. Expired entries are
+verification. Storage is bounded to 128 directory entries / 16 MiB of admitted allocations,
+with a 2 MiB entry ceiling; nothing is written to disk. Exact-clone storage bounds
+are checked before eviction. Oversized predicates cannot evict valid entries.
+Readers pin immutable facts with reference-counted leases; expiry and eviction
+release only directory ownership. Pinned retired entries continue consuming the
+same budget until the last reader releases them. Cloning/populating bitmaps occurs
+outside the directory mutex. Completed hits clone only the owned result bitmap; constrained hits clone the
+smaller of incoming candidates and cached membership before intersecting.
+Partial builders clone mutable facts outside the lock. If all capacity is pinned,
+new admission falls back to verification without exceeding the memory bound.
+Admission counts only reclaimable, unpinned entries as available eviction space;
+a doomed insertion under pin pressure cannot flush unrelated useful entries. Expired entries are
 reclaimed on subsequent cache access. Deployment restarts and owner moves may
 lose reuse, but preserve correctness.
 
@@ -227,3 +248,8 @@ mappings, unknown observed source associations, deleted-slot budgets, cache
 isolation after writes, shared source decoding, literal fusion, and lossless
 keyword proof. Its small shared-host Debug workload measures verification loads
 and end-to-end latency; it establishes no production-scale RSS or platform parity.
+
+Named detailed search-as-you-type representations use a plain lowercase query
+analyzer, not the prefix-expanding index analyzer. A query for `distributed` must
+not match `Dinosaur Bones` through the generated `di` token. Existing generated
+shingle/root analyzers retain their configured semantics.

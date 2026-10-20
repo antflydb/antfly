@@ -769,12 +769,15 @@ def test_logical_named_autocomplete_keeps_declared_source_associations(stateful_
     )
     stateful_api.batch_write(
         table,
-        inserts={"a": {"title": "Distributed Systems"}},
+        inserts={
+            "a": {"title": "Distributed Systems"},
+            "b": {"title": "Dinosaur Bones"},
+        },
         sync_level="full_index",
     )
     response = requests.post(
         stateful_api.url + f"/tables/{table}/query",
-        json={"query": {"autocomplete": "distributed sy", "field": "title"}},
+        json={"query": {"autocomplete": "distributed", "field": "title"}},
         timeout=60,
     )
     assert response.status_code == 200, response.text
@@ -952,6 +955,149 @@ def test_logical_verification_work_profile(stateful_api):
                 ).hexdigest(),
                 "records": records,
                 "limitations": "Debug server, shared macOS host, warm caches; work counters are exact, wall times include HTTP and host contention.",
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def test_logical_mixed_streaming_exceeds_decoded_source_cache(stateful_api):
+    """Mixed shapes retain membership, not a corpus of parsed source bodies."""
+    table = f"logical_mixed_stream_{time.time_ns()}"
+    stateful_api.create_table(table)
+    documents = 4096
+    title = "needle alpha beta " + "x" * 4096
+    for start in range(0, documents, 256):
+        stateful_api.batch_write(
+            table,
+            inserts={f"{i:05}": {"title": title} for i in range(start, start + 256)},
+            sync_level="full_index",
+        )
+    response = requests.post(
+        stateful_api.url + f"/tables/{table}/query",
+        json={
+            "query": {
+                "bool": {
+                    "should": [
+                        *(
+                            {"contains": word, "field": "title"}
+                            for word in ("needle", "alpha", "beta")
+                        ),
+                        {"matches": "z[e]bra", "field": "title"},
+                        {"equals": "missing", "field": "other"},
+                    ]
+                }
+            },
+            "count": True,
+            "limit": 1,
+            "fields": [],
+            "profile": True,
+            # Exactly one source pass fits. Repeated passes must fail admission.
+            "value_search_execution": {
+                "allow_scan": True,
+                "max_documents": documents,
+                "max_bytes": 20 * 1024 * 1024,
+                "max_regex_work": 1_000_000_000,
+            },
+        },
+        timeout=120,
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()["responses"][0]
+    assert result["status"] == 200, result
+    assert result["hits"]["total"] == {"value": documents, "relation": "exact"}
+    assert result["profile"]["value_search"]["documents"] == documents
+    assert result["profile"]["value_search"]["bytes"] == documents * len(
+        json.dumps({"title": title}, separators=(",", ":")).encode()
+    )
+
+
+def test_logical_mixed_work_profile(stateful_api):
+    """Opt-in reproducible work/latency comparison against an earlier binary."""
+    import hashlib
+    import platform
+
+    report = os.environ.get("ANTFLY_LOGICAL_STREAM_REPORT")
+    if not report:
+        pytest.skip(
+            "Set ANTFLY_LOGICAL_STREAM_REPORT to capture seven mixed-work trials"
+        )
+    table = f"stream_profile_{time.time_ns()}"
+    stateful_api.create_table(table)
+    n = 4096
+    title = "needle alpha beta " + "x" * 4096
+    for start in range(0, n, 256):
+        stateful_api.batch_write(
+            table,
+            inserts={f"{i:05}": {"title": title} for i in range(start, start + 256)},
+            sync_level="full_index",
+        )
+    leaves = [
+        {"contains": word, "field": "title"} for word in ("needle", "alpha", "beta")
+    ]
+    records = []
+    for trial in range(7):
+        for name, query in (
+            ("literal3", leaves),
+            ("mixed4", leaves + [{"matches": "z[e]bra", "field": "title"}]),
+            (
+                "mixed5",
+                leaves
+                + [
+                    {"matches": "z[e]bra", "field": "title"},
+                    {"equals": "missing", "field": "other"},
+                ],
+            ),
+        ):
+            started = time.perf_counter_ns()
+            response = requests.post(
+                stateful_api.url + f"/tables/{table}/query",
+                json={
+                    "query": {"bool": {"should": query}},
+                    "count": True,
+                    "limit": 1,
+                    "fields": [],
+                    "profile": True,
+                    "value_search_execution": {
+                        "allow_scan": True,
+                        "max_bytes": 256 * 1024 * 1024,
+                        "max_regex_work": 1000000000,
+                    },
+                },
+                timeout=120,
+            )
+            elapsed = time.perf_counter_ns() - started
+            assert response.status_code == 200, response.text
+            result = response.json()["responses"][0]
+            assert result["status"] == 200, result
+            assert result["hits"]["total"] == {"value": n, "relation": "exact"}, result
+            records.append(
+                {
+                    "trial": trial,
+                    "name": name,
+                    "elapsed_ns": elapsed,
+                    "work": result["profile"]["value_search"],
+                }
+            )
+    corpus = hashlib.sha256()
+    for i in range(n):
+        corpus.update(
+            json.dumps([f"{i:05}", {"title": title}], separators=(",", ":")).encode()
+        )
+    with open(os.environ["ANTFLY_BIN"], "rb") as binary:
+        binary_sha = hashlib.file_digest(binary, "sha256").hexdigest()
+    Path(report).write_text(
+        json.dumps(
+            {
+                "binary_sha256": binary_sha,
+                "host": platform.platform(),
+                "cpu_count": os.cpu_count(),
+                "documents": n,
+                "source_bytes": n
+                * len(json.dumps({"title": title}, separators=(",", ":")).encode()),
+                "corpus_sha256": corpus.hexdigest(),
+                "records": records,
             },
             indent=2,
         )

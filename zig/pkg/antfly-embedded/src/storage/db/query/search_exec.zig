@@ -18666,6 +18666,12 @@ const value_query = @import("../../../search/value_query.zig");
 /// Request-owned verification: compact membership is memoized so rescoring,
 /// cursor collection and counting do not reload the same original values.
 const ValueExecution = struct {
+    const LiteralGroup = struct {
+        set: value_query.LiteralSet,
+        slots: [64]u6,
+        count: usize,
+    };
+    const Cohort = struct { known: roaring.RoaringBitmap, members: u64 = 0 };
     a: Allocator,
     snapshot: *const index_mod.IndexSnapshot,
     req: types.SearchRequest,
@@ -18673,12 +18679,12 @@ const ValueExecution = struct {
     load: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
     producers: std.ArrayListUnmanaged(*ValueProducer) = .empty,
     local_work: value_query.Work = .{},
-    literals: ?value_query.LiteralSet = null,
-    fused_known: ?roaring.RoaringBitmap = null,
+    literal_groups: std.ArrayListUnmanaged(LiteralGroup) = .empty,
+    cohorts: std.ArrayListUnmanaged(Cohort) = .empty,
+    active_cohort: ?usize = null,
     literals_checked: bool = false,
     fn deinit(self: *@This()) void {
-        if (self.literals) |*set| set.deinit();
-        if (self.fused_known) |*known| known.deinit();
+        self.clearGroups();
         for (self.producers.items) |producer| {
             producer.matcher.deinit();
             producer.visited.deinit();
@@ -18686,45 +18692,122 @@ const ValueExecution = struct {
             self.a.destroy(producer);
         }
         self.producers.deinit(self.a);
+        for (self.cohorts.items) |*cohort| cohort.known.deinit();
+        self.cohorts.deinit(self.a);
         self.local_work.deinit(self.a);
+    }
+    fn clearGroups(self: *@This()) void {
+        for (self.literal_groups.items) |*group| group.set.deinit();
+        self.literal_groups.deinit(self.a);
+        self.literal_groups = .empty;
+        for (self.cohorts.items) |*cohort| {
+            cohort.known.deinit();
+            cohort.known = roaring.RoaringBitmap.init(self.a);
+        }
+        self.literals_checked = false;
+    }
+    fn streamsPredicates(self: *@This(), producer: *ValueProducer) bool {
+        if (self.producers.items.len > 64) return false;
+        const cohort = producer.cohort orelse return false;
+        return @popCount(self.cohorts.items[cohort].members) >= 2;
+    }
+    fn newCohort(self: *@This()) !usize {
+        const id = self.cohorts.items.len;
+        try self.cohorts.append(self.a, .{ .known = roaring.RoaringBitmap.init(self.a) });
+        return id;
     }
     fn prepareLiterals(self: *@This()) void {
         if (self.literals_checked) return;
         self.literals_checked = true;
-        const producers = self.producers.items;
-        if (producers.len < 3 or producers.len > 64) return;
-        const field = producers[0].matcher.spec.field;
-        var needles: [64][]const u8 = undefined;
-        for (producers, 0..) |producer, i| {
-            const spec = producer.matcher.spec;
-            if (spec.kind != .contains or !spec.case_sensitive or !std.mem.eql(u8, field, spec.field)) return;
-            needles[i] = spec.text;
+        if (self.producers.items.len > 64) return;
+        var grouped: u64 = 0;
+        for (self.producers.items, 0..) |first, i| {
+            if (grouped & (@as(u64, 1) << @intCast(i)) != 0) continue;
+            const spec = first.matcher.spec;
+            if (spec.kind != .contains or !spec.case_sensitive or first.exact_keyword or !self.streamsPredicates(first)) continue;
+            var needles: [64][]const u8 = undefined;
+            var slots: [64]u6 = undefined;
+            var n: usize = 0;
+            for (self.producers.items, 0..) |other, j| {
+                const candidate = other.matcher.spec;
+                if (candidate.kind != .contains or !candidate.case_sensitive or other.exact_keyword or other.cohort != first.cohort or !std.mem.eql(u8, candidate.field, spec.field)) continue;
+                needles[n] = candidate.text;
+                slots[n] = @intCast(j);
+                grouped |= @as(u64, 1) << @intCast(j);
+                n += 1;
+            }
+            if (n < 3) continue;
+            var set = value_query.LiteralSet.init(@import("../../../sql/memory_budget.zig").reclaimingAllocator(self.a), needles[0..n]) catch continue;
+            self.literal_groups.append(self.a, .{ .set = set, .slots = slots, .count = n }) catch {
+                set.deinit();
+                continue;
+            };
         }
-        // This is optional admission, not a new failure mode for valid queries.
-        self.literals = value_query.LiteralSet.init(@import("../../../sql/memory_budget.zig").reclaimingAllocator(self.a), needles[0..producers.len]) catch return;
-        self.fused_known = roaring.RoaringBitmap.init(self.a);
+    }
+    fn evaluateLeaf(self: *@This(), slot: usize, doc: std.json.Value, done: *u64, positives: *u64) !void {
+        const bit = @as(u64, 1) << @intCast(slot);
+        if (done.* & bit != 0) return;
+        const producer = self.producers.items[slot];
+        for (self.literal_groups.items) |*group| {
+            var member = false;
+            for (group.slots[0..group.count]) |index| if (index == slot) {
+                member = true;
+                break;
+            };
+            if (!member) continue;
+            if (group.set.document(doc, producer.matcher.spec.field)) |bits| {
+                for (group.slots[0..group.count], 0..) |index, j| {
+                    const target = @as(u64, 1) << index;
+                    done.* |= target;
+                    if (bits & (@as(u64, 1) << @intCast(j)) != 0) positives.* |= target;
+                }
+                return;
+            } else |_| {
+                // Eager group traversal may exceed a limit after a required
+                // leaf could have returned early. Preserve individual behavior.
+                break;
+            }
+        }
+        const yes = try producer.matcher.document(doc);
+        done.* |= bit;
+        if (yes) positives.* |= bit;
     }
     fn matchSource(self: *@This(), producer: *ValueProducer, global: u32, doc: std.json.Value) !bool {
-        if (self.literals) |*set| {
-            const bits = set.document(doc, producer.matcher.spec.field) catch |err| switch (err) {
-                // An optional eager group must not make a leaf fail when that
-                // leaf alone could finish before the traversal budget expires.
-                error.ValueSearchLimitExceeded => return producer.matcher.document(doc),
-                else => return err,
-            };
-            // One coverage set represents negative knowledge for the group.
-            // Sparse matches retain only their own positive leaf IDs, avoiding
-            // clauses × union-candidates bitmap growth on broad miss workloads.
-            try self.fused_known.?.add(global);
-            var remaining = bits;
-            while (remaining != 0) {
-                const i: usize = @intCast(@ctz(remaining));
-                try self.producers.items[i].matched.add(global);
-                remaining &= remaining - 1;
+        if (!self.streamsPredicates(producer)) return producer.matcher.document(doc);
+        const cohort = &self.cohorts.items[producer.cohort.?];
+        const required = cohort.members;
+        var done: u64 = 0;
+        var positives: u64 = 0;
+        for (self.producers.items, 0..) |leaf, i| {
+            const bit = @as(u64, 1) << @intCast(i);
+            if (required & bit == 0) continue;
+            if (leaf.visited.contains(global)) {
+                done |= bit;
+                if (leaf.matched.contains(global)) positives |= bit;
             }
-            return producer.matched.contains(global);
         }
-        return producer.matcher.document(doc);
+        try self.evaluateLeaf(producer.slot, doc, &done, &positives);
+        for (self.producers.items, 0..) |leaf, i| {
+            if (required & (@as(u64, 1) << @intCast(i)) == 0) continue;
+            // Preserve indexed selectivity: a sibling with its own candidate
+            // constraint runs through that iterator rather than expanding work
+            // to this leaf's broader source domain.
+            if (leaf != producer and leaf.candidate != null) continue;
+            try (@import("../../../search/query.zig").ExecutionControl{ .cancellation = self.req.cancellation, .deadline_ns = self.req.execution_deadline_ns }).check();
+            // Optional siblings use the same bounded work policy. Failures are
+            // never negative facts: defer them until that leaf is demanded by
+            // its own candidate iterator, without failing the requested leaf.
+            self.evaluateLeaf(i, doc, &done, &positives) catch continue;
+        }
+        const complete = done & required == required;
+        if (complete) try cohort.known.add(global);
+        for (self.producers.items, 0..) |leaf, i| {
+            const bit = @as(u64, 1) << @intCast(i);
+            if (done & bit == 0) continue;
+            if (!complete) try leaf.visited.add(global);
+            if (positives & bit != 0) try leaf.matched.add(global);
+        }
+        return positives & (@as(u64, 1) << @intCast(producer.slot)) != 0;
     }
     fn prepare(self: *@This(), arena: Allocator, spec: value_query.Spec, analysis: introducer_mod.TextAnalysisConfig, schema: ?runtime_schema_mod.TableSchema) !search_mod.SearchQuery {
         const producer = try self.a.create(ValueProducer);
@@ -18767,13 +18850,17 @@ const ValueExecution = struct {
             try work.record(self.a, spec, physical, self.req.index_name, if (candidate == null) "no_safe_indexed_constraint" else null, if (producer.exact_keyword) "lossless_keyword" else "original_value");
         }
         if (self.load == null) return error.UnsupportedQueryRequest;
+        // Preparation normally finishes before execution. If a caller extends
+        // an already evaluated plan, preserve prior coverage before regrouping.
+        for (self.producers.items) |leaf| if (leaf.cohort) |cohort| try leaf.visited.orWith(&self.cohorts.items[cohort].known);
+        producer.slot = self.producers.items.len;
+        producer.cohort = self.active_cohort;
         try self.producers.append(self.a, producer);
+        if (producer.cohort) |cohort| if (producer.slot < 64 and !producer.exact_keyword) {
+            self.cohorts.items[cohort].members |= @as(u64, 1) << @intCast(producer.slot);
+        };
         (self.req.value_search_work orelse &self.local_work).registerLeaf();
-        if (self.literals) |*set| set.deinit();
-        if (self.fused_known) |*known| known.deinit();
-        self.literals = null;
-        self.fused_known = null;
-        self.literals_checked = false;
+        self.clearGroups();
         return .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = producer, .produce = ValueProducer.produce }, .boost = spec.boost } };
     }
 };
@@ -18785,6 +18872,12 @@ const ValueProducer = struct {
     visited: roaring.RoaringBitmap,
     matched: roaring.RoaringBitmap,
     exact_keyword: bool = false,
+    slot: usize = 0,
+    cohort: ?usize = null,
+    fn covered(self: *@This(), global: u32) bool {
+        if (!self.owner.streamsPredicates(self)) return false;
+        return self.owner.cohorts.items[self.cohort.?].known.contains(global);
+    }
     fn produce(raw: *anyopaque, a: Allocator, offset: u32, count: u32, incoming: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const owner = self.owner;
@@ -18812,18 +18905,25 @@ const ValueProducer = struct {
         const membership = value_query.membership;
         const now = if (scope != null) @import("../native_query_cut.zig").nowMs() else 0;
         const cache_key = if (scope) |cut| membership.key(cut, owner.req.index_name, lease.entry.id, count, self.matcher.spec) else null;
-        var facts = if (cache_key) |key| (try membership.retained.get(a, key, now)) orelse membership.Facts.init(a) else membership.Facts.init(a);
-        defer facts.deinit();
-        if (facts.complete) {
+        var cached = if (cache_key) |key| membership.retained.borrow(key, now) else null;
+        defer if (cached) |*pin| pin.deinit();
+        if (cached != null and cached.?.facts().complete) {
             // A complete immutable predicate already includes the proof of
             // absence outside its conservative candidate postings. It needs
             // neither another term expansion nor a scan of cached IDs.
-            const reused = try facts.matched.clone(a);
+            const held = &cached.?.facts().matched;
+            const reused = if (incoming) |other| try held.intersectionClone(a, other) else try held.cloneExact(a);
             result.deinit();
             result = reused;
-            if (incoming) |other| result.andWith(other);
             try control.check();
             return result;
+        }
+        var facts = if (cached) |pin| pin.facts().clone(a) catch membership.Facts.init(a) else membership.Facts.init(a);
+        defer facts.deinit();
+        // Partial builders own mutable copies; completed hits above copy once.
+        if (cached) |*pin| {
+            pin.deinit();
+            cached = null;
         }
         var changed = false;
         // Snapshot deletion state once without holding its read lease across
@@ -18867,7 +18967,7 @@ const ValueProducer = struct {
             if (local >= count) return error.InvalidArgument;
             if (deleted) |*tombstones| if (tombstones.contains(local)) continue;
             const global = offset + local;
-            if (self.visited.contains(global) or (if (owner.fused_known) |*known| known.contains(global) else false)) {
+            if (self.visited.contains(global) or self.covered(global)) {
                 const yes = self.matched.contains(global);
                 if (yes) try result.add(local);
                 // Fusion can establish this leaf while another leaf is being
@@ -18895,7 +18995,7 @@ const ValueProducer = struct {
                 const stored = try owner.load.?(owner.load_ctx, scratch.allocator(), id);
                 if (stored) |bytes| {
                     try value_query.Work.charge(&work.bytes, bytes.len, owner.req.value_search_execution.max_bytes);
-                    const shared = if (owner.literals == null) try work.sources.remember(owner.a, owner.load_ctx, id, bytes) else null;
+                    const shared = if (!owner.streamsPredicates(self)) try work.sources.remember(owner.a, owner.load_ctx, id, bytes) else null;
                     if (shared) |doc| {
                         matched = try owner.matchSource(self, global, doc);
                     } else {
@@ -18909,7 +19009,7 @@ const ValueProducer = struct {
                 if (matched) try facts.matched.add(local);
                 changed = true;
             }
-            if (!(if (owner.fused_known) |*known| known.contains(global) else false)) try self.visited.add(global);
+            if (!self.covered(global)) try self.visited.add(global);
             if (matched) {
                 try self.matched.add(global);
                 try result.add(local);
@@ -19147,9 +19247,9 @@ fn textQueryToSearchQueryWithValues(
             .boost = regexp.boost,
         } },
         .bool_query => |bool_query| .{ .bool_query = .{
-            .must = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must, text_analysis, runtime_schema, values),
-            .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema, values),
-            .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema, values),
+            .must = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must, text_analysis, runtime_schema, values, false),
+            .should = try textQuerySliceToSearchQuerySlice(alloc, bool_query.should, text_analysis, runtime_schema, values, true),
+            .must_not = try textQuerySliceToSearchQuerySlice(alloc, bool_query.must_not, text_analysis, runtime_schema, values, false),
             .min_should = bool_query.min_should,
             .pure_should_optional = bool_query.pure_should_optional,
             .boost = bool_query.boost,
@@ -19163,11 +19263,48 @@ fn textQuerySliceToSearchQuerySlice(
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
     values: ?*ValueExecution,
+    share_regex: bool,
 ) anyerror![]search_mod.SearchQuery {
     if (items.len == 0) return &.{};
-    var out = try alloc.alloc(search_mod.SearchQuery, items.len);
+    var groups: [64]?usize = @splat(null);
+    const previous = if (values) |execution| execution.active_cohort else null;
+    defer if (values) |execution| {
+        execution.active_cohort = previous;
+    };
+    if (values) |execution| if (items.len <= groups.len) {
+        var all_values = share_regex and items.len >= 2;
+        for (items) |item| {
+            if (item != .value) {
+                all_values = false;
+                break;
+            }
+        }
+        if (all_values) {
+            const cohort = try execution.newCohort();
+            @memset(groups[0..items.len], cohort);
+        } else {
+            // Preserve the existing cheap same-field literal fusion even in
+            // conjunctions. Expensive regex siblings keep their own domain.
+            for (items, 0..) |item, i| {
+                if (groups[i] != null or item != .value) continue;
+                const spec = item.value;
+                if (spec.kind != .contains or !spec.case_sensitive) continue;
+                var n: usize = 0;
+                for (items) |other| if (other == .value and other.value.kind == .contains and other.value.case_sensitive and std.mem.eql(u8, other.value.field, spec.field)) {
+                    n += 1;
+                };
+                if (n < 3) continue;
+                const cohort = try execution.newCohort();
+                for (items, 0..) |other, j| if (other == .value and other.value.kind == .contains and other.value.case_sensitive and std.mem.eql(u8, other.value.field, spec.field)) {
+                    groups[j] = cohort;
+                };
+            }
+        }
+    };
+    const out = try alloc.alloc(search_mod.SearchQuery, items.len);
     errdefer alloc.free(out);
     for (items, 0..) |item, i| {
+        if (values) |execution| execution.active_cohort = if (i < groups.len) groups[i] else null;
         out[i] = try textQueryToSearchQueryWithValues(alloc, item, text_analysis, runtime_schema, values);
     }
     return out;
@@ -20395,7 +20532,12 @@ test "fuzzy phrase clauses highlight matched surface terms" {
 /// two-byte suffixes would match nearly every document. Paths that cannot
 /// lower to containment lookups fall back to plain word tokens.
 fn queryTextAnalyzer(analyzer: *const analysis_mod.Analyzer) *const analysis_mod.Analyzer {
-    return if (analyzer == &analysis_mod.substring_analyzer) &analysis_mod.substring_query_analyzer else analyzer;
+    return if (analyzer == &analysis_mod.substring_analyzer)
+        &analysis_mod.substring_query_analyzer
+    else if (analyzer == &analysis_mod.search_as_you_type_index_prefix_analyzer)
+        &analysis_mod.simple_analyzer
+    else
+        analyzer;
 }
 
 fn fieldUsesSubstringAnalyzer(
@@ -33643,6 +33785,9 @@ test "logical value fusion preserves per-leaf scores and constrained retained fa
         .{ .value = .{ .kind = .contains, .field = "content", .text = "she", .boost = 10 } },
         .{ .value = .{ .kind = .contains, .field = "content", .text = "he", .boost = 2 } },
         .{ .value = .{ .kind = .contains, .field = "content", .text = "hers", .boost = 1 } },
+        .{ .value = .{ .kind = .matches, .field = "content", .text = "h.*e", .boost = 1 } },
+        .{ .value = .{ .kind = .equals, .field = "content", .text = "HE", .case_sensitive = false, .boost = 1 } },
+        .{ .value = .{ .kind = .contains, .field = "absent", .text = "ignored", .boost = 1 } },
     } } };
     const query = try textQueryToSearchQueryWithValues(arena.allocator(), source, .{}, null, &execution);
     try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), query));
@@ -33652,6 +33797,32 @@ test "logical value fusion preserves per-leaf scores and constrained retained fa
     try std.testing.expectEqual(@as(u32, 0), page.hits[0].doc_id);
     try std.testing.expect(page.hits[0].score > page.hits[1].score);
     try std.testing.expectEqual(@as(usize, 4), loader.calls);
+
+    try std.testing.expectEqual(@as(usize, 0), execution.local_work.sources.budget.live);
+
+    // A speculative sibling that exceeds its work budget is unknown, not a
+    // cached negative or an error for the demanded literal. Its own request
+    // must still report the original error.
+    var limited: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true, .max_regex_work = 1 } }, .load_ctx = &loader, .load = Loader.load };
+    defer limited.deinit();
+    const limited_query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .bool_query = .{ .should = &.{
+        .{ .value = .{ .kind = .contains, .field = "content", .text = "he" } },
+        .{ .value = .{ .kind = .matches, .field = "content", .text = "h.*e" } },
+    } } }, .{}, null, &limited);
+    const demanded = limited_query.bool_query.should[0];
+    const deferred = limited_query.bool_query.should[1];
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), demanded));
+    try std.testing.expectError(error.ValueSearchLimitExceeded, search_mod.countMatches(a, writer.snapshot(), deferred));
+
+    var selective: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true } }, .load_ctx = &loader, .load = Loader.load };
+    defer selective.deinit();
+    const conjunction: types.TextQuery = .{ .bool_query = .{ .must = &.{
+        .{ .value = .{ .kind = .contains, .field = "content", .text = "never-present" } },
+        .{ .value = .{ .kind = .matches, .field = "content", .text = "h.*e" } },
+    } } };
+    const selective_query = try textQueryToSearchQueryWithValues(arena.allocator(), conjunction, .{}, null, &selective);
+    try std.testing.expectEqual(@as(u32, 0), try search_mod.countMatches(a, writer.snapshot(), selective_query));
+    try std.testing.expectEqual(@as(u64, 0), selective.local_work.regex_work.load(.monotonic));
 
     // A cached subset, including a verified nonmatch, cannot stand for an
     // entire segment when a subsequent request has a broader candidate set.
