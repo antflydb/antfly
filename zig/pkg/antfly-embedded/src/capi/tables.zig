@@ -199,6 +199,7 @@ pub fn get(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {
 }
 
 pub fn create(handle: *h.Handle, name: []const u8, schema: []const u8, if_not_exists: bool) !void {
+    try api.requireEmbeddedCatalogOwnership(handle);
     @import("sql_ddl.zig").invalidate(handle);
     try requireDatabase(handle);
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.SqlReadOnlyTransaction;
@@ -267,6 +268,7 @@ pub fn publishCreated(handle: *h.Handle) !void {
 }
 
 pub fn drop(handle: *h.Handle, name: []const u8, if_exists: bool) !void {
+    try api.requireEmbeddedCatalogOwnership(handle);
     try requireDatabase(handle);
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.SqlReadOnlyTransaction;
     try load(handle);

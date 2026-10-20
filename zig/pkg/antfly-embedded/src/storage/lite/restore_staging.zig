@@ -648,6 +648,90 @@ fn freeKeyValueEntries(allocator: Allocator, entries: []backup_codec.KeyValueEnt
     allocator.free(entries);
 }
 
+// Adoption must publish the embedded definitions before reconciliation opens
+// the table. Defaults here would replace its schema and drop its producers.
+pub fn embeddedTableDefinition(
+    alloc: std.mem.Allocator,
+    store: *@import("../backend_erased.zig").Store,
+) !tables_api.CreateTableRequest {
+    var txn = try store.beginRead();
+    defer txn.abort();
+    const embedded_tables = txn.get("\x00antfly/embedded/tables/v1") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (embedded_tables) |raw| {
+        var catalog = try std.json.parseFromSlice(struct { tables: []const std.json.Value = &.{} }, alloc, raw, .{ .ignore_unknown_fields = true });
+        defer catalog.deinit();
+        if (catalog.value.tables.len != 0) {
+            std.log.err("embedded Lite adoption supports only the default root table; transfer additional embedded tables through a supported explicit restore", .{});
+            return error.UnsupportedEmbeddedLiteTables;
+        }
+    }
+    const raw_resolvers = txn.get("\x00\x00__metadata__:resolvers") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (raw_resolvers) |raw| {
+        const resolver_catalog = @import("../db/catalog/resolver_catalog.zig");
+        const resolvers = try resolver_catalog.deserializeCatalog(alloc, raw);
+        defer {
+            for (resolvers) |*resolver| resolver.deinit(alloc);
+            alloc.free(resolvers);
+        }
+        if (resolvers.len != 0) {
+            std.log.err("embedded Lite adoption cannot translate resolver catalogs; prepare a supported public catalog before transfer", .{});
+            return error.UnsupportedEmbeddedLiteResolvers;
+        }
+    }
+    var definition: tables_api.CreateTableRequest = .{};
+    errdefer definition.deinit(alloc);
+    const schema = txn.get("\x00\x00__metadata__:schema_json") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (schema) |value| definition.schema_json = try alloc.dupe(u8, value);
+    const indexes = txn.get("\x00\x00__metadata__:indexes") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    const enrichments = txn.get("\x00\x00__metadata__:enrichments") catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (indexes != null or enrichments != null) {
+        const stored = try tableIndexesJsonFromPortableMetadata(alloc, indexes, enrichments);
+        defer alloc.free(stored);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+        defer parsed.deinit();
+        const arena = parsed.arena.allocator();
+        var it = parsed.value.object.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+            const value = entry.value_ptr.*;
+            if (value != .object) return error.InvalidEmbeddedLiteIndex;
+            const kind = value.object.get("kind") orelse return error.InvalidEmbeddedLiteIndex;
+            // Native vector/graph configs need an explicit public catalog
+            // translation. Fail closed until that translation is qualified;
+            // never reinterpret a native index as the default full-text kind.
+            if (kind != .string or !std.mem.eql(u8, kind.string, "full_text")) {
+                std.log.err("embedded Lite adoption cannot translate index {s}; serve a supported full-text fixture or prepare an explicitly supported public catalog before transfer", .{entry.key_ptr.*});
+                return error.UnsupportedEmbeddedLiteIndex;
+            }
+            const raw = value.object.get("config_json") orelse return error.InvalidEmbeddedLiteIndex;
+            if (raw != .string) return error.InvalidEmbeddedLiteIndex;
+            var config = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw.string, .{});
+            if (config != .object) return error.InvalidEmbeddedLiteIndex;
+            try config.object.put(arena, "type", .{ .string = "full_text" });
+            if (value.object.get("coverage_generation")) |generation|
+                try config.object.put(arena, "_index_incarnation", generation);
+            entry.value_ptr.* = config;
+        }
+        definition.indexes_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    }
+    return definition;
+}
+
 pub fn tableIndexesJsonFromPortableMetadata(
     allocator: Allocator,
     raw_indexes_json: ?[]const u8,
@@ -2426,4 +2510,56 @@ test "backup preflight relational rows use archived schema for active media fiel
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "row:late") != null);
+}
+
+test "lite restore staging standalone adoption preserves full text incarnation and rejects unsupported catalogs" {
+    @import("antfly_test_error_logs").expectErrorLogs(5);
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catalog-contract.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var lite = try LiteDb.create(a, path, true);
+    defer lite.close();
+    try lite.db.setSchemaJson(a, tables_api.default_schema_json);
+    const full_text = "{\"body\":{\"kind\":\"full_text\",\"config_json\":\"{\\\"field\\\":\\\"body\\\"}\",\"coverage_generation\":42}}";
+    {
+        var txn = try lite.backend.native_runtime_store.?.beginWrite();
+        errdefer txn.abort();
+        try txn.put("\x00\x00__metadata__:indexes", full_text);
+        try txn.commit();
+    }
+    {
+        var definition = try embeddedTableDefinition(a, lite.backend.native_runtime_store.?);
+        defer definition.deinit(a);
+        try std.testing.expectEqualStrings(tables_api.default_schema_json, definition.schema_json.?);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, definition.indexes_json.?, .{});
+        defer parsed.deinit();
+        const index = parsed.value.object.get("body").?.object;
+        try std.testing.expectEqualStrings("full_text", index.get("type").?.string);
+        try std.testing.expectEqualStrings("body", index.get("field").?.string);
+        try std.testing.expectEqual(@as(i64, 42), index.get("_index_incarnation").?.integer);
+    }
+    for ([_][]const u8{ "dense_vector", "sparse_vector", "graph", "algebraic" }) |kind| {
+        const raw = try std.fmt.allocPrint(a, "{{\"other\":{{\"kind\":\"{s}\",\"config_json\":\"{{}}\"}}}}", .{kind});
+        defer a.free(raw);
+        {
+            var txn = try lite.backend.native_runtime_store.?.beginWrite();
+            errdefer txn.abort();
+            try txn.put("\x00\x00__metadata__:indexes", raw);
+            try txn.commit();
+        }
+        try std.testing.expectError(error.UnsupportedEmbeddedLiteIndex, embeddedTableDefinition(a, lite.backend.native_runtime_store.?));
+        try lite.backend.requireEmbeddedCatalogOwnership();
+        try std.testing.expect(!lite.backend.hasStandaloneRootAdoption());
+    }
+    {
+        var txn = try lite.backend.native_runtime_store.?.beginWrite();
+        errdefer txn.abort();
+        try txn.put("\x00\x00__metadata__:indexes", full_text);
+        try txn.put("\x00antfly/embedded/tables/v1", "{\"next_id\":3,\"tables\":[{\"name\":\"other\",\"id\":2}]}");
+        try txn.commit();
+    }
+    try std.testing.expectError(error.UnsupportedEmbeddedLiteTables, embeddedTableDefinition(a, lite.backend.native_runtime_store.?));
+    try lite.backend.requireEmbeddedCatalogOwnership();
 }
