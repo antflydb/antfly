@@ -971,7 +971,7 @@ test "capi Lite promotion recursively generates a taxonomy in the destination ta
     try tables.create(handle, "entities", "{}", false);
     const entities = try tables.get(handle, "entities");
     try entities.addIndex(.{ .name = "entity_context", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"context\",\"field\":\"context\"}]}" });
-    try entities.addEnrichment(.{ .name = "taxonomy", .kind = .asset, .field = "canonical_name", .neighbor_context = .{ .graph_index = "entity_context", .edge_types = &.{"context"}, .direction = .out }, .content_type = "application/json", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}" });
+    try entities.addEnrichment(.{ .name = "taxonomy", .kind = .asset, .field = "canonical_name", .neighbor_context = .{ .graph_index = "entity_context", .edge_types = &.{"context"}, .direction = .out }, .content_type = "application/json", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
     try entities.addIndex(.{ .name = "taxonomy_graph", .kind = .graph, .config_json =
         \\{"sources":[{"artifact":"taxonomy","format":"extraction_graph","mention_edge_type":"mentions"}],"edge_types":[{"name":"mentions"},{"name":"is_a"},{"name":"supersedes","field":"supersedes"}]}
     });

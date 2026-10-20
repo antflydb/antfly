@@ -204,3 +204,16 @@ Private owner queries provide a bounded `readiness` diagnostic for up to sixteen
 unit IDs. It reports the current/receipt work revisions, verified requirement
 prefix, next blocked producer, and any rejected completion command, without
 returning model inputs or outputs.
+
+Prior-context reads keep at most `max_items` candidates and stop reading older
+artifacts once they cannot affect that window. Ties across directory cells
+retain the same deterministic unit and item ordering as context selection.
+The 4 MiB decoded-artifact limit applies to outputs needed to establish the
+window; unrelated older outputs do not consume it or require acceptance proofs.
+Prior artifacts retain exact decimal and exponent literals through context
+rendering, including values outside floating-point precision and range. Template
+substitutions preserve their original numeric text; conditionals recognize numeric
+zero, and numeric equality uses the same exact decimal comparison as constraints.
+
+Dynamic output serialization and template-context conversion use explicit work
+lists so deeply nested unused fields cannot exhaust the native call stack.
