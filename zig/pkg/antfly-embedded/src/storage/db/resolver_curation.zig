@@ -43,6 +43,50 @@ pub const Namespace = struct {
     state: resolver.curation.State = .{},
 };
 pub const Namespaces = struct { version: u32 = 1, namespaces: []const Namespace = &.{} };
+pub const proposals_key = "_curation_proposals";
+
+/// Borrow only authority identities from the parsed catalog. Evidence and
+/// attribution are irrelevant to ownership and never copied into this index.
+pub const Ownership = struct {
+    templates: std.StringHashMapUnmanaged(void) = .empty,
+    proposal_keys: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    pub fn init(a: std.mem.Allocator, root: std.json.Value) !Ownership {
+        if (root != .object) return error.InvalidResolverCurationRequest;
+        var out: Ownership = .{};
+        if (root.object.get(namespaces_key)) |raw| {
+            if (raw != .object) return error.InvalidResolverCurationRequest;
+            if (raw.object.get("namespaces")) |items| {
+                if (items != .array or items.array.items.len > 4096) return error.InvalidResolverCurationRequest;
+                for (items.array.items) |item| {
+                    if (item != .object) return error.InvalidResolverCurationRequest;
+                    const template = item.object.get("key_template") orelse return error.InvalidResolverCurationRequest;
+                    if (template != .string) return error.InvalidResolverCurationRequest;
+                    try out.templates.put(a, template.string, {});
+                }
+            }
+        }
+        if (root.object.get(proposals_key)) |raw| {
+            if (raw != .object) return error.InvalidResolverCurationRequest;
+            if (raw.object.get("proposals")) |items| {
+                if (items != .array or items.array.items.len > 4096) return error.InvalidResolverCurationRequest;
+                for (items.array.items) |item| {
+                    if (item != .object) return error.InvalidResolverCurationRequest;
+                    const key = item.object.get("key") orelse return error.InvalidResolverCurationRequest;
+                    if (key != .string) return error.InvalidResolverCurationRequest;
+                    try out.proposal_keys.append(a, key.string);
+                }
+            }
+        }
+        return out;
+    }
+    pub fn owns(self: Ownership, template: []const u8) bool {
+        if (self.templates.contains(template)) return true;
+        for (self.proposal_keys.items) |key| if (keyInNamespace(template, key)) return true;
+        return false;
+    }
+};
+
 pub fn namespacesFromValue(a: std.mem.Allocator, root: std.json.Value) !Namespaces {
     const value = if (root == .object) root.object.get(namespaces_key) orelse return .{} else return .{};
     const result = try std.json.parseFromSliceLeaky(Namespaces, a, try std.json.Stringify.valueAlloc(a, value, .{}), .{});
@@ -413,7 +457,10 @@ pub fn namespaceConfig(a: std.mem.Allocator, cfg: catalog.ResolverConfig, reques
     // Receipts are scoped to the exact destination namespace. The table queue
     // retains history; carrying receipts to another table could mistake that
     // table's equal action/key proposal ID for an already applied decision.
-    if (!std.mem.eql(u8, cfg.table, request.table) or !std.mem.eql(u8, cfg.key_template, request.key_template)) state.proposals = &.{};
+    if (!std.mem.eql(u8, cfg.table, request.table) or !std.mem.eql(u8, cfg.key_template, request.key_template)) {
+        state.proposals = &.{};
+        state.receipt_scope = null;
+    }
     var suppression = if (cfg.suppress_json.len > 0) try std.json.parseFromSliceLeaky(resolver.curation.Suppression, a, cfg.suppress_json, .{}) else resolver.curation.Suppression{};
     if (request.reset_merges and !request.reset_curation and (state.distinct.len > 0 or state.removed_aliases.len > 0 or state.suppress.keys.len > 0 or suppression.keys.len > 0)) return error.InvalidResolverCurationRequest;
     if (request.reset_merges) {
@@ -991,4 +1038,23 @@ test "resolver curation namespace changes cannot carry equal proposal receipts i
     try std.testing.expectEqual(@as(usize, 0), next.proposals.len);
     const same = try namespaceConfig(a, cfg, .{ .table = "old", .key_template = cfg.key_template, .reset_merges = true, .reset_curation = true });
     try std.testing.expectEqual(@as(usize, 1), (try resolver.curation.parseState(a, same.curation_json)).proposals.len);
+}
+
+test "resolver curation ownership index borrows opaque proposal evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const evidence = try a.alloc(u8, 8192);
+    @memset(evidence, 'x');
+    const bytes = try std.json.Stringify.valueAlloc(a, .{
+        ._resolver_namespaces = .{ .namespaces = .{.{ .key_template = "other/{{uslug _entity.text}}" }} },
+        ._curation_proposals = .{ .proposals = .{.{ .key = "concept/x", .evidence = .{ .data = evidence } }} },
+    }, .{});
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    var memory: [1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    const index = try Ownership.init(fixed.allocator(), root);
+    try std.testing.expect(index.owns("concept/{{uslug _entity.text}}"));
+    try std.testing.expect(index.owns("other/{{uslug _entity.text}}"));
+    try std.testing.expect(!index.owns("person/{{uslug _entity.text}}"));
 }

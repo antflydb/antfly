@@ -44,15 +44,43 @@ pub const Suppression = struct {
     min_text_chars: u32 = 0,
 };
 pub const Pair = struct { from: []const u8, to: []const u8, origin: ?Origin = null };
+/// Durable identity of one queue lifetime, independent of its table name.
+/// Null denotes an existing legacy queue and retains its historical receipts.
+pub const ReceiptScope = [32]u8;
+pub fn sameReceiptScope(left: ?ReceiptScope, right: ?ReceiptScope) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, &left.?, &right.?);
+}
+pub fn bindReceiptScope(state: State, scope: ?ReceiptScope) State {
+    if (sameReceiptScope(state.receipt_scope, scope)) return state;
+    var next = state;
+    next.receipt_scope = scope;
+    next.proposals = &.{};
+    return next;
+}
 pub const State = struct {
     version: u32 = 1,
     suppress: Suppression = .{},
     distinct: []const Pair = &.{},
     redirect_origins: []const RedirectOrigin = &.{},
     proposals: []const Proposal = &.{},
+    receipt_scope: ?ReceiptScope = null,
     /// Mask a declarative alias after an explicit unmerge. Future graph
     /// replacements must not silently recreate the redirect just corrected.
     removed_aliases: []const []const u8 = &.{},
+
+    // Preserve the v10 legacy encoding when no scoped receipts exist.
+    pub fn jsonStringify(self: State, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(State).@"struct".field_names) |field| {
+            const omit = if (comptime std.mem.eql(u8, field, "receipt_scope")) self.receipt_scope == null else false;
+            if (!omit) {
+                try jw.objectField(field);
+                try jw.write(@field(self, field));
+            }
+        }
+        try jw.endObject();
+    }
 };
 pub const ProposalState = enum { open, accepted, rejected, superseded };
 pub const EntityAction = enum { merge, unmerge, suppress, unsuppress, distinct };
@@ -792,6 +820,7 @@ pub fn parseState(a: std.mem.Allocator, json: []const u8) !State {
         try entry.origin.validate();
     }
     for (result.distinct) |pair| if (pair.origin) |origin| try origin.validate();
+    if (result.receipt_scope) |scope| for (scope) |byte| if (!std.ascii.isHex(byte)) return error.InvalidResolverCurationRequest;
     var ids: std.StringHashMapUnmanaged(void) = .empty;
     for (result.proposals) |proposal| {
         if ((try ids.getOrPut(a, proposal.id)).found_existing) return error.InvalidResolverCurationRequest;
@@ -1040,4 +1069,34 @@ test "curation supersession follows both entity references and symmetric merge j
     try std.testing.expectEqual(.superseded, suppressed[0].state);
     try std.testing.expectEqual(.superseded, suppressed[2].state);
     try std.testing.expectEqual(.open, suppressed[3].state);
+}
+
+test "curation receipt scopes distinguish fresh queues and preserve legacy retries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first: ReceiptScope = @splat('a');
+    const second: ReceiptScope = @splat('b');
+    const request: ProposalRequest = .{ .action = .suppress, .key = "concept/x" };
+    const queued = try propose(a, .{ .receipt_scope = first }, &.{}, request, .{});
+    const id = queued.state.proposals[0].id;
+    const accepted = try decide(a, queued.state, &.{}, &.{}, id, .{ .accept = true }, .{});
+    const corrected = try plan(a, try std.json.Stringify.valueAlloc(a, accepted.state, .{}), &.{}, &.{}, .{ .action = .unsuppress, .key = "concept/x" });
+    const retried = try decide(a, bindReceiptScope(corrected.state, first), &.{}, &.{}, id, .{ .accept = true }, .{});
+    try std.testing.expect(!retried.changed and retried.state.suppress.keys.len == 0);
+    var rebound = bindReceiptScope(corrected.state, second);
+    try std.testing.expectEqual(@as(usize, 0), rebound.proposals.len);
+    const fresh = try propose(a, .{ .receipt_scope = second }, &.{}, request, .{});
+    try std.testing.expectEqualStrings(id, fresh.state.proposals[0].id);
+    rebound.proposals = fresh.state.proposals;
+    const applied = try decide(a, rebound, &.{}, &.{}, id, .{ .accept = true }, .{});
+    try std.testing.expectEqual(@as(usize, 1), applied.state.suppress.keys.len);
+    const restored = try parseState(a, try std.json.Stringify.valueAlloc(a, applied.state, .{}));
+    try std.testing.expect(sameReceiptScope(second, restored.receipt_scope));
+    // Pre-v11 histories retain the null identity for their entire lifetime.
+    const legacy = try propose(a, .{}, &.{}, request, .{});
+    const legacy_bytes = try std.json.Stringify.valueAlloc(a, legacy.state, .{});
+    try std.testing.expect(std.mem.indexOf(u8, legacy_bytes, "receipt_scope") == null);
+    try std.testing.expectEqual(@as(usize, 1), bindReceiptScope(legacy.state, null).proposals.len);
+    try std.testing.expectEqual(@as(usize, 0), bindReceiptScope(legacy.state, second).proposals.len);
 }

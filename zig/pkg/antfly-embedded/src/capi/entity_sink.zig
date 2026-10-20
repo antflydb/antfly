@@ -2416,3 +2416,47 @@ test "capi resolver curation proposals persist decisions and resume per resolver
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(later_id), &out));
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"superseded\"") != null);
 }
+
+test "capi resolver curation recreated destination applies a fresh proposal with the same ID" {
+    const api = @import("db.zig");
+    const table_ops = @import("tables.zig");
+    const pure = @import("antfly_resolver").curation;
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-queue-incarnation");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    try table_ops.create(root, "entities", "{}", false);
+    try root.db.addResolver(.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false });
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    const request = "{\"action\":\"suppress\",\"key\":\"concept/x\"}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(handle, .fromSlice("entities"), .fromSlice(request), &out));
+    const proposal = try std.json.parseFromSliceLeaky(pure.Proposal, scratch, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+    api.antfly_buffer_free(&out);
+    const original = try pure.parseProposalManifest(scratch, try (try table_ops.get(root, "entities")).core.store.get(scratch, pure.proposal_store_key));
+    try std.testing.expect(original.queue.receipt_scope != null);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(handle, .fromSlice("entities"), .fromSlice(proposal.id), .fromSlice("{\"accept\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    try table_ops.drop(root, "entities", false);
+    try table_ops.create(root, "entities", "{}", false);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_unsuppress_resolver_key_json(handle, .fromSlice("concepts"), .fromSlice("{\"key\":\"concept/x\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(handle, .fromSlice("entities"), .fromSlice(request), &out));
+    const fresh = try std.json.parseFromSliceLeaky(pure.Proposal, scratch, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+    try std.testing.expectEqualStrings(proposal.id, fresh.id);
+    api.antfly_buffer_free(&out);
+    const current = try pure.parseProposalManifest(scratch, try (try table_ops.get(root, "entities")).core.store.get(scratch, pure.proposal_store_key));
+    try std.testing.expect(!pure.sameReceiptScope(original.queue.receipt_scope, current.queue.receipt_scope));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(handle, .fromSlice("entities"), .fromSlice(fresh.id), .fromSlice("{\"accept\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    const configs = try root.db.core.index_manager.listResolverIdentities(scratch);
+    const state = try pure.parseState(scratch, configs[0].curation_json);
+    try std.testing.expectEqual(@as(usize, 1), state.suppress.keys.len);
+    try std.testing.expectEqualStrings("concept/x", state.suppress.keys[0]);
+    try std.testing.expect(pure.sameReceiptScope(current.queue.receipt_scope, state.receipt_scope));
+}

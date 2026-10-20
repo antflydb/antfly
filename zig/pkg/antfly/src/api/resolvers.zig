@@ -556,12 +556,7 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
 fn requireSourceCuration(a: std.mem.Allocator, indexes_json: []const u8, key_template: []const u8) !void {
     if (indexes_json.len == 0) return;
     const root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
-    const namespaces = try curation.namespacesFromValue(a, root);
-    for (namespaces.namespaces) |namespace| if (std.mem.eql(u8, namespace.key_template, key_template)) return error.ResolverNamespaceCurationRequired;
-    // Once entity judgments exist, corrections must use their destination
-    // authority. A source-only CAS cannot atomically settle that table's queue.
-    const queue = try proposalQueue(a, root);
-    for (queue.proposals) |proposal| if (curation.keyInNamespace(key_template, proposal.key)) return error.ResolverNamespaceCurationRequired;
+    if ((try curation.Ownership.init(a, root)).owns(key_template)) return error.ResolverNamespaceCurationRequired;
 }
 
 fn namespaceAdopted(stored: curation.Namespaces, key_template: []const u8) bool {
@@ -720,7 +715,7 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
     }
 }
 
-const proposals_key = "_curation_proposals";
+const proposals_key = curation.proposals_key;
 const ProposalEdit = struct { id: []const u8, decision: resolver.curation.ProposalDecision };
 fn proposalQueue(a: std.mem.Allocator, root: std.json.Value) !resolver.curation.State {
     const value = root.object.get(proposals_key) orelse return .{};

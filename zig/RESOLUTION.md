@@ -1835,8 +1835,9 @@ suppressions retain the compatible `keys`/`texts` sets and add attributed
 `entries`/`text_entries`. Cascades name their original target in `cascade_from`;
 review acceptance names its proposal in `proposal_id`. Legacy attribution remains absent or has zero creation time/revision; table-level
 proposals can also have revision zero until an individual policy edit is recorded. Persisting this extended
-curation format requires reader version 10. Cluster metadata writers require
-coordinated decoder version 36 before publishing resolver policy or proposal
+curation provenance requires reader version 10; scoped queue receipts require
+reader version 11. Cluster metadata writers require
+coordinated decoder version 37 before publishing resolver policy or proposal
 queues, including queue-only and retired resolver metadata restored from backups.
 
 `/tables/{entity_table}/curation/proposals` is the entity-level review surface;
@@ -1849,7 +1850,10 @@ carry `origin: review`. Direct entity corrections supersede affected open
 proposals. Lite resolver-level edits settle the same destination queue through
 atomic source receipts. HTTP source-only edits are rejected with
 `ResolverNamespaceCurationRequired` once a namespace has entity proposals;
-clients use the entity resources so policy and queue changes share one CAS.
+clients use the entity resources so policy and queue changes share one CAS. The same
+ownership check runs inside the primary metadata transaction, so proposal
+creation racing a source write cannot bypass it. Ownership checks index only
+namespace templates and proposal keys, with one index per destination table.
 Terminal proposals retain their identity: repeated screening does not
 reopen a rejection, and repeated acceptance does not override a later correction.
 
@@ -1875,6 +1879,13 @@ source catalog's scratch memory before reading the next source. Edits that do
 not affect proposals skip extra queue publications. `complete: false` means
 the caller should retry the same decision. Effect options and attribution remain
 frozen, while revision fences and wait budgets belong to the current request.
+A newly created Lite queue receives a durable random identity. Source receipts
+are bound to that queue identity as well as the public proposal ID. Dropping and
+recreating a destination therefore cannot reuse its prior source receipts.
+Backups preserve the identity and reopen/retry preserves completed decisions.
+Existing unscoped queues retain the legacy null identity for their lifetime;
+new queues always use a fresh identity. Inference ignores this receipt metadata.
+
 HTTP initial decisions and terminal retries return the same decision envelope,
 including the proposal, `changed`, `complete`, `applied`, and per-consumer results.
 HTTP terminal retries observe current authoritative namespace revisions using

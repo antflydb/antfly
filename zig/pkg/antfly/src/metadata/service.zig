@@ -13286,7 +13286,10 @@ test "metadata table topology protocol fences namespace writers and restored dec
         .table_topology_protocol_version = 35,
         .metrics = .{},
     };
-    try std.testing.expect(!tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
+    for ([_]u16{ 35, 36 }) |old_version| {
+        predecessor.table_topology_protocol_version = old_version;
+        try std.testing.expect(!tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
+    }
     predecessor.table_topology_protocol_version = version;
     try std.testing.expect(tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
 }

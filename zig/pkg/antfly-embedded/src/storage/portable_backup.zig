@@ -3546,6 +3546,7 @@ const PortableArchiveValidation = struct {
     minimum_reader_version: ?u32 = null,
     saw_resolver_merges: bool = false,
     saw_curation_proposals: bool = false,
+    proposal_reader_version: u32 = 0,
     resolver_configs: ?[]resolver_catalog.ResolverConfig = null,
     resolver_merge_data: ?[]u8 = null,
 
@@ -3798,7 +3799,7 @@ const PortableArchiveValidation = struct {
     }
 
     fn finish(self: *PortableArchiveValidation, alloc: Allocator) !void {
-        if (self.saw_curation_proposals and (self.minimum_reader_version orelse 0) < resolver_catalog.curation_provenance_reader_version) return error.InvalidMetadataBatch;
+        if (self.saw_curation_proposals and (self.minimum_reader_version orelse 0) < self.proposal_reader_version) return error.InvalidMetadataBatch;
         const resolver_bytes = try resolver_catalog.serializeCatalog(alloc, self.resolver_configs orelse &.{});
         defer alloc.free(resolver_bytes);
         if (self.minimum_reader_version) |version| {
@@ -4752,11 +4753,12 @@ fn validateMetadataEntries(
             if (archive.saw_curation_proposals) return error.InvalidMetadataBatch;
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
-            _ = @import("antfly_resolver").curation.parseProposalManifest(arena.allocator(), entry.value) catch |err| switch (err) {
+            const manifest = @import("antfly_resolver").curation.parseProposalManifest(arena.allocator(), entry.value) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidMetadataBatch,
             };
             archive.saw_curation_proposals = true;
+            archive.proposal_reader_version = if (manifest.queue.receipt_scope != null) resolver_catalog.scoped_curation_reader_version else resolver_catalog.curation_provenance_reader_version;
         } else if (std.mem.eql(u8, entry.key, resolver_catalog.minimum_reader_key)) {
             if (archive.minimum_reader_version != null) return error.InvalidMetadataBatch;
             const version = std.fmt.parseInt(u32, entry.value, 10) catch return error.InvalidMetadataBatch;
@@ -7484,4 +7486,15 @@ test "portable backup curation proposal metadata validates identity and reader f
     var invalid: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
     defer invalid.deinit(alloc);
     try std.testing.expectError(error.InvalidMetadataBatch, validateMetadataEntries(alloc, &.{.{ .key = pure.proposal_store_key, .value = "{\"pending_id\":\"orphan\"}" }}, &invalid));
+    var scoped_queue = plan.state;
+    scoped_queue.receipt_scope = @splat('a');
+    const scoped_bytes = try std.json.Stringify.valueAlloc(a, pure.ProposalManifest{ .queue = scoped_queue }, .{});
+    var scoped: PortableArchiveValidation = .{ .format_version = backup_codec.format_version };
+    defer scoped.deinit(alloc);
+    try validateMetadataEntries(alloc, &.{ .{ .key = pure.proposal_store_key, .value = scoped_bytes }, .{ .key = resolver_catalog.minimum_reader_key, .value = "10" } }, &scoped);
+    try std.testing.expectError(error.InvalidMetadataBatch, scoped.finish(alloc));
+    scoped.minimum_reader_version = resolver_catalog.scoped_curation_reader_version;
+    try scoped.finish(alloc);
+    const restored = try pure.parseProposalManifest(a, scoped_bytes);
+    try std.testing.expect(pure.sameReceiptScope(scoped_queue.receipt_scope, restored.queue.receipt_scope));
 }

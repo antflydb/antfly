@@ -67,8 +67,10 @@ const std = @import("std");
 /// and fences every namespace mutation against its validated consumer cut.
 /// Version 36 decodes curation provenance, cascade dispositions and proposal
 /// queues. Even an empty newly serialized namespace has fields v35 rejects.
-pub const current_version: u16 = 36;
-pub const resolver_namespaces_version: u16 = 36;
+/// Version 37 fences proposal-owned source corrections at primary apply and
+/// understands durable queue identities on embedded resolver receipts.
+pub const current_version: u16 = 37;
+pub const resolver_namespaces_version: u16 = 37;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverNamespaces(indexes_json: []const u8) bool {

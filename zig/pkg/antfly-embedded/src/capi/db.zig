@@ -7503,7 +7503,8 @@ fn curateResolverWithProposals(handle: *Handle, name: []const u8, request_json: 
     const intent = try std.json.parseFromSliceLeaky(pure.Request, a, request_json, .{});
     if (intent.expected_revision) |expected| if (expected != cfg.curation_revision) return error.ResolverCurationConflict;
     const origin = owner.manualOrigin(intent, try std.math.add(u64, cfg.curation_revision, 1));
-    var edit = try pure.planWithOrigin(a, cfg.curation_json, cfg.merges, try cfg.effectiveAliasesAlloc(a), intent, origin);
+    const state = pure.bindReceiptScope(try pure.parseState(a, cfg.curation_json), manifest.queue.receipt_scope);
+    var edit = try pure.planWithOrigin(a, try std.json.Stringify.valueAlloc(a, state, .{}), cfg.merges, try cfg.effectiveAliasesAlloc(a), intent, origin);
     _ = try pure.recordSupersessions(a, &edit, manifest.queue.proposals, intent, origin);
     var next = cfg;
     next.merges = edit.merges;
@@ -7755,7 +7756,8 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
             const intent: pure.curation.Request = .{ .action = action, .key = entity_key.bytes(), .to = input.into, .absorbed = input.absorbed, .actor = input.actor, .reason = input.reason, .replace = input.replace, .pin_distinct = input.pin_distinct, .wait = input.wait, .expected_revision = cfg.curation_revision };
             if (input.expected_revision) |revision| if (revision != cfg.curation_revision) return capi.mapError(error.ResolverCurationConflict);
             const stamp = curation.manualOrigin(intent, std.math.add(u64, cfg.curation_revision, 1) catch |err| return capi.mapError(err));
-            var edit = pure.curation.planWithOrigin(a, cfg.curation_json, cfg.merges, cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err), intent, stamp) catch |err| return capi.mapError(err);
+            const state = pure.curation.bindReceiptScope(pure.curation.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err), manifest.queue.receipt_scope);
+            var edit = pure.curation.planWithOrigin(a, std.json.Stringify.valueAlloc(a, state, .{}) catch |err| return capi.mapError(err), cfg.merges, cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err), intent, stamp) catch |err| return capi.mapError(err);
             _ = pure.curation.recordSupersessions(a, &edit, manifest.queue.proposals, intent, stamp) catch |err| return capi.mapError(err);
             var next = cfg;
             next.merges = edit.merges;
@@ -7818,7 +7820,7 @@ fn saveProposalManifest(a: std.mem.Allocator, db: *db_mod.DB, manifest: Proposal
     defer lease.release();
     if (try db.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
     const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
-    const version = @max(catalog.curation_provenance_reader_version, db.core.index_manager.minimum_reader_version.load(.acquire));
+    const version = @max(if (manifest.queue.receipt_scope != null) catalog.scoped_curation_reader_version else catalog.curation_provenance_reader_version, db.core.index_manager.minimum_reader_version.load(.acquire));
     _ = try @import("antfly_resolver").curation.parseState(a, try std.json.Stringify.valueAlloc(a, manifest.queue, .{}));
     const bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
     // Queue budgets exclude only the fixed pending-decision envelope.
@@ -7852,6 +7854,7 @@ fn refreshProposalManifest(handle: *Handle, a: std.mem.Allocator, table: []const
             for (try source.core.index_manager.listResolverIdentities(scratch)) |cfg| {
                 if (!std.mem.eql(u8, cfg.table, table)) continue;
                 const state = try pure.parseState(scratch, cfg.curation_json);
+                if (!pure.sameReceiptScope(state.receipt_scope, manifest.queue.receipt_scope)) continue;
                 for (state.proposals) |receipt| if (receipt.state == .superseded) {
                     if (open_ids.get(receipt.id)) |i| {
                         records[i].state = .superseded;
@@ -7876,7 +7879,7 @@ fn refreshProposalManifest(handle: *Handle, a: std.mem.Allocator, table: []const
 const ProposalObservation = struct { applied: bool, rows: std.json.Value };
 /// A retry observes receipts, never replays the accepted action. Current policy
 /// can contain later corrections, whose progress is a conservative wait floor.
-fn observeProposal(handle: *handles.Handle, a: std.mem.Allocator, table: []const u8, id: []const u8) !ProposalObservation {
+fn observeProposal(handle: *handles.Handle, a: std.mem.Allocator, table: []const u8, id: []const u8, scope: ?@import("antfly_resolver").curation.ReceiptScope) !ProposalObservation {
     const pure = @import("antfly_resolver").curation;
     const owner = @import("../storage/db/resolver_curation.zig");
     var sources: std.ArrayListUnmanaged(struct { db: *db_mod.DB, name: []const u8 }) = .empty;
@@ -7894,6 +7897,7 @@ fn observeProposal(handle: *handles.Handle, a: std.mem.Allocator, table: []const
         for (configs) |cfg| {
             if (!std.mem.eql(u8, cfg.table, table)) continue;
             const state = try pure.parseState(a, cfg.curation_json);
+            if (!pure.sameReceiptScope(state.receipt_scope, scope)) continue;
             const participant = for (state.proposals) |receipt| {
                 if (std.mem.eql(u8, receipt.id, id) and receipt.state != .open) break true;
             } else false;
@@ -7963,6 +7967,11 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
     if (manifest.pending_id) |pending| if (!std.mem.eql(u8, pending, proposal_id)) return capi.mapError(error.ResolverCurationConflict);
     const input_decision = if (operation_name == .decide) std.json.parseFromSliceLeaky(pure.ProposalDecision, a, request.bytes(), .{}) catch |err| return capi.mapError(err) else pure.ProposalDecision{ .accept = false };
     const proposal = if (selected) |i| manifest.queue.proposals[i] else if (creation) |input| blk: {
+        if (manifest.queue.proposals.len == 0 and manifest.queue.receipt_scope == null) {
+            var entropy: [16]u8 = undefined;
+            @import("antfly_platform").entropy.fill(handleLockIo(), &entropy) catch |err| return capi.mapError(err);
+            manifest.queue.receipt_scope = std.fmt.bytesToHex(entropy, .lower);
+        }
         const plan = pure.propose(a, manifest.queue, &.{}, input, owner.manualOrigin(.{ .action = .suppress, .actor = input.actor, .reason = input.reason }, 0)) catch |err| return capi.mapError(err);
         manifest.queue = plan.state;
         selected = manifest.queue.proposals.len - 1;
@@ -7972,7 +7981,7 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
     if (operation_name == .decide and proposal.state != .open) {
         const wanted: pure.ProposalState = if (input_decision.accept) .accepted else .rejected;
         if (proposal.state != wanted) return capi.mapError(error.ResolverCurationConflict);
-        const observation = observeProposal(handle, a, table.bytes(), proposal.id) catch |err| return capi.mapError(err);
+        const observation = observeProposal(handle, a, table.bytes(), proposal.id, manifest.queue.receipt_scope) catch |err| return capi.mapError(err);
         out.* = stringifyJson(.{ .proposal = proposal, .atomicity = "resolver", .changed = false, .complete = true, .applied = observation.applied, .results = observation.rows }) catch |err| return capi.mapError(err);
         policy_lease.release();
         admitted = false;
@@ -8005,7 +8014,7 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
                 continue;
             }
             if (!decision.accept and !decision.pin_distinct) continue;
-            var state = pure.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err);
+            var state = pure.bindReceiptScope(pure.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err), manifest.queue.receipt_scope);
             // A receipt makes retries independent of subsequent direct edits.
             var found = false;
             for (state.proposals) |old| if (std.mem.eql(u8, old.id, proposal.id)) {
