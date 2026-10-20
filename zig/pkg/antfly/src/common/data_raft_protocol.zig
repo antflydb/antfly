@@ -40,7 +40,10 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 22;
+/// Required BEGIN persists the agreed preparation mode with its apply receipt.
+/// Every applying member must cross this barrier before admission.
+pub const batch_required_preparation_protocol_version: u16 = 23;
+pub const batch_protocol_version: u16 = 23;
 pub const batch_row_semantics_protocol_version: u16 = 18;
 pub const batch_artifact_catalog_protocol_version: u16 = 14;
 /// Full producer publications require a separate all-member barrier; the

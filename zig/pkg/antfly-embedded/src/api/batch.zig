@@ -1311,7 +1311,9 @@ fn parseBatchRequestWithOptions(
         if (phase_value != .string or txn_value != .string or txn_value.string.len != 32) return error.InvalidBatchRequest;
         var txn_id: db_mod.types.TxnId = undefined;
         _ = std.fmt.hexToBytes(&txn_id, txn_value.string) catch return error.InvalidBatchRequest;
-        if (std.mem.eql(u8, phase_value.string, "begin")) {
+        const required_begin = std.mem.eql(u8, phase_value.string, "begin_required_v1");
+        if (!required_begin and object.contains("preparation_mode")) return error.InvalidBatchRequest;
+        if (std.mem.eql(u8, phase_value.string, "begin") or required_begin) {
             const participants_value = object.get("participants") orelse return error.InvalidBatchRequest;
             if (participants_value != .array or participants_value.array.items.len == 0) return error.InvalidBatchRequest;
             transaction_participants = try alloc.alloc([]const u8, participants_value.array.items.len);
@@ -1329,6 +1331,11 @@ fn parseBatchRequestWithOptions(
                     .bool => |flag| flag,
                     else => return error.InvalidBatchRequest,
                 } else false,
+                .preparation_requirement = if (required_begin) blk: {
+                    const mode = object.get("preparation_mode") orelse return error.InvalidBatchRequest;
+                    if (mode != .string) return error.InvalidBatchRequest;
+                    break :blk .{ .mode = std.meta.stringToEnum(@import("../storage/db/prepared_transaction_effects.zig").Mode, mode.string) orelse return error.InvalidBatchRequest };
+                } else null,
                 .participants = transaction_participants,
             } };
         }
@@ -1393,6 +1400,8 @@ fn parseBatchRequestWithOptions(
     {
         return error.InvalidBatchRequest;
     }
+    if (transaction) |mutation| if (mutation == .begin and mutation.begin.preparation_requirement != null and
+        (writes.len != 0 or deletes.len != 0 or transforms.len != 0 or graph_writes.len != 0 or graph_deletes.len != 0 or predicates.len != 0)) return error.InvalidBatchRequest;
     if (predicates.len != 0 and transaction == null) return error.InvalidBatchRequest;
     if (range_guards != null and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (integrity.len != 0 and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
@@ -1578,6 +1587,8 @@ fn validateGraphBatchCommand(req: db_mod.types.BatchRequest) !void {
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
+    if (req.transaction) |mutation| if (mutation == .begin and mutation.begin.preparation_requirement != null and
+        (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0)) return error.InvalidBatchRequest;
     return encodeBatchRequestOwned(alloc, req) catch |err| switch (err) {
         // This memory writer can fail only when allocation fails.
         error.WriteFailed => error.OutOfMemory,
@@ -2029,14 +2040,15 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         switch (mutation) {
             .begin => |begin| {
                 const txn_hex = std.fmt.bytesToHex(begin.txn_id, .lower);
-                try writer.print("\"phase\":\"begin\",\"txn_id\":\"{s}\",\"begin_timestamp\":\"{d}\",\"created_at_ns\":\"{d}\",\"topology_epoch\":\"{d}\",\"retain_terminal\":{},\"participants\":[", .{
-                    &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch, begin.retain_terminal,
+                try writer.print("\"phase\":\"{s}\",\"txn_id\":\"{s}\",\"begin_timestamp\":\"{d}\",\"created_at_ns\":\"{d}\",\"topology_epoch\":\"{d}\",\"retain_terminal\":{},\"participants\":[", .{
+                    if (begin.preparation_requirement != null) "begin_required_v1" else "begin", &txn_hex, begin.begin_timestamp, begin.created_at_ns, begin.topology_epoch, begin.retain_terminal,
                 });
                 for (begin.participants, 0..) |participant, i| {
                     if (i != 0) try writer.writeByte(',');
                     try writer.print("{f}", .{std.json.fmt(participant, .{})});
                 }
                 try writer.writeByte(']');
+                if (begin.preparation_requirement) |required| try writer.print(",\"preparation_mode\":{f}", .{std.json.fmt(@tagName(required.mode), .{})});
             },
             .prepare => |prepare| {
                 const txn_hex = std.fmt.bytesToHex(prepare.txn_id, .lower);

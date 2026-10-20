@@ -1034,8 +1034,8 @@ fn beginTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, 
     return .{ .value = self.beginTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn beginReplicatedTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8) engine.Outcome(@import("transactions.zig").TxnId) {
-    return .{ .value = self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn beginReplicatedTransactionScoped(self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8, requirement: ?@import("db/prepared_transaction_effects.zig").Requirement) engine.Outcome(@import("transactions.zig").TxnId) {
+    return .{ .value = self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, requirement) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn writeIntents(self: *DB, txn_id: @import("transactions.zig").TxnId, intents: []const @import("transactions.zig").WriteIntent, predicates: []const @import("transactions.zig").VersionPredicate) engine.Outcome(void) {

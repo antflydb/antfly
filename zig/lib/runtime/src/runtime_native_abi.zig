@@ -71,7 +71,8 @@ const builtin = @import("builtin");
 // Reject earlier layouts before reading mutation flags or publication stamps.
 // Participant workers carry negotiated preparation and seal callbacks.
 // Transaction records retain their original required-preparation contract.
-pub const abi_version: u32 = 37;
+// Replicated BEGIN carries an explicit required-preparation contract.
+pub const abi_version: u32 = 38;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

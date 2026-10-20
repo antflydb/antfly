@@ -5930,6 +5930,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-artifact-replay-inventory-test", "Run physical artifact replay accounting, reconciliation and legacy-epoch fences")
         .dependOn(&addCuratedTestRunArtifact(b, artifact_inventory_tests, &artifact_inventory_filters).step);
+    const required_begin_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/required_begin_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, required_begin_mod, true, true);
+    const required_begin_tests = b.addTest(.{
+        .root_module = required_begin_mod,
+        .filters = &.{"required replicated begin"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-required-replicated-begin-test", "Verify required BEGIN wire, ordered apply and durable retry contract")
+        .dependOn(&addCuratedTestRunArtifact(b, required_begin_tests, &.{"required replicated begin"}).step);
     const prepared_effects_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/prepared_transaction_effects_test_root.zig"),
         .target = target,

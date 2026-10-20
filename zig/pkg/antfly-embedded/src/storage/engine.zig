@@ -277,7 +277,7 @@ pub const VTable = struct {
     enablePreparedTransactionProtocol: *const fn (self: *DB) Outcome(void),
     beginTransactionWithIdAndParticipantsCreatedAtAndRole: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool) Outcome(@import("transactions.zig").TxnId),
     beginTransactionScoped: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) Outcome(@import("transactions.zig").TxnId),
-    beginReplicatedTransactionScoped: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8) Outcome(@import("transactions.zig").TxnId),
+    beginReplicatedTransactionScoped: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: db.OrderedApplyReceipt, scope: ?[32]u8, requirement: ?@import("db/prepared_transaction_effects.zig").Requirement) Outcome(@import("transactions.zig").TxnId),
     writeIntents: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, intents: []const @import("transactions.zig").WriteIntent, predicates: []const @import("transactions.zig").VersionPredicate) Outcome(void),
     writeTransaction: *const fn (self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) Outcome(void),
     resolveTransactionIntentsWithSyncLevelAndCancellation: *const fn (self: *DB, txn_id: @import("transactions.zig").TxnId, status: @import("transactions.zig").TxnStatus, commit_version: u64, sync_level: types.SyncLevel, visibility_cancellation: types.CancellationToken) Outcome(void),
@@ -531,7 +531,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 24,
+    version: u32 = 25,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -650,7 +650,7 @@ pub fn descriptorForValidation() *const Descriptor {
     return antfly_storage_engine_get_descriptor_v24();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 24 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 25 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or

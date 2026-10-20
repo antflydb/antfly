@@ -87,6 +87,7 @@ pub fn applyReplicatedTransactionMutationInternalWithExecution(
     var admission_borrow: @import("transaction_execution_admission.zig").Borrow = .{};
     switch (mutation) {
         .begin => |begin| {
+            if (begin.preparation_requirement != null and raft_entry == null) return error.PreparedTransactionProtocolUnavailable;
             const local_participant = try local_transaction_contract.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
             defer alloc.free(local_participant);
             const coordinator = try @import("transaction_participant_admission.zig").validate(alloc, begin.participants, local_participant, if (raft_entry == null) execution else null);
@@ -105,6 +106,7 @@ pub fn applyReplicatedTransactionMutationInternalWithExecution(
                     begin.retain_terminal,
                     entry,
                     req.restore_staging_scope,
+                    begin.preparation_requirement,
                 )
             else if (execution) |original| {
                 var borrow: @import("transaction_execution_admission.zig").Borrow = .{};

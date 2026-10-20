@@ -23886,11 +23886,11 @@ pub const DB = struct {
         identity: OrderedApplyReceipt,
     ) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedTransactionAtOrderedReceipt", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity });
-        return self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, null);
+        return self.beginReplicatedTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, null, null);
     }
 
-    pub fn beginReplicatedTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8) !transactions_mod.TxnId {
-        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope });
+    pub fn beginReplicatedTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, identity: OrderedApplyReceipt, scope: ?[32]u8, requirement: ?@import("prepared_transaction_effects.zig").Requirement) !transactions_mod.TxnId {
+        if (comptime storage_engine.enabled) return storage_engine.call("beginReplicatedTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, identity, scope, requirement });
         lockApply(self);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
@@ -23905,6 +23905,7 @@ pub const DB = struct {
         }
         var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
         const marker = orderedApplyReceiptWrite(identity, &value_buf);
+        if (requirement) |required| return self.core.beginTransactionRequiringPreparedEffects(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, required, .{ .writes = &.{marker} }, null);
         return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
             txn_id,
             timestamp_ns,

@@ -316,6 +316,7 @@ pub const TransactionMutation = union(enum) {
         /// use the shorter ordinary recovery retention.
         retain_terminal: bool = false,
         participants: []const []const u8,
+        preparation_requirement: ?@import("prepared_transaction_effects.zig").Requirement = null,
     },
     prepare: struct {
         txn_id: TxnId,

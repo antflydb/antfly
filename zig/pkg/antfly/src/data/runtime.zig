@@ -12638,7 +12638,17 @@ pub const DataServer = struct {
         return legacy_req;
     }
 
-    fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+    /// Decoding support is not all-member file/producer readiness. Until the
+    /// coordinated migration owns that proof, no direct/private route may
+    /// append a required BEGIN or activate its protocol barrier.
+    pub fn ensurePreparedTransactionProposalSupported(req: antfly.db.types.BatchRequest) !void {
+        if (req.transaction) |mutation| if (mutation == .begin and mutation.begin.preparation_requirement != null)
+            return error.PreparedTransactionMigrationRequired;
+    }
+
+    pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.transaction) |mutation| if (mutation == .begin and mutation.begin.preparation_requirement != null)
+            return @import("../common/data_raft_protocol.zig").batch_required_preparation_protocol_version;
         if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
         if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))
             return @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
@@ -13249,6 +13259,7 @@ pub const DataServer = struct {
         route: DataRaftBatchRoute,
         leader_wait_ns: u64,
     ) !void {
+        try ensurePreparedTransactionProposalSupported(req);
         try @import("antfly_local_sources").storage_db_artifact_publication.validateRequest(alloc, req);
         try @import("antfly_local_sources").storage_db_artifact_publication_transport.validateBatchRequest(req);
         // Do not allow a private/direct batch route to bypass the metadata
