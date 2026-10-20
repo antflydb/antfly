@@ -1372,13 +1372,40 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
         found = true;
     };
     try std.testing.expect(found);
+    // Quiesce the automatic maintenance worker before checking query side
+    // effects. Inference releases the writer gate, so renewal of unrelated
+    // job leases/status observations would otherwise race this assertion.
+    // Foreground draining still completes all actual setup/replay work.
+    const owner = blk: {
+        const guard = api.enterHandle(id, .read).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(h.handleLockIo());
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
     // The ad-hoc text route runs the configured extractor and resolves its
     // real, non-empty mentions against the entities promoted above.
     var query_result: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&query_result);
-    const before = api.enterHandle(id, .read).?;
-    const sequence = before.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
-    before.leave();
+    const native = @import("../storage/lite/native.zig");
+    const baseline = blk: {
+        const before = api.enterHandle(id, .read).?;
+        defer before.leave();
+        const file = &before.handle.owned_lite_backend.?.native_docstore.?.file;
+        const documents = try file.snapshotDocumentsAlloc(a);
+        errdefer native.NativeFile.freeSnapshotDocuments(a, documents);
+        const catalog = try file.snapshotCatalogRecordsAlloc(a);
+        errdefer native.NativeFile.freeSnapshotCatalogRecords(a, catalog);
+        const indexes = try file.snapshotIndexCatalogRecordsAlloc(a);
+        break :blk .{ .documents = documents, .catalog = catalog, .indexes = indexes };
+    };
+    defer native.NativeFile.freeSnapshotDocuments(a, baseline.documents);
+    defer native.NativeFile.freeSnapshotCatalogRecords(a, baseline.catalog);
+    defer native.NativeFile.freeSnapshotCatalogRecords(a, baseline.indexes);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}"), &query_result));
     const query_json = try std.json.parseFromSlice(std.json.Value, a, query_result.ptr.?[0..query_result.len], .{});
     defer query_json.deinit();
@@ -1392,9 +1419,32 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
         api.antfly_buffer_free(&entity_response);
         try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_lookup_json(entities, .fromSlice(entity.object.get("doc_ref").?.object.get("key").?.string), &entity_response));
     }
-    const after = api.enterHandle(id, .read).?;
-    try std.testing.expectEqual(sequence, after.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
-    after.leave();
+    {
+        const after = api.enterHandle(id, .read).?;
+        defer after.leave();
+        const file = &after.handle.owned_lite_backend.?.native_docstore.?.file;
+        // Candidate readers publish artifact leases, advancing the physical
+        // checkpoint. Query resolution must preserve every document, index,
+        // and non-lease metadata record, including derived-work state.
+        const documents = try file.snapshotDocumentsAlloc(a);
+        defer native.NativeFile.freeSnapshotDocuments(a, documents);
+        try std.testing.expectEqualDeep(baseline.documents, documents);
+        const indexes = try file.snapshotIndexCatalogRecordsAlloc(a);
+        defer native.NativeFile.freeSnapshotCatalogRecords(a, indexes);
+        try std.testing.expectEqualDeep(baseline.indexes, indexes);
+        const catalog = try file.snapshotCatalogRecordsAlloc(a);
+        defer native.NativeFile.freeSnapshotCatalogRecords(a, catalog);
+        var position: usize = 0;
+        for (baseline.catalog) |expected| {
+            if (std.mem.startsWith(u8, expected.key, native.NativeFile.artifact_lease_key_prefix)) continue;
+            while (position < catalog.len and std.mem.startsWith(u8, catalog[position].key, native.NativeFile.artifact_lease_key_prefix)) : (position += 1) {}
+            try std.testing.expect(position < catalog.len);
+            try std.testing.expectEqualDeep(expected, catalog[position]);
+            position += 1;
+        }
+        while (position < catalog.len and std.mem.startsWith(u8, catalog[position].key, native.NativeFile.artifact_lease_key_prefix)) : (position += 1) {}
+        try std.testing.expectEqual(catalog.len, position);
+    }
     api.antfly_db_close(entities);
     entities = null;
     api.antfly_db_close(id);
@@ -1404,16 +1454,19 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_with_options(path, &readonly, &id));
     api.antfly_buffer_free(&query_result);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}"), &query_result));
-    const readonly_guard = api.enterHandle(id, .read).?;
-    const cached_producer = readonly_guard.handle.query_producer orelse return error.TestExpectedEqual;
-    const readonly_sequence = readonly_guard.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
-    readonly_guard.leave();
+    const cached_producer, const readonly_sequence = blk: {
+        const readonly_guard = api.enterHandle(id, .read).?;
+        defer readonly_guard.leave();
+        break :blk .{ readonly_guard.handle.query_producer orelse return error.TestExpectedEqual, readonly_guard.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence };
+    };
     api.antfly_buffer_free(&query_result);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}"), &query_result));
-    const repeated_guard = api.enterHandle(id, .read).?;
-    try std.testing.expectEqual(cached_producer, repeated_guard.handle.query_producer.?);
-    try std.testing.expectEqual(readonly_sequence, repeated_guard.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
-    repeated_guard.leave();
+    {
+        const repeated_guard = api.enterHandle(id, .read).?;
+        defer repeated_guard.leave();
+        try std.testing.expectEqual(cached_producer, repeated_guard.handle.query_producer.?);
+        try std.testing.expectEqual(readonly_sequence, repeated_guard.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    }
     var readonly_table: ?*anyopaque = null;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(id, .fromSlice("queries"), &readonly_table));
     defer api.antfly_db_close(readonly_table);
@@ -1421,10 +1474,12 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
     defer api.antfly_buffer_free(&table_query);
     const text_request = "{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}";
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(readonly_table, .fromSlice("concepts"), .fromSlice(text_request), &table_query));
-    const child, const slot = api.handleRegistry().enter(readonly_table).?;
-    try std.testing.expect(child.query_producer == null);
-    try std.testing.expect(child.parent_handle.?.query_producer != null);
-    api.HandleRegistry.leave(slot);
+    {
+        const child, const slot = api.handleRegistry().enter(readonly_table).?;
+        defer api.HandleRegistry.leave(slot);
+        try std.testing.expect(child.query_producer == null);
+        try std.testing.expect(child.parent_handle.?.query_producer != null);
+    }
     var writer: ?*anyopaque = null;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_with_options(path, &options, &writer));
     defer api.antfly_db_close(writer);
@@ -1433,11 +1488,13 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(writer, .fromSlice("{\"inserts\":{\"refresh_probe\":{\"body\":\"snapshot changed\"}}}"), &write_result));
     // Entering any read refreshes the owner, invalidating child caches before
     // freeing the old provider. No stale producer survives to the next query.
-    const refreshed = api.enterHandle(readonly_table, .read).?;
-    try std.testing.expect(refreshed.entry_error == null);
-    try std.testing.expect(refreshed.handle.query_producer == null);
-    try std.testing.expect(refreshed.handle.parent_handle.?.query_producer == null);
-    refreshed.leave();
+    {
+        const refreshed = api.enterHandle(readonly_table, .read).?;
+        defer refreshed.leave();
+        try std.testing.expect(refreshed.entry_error == null);
+        try std.testing.expect(refreshed.handle.query_producer == null);
+        try std.testing.expect(refreshed.handle.parent_handle.?.query_producer == null);
+    }
     api.antfly_buffer_free(&table_query);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(readonly_table, .fromSlice("concepts"), .fromSlice(text_request), &table_query));
     try std.testing.expect(table_query.len > 0);
