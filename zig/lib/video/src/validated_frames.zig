@@ -213,8 +213,45 @@ pub const Cache = struct {
         };
         const future = self.count != 0 and @as(i128, frame.pts) * std.time.ns_per_s >= self.horizon * self.scale;
         const spill_slot = if (future) std.mem.indexOfScalar(?*Entry, &self.spill, null) orelse return error.ResourceLimitExceeded else null;
-        const used = self.budget.used.load(.acquire);
-        if (bytes > self.budget.limit -| used) return error.ResourceLimitExceeded;
+        // Speculative reorder pictures must never evict an imminent sampling
+        // target. Bound their share even when no target has arrived yet.
+        if (future) {
+            var spill_bytes: usize = 0;
+            for (self.spill) |entry| if (entry) |owner| {
+                spill_bytes += owner.frame.nv12.len + @sizeOf(Entry);
+            };
+            if (bytes > self.budget.limit / 4 -| spill_bytes) return error.ResourceLimitExceeded;
+        } else {
+            // Reclaim speculative owners before declining a selected picture.
+            // External immutable pins remain charged and cannot be reclaimed.
+            for (&self.spill) |*entry| {
+                if (bytes <= self.budget.limit -| self.budget.used.load(.acquire)) break;
+                if (entry.*) |owner| owner.release();
+                entry.* = null;
+            }
+            var priority: i128 = std.math.maxInt(i128);
+            for (self.targets[0..self.count]) |target| if (target.prefers(packet, frame.pts, self.scale)) {
+                priority = @min(priority, target.ns);
+            };
+            // Farthest-window candidates yield to nearer selections. Release
+            // every target reference to a victim so duplicate targets do not
+            // accidentally keep its pixels resident.
+            var cursor = self.count;
+            while (cursor > 0 and bytes > self.budget.limit -| self.budget.used.load(.acquire)) {
+                cursor -= 1;
+                const victim = self.targets[cursor].entry orelse continue;
+                var nearest: i128 = std.math.maxInt(i128);
+                for (self.targets[0..self.count]) |target| if (target.entry == victim) {
+                    nearest = @min(nearest, target.ns);
+                };
+                if (nearest <= priority) continue;
+                for (self.targets[0..self.count]) |*target| if (target.entry == victim) {
+                    target.entry = null;
+                    victim.release();
+                };
+            }
+        }
+        if (bytes > self.budget.limit -| self.budget.used.load(.acquire)) return error.ResourceLimitExceeded;
         var reservation = if (self.pool) |pool| try pool.acquire(.{ .host_bytes = bytes }) else media.admission.Token{};
         errdefer reservation.deinit();
         const entry = try self.allocator.create(Entry);
@@ -297,4 +334,28 @@ test "live coordinator cache preserves predictive pictures beyond four windows u
     var pin = cache.pinWindow(4 * std.time.ns_per_s, 5 * std.time.ns_per_s);
     defer pin.deinit();
     try std.testing.expectEqualSlices(u8, &pixels, pin.get(40).?.nv12);
+}
+
+test "live coordinator cache prioritizes near selections over speculative and distant pixels" {
+    const a = std.testing.allocator;
+    const pixels: [256]u8 = @splat(1);
+    const bytes = pixels.len + @sizeOf(Entry);
+    var cache = try Cache.init(a, null, bytes * 4);
+    defer cache.deinit();
+    cache.configure(0, std.time.ns_per_s, std.time.ns_per_s, std.time.ns_per_s, 1, 0, 1);
+    var frame = h264.Frame{ .allocator = a, .nv12 = @constCast(&pixels), .width = 16, .height = 16, .pts = 4, .duration = 1, .timescale = 1, .full_range = true, .color = .{}, .decode_high_water = 0, .decoded_packets = 1, .payload_bytes = 1 };
+    const picture = h264.Picture{ .first_packet = 4, .pts = 4, .duration = 1, .width = 16, .height = 16, .bit_depth = 8, .chroma_format = 1 };
+    try cache.capture(picture, &frame);
+    // Spill consumes at most a quarter of this budget.
+    frame.pts = 5;
+    try std.testing.expectError(error.ResourceLimitExceeded, cache.capture(.{ .first_packet = 5, .pts = 5, .duration = 1, .width = 16, .height = 16, .bit_depth = 8, .chroma_format = 1 }, &frame));
+    for ([_]i64{ 3, 2, 1, 0 }) |pts| {
+        frame.pts = pts;
+        try cache.capture(.{ .first_packet = @intCast(pts), .pts = pts, .duration = 1, .width = 16, .height = 16, .bit_depth = 8, .chroma_format = 1 }, &frame);
+    }
+    var view = cache.pin();
+    defer view.deinit();
+    try std.testing.expect(view.get(0) != null);
+    try std.testing.expect(view.get(4) == null);
+    try std.testing.expect(cache.budget.used.load(.acquire) <= bytes * 4);
 }

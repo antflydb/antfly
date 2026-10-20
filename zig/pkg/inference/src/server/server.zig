@@ -38557,7 +38557,9 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
         _ = try cohort_stream.process(&ended_reader, &captured, CohortCapture.accept);
         const cohort_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - cohort_started;
         try std.testing.expectEqual(@as(usize, 6), captured.count);
-        try std.testing.expectEqual(@as(usize, 3), cohort_stream.stats.native_batches);
+        // Completed-cost calibration may choose serial windows after its
+        // initial admitted batch samples; delivery and parity stay identical.
+        try std.testing.expect(cohort_stream.stats.native_batches > 0 and cohort_stream.stats.native_batches <= 3);
         try std.testing.expect(telemetry.validated_frames.load(.acquire) > 0);
         var cohort_error: f32 = 0;
         const serial_started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
@@ -38569,7 +38571,40 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
         }
         try std.testing.expect(cohort_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
         const serial_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - serial_started;
-        std.debug.print("sealed live cohorts metal={} batches={d} ahead={d} validated_frames={d} callbacks={d} max_error={d:.9} completed_ns={d} serial_ns={d}\n", .{ metal, cohort_stream.stats.native_batches, cohort_stream.stats.prepared_ahead, telemetry.validated_frames.load(.acquire), captured.calls, cohort_error, cohort_ns, serial_ns });
+        std.debug.print("sealed live cohorts metal={} batches={d} shared_vision_batches={d} ahead={d} validated_frames={d} callbacks={d} max_error={d:.9} completed_ns={d} serial_ns={d}\n", .{ metal, cohort_stream.stats.native_batches, cohort_stream.stats.shared_vision_batches, cohort_stream.stats.prepared_ahead, telemetry.validated_frames.load(.acquire), captured.calls, cohort_error, cohort_ns, serial_ns });
+        // Ready preparations from distinct sources must share the vision lane,
+        // while preserving each row's independent caption and pooled vector.
+        {
+            var pools = [_]stream_media.admission.Pool{ .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } }, .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } } };
+            var ahead_rows: [2]?*stream_embedding.VideoAhead = @splat(null);
+            defer for (ahead_rows) |entry| if (entry) |ahead| ahead.deinit();
+            var items: [2]stream_embedding.VideoBatchItem = undefined;
+            for (&items, 0..) |*item, index| {
+                const snapshot = &snapshots[index].?;
+                const movie = stream_embedding.SampledVideo{ .reader = &snapshot.window.reader, .sampling = .{ .source_timestamps = snapshot.policy } };
+                ahead_rows[index] = (try stream_embedding.VideoAhead.start(loaded.session, movie, node.extractionExecutionControl(null), null, &pools[index], .{})).?;
+                item.* = .{ .movie = movie, .caption = caption, .ahead = ahead_rows[index] };
+            }
+            // The test supplies an already prepared backlog. Serving never
+            // waits for a batch to fill; it consumes whatever is currently ready.
+            for (ahead_rows) |entry| entry.?.producer.?.finished.waitUncancelable(std.testing.io);
+            const shared = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &items, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+            defer {
+                for (shared.vectors) |vector| a.free(vector);
+                a.free(shared.vectors);
+                a.free(shared.input_tokens);
+            }
+            var error_max: f32 = 0;
+            for (shared.vectors, 0..) |vector, index| for (vector, captured.outputs[index].?.result.?.vector) |left, right| {
+                error_max = @max(error_max, @abs(left - right));
+            };
+            try std.testing.expect(error_max < 1e-3);
+            // CPU calibration may correctly prefer singleton vision after
+            // exercising the shared cohorts above. Qualify the serving route
+            // without overriding its measured policy for this later call.
+            try std.testing.expect(shared.shared_vision_batches + cohort_stream.stats.shared_vision_batches > 0);
+            std.debug.print("ready cross-window vision metal={} shared_batches={d} max_error={d:.9}\n", .{ metal, shared.shared_vision_batches, error_max });
+        }
         // One publication exceeds the cache horizon. Its packet slices must
         // reuse later validated frames and advance validation during backbone
         // execution, with the same captioned vectors as independent windows.

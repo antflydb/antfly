@@ -30,8 +30,10 @@ pub const Index = struct {
     decoded_packets: usize = 0,
     payload_bytes: u64 = 0,
     reservation: media.admission.Token = .{},
+    borrowed: bool = false,
+    storage: ?[]h264.Picture = null,
     pub fn deinit(self: *Index) void {
-        self.allocator.free(self.pictures);
+        if (!self.borrowed) self.allocator.free(self.storage orelse self.pictures);
         self.reservation.deinit();
         self.* = undefined;
     }
@@ -94,6 +96,7 @@ const Collector = struct {
     pictures: std.ArrayList(h264.Picture) = .empty,
     planes: std.ArrayList(u8) = .empty,
     limit: usize,
+    incomplete_planes: usize = 0,
     pending_pts: ?i64 = null,
     pending_first_packet: ?usize = null,
     fn pending(raw: *anyopaque, picture: h264.PendingPicture) void {
@@ -110,6 +113,7 @@ const Collector = struct {
                 if (seen & mask != 0 or existing.pts != picture.pts or existing.duration != picture.duration or existing.width != picture.width or existing.height != picture.height or existing.bit_depth != picture.bit_depth) return error.MixedVideoPictures;
                 if (picture.last_packet) |last| self.pictures.items[i].last_packet = @max(existing.last_packet orelse last, last);
                 self.planes.items[i] |= mask;
+                if (seen != 7 and self.planes.items[i] == 7) self.incomplete_planes -= 1;
                 return;
             }
         }
@@ -119,6 +123,7 @@ const Collector = struct {
         result.independent_plane = null;
         try self.pictures.append(self.allocator, result);
         try self.planes.append(self.allocator, if (picture.independent_plane) |plane| @as(u8, 1) << @intCast(plane) else 0);
+        if (picture.independent_plane != null) self.incomplete_planes += 1;
     }
 };
 /// Persistent static-configuration logical index. Published packets are immutable;
@@ -244,6 +249,38 @@ pub const Stream = struct {
     pub fn parameterBootstrap(self: *Stream, a: std.mem.Allocator, before: usize) ![]u8 {
         if (!self.valid or before > self.position) return error.InvalidLivePictureIndex;
         return if (self.registry) |owner| owner.bootstrapBefore(a, before) else a.alloc(u8, 0);
+    }
+    /// Coordinator-only view, invalidated by advance/rebase/deinit. Prepared
+    /// windows clone independently before validation can mutate this owner.
+    /// Incomplete separate planes retain the filtered owning snapshot route.
+    pub fn currentIndex(self: *Stream, reader: *media.mp4.Reader) !Index {
+        if (!self.valid or reader.packets.len != self.position) return error.InvalidLivePictureIndex;
+        if (self.collector.incomplete_planes != 0) return self.snapshot(reader);
+        return self.borrowedView(reader.track.timescale);
+    }
+    /// Failed append rollback without allocation: detach the collector's current
+    /// capacity and retain only the formerly published complete-picture prefix.
+    /// Complete records are immutable; only incomplete plane assemblies mutate.
+    /// The stream must be destroyed immediately after transferring this owner.
+    pub fn recoverBorrowed(self: *Stream, previous: Index) Index {
+        std.debug.assert(previous.borrowed and previous.pictures.len <= self.collector.pictures.items.len);
+        self.collector.planes.deinit(self.collector.allocator);
+        self.collector.planes = .empty;
+        const storage = self.collector.pictures.allocatedSlice();
+        self.collector.pictures = .empty;
+        std.debug.assert(self.allocations.live == storage.len * @sizeOf(h264.Picture));
+        self.allocations.live = 0;
+        var recovered = previous;
+        recovered.allocator = self.allocator;
+        recovered.pictures = storage[0..previous.pictures.len];
+        recovered.storage = storage;
+        recovered.borrowed = false;
+        recovered.reservation = self.allocations.reservation;
+        self.allocations.reservation = .{};
+        return recovered;
+    }
+    pub fn borrowedView(self: *Stream, timescale: u32) Index {
+        return .{ .allocator = self.allocator, .pictures = self.collector.pictures.items, .timescale = timescale, .packet_count = self.position, .pending_pts = self.collector.pending_pts, .pending_first_packet = self.collector.pending_first_packet, .decoded_packets = self.last_stats.decoded_packets, .payload_bytes = self.last_stats.payload_bytes, .borrowed = true };
     }
     pub fn snapshot(self: *Stream, reader: *media.mp4.Reader) !Index {
         if (!self.valid or reader.packets.len != self.position) return error.InvalidLivePictureIndex;

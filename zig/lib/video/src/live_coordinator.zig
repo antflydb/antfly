@@ -86,6 +86,7 @@ pub const Coordinator = struct {
     logical: ?pictures.Index = null,
     stream: ?*pictures.Stream = null,
     frame_cache: ?frames.Cache = null,
+    probe: ?*windows.Builder = null,
     parameters: Parameters = .{},
     logical_base: usize = 0,
     packet_base: usize = 0,
@@ -123,12 +124,20 @@ pub const Coordinator = struct {
         hash.update(&bytes);
         return hash.finalResult();
     }
+    fn dropProbe(self: *Coordinator) void {
+        if (self.probe) |probe| probe.deinit();
+        self.probe = null;
+    }
     fn dropStream(self: *Coordinator) void {
+        if (self.logical) |index| {
+            if (index.borrowed) self.logical = null;
+        }
         if (self.stream) |stream| stream.deinit();
         self.stream = null;
     }
     pub fn deinit(self: *Coordinator) void {
         self.dropStream();
+        self.dropProbe();
         if (self.frame_cache) |*cache| cache.deinit();
         self.parameters.deinit();
         for (self.units[0..self.count]) |*unit| unit.deinit();
@@ -170,7 +179,12 @@ pub const Coordinator = struct {
     fn rebaseStream(self: *Coordinator, reader: *media.mp4.Reader, removed: usize) !void {
         if (removed == 0) return;
         if (!reader.track.inband_parameter_sets) {
-            if (self.stream) |stream| try stream.rebase(reader, removed);
+            if (self.stream) |stream| {
+                try stream.rebase(reader, removed);
+                if (self.logical) |index| {
+                    if (index.borrowed) self.logical = stream.borrowedView(reader.track.timescale);
+                }
+            }
             return;
         }
         const limit = (@import("h264.zig").Options{}).max_parameter_bytes;
@@ -189,7 +203,12 @@ pub const Coordinator = struct {
         suffix.packets = reader.packets[removed..];
         var canonical = try windows.borrowWithParameters(self.allocator, &suffix, checkpoint.bytes, self.options.window);
         defer canonical.deinit();
-        if (self.stream) |stream| try stream.rebaseWithPrefix(reader, removed, &canonical.reader);
+        if (self.stream) |stream| {
+            try stream.rebaseWithPrefix(reader, removed, &canonical.reader);
+            if (self.logical) |index| {
+                if (index.borrowed) self.logical = stream.borrowedView(reader.track.timescale);
+            }
+        }
         self.parameters.deinit();
         self.parameters = checkpoint;
     }
@@ -210,46 +229,55 @@ pub const Coordinator = struct {
             start = if (start) |old| @min(old, @max(0, pts)) else @max(0, pts);
             tail = @max(tail, std.math.cast(i64, @divFloor(@as(i128, try std.math.add(i64, packet.pts, packet.duration)) * std.time.ns_per_s + value.reader.track.timescale - 1, value.reader.track.timescale)) orelse return error.TimestampOverflow);
         }
-        // Join validates complete clock/configuration compatibility transactionally.
         self.units[self.count] = value;
-        var view = try self.joined("live-probe", self.count + 1);
-        defer view.deinit();
+        // Append only new packet/span metadata. Immutable prepared windows own
+        // separate snapshots; this validation-only builder never escapes.
         errdefer {
+            if (self.stream) |stream| if (self.logical) |index| {
+                if (index.borrowed) self.logical = stream.recoverBorrowed(index);
+            };
             self.dropStream();
+            self.dropProbe();
             if (self.frame_cache) |*cache| cache.clear();
         }
+        if (self.probe == null) {
+            self.probe = try windows.Builder.init(self.allocator, self.units[0], self.parameters.bytes, self.options.window);
+            for (self.units[0..self.count]) |old| try self.probe.?.append(old, self.options.window);
+        }
+        try self.probe.?.append(value, self.options.window);
+        const reader = &self.probe.?.reader;
         var sealed = self.sealed_ns;
         var pending_ns: ?i64 = null;
         var logical: ?pictures.Index = null;
         defer if (logical) |*index| index.deinit();
-        if (view.reader.track.codec == .mjpeg) {
-            const last = view.reader.packets[view.reader.packets.len - 1];
-            sealed = @max(sealed orelse 0, try ns(try std.math.add(i64, last.dts, last.duration), view.reader.track.timescale));
+        if (reader.track.codec == .mjpeg) {
+            const last = reader.packets[reader.packets.len - 1];
+            sealed = @max(sealed orelse 0, try ns(try std.math.add(i64, last.dts, last.duration), reader.track.timescale));
         } else {
             const picture_options = pictures.Options{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } };
             if (self.options.incremental_validation) {
-                if (self.stream == null) self.stream = try pictures.Stream.init(self.allocator, &view.reader, picture_options);
+                if (self.stream == null) self.stream = try pictures.Stream.init(self.allocator, reader, picture_options);
                 if (self.frame_cache == null and self.options.max_validated_frame_bytes != 0) self.frame_cache = frames.Cache.init(self.allocator, self.options.window.stream.admission_pool, self.options.max_validated_frame_bytes) catch null;
                 if (self.frame_cache) |*cache| {
-                    cache.configure(if (self.epoch_committed) self.start_ns.? else start.?, self.options.duration_ns, self.options.advance_ns orelse @as(u64, @intCast(self.options.duration_ns)), self.options.step_ns, self.options.max_frames, self.packet_base, view.reader.track.timescale);
+                    cache.configure(if (self.epoch_committed) self.start_ns.? else start.?, self.options.duration_ns, self.options.advance_ns orelse @as(u64, @intCast(self.options.duration_ns)), self.options.step_ns, self.options.max_frames, self.packet_base, reader.track.timescale);
                     self.stream.?.frames = cache.observer();
                 }
-                _ = try self.stream.?.advanceOwned(&view.reader);
-                logical = try self.stream.?.snapshot(&view.reader);
+                _ = try self.stream.?.advanceOwned(reader);
+                logical = try self.stream.?.currentIndex(reader);
             } else {
                 self.dropStream();
-                logical = try pictures.streaming(self.allocator, &view.reader, picture_options);
+                logical = try pictures.streaming(self.allocator, reader, picture_options);
             }
-            const last = view.reader.packets[view.reader.packets.len - 1];
-            var frontier = try ns(try std.math.add(i64, last.dts, last.duration), view.reader.track.timescale);
-            if (logical.?.pending_pts) |pts| frontier = @min(frontier, try ns(pts, view.reader.track.timescale));
+            const last = reader.packets[reader.packets.len - 1];
+            var frontier = try ns(try std.math.add(i64, last.dts, last.duration), reader.track.timescale);
+            if (logical.?.pending_pts) |pts| frontier = @min(frontier, try ns(pts, reader.track.timescale));
             sealed = @max(sealed orelse 0, frontier);
-            pending_ns = if (logical.?.pending_pts) |pts| try ns(pts, view.reader.track.timescale) else null;
+            pending_ns = if (logical.?.pending_pts) |pts| try ns(pts, reader.track.timescale) else null;
         }
         // A sparse advance can leave the cursor beyond the published frontier.
         // Retain only its validated preroll while pumping skipped units, so a
         // long interval does not consume one slot for every intervening unit.
-        const keep = if (self.epoch_committed and self.start_ns.? >= (sealed orelse 0)) try self.retentionKeep(view.reader, logical, self.start_ns.?, self.count + 1) else 0;
+        const keep = if (self.epoch_committed and self.start_ns.? >= (sealed orelse 0)) try self.retentionKeep(reader.*, logical, self.start_ns.?, self.count + 1) else 0;
         var released: usize = 0;
         var removed_packets: usize = 0;
         for (self.units[0..keep], 0..) |old, removed_index| {
@@ -257,11 +285,16 @@ pub const Coordinator = struct {
             removed_packets = try std.math.add(usize, removed_packets, old.reader.packets.len);
         }
         const next_packet_base = try std.math.add(usize, self.packet_base, removed_packets);
-        if (keep != 0) try self.rebaseStream(&view.reader, removed_packets);
+        if (keep != 0) {
+            try self.rebaseStream(reader, removed_packets);
+            if (logical) |index| {
+                if (index.borrowed) logical = self.stream.?.borrowedView(reader.track.timescale);
+            }
+        }
         if (self.logical) |*previous| previous.deinit();
         self.logical = logical;
         logical = null;
-        self.logical_base = removed_packets;
+        self.logical_base = if (self.logical != null and self.logical.?.borrowed) 0 else removed_packets;
         self.packet_base = next_packet_base;
         self.pending_ns = pending_ns;
         if (self.logical) |validated| {
@@ -280,6 +313,7 @@ pub const Coordinator = struct {
         std.mem.copyForwards(media.live_mp4.Segment, self.units[0 .. self.count - keep], self.units[keep..self.count]);
         self.count -= keep;
         unit.* = null;
+        if (keep != 0) self.dropProbe();
     }
     /// Explicit presentation watermark for layouts without an automatic proof.
     /// Late subsequent pictures are rejected before advancing retention state.
@@ -439,7 +473,7 @@ pub const Coordinator = struct {
             released = try std.math.add(usize, released, try self.releaseCharge(unit, removed_index, self.count));
             removed_packets = try std.math.add(usize, removed_packets, unit.reader.packets.len);
         }
-        const next_base = try std.math.add(usize, self.logical_base, removed_packets);
+        const next_base = if (self.logical != null and self.logical.?.borrowed) 0 else try std.math.add(usize, self.logical_base, removed_packets);
         const next_packet_base = try std.math.add(usize, self.packet_base, removed_packets);
         try self.rebaseStream(@constCast(&prepared.window.reader), removed_packets);
         self.start_ns = next_start;
@@ -451,6 +485,7 @@ pub const Coordinator = struct {
         for (self.units[0..keep]) |*unit| unit.deinit();
         std.mem.copyForwards(media.live_mp4.Segment, self.units[0 .. self.count - keep], self.units[keep..self.count]);
         self.count -= keep;
+        if (keep != 0) self.dropProbe();
     }
     /// Caller drains finished old-epoch windows before accepting a new epoch.
     /// No incoming ownership transfers while an old output remains uncommitted.
@@ -477,6 +512,7 @@ pub const Coordinator = struct {
         if (self.logical) |*logical| logical.deinit();
         self.logical = null;
         self.dropStream();
+        self.dropProbe();
         self.parameters.deinit();
         self.logical_base = 0;
         self.packet_base = 0;
@@ -806,7 +842,9 @@ test "live coordinator reuses admitted validation metadata across prepare commit
     try std.testing.expect(prepared.logical != null);
     try flow.commit(&prepared);
     try std.testing.expectEqual(@as(usize, 2), flow.stats.validation_walks);
-    try std.testing.expect(flow.logical_base > 0);
+    try std.testing.expect(flow.packet_base > 0);
+    try std.testing.expect(flow.logical.?.borrowed);
+    try std.testing.expectEqual(@as(usize, 0), flow.logical_base);
     try flow.finish();
     var tail = (try flow.prepare()).?;
     defer tail.deinit();
@@ -1371,4 +1409,36 @@ test "live coordinator packet slices share payload charge and preserve every win
         try flow.commit(&prepared);
     }
     try std.testing.expect(flow.ordinal >= 4);
+}
+
+test "live coordinator failed quantum preserves ready borrowed metadata without allocating rollback" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var ingest = try media.live_mp4.Ingest.init(a, "rollback-prefix", fixture[0..797], .{ .stream = .{ .admission_pool = &pool } });
+    defer ingest.deinit();
+    var one = try part(&ingest, 797, 11206);
+    defer if (one) |*owner| owner.deinit();
+    var two = try part(&ingest, 11206, 20811);
+    defer if (two) |*owner| owner.deinit();
+    var flow = try Coordinator.init(failing.allocator(), .{ .duration_ns = std.time.ns_per_s / 2, .max_validated_frame_bytes = 0, .window = .{ .stream = .{ .admission_pool = &pool } } });
+    defer flow.deinit();
+    try flow.append(&one);
+    var before = (try flow.prepare()).?;
+    defer before.deinit();
+    try std.testing.expect(flow.logical.?.borrowed);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, flow.append(&two));
+    // Keep allocation disabled while inspecting the preserved published state.
+    try std.testing.expect(try flow.ready());
+    try std.testing.expect(flow.logical != null and !flow.logical.?.borrowed);
+    try std.testing.expectEqualSlices(@import("h264.zig").Picture, before.logical.?.pictures, flow.logical.?.pictures);
+    try std.testing.expect(two != null);
+    failing.fail_index = std.math.maxInt(usize);
+    var after = (try flow.prepare()).?;
+    defer after.deinit();
+    try std.testing.expectEqualSlices(@import("h264.zig").Picture, before.logical.?.pictures, after.logical.?.pictures);
+    try flow.append(&two);
+    try std.testing.expect(flow.logical.?.borrowed);
 }

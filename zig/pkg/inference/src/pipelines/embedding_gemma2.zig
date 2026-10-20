@@ -376,6 +376,8 @@ pub const Options = struct {
     video_decoder: @import("antfly_video").decoding.Options = .{},
     video_ahead: ?*VideoAhead = null,
     video_prepared: ?VideoPreparedHook = null,
+    /// Scoped to one admitted video row; never retained past preparation.
+    video_encoded: ?*const @import("embedding_gemma2_video.zig").Encoded = null,
     task_type: []const u8 = "RETRIEVAL_DOCUMENT",
     dimensions: usize = 768,
     /// Expanded input limit, including prompts, wrappers, and media tokens.
@@ -646,7 +648,7 @@ pub const LiveDecoder = struct {
     }
     pub fn bind(self: *LiveDecoder, prepared: *@import("antfly_video").live_coordinator.Prepared) !*@import("embedding_gemma2_video.zig").DecoderContinuation {
         if (self.epoch != null and (self.epoch.? != prepared.window.epoch or self.generation != prepared.generation or self.packet_base != prepared.packet_base)) self.reset();
-        if (prepared.window.reader.packets.len < self.packets) return error.InvalidLivePictureIndex;
+        if (prepared.window.reader.packets.len < self.packets) self.reset();
         var window = try @import("antfly_video").live_windows.clone(self.allocation.allocator(), &prepared.window, .{ .stream = .{ .control = prepared.window.reader.input.control, .admission_pool = prepared.window.reader.input.admission_pool } });
         errdefer window.deinit();
         self.reader = window.reader;
@@ -1058,7 +1060,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
 /// Independent windows share backbone execution, never attention or pooling.
 /// Decode remains ordered so retained codec continuations can advance safely.
 /// No queue fill delay: callers pass only already available windows (max four).
-pub const VideoBatchResult = struct { vectors: [][]f32, input_tokens: []usize, execution: BatchExecution.Execution };
+pub const VideoBatchResult = struct { vectors: [][]f32, input_tokens: []usize, execution: BatchExecution.Execution, shared_vision_batches: usize = 0 };
 pub const VideoBatchItem = struct { movie: SampledVideo, caption: ?[]const u8 = null, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*VideoAhead = null };
 pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, items: []const VideoBatchItem, input_options: Options, lock: ?*std.atomic.Mutex, control: Control, cache: ?*FrameCache) !VideoBatchResult {
     var pins = @import("embedding_gemma2_video.zig").CachePins{ .cache = cache };
@@ -1090,6 +1092,9 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     var commands: u64 = 0;
     var host: usize = 64 * 1024 * 1024;
     var vision_workspace: usize = 0;
+    const preparation_context = try factory.videoPreparationContext(session, false);
+    const cohort_io = control.io orelse preparation_context.io;
+    const cohort = items.len > 1 and cohort_io != null and !@import("builtin").single_threaded and !@import("builtin").cpu.arch.isWasm() and (session.backend() == .metal or session.backend() == .native);
     for (items) |item| {
         const movie = item.movie;
         try control.check();
@@ -1103,9 +1108,9 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         raw_longest = @max(raw_longest, raw);
         total = try std.math.add(usize, total, raw);
         if (item.ahead == null) {
-            device = @max(device, try plan.deviceBytes());
-            commands = @max(commands, plan.commands);
-            host = @max(host, try plan.hostBytes());
+            device = if (cohort) try std.math.add(usize, device, try plan.deviceBytes()) else @max(device, try plan.deviceBytes());
+            commands = if (cohort) try std.math.add(u64, commands, plan.commands) else @max(commands, plan.commands);
+            host = if (cohort) try std.math.add(usize, host, try plan.hostBytes()) else @max(host, try plan.hostBytes());
         }
         vision_workspace = @max(vision_workspace, plan.vision_workspace_bytes);
     }
@@ -1146,12 +1151,45 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     var initialized: usize = 0;
     defer for (rows[0..initialized]) |row| row.deinit(a);
     defer if (cb.embedding_stage) |stage| stage.cleanup();
-    for (items) |item| {
+    const video_model = @import("embedding_gemma2_video.zig");
+    var encoded_rows: [4]video_model.Encoded = undefined;
+    var encoded_count: usize = 0;
+    var shared_vision_batches: usize = 0;
+    defer for (encoded_rows[0..encoded_count]) |encoded| encoded.deinit(a);
+    if (cohort) {
+        var context = preparation_context;
+        if (commands != 0) context = try factory.videoPreparationContext(session, true);
+        var producers: [4]*video_model.Prefetch = undefined;
+        var producer_count: usize = 0;
+        defer {
+            video_model.Prefetch.cancelCohort(producers[0..producer_count]);
+            for (items[0..producer_count], producers[0..producer_count]) |item, producer| {
+                if (item.ahead) |ahead| ahead.release() else producer.deinit();
+            }
+        }
+        // Complete shared inspection/pin mutations before any new producer
+        // reads those immutable entries on another thread.
+        for (items) |item| if (item.ahead == null) {
+            const movie = item.movie;
+            const configuration = video_model.Configuration{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins, .inspection_scope = &inspection_scope, .pool = &pool, .cache = cache, .coefficients = context.coefficients };
+            if (inspection_scope.find(movie.bytes, movie.reader, configuration) == null) _ = try inspection_scope.inspect(movie.bytes, movie.reader, control, configuration, session.backend() == .metal);
+        };
+        for (items, 0..) |item, index| {
+            const movie = item.movie;
+            producers[index] = if (item.ahead) |ahead| ahead.producer.? else try video_model.Prefetch.startConfigured(a, cohort_io.?, context.device, movie.bytes, movie.reader, control, .{ .predecessor = if (index == 0) null else producers[index - 1], .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins, .inspection_scope = &inspection_scope, .pool = &pool, .cache = cache, .coefficients = context.coefficients });
+            producer_count += 1;
+        }
+        shared_vision_batches = try video_model.Prefetch.encodeCohort(a, cb, producers[0..producer_count], encoded_rows[0..producer_count]);
+        encoded_count = producer_count;
+    }
+    for (items, 0..) |item, row_index| {
         const movie = item.movie;
         const parts = [_]Part{ .{ .sampled_video = movie }, .{ .text = item.caption orelse "" } };
         const group = Group{ .content = parts[0..if (item.caption != null) 2 else 1] };
         try validateGroup(group, options);
-        rows[initialized] = try prepareGroupWithBudget(a, cb, tokenizer, group, options, control, &pool, if (item.ahead) |ahead| ahead.producer else null, cache);
+        var row_options = options;
+        if (cohort) row_options.video_encoded = &encoded_rows[row_index];
+        rows[initialized] = try prepareGroupWithBudget(a, cb, tokenizer, group, row_options, control, &pool, if (!cohort and item.ahead != null) item.ahead.?.producer else null, cache);
         if (cb.embedding_stage != null) if (rows[initialized].tensor) |tensor| {
             rows[initialized].tensor = @import("../ops/metal_compute.zig").MetalCompute.escapeEmbeddingStage(cb, tensor) catch |err| {
                 rows[initialized].deinit(a);
@@ -1159,13 +1197,15 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
             };
             cb.free(tensor);
         };
-        if (item.ahead) |ahead| ahead.release();
+        if (!cohort) if (item.ahead) |ahead| ahead.release();
         initialized += 1;
         if (cb.embedding_stage) |stage| {
             try stage.pause();
             try stage.acquire();
         }
     }
+    for (encoded_rows[0..encoded_count]) |encoded| encoded.deinit(a);
+    encoded_count = 0;
     for (rows[0..initialized]) |row| if (row.ids.len > longest) return error.MemoryBudgetExceeded;
     inspection_scope.deinit();
     const batch_inputs = try packVideoRows(a, cb, rows[0..initialized]);
@@ -1204,7 +1244,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         copied += 1;
         count.* = row.ids.len;
     }
-    return .{ .vectors = result_vectors, .input_tokens = counts, .execution = if (items.len > 1) .native_batch else .serial };
+    return .{ .vectors = result_vectors, .input_tokens = counts, .execution = if (items.len > 1) .native_batch else .serial, .shared_vision_batches = shared_vision_batches };
 }
 
 pub fn preparedCohortCount(lengths: []const usize, maximum: usize) usize {
@@ -2213,7 +2253,17 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
             inline .video, .sampled_video => |payload| {
                 const bytes = if (@TypeOf(payload) == SampledVideo) payload.bytes else payload;
                 const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
-                const encoded = if (!used_prefetch and prefetched != null) blk: {
+                const encoded = if (!used_prefetch and options.video_encoded != null) blk: {
+                    used_prefetch = true;
+                    const source = options.video_encoded.?;
+                    const counts = try a.dupe(usize, source.frame_tokens);
+                    errdefer a.free(counts);
+                    var tokens: usize = 0;
+                    for (counts) |count| tokens += count;
+                    const tensor = if (source.tensor) |value| try cb.sliceRows2D(a, value, 0, tokens, 512) else null;
+                    errdefer if (tensor) |value| cb.free(value);
+                    break :blk @import("embedding_gemma2_video.zig").Encoded{ .embeddings = try a.dupe(f32, source.embeddings), .tensor = tensor, .backend = cb, .frame_tokens = counts };
+                } else if (!used_prefetch and prefetched != null) blk: {
                     used_prefetch = true;
                     break :blk try prefetched.?.encodeAllocStaged(a, cb, cb.embedding_stage);
                 } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });

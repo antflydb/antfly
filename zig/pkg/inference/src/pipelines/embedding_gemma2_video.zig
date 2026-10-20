@@ -115,7 +115,7 @@ pub const InspectionScope = struct {
         for (self.entries[0..self.count]) |entry| if (entry.?.matches(bytes, reader, configuration)) return entry.?;
         return null;
     }
-    fn inspect(self: *InspectionScope, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration, metal: bool) !Plan {
+    pub fn inspect(self: *InspectionScope, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration, metal: bool) !Plan {
         if (self.find(bytes, reader, configuration)) |entry| return entry.plan;
         if (self.count == self.entries.len) return error.ResourceLimitExceeded;
         const entry = try Inspection.create(self.allocator, self.limit, bytes, reader, control, configuration, metal);
@@ -210,6 +210,8 @@ pub const Inspection = struct {
     }
 };
 pub const Configuration = struct {
+    /// Serialize coded preparation within a cohort to preserve warm DPB order.
+    predecessor: ?*Prefetch = null,
     coefficients: ?*const video.preparation.CoefficientCache = null,
     /// Explicit pipeline handoff; generic container/preflight callers never
     /// inspect a model backend before their metadata admission succeeds.
@@ -351,6 +353,12 @@ pub fn immutableSourceBinding(reader: *const media.mp4.Reader) [32]u8 {
 pub const ReaderSelection = struct {
     validated: ?*const video.validated_frames.View = null,
     validated_packet_base: usize = 0,
+    /// Acquired only for cache misses, and held through native callback drain.
+    continuation_lease: ?struct {
+        context: *anyopaque,
+        acquire: *const fn (*anyopaque) anyerror!*DecoderContinuation,
+        release: *const fn (*anyopaque) void,
+    } = null,
     continuation: ?*DecoderContinuation = null,
     packet_base: usize = 0,
     allocator: std.mem.Allocator,
@@ -1159,12 +1167,15 @@ pub const Prefetch = struct {
     failure: ?anyerror = null, // Read only after joining the producer.
     aborted: std.atomic.Value(bool) = .init(false),
     published: std.atomic.Value(usize) = .init(0),
+    wake: std.atomic.Value(?*std.Io.Event) = .init(null),
+    predecessor: ?*Prefetch = null,
+    finished: std.Io.Event = .unset,
 
     pub fn start(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !*Prefetch {
         return startCached(a, io, device, bytes, control, sampling, pool, null);
     }
     pub fn startCached(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache) !*Prefetch {
-        return startInput(a, io, device, bytes, null, control, sampling, pool, cache, null, .{}, null, null, null, null);
+        return startInput(a, io, device, bytes, null, control, sampling, pool, cache, null, .{}, null, null, null, null, null);
     }
     pub fn startReader(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !*Prefetch {
         return startReaderWithSelection(a, io, device, reader, control, sampling, pool, null);
@@ -1173,7 +1184,7 @@ pub const Prefetch = struct {
         return startReaderCachedWithSelection(a, io, device, reader, control, sampling, pool, selection, null);
     }
     pub fn startReaderCachedWithSelection(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, selection: ?*const ReaderSelection, cache: ?*FrameCache) !*Prefetch {
-        return startInput(a, io, device, try packetBytes(reader), reader, control, sampling, pool, cache, selection, .{}, null, null, null, null);
+        return startInput(a, io, device, try packetBytes(reader), reader, control, sampling, pool, cache, selection, .{}, null, null, null, null, null);
     }
     pub fn startConfigured(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration) !*Prefetch {
         if (configuration.inspection_scope) |scope| if (scope.find(bytes, reader, configuration) == null) {
@@ -1182,13 +1193,13 @@ pub const Prefetch = struct {
             _ = try scope.inspect(bytes, reader, control, configuration, device != null);
         };
         const inspection = if (configuration.inspection_scope) |scope| scope.find(bytes, reader, configuration) else null;
-        return startInput(a, io, device, if (inspection) |owner| owner.validated_bytes else if (reader) |r| try packetBytes(r) else bytes, reader, control, configuration.sampling, configuration.pool, configuration.cache, configuration.selection, configuration.decoder, configuration.webm, configuration.cache_pins, inspection, configuration.coefficients);
+        return startInput(a, io, device, if (inspection) |owner| owner.validated_bytes else if (reader) |r| try packetBytes(r) else bytes, reader, control, configuration.sampling, configuration.pool, configuration.cache, configuration.selection, configuration.decoder, configuration.webm, configuration.cache_pins, inspection, configuration.coefficients, configuration.predecessor);
     }
-    fn startInput(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection, decoder: video.decoding.Options, webm_input: ?WebmInput, cache_pins: ?*CachePins, inspection: ?*const Inspection, coefficients: ?*const video.preparation.CoefficientCache) !*Prefetch {
+    fn startInput(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection, decoder: video.decoding.Options, webm_input: ?WebmInput, cache_pins: ?*CachePins, inspection: ?*const Inspection, coefficients: ?*const video.preparation.CoefficientCache, predecessor: ?*Prefetch) !*Prefetch {
         try control.check();
         const self = try a.create(Prefetch);
         errdefer a.destroy(self);
-        self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .packet_reader = reader, .reader_selection = selection, .webm_input = webm_input, .control = control, .sampling = sampling, .pool = pool, .cache = cache, .cache_pins = cache_pins, .inspection = inspection, .decoder = decoder, .coefficients = coefficients };
+        self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .packet_reader = reader, .reader_selection = selection, .webm_input = webm_input, .control = control, .sampling = sampling, .pool = pool, .cache = cache, .cache_pins = cache_pins, .inspection = inspection, .decoder = decoder, .coefficients = coefficients, .predecessor = predecessor };
         if (cache != null and selection == null and bytes.len <= 64 * 1024 * 1024) {
             const adapter = control.imageWorkControl();
             self.clip_hash = try clipBinding(bytes, reader, webm_input, .{ .context = adapter.context, .check_fn = adapter.check_fn }, cache_pins, null);
@@ -1213,13 +1224,16 @@ pub const Prefetch = struct {
         try check(self);
         if (job == .header) try self.header_queue.putOneUncancelable(self.io, job) else try self.queue.putOneUncancelable(self.io, job);
         _ = self.published.fetchAdd(1, .release);
+        if (self.wake.load(.acquire)) |wake| wake.set(self.io);
     }
     fn run(self: *Prefetch) void {
+        defer self.finished.set(self.io);
         self.produce() catch |err| {
             self.failure = err;
         };
         self.header_queue.close(self.io);
         self.queue.close(self.io);
+        if (self.wake.load(.acquire)) |wake| wake.set(self.io);
     }
     fn join(self: *Prefetch) void {
         if (self.thread) |thread| {
@@ -1235,10 +1249,20 @@ pub const Prefetch = struct {
             .cached => |value| if (!value.pinned) self.cache.?.restore(value.ticket),
         }
     }
-    pub fn deinit(self: *Prefetch) void {
+    /// Signal every owner before joining any member of a shared decoder cohort.
+    pub fn cancel(self: *Prefetch) void {
         self.aborted.store(true, .release);
         self.header_queue.close(self.io);
         self.queue.close(self.io);
+    }
+    /// A predecessor event must outlive every waiter, even if startup fails
+    /// before the consumer runs. Join all members before releasing any owner.
+    pub fn cancelCohort(producers: []const *Prefetch) void {
+        for (producers) |producer| producer.cancel();
+        for (producers) |producer| producer.join();
+    }
+    pub fn deinit(self: *Prefetch) void {
+        self.cancel();
         self.join();
         var job: [1]Job = undefined;
         while (true) {
@@ -1340,6 +1364,10 @@ pub const Prefetch = struct {
             missing += 1;
         }
         if (missing == 0) return;
+        // Publish every header before waiting: the consumer needs all row
+        // identities before it can drain a predecessor's bounded frame queue.
+        if (self.predecessor) |previous| previous.finished.waitUncancelable(self.io);
+        try check(self);
         if (self.device) |device| {
             self.preparer = try video.preparation.Metal.init(device);
             self.preparer.?.useCoefficientCache(self.coefficients);
@@ -1351,6 +1379,157 @@ pub const Prefetch = struct {
         if (webm) {
             try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, self.webm_input);
         } else try decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
+    }
+
+    /// Consume ready jobs from up to four windows through one projection lane.
+    /// Frame identities remain scoped to their source row, while compatible
+    /// geometry shares vision calls. No delay is introduced to fill a cohort.
+    pub fn encodeCohort(a: std.mem.Allocator, cb: *const ComputeBackend, producers: []const *Prefetch, outputs: []Encoded) !usize {
+        if (producers.len == 0 or producers.len > 4 or outputs.len != producers.len) return error.InvalidInputShape;
+        const io = producers[0].io;
+        var wake: std.Io.Event = .unset;
+        for (producers) |producer| producer.wake.store(&wake, .release);
+        defer for (producers) |producer| producer.wake.store(null, .release);
+        errdefer {
+            // Wake blocked producers before joining, including a decoder lease
+            // holder whose queue filled while another row failed.
+            cancelCohort(producers);
+        }
+        defer if (cb.embedding_stage) |stage| stage.cleanup();
+        if (cb.embedding_stage) |stage| try stage.pause();
+        var offsets: [5]usize = @splat(0);
+        var ids: [128]usize = undefined;
+        var keys: [128]CacheKey = undefined;
+        var counts: [128]usize = @splat(0);
+        for (producers, 0..) |producer, row| {
+            if (producer.cache != producers[0].cache) return error.InvalidVideoCacheSession;
+            var header: [1]Job = undefined;
+            _ = producer.header_queue.getUncancelable(io, &header, 1) catch {
+                producer.join();
+                return producer.failure orelse error.InvalidTensorShape;
+            };
+            const selected = switch (header[0]) {
+                .header => |value| value,
+                else => return error.InvalidTensorShape,
+            };
+            if (selected.len == 0 or selected.len > 32) return error.ResourceLimitExceeded;
+            offsets[row + 1] = offsets[row] + selected.len;
+            for (selected, 0..) |id, slot| {
+                ids[offsets[row] + slot] = offsets[row] + std.mem.indexOfScalar(usize, selected, id).?;
+                keys[offsets[row] + slot] = projectionKey(producer.reader_selection, producer.clip_hash, selected, slot, producer.decoder.policy);
+            }
+        }
+        const n = offsets[producers.len];
+        const output = try a.alloc(f32, if (cb.kind() == .metal) 0 else n * 140 * 512);
+        defer a.free(output);
+        const resident = if (cb.kind() == .metal) try a.alloc(?CT, n) else null;
+        if (resident) |tensors| @memset(tensors, null);
+        defer if (resident) |tensors| {
+            for (tensors) |tensor| if (tensor) |value| cb.free(value);
+            a.free(tensors);
+        };
+        const adapter = producers[0].control.imageWorkControl();
+        var capture = Capture{ .a = a, .cb = cb, .track = undefined, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .output = output, .resident = resident, .frame_tokens = counts[0..n], .selected = ids[0..n], .projection_keys = keys[0..n], .row_boundaries = offsets[0 .. producers.len + 1], .io = io, .native_batching = cb.kind() == .native, .cache = producers[0].cache };
+        defer capture.discardNativePending();
+        var closed: [4]bool = @splat(false);
+        var remaining = producers.len;
+        while (remaining != 0) {
+            try producers[0].control.check();
+            if (cb.embedding_stage) |stage| try stage.pause();
+            wake.reset();
+            var jobs: [8]Job = undefined;
+            var owners: [8]*Prefetch = undefined;
+            var count: usize = 0;
+            var owned: [8]bool = @splat(true);
+            defer for (jobs[0..count], owners[0..count], 0..) |*job, owner, index| if (owned[index]) owner.discard(job);
+            for (producers, 0..) |producer, row| {
+                if (closed[row] or count == jobs.len) continue;
+                const begin = count;
+                const got = producer.queue.getUncancelable(io, jobs[count..], 0) catch {
+                    producer.join();
+                    if (producer.failure) |err| return err;
+                    closed[row] = true;
+                    remaining -= 1;
+                    continue;
+                };
+                count += got;
+                for (jobs[begin..count], owners[begin..count]) |*job, *owner| {
+                    owner.* = producer;
+                    switch (job.*) {
+                        .native => |*value| value.slot += offsets[row],
+                        .metal => |*value| value.slot += offsets[row],
+                        .cached => |*value| value.slot += offsets[row],
+                        .header => unreachable,
+                    }
+                }
+            }
+            if (count == 0) {
+                if (remaining != 0) try wake.wait(io);
+                continue;
+            }
+            // Pause while GPU preparation completes; all model operations stay
+            // on this consumer lane and obey the existing workspace admission.
+            var cursor: usize = 0;
+            while (cursor < count) {
+                if (jobs[cursor] == .metal) {
+                    if (cb.embedding_stage) |stage| try stage.pause();
+                    try jobs[cursor].metal.prepared.wait(io, capture.control);
+                    var gpu: [8]ProjectionJob = undefined;
+                    var take: usize = 0;
+                    while (cursor < count and jobs[cursor] == .metal) : (cursor += 1) {
+                        if (take != 0 and !try jobs[cursor].metal.prepared.isReady()) break;
+                        gpu[take] = jobs[cursor].metal;
+                        owned[cursor] = false;
+                        take += 1;
+                    }
+                    if (cb.embedding_stage) |stage| try stage.acquire();
+                    try capture.projectGpuBatchNow(gpu[0..take]);
+                    continue;
+                }
+                if (cb.embedding_stage) |stage| try stage.acquire();
+                switch (jobs[cursor]) {
+                    .native => |value| try capture.project(value.slot, value.patches, value.options),
+                    .cached => |value| try capture.loadCached(value.slot, value.ticket),
+                    else => unreachable,
+                }
+                cursor += 1;
+            }
+        }
+        for (producers) |producer| {
+            producer.join();
+            producer.releasePreparer();
+        }
+        if (cb.embedding_stage) |stage| {
+            try stage.acquire();
+            try stage.workspace(null);
+        }
+        try capture.flushNativePending();
+        try capture.finishDuplicates();
+        var initialized: usize = 0;
+        errdefer for (outputs[0..initialized]) |encoded| encoded.deinit(a);
+        for (outputs, 0..) |*encoded, row| {
+            const begin = offsets[row];
+            const end = offsets[row + 1];
+            const tokens = try a.dupe(usize, counts[begin..end]);
+            errdefer a.free(tokens);
+            if (resident) |tensors| {
+                const tensor = try assembleProjections(a, cb, ids[begin..end], tensors[begin..end], counts[begin..end]);
+                errdefer cb.free(tensor);
+                encoded.* = .{ .embeddings = try a.alloc(f32, 0), .tensor = tensor, .backend = cb, .frame_tokens = tokens };
+            } else {
+                var total: usize = 0;
+                for (tokens) |value| total += value * 512;
+                const values = try a.alloc(f32, total);
+                var at: usize = 0;
+                for (tokens, begin..) |value, slot| {
+                    @memcpy(values[at..][0 .. value * 512], output[slot * 140 * 512 ..][0 .. value * 512]);
+                    at += value * 512;
+                }
+                encoded.* = .{ .embeddings = values, .frame_tokens = tokens };
+            }
+            initialized += 1;
+        }
+        return capture.shared_vision_batches;
     }
 
     /// Consumer owns model operations; the producer fills the next bounded cohort.
@@ -1504,7 +1683,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         const device = if (cb.kind() == .metal) try MetalCompute.videoDevice(cb) else null;
         try stage.pause();
         defer stage.cleanup();
-        const producer = try Prefetch.startInput(a, io, device, bytes, borrowed, control, sampling, pool, cache, selection, decoder, webm_input, cache_pins, inspection, coefficients);
+        const producer = try Prefetch.startInput(a, io, device, bytes, borrowed, control, sampling, pool, cache, selection, decoder, webm_input, cache_pins, inspection, coefficients, null);
         defer producer.deinit();
         try stage.acquire();
         return producer.encodeAllocStaged(a, cb, stage);
@@ -1801,22 +1980,27 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, requested: [
                 capture.decode_slots = slots[0..count];
             }
         };
+        // Binding and decoding share one lease: another producer cannot rebind
+        // the retained reader while callbacks or source controls still use it.
+        const lease = if (capture.reader_selection) |selection| selection.continuation_lease else null;
+        const continuation = if (lease) |owner| try owner.acquire(owner.context) else if (capture.reader_selection) |selection| selection.continuation else null;
+        defer if (lease) |owner| owner.release(owner.context);
         if (capture.decoder.policy != .portable and appleAllowed(capture.decoder)) {
-            if (capture.reader_selection) |selection| if (selection.continuation) |continuation| {
-                const used = continuation.decodeApple(selected, selection.packet_base, capture) catch |err| retry: {
+            if (continuation) |owner| {
+                const used = owner.decodeApple(selected, capture.reader_selection.?.packet_base, capture) catch |err| retry: {
                     try appleUnavailable(capture, err);
                     break :retry false;
                 };
                 if (used) return;
-            };
+            }
         }
         if (try decodeAppleH264(a, reader, selected, capture)) return;
-        if (capture.reader_selection) |selection| if (selection.continuation) |continuation| {
-            if (try continuation.decodeControlled(selected, selection.packet_base, capture, Capture.publishDecoded, capture.control)) {
+        if (continuation) |owner| {
+            if (try owner.decodeControlled(selected, capture.reader_selection.?.packet_base, capture, Capture.publishDecoded, capture.control)) {
                 capture.decoder.record(.portable);
                 return;
             }
-        };
+        }
         capture.decoder.record(.portable);
         // Decode references once for the whole selection, never once per frame.
         if (configurations) |session| _ = try session.decodeSelectedBorrowed(a, reader, selected, capture, Capture.publishDecoded) else _ = try video.h264_sparse.decodeSelected(a, reader, selected, .{ .max_total_packets = 8192 }, capture, Capture.publishDecoded);
@@ -1902,6 +2086,9 @@ const Capture = struct {
     decoder: video.decoding.Options = .{},
     clip_hash: [32]u8 = @splat(0),
     reader_selection: ?*const ReaderSelection = null,
+    projection_keys: ?[]const CacheKey = null,
+    row_boundaries: ?[]const usize = null,
+    shared_vision_batches: usize = 0,
     decode_slots: ?[]const usize = null,
     track: media.mp4.Track,
     webm_track: ?media.webm.Track = null,
@@ -1920,9 +2107,25 @@ const Capture = struct {
     native_pending: [8]NativeProjectionJob = undefined,
     native_count: usize = 0,
     native_limit: usize = 1,
-    claimed: [32]bool = @splat(false),
+    claimed: [128]bool = @splat(false),
     apple_published: usize = 0,
     last_prepared: bool = false,
+    fn recordCohort(self: *Capture, jobs: anytype) void {
+        const boundaries = self.row_boundaries orelse return;
+        if (jobs.len < 2) return;
+        for (boundaries[1 .. boundaries.len - 1]) |boundary| {
+            var before = false;
+            var after = false;
+            for (jobs) |job| {
+                before = before or job.slot < boundary;
+                after = after or job.slot >= boundary;
+            }
+            if (before and after) {
+                self.shared_vision_batches += 1;
+                return;
+            }
+        }
+    }
     fn loadCached(self: *Capture, slot: usize, ticket: CacheTicket) !void {
         try self.control.check();
         const tokens = ticket.entry.tokens;
@@ -1938,8 +2141,11 @@ const Capture = struct {
             self.claimed[duplicate] = true;
         };
     }
+    fn key(self: *const Capture, slot: usize) CacheKey {
+        return if (self.projection_keys) |keys| keys[slot] else projectionKey(self.reader_selection, self.clip_hash, self.selected, slot, self.decoder.policy);
+    }
     fn storeDevice(self: *Capture, slot: usize, tensor: CT, tokens: usize) void {
-        if (self.cache) |cache| cache.storeDevice(projectionKey(self.reader_selection, self.clip_hash, self.selected, slot, self.decoder.policy), tensor, tokens);
+        if (self.cache) |cache| cache.storeDevice(self.key(slot), tensor, tokens);
     }
     fn finishDuplicates(self: *Capture) !void {
         for (self.selected, 0..) |id, slot| {
@@ -1995,15 +2201,31 @@ const Capture = struct {
         defer self.a.free(embeddings);
         if (encoded.tokens % count != 0 or embeddings.len != encoded.tokens * 512) return error.InvalidTensorShape;
         const per_frame = encoded.tokens / count;
+        self.recordCohort(self.native_pending[0..count]);
         for (self.native_pending[0..count], 0..) |job, i| try self.commitNative(job.slot, embeddings[i * per_frame * 512 ..][0 .. per_frame * 512], per_frame);
         batch_policy.completed(false, pending.options.width, pending.options.height, count, batch_clock.monotonicNs() -| started);
+    }
+    fn remainingSelections(self: *const Capture) usize {
+        var count: usize = 0;
+        for (self.selected, 0..) |id, slot| {
+            if (self.claimed[slot] or self.frame_tokens[slot] != 0) continue;
+            if (std.mem.indexOfScalar(usize, self.selected, id).? != slot) continue;
+            count += 1;
+        }
+        return count;
     }
     fn projectNativeBatch(self: *Capture, slot: usize, patches: []const f32, options: video.preparation.Options) !void {
         if (self.native_count != 0) {
             const pending = self.native_pending[0];
             if (pending.options.width != options.width or pending.options.height != options.height or pending.patches.len != patches.len) try self.flushNativePending();
         }
-        if (self.native_count == 0) self.native_limit = batch_policy.capacity(false, options.width, options.height, try projector.embeddingGemma2VideoBatchCapacityForBackend(options.width, options.height, 384 * 1024 * 1024, false));
+        if (self.native_count == 0) {
+            const geometry_limit = try projector.embeddingGemma2VideoBatchCapacityForBackend(options.width, options.height, 384 * 1024 * 1024, false);
+            // An unfillable exploratory width never produces an observation.
+            // Cap by remaining unique work so small windows can actually learn
+            // that singleton projection is faster than a paired CPU tower.
+            self.native_limit = batch_policy.capacity(false, options.width, options.height, @min(geometry_limit, @max(1, self.remainingSelections())));
+        }
         self.native_pending[self.native_count] = .{ .slot = slot, .patches = try self.a.dupe(f32, patches), .options = options };
         self.native_count += 1;
         self.claimed[slot] = true;
@@ -2036,7 +2258,7 @@ const Capture = struct {
     }
     fn save(self: *Capture, slot: usize, encoded: anytype) !void {
         if (encoded.tokens == 0 or encoded.tokens > 140 or encoded.embeddings.len != encoded.tokens * 512) return error.InvalidTensorShape;
-        if (self.cache) |cache| cache.storeCpu(projectionKey(self.reader_selection, self.clip_hash, self.selected, slot, self.decoder.policy), encoded.embeddings, encoded.tokens);
+        if (self.cache) |cache| cache.storeCpu(self.key(slot), encoded.embeddings, encoded.tokens);
         @memcpy(self.output[slot * 140 * 512 ..][0..encoded.embeddings.len], encoded.embeddings);
         self.frame_tokens[slot] = encoded.tokens;
     }
@@ -2183,6 +2405,7 @@ const Capture = struct {
             defer self.cb.free(encoded.tensor);
             if (encoded.tokens % jobs.len != 0) return error.InvalidTensorShape;
             const per_frame = encoded.tokens / jobs.len;
+            self.recordCohort(jobs);
             const shape = [_]i64{ @intCast(encoded.tokens), 512 };
             // Slice both before publishing either: an allocation failure cannot
             // leave one slot with a partially committed batched result.
@@ -4427,4 +4650,131 @@ test "embeddinggemma2 video partial validated frame reuse preserves preparation 
     try std.testing.expectEqual(@as(usize, 1), stats.validated_frames.load(.acquire));
     try std.testing.expectEqual(expected.count, actual.count);
     for (expected.patches[0..expected.count], actual.patches[0..actual.count]) |left, right| try std.testing.expectEqualSlices(f32, left.?, right.?);
+}
+
+test "embeddinggemma2 video cohort header failure drains a blocked preparation producer" {
+    const a = std.testing.allocator;
+    const first = try a.create(Prefetch);
+    first.* = .{ .a = a, .io = std.testing.io, .bytes = &.{}, .control = .{}, .sampling = .reference, .pool = null, .device = null };
+    first.selected = try a.dupe(usize, &.{0});
+    first.header_queue = .init(&first.header_storage);
+    first.queue = .init(&first.storage);
+    defer first.deinit();
+    const second = try a.create(Prefetch);
+    second.* = .{ .a = a, .io = std.testing.io, .bytes = &.{}, .control = .{}, .sampling = .reference, .pool = null, .device = null, .failure = error.InvalidVideoFixture };
+    second.header_queue = .init(&second.header_storage);
+    second.queue = .init(&second.storage);
+    second.header_queue.close(second.io);
+    second.queue.close(second.io);
+    defer second.deinit();
+    const Worker = struct {
+        fn run(producer: *Prefetch) void {
+            produce(producer) catch {};
+            producer.header_queue.close(producer.io);
+            producer.queue.close(producer.io);
+        }
+        fn produce(producer: *Prefetch) !void {
+            try producer.put(.{ .header = producer.selected.? });
+            for (0..32) |_| {
+                const patches = try producer.a.alloc(f32, 1);
+                errdefer producer.a.free(patches);
+                try producer.put(.{ .native = .{ .slot = 0, .patches = patches, .options = .{ .width = 16, .height = 16, .matrix = .bt709 } } });
+            }
+        }
+    };
+    first.thread = try std.Thread.spawn(.{}, Worker.run, .{first});
+    // Header failure precedes every backend operation.
+    var cb: ComputeBackend = undefined;
+    cb.embedding_stage = null;
+    var output: [2]Encoded = undefined;
+    try std.testing.expectError(error.InvalidVideoFixture, Prefetch.encodeCohort(a, &cb, &.{ first, second }, &output));
+    try std.testing.expect(first.thread == null);
+}
+
+test "embeddinggemma2 video ordered cohort publishes headers before waiting for a full predecessor" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/video/mjpeg.mov") }, .identity = "ordered-cohort" };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var packets: [12]media.mp4.Packet = undefined;
+    @memset(&packets, reader.packets[0]);
+    for (&packets, 0..) |*packet, index| {
+        packet.pts = @intCast(index);
+        packet.dts = @intCast(index);
+        packet.duration = 1;
+    }
+    var borrowed = reader;
+    borrowed.packets = &packets;
+    borrowed.track.timescale = 1;
+    const configuration = Configuration{ .sampling = .{ .timestamps = .{ .end_ns = 12 * std.time.ns_per_s, .step_ns = std.time.ns_per_s, .max_frames = 12 } } };
+    const first = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, &borrowed, .{}, configuration);
+    var second: ?*Prefetch = null;
+    defer {
+        for ([_]?*Prefetch{ first, second }) |entry| if (entry) |producer| {
+            producer.aborted.store(true, .release);
+            producer.header_queue.close(producer.io);
+            producer.queue.close(producer.io);
+        };
+        first.join();
+        if (second) |producer| producer.join();
+        first.deinit();
+        if (second) |producer| producer.deinit();
+    }
+    var polls: usize = 0;
+    while (first.published.load(.acquire) < 9 and polls < 1000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    try std.testing.expect(first.published.load(.acquire) >= 9);
+    var next = configuration;
+    next.predecessor = first;
+    second = try Prefetch.startConfigured(a, std.testing.io, null, &.{}, &borrowed, .{}, next);
+    var header: [1]Prefetch.Job = undefined;
+    polls = 0;
+    var count: usize = 0;
+    while (count == 0 and polls < 1000) : (polls += 1) {
+        count = try second.?.header_queue.getUncancelable(std.testing.io, &header, 0);
+        if (count == 0) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(usize, 12), header[0].header.len);
+}
+
+test "embeddinggemma2 video cohort body failure releases already dequeued jobs from other rows" {
+    const a = std.testing.allocator;
+    var producers: [2]*Prefetch = undefined;
+    for (&producers, 0..) |*entry, index| {
+        const producer = try a.create(Prefetch);
+        producer.* = .{ .a = a, .io = std.testing.io, .bytes = &.{}, .control = .{}, .sampling = .reference, .pool = null, .device = null };
+        producer.selected = try a.dupe(usize, &.{0});
+        producer.header_queue = .init(&producer.header_storage);
+        producer.queue = .init(&producer.storage);
+        try producer.header_queue.putOneUncancelable(producer.io, .{ .header = producer.selected.? });
+        producer.header_queue.close(producer.io);
+        if (index == 0) {
+            const patches = try a.alloc(f32, 1);
+            try producer.queue.putOneUncancelable(producer.io, .{ .native = .{ .slot = 0, .patches = patches, .options = .{ .width = 16, .height = 16, .matrix = .bt709 } } });
+        } else producer.failure = error.InvalidVideoFixture;
+        producer.queue.close(producer.io);
+        entry.* = producer;
+    }
+    defer for (producers) |producer| producer.deinit();
+    const Fake = struct {
+        fn kind(_: *anyopaque) @import("../ops/ops.zig").BackendKind {
+            return .native;
+        }
+    };
+    var vtable: ComputeBackend.VTable = undefined;
+    vtable.backendKind = Fake.kind;
+    var marker: u8 = 0;
+    const cb = ComputeBackend{ .ptr = &marker, .vtable = &vtable };
+    var outputs: [2]Encoded = undefined;
+    try std.testing.expectError(error.InvalidVideoFixture, Prefetch.encodeCohort(a, &cb, &producers, &outputs));
+}
+
+test "embeddinggemma2 video native calibration counts only remaining unique projections" {
+    var counts = [_]usize{ 0, 0, 0, 0 };
+    var capture = Capture{ .a = std.testing.allocator, .cb = undefined, .track = undefined, .control = .{}, .output = &.{}, .frame_tokens = &counts, .selected = &.{ 3, 1, 3, 2 } };
+    try std.testing.expectEqual(@as(usize, 3), capture.remainingSelections());
+    capture.claimed[0] = true;
+    try std.testing.expectEqual(@as(usize, 2), capture.remainingSelections());
+    counts[1] = 5;
+    try std.testing.expectEqual(@as(usize, 1), capture.remainingSelections());
 }

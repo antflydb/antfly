@@ -37,7 +37,7 @@ pub const Delivery = struct {
         return value;
     }
 };
-pub const Stats = struct { resources: usize = 0, windows: usize = 0, prefetched_fragments: usize = 0, overlapped_fragments: usize = 0, native_batches: usize = 0, prepared_ahead: usize = 0, overlapped_validation_packets: usize = 0 };
+pub const Stats = struct { resources: usize = 0, windows: usize = 0, prefetched_fragments: usize = 0, overlapped_fragments: usize = 0, native_batches: usize = 0, shared_vision_batches: usize = 0, prepared_ahead: usize = 0, overlapped_validation_packets: usize = 0 };
 /// Borrows session/tokenizer/coordinator/cache/lock and their stable controls.
 /// These owners outlive this state, including any pending output and permit.
 /// Captions/tasks are copied so retry cannot silently change model inputs.
@@ -61,6 +61,7 @@ pub const Stream = struct {
     input_cursor: usize = 0,
     validation: ?struct { context: *anyopaque, run: *const fn (*anyopaque, *const std.atomic.Value(bool)) void } = null,
     decoder: ?*embedding.LiveDecoder = null,
+    decoder_mutex: std.atomic.Mutex = .unlocked,
     retained: [3]?media.live_mp4.Segment = @splat(null),
     retained_count: usize = 0,
     active: bool = false,
@@ -80,13 +81,31 @@ pub const Stream = struct {
     /// Stable addresses keep ahead workers' reader/selection pointers valid.
     const Slot = struct {
         allocation: *embedding.LiveAllocation,
+        stream: *Stream,
         prepared: coordinator_mod.Prepared,
         selection: ?video_model.ReaderSelection = null,
         ahead: ?*embedding.VideoAhead = null,
         plan: ?video_model.Plan = null,
         pool: media.admission.Pool = .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } },
+        fn acquireDecoder(raw: *anyopaque) !*video_model.DecoderContinuation {
+            const self: *Slot = @ptrCast(@alignCast(raw));
+            while (!self.stream.decoder_mutex.tryLock()) {
+                try self.stream.control.check();
+                std.Thread.yield() catch {};
+            }
+            errdefer self.stream.decoder_mutex.unlock();
+            if (self.stream.decoder == null) self.stream.decoder = try embedding.LiveDecoder.create(self.stream.session, self.stream.control);
+            return self.stream.decoder.?.bind(&self.prepared);
+        }
+        fn releaseDecoder(raw: *anyopaque) void {
+            const self: *Slot = @ptrCast(@alignCast(raw));
+            self.stream.decoder_mutex.unlock();
+        }
         fn movie(self: *Slot) embedding.SampledVideo {
             return .{ .reader = &self.prepared.window.reader, .sampling = .{ .source_timestamps = self.prepared.policy }, .selection = if (self.selection) |*selection| selection else null };
+        }
+        fn cancelPreparation(self: *Slot) void {
+            if (self.ahead) |ahead| if (ahead.producer) |producer| producer.cancel();
         }
         fn releasePreparation(self: *Slot) void {
             if (self.ahead) |ahead| ahead.deinit();
@@ -116,14 +135,22 @@ pub const Stream = struct {
         slot: ?*Slot,
         previous: ?embedding.VideoPreparedHook = null,
         thread: ?std.Thread = null,
+        validation_thread: ?std.Thread = null,
         started: bool = false,
         stop: std.atomic.Value(bool) = .init(false),
+        fn startValidation(self: *@This()) void {
+            if (comptime @import("builtin").single_threaded) return;
+            if (self.stream.validation != null) self.validation_thread = std.Thread.spawn(.{}, validate, .{self}) catch null;
+        }
+        fn validate(self: *@This()) void {
+            if (self.stream.validation) |validation| validation.run(validation.context, &self.stop);
+        }
         fn ready(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.started) return;
             self.started = true;
             if (self.previous) |hook| try hook.ready(hook.context);
-            if (self.slot == null and self.stream.validation == null) return;
+            if (self.slot == null) return;
             if (comptime @import("builtin").single_threaded) return;
             self.thread = std.Thread.spawn(.{}, run, .{self}) catch null;
         }
@@ -131,9 +158,11 @@ pub const Stream = struct {
             // Immutable slots and their plans are independent of the validation
             // owner. The caller touches coordinator state only after join().
             if (self.slot) |slot| slot.ahead = embedding.VideoAhead.start(self.stream.session, slot.movie(), self.stream.control, self.stream.cache, &slot.pool, self.stream.options.video_decoder) catch null;
-            if (self.stream.validation) |validation| validation.run(validation.context, &self.stop);
         }
         fn join(self: *@This()) void {
+            self.stop.store(true, .release);
+            if (self.validation_thread) |thread| thread.join();
+            self.validation_thread = null;
             if (self.thread) |thread| {
                 self.stop.store(true, .release);
                 thread.join();
@@ -147,12 +176,13 @@ pub const Stream = struct {
         errdefer allocation.deinit();
         const slot = try allocation.allocator().create(Slot);
         errdefer allocation.allocator().destroy(slot);
-        slot.* = .{ .allocation = allocation, .prepared = (try self.coordinator.prepareAheadAlloc(allocation.allocator(), offset)).? };
+        slot.* = .{ .allocation = allocation, .stream = self, .prepared = (try self.coordinator.prepareAheadAlloc(allocation.allocator(), offset)).? };
         errdefer slot.prepared.deinit();
         if (slot.prepared.has_pictures and slot.prepared.logical != null) {
             slot.selection = try video_model.ReaderSelection.initImmutable(allocation.allocator(), &slot.prepared.window.reader, .{ .source_timestamps = slot.prepared.policy }, &slot.prepared.logical.?, self.coordinator.options.window.stream.admission_pool, self.coordinator.options.window.stream.control, self.coordinator.sourceBinding(slot.prepared.window.epoch, slot.prepared.generation), slot.prepared.packet_base);
             slot.selection.?.validated = &slot.prepared.frames;
             slot.selection.?.validated_packet_base = slot.prepared.packet_base;
+            if (slot.prepared.window.reader.track.codec == .avc) slot.selection.?.continuation_lease = .{ .context = slot, .acquire = Slot.acquireDecoder, .release = Slot.releaseDecoder };
         }
         errdefer if (slot.selection) |*selection| selection.deinit();
         try allocation.trim();
@@ -170,10 +200,6 @@ pub const Stream = struct {
             self.pending = first.finish(null);
             slots[0] = null;
             return;
-        }
-        if (first.ahead == null and first.prepared.window.reader.track.codec == .avc) {
-            if (self.decoder == null) self.decoder = try embedding.LiveDecoder.create(self.session, self.control);
-            if (first.selection) |*selection| selection.continuation = try self.decoder.?.bind(&first.prepared);
         }
         var count: usize = 1;
         slots[1] = self.later;
@@ -194,6 +220,9 @@ pub const Stream = struct {
         // ownership to validation during model execution.
         if (self.options.prepare_ahead and (self.session.backend() == .metal or self.session.backend() == .cuda)) self.next = self.prepareSlot(count) catch null;
         errdefer {
+            for (slots) |entry| if (entry) |slot| slot.cancelPreparation();
+            if (self.next) |next| next.cancelPreparation();
+            if (self.later) |later| later.cancelPreparation();
             if (self.next) |next| next.deinit();
             self.next = null;
             if (self.later) |later| later.deinit();
@@ -217,12 +246,26 @@ pub const Stream = struct {
                 try slot.allocation.trim();
             }
         }
+        // All coordinator-derived plans and slots are pinned. Validation can
+        // now overlap vision preparation as well as backbone execution.
+        schedule.startValidation();
+        const clock = @import("antfly_platform").time;
+        const started = clock.monotonicNs();
+        const track = first.prepared.window.reader.track;
+        const shape = [_]u64{ track.width, track.height, if (first.selection) |selection| selection.selected.len else first.prepared.policy.max_frames, if (self.caption) |caption| caption.len + 1 else 0, @backingInt(self.session.backend()) };
+        const policy_key = (@as(u128, @intFromPtr(self.session.ptr)) << 64) | std.hash.Wyhash.hash(0, std.mem.asBytes(&shape));
+        var completed_rows: usize = 1;
         var items: [2]embedding.VideoBatchItem = undefined;
         for (slots[0..count], items[0..count]) |slot, *item| item.* = .{ .movie = slot.?.movie(), .caption = self.caption, .ahead = slot.?.ahead, .plan = if (slot.?.plan) |*plan| plan else null };
         // Every row carries an inspection plan, so an ahead producer and an
         // ordinary prepared row can enter the same admitted model batch.
-        const batched = if (count == 2 and compatible) embedding.embedVideos(first.allocation.allocator(), self.session, self.tokenizer, items[0..count], options, self.lock, self.control, self.cache) catch |err| blk: {
-            if (err == error.BatchIncompatible or embedding.videoSpeculationPressure(err)) break :blk null;
+        const batch_width = @import("media_batch_policy.zig").windowCapacity(policy_key, count);
+        if (count == 2 and !compatible and batch_width > 1) @import("media_batch_policy.zig").windowDeclined(policy_key);
+        const batched = if (count == 2 and compatible and batch_width > 1) embedding.embedVideos(first.allocation.allocator(), self.session, self.tokenizer, items[0..count], options, self.lock, self.control, self.cache) catch |err| blk: {
+            if (err == error.BatchIncompatible or embedding.videoSpeculationPressure(err)) {
+                @import("media_batch_policy.zig").windowDeclined(policy_key);
+                break :blk null;
+            }
             return err;
         } else null;
         schedule.join();
@@ -242,6 +285,8 @@ pub const Stream = struct {
             self.pending = first.finish(.{ .vector = first_vector, .input_tokens = batch.input_tokens[0] });
             slots[0] = null;
             self.stats.native_batches += 1;
+            self.stats.shared_vision_batches += batch.shared_vision_batches;
+            completed_rows = 2;
         } else {
             // Keep both prepared successors when admission declines a cohort.
             // Their ordinals remain valid after this row commits.
@@ -263,6 +308,7 @@ pub const Stream = struct {
             self.pending = first.finish(result);
             slots[0] = null;
         }
+        @import("media_batch_policy.zig").windowCompleted(policy_key, completed_rows, clock.monotonicNs() -| started);
         if (self.next) |next| if (next.ahead != null) {
             self.stats.prepared_ahead += 1;
         };
@@ -286,11 +332,13 @@ pub const Stream = struct {
     }
     pub fn deinit(self: *Stream) void {
         for (&self.retained) |*unit| if (unit.*) |*value| value.deinit();
-        if (self.decoder) |decoder| decoder.deinit();
+        if (self.next) |next| next.cancelPreparation();
+        if (self.later) |later| later.cancelPreparation();
         if (self.pending) |*pending| pending.deinit(self.allocator);
         if (self.queued) |*pending| pending.deinit(self.allocator);
         if (self.next) |next| next.deinit();
         if (self.later) |later| later.deinit();
+        if (self.decoder) |decoder| decoder.deinit();
         if (self.input) |*input| input.deinit();
         if (self.caption) |caption| self.allocator.free(caption);
         self.allocator.free(self.task);
@@ -475,13 +523,16 @@ pub const Stream = struct {
         if (self.active) return error.InvalidMediaStreamState;
         self.active = true;
         defer self.active = false;
-        defer for ([_]?*Slot{ self.next, self.later }) |slot| if (slot) |next| {
-            // A process call never leaves a preparation worker or GPU import
-            // running across callback failure/cancellation. Keep metadata for
-            // retry, but drain speculative pixels before returning.
-            if (next.ahead) |ahead| ahead.deinit();
-            next.ahead = null;
-        };
+        defer {
+            for ([_]?*Slot{ self.next, self.later }) |slot| if (slot) |next| next.cancelPreparation();
+            for ([_]?*Slot{ self.next, self.later }) |slot| if (slot) |next| {
+                // A process call never leaves a preparation worker or GPU import
+                // running across callback failure/cancellation. Keep metadata for
+                // retry, but drain speculative pixels before returning.
+                if (next.ahead) |ahead| ahead.deinit();
+                next.ahead = null;
+            };
+        }
         try self.drain(context, accept);
         try self.drainInput(context, accept);
         try self.drainRetained(context, accept);
@@ -821,4 +872,40 @@ test "embeddinggemma2 live validation worker owns append while immutable model w
     try std.testing.expect(stream.stats.overlapped_validation_packets > 0);
     try coordinator.commit(&prepared);
     try std.testing.expectEqual(@as(usize, 1), coordinator.ordinal);
+}
+
+test "embeddinggemma2 live cache misses in both cohort rows retain the same decoder" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/live-fragmented.mp4");
+    var ingest = try media.live_mp4.Ingest.init(a, "leased-cohort", bytes[0..797], .{});
+    defer ingest.deinit();
+    try ingest.push(bytes[797..20811]);
+    var unit: ?media.live_mp4.Segment = try ingest.finishSegment();
+    defer if (unit) |*owner| owner.deinit();
+    var coordinator = try coordinator_mod.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s / 2, .max_frames = 1, .max_validated_frame_bytes = 0 });
+    defer coordinator.deinit();
+    try coordinator.append(&unit);
+    try coordinator.finish();
+    const Fake = struct {
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .native;
+        }
+        const vtable = Session.VTable{ .run = undefined, .inputInfo = undefined, .outputInfo = undefined, .backend = backend, .close = undefined };
+    };
+    var marker: u8 = 0;
+    var stream = try Stream.init(a, .{ .ptr = &marker, .vtable = &Fake.vtable }, undefined, &coordinator, null, .{}, null, null, null);
+    defer stream.deinit();
+    for (0..2) |offset| {
+        const slot = (try stream.prepareSlot(offset)).?;
+        defer slot.deinit();
+        const movie = slot.movie();
+        const producer = try video_model.Prefetch.startConfigured(a, std.testing.io, null, &.{}, movie.reader, .{}, .{ .sampling = movie.sampling, .selection = movie.selection, .decoder = .{ .policy = .portable } });
+        defer producer.deinit();
+        // One selected picture fits the bounded queue; no model is needed to
+        // qualify the real preparation/lease route and its retained references.
+        producer.finished.waitUncancelable(std.testing.io);
+        try std.testing.expect(stream.decoder != null);
+        try std.testing.expect(stream.decoder.?.continuation.decoded_packets > 0);
+    }
+    try std.testing.expect(stream.decoder.?.continuation.reused_windows > 0);
 }

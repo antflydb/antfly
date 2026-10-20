@@ -377,7 +377,11 @@ assembly; long clips fall back to sparse header reads when the cache fills.
 Original source ranges remain authoritative for decoder validation and playback.
 
 The inference consumer may retain two current immutable windows for a masked
-backbone batch plus one next-window preparation wave. All readers and selections
+backbone batch plus one next-window preparation wave. Compatible ready frames
+can share vision/projector calls across windows, with independent sampling and
+cache identities. Whole-window batching learns completed serial/paired throughput
+within admission limits. Validation starts after immutable slots/plans are pinned,
+so it can overlap both vision and backbone work. All readers and selections
 stay in stable slots until completed execution and worker join. Independent
 window identity, sample selection, output ordering and continuation semantics
 remain unchanged by batching.
@@ -915,8 +919,8 @@ not relax validation or deny its serial decoder fallback. Live model consumers
 preview only sealed windows, batch ready rows without a fill delay, and keep
 transport acknowledgement separate from ordered output acknowledgement/commit.
 A single admitted successor may prepare during backbone execution. A scoped
-validation worker can also advance available input while the model reads its
-immutable prepared windows. Coordinator ownership transfers back before output
+validation worker can advance available input during vision preparation and
+backbone execution while the model reads its immutable prepared windows. Coordinator ownership transfers back before output
 delivery/commit; retries retain the encoded input and exact packet cursor.
 Cancellation joins these workers before releasing sources, controls or frame pins.
 Prepared-ahead and ordinary rows can batch together; pressure preserves their
@@ -927,3 +931,9 @@ Settled phase residency returns its live-memory credit only within the same
 kernel pressure epoch. Credits from older epochs cannot augment a new sample;
 long-lived stream contexts retain shared quota without accumulating false pressure
 as completed phases release their allocations.
+
+Live validation owns an appendable packet/span probe rather than rebuilding the
+retained prefix for each packet quantum. Prepared consumers still own immutable
+metadata snapshots. Probe growth is admitted before allocation, retains encoded
+snapshot owners, and resets on eviction or failed append; transport publication
+and output acknowledgement boundaries remain transactional.

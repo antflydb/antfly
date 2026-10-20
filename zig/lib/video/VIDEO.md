@@ -852,12 +852,18 @@ Partial hits preserve preparation slots and decode only missing selections.
 Separate colour planes and explicitly forced Apple decoding use the decoder path.
 A 32-picture reorder tail shares that same byte budget: predictive pictures
 reconstructed beyond the four-window horizon remain available when preceding
-B pictures complete and the sampling cursor advances. It never expands admission.
+B pictures complete and the sampling cursor advances. Spill owners use at most
+one quarter of the pixel budget and yield to selected pictures; farther target
+candidates also yield to nearer selections. External pins remain immutable and
+charged. It never expands admission.
 Set `max_validated_frame_bytes=0` to disable this optional reuse.
 
 A live stream retains an admitted decoder owner while a GOP grows, including
 portable reference pictures, dynamic parameter registry and eligible VideoToolbox
-state. Retention eviction, configuration/period transitions and failed inference
+state. Cache-missing current, batched and speculative rows acquire one exclusive
+decoder lease through reader binding, decoding and callback drain. Fresh cohort
+producers follow coded-window order while their prepared frames can share vision
+execution. Retention eviction, configuration/period transitions and failed inference
 reset that owner. Rewinding selections retain the existing replay fallback.
 For sparse forward windows, portable decoders verify a later independent reset
 before discarding references, with a 32-packet hysteresis; unfinished field or
@@ -872,8 +878,19 @@ their decoder at a verified IDR when it saves more than 32 packets or avoids the
 dependency limit. Configuration epochs keep their own parameter context.
 
 Live model execution combines up to two already sealed windows, including their
-captions, through the existing admitted video batch executor. There is no fill
-wait. One following sealed window can prepare while the current backbone runs.
+captions, through the existing admitted video batch executor. A bounded
+process-local policy compares completed cost per window for serial and paired
+execution, keyed by model session, backend, geometry, frame count and caption
+byte length/presence. Declined cohorts back off with bounded retries as shared pressure
+changes; failed admission is never recorded as completed batch cost. Admission
+remains the hard ceiling; there is no fill wait. Native frame exploration also
+caps width by remaining unique projections, preventing an unfillable wider
+cohort from indefinitely postponing the serial-versus-batched decision. Compatible
+ready CPU or Metal frames from different windows share vision/projector cohorts,
+while cache keys, duplicate samples and output assembly retain their row identity.
+Producer queues share an event notification; the consumer can drain either queue
+without waiting on a decoder lease held by the other. Concurrent preparation is
+admitted as a sum of producer bounds before any worker starts. One following sealed window can prepare while the current backbone runs.
 Previewed snapshots keep stable reader/selection addresses and independent pixel
 pins. Output acknowledgement and commit stay ordered; a rejected callback retains
 both its exact vector and any later computed row. Commit rebases against current
@@ -893,8 +910,9 @@ and pinned pixels remain independently admitted. Field/partition assembly and
 parameter state persist across these boundaries. Optional pressure still falls
 back to selected-frame decoding.
 
-After current model inputs are prepared, a scoped worker exclusively owns the
-coordinator while validating available input alongside backbone execution. It
+After immutable current/preview slots and inspection plans are pinned, a scoped
+worker exclusively owns the coordinator while validating available input alongside
+vision preparation and backbone execution. It
 never waits for network input or fills an unbounded backlog. It yields at an
 eight-packet validation quantum when the backbone completes, preserving the DPB
 rather than cancelling reconstruction midway through a picture. The caller joins
@@ -1196,3 +1214,13 @@ Host-only inspection, streaming-window and media preprocessing admission use the
 same bounded cache-recovery policy as model execution. Relevant warm state is
 reclaimed before retrying the original host reservation; no compute workspace
 is reserved, no bound is reduced, and forced/permanent denials still propagate.
+
+Validation probes use appendable packet/span arrays with retained immutable
+payload owners. Each quantum appends only new metadata; ordinary completed-picture
+indexes are borrowed from the validation owner until its next mutation. Prepared
+windows clone independent metadata before validation resumes. Incomplete separate
+colour planes retain the filtered owning-index route. Prefix eviction rebuilds the
+probe with its effective parameter bootstrap. Failed append detaches the already
+admitted collector capacity to preserve the published metadata prefix without
+allocating rollback storage. Cohort teardown signals every producer before
+joining any member, so a queued preparation cannot strand a shared decoder lease.

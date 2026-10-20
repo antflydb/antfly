@@ -229,6 +229,140 @@ const Segmented = struct {
         self.allocator.destroy(self);
     }
 };
+/// Mutable validation-only index. Append is transactional and amortized linear;
+/// independently prepared windows continue to use immutable join/clone owners.
+/// The coordinator drops this builder on prefix eviction or configuration reset.
+pub const Builder = struct {
+    allocator: std.mem.Allocator,
+    allocations: media.admission.TrackedAllocator,
+    reservation: media.admission.Token,
+    reader: media.mp4.Reader,
+    input: media.source.Source,
+    packets: std.ArrayList(media.mp4.Packet) = .empty,
+    spans: std.ArrayList(Segmented.Span) = .empty,
+    owners: std.ArrayList(*media.stream.Snapshot) = .empty,
+    prefix: []u8 = &.{},
+    epoch: usize,
+    dash_timing: ?media.hls.DashTiming,
+    bytes: u64 = 0,
+    pub fn init(a: std.mem.Allocator, first: media.live_mp4.Segment, parameters: []const u8, options: Options) !*Builder {
+        const packet_bytes = try std.math.mul(usize, options.max_packets, 3 * (@sizeOf(media.mp4.Packet) + @sizeOf(Segmented.Span)));
+        const owner_bytes = try std.math.mul(usize, options.max_units, 32);
+        const limit = try std.math.add(usize, options.stream.max_bytes, try std.math.add(usize, packet_bytes, owner_bytes));
+        const reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(Builder) }) else media.admission.Token{};
+        const self = a.create(Builder) catch |err| {
+            var owned = reservation;
+            owned.deinit();
+            return err;
+        };
+        self.* = .{ .allocator = a, .reservation = reservation, .allocations = .{ .backing = a, .reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{}) else .{}, .limit = limit }, .reader = first.reader, .input = .{ .allocator = a, .identity = "live-probe", .control = options.stream.control, .limits = options.stream.source_limits, .admission_pool = options.stream.admission_pool, .storage = undefined }, .epoch = first.epoch, .dash_timing = first.dash_timing };
+        self.reader.input = &self.input;
+        self.reader.packets = &.{};
+        self.reader.metadata = .{ .bytes = &.{}, .source = null };
+        self.reader.index_reservation = .{};
+        errdefer self.deinit();
+        if (parameters.len != 0) {
+            if (first.reader.packets.len == 0 or first.reader.track.codec != .avc or !first.reader.track.inband_parameter_sets) return error.UnsupportedDynamicVideoConfig;
+            const packet = first.reader.packets[0];
+            const size = try std.math.add(usize, parameters.len, packet.size);
+            if (size > options.stream.max_bytes or size > self.input.limits.max_read_bytes or packet.offset > first.backing.bytes.len or packet.size > first.backing.bytes.len - packet.offset) return error.ResourceLimitExceeded;
+            self.prefix = try self.allocations.allocator().alloc(u8, size);
+            @memcpy(self.prefix[0..parameters.len], parameters);
+            @memcpy(self.prefix[parameters.len..], first.backing.bytes[@intCast(packet.offset)..][0..packet.size]);
+        }
+        return self;
+    }
+    pub fn deinit(self: *Builder) void {
+        const a = self.allocations.allocator();
+        for (self.owners.items) |owner| owner.deinit();
+        self.owners.deinit(a);
+        self.packets.deinit(a);
+        self.spans.deinit(a);
+        a.free(self.prefix);
+        var reservation = self.allocations.reservation;
+        var header_reservation = self.reservation;
+        std.debug.assert(self.allocations.live == 0);
+        const backing = self.allocator;
+        backing.destroy(self);
+        reservation.deinit();
+        header_reservation.deinit();
+    }
+    pub fn append(self: *Builder, segment: media.live_mp4.Segment, options: Options) !void {
+        if (segment.epoch != self.epoch or !sameTrack(self.reader.track, segment.reader.track)) return error.UnsupportedDynamicVideoConfig;
+        if (self.dash_timing) |left| {
+            if (segment.dash_timing == null or !left.period.compatible(segment.dash_timing.?.period)) return error.UnsupportedDynamicVideoConfig;
+        } else if (segment.dash_timing != null) return error.UnsupportedDynamicVideoConfig;
+        if (segment.reader.packets.len == 0) return error.EmptyVideo;
+        if (self.owners.items.len >= options.max_units or segment.reader.packets.len > options.max_packets -| self.packets.items.len) return error.ResourceLimitExceeded;
+        var previous: ?media.mp4.Packet = if (self.packets.items.len != 0) self.packets.items[self.packets.items.len - 1] else null;
+        var size = self.bytes;
+        for (segment.reader.packets, 0..) |packet, index| {
+            try options.stream.control.check();
+            if (previous) |last| if (packet.media_dts < try std.math.add(i64, last.media_dts, last.duration)) return error.NonMonotonicMediaSegment;
+            previous = packet;
+            if (packet.offset > segment.backing.bytes.len or packet.size > segment.backing.bytes.len - packet.offset) return error.UnexpectedEndOfSource;
+            size = try std.math.add(u64, size, if (self.packets.items.len == 0 and index == 0 and self.prefix.len != 0) self.prefix.len else packet.size);
+            if (size > options.stream.max_bytes) return error.ResourceLimitExceeded;
+        }
+        const a = self.allocations.allocator();
+        try self.packets.ensureUnusedCapacity(a, segment.reader.packets.len);
+        // Keep reader valid even when a subsequent capacity request fails.
+        self.reader.packets = self.packets.items;
+        try self.spans.ensureUnusedCapacity(a, segment.reader.packets.len);
+        try self.owners.ensureUnusedCapacity(a, 1);
+        for (segment.reader.packets) |packet| {
+            const bytes = if (self.packets.items.len == 0 and self.prefix.len != 0) self.prefix else segment.backing.bytes[@intCast(packet.offset)..][0..packet.size];
+            var value = packet;
+            value.offset = self.bytes;
+            value.size = @intCast(bytes.len);
+            self.packets.appendAssumeCapacity(value);
+            self.spans.appendAssumeCapacity(.{ .offset = self.bytes, .bytes = bytes });
+            self.bytes += bytes.len;
+        }
+        segment.backing.retain();
+        self.owners.appendAssumeCapacity(segment.backing);
+        self.reader.packets = self.packets.items;
+        self.input.control = options.stream.control;
+        self.input.storage = .{ .range = .{ .context = self, .read_at = read, .borrow_at = borrowAt, .length = self.bytes } };
+    }
+    fn borrowAt(raw: *anyopaque, offset: u64, size: usize, control: media.source.Control) !?[]const u8 {
+        const self: *Builder = @ptrCast(@alignCast(raw));
+        try control.check();
+        var lo: usize = 0;
+        var hi = self.spans.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.spans.items[mid].offset <= offset) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return null;
+        const span = self.spans.items[lo - 1];
+        const relative = offset - span.offset;
+        if (relative > span.bytes.len or size > span.bytes.len - relative) return null;
+        return span.bytes[@intCast(relative)..][0..size];
+    }
+    fn read(raw: *anyopaque, offset: u64, destination: []u8, control: media.source.Control) !usize {
+        const self: *Builder = @ptrCast(@alignCast(raw));
+        var done: usize = 0;
+        var lo: usize = 0;
+        var hi = self.spans.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.spans.items[mid].offset <= offset) lo = mid + 1 else hi = mid;
+        }
+        var index = lo -| 1;
+        while (done < destination.len and index < self.spans.items.len) : (index += 1) {
+            try control.check();
+            const span = self.spans.items[index];
+            const relative = offset + done - span.offset;
+            if (relative > span.bytes.len) return error.UnexpectedEndOfSource;
+            const count: usize = @intCast(@min(destination.len - done, span.bytes.len - relative));
+            @memcpy(destination[done..][0..count], span.bytes[@intCast(relative)..][0..count]);
+            done += count;
+        }
+        return done;
+    }
+};
+
 /// Join published immutable snapshots without copying their encoded payloads.
 /// The returned view survives segment eviction and may be consumed independently.
 pub fn join(a: std.mem.Allocator, identity: []const u8, segments: []const media.live_mp4.Segment, options: Options) !Window {
@@ -554,4 +688,41 @@ test "live packet window admits metadata only and borrows payload without alloca
     try std.testing.expectEqual(@as(u64, @intCast(exact)), pool.high_water.host_bytes);
     window.deinit();
     try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+}
+
+fn builderAllocationRun(a: std.mem.Allocator) !void {
+    const bytes = @embedFile("../testdata/live/fragmented.mp4");
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 8 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    const options = Options{ .stream = .{ .admission_pool = &pool } };
+    var ingest = try media.live_mp4.Ingest.init(a, "builder", bytes[0..797], .{ .stream = options.stream });
+    defer ingest.deinit();
+    try ingest.push(bytes[797..11206]);
+    var first = try ingest.finishSegment();
+    defer first.deinit();
+    try ingest.push(bytes[11206..20811]);
+    var second = try ingest.finishSegment();
+    defer second.deinit();
+    const builder = try Builder.init(a, first, &.{}, options);
+    defer builder.deinit();
+    try builder.append(first, options);
+    try builder.append(second, options);
+    var immutable = try join(a, "builder-oracle", &.{ first, second }, options);
+    defer immutable.deinit();
+    try std.testing.expectEqualSlices(media.mp4.Packet, immutable.reader.packets, builder.reader.packets);
+    for (builder.reader.packets, 0..) |_, id| {
+        var actual = try builder.reader.readPacket(id);
+        defer actual.deinit();
+        var expected = try immutable.reader.readPacket(id);
+        defer expected.deinit();
+        try std.testing.expectEqualSlices(u8, expected.bytes, actual.bytes);
+        try std.testing.expect(actual.owned == null);
+    }
+    const count = builder.reader.packets.len;
+    try std.testing.expectError(error.NonMonotonicMediaSegment, builder.append(first, options));
+    try std.testing.expectEqual(count, builder.reader.packets.len);
+}
+test "live packet window append builder matches immutable joins and rolls back allocation failures" {
+    try builderAllocationRun(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, builderAllocationRun, .{});
 }
