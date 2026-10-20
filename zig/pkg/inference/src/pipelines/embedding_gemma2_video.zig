@@ -894,6 +894,11 @@ pub const Plan = struct {
     pixels: u64 = 0,
     metal_preparation: bool = false,
     decoder_host_bytes: usize = 0,
+    // Filtered paths borrow immutable validated pins through producer drain.
+    // Keep the original decoder envelope so a replan can restore misses.
+    needs_decoder: bool = true,
+    preparation_commands: ?u64 = null,
+    host_patch_bytes: usize = 0,
     preparation_bytes: usize = 0,
     vision_workspace_bytes: usize = 0,
     apple_surface_bytes: usize = 0,
@@ -905,13 +910,14 @@ pub const Plan = struct {
     pub fn hostBytes(self: Plan) !usize {
         // There is one decoder/preparation producer. GPU queue entries retain
         // device buffers; CPU entries retain final patches, not RGB scratch.
-        const active = if (self.commands == 0) 0 else try std.math.add(usize, self.preparation_bytes, self.decoder_host_bytes);
-        const queued = if (self.metal_preparation) 0 else self.patch_output_bytes;
+        const active = if (self.commands == 0) 0 else try std.math.add(usize, self.preparation_bytes, if (self.needs_decoder) self.decoder_host_bytes else 0);
+        const queued = if (self.metal_preparation) self.host_patch_bytes else self.patch_output_bytes;
         return std.math.add(usize, 32 * 1024 * 1024, try std.math.add(usize, active, queued));
     }
     pub fn deviceBytes(self: Plan) !usize {
         if (self.commands == 0) return 0;
-        return std.math.add(usize, self.patch_output_bytes, try std.math.add(usize, 16 * 1024 * 1024, try std.math.add(usize, self.apple_surface_bytes, try std.math.mul(usize, self.device_preparation_bytes, @intCast(self.commands)))));
+        const preparations = self.preparation_commands orelse self.commands;
+        return std.math.add(usize, self.patch_output_bytes, try std.math.add(usize, if (preparations == 0) 0 else 16 * 1024 * 1024, try std.math.add(usize, self.apple_surface_bytes, try std.math.mul(usize, self.device_preparation_bytes, @intCast(preparations)))));
     }
     fn picture(self: *Plan, width: u32, height: u32, options: video.preparation.Options) !void {
         const geometry = try video.preparation.geometry(width, height, options);
@@ -1039,14 +1045,16 @@ pub fn inspectConfiguredPlan(a: std.mem.Allocator, bytes: []const u8, reader: ?*
 /// Sequence/presentation metadata stays intact; preparation is charged only for
 /// unique misses whose cached alternatives are owned by this admission scope.
 pub fn pinCachedPlan(original: Plan, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration) !Plan {
-    const pins = configuration.cache_pins orelse return original;
-    if (pins.cache == null) return original;
+    const pins = configuration.cache_pins;
+    const projected_cache = if (pins) |owner| owner.cache != null else false;
+    const validated = validatedInputs(reader, configuration);
+    if (!projected_cache and validated == null and original.preparation_commands == null) return original;
     var clip: [32]u8 = @splat(0);
-    if (configuration.selection == null) {
+    if (projected_cache and configuration.selection == null) {
         const adapter = control.imageWorkControl();
         var scope_key: [32]u8 = undefined;
         clip = try clipBinding(bytes, reader, configuration.webm, .{ .context = adapter.context, .check_fn = adapter.check_fn }, pins, &scope_key);
-        pins.rememberBinding(scope_key, clip);
+        pins.?.rememberBinding(scope_key, clip);
     }
     var selected: [32]usize = undefined;
     for (original.picture_indexes[0..original.pictures], selected[0..original.pictures]) |id, *out| out.* = @intCast(id);
@@ -1056,28 +1064,50 @@ pub fn pinCachedPlan(original: Plan, bytes: []const u8, reader: ?*const media.mp
     result.device_preparation_bytes = 0;
     result.patch_output_bytes = 0;
     result.vision_workspace_bytes = 0;
-    var misses: [32]bool = @splat(false);
+    result.needs_decoder = false;
+    result.preparation_commands = 0;
+    result.host_patch_bytes = 0;
+    var paths: [32]enum { projected, prepared, raw, decode } = @splat(.projected);
+    var decode_count: u64 = 0;
     for (selected[0..original.pictures], 0..) |id, slot| {
         if (std.mem.indexOfScalar(usize, selected[0..slot], id) != null) continue;
         try control.check();
-        if (pins.pin(projectionKey(configuration.selection, clip, selected[0..original.pictures], slot, configuration.decoder.policy))) continue;
-        misses[slot] = true;
+        if (projected_cache and pins.?.pin(projectionKey(configuration.selection, clip, selected[0..original.pictures], slot, configuration.decoder.policy))) continue;
+        const packet = if (configuration.selection) |selection| try std.math.add(usize, selection.validated_packet_base, id) else id;
+        paths[slot] = if (validated) |frames| (if (frames.getPrepared(packet, validatedPreparation.identity) != null) .prepared else if (frames.get(packet) != null) .raw else .decode) else .decode;
+        if (paths[slot] == .decode) decode_count += 1;
+        result.needs_decoder = decode_count != 0;
+        if (paths[slot] != .prepared) result.preparation_commands.? += 1;
         result.commands += 1;
     }
-    const miss_count = result.commands;
     result.commands = @min(result.commands, 17);
+    result.preparation_commands = @min(result.preparation_commands.?, 17);
     for (original.resources[0..original.pictures], 0..) |resource, slot| {
-        if (!misses[slot]) continue;
-        result.preparation_bytes = @max(result.preparation_bytes, resource.host);
-        result.device_preparation_bytes = @max(result.device_preparation_bytes, resource.device);
+        if (paths[slot] == .projected) continue;
+        if (paths[slot] == .prepared) {
+            // The pin owns the immutable source; queued job copies and one
+            // packed upload wave remain request-owned, even on unified memory.
+            result.host_patch_bytes = try std.math.add(usize, result.host_patch_bytes, try std.math.mul(usize, resource.patches, 2));
+        } else {
+            result.preparation_bytes = @max(result.preparation_bytes, resource.host);
+            result.device_preparation_bytes = @max(result.device_preparation_bytes, resource.device);
+        }
         result.patch_output_bytes = try std.math.add(usize, result.patch_output_bytes, resource.patches);
         result.vision_workspace_bytes = @max(result.vision_workspace_bytes, try std.math.mul(usize, @min(resource.capacity, @as(usize, @intCast(result.commands))), resource.vision));
     }
     // Retain all 24 decoder/reference slots, reducing only selected-output
     // surfaces. The original maximum geometry/depth still bounds every miss.
     result.source_apple_surface_bytes = original.source_apple_surface_bytes orelse original.apple_surface_bytes;
-    result.apple_surface_bytes = if (miss_count == 0) 0 else try std.math.mul(usize, result.source_apple_surface_bytes.? / (original.pictures + 24), @as(usize, @intCast(miss_count)) + 24);
+    result.apple_surface_bytes = if (decode_count == 0) 0 else try std.math.mul(usize, result.source_apple_surface_bytes.? / (original.pictures + 24), @as(usize, @intCast(decode_count)) + 24);
     return result;
+}
+/// Only AVC currently consumes these pins. Never discount a decoder path
+/// whose runtime cannot consume the same immutable capability.
+fn validatedInputs(reader: ?*const media.mp4.Reader, configuration: Configuration) ?*const video.validated_frames.View {
+    if (configuration.webm != null or configuration.decoder.policy == .apple) return null;
+    const source = reader orelse return null;
+    if (source.track.codec != .avc) return null;
+    return if (configuration.selection) |selection| selection.validated else null;
 }
 fn inspectWebmPlan(a: std.mem.Allocator, reader: *const media.webm.Reader, index: video.webm_pictures.Index, sampling: Sampling, metal: bool, timeline: ?*const video.sampling.Timeline) !Plan {
     const selected = try selectWebm(a, index, sampling, reader.input.control, timeline);
@@ -1409,22 +1439,21 @@ pub const Prefetch = struct {
         // identities before it can drain a predecessor's bounded frame queue.
         if (self.predecessor) |previous| previous.finished.waitUncancelable(self.io);
         try check(self);
-        const prepared_only = ready: {
-            if (webm or reader.track.codec != .avc or self.decoder.policy == .apple) break :ready false;
-            const bound = self.reader_selection orelse break :ready false;
-            const frames = bound.validated orelse break :ready false;
-            for (misses[0..missing]) |packet| {
-                if (frames.getPrepared(try std.math.add(usize, bound.validated_packet_base, packet), validatedPreparation.identity) == null) break :ready false;
-            }
-            break :ready true;
-        };
-        if (!prepared_only) if (self.device) |device| {
+        var prepare_packets: [32]usize = undefined;
+        var prepare_count: usize = 0;
+        const frames = if (!webm and reader.track.codec == .avc and self.decoder.policy != .apple) (if (self.reader_selection) |bound| bound.validated else null) else null;
+        for (misses[0..missing]) |packet| {
+            if (frames) |validated| if (validated.getPrepared(try std.math.add(usize, self.reader_selection.?.validated_packet_base, packet), validatedPreparation.identity) != null) continue;
+            prepare_packets[prepare_count] = packet;
+            prepare_count += 1;
+        }
+        if (prepare_count != 0) if (self.device) |device| {
             self.preparer = try video.preparation.Metal.init(device);
             self.preparer.?.useCoefficientCache(self.coefficients);
             if (pool) |shared| try self.preparer.?.admit(shared, 16 * 1024 * 1024);
         };
         capture.metal = if (self.preparer) |*value| value else null;
-        if (self.preparer) |*preparer| try configureOutputSlab(preparer, pool, try selectionOutputBytes(a, misses[0..missing], if (webm) null else &reader, configurations, if (webm) &webm_reader else null, webm_index));
+        if (self.preparer) |*preparer| try configureOutputSlab(preparer, pool, try selectionOutputBytes(a, prepare_packets[0..prepare_count], if (webm) null else &reader, configurations, if (webm) &webm_reader else null, webm_index));
         capture.decode_slots = miss_slots[0..missing];
         if (webm) {
             try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture, self.webm_input);
@@ -1442,6 +1471,9 @@ pub const Prefetch = struct {
         return encodeCohortReady(a, cb, producers, outputs, null);
     }
     pub fn encodeCohortReady(a: std.mem.Allocator, cb: *const ComputeBackend, producers: []const *Prefetch, outputs: []Encoded, ready: ?RowReady) !usize {
+        return encodeCohortReadyStaged(a, cb, producers, outputs, ready, cb.embedding_stage);
+    }
+    fn encodeCohortReadyStaged(a: std.mem.Allocator, cb: *const ComputeBackend, producers: []const *Prefetch, outputs: []Encoded, ready: ?RowReady, initial_stage: ?*const @import("../ops/ops.zig").EmbeddingStageControl) !usize {
         if (producers.len == 0 or producers.len > 4 or outputs.len != producers.len) return error.InvalidInputShape;
         const io = producers[0].io;
         var wake: std.Io.Event = .unset;
@@ -1452,8 +1484,8 @@ pub const Prefetch = struct {
             // holder whose queue filled while another row failed.
             cancelCohort(producers);
         }
-        defer if (cb.embedding_stage) |stage| stage.cleanup();
-        if (cb.embedding_stage) |stage| try stage.pause();
+        defer if (initial_stage) |stage| stage.cleanup();
+        if (initial_stage) |stage| try stage.pause();
         var offsets: [5]usize = @splat(0);
         var ids: [128]usize = undefined;
         var keys: [128]CacheKey = undefined;
@@ -1476,6 +1508,9 @@ pub const Prefetch = struct {
                 keys[offsets[row] + slot] = projectionKey(producer.reader_selection, producer.clip_hash, selected, slot, producer.decoder.policy);
             }
         }
+        // A failed producer can reject its header before a model/backend
+        // exists. Only successful header admission permits backend access.
+        defer if (cb.embedding_stage) |stage| stage.cleanup();
         const n = offsets[producers.len];
         const output = try a.alloc(f32, if (cb.kind() == .metal) 0 else n * 140 * 512);
         defer a.free(output);
@@ -1662,106 +1697,9 @@ pub const Prefetch = struct {
     pub fn encodeAllocStaged(self: *Prefetch, a: std.mem.Allocator, cb: *const ComputeBackend, stage_control: ?*const @import("../ops/ops.zig").EmbeddingStageControl) !Encoded {
         try self.control.check();
         defer if (stage_control) |stage| stage.cleanup();
-        if (stage_control) |stage| try stage.pause();
-        var header: [1]Job = undefined;
-        _ = self.header_queue.getUncancelable(self.io, &header, 1) catch {
-            self.join();
-            return self.failure orelse error.InvalidTensorShape;
-        };
-        const selected = switch (header[0]) {
-            .header => |value| value,
-            else => {
-                self.discard(&header[0]);
-                return error.InvalidTensorShape;
-            },
-        };
-        if (stage_control) |stage| try stage.acquire();
-        const frame_tokens = try a.alloc(usize, selected.len);
-        errdefer a.free(frame_tokens);
-        @memset(frame_tokens, 0);
-        const output = try a.alloc(f32, if (cb.kind() == .metal) 0 else selected.len * 140 * 512);
-        defer a.free(output);
-        const resident = if (cb.kind() == .metal) try a.alloc(?CT, selected.len) else null;
-        defer if (resident) |tensors| {
-            for (tensors) |tensor| if (tensor) |value| cb.free(value);
-            a.free(tensors);
-        };
-        if (resident) |tensors| @memset(tensors, null);
-        const adapter = self.control.imageWorkControl();
-        var capture = Capture{ .reader_selection = self.reader_selection, .a = a, .cb = cb, .track = undefined, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .output = output, .resident = resident, .frame_tokens = frame_tokens, .selected = selected, .io = self.io, .native_batching = cb.kind() == .native, .cache = self.cache, .clip_hash = self.clip_hash, .decoder = self.decoder };
-        defer capture.discardNativePending();
-        defer if (cb.embedding_stage) |stage| stage.cleanup();
-        var jobs: [8]Job = undefined;
-        var pending: [8]Job = undefined;
-        var pending_count: usize = 0;
-        defer for (pending[0..pending_count]) |*job| self.discard(job);
-        while (true) {
-            if (cb.embedding_stage) |stage| try stage.pause();
-            if (pending_count == 0) pending_count = self.queue.getUncancelable(self.io, &pending, 1) catch break;
-            try self.control.check();
-            // Project a ready prefix. A later submitted frame must not hold
-            // already-completed projections behind its completion barrier.
-            if (pending[0] == .metal) try pending[0].metal.prepared.wait(self.io, capture.control);
-            var count: usize = 1;
-            while (count < pending_count) : (count += 1) {
-                if (pending[count] == .metal and !try pending[count].metal.prepared.isReady()) break;
-            }
-            @memcpy(jobs[0..count], pending[0..count]);
-            std.mem.copyForwards(Job, pending[0 .. pending_count - count], pending[count..pending_count]);
-            pending_count -= count;
-            var owned: [8]bool = @splat(true);
-            defer for (jobs[0..count], 0..) |*job, i| if (owned[i]) {
-                self.discard(job);
-            };
-            try self.control.check();
-            if (cb.embedding_stage) |stage| try stage.acquire();
-            var cursor: usize = 0;
-            while (cursor < count) {
-                if (jobs[cursor] == .metal) {
-                    var gpu: [8]ProjectionJob = undefined;
-                    var n: usize = 0;
-                    while (cursor < count and jobs[cursor] == .metal) : (cursor += 1) {
-                        gpu[n] = jobs[cursor].metal;
-                        owned[cursor] = false;
-                        n += 1;
-                    }
-                    try capture.projectGpuBatchNow(gpu[0..n]);
-                    for (gpu[0..n]) |job| for (selected, 0..) |index, slot| if (index == selected[job.slot]) {
-                        frame_tokens[slot] = frame_tokens[job.slot];
-                    };
-                    continue;
-                }
-                switch (jobs[cursor]) {
-                    .native => |value| try capture.project(value.slot, value.patches, value.options),
-                    .cached => |value| try capture.loadCached(value.slot, value.ticket),
-                    .metal, .header => unreachable,
-                }
-                cursor += 1;
-            }
-        }
-        self.join();
-        if (self.failure) |err| return err;
-        self.releasePreparer();
-        if (cb.embedding_stage) |stage| {
-            try stage.acquire();
-            try stage.workspace(null);
-        }
-        try capture.flushNativePending();
-        try capture.finishDuplicates();
-        if (resident) |tensors| {
-            const combined = try assembleProjections(a, cb, selected, tensors, frame_tokens);
-            errdefer cb.free(combined);
-            return .{ .embeddings = try a.alloc(f32, 0), .tensor = combined, .backend = cb, .frame_tokens = frame_tokens };
-        }
-        // Callbacks arrive in decode order; compact in presentation slot order.
-        var count: usize = 0;
-        for (frame_tokens, 0..) |tokens, slot| {
-            if (tokens == 0 or tokens > 140) return error.InvalidTensorShape;
-            const n = tokens * 512;
-            std.mem.copyForwards(f32, output[count..][0..n], output[slot * 140 * 512 ..][0..n]);
-            count += n;
-        }
-        return .{ .embeddings = try a.dupe(f32, output[0..count]), .frame_tokens = frame_tokens };
+        var outputs: [1]Encoded = .{.{}};
+        _ = try encodeCohortReadyStaged(a, cb, &.{self}, &outputs, null, stage_control);
+        return outputs[0];
     }
 };
 
@@ -1857,17 +1795,41 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     defer if (inspection == null) {
         if (configurations) |session| session.deinit();
     };
-    const frame_tokens = try a.alloc(usize, selected.len);
-    errdefer a.free(frame_tokens);
-    @memset(frame_tokens, 0);
-    const output = try a.alloc(f32, if (cb.kind() == .metal) 0 else selected.len * 140 * 512);
-    defer a.free(output);
     var signal = if (inspection) |owner| owner.signal else video.h264.Color{};
     if (inspection == null and !webm and reader.track.codec == .avc and !reader.track.inband_parameter_sets) {
         const cfg = try video.h264.configParse(a, reader.track.avcc);
         defer cfg.groups.deinit(a);
         signal = cfg.color;
     }
+    // Backend access follows admitted parsing, including for standalone
+    // callers. Rejected inputs must never dereference an unopened backend.
+    // Borrow this already inspected input until the synchronous consumer joins;
+    // the producer owns only its independent source counters and selected IDs.
+    if (cb.kind() == .metal) if (control.io orelse cb.getIo()) |io| {
+        var prepared = Inspection{
+            .backing = a,
+            .bounded = undefined,
+            .pool = undefined,
+            .bytes = bytes,
+            .borrowed = borrowed,
+            .configuration = .{ .sampling = sampling, .selection = selection, .webm = webm_input, .decoder = decoder },
+            .reader = if (webm) undefined else reader,
+            .webm_reader = if (webm) webm_reader else undefined,
+            .webm_index = webm_index,
+            .webm = webm,
+            .selected = selected,
+            .configurations = configurations,
+            .signal = signal,
+        };
+        const producer = try Prefetch.startInput(a, io, try MetalCompute.videoDevice(cb), bytes, borrowed, control, sampling, pool, cache, selection, decoder, webm_input, cache_pins, inspection orelse &prepared, coefficients, null);
+        defer producer.deinit();
+        return producer.encodeAllocStaged(a, cb, null);
+    };
+    const frame_tokens = try a.alloc(usize, selected.len);
+    errdefer a.free(frame_tokens);
+    @memset(frame_tokens, 0);
+    const output = try a.alloc(f32, if (cb.kind() == .metal) 0 else selected.len * 140 * 512);
+    defer a.free(output);
     var preparer: ?video.preparation.Metal = null;
     defer if (preparer) |*value| value.deinit();
     const resident = if (cb.kind() == .metal) try a.alloc(?CT, selected.len) else null;
@@ -5012,4 +4974,74 @@ test "embeddinggemma2 video cohort readiness accepts another row or terminal err
     try Prefetch.waitCohortReady(&.{failed}, &wake, .{});
     failed.join();
     try std.testing.expect(failed.failure != null);
+}
+
+test "embeddinggemma2 video admission follows pinned prepared raw and decoder paths and restores bounds" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn options(_: media.mp4.Track, _: *const video.h264.Frame) !video.preparation.Options {
+            return .{ .width = 48, .height = 48, .crop = .{ .right = 336, .bottom = 168 }, .matrix = .bt601, .torchvision = true };
+        }
+    };
+    var source = media.source.Source{ .allocator = a, .identity = "pinned-paths", .storage = .{ .borrowed = @embedFile("../testdata/video/closed.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const pixels = try a.alloc(u8, 384 * 216 * 3 / 2);
+    defer a.free(pixels);
+    @memset(pixels, 128);
+    var frame = video.h264.Frame{ .allocator = a, .nv12 = pixels, .width = 384, .height = 216, .pts = 0, .duration = 1, .timescale = 1, .full_range = false, .decode_high_water = 0 };
+    var cache = try video.validated_frames.Cache.init(a, null, 1024 * 1024);
+    defer cache.deinit();
+    cache.preparation = .{ .policy = .{ .identity = validatedPreparation.identity, .options = Fixture.options }, .track = reader.track, .control = .{} };
+    cache.configure(0, 3 * std.time.ns_per_s, 3 * std.time.ns_per_s, std.time.ns_per_s, 3, 100, 1);
+    const observer = cache.observer();
+    var picture = video.h264.Picture{ .first_packet = 0, .pts = 0, .duration = 1, .width = 384, .height = 216, .bit_depth = 8, .chroma_format = 1 };
+    observer.accept(observer.context, picture, &frame);
+    cache.preparation = null;
+    frame.pts = 1;
+    picture.pts = 1;
+    picture.first_packet = 1;
+    observer.accept(observer.context, picture, &frame);
+    var view = cache.pin();
+    defer view.deinit();
+    try std.testing.expect(view.getPrepared(100, validatedPreparation.identity) != null);
+    try std.testing.expect(view.get(101) != null);
+    const selected = [_]usize{ 0, 1, 2 };
+    const keys: [3]CacheKey = @splat(.{ .clip = @splat(0), .picture = 0 });
+    var selection = ReaderSelection{ .allocator = a, .selected = &selected, .projection_keys = &keys, .binding = @splat(0), .validated = &view, .validated_packet_base = 100 };
+    const patch_bytes = view.getPrepared(100, validatedPreparation.identity).?.patches.len * 4;
+    const resource = PictureResources{ .host = 1024 * 1024, .device = 2 * 1024 * 1024, .patches = patch_bytes, .vision = 1024, .capacity = 8 };
+    var original = Plan{ .pictures = 3, .commands = 3, .metal_preparation = true, .decoder_host_bytes = 128 * 1024 * 1024, .preparation_bytes = resource.host, .device_preparation_bytes = resource.device, .patch_output_bytes = 3 * patch_bytes, .apple_surface_bytes = 27 * 1024, .vision_workspace_bytes = 3 * resource.vision };
+    original.picture_indexes[0..3].* = .{ 0, 1, 2 };
+    @memset(original.resources[0..3], resource);
+    const configuration = Configuration{ .selection = &selection };
+    const mixed = try pinCachedPlan(original, &.{}, &reader, .{}, configuration);
+    try std.testing.expect(mixed.needs_decoder);
+    try std.testing.expectEqual(@as(u64, 2), mixed.preparation_commands.?);
+    try std.testing.expectEqual(@as(usize, 25 * 1024), mixed.apple_surface_bytes);
+    try std.testing.expectEqual(2 * patch_bytes, mixed.host_patch_bytes);
+    try std.testing.expectEqual(original.sequence_tokens, mixed.sequence_tokens);
+    original.pictures = 1;
+    original.commands = 1;
+    original.patch_output_bytes = patch_bytes;
+    original.apple_surface_bytes = 25 * 1024;
+    const prepared = try pinCachedPlan(original, &.{}, &reader, .{}, configuration);
+    try std.testing.expect(!prepared.needs_decoder);
+    try std.testing.expectEqual(@as(u64, 0), prepared.preparation_commands.?);
+    try std.testing.expectEqual(@as(usize, 0), prepared.preparation_bytes);
+    try std.testing.expectEqual(@as(usize, 0), prepared.apple_surface_bytes);
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024) + 2 * patch_bytes, try prepared.hostBytes());
+    try std.testing.expectEqual(patch_bytes, try prepared.deviceBytes());
+    const restored = try pinCachedPlan(prepared, &.{}, &reader, .{}, .{});
+    try std.testing.expect(restored.needs_decoder);
+    try std.testing.expectEqual(try original.hostBytes(), try restored.hostBytes());
+    try std.testing.expectEqual(try original.deviceBytes(), try restored.deviceBytes());
+    const apple = try pinCachedPlan(prepared, &.{}, &reader, .{}, .{ .selection = &selection, .decoder = .{ .policy = .apple } });
+    try std.testing.expect(apple.needs_decoder);
+    original.picture_indexes[0] = 1;
+    const raw = try pinCachedPlan(original, &.{}, &reader, .{}, configuration);
+    try std.testing.expect(!raw.needs_decoder);
+    try std.testing.expectEqual(@as(u64, 1), raw.preparation_commands.?);
+    try std.testing.expectEqual(resource.host, raw.preparation_bytes);
+    try std.testing.expectEqual(@as(usize, 0), raw.host_patch_bytes);
 }

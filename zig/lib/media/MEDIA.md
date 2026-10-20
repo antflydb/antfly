@@ -943,5 +943,10 @@ versioned preparation policy; raw pixels and prepared inputs share one bounded
 cache with immutable window pins. The inference stream installs and restores
 its policy, while generic media callers retain the raw-pixel default. Admitted
 video producers prepare ahead of the model execution queue; completed windows
-can compose independently within a cohort. See `../video/VIDEO.md` for ownership,
-policy matching, scratch admission and fallback behavior.
+can compose independently within a cohort. Admission follows the immutable input
+path: prepared patches need upload/vision storage, raw pixels also need conversion,
+and only decoder misses retain decoder storage. Qualified Metal rows compose into
+one persistent final input, preserving caller order through a pooled-result
+permutation rather than copying composed rows. Singleton and cohort consumers
+share ready-frame batching. See `../video/VIDEO.md` for ownership, policy matching,
+scratch admission and fallback behavior.

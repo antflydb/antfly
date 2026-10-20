@@ -1041,8 +1041,17 @@ Composition consumes host projection ownership and escaped per-frame Metal
 owners directly. Segmented device composition scatters compact wrapper rows and
 frame rows into token order without a concatenated media table or intermediate
 window projection tensor. Repeated frames preserve their source mapping. Every
-row retains independent captions, masks, attention and pooling; final batch
-packing and stage lifetime copies remain explicit ownership boundaries.
+row retains independent captions, masks, attention and pooling. Qualified Metal
+video batches allocate their final input outside the recyclable embedding stage,
+then scatter each completed row directly into its next contiguous span. Rows may
+complete out of order: masks follow physical completion order and only the small
+pooled-vector result is permuted back to caller order. Final input packing uses a
+retained view, with no composed-row escape or second packing copy. The admitted
+capacity bounds tokenization before any writes; errors discard the entire owner.
+Other backends and disabled compact policies retain the ordinary packing path.
+Singleton and multiwindow Metal consumers share the same ready-frame batching
+lane, including host patches from compact validation entries. Geometry, measured
+capacity and live admission bound each upload/tower wave without a fill delay.
 
 Live validation optionally accepts a model preparation policy with a versioned
 identity. For frames whose exact F32 patch inputs consume at most half the raw
@@ -1118,8 +1127,15 @@ window. The pins outlive producers and imported model inputs, including error
 and cancellation cleanup, so eviction cannot turn a planned hit into an
 unadmitted decode. Token counts and presentation order still describe the full
 selection. A fully pinned selection reserves no preparation device bytes or
-commands and creates no preparer. Any miss retains all decoder/reference slots while reducing only selected-output
-surfaces.
+commands and creates no preparer. Validated AVC pins further distinguish exact
+prepared inputs, raw pixels and decoder misses. Prepared inputs reserve queued
+host patches and packed uploads, plus vision work, without decoder or conversion
+scratch; raw pixels reserve conversion but no decoder. Mixed paths reserve a
+decoder only if an actual decode miss remains. Apple-only decoding and unsupported
+containers retain their full envelopes. Filtered plans preserve original picture
+resources and decoder bounds so another cache scope can restore every miss.
+Prepared inputs are excluded from conversion output slabs. All pins outlive the
+producer drain, including cancellation and serial retry.
 
 Metal command credits describe its own allocations: uploaded image buffers or
 integer textures, the horizontal resize buffer, optional chroma reconstruction,

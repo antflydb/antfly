@@ -378,6 +378,8 @@ pub const Options = struct {
     video_prepared: ?VideoPreparedHook = null,
     /// Scoped to one admitted video row; never retained past preparation.
     video_encoded: ?*@import("embedding_gemma2_video.zig").Encoded = null,
+    /// Request-owned storage allocated outside a recyclable embedding stage.
+    video_composition: ?*VideoComposition = null,
     task_type: []const u8 = "RETRIEVAL_DOCUMENT",
     dimensions: usize = 768,
     /// Expanded input limit, including prompts, wrappers, and media tokens.
@@ -1189,6 +1191,12 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     if (session.backend() == .metal) options.video_coefficients = (try factory.videoPreparationContext(session, commands != 0)).coefficients;
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
+    var composition: ?VideoComposition = if (compact_policy and compactMediaEnabled(&managed.backend)) .{
+        .tensor = (try managed.backend.allocUninitF32Shape(&.{ @intCast(total + items.len * 128), 512 })) orelse return error.ResidentImageOperationUnavailable,
+        .capacity = total + items.len * 128,
+    } else null;
+    defer if (composition) |owner| managed.backend.free(owner.tensor);
+    options.video_composition = if (composition) |*owner| owner else null;
     var lane = StageLane{ .session = session, .gate = lock, .waiter = &execution_waiter, .permit = &permit, .timings = options.timings, .idle_backend = idle_backend, .cb = &managed.backend, .control = control, .video_phases = video_phases, .composition_request = if (video_phases) try compositionRequest(execution_request, idle_backend, total + items.len * 128) else null };
     lane.attach();
     defer lane.deinit();
@@ -1224,7 +1232,10 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
             row_options.video_encoded = encoded;
             self.rows[index] = try prepareGroupWithBudget(self.a, self.cb, self.tokenizer, group, row_options, self.control, self.pool, if (encoded == null and item.ahead != null) item.ahead.?.producer else null, self.cache);
             self.prepared[index] = true;
-            if (self.cb.embedding_stage != null) if (self.rows[index].tensor) |tensor| {
+            if (self.options.video_composition) |owner| {
+                owner.order[owner.count] = index;
+                owner.count += 1;
+            } else if (self.cb.embedding_stage != null) if (self.rows[index].tensor) |tensor| {
                 self.rows[index].tensor = try @import("../ops/metal_compute.zig").MetalCompute.escapeEmbeddingStage(self.cb, tensor);
                 self.cb.free(tensor);
             };
@@ -1248,7 +1259,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     const initialized = items.len;
     for (rows[0..initialized]) |row| if (row.ids.len > longest) return error.MemoryBudgetExceeded;
     inspection_scope.deinit();
-    const batch_inputs = try packVideoRows(a, cb, rows[0..initialized]);
+    const batch_inputs = if (composition) |*owner| try owner.pack(a, cb, rows[0..initialized]) else try packVideoRows(a, cb, rows[0..initialized]);
     defer batch_inputs.deinit(a, cb);
     // Use the established activation/attention envelope over all padded rows.
     // Treating rows as one sequence deliberately overestimates cross-row
@@ -1278,9 +1289,10 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     errdefer out.free(counts);
     var copied: usize = 0;
     errdefer for (result_vectors[0..copied]) |vector| out.free(vector);
-    for (result_vectors, counts, vectors, rows[0..initialized]) |*dst, *count, vector, row| {
+    for (result_vectors, counts, rows[0..initialized], 0..) |*dst, *count, row, index| {
         try control.check();
-        dst.* = try out.dupe(f32, vector);
+        const physical = if (composition) |*owner| owner.physicalRow(index) else index;
+        dst.* = try out.dupe(f32, vectors[physical]);
         copied += 1;
         count.* = row.ids.len;
     }
@@ -2227,6 +2239,45 @@ fn embedCudaGroup(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, 
     return .{ .vector = output, .input_tokens = prepared.sequence };
 }
 
+/// Rows append as projections complete. Physical order is independent of the
+/// caller's row order; the small permutation applies only to pooled vectors.
+/// The backing tensor is allocated before entering the stage and survives its
+/// retirement without copying a composed row or retaining stage scratch.
+const VideoComposition = struct {
+    tensor: CT,
+    capacity: usize,
+    used: usize = 0,
+    order: [4]usize = undefined,
+    count: usize = 0,
+    fn target(self: *VideoComposition, rows: usize) !CompositionTarget {
+        if (rows == 0 or rows > self.capacity - self.used) return error.MemoryBudgetExceeded;
+        return .{ .tensor = self.tensor, .offset = self.used };
+    }
+    fn pack(self: *const VideoComposition, a: std.mem.Allocator, cb: *const ComputeBackend, rows: []const PreparedGroup) !ResidentPackedGroups {
+        if (self.count != rows.len or self.used == 0) return error.InvalidInputShape;
+        var sequence: usize = 0;
+        for (rows) |row| sequence = @max(sequence, row.ids.len);
+        const mask = try a.alloc(i64, rows.len * sequence);
+        errdefer a.free(mask);
+        @memset(mask, 0);
+        var active: usize = 0;
+        for (self.order[0..self.count], 0..) |index, physical| {
+            const row = rows[index];
+            if (row.ids.len != row.mask.len) return error.InvalidInputShape;
+            for (row.mask) |value| if (value != 1) return error.InvalidAttentionMask;
+            @memcpy(mask[physical * sequence ..][0..row.mask.len], row.mask);
+            active += row.mask.len;
+        }
+        if (active != self.used) return error.InvalidInputShape;
+        const view = try cb.sliceRows2D(a, self.tensor, 0, active, 512);
+        return .{ .embeddings = view, .mask = mask, .sequence = sequence, .compact_input = true };
+    }
+    fn physicalRow(self: *const VideoComposition, index: usize) usize {
+        return std.mem.indexOfScalar(usize, self.order[0..self.count], index).?;
+    }
+};
+const CompositionTarget = struct { tensor: CT, offset: usize };
+
 const PreparedGroup = struct {
     ids: []i64,
     mask: []i64,
@@ -2401,6 +2452,12 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
     for (ids, tokens.ids[0..count]) |*dest, id| dest.* = id;
     for (mask, tokens.attention_mask[0..count]) |*dest, m| dest.* = m;
     if (media.items.len == 0) return .{ .ids = ids, .mask = mask, .embeddings = null };
+    if (options.video_composition) |owner| {
+        const target = try owner.target(count);
+        const tensor = (try composeCompactMediaInto(a, cb, ids, media.items, target)) orelse return error.ResidentImageOperationUnavailable;
+        owner.used += count;
+        return .{ .ids = ids, .mask = mask, .embeddings = null, .tensor = tensor, .backend = cb };
+    }
     if (try composeCompactMedia(a, cb, ids, media.items)) |tensor| return .{ .ids = ids, .mask = mask, .embeddings = null, .tensor = tensor, .backend = cb };
     const ew = try cb.getWeight("language_model.embed_tokens.weight");
     defer cb.free(ew);
@@ -2448,9 +2505,15 @@ fn compositionRows(a: std.mem.Allocator, ids: []i64, media: []const SoftTokens) 
 /// Compact wrappers and media share the same indexed compositor for single,
 /// mixed and video groups. Multiple media owners are packed once, not by a
 /// sequence of growing concatenations. Preserve tokenizer IDs until success.
+fn compactMediaEnabled(cb: *const ComputeBackend) bool {
+    return cb.kind() == .metal and cb.vtable.embeddingComposeRows != null and cb.supportsCopyRows2D() and cb.vtable.allocUninitF32Shape != null and cb.vtable.sliceRows2D != null and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES");
+}
 fn composeCompactMedia(a: std.mem.Allocator, cb: *const ComputeBackend, ids: []i64, media: []const SoftTokens) !?CT {
-    if (cb.kind() != .metal or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES")) return null;
-    const compose = cb.vtable.embeddingComposeRows orelse return null;
+    return composeCompactMediaInto(a, cb, ids, media, null);
+}
+fn composeCompactMediaInto(a: std.mem.Allocator, cb: *const ComputeBackend, ids: []i64, media: []const SoftTokens, target: ?CompositionTarget) !?CT {
+    if (!compactMediaEnabled(cb)) return null;
+    const compose = cb.vtable.embeddingComposeRows.?;
     const rewritten = try a.dupe(i64, ids);
     defer a.free(rewritten);
     const sources = try compositionRows(a, rewritten, media);
@@ -2480,7 +2543,10 @@ fn composeCompactMedia(a: std.mem.Allocator, cb: *const ComputeBackend, ids: []i
     const video_frames = for (media) |item| {
         if (item.id != 258884) break false;
     } else true;
-    const result = if (media.len > 1 and video_frames) try composeSegmentedMedia(a, cb, scaled, map, media) else blk: {
+    const result = if (target) |destination| blk: {
+        try scatterSegmentedMedia(a, cb, scaled, map, media, destination);
+        break :blk try cb.sliceRows2D(a, destination.tensor, destination.offset, map.len, 512);
+    } else if (media.len > 1 and video_frames) try composeSegmentedMedia(a, cb, scaled, map, media) else blk: {
         const direct = media.len == 1 and media[0].tensor != null;
         const pixels = if (direct) media[0].tensor.? else (try cb.allocUninitF32Shape(&.{ @intCast(media_count), 512 })) orelse return null;
         defer if (!direct) cb.free(pixels);
@@ -2504,6 +2570,11 @@ fn composeCompactMedia(a: std.mem.Allocator, cb: *const ComputeBackend, ids: []i
 fn composeSegmentedMedia(a: std.mem.Allocator, cb: *const ComputeBackend, text: ?CT, map: []const i32, media: []const SoftTokens) !CT {
     const output = (try cb.allocUninitF32Shape(&.{ @intCast(map.len), 512 })) orelse return error.ResidentImageOperationUnavailable;
     errdefer cb.free(output);
+    try scatterSegmentedMedia(a, cb, text, map, media, .{ .tensor = output, .offset = 0 });
+    return output;
+}
+fn scatterSegmentedMedia(a: std.mem.Allocator, cb: *const ComputeBackend, text: ?CT, map: []const i32, media: []const SoftTokens, target: CompositionTarget) !void {
+    const output = target.tensor;
     var cursor: usize = 0;
     while (cursor < map.len) {
         if (map[cursor] < 0) {
@@ -2512,7 +2583,7 @@ fn composeSegmentedMedia(a: std.mem.Allocator, cb: *const ComputeBackend, text: 
         }
         const first = cursor;
         while (cursor < map.len and map[cursor] == map[first] + @as(i32, @intCast(cursor - first))) : (cursor += 1) {}
-        if (!try cb.copyRows2D(a, output, first, text orelse return error.InvalidEmbeddingGroup, @intCast(map[first]), cursor - first, 512)) return error.ResidentImageOperationUnavailable;
+        if (!try cb.copyRows2D(a, output, target.offset + first, text orelse return error.InvalidEmbeddingGroup, @intCast(map[first]), cursor - first, 512)) return error.ResidentImageOperationUnavailable;
     }
     var base: usize = 0;
     cursor = 0;
@@ -2526,12 +2597,11 @@ fn composeSegmentedMedia(a: std.mem.Allocator, cb: *const ComputeBackend, text: 
             if (cursor == map.len) return error.InvalidEmbeddingGroup;
             const first = cursor;
             while (cursor < map.len and cursor - first < item.tokens - copied and map[cursor] == index - @as(i32, @intCast(cursor - first))) : (cursor += 1) {}
-            if (!try cb.copyRows2D(a, output, first, tensor, copied, cursor - first, 512)) return error.ResidentImageOperationUnavailable;
+            if (!try cb.copyRows2D(a, output, target.offset + first, tensor, copied, cursor - first, 512)) return error.ResidentImageOperationUnavailable;
             copied += cursor - first;
         }
         base += item.tokens;
     }
-    return output;
 }
 
 fn composeDeviceTokens(a: std.mem.Allocator, cb: *const ComputeBackend, text: CT, ids: []i64, media: []const SoftTokens) !CT {
@@ -5688,6 +5758,51 @@ test "embeddinggemma2 segmented composition scatters wrappers and variable frame
             const actual = try cb.toFloat32(result, a);
             defer a.free(actual);
             for ([_]f32{ 0.5, 0.25, 0.25, -0.5, 0.75, 0.25, 0.25 }, 0..) |value, row| for (actual[row * 512 ..][0..512]) |got| try std.testing.expectEqual(value, got);
+        }
+    };
+    const tests = @import("../ops/media_residency_test.zig");
+    try tests.onNative(tests.noWeights, Fixture.check);
+    try tests.onMetal(tests.noWeights, Fixture.check);
+}
+
+test "embeddinggemma2 persistent composition packs completion order without copying rows" {
+    const Fixture = struct {
+        fn check(cb: ComputeBackend, _: ComputeBackend) !void {
+            const a = std.testing.allocator;
+            var owner = VideoComposition{ .tensor = (try cb.allocUninitF32Shape(&.{ 12, 512 })).?, .capacity = 12 };
+            defer cb.free(owner.tensor);
+            var values: [2 * 512]f32 = undefined;
+            @memset(values[0..512], 0.5);
+            @memset(values[512..], -0.5);
+            const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&values, &.{ 2, 512 }));
+            defer cb.free(input);
+            const media = [_]SoftTokens{.{ .id = 258884, .tokens = 2, .embeddings = &.{}, .tensor = input }};
+            const before = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
+            // Original row 1 finishes before row 0, with a duplicated frame.
+            try scatterSegmentedMedia(a, &cb, input, &.{ 0, -1, -2 }, &media, try owner.target(3));
+            owner.used += 3;
+            owner.order[0] = 1;
+            try scatterSegmentedMedia(a, &cb, input, &.{1}, &.{}, try owner.target(1));
+            owner.used += 1;
+            owner.order[1] = 0;
+            owner.count = 2;
+            var short_ids = [_]i64{1};
+            var short_mask = [_]i64{1};
+            var long_ids = [_]i64{ 1, 258884, 258884 };
+            var long_mask = [_]i64{ 1, 1, 1 };
+            const rows = [_]PreparedGroup{ .{ .ids = &short_ids, .mask = &short_mask, .embeddings = null }, .{ .ids = &long_ids, .mask = &long_mask, .embeddings = null } };
+            const inputs = try owner.pack(a, &cb, &rows);
+            defer inputs.deinit(a, &cb);
+            try before.expectUnchanged(cb);
+            try std.testing.expect(inputs.compact_input);
+            try std.testing.expectEqualSlices(i64, &.{ 1, 1, 1, 1, 0, 0 }, inputs.mask);
+            try std.testing.expectEqual(@as(usize, 1), owner.physicalRow(0));
+            try std.testing.expectEqual(@as(usize, 0), owner.physicalRow(1));
+            try std.testing.expectError(error.MemoryBudgetExceeded, owner.target(9));
+            const actual = try cb.toFloat32(inputs.embeddings, a);
+            defer a.free(actual);
+            try std.testing.expectEqual(@as(usize, 4 * 512), actual.len);
+            for ([_]f32{ 0.5, 0.5, -0.5, -0.5 }, 0..) |expected, row| for (actual[row * 512 ..][0..512]) |value| try std.testing.expectEqual(expected, value);
         }
     };
     const tests = @import("../ops/media_residency_test.zig");

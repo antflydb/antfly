@@ -38695,6 +38695,31 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
                 }
                 for (host.vectors, expected_vectors) |actual, expected| for (actual, expected) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
                 std.debug.print("host patch cohort metal=true parity=true shared_batches={d}\n", .{host.shared_vision_batches});
+                // A single window with two ready host frames uses the same
+                // consumer as a multiwindow cohort, including its caption.
+                const singleton_movie = stream_embedding.SampledVideo{ .bytes = bytes, .sampling = .{ .source_timestamps = .{ .end_ns = 2 * std.time.ns_per_s, .step_ns = std.time.ns_per_s, .max_frames = 2 } } };
+                const singleton = (try stream_embedding.VideoAhead.start(loaded.session, singleton_movie, node.extractionExecutionControl(null), null, &pools[0], .{})).?;
+                defer singleton.deinit();
+                singleton.producer.?.deinit();
+                singleton.producer = null;
+                singleton.producer = try @import("../pipelines/embedding_gemma2_video.zig").Prefetch.startConfigured(singleton.bounded.allocator(), std.testing.io, null, bytes, null, node.extractionExecutionControl(null), .{ .sampling = singleton_movie.sampling, .cache_pins = singleton.pins, .inspection_scope = singleton.inspection_scope, .pool = &singleton.pool });
+                singleton.producer.?.finished.waitUncancelable(std.testing.io);
+                try std.testing.expectEqual(@as(usize, 2), singleton.producer.?.selected.?.len);
+                const single_host = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &.{.{ .movie = singleton_movie, .caption = caption, .ahead = singleton }}, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (single_host.vectors) |vector| a.free(vector);
+                    a.free(single_host.vectors);
+                    a.free(single_host.input_tokens);
+                }
+                const single_device = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &.{.{ .movie = singleton_movie, .caption = caption }}, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (single_device.vectors) |vector| a.free(vector);
+                    a.free(single_device.vectors);
+                    a.free(single_device.input_tokens);
+                }
+                try std.testing.expectEqual(single_device.input_tokens[0], single_host.input_tokens[0]);
+                for (single_host.vectors[0], single_device.vectors[0]) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+                std.debug.print("singleton host patch frames=2 metal=true parity=true\n", .{});
             }
             // Ordinary rows must begin bounded preparation while the model
             // gate belongs to another request, rather than waiting to decode.
