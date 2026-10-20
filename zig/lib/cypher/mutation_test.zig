@@ -1454,3 +1454,32 @@ test "ordinary expression loops own write epoch constants and release them on fa
     try std.testing.expectError(error.CypherDeletedEntity, root.runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "entity", .value = .{ .node = fixture.nodes[0] } }}, .{}));
     try std.testing.expectEqual(@as(usize, 1), fixture.nodes.len);
 }
+
+test "projected producers cannot lend shorter write epochs to receiver state" {
+    const Campaign = struct {
+        fn run(a: A) !void {
+            var fixture = Fixture.init();
+            defer fixture.arena.deinit();
+            var diagnostic: root.compiler.Diagnostic = .{};
+            var compiled = try root.compiler.compile(a, "CREATE(n:Person {id:'producer'}) WITH [i IN range(1,3)|toLower($word)] AS xs RETURN head(xs),reduce(s='',x IN xs|s+x),reduce(s='',x IN [i IN range(1,3)|toLower($word)]|x),any(x IN [i IN range(1,3)|toLower($word)] WHERE x='abc')", .{}, &diagnostic);
+            defer compiled.deinit();
+            var result = try root.runtime.execute(a, fixture.backend(), graph, &compiled, &.{.{ .name = "word", .value = .{ .string = "AbC" } }}, .{});
+            defer result.deinit();
+            try std.testing.expectEqualStrings("abc", result.rows[0][0].string);
+            try std.testing.expectEqualStrings("abcabcabc", result.rows[0][1].string);
+            try std.testing.expectEqualStrings("abc", result.rows[0][2].string);
+            try std.testing.expect(result.rows[0][3].boolean);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "projected list source failures precede consumer reads of deleted entities" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(std.testing.allocator, "CREATE(n:Person {id:'phase'}) WITH n DELETE n RETURN any(x IN [i IN [1,0]|1/i] WHERE size(keys(n))>0)", .{}, &diagnostic);
+    defer compiled.deinit();
+    try std.testing.expectError(error.CypherDivisionByZero, root.runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+}

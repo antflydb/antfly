@@ -4101,3 +4101,93 @@ test "ordinary comprehension scopes and list sources release failed allocations"
         "RETURN any(x IN range(1,3) WHERE toString(x)='3'),reduce(s='',x IN range(1,3)|s+toString(x)),size([x IN range(1,3) WHERE x>1|null])",
     }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as([]const u8, text)});
 }
+
+test "projected list producers compose summaries aliases nulls and lexical scopes" {
+    try check("WITH [x IN [1,null,2]|x] AS xs WITH xs AS ys RETURN size(ys),head(ys),last(ys),ys[-2..],any(x IN ys WHERE x=2),reduce(s=0,x IN ys|s+coalesce(x,0))", "[[3,1,2,[null,2],true,3]]");
+    try check("WITH [x IN null|x] AS xs RETURN size(xs),head(xs),last(xs),any(x IN xs WHERE true),reduce(s=9,x IN xs|s+x)", "[[null,null,null,null,null]]");
+    try check("WITH [x IN []|x] AS xs RETURN size(xs),head(xs),any(x IN xs WHERE true),reduce(s=9,x IN xs|s+x)", "[[0,null,false,9]]");
+    try check("WITH range(-9223372036854775808,9223372036854775807) AS xs RETURN any(x IN xs WHERE x=-9223372036854775808),all(x IN xs WHERE x>0),last(xs)", "[[true,false,9223372036854775807]]");
+    try check("WITH range(-9223372036854775808,9223372036854775807) AS xs RETURN head(xs),last(xs),xs[-2..]", "[[-9223372036854775808,9223372036854775807,[9223372036854775806,9223372036854775807]]]");
+    try check("WITH [x IN range(1,3)|x*2] AS xs RETURN xs,head(xs),size(xs)", "[[[2,4,6],2,3]]");
+    try check("WITH [x IN range(1,3)|x*2] AS xs WITH xs,xs AS ys RETURN head(xs),last(ys)", "[[2,6]]");
+    try check("WITH 7 AS k RETURN reduce(s=0,x IN [y IN [1,2,3]|y*2]|s+x+k),any(x IN [y IN [1,2]|y] WHERE x=k)", "[[33,false]]");
+    try check("WITH 9 AS y RETURN head([x IN [y IN [1,2]|y+1]|x+y]),y", "[[11,9]]");
+    try check("RETURN any(x IN [y IN [null,false]|y] WHERE x),single(x IN [y IN [true,true]|y] WHERE x)", "[[null,false]]");
+    try check("MATCH(a:Document {id:'a'}) WITH [(a)-[:CITES]->(b)|b.rank] AS xs RETURN size(xs),head(xs),last(xs),reduce(s=0,x IN xs|s+x)", "[[2,2,2,4]]");
+    try check("MATCH(a:Document {id:'a'}) RETURN any(x IN [(a)-[:CITES]->(b)|b.rank] WHERE x=2),reduce(s=0,x IN [(a)-[:CITES]->(b)|b.rank]|s+x)", "[[true,4]]");
+    try check("MATCH(a:Document {id:'a'}) RETURN head([x IN [(a)-[:CITES]->(b)|b.rank]|x+1])", "[[3]]");
+    try check("WITH [x IN [1,2]|x] AS xs RETURN CASE WHEN false THEN reduce(s=1/0,x IN xs|s+x) ELSE 7 END", "[[7]]");
+}
+
+test "projected list phases preserve source consumer initial and late depth failures" {
+    const Case = struct { query: []const u8, err: anyerror };
+    for ([_]Case{
+        .{ .query = "RETURN reduce(s=1/0,x IN [y IN [1]|true+1]|s+x)", .err = error.CypherDivisionByZero },
+        .{ .query = "WITH [y IN [1]|true+1] AS xs RETURN reduce(s=1/0,x IN xs|s+x)", .err = error.CypherTypeMismatch },
+        .{ .query = "RETURN any(x IN [y IN [1,0]|1/y] WHERE true)", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN any(x IN [y IN [1,0]|1/y] WHERE true+1)", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN head([x IN [y IN [1,0]|1/y]|true+1])", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN reduce(s=0,x IN [y IN [1,0]|1/y]|true+1)", .err = error.CypherDivisionByZero },
+        .{ .query = "WITH [x IN null|x] AS xs RETURN reduce(s=1/0,x IN xs|s+x)", .err = error.CypherDivisionByZero },
+        .{ .query = "WITH reduce(s=0,i IN range(1,64)|[s]) AS deep RETURN any(x IN [y IN [1]|deep] WHERE true)", .err = error.CypherValueDepthExceeded },
+        .{ .query = "WITH reduce(s=0,i IN range(1,64)|[s]) AS deep,[x IN [1]|x] AS xs RETURN size([x IN xs|deep])", .err = error.CypherValueDepthExceeded },
+        .{ .query = "MATCH(a:Document {id:'a'}) RETURN any(x IN [(a)-[r:CITES]->(b) WHERE CASE WHEN r.weight=1 THEN true ELSE 1/0>0 END|true+1] WHERE true)", .err = error.CypherDivisionByZero },
+    }) |case| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(case.err, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "scalar row seeds stream UNWIND aggregates windows and intermediate barriers" {
+    try check("UNWIND null AS x RETURN count(*)", "[[0]]");
+    try check("UNWIND 7 AS x RETURN x", "[[7]]");
+    try check("UNWIND range(1,3) AS x UNWIND [x,x] AS y RETURN y ORDER BY y DESC LIMIT 3", "[[3],[3],[2]]");
+    try check("UNWIND range(1,4) AS x WITH x ORDER BY x DESC LIMIT 2 UNWIND [x,x] AS y RETURN sum(y),count(*)", "[[14,4]]");
+    try check("UNWIND [2,2,1] AS x WITH DISTINCT x RETURN sum(x),count(*)", "[[3,2]]");
+    try check("UNWIND range(1,3) AS x RETURN x,count(*) ORDER BY x", "[[1,1],[2,1],[3,1]]");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND range(1,300000) AS x RETURN x LIMIT 1", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
+}
+
+test "producer summaries and scalar seeds release every failed allocation" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, text: []const u8) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    inline for (.{
+        "WITH [x IN range(1,3)|toString(x)] AS xs RETURN head(xs),last(xs),size(xs),reduce(s='',x IN xs|s+x)",
+        "RETURN reduce(s='',x IN [y IN range(1,3)|toString(y)]|s+x),head([x IN [y IN range(1,3)|toString(y)]|x])",
+        "MATCH(a:Document {id:'a'}) RETURN any(x IN [(a)-[:CITES]->(b)|b.title] WHERE size(x)>1),reduce(s='',x IN [(a)-[:CITES]->(b)|b.title]|s+x)",
+        "UNWIND range(1,3) AS x UNWIND [x,x] AS y RETURN y,count(*) ORDER BY y DESC LIMIT 2",
+        "UNWIND [1,0] AS x RETURN CASE WHEN true THEN count(*) ELSE sum(1/x) END",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as([]const u8, text)});
+}
+
+test "direct range consumers retain sparse work alongside generic producer plans" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "RETURN head(range(1,300000)),last(range(1,300000)),size(range(1,300000)),range(1,300000)[100..102],range(1,300000)[-1]", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .intermediate_states = 1000, .memory_bytes = 1 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 300000), result.rows[0][2].integer);
+    try std.testing.expectEqual(@as(usize, 2), result.rows[0][3].list.len);
+}

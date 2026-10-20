@@ -47,6 +47,7 @@ fn hashValue(hasher: *std.hash.Wyhash, value: anytype) void {
         hashValue(hasher, value.collect_summary);
         hashValue(hasher, value.collect_filters);
         hashValue(hasher, value.collection_extract);
+        hashValue(hasher, value.execution_list);
         return;
     }
     switch (@typeInfo(T)) {

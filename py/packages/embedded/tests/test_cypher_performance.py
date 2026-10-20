@@ -4945,6 +4945,17 @@ def test_pattern_window_and_cardinality_sinks_do_not_retain_match_payloads(graph
         else:
             assert len(cell["value"]) == 4092
 
+    anchor = "MATCH(a:W) WHERE antfly.documentKey(a)='n0' "
+    pattern = "[(a)-[:R]->(b:W)|b.payload]"
+    for tail, expected_value in (
+        (f"RETURN any(x IN {pattern} WHERE size(x)=4092)", True),
+        (f"RETURN reduce(s=0,x IN {pattern}|s+size(x))", str(1499 * 4092)),
+        (f"WITH {pattern} AS xs RETURN head(xs)", expected[0]["value"]),
+        (f"WITH {pattern} AS xs RETURN any(x IN xs WHERE size(x)=4092)", True),
+    ):
+        response = db.cypher_json("payloads", {"query": anchor + tail, "limits": {"memory_bytes": 8 << 20}})
+        assert response["rows"][0][0]["value"] == expected_value
+
 
 def test_ordinary_list_scopes_reclaim_discarded_temporary_strings(graph_db):
     db = graph_db
@@ -5025,3 +5036,51 @@ def test_contains_prefix_cache_is_bounded_for_many_distinct_needles(graph_db):
         },
     )
     assert response["rows"][0][0]["value"] is False
+
+
+def test_unwind_seeds_stream_ranges_and_parameter_lists_without_row_bags(graph_db):
+    for query, parameters, expected, states in (
+        ("UNWIND range(1,300000) AS x RETURN x LIMIT 1", {}, "1", 1000),
+        ("UNWIND range(1,100000) AS x RETURN count(*)", {}, "100000", 1000000),
+        ("UNWIND $xs AS x RETURN count(*)", {"xs": list(range(100000))}, "100000", 1000000),
+    ):
+        response = graph_db.cypher_json(
+            "g",
+            {
+                "query": query,
+                "parameters": parameters,
+                "limits": {"memory_bytes": 1 << 20, "intermediate_states": states},
+            },
+        )
+        assert response["rows"][0][0]["value"] == expected
+
+
+def test_projected_list_aliases_and_nested_consumers_keep_only_demanded_values(graph_db):
+    word = "A" * 4096
+    mapped = "[y IN range(1,2000)|$word+toString(y)]"
+    for query, expected in (
+        (f"WITH {mapped} AS xs WITH xs AS ys RETURN head(ys)", word + "1"),
+        (f"WITH {mapped} AS xs RETURN last(xs)", word + "2000"),
+        (f"RETURN head([x IN {mapped}|x])", word + "1"),
+        (f"RETURN any(x IN {mapped} WHERE size(x)=4097)", True),
+        (f"RETURN reduce(s=0,x IN {mapped}|s+size(x))", str(sum(4096 + len(str(i)) for i in range(1, 2001)))),
+    ):
+        response = graph_db.cypher_json(
+            "g", {"query": query, "parameters": {"word": word}, "limits": {"memory_bytes": 1 << 20}}
+        )
+        assert response["rows"][0][0]["value"] == expected
+
+
+def test_range_aliases_preserve_full_domain_windows_and_cardinality(graph_db):
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "WITH range($a,$b) AS xs RETURN head(xs),last(xs),xs[-2..],any(x IN xs WHERE x=$a)",
+            "parameters": {"a": -(1 << 63), "b": (1 << 63) - 1},
+            "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000},
+        },
+    )
+    cells = response["rows"][0]
+    assert [cell["value"] for cell in cells[:2]] == [str(-(1 << 63)), str((1 << 63) - 1)]
+    assert [cell["value"] for cell in cells[2]["value"]] == [str((1 << 63) - 2), str((1 << 63) - 1)]
+    assert cells[3]["value"] is True

@@ -629,7 +629,12 @@ pub const BytePool = struct {
 /// Membership metadata owns the pool descriptor; its owner must release the
 /// pool's backing slabs before destroying that metadata arena.
 pub fn cloneMembership(value: Value, a: std.mem.Allocator, backing: std.mem.Allocator, pool: *?*BytePool, retain_payload: bool) Value.CloneError!Value {
-    var context: CloneContext = .{ .a = a, .scratch = a, .identity_only = !retain_payload, .share_allocations = false, .byte_pool = pool, .byte_allocator = backing };
+    // Containers can share large subtrees. Preserve that sharing in retained
+    // keys without retaining source allocation addresses in the membership.
+    var scratch = std.heap.ArenaAllocator.init(backing);
+    defer scratch.deinit();
+    const sharing = value == .list or value == .map or value == .path or (retain_payload and (value == .node or value == .relationship));
+    var context: CloneContext = .{ .a = a, .scratch = scratch.allocator(), .identity_only = !retain_payload, .share_allocations = sharing, .byte_pool = pool, .byte_allocator = backing };
     return context.clone(value);
 }
 

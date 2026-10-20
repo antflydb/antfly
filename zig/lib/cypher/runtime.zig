@@ -1238,6 +1238,7 @@ const Engine = struct {
         index: *const std.AutoHashMapUnmanaged(*const ast.Expr, usize),
         values: []v.Value,
         lazy: ?struct { ready: []bool, rows: []const Row, leaders: []const usize, inputs: []?[]const v.Value } = null,
+        stream: ?struct { ready: []bool, states: []StreamingAggregate } = null,
     };
     const GroupOverrides = struct { index: *const std.AutoHashMapUnmanaged(*const ast.Expr, usize), values: []const v.Value, aliases: Row = &.{} };
     fn checkpoint(self: *Engine) !void {
@@ -1327,7 +1328,7 @@ const Engine = struct {
                 candidate = link.next;
             }
             const a = self.arena.allocator();
-            const owned = try v.cloneMembership(value, a, engine.scratch_allocator, &self.bytes, self.retain_payload);
+            const owned = if (engine.read_only and engine.immutableOwner(value) != null) value else try v.cloneMembership(value, a, engine.scratch_allocator, &self.bytes, self.retain_payload);
             const position = self.values.items.len;
             try self.index.insert(a, hash, position);
             try self.values.append(a, owned);
@@ -1471,6 +1472,9 @@ const Engine = struct {
     };
     const StreamingAggregate = struct {
         function: ast.Function,
+        consumer_row: Row = &.{},
+        source_null: bool = false,
+        failure: ?anyerror = null,
         released: bool = false,
         arena: std.heap.ArenaAllocator,
         distinct_arena: std.heap.ArenaAllocator,
@@ -1518,16 +1522,23 @@ const Engine = struct {
                 } };
             }
         };
-        fn filterItem(engine: *Engine, filter: ast.CollectionFilter, value: v.Value) !?bool {
+        fn filterItem(engine: *Engine, filter: ast.CollectionFilter, value: v.Value, outer: Row, state_value: *FilterState) !?bool {
             const previous = engine.projection_locals;
             const local: @import("expressions.zig").Local = .{ .name = filter.alias, .parent = previous };
             engine.projection_locals = &local;
             defer engine.projection_locals = previous;
-            const row = &.{v.Entry{ .name = filter.alias, .value = value }};
+            const row = try engine.replace(outer, filter.alias, value);
             if (filter.kind != .count) return (try engine.eval(filter.predicate.?, row, null)).truth();
             if (filter.predicate) |predicate| if ((try (try engine.eval(predicate, row, null)).truth()) != true) return false;
             // SIZE still observes projection errors and counts NULL projections.
-            if (filter.projection) |projection| _ = try engine.eval(projection, row, null);
+            if (filter.projection) |projection| {
+                const projected = try engine.eval(projection, row, null);
+                _ = engine.values.info(.{ .list = &.{projected} }) catch |err| blk: {
+                    if (err != error.CypherValueDepthExceeded) return err;
+                    state_value.embedding_failure = true;
+                    break :blk null;
+                };
+            }
             return true;
         }
         fn ensureFilters(self: *@This()) !void {
@@ -1537,12 +1548,12 @@ const Engine = struct {
         }
         fn consumerFailure(err: anyerror) bool {
             return switch (err) {
-                error.CypherTypeMismatch, error.CypherNumericOverflow, error.CypherDivisionByZero, error.MissingCypherParameter, error.UnboundCypherVariable, error.CypherInvalidArgument, error.CypherInvalidRange, error.CypherInvalidSubstring, error.CypherInvalidRegex, error.CypherRegexUnavailable, error.CypherValueDepthExceeded => true,
+                error.CypherTypeMismatch, error.CypherNumericOverflow, error.CypherDivisionByZero, error.MissingCypherParameter, error.UnboundCypherVariable, error.CypherInvalidArgument, error.CypherInvalidRange, error.CypherInvalidSubstring, error.CypherInvalidRegex, error.CypherRegexUnavailable, error.CypherValueDepthExceeded, error.CypherDeletedEntity => true,
                 else => false,
             };
         }
-        fn initFold(engine: *Engine, filter: ast.CollectionFilter, state_value: *FilterState) !void {
-            if (!state_value.fold.initialized) try state_value.fold.own(engine, try engine.eval(filter.initial.?, &.{}, null));
+        fn initFold(self: *@This(), engine: *Engine, filter: ast.CollectionFilter, state_value: *FilterState) !void {
+            if (!state_value.fold.initialized) try state_value.fold.own(engine, try engine.eval(filter.initial.?, self.consumer_row, null));
         }
         fn addConsumer(self: *@This(), engine: *Engine, filter: ast.CollectionFilter, state_value: *FilterState, value: v.Value, weight: Count) !void {
             const previous = engine.projection_locals;
@@ -1550,13 +1561,13 @@ const Engine = struct {
             engine.projection_locals = &local;
             defer engine.projection_locals = previous;
             if (filter.kind == .fold) {
-                try initFold(engine, filter, state_value);
+                try self.initFold(engine, filter, state_value);
                 const accumulator_local: @import("expressions.zig").Local = .{ .name = filter.accumulator.?, .parent = &local };
                 engine.projection_locals = &accumulator_local;
-                try state_value.fold.advance(engine, filter.projection.?, &.{}, filter.accumulator.?, filter.alias, value, weight);
+                try state_value.fold.advance(engine, filter.projection.?, self.consumer_row, filter.accumulator.?, filter.alias, value, weight);
                 return;
             }
-            const row = &.{v.Entry{ .name = filter.alias, .value = value }};
+            const row = try engine.replace(self.consumer_row, filter.alias, value);
             try engine.state();
             if (filter.predicate) |predicate| if ((try (try engine.eval(predicate, row, null)).truth()) != true) return;
             const projected = if (filter.projection) |projection| try engine.eval(projection, row, null) else value;
@@ -1599,7 +1610,7 @@ const Engine = struct {
                     };
                     continue;
                 }
-                const selected = filterItem(engine, filter, value) catch |err| {
+                const selected = filterItem(engine, filter, value, self.consumer_row, state_value) catch |err| {
                     if (!consumerFailure(err)) return err;
                     state_value.failure = err;
                     continue;
@@ -1739,7 +1750,7 @@ const Engine = struct {
                         candidate = link.next;
                     }
                     const retained = self.distinct_arena.allocator();
-                    const owned = try v.cloneMembership(value, retained, engine.scratch_allocator, &self.distinct_bytes, std.ascii.eqlIgnoreCase(self.function.name, "collect") and self.function.collect_suffix == 0 and !self.function.collect_summary);
+                    const owned = if (engine.read_only and engine.immutableOwner(value) != null) value else try v.cloneMembership(value, retained, engine.scratch_allocator, &self.distinct_bytes, std.ascii.eqlIgnoreCase(self.function.name, "collect") and self.function.collect_suffix == 0 and !self.function.collect_summary);
                     try self.distinct_index.insert(retained, hash, self.distinct_values.items.len);
                     try self.distinct_values.append(retained, owned);
                 }
@@ -1890,19 +1901,19 @@ const Engine = struct {
             const header = 1 + self.function.collect_filters.len * 2;
             var tuple: std.ArrayList(v.Value) = .empty;
             try tuple.resize(engine.a, header + 1 + window.list.len);
-            tuple.items[0] = .{ .integer = if (self.collection_overflow) -1 else @intCast(self.collection_count) };
+            tuple.items[0] = if (self.source_null) .null else .{ .integer = if (self.collection_overflow) -1 else @intCast(self.collection_count) };
             tuple.items[header] = .{ .integer = @intCast(window.list.len) };
             @memcpy(tuple.items[header + 1 ..], window.list);
             for (self.function.collect_filters, 0..) |filter, i| {
                 const state_value = &self.filter_states[i];
                 if (filter.kind == .fold and state_value.failure == null and !state_value.fold.initialized) {
-                    initFold(engine, filter, state_value) catch |err| {
+                    self.initFold(engine, filter, state_value) catch |err| {
                         if (!consumerFailure(err)) return err;
                         state_value.failure = err;
                     };
                 }
                 if (state_value.failure == null and state_value.embedding_failure) state_value.failure = error.CypherValueDepthExceeded;
-                const consumer_value: v.Value = if (state_value.failure != null) .null else switch (filter.kind) {
+                const consumer_value: v.Value = if (state_value.failure != null or self.source_null) .null else switch (filter.kind) {
                     .window => if (state_value.window) |retained| try retained.finishWindow(engine) else .{ .list = &.{} },
                     .fold => state_value.fold.accumulator,
                     else => state_value.result(filter.kind),
@@ -2138,11 +2149,11 @@ const Engine = struct {
         }
     };
     fn cloneGroupingBinding(self: *Engine, a: A, expression: *const ast.Expr, value: v.Value) !v.Value {
-        const fields = self.entity_retention.get(expression) orelse return value.clone(a);
+        const fields = self.entity_retention.get(expression) orelse return if (self.read_only and self.immutableOwner(value) != null) value else self.cloneScoped(value, a);
         const properties = switch (value) {
             .node => |node| node.properties,
             .relationship => |edge| edge.properties,
-            else => return value.clone(a),
+            else => return self.cloneScoped(value, a),
         };
         try chargeWork(self, properties.len);
         var kept: std.ArrayList(v.Entry) = .empty;
@@ -2151,12 +2162,12 @@ const Engine = struct {
             .node => |node| blk: {
                 var projected = node.*;
                 projected.properties = kept.items;
-                break :blk (v.Value{ .node = &projected }).clone(a);
+                break :blk self.cloneScoped(.{ .node = &projected }, a);
             },
             .relationship => |edge| blk: {
                 var projected = edge.*;
                 projected.properties = kept.items;
-                break :blk (v.Value{ .relationship = &projected }).clone(a);
+                break :blk self.cloneScoped(.{ .relationship = &projected }, a);
             },
             else => unreachable,
         };
@@ -2180,7 +2191,7 @@ const Engine = struct {
         };
         if (retention) |plan| for (input) |entry| {
             if ((plan.all or plan.fields.contains(entry.name)) and lookup(source.items, entry.name) == null)
-                try source.append(a, .{ .name = try a.dupe(u8, entry.name), .value = try entry.value.clone(a) });
+                try source.append(a, .{ .name = try a.dupe(u8, entry.name), .value = try self.cloneScoped(entry.value, a) });
         };
         const retain_payloads = try a.alloc(bool, calls.len);
         @memset(retain_payloads, false);
@@ -2236,8 +2247,9 @@ const Engine = struct {
             const eval_scope = EvalScope.enter(self, scratch.allocator());
             defer eval_scope.leave(self);
             const overrides = try self.a.alloc(v.Value, calls.items.len);
-            for (overrides, group.states) |*override, *state_value| override.* = try state_value.finish(self);
-            self.aggregate_overrides = .{ .index = &calls.index.pointers, .values = overrides };
+            const ready = try self.a.alloc(bool, calls.items.len);
+            @memset(ready, false);
+            self.aggregate_overrides = .{ .index = &calls.index.pointers, .values = overrides, .stream = .{ .ready = ready, .states = group.states } };
             self.group_overrides = .{ .index = &retention.uses, .values = group.key };
             const row = try self.a.alloc(v.Entry, projection.items.len);
             for (projection.items, row) |item, *entry| entry.* = .{ .name = item.alias orelse try self.expressionName(item.expression), .value = try self.eval(item.expression, group.source, &.{}) };
@@ -2331,6 +2343,7 @@ const Engine = struct {
         moment_direct: ?struct { calls: []const ?DirectMoment, values: PathMoments } = null,
         record_rows: bool = true,
         consumer: ?*PatternConsumer = null,
+        defer_aggregates: bool = false,
         continuation: ?struct { parent: *StreamFold, index: usize, apply: ?Row = null, returned: ?*bool = null, capture: ?*StreamCapture = null, admission: bool = false } = null,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
             const weight = @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
@@ -2343,12 +2356,10 @@ const Engine = struct {
                 const clause = fold.middle[index];
                 switch (clause.operation) {
                     .unwind => |unwind| {
-                        const value = try engine.eval(unwind.expression, row, null);
-                        if (value == .null) return;
-                        const items = if (value == .list) value.list else &.{value};
+                        var source = (try engine.unwindSource(unwind.expression, row)) orelse return;
                         var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
                         defer arena.deinit();
-                        for (items) |item| {
+                        while (source.next()) |item| {
                             _ = arena.reset(.retain_capacity);
                             const scope = EvalScope.enter(engine, arena.allocator());
                             defer scope.leave(engine);
@@ -2482,7 +2493,7 @@ const Engine = struct {
             if (fold.record_rows) fold.matched.* +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
             if (fold.top.*) |*top| {
                 try top.addWeighted(row, fold.weight);
-                if (fold.projection.limit != null and fold.projection.order.len == 0 and top.total == top.capacity) return error.CypherStreamComplete;
+                if (fold.projection.limit != null and fold.projection.order.len == 0 and top.capacity != 0 and top.total == top.capacity) return error.CypherStreamComplete;
                 return;
             }
             var key: std.ArrayList(v.Value) = .empty;
@@ -2520,7 +2531,7 @@ const Engine = struct {
                 if (fold.retention) |plan| {
                     var retained_source: std.ArrayList(v.Entry) = .empty;
                     for (row) |entry| if (plan.all or plan.fields.contains(entry.name))
-                        try retained_source.append(fold.retained, .{ .name = try fold.retained.dupe(u8, entry.name), .value = try entry.value.clone(fold.retained) });
+                        try retained_source.append(fold.retained, .{ .name = try fold.retained.dupe(u8, entry.name), .value = try engine.cloneScoped(entry.value, fold.retained) });
                     fold.groups.items[0].source = retained_source.items;
                 }
             }
@@ -2554,7 +2565,11 @@ const Engine = struct {
                     try accumulator.addMoments(engine, input.kind, input.form, direct.values.part(input.form.field.?), direct.values.count, fold.weight);
                     continue;
                 };
-                try accumulator.addWeighted(engine, row, fold.weight);
+                if (accumulator.failure != null) continue;
+                accumulator.addWeighted(engine, row, fold.weight) catch |err| {
+                    if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
+                    accumulator.failure = err;
+                };
             }
             if (fold.distinct_goal) |goal| if (fold.groups.items.len >= goal) return error.CypherStreamComplete;
         }
@@ -2619,10 +2634,13 @@ const Engine = struct {
                     return fold.probe(engine, rows[0], index + 1);
                 },
                 .unwind => |u| {
-                    const value = try engine.eval(u.expression, row, null);
-                    if (value == .null) return false;
-                    const items = if (value == .list) value.list else &.{value};
-                    for (items) |item| {
+                    var source = (try engine.unwindSource(u.expression, row)) orelse return false;
+                    var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                    defer arena.deinit();
+                    while (source.next()) |item| {
+                        _ = arena.reset(.retain_capacity);
+                        const scope = EvalScope.enter(engine, arena.allocator());
+                        defer scope.leave(engine);
                         try engine.state();
                         if (try fold.probe(engine, try engine.replace(row, u.alias, item), index + 1)) return true;
                     }
@@ -3256,9 +3274,18 @@ const Engine = struct {
         // The row pipeline nests only within the statement's stack allowance.
         // Longer clause sequences retain the iterative general executor.
         if (original_middle.len > self.limits.recursion_depth -| self.recursion) return null;
-        if (operation.paths.len == 0) return null;
+        const scalar_seed = operation.paths.len == 0;
+        // Invalid/unknown pagination remains late, after source/projection
+        // failures. A proved finite window can safely be allocated up front.
+        if (scalar_seed) {
+            if (projection.limit != null and self.windowGoal(projection) == null) return null;
+            if (projection.skip) |expression| {
+                const skip = self.constant(expression, &.{}) orelse return null;
+                if (skip != .integer or skip.integer < 0) return null;
+            }
+        }
         if (operation.paths.len > 1) for (operation.paths) |candidate| if (candidate.selector != .all) return null;
-        const path = operation.paths[0];
+        const path: ast.Path = if (scalar_seed) .{ .span = .{}, .alias = null, .nodes = &.{}, .edges = &.{} } else operation.paths[0];
         if (operation.predicate) |predicate| if (@import("expressions.zig").containsPattern(predicate)) return null;
         for (operation.paths) |pattern| {
             for (pattern.nodes) |node| for (node.properties) |entry| {
@@ -3268,7 +3295,7 @@ const Engine = struct {
                 if (@import("expressions.zig").containsPattern(entry.value)) return null;
             };
         }
-        const middle = try self.pruneMiddle(input, operation, try self.elideMiddleOrder(input, operation, original_middle, projection), projection);
+        const middle = if (scalar_seed) original_middle else try self.pruneMiddle(input, operation, try self.elideMiddleOrder(input, operation, original_middle, projection), projection);
         var grouped = projection.distinct;
         for (projection.items) |item| {
             grouped = grouped or aggregates(item.expression);
@@ -3383,7 +3410,7 @@ const Engine = struct {
         var groups: std.ArrayList(StreamGroup) = .empty;
         var group_index: value_work.Index = .{};
         defer for (groups.items) |*group| group.deinit();
-        const scalar_groups = path.edges.len == 0 and operation.paths.len == 1 and blk: {
+        const scalar_groups = (scalar_seed or (path.edges.len == 0 and operation.paths.len == 1)) and blk: {
             if (input_weights) |weights| for (weights) |weight| if (!weight.isOne()) break :blk false;
             for (middle) |clause| switch (clause.operation) {
                 .project, .unwind => {},
@@ -3411,7 +3438,7 @@ const Engine = struct {
         for (probes, middle) |*probe, clause| probe.* = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) }, .disabled = clause.operation != .match and clause.operation != .subquery };
         defer for (probes) |*probe| probe.deinit();
         const retention: GroupRetention = if (grouped) try self.groupRetention(projection) else .{ .a = self.a };
-        var fold: StreamFold = .{ .consumer = consumer, .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
+        var fold: StreamFold = .{ .defer_aggregates = scalar_seed and group_window == null, .consumer = consumer, .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
         var adaptive_probe = adaptive_candidate;
         if (adaptive_probe) for (input) |row| {
             if (operation.predicate) |predicate| if (!endpointExpression(predicate, path, row)) {
@@ -3430,6 +3457,7 @@ const Engine = struct {
         };
         if (projection.distinct and calls.items.len == 0 and projection.order.len == 0 and projection.predicate == null and projection.limit != null) {
             fold.distinct_goal = try std.math.add(usize, if (projection.skip) |skip| try self.count(skip) else 0, try self.count(projection.limit.?));
+            if (scalar_seed and fold.distinct_goal == 0) fold.distinct_goal = null;
         }
         const saved_lookups = self.lookups;
         const saved_lookup = self.lookup;
@@ -3483,14 +3511,21 @@ const Engine = struct {
             @memset(distinct_stages, .{});
             produce: for (input, 0..) |row, input_index| {
                 fold.weight = if (input_weights) |weights| weights[input_index] else Count.one;
-                if (fold.distinct_goal == 0 or (projection.limit != null and try self.count(projection.limit.?) == 0)) break :produce;
-                if (top) |value| if (value.capacity == 0 and projection.order.len == 0) break :produce;
+                if (!scalar_seed and (fold.distinct_goal == 0 or (projection.limit != null and try self.count(projection.limit.?) == 0))) break :produce;
+                if (!scalar_seed) if (top) |value| if (value.capacity == 0 and projection.order.len == 0) break :produce;
                 var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
                 defer scratch.deinit();
                 const scope = EvalScope.enter(self, scratch.allocator());
                 defer scope.leave(self);
                 var ignored: std.ArrayList(MatchState) = .empty;
                 fold.had_match = false;
+                if (scalar_seed) {
+                    fold.add(self, row) catch |err| switch (err) {
+                        error.CypherStreamComplete => if (continuation != null) return err else break :produce,
+                        else => return err,
+                    };
+                    continue;
+                }
                 var count_paths: u64 = 0;
                 self.shortest_count = if (count_shortest) &count_paths else null;
                 const planned_path = if (count_shortest or count_endpoints) try self.reductionPath(path, row, operation, pass.projection, middle) else path;
@@ -3538,7 +3573,7 @@ const Engine = struct {
         self.stream_fold = previous_fold;
         if (continuation != null or consumer != null) return &.{};
         const rows = if (top) |*value| try value.finish(true) else try self.finishStreamGroups(groups.items, &calls, &retention, projection);
-        try self.stages.append(self.a, .{ .operation = "match", .span = match_span, .input_rows = input.len, .output_rows = stage_counts[0] });
+        if (!scalar_seed) try self.stages.append(self.a, .{ .operation = "match", .span = match_span, .input_rows = input.len, .output_rows = stage_counts[0] });
         for (middle, 0..) |clause, index| try self.stages.append(self.a, .{ .operation = @tagName(clause.operation), .span = clause.span, .input_rows = stage_counts[index], .output_rows = stage_counts[index + 1] });
         try self.stages.append(self.a, .{ .operation = "project", .span = projection_span, .input_rows = matched, .output_rows = if (self.pending_window) |weighted| weighted.count() else rows.len });
         return rows;
@@ -4308,10 +4343,8 @@ const Engine = struct {
                     var rows: std.ArrayList(Row) = .empty;
                     var weights: std.ArrayList(Count) = .empty;
                     for (bags.rows, bags.weights) |row, weight| {
-                        const value = try self.eval(u.expression, row, null);
-                        if (value == .null) continue;
-                        const items = if (value == .list) value.list else &.{value};
-                        for (items) |item| {
+                        var source = (try self.unwindSource(u.expression, row)) orelse continue;
+                        while (source.next()) |item| {
                             try self.state();
                             try rows.append(self.a, try self.replace(row, u.alias, item));
                             try weights.append(self.a, weight);
@@ -4531,6 +4564,21 @@ const Engine = struct {
                 }
             }
             self.retain_windows = false;
+            if (!explain and clause.operation == .unwind) {
+                for (clauses[clause_index + 1 ..], clause_index + 1..) |next, index| {
+                    if (next.operation == .unwind or next.operation == .match or (next.operation == .subquery and pureReturningCall(next.operation.subquery))) continue;
+                    if (next.operation != .project) break;
+                    const projection = next.operation.project.value;
+                    var reduction = false;
+                    for (projection.items) |item| reduction = reduction or aggregates(item.expression);
+                    if (!next.operation.project.final and !reduction and projection.limit == null and projection.order.len == 0 and !projection.distinct) continue;
+                    if (try self.streamMatchProjection(rows, .{ .paths = &.{} }, projection, clauses[clause_index..index], .{}, next.span)) |streamed| {
+                        if (index + 1 < clauses.len) return self.runNext(clauses[index + 1 ..], streamed, preserve_rows);
+                        return streamed;
+                    }
+                    break;
+                }
+            }
             rows = switch (clause.operation) {
                 .match => |m| blk: {
                     if (clause_index == 0 and clauses.len == 2 and clauses[1].operation == .project and clauses[1].operation.project.final) {
@@ -4542,10 +4590,8 @@ const Engine = struct {
                 .unwind => |u| blk: {
                     var output: std.ArrayList(Row) = .empty;
                     for (rows) |row| {
-                        const value = try self.eval(u.expression, row, null);
-                        if (value == .null) continue;
-                        const items = if (value == .list) value.list else &.{value};
-                        for (items) |item| {
+                        var source = (try self.unwindSource(u.expression, row)) orelse continue;
+                        while (source.next()) |item| {
                             try self.state();
                             try output.append(self.a, try self.replace(row, u.alias, item));
                         }
@@ -8311,6 +8357,13 @@ const Engine = struct {
         var parent = &self.values.parent;
         while (parent.*) |current| {
             if (current == &owner.work) return owner;
+            // Insert a new child before any shared ancestor. Appending it to
+            // that ancestor would invert ownership and create a parent cycle.
+            var ancestor = owner.work.parent;
+            while (ancestor) |known| : (ancestor = known.parent) if (known == current) {
+                parent.* = &owner.work;
+                return owner;
+            };
             parent = &current.parent;
         }
         parent.* = &owner.work;
@@ -8354,10 +8407,11 @@ const Engine = struct {
     /// General expressions are evaluated eagerly before the consumer starts, so
     /// their errors cannot be hidden behind a predicate's short circuit.
     const ListSource = struct {
-        values: union(enum) { list: []const v.Value, range: @import("range.zig").Range },
+        values: union(enum) { list: []const v.Value, range: @import("range.zig").Range, scalar: v.Value },
         position: u128 = 0,
         fn next(self: *@This()) ?v.Value {
             const value = switch (self.values) {
+                .scalar => |value| if (self.position == 0) value else return null,
                 .list => |items| if (self.position < items.len) items[@intCast(self.position)] else return null,
                 .range => |sequence| if (self.position < sequence.length) sequence.at(self.position) else return null,
             };
@@ -8375,6 +8429,12 @@ const Engine = struct {
         if (value != .list) return error.CypherTypeMismatch;
         return .{ .values = .{ .list = value.list } };
     }
+    fn unwindSource(self: *Engine, expression: *const ast.Expr, row: Row) !?ListSource {
+        if (isRange(expression)) return self.listSource(expression, row, null);
+        const value = try self.eval(expression, row, null);
+        if (value == .null) return null;
+        return .{ .values = if (value == .list) .{ .list = value.list } else .{ .scalar = value } };
+    }
     fn cloneScoped(self: *Engine, value: v.Value, allocator: A) !v.Value {
         var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
         defer scratch.deinit();
@@ -8382,68 +8442,304 @@ const Engine = struct {
         return context.clone(value);
     }
     const ListDemand = union(enum) { all, count, window: reduction_plan.Bounds };
-    fn evalComprehension(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, demand: ListDemand) anyerror!v.Value {
-        const c = expression.value.comprehension;
-        var input = (try self.listSource(c.input, row, group)) orelse return .null;
-        const destination = self.a;
-        const caller_owner = self.scalarOwner();
-        var invariants: LoopScope = .{};
-        defer invariants.deinit();
-        const previous_invariants = try invariants.enter(self);
-        defer self.local_invariants = previous_invariants;
-        var values: std.ArrayList(v.Value) = .empty;
-        var cardinality: usize = 0;
-        var embedding_failure = false;
-        const bounds = if (demand == .window) demand.window else reduction_plan.Bounds{};
-        var window: StreamingAggregate = .{
-            .function = .{ .name = "collect", .args = &.{}, .collect_limit = bounds.prefix, .collect_suffix = bounds.suffix },
-            .arena = std.heap.ArenaAllocator.init(self.scratch_allocator),
-            .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator),
+    /// A source finishes before a receiver's scalar failure becomes observable.
+    /// This composes eager list phases without retaining their intermediate
+    /// values. Resource failures and pipeline control signals remain immediate.
+    const ListReceiver = struct {
+        ptr: *anyopaque,
+        emit: *const fn (*anyopaque, *Engine, v.Value, Count, ?*const value_work.Work) anyerror!void,
+        destination: A,
+        observer: ast.Function,
+        failure: ?anyerror = null,
+        fn accept(self: *@This(), engine: *Engine, value: v.Value, weight: Count, borrowed: ?*const value_work.Work) !void {
+            if (self.failure != null) return;
+            self.emit(self.ptr, engine, value, weight, borrowed) catch |err| {
+                if (!StreamingAggregate.consumerFailure(err)) return err;
+                self.failure = err;
+            };
+        }
+        fn check(self: @This()) !void {
+            if (self.failure) |err| return err;
+        }
+    };
+    const ListMapper = struct {
+        expression: *const ast.Expr,
+        row: Row,
+        locals: ?*const @import("expressions.zig").Local,
+        output: *ListReceiver,
+        scratch: std.heap.ArenaAllocator,
+        embedding_failure: bool = false,
+        repeatable: bool,
+        fn add(ptr: *anyopaque, engine: *Engine, value: v.Value, weight: Count, borrowed: ?*const value_work.Work) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const c = self.expression.value.comprehension;
+            const copies = if (self.repeatable) 1 else std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
+            for (0..copies) |_| {
+                try engine.state();
+                _ = self.scratch.reset(.retain_capacity);
+                const scope = EvalScope.enter(engine, self.scratch.allocator());
+                defer scope.leave(engine);
+                const previous = engine.projection_locals;
+                const local: @import("expressions.zig").Local = .{ .name = c.alias, .parent = self.locals };
+                engine.projection_locals = &local;
+                defer engine.projection_locals = previous;
+                const row = try engine.replace(self.row, c.alias, value);
+                if (c.predicate) |predicate| if ((try (try engine.eval(predicate, row, null)).truth()) != true) continue;
+                const projected = if (c.projection) |projection| try engine.eval(projection, row, null) else value;
+                _ = engine.values.info(.{ .list = &.{projected} }) catch |err| blk: {
+                    if (err != error.CypherValueDepthExceeded) return err;
+                    self.embedding_failure = true;
+                    break :blk null;
+                };
+                try self.output.accept(engine, projected, if (self.repeatable) weight else Count.one, borrowed);
+            }
+        }
+    };
+    fn producePatternCount(self: *Engine, expression: *const ast.Expr, input: Row, receiver: *ListReceiver) !void {
+        const c = expression.value.pattern_comprehension;
+        const count_expression: ast.Expr = .{ .span = expression.span, .value = .{ .call = .{ .name = "count", .args = &.{}, .star = true } } };
+        // Preserve symbolic path/relationship dependencies without asking for
+        // concrete routes. A count-only consumer never observes their order.
+        const dependencies = [_]ast.Clause{
+            .{ .span = expression.span, .operation = .{ .project = .{ .value = .{ .items = &.{.{ .expression = c.projection, .alias = "_comprehension_value" }} }, .final = false } } },
+            .{ .span = expression.span, .operation = .{ .project = .{ .value = .{ .items = &.{.{ .expression = &count_expression }} }, .final = true } } },
         };
-        defer window.deinit();
-        const previous = self.projection_locals;
-        defer self.projection_locals = previous;
-        const local: @import("expressions.zig").Local = .{ .name = c.alias, .parent = previous };
-        self.projection_locals = &local;
+        const matched = try self.weightedMatch(input, .{ .paths = &.{c.path}, .predicate = c.predicate }, &dependencies);
+        var embedding_failure = false;
         var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
         defer scratch.deinit();
-        while (input.next()) |item| {
-            try self.state();
+        for (matched.rows, matched.weights) |row, weight| {
             _ = scratch.reset(.retain_capacity);
             const scope = EvalScope.enter(self, scratch.allocator());
             defer scope.leave(self);
-            const inner = try self.replace(row, c.alias, item);
-            if (c.predicate) |predicate| if ((try (try self.eval(predicate, inner, null)).truth()) != true) continue;
-            const value = if (c.projection) |projection| try self.eval(projection, inner, null) else item;
-            cardinality += 1;
-            switch (demand) {
+            const value = try self.eval(c.projection, row, null);
+            _ = self.values.info(.{ .list = &.{value} }) catch |err| blk: {
+                if (err != error.CypherValueDepthExceeded) return err;
+                embedding_failure = true;
+                break :blk null;
+            };
+            try receiver.accept(self, value, weight, null);
+        }
+        if (embedding_failure) return error.CypherValueDepthExceeded;
+    }
+    fn producePattern(self: *Engine, expression: *const ast.Expr, row: Row, receiver: *ListReceiver) !bool {
+        if (!self.read_only or !weightedExpression(expression)) return false;
+        const scope = PatternScope.enter(self);
+        defer scope.leave(self);
+        const c = expression.value.pattern_comprehension;
+        var input = row;
+        if (c.path.alias) |alias| {
+            var bindings: std.ArrayList(v.Entry) = .empty;
+            for (row) |entry| if (!std.mem.eql(u8, entry.name, alias)) try bindings.append(self.a, entry);
+            input = bindings.items;
+        }
+        const cardinality = receiver.observer.collect_limit == 0 and receiver.observer.collect_suffix == 0 and receiver.observer.collect_filters.len == 0;
+        if (cardinality and !endpointExpression(c.projection, c.path, input)) {
+            try self.producePatternCount(expression, input, receiver);
+            return true;
+        }
+        const previous_demand = self.match_weight_demand;
+        defer self.match_weight_demand = previous_demand;
+        if (cardinality) self.match_weight_demand = .exact;
+        var observer_call = receiver.observer;
+        observer_call.name = "collect";
+        observer_call.execution_list = false;
+        observer_call.collection_extract = null;
+        observer_call.args = &.{c.projection};
+        var consumer: PatternConsumer = .{ .projection = c.projection, .cardinality = cardinality, .receiver = receiver, .reducer = .{
+            .function = observer_call,
+            .arena = std.heap.ArenaAllocator.init(self.scratch_allocator),
+            .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator),
+        } };
+        defer consumer.reducer.deinit();
+        const observer: ast.Expr = .{ .span = expression.span, .value = .{ .call = observer_call } };
+        const columns = self.columns;
+        const stages = self.stages.items.len;
+        defer self.columns = columns;
+        defer self.stages.shrinkRetainingCapacity(stages);
+        if ((try self.streamMatchProjectionInto(&.{input}, null, .{ .paths = &.{c.path}, .predicate = c.predicate }, .{ .items = &.{.{ .expression = if (cardinality) c.projection else &observer, .alias = "_list_producer" }} }, &.{}, .{}, .{}, null, &consumer)) == null) return false;
+        if (consumer.failure) |err| return err;
+        if (consumer.embedding_failure) return error.CypherValueDepthExceeded;
+        return true;
+    }
+    fn produceList(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, receiver: *ListReceiver) anyerror!bool {
+        if (expression.value == .comprehension) {
+            var invariants: LoopScope = .{};
+            defer invariants.deinit();
+            const previous = try invariants.enter(self);
+            defer self.local_invariants = previous;
+            // Input expressions also run in this producer epoch. Keep its
+            // cache chain above the outer owner before evaluating closed input
+            // lists; no longer-lived owner may ever acquire a child parent.
+            const input_scope = EvalScope.enter(self, self.a);
+            defer input_scope.leave(self);
+            const c = expression.value.comprehension;
+            var mapper: ListMapper = .{ .repeatable = (c.predicate == null or reduction_plan.repeatable(c.predicate.?)) and (c.projection == null or reduction_plan.repeatable(c.projection.?)), .expression = expression, .row = row, .locals = self.projection_locals, .output = receiver, .scratch = std.heap.ArenaAllocator.init(self.scratch_allocator) };
+            defer mapper.scratch.deinit();
+            // A nested mapping is an ordered full observer of its input. Its
+            // own output demand still bounds retention in the next receiver.
+            var mapped: ListReceiver = .{ .ptr = &mapper, .emit = ListMapper.add, .destination = receiver.destination, .observer = .{ .name = "collect", .args = &.{} } };
+            const present = try self.produceList(expression.value.comprehension.input, row, group, &mapped);
+            try mapped.check();
+            if (mapper.embedding_failure) return error.CypherValueDepthExceeded;
+            return present;
+        }
+        if (expression.value == .pattern_comprehension and try self.producePattern(expression, row, receiver)) return true;
+        var source = (try self.listSource(expression, row, group)) orelse return false;
+        // Only this caller-owned allocation epoch can be borrowed by escaping
+        // values. The snapshot is immutable while receivers enter inner scopes;
+        // it is never retained after the source returns or used as a value key.
+        const metadata = self.values;
+        const borrowed = if (self.a.ptr == receiver.destination.ptr and self.a.vtable == receiver.destination.vtable) &metadata else null;
+        while (source.next()) |value| {
+            try self.state();
+            try receiver.accept(self, value, Count.one, borrowed);
+        }
+        return true;
+    }
+    const ListWriter = struct {
+        demand: ListDemand,
+        destination: A,
+        caller_owner: ?*Invariants,
+        values: std.ArrayList(v.Value) = .empty,
+        cardinality: u64 = 0,
+        window: StreamingAggregate,
+        fn add(ptr: *anyopaque, engine: *Engine, value: v.Value, weight: Count, borrowed: ?*const value_work.Work) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (self.demand) {
+                .count => self.cardinality = try addPathCount(self.cardinality, weight.cap(std.math.maxInt(u64))),
+                .window => try self.window.retainCollection(engine, value, weight, null),
                 .all => {
-                    // The caller's own metadata proves a value predates this
-                    // element scope. Keep aliases shared; only new projections
-                    // need cloning before the element arena is recycled. A
-                    // write loop's new invariant owner cannot escape by borrow.
-                    const owned = if (c.projection == null or scope.values.hasMetadata(value) or immutableOwnerFrom(if (invariants.owner == null) self.scalarOwner() else caller_owner, value) != null) value else try self.cloneScoped(value, destination);
-                    try values.append(destination, owned);
-                },
-                .count, .window => {
-                    // The original list is validated after every projection has
-                    // run. Discarding an item cannot hide excessive embedding
-                    // depth; a later scalar failure still takes precedence.
-                    _ = self.values.info(.{ .list = &.{value} }) catch |err| blk: {
-                        if (err != error.CypherValueDepthExceeded) return err;
-                        embedding_failure = true;
-                        break :blk null;
-                    };
-                    if (demand == .window) try window.retainCollection(self, value, Count.one, null);
+                    const copies = std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
+                    try chargeWork(engine, copies);
+                    const owner = if (engine.read_only) engine.scalarOwner() else self.caller_owner;
+                    const owned = if ((borrowed != null and borrowed.?.hasMetadata(value)) or immutableOwnerFrom(owner, value) != null) value else try engine.cloneScoped(value, self.destination);
+                    try self.values.ensureUnusedCapacity(self.destination, copies);
+                    for (0..copies) |_| self.values.appendAssumeCapacity(owned);
                 },
             }
         }
-        if (embedding_failure) return error.CypherValueDepthExceeded;
+    };
+    fn evalComprehension(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, demand: ListDemand) anyerror!v.Value {
+        const bounds = if (demand == .window) demand.window else reduction_plan.Bounds{};
+        var writer: ListWriter = .{ .demand = demand, .destination = self.a, .caller_owner = self.scalarOwner(), .window = .{
+            .function = .{ .name = "collect", .args = &.{}, .collect_limit = if (demand == .all) null else bounds.prefix, .collect_suffix = bounds.suffix },
+            .arena = std.heap.ArenaAllocator.init(self.scratch_allocator),
+            .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator),
+        } };
+        defer writer.window.deinit();
+        var receiver: ListReceiver = .{ .ptr = &writer, .emit = ListWriter.add, .destination = self.a, .observer = writer.window.function };
+        if (!try self.produceList(expression, row, group, &receiver)) return .null;
+        try receiver.check();
         return switch (demand) {
-            .all => .{ .list = try values.toOwnedSlice(destination) },
-            .count => .{ .integer = std.math.cast(i64, cardinality) orelse return error.CypherNumericOverflow },
-            .window => try self.cloneScoped(try window.finishWindow(self), destination),
+            .all => .{ .list = try writer.values.toOwnedSlice(self.a) },
+            .count => .{ .integer = @intCast(writer.cardinality) },
+            .window => try self.cloneScoped(try writer.window.finishWindow(self), self.a),
         };
+    }
+    const SummaryReceiver = struct {
+        reducer: *StreamingAggregate,
+        owner: ?*Invariants,
+        locals: ?*const @import("expressions.zig").Local,
+        fn add(ptr: *anyopaque, engine: *Engine, value: v.Value, weight: Count, _: ?*const value_work.Work) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Receiver state outlives the producer's element/constant arenas.
+            // Never borrow or parent a fold cache to a shorter producer epoch.
+            const previous_owner = engine.local_invariants;
+            const previous_locals = engine.projection_locals;
+            engine.local_invariants = self.owner;
+            engine.projection_locals = self.locals;
+            defer engine.local_invariants = previous_owner;
+            defer engine.projection_locals = previous_locals;
+            try self.reducer.addSummary(engine, value, weight);
+            try self.reducer.retainCollection(engine, value, weight, null);
+        }
+    };
+    fn projectedSource(expression: *const ast.Expr) bool {
+        return expression.value == .comprehension or expression.value == .pattern_comprehension;
+    }
+    fn rangeSummary(self: *Engine, call_value: ast.Function, row: Row, group: ?[]const Row) !v.Value {
+        const sequence = try self.rangeInput(call_value.args[0], row, group);
+        var reducer: StreamingAggregate = .{ .function = call_value, .consumer_row = row, .source_null = sequence == null, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
+        defer reducer.deinit();
+        reducer.function.name = "collect";
+        reducer.function.execution_list = false;
+        // RANGE's source phase is total after checked argument evaluation.
+        // Cardinality and root windows are arithmetic; visit only elements
+        // still observed by a predicate, mapped consumer, or sequential fold.
+        reducer.function.collect_limit = 0;
+        reducer.function.collect_suffix = 0;
+        try reducer.ensureFilters();
+        if (sequence) |range| {
+            var summary: SummaryReceiver = .{ .reducer = &reducer, .owner = self.local_invariants, .locals = self.projection_locals };
+            var receiver: ListReceiver = .{ .ptr = &summary, .emit = SummaryReceiver.add, .destination = self.a, .observer = reducer.function };
+            var source: ListSource = .{ .values = .{ .range = range } };
+            while (true) {
+                const pending = for (reducer.filter_states) |state_value| {
+                    if (state_value.failure == null and state_value.decided == null) break true;
+                } else false;
+                if (!pending) break;
+                const value = source.next() orelse break;
+                try self.state();
+                try receiver.accept(self, value, Count.one, null);
+            }
+            try receiver.check();
+            reducer.collection_overflow = range.length > std.math.maxInt(i64);
+            reducer.collection_count = std.math.cast(u64, range.length) orelse 0;
+            const prefix = @min(range.length, call_value.collect_limit orelse 0);
+            const suffix = @min(range.length - prefix, call_value.collect_suffix);
+            const front = try self.rangeCells(range, 0, prefix);
+            const back = try self.rangeCells(range, range.length - suffix, suffix);
+            // These non-overlapping arithmetic windows already have their final
+            // encounter order; no suffix ring or expanded skipped cells exist.
+            try reducer.collected.appendSlice(reducer.arena.allocator(), front.list);
+            try reducer.collected.appendSlice(reducer.arena.allocator(), back.list);
+        }
+        return self.cloneScoped(try reducer.finish(self), self.a);
+    }
+    fn listSummary(self: *Engine, call_value: ast.Function, row: Row, group: ?[]const Row) !v.Value {
+        if (isRange(call_value.args[0])) return self.rangeSummary(call_value, row, group);
+        var reducer: StreamingAggregate = .{ .function = call_value, .consumer_row = row, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
+        defer reducer.deinit();
+        reducer.function.name = "collect";
+        reducer.function.execution_list = false;
+        var summary: SummaryReceiver = .{ .reducer = &reducer, .owner = self.local_invariants, .locals = self.projection_locals };
+        var receiver: ListReceiver = .{ .ptr = &summary, .emit = SummaryReceiver.add, .destination = self.a, .observer = reducer.function };
+        reducer.source_null = !try self.produceList(call_value.args[0], row, group, &receiver);
+        try receiver.check();
+        return self.cloneScoped(try reducer.finish(self), self.a);
+    }
+    fn projectedConsumer(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?v.Value {
+        const input = switch (expression.value) {
+            .list_predicate => |c| c.input,
+            .reduce => |c| c.input,
+            else => return null,
+        };
+        if (!projectedSource(input)) return null;
+        const filter: ast.CollectionFilter = switch (expression.value) {
+            .list_predicate => |c| .{ .alias = c.alias, .predicate = c.predicate, .projection = null, .kind = switch (c.kind) {
+                .all => .all,
+                .any => .any,
+                .none => .none,
+                .single => .single,
+            } },
+            .reduce => |c| .{ .alias = c.alias, .predicate = null, .projection = c.projection, .kind = .fold, .accumulator = c.accumulator, .initial = c.initial },
+            else => unreachable,
+        };
+        var reducer: StreamingAggregate = .{ .function = .{ .name = "collect", .args = &.{}, .collect_limit = 0, .collect_summary = true, .collect_filters = &.{filter} }, .consumer_row = row, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
+        defer reducer.deinit();
+        if (expression.value == .reduce) {
+            // REDUCE evaluates its initial value before reaching its input.
+            const initial = try self.eval(expression.value.reduce.initial, row, group);
+            try reducer.ensureFilters();
+            try reducer.filter_states[0].fold.own(self, initial);
+        }
+        var summary: SummaryReceiver = .{ .reducer = &reducer, .owner = self.local_invariants, .locals = self.projection_locals };
+        var receiver: ListReceiver = .{ .ptr = &summary, .emit = SummaryReceiver.add, .destination = self.a, .observer = reducer.function };
+        if (!try self.produceList(input, row, group, &receiver)) return v.Value.null;
+        try receiver.check();
+        const value = try self.collectionExtract(.{ .filtered = 0 }, try reducer.finish(self));
+        return try self.cloneScoped(value, self.a);
     }
     fn rangeInput(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?@import("range.zig").Range {
         const call_value = expression.value.call;
@@ -8503,6 +8799,11 @@ const Engine = struct {
             if (@import("expressions.zig").same(item.expression, expression) and @import("expressions.zig").unshadowed(expression, self.projection_locals)) return entry.value;
         };
         if (self.aggregate_overrides) |overrides| if (overrides.index.get(expression)) |index| {
+            if (overrides.stream) |stream| if (!stream.ready[index]) {
+                if (stream.states[index].failure) |err| return err;
+                overrides.values[index] = try stream.states[index].finish(self);
+                stream.ready[index] = true;
+            };
             if (overrides.lazy) |lazy| if (!lazy.ready[index]) {
                 const call_value = expression.value.call;
                 const leader = lazy.leaders[index];
@@ -8525,7 +8826,9 @@ const Engine = struct {
             return overrides.values[index];
         };
         try self.checkpoint();
+        if (expression.value == .call and expression.value.call.execution_list) return self.listSummary(expression.value.call, row, group);
         if (try self.rangeConsumer(expression, row, group)) |result| return result;
+        if (try self.projectedConsumer(expression, row, group)) |result| return result;
         if (expression.value == .call) {
             const call_value = expression.value.call;
             if (!call_value.star and !call_value.distinct and call_value.args.len == 1 and std.ascii.eqlIgnoreCase(call_value.name, "size") and call_value.args[0].value == .comprehension)
@@ -8739,7 +9042,7 @@ const Engine = struct {
                 }
                 break :blk .{ .map = try output.toOwnedSlice(self.a) };
             },
-            .call => |c| if (c.collection_extract) |extract|
+            .call => |c| if (c.execution_list) try self.listSummary(c, row, group) else if (c.collection_extract) |extract|
                 try self.collectionExtract(extract, try self.eval(c.args[0], row, group))
             else if (std.ascii.eqlIgnoreCase(c.name, "size") and c.args.len == 1 and c.args[0].value == .pattern_comprehension and weightedExpression(c.args[0]))
                 (try self.patternDemand(c.args[0], row, null)) orelse try self.comprehensionSize(c.args[0], row)
@@ -8765,14 +9068,15 @@ const Engine = struct {
     }
     fn collectionExtract(self: *Engine, extract: ast.CollectionExtract, value: v.Value) !v.Value {
         return switch (extract) {
-            .window => |header| .{ .list = value.list[header + 1 ..][0..@intCast(value.list[header].integer)] },
-            .cardinality => if (value.list[0].integer < 0) error.CypherNumericOverflow else value.list[0],
+            .window => |header| if (value.list[0] == .null) .null else .{ .list = value.list[header + 1 ..][0..@intCast(value.list[header].integer)] },
+            .cardinality => if (value.list[0] == .null) .null else if (value.list[0].integer < 0) error.CypherNumericOverflow else value.list[0],
             .filtered => |slot| try @import("collection_summary.zig").unpack(self.a, value.list, .{ .value = value.list[1 + slot * 2], .code = value.list[2 + slot * 2].integer }),
         };
     }
     const PatternConsumer = struct {
         projection: *const ast.Expr,
         cardinality: bool,
+        receiver: ?*ListReceiver = null,
         reducer: StreamingAggregate,
         count: u64 = 0,
         failure: ?anyerror = null,
@@ -8793,14 +9097,21 @@ const Engine = struct {
             const value = try engine.eval(self.projection, row, null);
             if (self.cardinality) {
                 // A comprehension counts NULL projections too.
-                self.count = try addPathCount(self.count, weight.cap(std.math.maxInt(u64)));
+                if (self.receiver) |receiver| {
+                    _ = engine.values.info(.{ .list = &.{value} }) catch |err| blk: {
+                        if (err != error.CypherValueDepthExceeded) return err;
+                        self.embedding_failure = true;
+                        break :blk null;
+                    };
+                    try receiver.accept(engine, value, weight, null);
+                } else self.count = try addPathCount(self.count, weight.cap(std.math.maxInt(u64)));
             } else {
                 _ = engine.values.info(.{ .list = &.{value} }) catch |err| blk: {
                     if (err != error.CypherValueDepthExceeded) return err;
                     self.embedding_failure = true;
                     break :blk null;
                 };
-                try self.reducer.retainCollection(engine, value, weight, null);
+                if (self.receiver) |receiver| try receiver.accept(engine, value, weight, null) else try self.reducer.retainCollection(engine, value, weight, null);
             }
         }
     };

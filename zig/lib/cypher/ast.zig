@@ -65,6 +65,8 @@ pub const Function = struct {
     collect_summary: bool = false,
     collect_filters: []const CollectionFilter = &.{},
     collection_extract: ?CollectionExtract = null,
+    /// Invocation-local list producer; its flat carrier cannot escape planning.
+    execution_list: bool = false,
 };
 /// Private physical summary access; never emitted by the parser or exposed on wire.
 pub const CollectionExtract = union(enum) { cardinality, window: usize, filtered: usize };

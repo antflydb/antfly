@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Invocation-local aggregate demand propagation through projection bindings.
+//! Invocation-local list and aggregate demand propagation through projection bindings.
 //! Rewrites are keyed by AST identity, never by a globally visible spelling.
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -26,10 +26,28 @@ const Names = std.StringHashMapUnmanaged(usize);
 const FilterUse = struct { expression: *const ast.Expr, input: *const ast.Expr, filter: ast.CollectionFilter, window: bool = false };
 const Candidate = struct { expression: *const ast.Expr, valid: bool = true, window: ?Bounds = null, uses: std.ArrayList(*const ast.Expr) = .empty, windows: std.ArrayList(*const ast.Expr) = .empty, filters: std.ArrayList(FilterUse) = .empty };
 const Cohort = struct { members: std.ArrayList(usize) = .empty, full: bool = false };
+fn collectProducer(expression: *const ast.Expr) bool {
+    return expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "collect") and !expression.value.call.star and expression.value.call.args.len == 1;
+}
+fn rangeProducer(expression: *const ast.Expr) bool {
+    return expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "range") and !expression.value.call.star and !expression.value.call.distinct and (expression.value.call.args.len == 2 or expression.value.call.args.len == 3);
+}
+fn producer(expression: *const ast.Expr) bool {
+    return collectProducer(expression) or rangeProducer(expression) or expression.value == .comprehension or expression.value == .pattern_comprehension;
+}
+fn directRange(expression: *const ast.Expr) ?*const ast.Expr {
+    const input = switch (expression.value) {
+        .call => |c| if (!c.star and !c.distinct and c.args.len == 1 and (std.ascii.eqlIgnoreCase(c.name, "head") or std.ascii.eqlIgnoreCase(c.name, "last") or std.ascii.eqlIgnoreCase(c.name, "size"))) c.args[0] else return null,
+        .index => |i| i.base,
+        .slice => |s| s.base,
+        else => return null,
+    };
+    return if (rangeProducer(input)) input else null;
+}
 fn hasCollection(value: anytype) bool {
     const T = @TypeOf(value);
     if (T == *const ast.Expr) {
-        if (value.value == .call and std.ascii.eqlIgnoreCase(value.value.call.name, "collect")) return true;
+        if (producer(value)) return true;
         return hasCollection(value.value);
     }
     switch (@typeInfo(T)) {
@@ -70,14 +88,27 @@ const Flow = struct {
         if (slot == self.cohorts.items.len) try self.cohorts.append(self.a, .{});
         return slot;
     }
+    fn scanProducer(self: *@This(), input: *const ast.Expr, names: Names, locals: ?*const expressions.Local, index: ?*Index) anyerror!void {
+        switch (input.value) {
+            .call => |call| try self.scan(call.args, names, locals, index),
+            .comprehension => |c| {
+                try self.scan(c.input, names, locals, index);
+                const local: expressions.Local = .{ .name = c.alias, .parent = locals };
+                try self.scan(c.predicate, names, &local, index);
+                try self.scan(c.projection, names, &local, index);
+            },
+            .pattern_comprehension => self.barrier(names),
+            else => unreachable,
+        }
+    }
     fn consumerInput(self: *@This(), input: *const ast.Expr, names: Names, locals: ?*const expressions.Local, index: ?*Index) !?usize {
         if (input.value == .variable) return lookup(names, input.value.variable, locals);
-        if (index) |slots| if (input.value == .call and std.ascii.eqlIgnoreCase(input.value.call.name, "collect") and !input.value.call.star and input.value.call.args.len == 1) {
+        if (index) |slots| if (producer(input) and !rangeProducer(input)) {
             const slot = try self.cohort(slots, input);
             const id = self.candidates.items.len;
             try self.candidates.append(self.a, .{ .expression = input });
             try self.cohorts.items[slot].members.append(self.a, id);
-            try self.scan(input.value.call.args, names, locals, index);
+            try self.scanProducer(input, names, locals, index);
             return id;
         };
         return null;
@@ -94,6 +125,20 @@ const Flow = struct {
                     return self.scan(value, projection.names, locals, index);
                 };
             };
+            // Direct RANGE consumers already evaluate a sparse arithmetic
+            // demand. Do not replace them with repeated shared prefix windows.
+            if (directRange(value)) |range| {
+                try self.scan(range.value.call.args, names, locals, index);
+                switch (value.value) {
+                    .index => |i| try self.scan(i.index, names, locals, index),
+                    .slice => |s| {
+                        try self.scan(s.start, names, locals, index);
+                        try self.scan(s.end, names, locals, index);
+                    },
+                    else => {},
+                }
+                return;
+            }
             if (@import("reduction.zig").collectionConsumer(value)) |prefix| {
                 if (prefix.input.value == .comprehension) {
                     const c = prefix.input.value.comprehension;
@@ -119,6 +164,10 @@ const Flow = struct {
                     return;
                 }
             }
+            if (!collectProducer(value) and producer(value)) if (index) |slots| {
+                const slot = try self.cohort(slots, value);
+                self.cohorts.items[slot].full = true;
+            };
             switch (value.value) {
                 .variable => |name| self.full(names, name, locals),
                 .exists, .pattern_comprehension => self.barrier(names),
@@ -163,7 +212,7 @@ const Flow = struct {
                     try self.scan(c.projection, names, &local, index);
                 },
                 .list_predicate => |c| {
-                    if (try self.consumerInput(c.input, names, locals, index)) |id| {
+                    if (c.input.value == .variable or collectProducer(c.input)) if (try self.consumerInput(c.input, names, locals, index)) |id| {
                         const Context = struct {
                             alias: []const u8,
                             pub fn permits(context: @This(), name: []const u8) bool {
@@ -180,7 +229,7 @@ const Flow = struct {
                             try self.candidates.items[id].filters.append(self.a, .{ .expression = value, .input = c.input, .filter = .{ .alias = c.alias, .predicate = c.predicate, .projection = null, .kind = kind } });
                             return;
                         }
-                    }
+                    };
                     try self.scan(c.input, names, locals, index);
                     const local: expressions.Local = .{ .name = c.alias, .parent = locals };
                     try self.scan(c.predicate, names, &local, index);
@@ -193,7 +242,10 @@ const Flow = struct {
                             return (context.alias != null and std.mem.eql(u8, context.alias.?, name)) or (context.accumulator != null and std.mem.eql(u8, context.accumulator.?, name));
                         }
                     };
-                    if (!expressions.aggregates(r.initial) and !expressions.aggregates(r.projection) and expressions.rowLocal(r.initial, Context{}) and expressions.rowLocal(r.projection, Context{ .alias = r.alias, .accumulator = r.accumulator })) {
+                    // A direct nonaggregate REDUCE reaches its initial value
+                    // before the input producer. Keep that ordering in the
+                    // runtime consumer; alias/aggregate inputs already exist.
+                    if ((r.input.value == .variable or collectProducer(r.input)) and !expressions.aggregates(r.initial) and !expressions.aggregates(r.projection) and expressions.rowLocal(r.initial, Context{}) and expressions.rowLocal(r.projection, Context{ .alias = r.alias, .accumulator = r.accumulator })) {
                         if (try self.consumerInput(r.input, names, locals, index)) |id| {
                             try self.candidates.items[id].filters.append(self.a, .{ .expression = value, .input = r.input, .filter = .{ .alias = r.alias, .predicate = null, .projection = r.projection, .kind = .fold, .accumulator = r.accumulator, .initial = r.initial } });
                             return;
@@ -246,8 +298,8 @@ const Flow = struct {
                         }
                     }
                     const expression = item.expression;
-                    if (!p.final and item.alias != null and expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "collect") and !expression.value.call.star and expression.value.call.args.len == 1) {
-                        try self.scan(expression.value.call.args, names, null, &slots);
+                    if (!p.final and item.alias != null and producer(expression)) {
+                        try self.scanProducer(expression, names, null, &slots);
                         const id = self.candidates.items.len;
                         try self.candidates.append(self.a, .{ .expression = expression, .valid = !p.value.distinct and !p.value.wildcard });
                         const slot = try self.cohort(&slots, expression);
@@ -290,11 +342,21 @@ const Flow = struct {
             var filters: std.ArrayList(ast.CollectionFilter) = .empty;
             for (cohort_.members.items) |id| for (self.candidates.items[id].filters.items) |use| try filters.append(self.a, use.filter);
             if (!allowed or (!used and prefix == null and filters.items.len == 0)) continue;
-            const summary = filters.items.len != 0 or (used and prefix != null);
+            const list_source = !collectProducer(self.candidates.items[cohort_.members.items[0]].expression);
+            const summary = list_source or filters.items.len != 0 or (used and prefix != null);
             var filter_slot: usize = 0;
             for (cohort_.members.items) |id| {
                 const original = self.candidates.items[id].expression;
                 var count = original.*;
+                if (list_source) {
+                    const source = try self.a.create(ast.Expr);
+                    source.* = original.*;
+                    source.execution_invariant = null;
+                    const args = try self.a.alloc(*const ast.Expr, 1);
+                    args[0] = source;
+                    count.execution_invariant = null;
+                    count.value = .{ .call = .{ .name = "head", .args = args, .execution_list = true } };
+                }
                 if (summary) {
                     count.value.call.collect_summary = true;
                     count.value.call.collect_limit = if (prefix) |limit| limit.prefix else 0;
