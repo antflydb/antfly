@@ -54,9 +54,17 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 
 .PHONY: generate generated-check tls-compat-check openapi-generate openapi-check mcp-schema-fragments-generate mcp-schema-fragments-check snowball-generate snowball-check sql-grammar-generate sql-grammar-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
-generate: openapi-generate snowball-generate sql-grammar-generate cabi-header-generate source-catalog-generate ## Regenerate checked-in generated sources.
+generate: engine-errors-generate openapi-generate snowball-generate sql-grammar-generate cabi-header-generate source-catalog-generate ## Regenerate checked-in generated sources.
 
-generated-check: tls-compat-check openapi-check snowball-check sql-grammar-check cabi-header-check source-catalog-check ## Check all checked-in generated sources are current.
+generated-check: engine-errors-check tls-compat-check openapi-check snowball-check sql-grammar-check cabi-header-check source-catalog-check ## Check all checked-in generated sources are current.
+
+# New model/codec failures must retain their identities across runtime units.
+.PHONY: engine-errors-generate engine-errors-check
+engine-errors-generate:
+	$(SCRIPTS_PY) tools/generate_engine_errors.py --zig $(ZIG)
+
+engine-errors-check:
+	$(SCRIPTS_PY) tools/generate_engine_errors.py --zig $(ZIG) --check
 
 .PHONY: source-catalog-generate source-catalog-check
 source-catalog-generate:

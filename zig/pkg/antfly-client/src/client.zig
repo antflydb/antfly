@@ -17,7 +17,7 @@ const std = @import("std");
 const openapi = @import("antfly_client_openapi");
 const httpx = @import("httpx");
 
-const retrieval_agent_timeout_ms = 300_000;
+const bounded_agent_timeout_ms = 300_000;
 /// Research runs and job advances are bounded by the request's declared
 /// budget (at most 30 minutes); allow that plus transport slack.
 const research_agent_timeout_ms = 1_860_000;
@@ -713,7 +713,7 @@ pub const AntflyClient = struct {
         var resp = try self.inner.http.post(url, .{
             .json = json_body,
             .headers = if (auth_headers) |*h| h[0..] else null,
-            .timeout_ms = retrieval_agent_timeout_ms,
+            .timeout_ms = bounded_agent_timeout_ms,
         });
         defer resp.deinit();
         return .{
@@ -742,7 +742,7 @@ pub const AntflyClient = struct {
         var resp = try self.inner.http.requestToWriter(.POST, url, .{
             .json = json_body,
             .headers = if (auth_headers) |*h| h[0..] else null,
-            .timeout_ms = retrieval_agent_timeout_ms,
+            .timeout_ms = bounded_agent_timeout_ms,
         }, writer, null, null);
         defer resp.deinit();
         return .{
@@ -855,7 +855,28 @@ pub const AntflyClient = struct {
     }
 
     pub fn queryBuilder(self: *AntflyClient, body: openapi.types.QueryBuilderRequest) !openapi.ApiResponse(openapi.types.QueryBuilderResult) {
-        var resp = try self.inner.queryBuilderAgent(body);
+        return self.queryBuilderWithTimeout(body, bounded_agent_timeout_ms);
+    }
+
+    /// Planning performs bounded model/tool rounds like retrieval. Keep its
+    /// transport lifetime independent of ordinary short metadata requests,
+    /// while allowing a caller's smaller end-to-end budget to remain binding.
+    pub fn queryBuilderWithTimeout(self: *AntflyClient, body: openapi.types.QueryBuilderRequest, timeout_ms: u64) !openapi.ApiResponse(openapi.types.QueryBuilderResult) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/query-builder", .{self.inner.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header|
+            @as(*const [1][2][]const u8, header)
+        else
+            null;
+        var response = try self.inner.http.post(url, .{
+            .json = json_body,
+            .headers = headers,
+            .timeout_ms = @max(timeout_ms, 1),
+            .max_retries = 0,
+        });
+        var resp = try openapi.ApiResponse(openapi.types.QueryBuilderResult).fromResponse(self.allocator, &response);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);

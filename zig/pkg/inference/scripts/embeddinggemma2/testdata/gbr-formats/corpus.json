@@ -1,0 +1,148 @@
+{
+  "version": 1,
+  "purpose": "Identity-matrix reference preservation; no relevance labels",
+  "documents": [
+    {
+      "id": "av1-gbr-8-127",
+      "path": "av1-gbr-8-127.webm",
+      "sha256": "49a292afa77542b9fa8e794e562c8478b01c0b92b66e6c628c5f83fc3d6158b1",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "fa415aeefc7de2d3894c21abb90f27ec7a54a6741215db645c1ebb2b7a5c3675",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    },
+    {
+      "id": "vp9-gbr-8-127",
+      "path": "vp9-gbr-8-127.webm",
+      "sha256": "831a71f7f03a7f164dba313278203fdad6343c01f392af807cd90e485c1e58c3",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "fa415aeefc7de2d3894c21abb90f27ec7a54a6741215db645c1ebb2b7a5c3675",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    },
+    {
+      "id": "av1-gbr-10-127",
+      "path": "av1-gbr-10-127.webm",
+      "sha256": "ef91148db5b834e1919a282e1dbb19f7858c87c2709fa8db539d6eb57b11d44d",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "bfe11575a27b7f5ad927c0f97055462716fa5e1aac2432bd0254e5d98bc49782",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    },
+    {
+      "id": "vp9-gbr-10-127",
+      "path": "vp9-gbr-10-127.webm",
+      "sha256": "43d8550abeec76d8f89af65d46bf5556d7d762afb3b09173ce3a16c4a66a24bd",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "bfe11575a27b7f5ad927c0f97055462716fa5e1aac2432bd0254e5d98bc49782",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    },
+    {
+      "id": "av1-gbr-12-127",
+      "path": "av1-gbr-12-127.webm",
+      "sha256": "0cbcf3f3f580c2edb4dd8a89e650074117381364886666bff575b0f51c1eb231",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "e76e1f28a3752818a4af2eb6dab20383b5b4a791664ad8fae185d5d44e797e6b",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    },
+    {
+      "id": "vp9-gbr-12-127",
+      "path": "vp9-gbr-12-127.webm",
+      "sha256": "e79e31efe104a4a50b55dd46727d74a2d8b0eff1eb1b55c80bb56e9e7314bf68",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "e76e1f28a3752818a4af2eb6dab20383b5b4a791664ad8fae185d5d44e797e6b",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    },
+    {
+      "id": "av1-gbr-8-128",
+      "path": "av1-gbr-8-128.webm",
+      "sha256": "4d153e436062faa278391f0749d0ded3000a577bb89cce4d537bee972683743e",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "8937ee8703d0d2e96beeadd6548ffec3ce6f4a57a39f935a5ee01fac259616e8",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    },
+    {
+      "id": "vp9-gbr-8-128",
+      "path": "vp9-gbr-8-128.webm",
+      "sha256": "8f5bebbffca62345b5e46a524f30168e348dd1b968f1879639f8be2ed40ce4c5",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "8937ee8703d0d2e96beeadd6548ffec3ce6f4a57a39f935a5ee01fac259616e8",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    },
+    {
+      "id": "av1-gbr-10-128",
+      "path": "av1-gbr-10-128.webm",
+      "sha256": "f63ba1b1f910dfb9d8525e792ce07f9df0e8842bf3d020e495173a357557a9fd",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "ed341cba5310091f9fe278ece76fa05bf7cc99a2386ff3226f6945a2cf95ebc2",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    },
+    {
+      "id": "vp9-gbr-10-128",
+      "path": "vp9-gbr-10-128.webm",
+      "sha256": "c921b07cbf453344ee089013850d29f80d7a806ba161386050a61b46d49eb0da",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "ed341cba5310091f9fe278ece76fa05bf7cc99a2386ff3226f6945a2cf95ebc2",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    },
+    {
+      "id": "av1-gbr-12-128",
+      "path": "av1-gbr-12-128.webm",
+      "sha256": "31bec7cfdd8368eaa04807b43b20daaf0f6c14854d275f4771d97d898bac35c6",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "7b084da32a63cd9ebfb7034455473cc8eb48c250522b3651c7fe688578f0279e",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    },
+    {
+      "id": "vp9-gbr-12-128",
+      "path": "vp9-gbr-12-128.webm",
+      "sha256": "4f54d6678c01635edadaa7a1a907d53b4df0587f987706469d38b2d4740ca625",
+      "provenance": {
+        "title": "Antfly generated identity-matrix RGB pattern",
+        "license": "Apache-2.0",
+        "source_sha256": "7b084da32a63cd9ebfb7034455473cc8eb48c250522b3651c7fe688578f0279e",
+        "generation": "tools/embeddinggemma2/generate_gbr_model_corpus.py"
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "colour",
+      "text": "A colourful pattern with moving shapes."
+    },
+    {
+      "id": "gray",
+      "text": "A grayscale pattern."
+    }
+  ]
+}

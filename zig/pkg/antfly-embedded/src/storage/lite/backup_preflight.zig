@@ -264,6 +264,30 @@ fn number(v: Value) u32 {
     return if (v == .integer and v.integer > 0 and v.integer <= std.math.maxInt(u32)) @intCast(v.integer) else 0;
 }
 
+fn producerEnabled(value: Value, fallback: bool) bool {
+    if (value == .bool) return value.bool;
+    if (value == .object) {
+        const enabled = get(value, "enabled");
+        return enabled != .bool or enabled.bool;
+    }
+    return fallback;
+}
+
+fn modelBackedProducer(producer: Value) bool {
+    const typ = str(get(producer, "type"));
+    if (eq(typ, "generator") or eq(typ, "extractor") or eq(typ, "transcriber")) return true;
+    const config = get(producer, "config");
+    if (eq(typ, "document_extraction")) {
+        // Extraction uses the default OCR model for PDF fallback unless
+        // explicitly disabled; transcription is separately opt-in.
+        return producerEnabled(get(config, "ocr"), producerEnabled(get(config, "ocr_fallback"), true)) or
+            producerEnabled(get(config, "transcription"), producerEnabled(get(config, "transcribe_audio"), false));
+    }
+    if (!eq(typ, "reader")) return false;
+    const provider = str(get(config, "provider"));
+    return str(get(config, "model")).len > 0 or eq(provider, "antfly") or eq(provider, "openai") or eq(provider, "vertex") or eq(provider, "apple");
+}
+
 const Selector = struct { field: []const u8, template: []const u8, artifact: []const u8, locator: bool, dynamic: bool };
 pub const Inspector = struct {
     allocator: Allocator,
@@ -430,7 +454,10 @@ pub const Inspector = struct {
             defer self.allocator.free(identity);
             try self.report.add(self.options, .model, identity, "", str(get(value, "name")), dims);
         }
-        if (get(value, "model") == .string and str(get(value, "model")).len > 0) {
+        // Providers can select an implicit model (Apple generation forbids an
+        // explicit model). Bind the enclosing producer definition, including
+        // its source and template, rather than certifying it from model names.
+        if (modelBackedProducer(producer) or get(value, "transcriber") != .null or str(get(value, "model")).len > 0) {
             const identity = try canonical.canonicalJsonValueAlloc(self.allocator, value);
             defer self.allocator.free(identity);
             try self.report.add(self.options, .producer_model, identity, "", "model", 0);
@@ -440,7 +467,15 @@ pub const Inspector = struct {
             const key = entry.key_ptr.*;
             const v = entry.value_ptr.*;
             if (eq(key, "api_url") or eq(key, "base_url") or eq(key, "endpoint") or eq(key, "url") or eq(key, "uri") or eq(key, "source_url") or eq(key, "model_path") or eq(key, "credentials_path")) {
-                if (v == .string and v.string.len > 0) try self.locator(v.string, "", key);
+                if (v == .string and v.string.len > 0) {
+                    // This v2 semantic-model sentinel selects the built-in
+                    // runtime, not a source URI. Its model still needs exact
+                    // destination evidence; never exempt media locators.
+                    const embedded_model_endpoint = eq(key, "endpoint") and eq(v.string, "antfly:embedded") and
+                        number(get(value, "version")) == 2 and eq(str(get(value, "provider")), "antfly") and
+                        str(get(value, "model")).len > 0 and get(value, "sparse") == .bool;
+                    if (!embedded_model_endpoint) try self.locator(v.string, "", key);
+                }
             } else if (eq(key, "connection") or eq(key, "credential") or eq(key, "credential_name") or eq(key, "credentials") or eq(key, "connection_id") or eq(key, "connection_name")) {
                 if (v == .string and v.string.len > 0) try self.report.add(self.options, .connection, v.string, "", key, 0);
             } else if (eq(key, "api_key") or eq(key, "api_token") or eq(key, "password") or eq(key, "authorization") or eq(key, "headers")) {
@@ -779,6 +814,134 @@ test "backup preflight model evidence includes query ingestion revision preproce
     try std.testing.expectEqual(Verdict.compatible, evaluate(r, destination).verdict);
     caps[0].dimensions = 4;
     try std.testing.expectEqual(Verdict.blocked, evaluate(r, destination).verdict);
+}
+
+test "backup preflight implicit Apple generator requires exact producer evidence" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(
+        \\[{"name":"summary","kind":"asset","source_field":"body","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"apple\"}}"}]
+    );
+    try std.testing.expectEqual(@as(u64, 1), count(report, .producer_model));
+    const r = &report.requirements.items[0];
+    try std.testing.expectEqual(Verdict.unknown, evaluate(r, null).verdict);
+    const unattested = try report.jsonAlloc("{\"version\":1,\"configuration_id\":\"destination\"}");
+    defer a.free(unattested);
+    try std.testing.expect(std.mem.indexOf(u8, unattested, "\"compatibility\":{\"verdict\":\"unknown\"") != null);
+    var caps = [_]Capability{.{ .requirement_sha256 = &r.sha256, .supported = true }};
+    const destination: Destination = .{ .version = 1, .configuration_id = "destination", .requirements = &caps };
+    try std.testing.expectEqual(Verdict.blocked, evaluate(r, destination).verdict);
+    caps[0].future_ingestion = true;
+    try std.testing.expectEqual(Verdict.blocked, evaluate(r, destination).verdict);
+    caps[0].model_revision_verified = true;
+    try std.testing.expectEqual(Verdict.compatible, evaluate(r, destination).verdict);
+
+    // Evidence for the same provider must not certify a different source or
+    // producer configuration. Keep a copy across requirement-list growth.
+    const original = r.sha256;
+    caps[0].requirement_sha256 = &original;
+    try inspector.metadataJson(
+        \\[{"name":"summary","kind":"asset","source_field":"title","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"apple\"}}"}]
+    );
+    try inspector.metadataJson(
+        \\[{"name":"summary","kind":"asset","source_field":"body","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"apple\",\"temperature\":0.5}}"}]
+    );
+    try std.testing.expectEqual(@as(usize, 3), report.requirements.items.len);
+    for (report.requirements.items[1..]) |*changed| {
+        try std.testing.expect(!eq(&original, &changed.sha256));
+        try std.testing.expectEqual(Verdict.unknown, evaluate(changed, destination).verdict);
+    }
+}
+
+test "backup preflight implicit producer detection excludes deterministic producers" {
+    const a = std.testing.allocator;
+    const Case = struct { json: []const u8, model_count: u64 };
+    for ([_]Case{
+        .{ .json = "{\"producer\":{\"type\":\"transcriber\",\"config\":{\"provider\":\"apple\"}}}", .model_count = 1 },
+        .{ .json = "{\"producer\":{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\"}}}", .model_count = 1 },
+        .{ .json = "{\"producer\":{\"type\":\"reader\",\"config\":{\"provider\":\"apple\"}}}", .model_count = 1 },
+        .{ .json = "{\"producer\":{\"type\":\"reader\"}}", .model_count = 0 },
+        .{ .json = "{\"producer\":{\"type\":\"copy\"}}", .model_count = 0 },
+        .{ .json = "{\"producer\":{\"type\":\"document_extraction\"}}", .model_count = 1 },
+        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr_fallback\":false}}}", .model_count = 0 },
+        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":false}}}", .model_count = 0 },
+        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":{\"enabled\":false}}}}", .model_count = 0 },
+        .{ .json = "{\"producer\":{\"type\":\"document_extraction\",\"config\":{\"ocr\":false,\"transcription\":true}}}", .model_count = 1 },
+    }) |case| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.metadataJson(case.json);
+        try std.testing.expectEqual(case.model_count, count(report, .producer_model));
+    }
+}
+
+test "backup preflight embedded semantic model remains subject to complete model evidence" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(
+        \\[{"name":"dense","kind":"embedding","source_field":"body","expected_dims":3,"producer_json":"{\"version\":2,\"provider\":\"antfly\",\"model\":\"exact-model\",\"endpoint\":\"antfly:embedded\",\"sparse\":false}"}]
+    );
+    try std.testing.expectEqual(@as(u64, 1), count(report, .model));
+    try std.testing.expectEqual(@as(u64, 1), count(report, .producer_model));
+    try std.testing.expectEqual(@as(u64, 0), count(report, .source_unresolved));
+    try std.testing.expect(report.analysis_complete);
+    const caps = try a.alloc(Capability, report.requirements.items.len);
+    defer a.free(caps);
+    const destination: Destination = .{ .version = 1, .configuration_id = "embedded-runtime", .requirements = caps };
+    for (report.requirements.items, caps) |*r, *cap| {
+        cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .dimensions = r.dimensions };
+    }
+    for (report.requirements.items, caps) |*r, *cap| {
+        try std.testing.expectEqual(Verdict.unknown, evaluate(r, null).verdict);
+        try std.testing.expectEqual(Verdict.blocked, evaluate(r, destination).verdict);
+        cap.query_embedding = true;
+        cap.future_ingestion = true;
+        cap.model_revision_verified = true;
+        cap.preprocessing_verified = true;
+        cap.vector_space_verified = true;
+    }
+    const evidence = try std.json.Stringify.valueAlloc(a, destination, .{});
+    defer a.free(evidence);
+    const compatible = try report.jsonAlloc(evidence);
+    defer a.free(compatible);
+    try std.testing.expect(std.mem.indexOf(u8, compatible, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+
+    // The exemption belongs only to the model endpoint, never media inputs.
+    try inspector.document("d", "{\"body\":\"<<<dotprompt:media:url antfly:embedded>>>\"}", "");
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_unresolved));
+    const blocked = try report.jsonAlloc(evidence);
+    defer a.free(blocked);
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
+}
+
+test "backup preflight embedded endpoint exemption rejects unknown schemes and other schemas" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"version\":2,\"provider\":\"antfly\",\"model\":\"exact-model\",\"endpoint\":\"antfly:unknown\",\"sparse\":false}",
+        "{\"version\":2,\"provider\":\"openai\",\"model\":\"exact-model\",\"endpoint\":\"antfly:embedded\",\"sparse\":false}",
+        "{\"provider\":\"antfly\",\"model\":\"exact-model\",\"endpoint\":\"antfly:embedded\",\"sparse\":false}",
+        "{\"version\":2,\"provider\":\"antfly\",\"model\":\"exact-model\",\"endpoint\":\"antfly:embedded\"}",
+        "{\"version\":2,\"provider\":\"antfly\",\"model\":\"exact-model\",\"endpoint\":\"antfly:embedded\",\"sparse\":false,\"url\":\"antfly:embedded\"}",
+    }) |json| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.metadataJson(json);
+        try std.testing.expectEqual(@as(u64, 1), count(report, .source_unresolved));
+        try std.testing.expect(!report.analysis_complete);
+        for (report.requirements.items) |*r| {
+            if (r.kind == .source_unresolved) try std.testing.expectEqual(Verdict.blocked, evaluate(r, null).verdict);
+        }
+    }
 }
 
 test "backup preflight static templates and dynamic loaders never execute" {

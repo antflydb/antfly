@@ -321,8 +321,8 @@ def test_catalog_remote_apply_outage_recovers_without_primary_restart(
     assert retry.status_code == 409, retry.text
     assert retry.text == "table already exists"
     assert retry.headers.get("X-Antfly-Raft-Mutation-Outcome") is None
-    cluster.primary.batch_write(
-        "pending_table", {"recovered": {"title": "replayed catalog"}}
+    _write_and_wait_for_standby_durability(
+        cluster, "pending_table", {"recovered": {"title": "replayed catalog"}}
     )
     _wait_for_standby_lookup(cluster, "pending_table", "recovered")
     cluster.primary.create_table("after_outage")

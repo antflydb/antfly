@@ -38,6 +38,7 @@ pub const Stats = struct {
 
 const PlanKey = struct {
     dtype_tag: u8,
+    output_dtype_tag: u8,
     rows: u32,
     in_dim: u32,
     out_dim: u32,
@@ -129,12 +130,34 @@ pub const DenseLt = struct {
         if (!eligible(self, rows, in_dim, out_dim, dtype)) return false;
 
         self.attempts += 1;
-        const ran = self.linearInner(ctx, libraries, dst, activation16, weight16, bias, rows, in_dim, out_dim, dtype) catch false;
+        const ran = self.linearInner(ctx, libraries, dst, activation16, weight16, bias, rows, in_dim, out_dim, dtype, .f32) catch false;
         if (ran) {
             self.successes += 1;
         } else {
             self.fallbacks += 1;
         }
+        return ran;
+    }
+
+    /// BF16 resident-output counterpart used by EmbeddingGemma 2. Accumulation
+    /// remains FP32 in cuBLASLt; only the final store rounds to BF16. Bias is
+    /// deliberately excluded so its storage type cannot be confused with the
+    /// existing FP32 epilogue contract.
+    pub fn linearBf16Output(
+        self: *DenseLt,
+        ctx: *context_mod.CudaContext,
+        libraries: *const libraries_mod.CudaLibraries,
+        dst: buffer_mod.DeviceBuffer,
+        activation_bf16: buffer_mod.DeviceBuffer,
+        weight_bf16: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) !bool {
+        if (!self.enabled_ or !eligible(self, rows, in_dim, out_dim, .bf16)) return false;
+        self.attempts += 1;
+        const ran = self.linearInner(ctx, libraries, dst, activation_bf16, weight_bf16, null, rows, in_dim, out_dim, .bf16, .bf16) catch false;
+        if (ran) self.successes += 1 else self.fallbacks += 1;
         return ran;
     }
 
@@ -150,16 +173,20 @@ pub const DenseLt = struct {
         in_dim: usize,
         out_dim: usize,
         dtype: tensor_mod.DType,
+        output_dtype: tensor_mod.DType,
     ) !bool {
         const fns = libraries.cublasLtFns() orelse return false;
         const handle = libraries.cublasLtHandle();
         if (handle == null) return false;
 
         const out_count = try checkedMul(rows, out_dim);
-        try checkRawBytes(dst, try checkedMul(out_count, @sizeOf(f32)));
+        try checkRawBytes(dst, try checkedMul(out_count, output_dtype.byteSize()));
         try checkRawBytes(activation16, try checkedMul(try checkedMul(rows, in_dim), @sizeOf(u16)));
         try checkRawBytes(weight16, try checkedMul(try checkedMul(out_dim, in_dim), @sizeOf(u16)));
-        if (bias) |b| try checkRawBytes(b, try checkedMul(out_dim, @sizeOf(f32)));
+        if (bias) |b| {
+            if (output_dtype != .f32) return false;
+            try checkRawBytes(b, try checkedMul(out_dim, @sizeOf(f32)));
+        }
         if (out_count == 0) return true;
 
         var op_desc: libraries_mod.CublasLtMatmulDesc = null;
@@ -184,10 +211,10 @@ pub const DenseLt = struct {
         if (fns.matrixLayoutCreate(&b_desc, cudaDataType(dtype), @intCast(rows), @intCast(in_dim), @intCast(in_dim)) != libraries_mod.CUBLAS_STATUS_SUCCESS) return false;
         defer _ = fns.matrixLayoutDestroy(b_desc);
         var c_desc: libraries_mod.CublasLtMatrixLayout = null;
-        if (fns.matrixLayoutCreate(&c_desc, libraries_mod.CUDA_R_32F, @intCast(out_dim), @intCast(rows), @intCast(out_dim)) != libraries_mod.CUBLAS_STATUS_SUCCESS) return false;
+        if (fns.matrixLayoutCreate(&c_desc, cudaDataType(output_dtype), @intCast(out_dim), @intCast(rows), @intCast(out_dim)) != libraries_mod.CUBLAS_STATUS_SUCCESS) return false;
         defer _ = fns.matrixLayoutDestroy(c_desc);
         var d_desc: libraries_mod.CublasLtMatrixLayout = null;
-        if (fns.matrixLayoutCreate(&d_desc, libraries_mod.CUDA_R_32F, @intCast(out_dim), @intCast(rows), @intCast(out_dim)) != libraries_mod.CUBLAS_STATUS_SUCCESS) return false;
+        if (fns.matrixLayoutCreate(&d_desc, cudaDataType(output_dtype), @intCast(out_dim), @intCast(rows), @intCast(out_dim)) != libraries_mod.CUBLAS_STATUS_SUCCESS) return false;
         defer _ = fns.matrixLayoutDestroy(d_desc);
 
         var row_order = libraries_mod.CUBLASLT_ORDER_ROW;
@@ -199,6 +226,7 @@ pub const DenseLt = struct {
 
         const key = PlanKey{
             .dtype_tag = dtypeTag(dtype),
+            .output_dtype_tag = dtypeTag(output_dtype),
             .rows = try toU32(rows),
             .in_dim = try toU32(in_dim),
             .out_dim = try toU32(out_dim),

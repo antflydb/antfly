@@ -85,6 +85,10 @@ pub fn chunkTextWithConfigJsonAndProvider(
     var cfg = try chunking.types.parseConfigFromSlice(alloc, config_json);
     defer cfg.deinit(alloc);
 
+    if (cfg.embedding != null) {
+        if (cfg.provider != .antfly) return error.InvalidChunkerConfig;
+        return chunking.inference.chunkMediaWithProvider(alloc, cfg, .{ .text = text }, antfly_provider);
+    }
     var sanitized = try utf8_text.sanitizeAlloc(alloc, text, "configured enrichment chunker");
     defer sanitized.deinit(alloc);
     const source_text = sanitized.text;
@@ -96,6 +100,15 @@ pub fn chunkTextWithConfigJsonAndProvider(
     errdefer freeChunks(alloc, chunks);
     remapChunkOffsets(&sanitized, chunks);
     return chunks;
+}
+
+/// Model-aware inputs are not sanitized or flattened to text: source hashing and
+/// exact coordinates must name the original bytes retained by the document.
+pub fn chunkInputWithConfigJsonAndProvider(alloc: Allocator, input: @import("inference_chunker").Input, config_json: []const u8, provider: ?chunk_provider.Provider) ![]Chunk {
+    var cfg = try chunking.types.parseConfigFromSlice(alloc, config_json);
+    defer cfg.deinit(alloc);
+    if (cfg.embedding == null or cfg.provider != .antfly) return error.InvalidChunkerConfig;
+    return chunking.inference.chunkMediaWithProvider(alloc, cfg, input, provider);
 }
 
 pub fn freeChunks(alloc: Allocator, chunks: []Chunk) void {

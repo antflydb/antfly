@@ -98,6 +98,7 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .optimize = .safe,
         .single_threaded = true,
     });
+    @import("antfly_media").support.attach(b, wasm_audio_mod, b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media" })));
     const wasm_image_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/image/src/mod.zig" })),
         .target = wasm_target,
@@ -146,10 +147,22 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     wasm_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_tokenizer_mod);
     wasm_lib.root_module.addImport("jinja", wasm_jinja_mod);
     wasm_lib.root_module.addImport("inference_audio", wasm_audio_mod);
+    wasm_lib.root_module.addImport("antfly_media", wasm_audio_mod.import_table.get("antfly_media").?);
     wasm_lib.root_module.addImport("inference_tokenizer", wasm_tokenizer_mod);
     wasm_lib.root_module.addImport("inference_hf_tokenizer", wasm_hf_tokenizer_mod);
     wasm_lib.root_module.addImport("inference_linalg", wasm_linalg_mod);
     wasm_lib.root_module.addImport("antfly_image", wasm_image_mod);
+    @import("antfly_video").support.attach(b, wasm_lib.root_module, b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/video" })), .{
+        .media = wasm_audio_mod.import_table.get("antfly_media").?,
+        .image = wasm_image_mod,
+    });
+    const wasm_runtime_abi_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/runtime/src/root.zig" })),
+        .target = wasm_target,
+        .optimize = .safe,
+    });
+    wasm_runtime_abi_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_lib.root_module.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     wasm_lib.root_module.addImport("antfly_platform", wasm_platform_mod);
     const wasm_decisions_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/decisions/root.zig" })),
@@ -158,6 +171,15 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .single_threaded = true,
     });
     wasm_lib.root_module.addImport("antfly_decisions", wasm_decisions_mod);
+    // Boundary preprocessing needs shared text/window contracts, not hosted
+    // provider clients or their generated API and HTTP dependencies.
+    const wasm_extracting_text_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/extracting/src/text_root.zig" })),
+        .target = wasm_target,
+        .optimize = .safe,
+        .single_threaded = true,
+    });
+    wasm_lib.root_module.addImport("antfly_extracting", wasm_extracting_text_mod);
     wasm_lib.root_module.addImport("ml", wasm_ml_mod);
     wasm_lib.root_module.addImport("onnx_graph", wasm_onnx.graph);
     wasm_lib.root_module.addImport("onnx_data", wasm_onnx.data);

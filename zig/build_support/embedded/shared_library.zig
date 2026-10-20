@@ -17,9 +17,7 @@
 const std = @import("std");
 
 /// Executor owners and provider archives must share the internal Zig callback ABI.
-pub fn llvmBackend(target: std.Target) ?bool {
-    return if (target.ofmt == .elf) true else null;
-}
+pub const llvmBackend = @import("source_owner.zig").llvmBackend;
 
 pub fn inferenceCompileMaxRss(os: std.Target.Os.Tag, shared: bool, measured_darwin: bool) u64 {
     const gib = 1024 * 1024 * 1024;
@@ -132,6 +130,12 @@ pub fn addWithStorageOwner(b: *std.Build, module: *std.Build.Module, providers: 
         // Traverse imports without caching Module.getGraph: composition owners
         // still add build-info imports after this helper returns.
         addLinks(b, run, module, &visited, &libraries);
+        if (storage_owner) |owner| {
+            // The owner is already force-loaded above. Its imported native
+            // dependencies still belong to this final dynamic image.
+            libraries.put(owner, {}) catch @panic("OOM");
+            addLinks(b, run, owner.root_module, &visited, &libraries);
+        }
         for (providers) |provider| {
             if (!(libraries.getOrPut(provider) catch @panic("OOM")).found_existing) {
                 run.addFileArg(provider.getEmittedBin());
@@ -253,8 +257,7 @@ pub fn storageConsumerModule(b: *std.Build, original: *std.Build.Module) *std.Bu
 }
 fn cloneStorageConsumer(b: *std.Build, original: *std.Build.Module, copies: *std.AutoHashMap(*std.Build.Module, *std.Build.Module)) *std.Build.Module {
     if (copies.get(original)) |existing| return existing;
-    const copy = b.allocator.create(std.Build.Module) catch @panic("OOM");
-    copy.init(original.owner, .{ .existing = original });
+    const copy = @import("source_owner.zig").cloneModule(b, original);
     copy.import_table = .empty;
     copy.link_objects = .empty;
     copy.cached_graph = .{ .modules = &.{}, .names = &.{} };
@@ -274,7 +277,7 @@ fn cloneStorageConsumer(b: *std.Build, original: *std.Build.Module, copies: *std
 pub fn addStorageProbe(b: *std.Build, module: *std.Build.Module, name: []const u8) *std.Build.Step.Run {
     const target = module.resolved_target.?.result;
     if (target.os.tag != .macos) {
-        const executable = b.addExecutable(.{ .name = name, .root_module = module, .max_rss = 4 * 1024 * 1024 * 1024 });
+        const executable = b.addExecutable(.{ .name = name, .root_module = module, .use_llvm = llvmBackend(target), .max_rss = 4 * 1024 * 1024 * 1024 });
         return b.addRunArtifact(executable);
     }
     module.link_libc = true;
@@ -283,6 +286,23 @@ pub fn addStorageProbe(b: *std.Build, module: *std.Build.Module, name: []const u
     object.entry = .enabled;
     object.bundle_compiler_rt = false;
     object.bundle_ubsan_rt = false;
+    const image = nativeExecutableLink(b, object, name);
+    const link = image.link;
+    var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
+    var libraries: std.AutoHashMap(*std.Build.Step.Compile, void) = .init(b.allocator);
+    addLinks(b, link, module, &modules, &libraries);
+    const run = std.Build.Step.Run.create(b, name);
+    run.addFileArg(image.binary);
+    return run;
+}
+
+pub const NativeExecutable = struct {
+    link: *std.Build.Step.Run,
+    binary: std.Build.LazyPath,
+};
+
+pub fn nativeExecutableLink(b: *std.Build, object: *std.Build.Step.Compile, name: []const u8) NativeExecutable {
+    const target = object.root_module.resolved_target.?.result;
     const link = b.addSystemCommand(&.{"python3"});
     link.addFileArg(b.path("tools/native_executable_link.py"));
     const deployment = target.os.version_range.semver.min;
@@ -293,12 +313,17 @@ pub fn addStorageProbe(b: *std.Build, module: *std.Build.Module, name: []const u
     link.addArg("--output");
     const binary = link.addOutputFileArg(name);
     link.addArg("--");
+    return .{ .link = link, .binary = binary };
+}
+
+pub fn addNativeExecutableLinks(b: *std.Build, image: NativeExecutable, object: *std.Build.Step.Compile, module: *std.Build.Module) void {
     var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
     var libraries: std.AutoHashMap(*std.Build.Step.Compile, void) = .init(b.allocator);
-    addLinks(b, link, module, &modules, &libraries);
-    const run = std.Build.Step.Run.create(b, name);
-    run.addFileArg(binary);
-    return run;
+    // The entry object is already the --object argument. Its imported modules
+    // can still contribute frameworks and provider archives.
+    libraries.put(object, {}) catch @panic("OOM");
+    addLinks(b, image.link, object.root_module, &modules, &libraries);
+    addLinks(b, image.link, module, &modules, &libraries);
 }
 
 pub fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(*std.Build.Module, void)) void {

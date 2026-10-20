@@ -1316,6 +1316,37 @@ pub const WriterAdmission = struct {
     leave: *const fn (*anyopaque) void,
 };
 
+/// Store publication can include durable I/O. Reserve a turn before waiting:
+/// a continuous group-commit writer must not barge ahead of queued vacuum,
+/// reader-release or maintenance work each time it drops the owner mutex.
+/// Keep the existing bounded-spin/yield policy without allocating wait nodes
+/// or depending on a foreign executor's futex namespace.
+const PublicationMutex = struct {
+    next_ticket: std.atomic.Value(u64) = .init(0),
+    serving_ticket: std.atomic.Value(u64) = .init(0),
+
+    pub fn lock(self: *@This()) void {
+        const Turn = struct {
+            serving: *std.atomic.Value(u64),
+            ticket: u64,
+            pub fn tryLock(turn: *@This()) bool {
+                return turn.serving.load(.acquire) == turn.ticket;
+            }
+        };
+        var turn = Turn{ .serving = &self.serving_ticket, .ticket = self.next_ticket.fetchAdd(1, .monotonic) };
+        platform_sync.lockYielding(&turn);
+    }
+
+    pub fn tryLock(self: *@This()) bool {
+        const serving = self.serving_ticket.load(.acquire);
+        return self.next_ticket.cmpxchgStrong(serving, serving +% 1, .monotonic, .monotonic) == null;
+    }
+
+    pub fn unlock(self: *@This()) void {
+        _ = self.serving_ticket.fetchAdd(1, .release);
+    }
+};
+
 pub const Store = struct {
     score_cache_owner: u64 = 0,
     allocator: Allocator,
@@ -1371,7 +1402,7 @@ pub const Store = struct {
     read_only: bool = false,
     /// Guarded by mutex. Secret publication failures fence every adapter until reopen.
     secret_store_uncertain: bool = false,
-    mutex: std.atomic.Mutex = .unlocked,
+    mutex: PublicationMutex = .{},
     writer_mutex: std.Io.Mutex = .init,
     writer_ready: std.Io.Condition = .init,
     generation_lock: std.Io.RwLock = .init,
@@ -3143,6 +3174,15 @@ pub const Txn = struct {
 
     /// Caller owns the result. Unlike get(), this does not retain keys or
     /// values in the transaction. Pending mutations still take precedence.
+    /// Pending mutations take precedence; persisted presence validates only
+    /// record headers and keys, never external value pages.
+    pub fn contains(self: *Txn, key: []const u8) !bool {
+        var cursor = try self.openKeyCursor();
+        defer cursor.close();
+        const found = cursor.seekAtOrAfter(key) catch |err| return if (err == error.NotFound) false else err;
+        return std.mem.eql(u8, found, key);
+    }
+
     pub fn getOwned(self: *Txn, allocator: Allocator, key: []const u8) ![]u8 {
         const lookup_key = if (self.prefix.len == 0) key else try std.mem.concat(allocator, u8, &.{ self.prefix, key });
         defer if (self.prefix.len > 0) allocator.free(lookup_key);
@@ -3237,6 +3277,51 @@ pub const Txn = struct {
             return self.scratch.allocator();
         }
 
+        pub fn getRangesMany(self: *@This(), requests: []const @import("../value_ranges.zig").Request) !void {
+            if (requests.len > 64) return error.InvalidBatch;
+            const a = self.resultAllocator();
+            var translated: [64]@import("../value_ranges.zig").Request = undefined;
+            var initialized: usize = 0;
+            defer if (self.parent.prefix.len != 0) for (translated[0..initialized]) |request| a.free(request.key);
+            var overlay = false;
+            for (requests, 0..) |request, i| {
+                const key = if (self.parent.prefix.len == 0) request.key else try std.mem.concat(a, u8, &.{ self.parent.prefix, request.key });
+                translated[i] = .{ .key = key, .ranges = request.ranges, .output = request.output };
+                initialized += 1;
+                overlay = overlay or self.parent.pending_tree.getEntryFor(key).node != null;
+            }
+            if (overlay) {
+                for (requests) |request| try self.getRanges(request.key, request.ranges, request.output);
+            } else try (try self.parent.readFile()).readDocumentRangesBatchAlloc(a, self.parent.checkpoint, translated[0..requests.len]);
+        }
+        pub fn getRanges(self: *@This(), key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
+            const a = self.resultAllocator();
+            const full = if (self.parent.prefix.len == 0) key else try std.mem.concat(a, u8, &.{ self.parent.prefix, key });
+            defer if (self.parent.prefix.len > 0) a.free(full);
+            if (self.parent.pending_tree.getEntryFor(full).node) |node| {
+                const bytes = self.parent.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
+                const Pending = struct {
+                    a: Allocator,
+                    bytes: []const u8,
+                    pub fn read(ctx: @This(), begin: usize, len: usize) ![]const u8 {
+                        return ctx.a.dupe(u8, ctx.bytes[begin..][0..len]);
+                    }
+                };
+                return @import("../value_ranges.zig").read(bytes.len, ranges, output, Pending{ .a = a, .bytes = bytes });
+            }
+            return (try self.parent.readFile()).readDocumentRangesAlloc(a, self.parent.checkpoint, full, ranges, output);
+        }
+        pub fn getRange(self: *@This(), key: []const u8, offset: u64, length: usize) ![]const u8 {
+            const a = self.resultAllocator();
+            const full = if (self.parent.prefix.len == 0) key else try std.mem.concat(a, u8, &.{ self.parent.prefix, key });
+            defer if (self.parent.prefix.len > 0) a.free(full);
+            if (self.parent.pending_tree.getEntryFor(full).node) |node| {
+                const value = self.parent.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
+                if (offset > value.len or length > value.len - offset) return error.EndOfStream;
+                return a.dupe(u8, value[@intCast(offset)..][0..length]);
+            }
+            return (try self.parent.readFile()).readDocumentRangeAlloc(a, self.parent.checkpoint, full, offset, length);
+        }
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             return self.parent.getOwned(self.resultAllocator(), key);
         }
@@ -3882,6 +3967,10 @@ pub const Cursor = struct {
     disk_candidate: ?native.DocumentIndexEntry = null,
     last_direction: ?Direction = null,
 
+    pub fn setKeysOnly(self: *Cursor) void {
+        self.load_values = false;
+    }
+
     pub fn close(self: *Cursor) void {
         self.records.deinit(self.txn.allocator);
         self.index_cursor.deinit();
@@ -4420,7 +4509,7 @@ fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u
 }
 
 fn lockStore(store: *Store) void {
-    platform_sync.lockYielding(&store.mutex);
+    store.mutex.lock();
 }
 
 fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
@@ -5434,6 +5523,56 @@ test "lite failed commit group discards every root and allows a clean retry" {
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+test "lite publication mutex reserves queued owners before a writer can reacquire" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Waiter = struct {
+        mutex: *PublicationMutex,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+        }
+    };
+    const io = std.testing.io;
+    for ([_]u64{ 0, std.math.maxInt(u64) }) |seed| {
+        var mutex: PublicationMutex = .{};
+        mutex.next_ticket.store(seed, .monotonic);
+        mutex.serving_ticket.store(seed, .monotonic);
+        mutex.lock();
+        var held = true;
+        var waiter = Waiter{ .mutex = &mutex };
+        {
+            const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+            defer {
+                if (held) mutex.unlock();
+                waiter.release.store(true, .release);
+                thread.join();
+            }
+            const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+            // Observe actual queue admission rather than relying on a sleep
+            // or a signal emitted before the waiter reaches the mutex.
+            while (mutex.next_ticket.load(.acquire) != seed +% 2) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+                @import("antfly_platform").time.yieldNow();
+            }
+            mutex.unlock();
+            held = false;
+            const barged = mutex.tryLock();
+            if (barged) mutex.unlock();
+            try std.testing.expect(!barged);
+            while (!waiter.entered.load(.acquire)) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+                @import("antfly_platform").time.yieldNow();
+            }
+        }
+        try std.testing.expect(mutex.tryLock());
+        mutex.unlock();
+    }
+}
+
 test "lite online vacuum publishes while group-commit mutations keep landing" {
     // The disk index publishes its catalog record through the group-commit
     // queue without ever taking the writer slot, so a vacuum that fenced
@@ -6351,6 +6490,9 @@ test "lite scoped reads release values without growing parent point reads" {
         try std.testing.expectError(error.BufferTooSmall, scope.getInto("doc", out[0..1]));
         const value = try scope.get("doc");
         try std.testing.expectEqualSlices(u8, payload, value);
+        try std.testing.expectEqualSlices(u8, payload[4090..][0..8192], try scope.getRange("doc", 4090, 8192));
+        try std.testing.expectEqual(@as(usize, 0), (try scope.getRange("doc", payload.len, 0)).len);
+        try std.testing.expectError(error.EndOfStream, scope.getRange("doc", payload.len - 1, 2));
         try std.testing.expectError(error.NotFound, scope.get("missing"));
         scope.close();
         try std.testing.expectEqual(@as(usize, 0), budget.live);
@@ -6402,10 +6544,17 @@ test "lite scoped write reads preserve copied values across pending mutations" {
     const disk = try scope.get("doc");
     try txn.put("doc", "pending");
     const pending = try scope.get("doc");
+    try std.testing.expectEqualStrings("end", try scope.getRange("doc", 1, 3));
+    var spans: [3][]const u8 = undefined;
+    try scope.getRanges("doc", &.{ .{ .offset = 1, .length = 3 }, .{ .offset = 0, .length = 1 }, .{ .offset = 1, .length = 3 } }, &spans);
+    try std.testing.expectEqualStrings("end", spans[0]);
+    try std.testing.expectEqualStrings("p", spans[1]);
+    try std.testing.expectEqual(spans[0].ptr, spans[2].ptr);
     try txn.delete("doc");
     try std.testing.expectError(error.NotFound, scope.get("doc"));
     try std.testing.expectEqualStrings("disk", disk);
     try std.testing.expectEqualStrings("pending", pending);
+    try std.testing.expectEqualStrings("end", spans[0]);
     try std.testing.expectEqual(@as(u32, 0), txn.snapshot_reads.count());
 }
 

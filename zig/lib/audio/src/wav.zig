@@ -40,7 +40,7 @@ pub const DecodedInterleaved = struct {
     channels: u16,
 };
 
-const ParsedData = struct {
+pub const ParsedData = struct {
     format: Format,
     channels: u16,
     data: []const u8,
@@ -82,8 +82,14 @@ pub fn parseFormat(wav_bytes: []const u8) !Format {
 }
 
 pub fn decodeMono(alloc: std.mem.Allocator, wav_bytes: []const u8) !Decoded {
-    const parsed = try parseData(wav_bytes);
+    return decodeMonoParsed(alloc, try parseData(wav_bytes));
+}
 
+/// Decode only a borrowed, frame-aligned window; no WAV remuxing or copy.
+pub fn decodeMonoParsed(alloc: std.mem.Allocator, parsed: ParsedData) !Decoded {
+    if (parsed.channels == 0 or parsed.format.sample_rate == 0 or !isDecodableFormat(parsed.format.audio_format)) return error.UnsupportedAudioFormat;
+    const frame_bytes = try std.math.mul(usize, parsed.format.bits_per_sample / 8, parsed.channels);
+    if (frame_bytes == 0 or parsed.data.len % frame_bytes != 0) return error.UnsupportedAudioFormat;
     if (try decodeMonoFastPath(alloc, parsed)) |decoded| {
         return decoded;
     }
@@ -106,7 +112,7 @@ pub fn decodeInterleaved(alloc: std.mem.Allocator, wav_bytes: []const u8) !Decod
     return decodeInterleavedParsed(alloc, parsed);
 }
 
-fn parseData(wav_bytes: []const u8) !ParsedData {
+pub fn parseData(wav_bytes: []const u8) !ParsedData {
     if (wav_bytes.len < 44) return error.WavTooShort;
     const riff = riffInfo(wav_bytes) orelse return error.NotRiffFormat;
     const endian = riff.endian;
@@ -158,6 +164,94 @@ fn parseData(wav_bytes: []const u8) !ParsedData {
         .data = wav_bytes[data_start..][0..data_size],
         .endian = endian,
     };
+}
+
+/// WAV metadata over a bounded range source. The data body is never downloaded
+/// while indexing; RF64/BW64 and big-endian RIFX use the same PCM conversion.
+pub const SourceLayout = struct {
+    format: Format,
+    channels: u16,
+    endian: std.builtin.Endian,
+    data_offset: u64,
+    data_bytes: u64,
+    frame_bytes: usize,
+    pub fn frames(self: SourceLayout) u64 {
+        return self.data_bytes / self.frame_bytes;
+    }
+    pub fn readMono(self: SourceLayout, a: std.mem.Allocator, input: anytype, first: usize, last: usize) ![]f32 {
+        if (first > last or last > self.frames()) return error.InvalidAudioWindow;
+        const output = try a.alloc(f32, last - first);
+        errdefer a.free(output);
+        const quantum = input.limits.max_read_bytes / self.frame_bytes;
+        if (quantum == 0) return error.ResourceLimitExceeded;
+        var position = first;
+        while (position < last) {
+            const count = @min(last - position, quantum);
+            const offset = try std.math.add(u64, self.data_offset, try std.math.mul(u64, position, self.frame_bytes));
+            var lease = try input.read(offset, try std.math.mul(usize, count, self.frame_bytes));
+            defer lease.deinit();
+            const decoded = try decodeMonoParsed(a, .{ .format = self.format, .channels = self.channels, .endian = self.endian, .data = lease.bytes });
+            defer a.free(decoded.samples);
+            if (decoded.samples.len != count) return error.InvalidAudioWindow;
+            @memcpy(output[position - first ..][0..count], decoded.samples);
+            position += count;
+        }
+        return output;
+    }
+};
+pub fn readSourceLayout(input: anytype) !SourceLayout {
+    if (input.length() < 12) return error.WavTooShort;
+    var header = try input.read(0, 12);
+    const riff = riffInfo(header.bytes) orelse {
+        header.deinit();
+        return error.NotRiffFormat;
+    };
+    const wave = std.mem.eql(u8, header.bytes[8..12], "WAVE");
+    header.deinit();
+    if (!wave) return error.NotWaveFormat;
+    var format: ?Format = null;
+    var channels: u16 = 0;
+    var data_offset: u64 = 0;
+    var data_size: u64 = 0;
+    var rf64_data_size: ?u64 = null;
+    var position: u64 = 12;
+    var chunks: usize = 0;
+    while (position <= input.length() and input.length() - position >= 8) {
+        if (chunks >= 100_000) return error.ResourceLimitExceeded;
+        chunks += 1;
+        var chunk = try input.read(position, 8);
+        var id: [4]u8 = undefined;
+        @memcpy(&id, chunk.bytes[0..4]);
+        const size32 = std.mem.readInt(u32, chunk.bytes[4..8], riff.endian);
+        chunk.deinit();
+        const size: u64 = if (isDs64SizedRiff(riff.kind) and size32 == std.math.maxInt(u32))
+            if (std.mem.eql(u8, &id, "data")) rf64_data_size orelse return error.UnsupportedAudioFormat else return error.UnsupportedAudioFormat
+        else
+            size32;
+        const start = try std.math.add(u64, position, 8);
+        if (size > input.length() - start) return error.WavTooShort;
+        if (std.mem.eql(u8, &id, "fmt ")) {
+            var payload = try input.read(start, @intCast(@min(size, 64)));
+            defer payload.deinit();
+            format = try parseFmtPayload(payload.bytes, riff.endian);
+            channels = std.mem.readInt(u16, payload.bytes[2..4], riff.endian);
+        } else if (std.mem.eql(u8, &id, "ds64")) {
+            if (size < 28) return error.UnsupportedAudioFormat;
+            var payload = try input.read(start, 28);
+            defer payload.deinit();
+            rf64_data_size = std.mem.readInt(u64, payload.bytes[8..16], .little);
+        } else if (std.mem.eql(u8, &id, "data")) {
+            data_offset = start;
+            data_size = size;
+        }
+        position = try std.math.add(u64, start, size);
+        if (position % 2 != 0) position = try std.math.add(u64, position, 1);
+    }
+    const cfg = format orelse return error.MissingWavChunks;
+    if (data_offset == 0 or channels == 0 or cfg.sample_rate == 0) return error.MissingWavChunks;
+    const bytes = try std.math.mul(usize, cfg.bits_per_sample / 8, channels);
+    if (bytes == 0 or data_size % bytes != 0) return error.UnsupportedAudioFormat;
+    return .{ .format = cfg, .channels = channels, .endian = riff.endian, .data_offset = data_offset, .data_bytes = data_size, .frame_bytes = bytes };
 }
 
 fn riffInfo(wav_bytes: []const u8) ?RiffInfo {

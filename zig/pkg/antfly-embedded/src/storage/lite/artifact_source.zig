@@ -389,12 +389,18 @@ const State = struct {
         return if (self.cache) |*cache| cache.retainedBytes() else 0;
     }
 
-    fn visit(ptr: *anyopaque, offset: u64, length: u64, context: *anyopaque, visitor: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+    fn visit(ptr: *anyopaque, offset: u64, length: u64, visitor_port: @import("../../segment_source.zig").SourceVisitor) !void {
+        var receiving_visitor = visitor_port;
+        const context: *anyopaque = &receiving_visitor;
+        const visitor = @import("../../segment_source.zig").SourceVisitor.consume;
         const self: *State = @ptrCast(@alignCast(ptr));
         return self.cache.?.visitRange(offset, length, context, visitor);
     }
 
-    fn visitUncached(ptr: *anyopaque, offset: u64, length: u64, context: *anyopaque, visitor: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+    fn visitUncached(ptr: *anyopaque, offset: u64, length: u64, visitor_port: @import("../../segment_source.zig").SourceVisitor) !void {
+        var receiving_visitor = visitor_port;
+        const context: *anyopaque = &receiving_visitor;
+        const visitor = @import("../../segment_source.zig").SourceVisitor.consume;
         const self: *State = @ptrCast(@alignCast(ptr));
         return self.reader.visitIndexValue(self.value, offset, length, self.checkpoint, context, visitor);
     }

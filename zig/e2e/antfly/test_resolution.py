@@ -222,6 +222,22 @@ class _Api:
             payload["indexes"] = indexes
         max_timeout = 90.0 if indexes is not None or num_shards > 1 else 30.0
         last_not_admitted_response: str | None = None
+        table_url = f"{self.url}/tables/{name}"
+        if deadline is not None:
+            # These names belong exclusively to this fresh cluster fixture.
+            # Prove absence before the first POST so a later observation cannot
+            # accidentally acknowledge a table that predates this attempt.
+            while True:
+                before = self.s.get(
+                    table_url, timeout=deadline.request_timeout(max_timeout)
+                )
+                if before.status_code == 404:
+                    break
+                if before.status_code == 503:
+                    deadline.sleep(_retry_after_delay_s(before))
+                    continue
+                self._check(before)
+                raise AssertionError(f"table already exists before create: {name}")
         while True:
             try:
                 timeout = (
@@ -254,6 +270,36 @@ class _Api:
                     f"indexes={index_names!r}: {exc!r}\n[native stacks]\n{stacks}"
                     f"\n[logs]\n{self._server.debug_logs()}"
                 ) from exc
+
+            if (
+                deadline is not None
+                and response.status_code == 409
+                and response.headers.get("X-Antfly-Raft-Mutation-Outcome")
+                == "unknown-v1"
+                and response.headers.get(METADATA_MUTATION_NOT_ADMITTED_HEADER, "")
+                .strip()
+                .lower()
+                != METADATA_MUTATION_NOT_ADMITTED_VALUE
+            ):
+                # Observe the single admitted attempt; never replay uncertain
+                # DDL. The existing deadline also bounds read-side shedding.
+                while True:
+                    observed = self.s.get(
+                        table_url, timeout=deadline.request_timeout(max_timeout)
+                    )
+                    if observed.status_code == 200:
+                        table = self._check(observed)
+                        assert table.get("name") == name
+                        assert len(table.get("shards", {})) == num_shards
+                        for index_name, config in (indexes or {}).items():
+                            assert (
+                                table["indexes"][index_name]["type"] == config["type"]
+                            )
+                        return table
+                    if observed.status_code not in (404, 503):
+                        self._check(observed)
+                        raise AssertionError("unexpected table create observation")
+                    deadline.sleep()
 
             mutation_not_admitted = (
                 response.status_code == 503
@@ -569,6 +615,7 @@ def test_create_table_retries_explicit_non_admission_within_deadline(
 
     deadline = _Deadline(10.0)
     monkeypatch.setattr(api.s, "post", post)
+    monkeypatch.setattr(api.s, "get", lambda *a, **kw: _test_response(url, 404))
     monkeypatch.setattr(deadline, "sleep", sleep_delays.append)
 
     assert api.create_table("documents", deadline=deadline) == {}
@@ -614,10 +661,66 @@ def test_create_table_never_retries_without_safe_bounded_non_admission_contract(
 
     monkeypatch.setattr(api.s, "post", post)
     deadline = _Deadline(10.0) if with_deadline else None
+    monkeypatch.setattr(api.s, "get", lambda *a, **kw: _test_response(url, 404))
 
     with pytest.raises(requests.HTTPError):
         api.create_table("documents", deadline=deadline)
     assert post_calls == 1
+
+
+@pytest.mark.parametrize("mismatch", [None, "name", "shards", "index"])
+def test_create_table_observes_unknown_admission_without_replaying(
+    monkeypatch, mismatch
+):
+    class Server:
+        def debug_logs(self):
+            return "fixture logs"
+
+    api = _Api("http://data-a/db/v1", Server())
+    url = f"{api.url}/tables/documents"
+    table = {
+        "name": "documents",
+        "shards": {"1": {}},
+        "indexes": {"graph": {"type": "graph"}},
+    }
+    if mismatch == "name":
+        table["name"] = "other"
+    elif mismatch == "shards":
+        table["shards"] = {}
+    elif mismatch == "index":
+        table["indexes"]["graph"]["type"] = "full_text"
+    observations = iter(
+        [
+            _test_response(url, 404),
+            _test_response(url, 503),
+            _test_response(url, 200, body=json.dumps(table).encode()),
+        ]
+    )
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append(args)
+        return _test_response(
+            url, 409, headers={"X-Antfly-Raft-Mutation-Outcome": "unknown-v1"}
+        )
+
+    monkeypatch.setattr(api.s, "post", post)
+    monkeypatch.setattr(api.s, "get", lambda *a, **kw: next(observations))
+    deadline = _Deadline(10)
+    monkeypatch.setattr(deadline, "sleep", lambda *a: None)
+    if mismatch:
+        with pytest.raises(AssertionError):
+            api.create_table(
+                "documents", indexes={"graph": {"type": "graph"}}, deadline=deadline
+            )
+    else:
+        assert (
+            api.create_table(
+                "documents", indexes={"graph": {"type": "graph"}}, deadline=deadline
+            )
+            == table
+        )
+    assert len(calls) == 1
 
 
 def test_insert_reconciles_unknown_upsert_before_retry(monkeypatch: pytest.MonkeyPatch):
@@ -681,6 +784,7 @@ def _wait_for_entities(
                     raise
                 last_error = repr(exc)
                 continue
+            last_error = None
             last[key] = doc
             if doc is not None and expected_names[key] in _doc_text(doc):
                 found[key] = doc
@@ -724,6 +828,34 @@ def test_entity_deadline_retains_diagnostics_below_request_floor(monkeypatch, tm
     assert "pending=['entity:a']" in str(failure.value)
     assert "captured native stacks" in str(failure.value)
     assert "captured entity diagnostics" in str(failure.value)
+
+
+def test_entity_deadline_reports_recovered_transport_separately_from_missing_rows(
+    monkeypatch,
+):
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+    monkeypatch.setitem(globals(), "_capture_failure_stacks", lambda _: "stacks")
+
+    class Api:
+        _server = None
+        calls = 0
+
+        def lookup(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise requests.ConnectionError("startup listener unavailable")
+            return None
+
+        def diagnostic(self):
+            return "rows still missing"
+
+    api = Api()
+    with pytest.raises(AssertionError, match="last_error=None") as failure:
+        _wait_for_entities(api, {"entity:a": "Alice"}, deadline=_Deadline(1.5))
+    assert api.calls > 1
+    assert "'entity:a': None" in str(failure.value)
 
 
 def _doc_text(doc: dict) -> str:

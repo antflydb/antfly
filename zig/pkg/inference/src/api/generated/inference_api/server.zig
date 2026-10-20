@@ -4,6 +4,7 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const types = @import("types.zig");
+const antfly_decision_openapi = @import("antfly_decision_openapi");
 const antfly_extraction_openapi = @import("antfly_extraction_openapi");
 
 /// --- Extractors (framework-agnostic) ---
@@ -18,8 +19,8 @@ pub fn parseChunkTextBody(allocator: std.mem.Allocator, body: []const u8) !std.j
 }
 
 /// Parse the JSON request body for decide.
-pub fn parseDecideBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DecideRequest) {
-    return std.json.parseFromSlice(types.DecideRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseDecideBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_decision_openapi.DecisionRequest) {
+    return std.json.parseFromSlice(antfly_decision_openapi.DecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for dictate.
@@ -38,8 +39,8 @@ pub fn parseCreateEmbeddingBody(allocator: std.mem.Allocator, body: []const u8) 
 }
 
 /// Parse the JSON request body for extract.
-pub fn parseExtractBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_extraction_openapi.ExtractionRequest) {
-    return std.json.parseFromSlice(antfly_extraction_openapi.ExtractionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseExtractBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_extraction_openapi.ExtractionInputRequest) {
+    return std.json.parseFromSlice(antfly_extraction_openapi.ExtractionInputRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for generateContent.
@@ -134,7 +135,7 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/chat/completions", .operation_id = "chatCompletions", .request_body = .buffered, .streaming_response = true },
-    .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/decisions", .operation_id = "decide", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/dictate", .operation_id = "dictate", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/embed", .operation_id = "generateEmbeddings", .request_body = .buffered, .streaming_response = false },
@@ -231,7 +232,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.chatCompletions(ctx);
         }
 
-        /// Chunk text into smaller segments
+        /// Chunk content with optional model-aware embeddings
         /// POST /chunk
         fn chunkText(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.chunkText(ctx);

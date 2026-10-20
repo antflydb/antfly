@@ -200,6 +200,8 @@ pub const SegmentShared = struct {
     physical_parent: ?*SegmentEntry = null,
 
     ref_count: u32,
+    /// Visibility cells and physical readers may have independent owners.
+    allocator: Allocator,
     residency_mutex: std.atomic.Mutex = .unlocked,
     // One process-level accounting owner per physical mapping. The manager
     // outlives all snapshots/forks sharing this segment, including query pins.
@@ -598,8 +600,8 @@ pub const SegmentEntry = struct {
         return bytes;
     }
 
-    fn initShared(shared: *SegmentShared, data: SegmentData, coverage: []TypedDocValuesFieldCoverage) void {
-        shared.* = .{ .ref_count = 1, .typed_doc_values_coverage = coverage };
+    fn initShared(alloc: Allocator, shared: *SegmentShared, data: SegmentData, coverage: []TypedDocValuesFieldCoverage) void {
+        shared.* = .{ .allocator = alloc, .ref_count = 1, .typed_doc_values_coverage = coverage };
         if (data.isMapped()) {
             // Opening a segment reads headers and dictionaries. Count the
             // whole mapping conservatively until the owner advises it cold.
@@ -612,7 +614,7 @@ pub const SegmentEntry = struct {
         const coverage = try buildTypedDocValuesCoverageMetadataAlloc(alloc, reader);
         errdefer freeTypedDocValuesCoverage(alloc, coverage);
         const shared = try alloc.create(SegmentShared);
-        initShared(shared, data, coverage);
+        initShared(alloc, shared, data, coverage);
         return shared;
     }
 
@@ -668,7 +670,7 @@ pub const SegmentEntry = struct {
             self.query_source = null;
         }
         if (@atomicRmw(u32, &self.shared.ref_count, .Sub, 1, .acq_rel) != 1) return;
-        const alloc = self.reader.alloc;
+        const alloc = self.shared.allocator;
         const seg_id = self.id;
         const cleanup = self.shared.retired_cleanup;
         if (self.shared.physical_parent) |parent| {
@@ -1163,8 +1165,8 @@ pub const IndexSnapshot = struct {
         if (entry.reader.postings_loader) |*loader| loader.context = context;
         if (entry.data == .native and entry.data.native == .ranges) {
             const range = entry.data.native.ranges;
-            if (range.bind_read_context) |bind| {
-                var source = try bind(range.ptr, self.alloc, context);
+            if (range.bind_read_context != null) {
+                var source = try entry.data.native.bindReadContext(self.alloc, context);
                 errdefer source.close();
                 const reader = try entry.reader.bindSource(self.alloc, source);
                 entry.query_base_reader = entry.reader;
@@ -1208,7 +1210,7 @@ pub const IndexSnapshot = struct {
     pub fn cachedTextTermSummary(self: *const IndexSnapshot, a: Allocator, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) !?TextTermSummary {
         try self.checkScoringReadContext();
         if (self.read_context_check) |check| try check(self.read_context.?);
-        if (self.segments[segment].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+        if (self.segments[segment].query_source) |source| try source.checkReadContext();
         const key = try textSummaryKey(a, segment, field, term, average, config);
         defer a.free(key);
         const owner = self.scoringCache();
@@ -1220,7 +1222,7 @@ pub const IndexSnapshot = struct {
             const value = try reader.summary(reader.ptr, a, segment, field, term, average, config);
             try reader.check(reader.ptr);
             if (self.read_context_check) |check| try check(self.read_context.?);
-            if (self.segments[segment].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+            if (self.segments[segment].query_source) |source| try source.checkReadContext();
             try self.rememberTextTermSummary(segment, field, term, average, config, value);
             return value;
         }
@@ -1832,9 +1834,9 @@ pub const IndexSnapshot = struct {
             return;
         }
         var entries = mutable.bound_segments.valueIterator();
-        while (entries.next()) |entry| if (entry.*.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+        while (entries.next()) |entry| if (entry.*.query_source) |source| try source.checkReadContext();
         for (self.segments) |segment| if (segment.query_source) |source| if (source == .ranges) {
-            if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+            try source.checkReadContext();
         };
     }
     fn cachedTermDocFreq(self: *const IndexSnapshot, field: []const u8, term: []const u8) ?u32 {
@@ -1917,7 +1919,7 @@ pub const IndexSnapshot = struct {
                     defer segment_lease.deinit();
                     const segment = segment_lease.entry;
                     if (segment.query_source) |source| if (source == .ranges) {
-                        if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+                        try source.checkReadContext();
                     };
                     var reader = (try segment.reader.invertedIndexScoped(a, name)) orelse continue;
                     defer reader.deinit();
@@ -2280,7 +2282,7 @@ pub const IndexWriter = struct {
 
     pub const ImmutableSegment = struct { snapshot: *IndexSnapshot, ordinal: usize, target_id: u64 };
     /// Compose a sealed corpus from already admitted physical readers. All
-    /// owners use the same allocator and immutable deletion state. This avoids
+    /// owners retain their own allocator and immutable deletion state. This avoids
     /// loading the same artifact twice when generations overlap partially.
     pub fn shareImmutableSegments(self: *IndexWriter, sources: []const ImmutableSegment) !void {
         if (sources.len == 0) return;
@@ -2295,9 +2297,6 @@ pub const IndexWriter = struct {
         errdefer totals.deinit(self.alloc);
         var next_id = self.next_segment_id;
         for (sources, segments[old.segments.len..]) |source, *target| {
-            var owner = source.snapshot;
-            while (owner.inventory_owner) |parent| owner = parent;
-            if (owner.alloc.ptr != self.alloc.ptr or owner.alloc.vtable != self.alloc.vtable) return error.InvalidSegment;
             if (source.ordinal >= source.snapshot.segments.len) return error.InvalidSegment;
             const segment = source.snapshot.segments[source.ordinal].physical();
             if (segment.shared.deleted_count.load(.acquire) != 0) return error.InvalidSegment;
@@ -4918,4 +4917,50 @@ test "external lake closing shared physical pins preserves concurrent and subseq
     const after = try subsequent.search(a, "body", &.{"hello"}, 10);
     defer a.free(after.hits);
     try std.testing.expectEqualDeep(before, after);
+}
+
+test "external lake metadata navigation foreign corpora retain physical allocators and private visibility" {
+    const a = std.testing.allocator;
+    var physical_budget: @import("sql/memory_budget.zig") = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+    var private_budget: @import("sql/memory_budget.zig") = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+    const bytes = try buildTestSegmentWithIds(a, &.{
+        .{ .id = "first", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} },
+        .{ .id = "second", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(bytes);
+    var source = try IndexWriter.init(physical_budget.allocator());
+    var source_open = true;
+    defer if (source_open) source.deinit();
+    try source.addSegment(bytes);
+    var destination = try IndexWriter.init(private_budget.allocator());
+    var destination_open = true;
+    defer if (destination_open) destination.deinit();
+    const original = source.acquireSnapshot();
+    var original_open = true;
+    defer if (original_open) original.release();
+    var mask = roaring.RoaringBitmap.init(a);
+    defer mask.deinit();
+    try mask.add(0);
+    try destination.shareMaskedImmutableSegments(&.{.{ .snapshot = original, .ordinal = 0, .target_id = 1 }}, &.{mask});
+    try std.testing.expectEqual(@as(u32, 0), original.segments[0].shared.deleted_count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), destination.snapshot().liveDocCount());
+    source.deinit();
+    source_open = false;
+    original.release();
+    original_open = false;
+    // The remaining private view keeps the original encoded backing alive.
+    try std.testing.expect(physical_budget.live != 0);
+    const segment = try destination.snapshot().readSegment(0);
+    {
+        var decoder = segment_mod.SegmentReader.StoredDocCursor.init(a);
+        defer decoder.deinit();
+        try std.testing.expectEqualStrings("second", (try decoder.get(&segment.reader, 1)).?.id);
+        try std.testing.expectEqualStrings("first", (try decoder.get(&segment.reader, 0)).?.id);
+        try std.testing.expectEqualStrings("second", (try decoder.get(&segment.reader, 1)).?.id);
+        try std.testing.expectEqual(@as(usize, 1), decoder.decode_count);
+    }
+    destination.deinit();
+    destination_open = false;
+    try std.testing.expectEqual(@as(usize, 0), physical_budget.live);
+    try std.testing.expectEqual(@as(usize, 0), private_budget.live);
 }

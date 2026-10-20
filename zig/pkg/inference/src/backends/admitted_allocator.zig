@@ -21,7 +21,10 @@ const memory = @import("../runtime/tier/memory.zig");
 
 pub const AdmittedAllocator = struct {
     backing: std.mem.Allocator,
-    session: sessions.Session,
+    session: ?sessions.Session = null,
+    admission_context: ?*anyopaque = null,
+    admit: ?*const fn (*anyopaque, usize) anyerror!memory.AdmissionLease = null,
+    trim_on_free: bool = false,
     live_bytes: usize = 0,
     reserved_bytes: usize = 0,
     metadata_bytes: usize = 0,
@@ -42,34 +45,58 @@ pub const AdmittedAllocator = struct {
         return std.mem.alignForward(usize, @sizeOf(Header), alignment.toByteUnits());
     }
 
+    fn reserve(self: *@This(), amount: usize) !?memory.AdmissionLease {
+        if (self.admit) |callback| return try callback(self.admission_context.?, amount);
+        const session = self.session orelse return error.ResourceLimitExceeded;
+        return (try session.admitHostPreprocess(amount)).lease;
+    }
+
     pub fn ensureCapacity(self: *@This(), extra: usize) !void {
         const needed = try std.math.add(usize, try std.math.add(usize, self.live_bytes, self.metadata_bytes), extra);
         if (needed <= self.reserved_bytes) return;
         const minimum = try std.math.add(usize, needed - self.reserved_bytes, @sizeOf(Reservation));
         var amount = @max(minimum, quantum);
-        var permit = self.session.admitHostPreprocess(amount) catch |err| blk: {
+        var lease = self.reserve(amount) catch |err| blk: {
             if (amount == minimum or (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable)) return err;
             amount = minimum; // Slack must not reject requests fitting tight limits.
-            break :blk try self.session.admitHostPreprocess(amount);
+            break :blk try self.reserve(amount);
         };
-        errdefer permit.deinit();
+        errdefer if (lease) |*active| active.release();
         const reservation = try self.backing.create(Reservation);
-        reservation.* = .{ .next = self.reservations, .lease = permit.lease, .bytes = amount };
+        reservation.* = .{ .next = self.reservations, .lease = lease, .bytes = amount };
         self.reservations = reservation;
         self.metadata_bytes += @sizeOf(Reservation);
         self.reserved_bytes += amount;
     }
 
     pub fn trim(self: *@This()) !void {
-        var spare = self.reserved_bytes - self.live_bytes - self.metadata_bytes;
-        var next = self.reservations;
-        while (next) |reservation| : (next = reservation.next) {
+        // A reservation must not keep its own bookkeeping allocation alive
+        // after the last payload is freed. Release both owners together.
+        if (self.live_bytes == 0) {
+            while (self.reservations) |reservation| {
+                self.reservations = reservation.next;
+                if (reservation.lease) |*lease| lease.release();
+                self.reserved_bytes -= reservation.bytes;
+                self.metadata_bytes -= @sizeOf(Reservation);
+                self.backing.destroy(reservation);
+            }
+            return;
+        }
+        var link = &self.reservations;
+        while (link.*) |reservation| {
+            const spare = self.reserved_bytes - self.live_bytes - self.metadata_bytes;
             const reduction = @min(spare, reservation.bytes);
-            if (reduction == 0) continue;
-            if (reservation.lease) |*lease| try lease.retain(.{ .host_scratch_bytes = reservation.bytes - reduction });
-            reservation.bytes -= reduction;
-            self.reserved_bytes -= reduction;
-            spare -= reduction;
+            if (reduction != 0) {
+                if (reservation.lease) |*lease| try lease.retain(.{ .host_scratch_bytes = reservation.bytes - reduction });
+                reservation.bytes -= reduction;
+                self.reserved_bytes -= reduction;
+            }
+            if (reservation.bytes == 0) {
+                link.* = reservation.next;
+                if (reservation.lease) |*lease| lease.release();
+                self.metadata_bytes -= @sizeOf(Reservation);
+                self.backing.destroy(reservation);
+            } else link = &reservation.next;
         }
     }
 
@@ -107,11 +134,22 @@ pub const AdmittedAllocator = struct {
         return base + allocationOverhead(alignment);
     }
 
-    // Shrink/reuse admitted capacity in place. Actual growth uses
-    // allocate/copy/free, accounting for both allocations during the copy.
-    fn resize(_: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, new_len: usize, _: usize) bool {
-        const header: *Header = @ptrCast(@alignCast(buffer.ptr - allocationOverhead(alignment)));
-        return new_len <= header.bytes - allocationOverhead(alignment);
+    // Logical shrink must not hide retained backing bytes from an outer
+    // BoundedAllocator. A failed physical resize uses allocate/copy/free.
+    fn resize(raw: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const overhead = allocationOverhead(alignment);
+        const base = buffer.ptr - overhead;
+        const header: *Header = @ptrCast(@alignCast(base));
+        if (new_len == buffer.len) return true;
+        if (new_len == 0 or new_len > buffer.len) return false;
+        const bytes = std.math.add(usize, overhead, new_len) catch return false;
+        const old_bytes = header.bytes;
+        if (!self.backing.rawResize(base[0..old_bytes], header.alignment, bytes, ra)) return false;
+        header.bytes = bytes;
+        self.live_bytes -= old_bytes - bytes;
+        if (self.trim_on_free) self.trim() catch {};
+        return true;
     }
     fn remap(raw: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
         return if (resize(raw, buffer, alignment, new_len, ra)) buffer.ptr else null;
@@ -124,5 +162,53 @@ pub const AdmittedAllocator = struct {
         if (header.next) |next| next.prev = header.prev;
         self.live_bytes -= header.bytes;
         self.backing.rawFree(base[0..header.bytes], header.alignment, ra);
+        if (self.trim_on_free and (self.live_bytes == 0 or self.reserved_bytes - self.live_bytes - self.metadata_bytes >= quantum)) self.trim() catch {};
     }
 };
+
+test "model aware media adaptive admission shares capacity grows and releases idle reservations" {
+    const Provider = struct {
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 160 * 1024 }, .{ .host_scratch_bytes = bytes }, false);
+        }
+    };
+    var provider = Provider{};
+    var first = AdmittedAllocator{ .backing = std.testing.allocator, .admission_context = &provider, .admit = Provider.acquire, .trim_on_free = true };
+    defer first.deinit();
+    var second = AdmittedAllocator{ .backing = std.testing.allocator, .admission_context = &provider, .admit = Provider.acquire, .trim_on_free = true };
+    defer second.deinit();
+    const one = try first.allocator().alloc(u8, 1024);
+    const two = try second.allocator().alloc(u8, 1024);
+    try std.testing.expect(provider.controller.snapshot().host_scratch_bytes < 160 * 1024);
+    try std.testing.expectError(error.OutOfMemory, first.allocator().alloc(u8, 160 * 1024));
+    try std.testing.expect(first.admission_error != null);
+    first.allocator().free(one);
+    try first.trim();
+    second.allocator().free(two);
+    try second.trim();
+    // Repeated small requests must not accumulate zero-byte lease records.
+    for (0..100) |_| {
+        const bytes = try first.allocator().alloc(u8, 1024);
+        first.allocator().free(bytes);
+        try first.trim();
+        try std.testing.expectEqual(@as(usize, 0), first.metadata_bytes);
+        try std.testing.expectEqual(@as(usize, 0), first.reserved_bytes);
+    }
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    var resized = AdmittedAllocator{ .backing = no_resize.allocator(), .admission_context = &provider, .admit = Provider.acquire, .trim_on_free = true };
+    defer resized.deinit();
+    var ceiling = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = resized.allocator(), .limit = 2048 };
+    var payload = try ceiling.allocator().alloc(u8, 1024);
+    @memset(payload, 7);
+    payload = try ceiling.allocator().realloc(payload, 512);
+    try std.testing.expectEqual(@as(usize, 512), ceiling.live);
+    try std.testing.expectEqual(ceiling.live + AdmittedAllocator.allocationOverhead(.of(u8)), resized.live_bytes);
+    try std.testing.expectEqual(@as(u8, 7), payload[511]);
+    ceiling.allocator().free(payload);
+    try std.testing.expectEqual(@as(usize, 0), resized.reserved_bytes);
+    first.deinit();
+    second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().host_scratch_bytes);
+}

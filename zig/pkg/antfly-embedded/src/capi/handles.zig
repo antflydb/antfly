@@ -45,6 +45,7 @@ pub const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
     db_live: bool = true,
+    io_lifetime_lease: bool = false,
     /// Public Lite connections borrow a persistent compatible storage owner.
     lite_connection: ?*@import("lite_connection.zig").Connection = null,
     /// Active connection context while its private SQL state is attached.
@@ -106,21 +107,15 @@ pub const Handle = struct {
     storage_owner_runtime_hooks: ?*anyopaque = null,
     server_cleanup: ?*const fn (*Handle) void = null,
     server_context_release: ?*const fn (*anyopaque) void = null,
-    // Present only for a Lite handle opened with the local-runtime-configured
-    // flag on a build that both advertises and actually links the local
-    // inference runtime (see capi_build_options.inference_enabled and
-    // pkg/antfly/build/runtime.zig's addCapiInferenceVariantUnits). Default
-    // libantfly and Lite handles opened without the flag leave these null,
-    // which keeps today's behavior unchanged.
-    lite_inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
-    lite_inference_io: ?*std.Io.Threaded = null,
-    lite_inference_models_dir: ?[]u8 = null,
+    /// Retained independently of storage/catalog generations. Foreground,
+    /// maintenance and retired cursor snapshots share this service.
+    lite_inference: ?*SharedLiteInference = null,
     // Mirrors `LiteResolvedOpenOptions.generated_enrichment_replay` from this
     // handle's open call. `refreshLiteManagedEmbeddingRuntime` must not lose
     // this caller intent across its own reconfigure passes -- see its doc
     // comment.
     lite_generated_enrichment_replay: bool = false,
-    /// Lazy foreground producer for read-only text queries. The mutex covers
+    /// Lazy shared producer for query extraction and resolver adjudication. The mutex covers
     /// construction; each call uses a scoped invocation context.
     query_producer: ?*@import("../asset_producer_runtime.zig").Runtime = null,
     query_producer_mutex: std.Io.Mutex = .init,
@@ -145,7 +140,7 @@ pub const Handle = struct {
 
     pub fn liteAntflyProvider(self: *Handle) ?managed_embedder.AntflyProvider {
         if (self.parent_handle) |parent| return parent.liteAntflyProvider();
-        const lifetime = if (self.lite_inference_lifetime) |*value| value else return null;
+        const lifetime = if (self.lite_inference) |service| &service.lifetime else return null;
         return inference_provider.inferenceBoundaryProvider(lifetime);
     }
 
@@ -190,20 +185,37 @@ pub const Handle = struct {
     }
 };
 
+/// Service lifetime is independent of the database snapshot which first opened
+/// it. Final release follows DB/producer teardown, after every borrower drains.
+pub const SharedLiteInference = struct {
+    alloc: Allocator,
+    references: std.atomic.Value(usize) = .init(1),
+    lifetime: inference_provider.EmbeddedInferenceProviderLifetime,
+    io: *std.Io.Threaded,
+    models_dir: ?[]u8,
+
+    pub fn retain(self: *SharedLiteInference) void {
+        const previous = self.references.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    pub fn release(self: *SharedLiteInference) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous != 1) return;
+        self.lifetime.quiesce();
+        inference_provider.destroyEmbeddedInferenceNode(self.lifetime.handle, self.lifetime.resource_owner);
+        if (self.models_dir) |directory| self.alloc.free(directory);
+        self.io.deinit();
+        self.alloc.destroy(self.io);
+        self.alloc.destroy(self);
+    }
+};
+
 pub fn stopLiteEmbeddedInference(handle: *Handle) void {
-    if (handle.lite_inference_lifetime) |*lifetime| {
-        lifetime.quiesce();
-        inference_provider.destroyEmbeddedInferenceNode(lifetime.handle, lifetime.resource_owner);
-        handle.lite_inference_lifetime = null;
-    }
-    if (handle.lite_inference_models_dir) |directory| {
-        handle.alloc.free(directory);
-        handle.lite_inference_models_dir = null;
-    }
-    if (handle.lite_inference_io) |io_impl| {
-        io_impl.deinit();
-        handle.alloc.destroy(io_impl);
-        handle.lite_inference_io = null;
+    if (handle.lite_inference) |service| {
+        handle.lite_inference = null;
+        service.release();
     }
 }
 
@@ -216,6 +228,8 @@ pub fn invalidateQueryProducer(handle: *Handle) void {
 }
 
 pub fn closeHandle(handle: *Handle) void {
+    const io_lifetime_lease = handle.io_lifetime_lease;
+    defer if (io_lifetime_lease) @import("io_lifetime.zig").release();
     invalidateQueryProducer(handle);
     if (handle.lite_connection) |connection| {
         connection.close();

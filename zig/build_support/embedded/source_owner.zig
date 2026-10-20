@@ -14,12 +14,50 @@
 // limitations under the License.
 
 const std = @import("std");
+/// Independently compiled ELF owners and their callers share Zig callback ABI.
+pub fn llvmBackend(target: std.Target) ?bool {
+    return if (target.ofmt == .elf) true else null;
+}
+
+/// Module.init(.existing) copies collection pointers. Each graph clone must own
+/// its mutable buffers before SDK finalizers or link composition append to them.
+pub fn cloneModule(b: *std.Build, original: *std.Build.Module) *std.Build.Module {
+    const copy = b.allocator.create(std.Build.Module) catch @panic("OOM");
+    copy.init(original.owner, .{ .existing = original });
+    copy.import_table = original.import_table.clone(b.allocator) catch @panic("OOM");
+    copy.c_macros = original.c_macros.clone(b.allocator) catch @panic("OOM");
+    copy.include_dirs = original.include_dirs.clone(b.allocator) catch @panic("OOM");
+    copy.lib_paths = original.lib_paths.clone(b.allocator) catch @panic("OOM");
+    copy.rpaths = original.rpaths.clone(b.allocator) catch @panic("OOM");
+    copy.frameworks = original.frameworks.clone(b.allocator) catch @panic("OOM");
+    copy.link_objects = original.link_objects.clone(b.allocator) catch @panic("OOM");
+    copy.cached_graph = .{ .modules = &.{}, .names = &.{} };
+    return copy;
+}
+
 const Binding = struct { consumer: *std.Build.Module, local: *std.Build.Module };
 var bindings: std.ArrayList(Binding) = .empty;
 var storage_provider: ?*std.Build.Step.Compile = null;
+var storage_dependencies: []const *std.Build.Step.Compile = &.{};
+const StorageVisit = struct { module: *std.Build.Module, testing: bool };
+const LocalProvider = struct { consumer: *std.Build.Module, provider: *std.Build.Step.Compile };
+var local_providers: std.ArrayList(LocalProvider) = .empty;
 
-pub fn registerStorageProvider(provider: *std.Build.Step.Compile) void {
+/// A source-level owner fixture may compile a provider in its final image.
+/// Do not also import that provider's archive through a storage dependency.
+/// Registration applies only to this final module, never to sibling images.
+pub fn registerLocalProvider(consumer: *std.Build.Module, provider: *std.Build.Step.Compile) void {
+    local_providers.append(consumer.owner.allocator, .{ .consumer = consumer, .provider = provider }) catch @panic("OOM");
+}
+
+fn providesLocally(consumer: *std.Build.Module, provider: *std.Build.Step.Compile) bool {
+    for (local_providers.items) |local| if (local.consumer == consumer and local.provider == provider) return true;
+    return false;
+}
+
+pub fn registerStorageProvider(provider: *std.Build.Step.Compile, dependencies: []const *std.Build.Step.Compile) void {
     storage_provider = provider;
+    storage_dependencies = dependencies;
 }
 
 /// One local source owner per consumer profile. Source files are never copied
@@ -88,22 +126,45 @@ pub fn localFor(consumer: *std.Build.Module) ?*std.Build.Module {
 fn attachStorageFinalLinks(b: *std.Build, step: *std.Build.Step, provider: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Step, void)) void {
     if ((seen.getOrPut(step) catch @panic("OOM")).found_existing) return;
     if (step.cast(std.Build.Step.Compile)) |artifact| {
-        if (artifact.kind == .exe or artifact.kind == .@"test" or (artifact.kind == .lib and artifact.linkage == .dynamic)) {
+        const consumer_target = artifact.root_module.resolved_target.?.result;
+        const provider_target = provider.root_module.resolved_target.?.result;
+        // Browser and cross-target artifacts share this build graph, but cannot
+        // consume the native engine archive or its libc/system-library inputs.
+        const same_target = consumer_target.cpu.arch == provider_target.cpu.arch and
+            consumer_target.os.tag == provider_target.os.tag and
+            consumer_target.abi == provider_target.abi and consumer_target.ofmt == provider_target.ofmt;
+        if (same_target and (artifact.kind == .exe or artifact.kind == .@"test" or (artifact.kind == .lib and artifact.linkage == .dynamic))) {
             var linked = false;
             for (artifact.root_module.link_objects.items) |input| if (input == .other_step and input.other_step == provider) {
                 linked = true;
             };
             if (!linked) {
-                var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
-                if (needsStorageProvider(b, artifact.root_module, provider, artifact.kind == .@"test", &modules)) artifact.root_module.linkLibrary(provider);
+                var modules: std.AutoHashMap(StorageVisit, void) = .init(b.allocator);
+                if (needsStorageProvider(b, artifact.root_module, provider, artifact.kind == .@"test", &modules)) {
+                    artifact.root_module.linkLibrary(provider);
+                    linked = true;
+                }
             }
+            // Private engine calls resolve in the final image. Keep provider
+            // dependencies here, not on static owners' codegen prerequisites.
+            if (linked) for (storage_dependencies) |dependency| {
+                if (providesLocally(artifact.root_module, dependency)) continue;
+                var found = false;
+                for (artifact.root_module.link_objects.items) |input| {
+                    if (input == .other_step and input.other_step == dependency) found = true;
+                }
+                if (!found) artifact.root_module.linkLibrary(dependency);
+            };
+            if (linked) artifact.use_llvm = llvmBackend(consumer_target);
         }
     }
     for (step.dependencies.items) |dependency| attachStorageFinalLinks(b, dependency, provider, seen);
 }
 
-fn needsStorageProvider(b: *std.Build, module: *std.Build.Module, provider: *std.Build.Step.Compile, testing: bool, seen: *std.AutoHashMap(*std.Build.Module, void)) bool {
-    if (module == provider.root_module or (seen.getOrPut(module) catch @panic("OOM")).found_existing) return false;
+fn needsStorageProvider(b: *std.Build, module: *std.Build.Module, provider: *std.Build.Step.Compile, testing: bool, seen: *std.AutoHashMap(StorageVisit, void)) bool {
+    // One module can feed both a test object and a production archive. Its
+    // builtin.is_test selection differs, so visit each compilation context.
+    if (module == provider.root_module or (seen.getOrPut(.{ .module = module, .testing = testing }) catch @panic("OOM")).found_existing) return false;
     if (!testing) if (module.root_source_file) |root| {
         if (@import("../antfly/source_paths.zig").authored(b, root)) |path| {
             if (module.import_table.contains("storage_engine_options") and
@@ -113,8 +174,13 @@ fn needsStorageProvider(b: *std.Build, module: *std.Build.Module, provider: *std
     };
     for (module.link_objects.items) |input| if (input == .other_step) {
         if (input.other_step == provider) continue;
+        // A shared library owns its private providers. Its consumers must not
+        // inherit another copy of those private engines or their hidden calls.
+        if (input.other_step.kind == .lib and input.other_step.linkage == .dynamic) continue;
         if (std.mem.eql(u8, input.other_step.name, "antfly-storage-kernel")) return true;
-        if (needsStorageProvider(b, input.other_step.root_module, provider, testing, seen)) return true;
+        // Crossing an artifact boundary selects its own builtin.is_test;
+        // production libraries linked by tests still require their providers.
+        if (needsStorageProvider(b, input.other_step.root_module, provider, input.other_step.kind.isTest(), seen)) return true;
     };
     var imports = module.import_table.iterator();
     while (imports.next()) |entry| if (needsStorageProvider(b, entry.value_ptr.*, provider, testing, seen)) return true;

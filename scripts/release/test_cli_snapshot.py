@@ -68,6 +68,57 @@ def write_wheel(path: Path) -> None:
 
 
 class CLISnapshotTests(unittest.TestCase):
+    def test_npm_only_snapshot_is_strict_and_pypi_is_paused(self) -> None:
+        policy = load_module(
+            "paused_cli_channels", REPO_ROOT / "scripts/release/release_channels.py"
+        ).load_policy()
+        self.assertTrue(
+            all(not channel["publish_pypi"] for channel in policy["channels"].values())
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            npm = root / "npm"
+            npm.mkdir()
+            for filename, package in NPM_PACKAGES.items():
+                write_npm_package(npm / f"{filename}-{VERSION}.tgz", package)
+            snapshot = root / "snapshot"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(BUILD),
+                    "--version",
+                    VERSION,
+                    "--commit",
+                    COMMIT,
+                    "--npm-dir",
+                    str(npm),
+                    "--out-dir",
+                    str(snapshot),
+                ],
+                check=True,
+            )
+            manifest = json.loads((snapshot / "cli-snapshot.json").read_text())
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(manifest["registry_versions"], {"npm": VERSION})
+            self.assertEqual(len(manifest["artifacts"]), 4)
+            command = [
+                sys.executable,
+                str(VERIFY),
+                "--snapshot-dir",
+                str(snapshot),
+                "--version",
+                VERSION,
+                "--commit",
+                COMMIT,
+            ]
+            subprocess.run(command, check=True)
+            write_wheel(snapshot / "unexpected.whl")
+            result = subprocess.run(
+                command, text=True, capture_output=True, check=False
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("file set mismatch", result.stderr)
+
     def test_python_registry_version_matches_packager(self) -> None:
         snapshot = load_module("cli_snapshot_builder", BUILD)
         packager = load_module(
@@ -89,6 +140,26 @@ class CLISnapshotTests(unittest.TestCase):
             with self.subTest(unsupported=unsupported), self.assertRaises(SystemExit):
                 snapshot.python_version_from_release(unsupported)
 
+    def test_darwin_deployment_target_matches_wheel_floor(self) -> None:
+        policy_module = load_module(
+            "apple_release_platforms",
+            REPO_ROOT / "scripts/release/release_platforms.py",
+        )
+        policy = policy_module.load_policy()
+        darwin = next(
+            row for row in policy["platforms"] if row["archive_os"] == "Darwin"
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            path = Path(raw_tmp) / "platforms.json"
+            darwin["wheel_platform"] = "macosx_11_0_arm64"
+            path.write_text(json.dumps(policy))
+            with self.assertRaisesRegex(SystemExit, "wheel tag must match"):
+                policy_module.load_policy(path)
+            darwin["zig_target"] = "aarch64-macos"
+            path.write_text(json.dumps(policy))
+            with self.assertRaisesRegex(SystemExit, "explicit macOS deployment target"):
+                policy_module.load_policy(path)
+
     def test_snapshot_rejects_mutated_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
@@ -100,7 +171,7 @@ class CLISnapshotTests(unittest.TestCase):
             for filename, package_name in NPM_PACKAGES.items():
                 write_npm_package(npm_dir / f"{filename}-{VERSION}.tgz", package_name)
             for platform in (
-                "macosx_11_0_arm64",
+                "macosx_15_0_arm64",
                 "manylinux_2_28_aarch64",
                 "manylinux_2_28_x86_64",
             ):

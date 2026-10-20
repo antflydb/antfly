@@ -644,6 +644,7 @@ pub const DocStore = struct {
         /// Exact key presence in this transaction's view. Physical references
         /// prove presence without resolving external source/artifact payloads.
         pub fn contains(self: *Txn, key: []const u8) !bool {
+            if (self.write) |*write| return write.contains(key);
             if (self.probe) |*probe| return try probe.contains(key);
             _ = self.getPhysical(key) catch |err| switch (err) {
                 error.NotFound => return false,
@@ -776,7 +777,7 @@ pub const DocStore = struct {
             if (try graphRelationshipRetiredCached(self, self.alloc, key, &self.graph_retirements_maybe)) return;
 
             try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-            try self.document_revisions.touch(self.alloc, key);
+            try self.document_revisions.touchValue(self.alloc, key, value);
             try self.artifact_footprint.touch(key, value);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -800,7 +801,7 @@ pub const DocStore = struct {
                     else => return err,
                 };
             }
-            try self.document_revisions.touch(self.alloc, key);
+            try self.document_revisions.touchValue(self.alloc, key, null);
             try self.artifact_footprint.touch(key, null);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, null);
@@ -849,6 +850,12 @@ pub const DocStore = struct {
             defer cursor.close();
             const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
             return std.mem.startsWith(u8, row.key, prefix);
+        }
+
+        pub fn openPhysicalKeyCursorAdapter(self: *Txn) !CursorAdapter {
+            var cursor = try self.openPhysicalCursorAdapter();
+            cursor.setKeysOnly();
+            return cursor;
         }
 
         pub fn openPhysicalCursorAdapter(self: *Txn) !CursorAdapter {
@@ -952,11 +959,11 @@ pub const DocStore = struct {
                 if (try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
-                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
+                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, value);
                 try self.invalidateColumns(key);
 
@@ -989,14 +996,14 @@ pub const DocStore = struct {
                 if (!retirement_checked and try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, true, retirement_checked);
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
                 // Active tracking requires point updates for bucket counters.
                 // Restore bulk writers publish into a fresh identity; they may
                 // defer activation until their unordered import is complete.
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
-                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
+                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 if (self.unordered_bulk_append_puts and internal_keys.isRelationalRowKey(key)) {
                     // Keep auxiliary records in the bulk arena too. A regular
                     // put drains that arena into a sorted mutable map, causing
@@ -1025,11 +1032,11 @@ pub const DocStore = struct {
                         else => return err,
                     };
                 }
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, null);
                 try self.artifact_footprint.touch(key, null);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, null);
-                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), self.retained_cache);
+                try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
 
@@ -5959,7 +5966,7 @@ test "graph endpoint cleanup byte admission releases partial page allocations" {
             try std.testing.expectEqual(@as(usize, 2), page.deletes.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{&store});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{&store});
 }
 
 test "graph relationship bulk ingestion preserves direct append and retirement during migration" {
@@ -6209,7 +6216,7 @@ test "graph owner revival planning releases every partial allocation" {
             defer page.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Case.plan, .{&store});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Case.plan, .{&store});
 }
 
 test "graph qualified directory upgrade removes stale foreign membership and preserves revived artifacts" {
@@ -6337,4 +6344,52 @@ test "graph endpoint cleanup bulk retirement mask releases ownership on decoding
     var batch = try store.beginWriteBatch();
     defer batch.abort();
     try std.testing.expectError(error.InvalidGraphRetirement, DocStore.graphBulkRetirementMask(alloc, batch.asTxn(), &.{.{ .key = edge, .value = "edge" }}));
+}
+
+test "public graph metric borrowed wire content authority shares txn batch append abort and reopen boundaries" {
+    const a = std.testing.allocator;
+    const revision = @import("document_mutation_revision.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const key = try internal_keys.documentKeyAlloc(a, "doc");
+    defer a.free(key);
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("last", &expected, .{});
+    for (0..2) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            try store.put(key, "first");
+            var pinned = try store.beginReadTxn();
+            defer pinned.abort();
+            const before = (try revision.loadContent(&pinned, key)).?;
+            {
+                var writer = try store.beginWriteTxn();
+                defer writer.abort();
+                try writer.put(key, "aborted");
+            }
+            {
+                var batch = try store.beginWriteBatch();
+                errdefer batch.abort();
+                try batch.asTxn().appendPut(key, "last");
+                try batch.commit();
+            }
+            try std.testing.expectEqualSlices(u8, &before.digest, &(try revision.loadContent(&pinned, key)).?.digest);
+        }
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectEqualSlices(u8, &expected, &(try revision.loadContent(&current, key)).?.digest);
+        try std.testing.expectEqualStrings("last", try current.get(key));
+        if (pass == 1) {
+            try store.delete(key);
+            var deleted = try store.beginReadTxn();
+            defer deleted.abort();
+            try std.testing.expect((try revision.loadContent(&deleted, key)) == null);
+            try std.testing.expectError(error.NotFound, deleted.get(key));
+        }
+    }
 }

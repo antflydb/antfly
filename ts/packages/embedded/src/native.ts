@@ -295,6 +295,30 @@ export interface NativeLibrary {
   dbGetRaw: KoffiFunc<(handle: unknown, key: object, out: object) => number>;
   dbGetSchemaJson: KoffiFunc<(handle: unknown, out: object) => number>;
   dbSetSchemaJson: KoffiFunc<(handle: unknown, schema: object) => number>;
+  dbRenderResolverKeyJson: KoffiFunc<
+    (handle: unknown, arg0: object, arg1: object, out: object) => number
+  >;
+  dbResolveQueryJson: KoffiFunc<
+    (handle: unknown, arg0: object, arg1: object, out: object) => number
+  >;
+  dbMergeResolverKeysJson: KoffiFunc<(handle: unknown, arg0: object, arg1: object) => number>;
+  dbUnmergeResolverKeyJson: KoffiFunc<
+    (handle: unknown, arg0: object, arg1: object, out: object) => number
+  >;
+  dbSuppressResolverKeysJson: KoffiFunc<
+    (handle: unknown, arg0: object, arg1: object, out: object) => number
+  >;
+  dbUnsuppressResolverKeyJson: KoffiFunc<
+    (handle: unknown, arg0: object, arg1: object, out: object) => number
+  >;
+  dbResolverCurationJson: KoffiFunc<(handle: unknown, arg0: object, out: object) => number>;
+  dbResolverReviewsJson: KoffiFunc<(handle: unknown, arg0: object, out: object) => number>;
+  dbCurateEntityJson: KoffiFunc<
+    (handle: unknown, arg0: object, arg1: object, arg2: object, out: object) => number
+  >;
+  dbListResolverIdentitiesJson: KoffiFunc<(handle: unknown, out: object) => number>;
+  dbSetResolverNamespaceJson: KoffiFunc<(handle: unknown, arg0: object, arg1: object) => number>;
+  dbDropResolverIdentity: KoffiFunc<(handle: unknown, name: object, out: object) => number>;
   dbListIndexesJson: KoffiFunc<(handle: unknown, out: object) => number>;
   dbAddIndexJson: KoffiFunc<(handle: unknown, config: object) => number>;
   dbDeleteIndex: KoffiFunc<(handle: unknown, name: object, outDeleted: boolean[]) => number>;
@@ -589,6 +613,72 @@ function buildNative(): NativeLibrary {
     dbGetRaw: f("antfly_db_get_raw", "uint32_t", [PAntflyDb, AntflySlice, PAntflyBufferOut]),
     dbGetSchemaJson: f("antfly_db_get_schema_json", "uint32_t", [PAntflyDb, PAntflyBufferOut]),
     dbSetSchemaJson: f("antfly_db_set_schema_json", "uint32_t", [PAntflyDb, AntflySlice]),
+    dbRenderResolverKeyJson: f("antfly_db_render_resolver_key_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    dbResolveQueryJson: f("antfly_db_resolve_query_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    dbMergeResolverKeysJson: f("antfly_db_merge_resolver_keys_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+    ]),
+    dbUnmergeResolverKeyJson: f("antfly_db_unmerge_resolver_key_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    dbSuppressResolverKeysJson: f("antfly_db_suppress_resolver_keys_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    dbUnsuppressResolverKeyJson: f("antfly_db_unsuppress_resolver_key_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    dbResolverCurationJson: f("antfly_db_resolver_curation_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    dbResolverReviewsJson: f("antfly_db_resolver_reviews_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    dbCurateEntityJson: f("antfly_db_curate_entity_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    dbListResolverIdentitiesJson: f("antfly_db_list_resolver_identities_json", "uint32_t", [
+      PAntflyDb,
+      PAntflyBufferOut,
+    ]),
+    dbSetResolverNamespaceJson: f("antfly_db_set_resolver_namespace_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+    ]),
+    dbDropResolverIdentity: f("antfly_db_drop_resolver_identity", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      PBoolOut,
+    ]),
     dbListIndexesJson: f("antfly_db_list_indexes_json", "uint32_t", [PAntflyDb, PAntflyBufferOut]),
     dbAddIndexJson: f("antfly_db_add_index_json", "uint32_t", [PAntflyDb, AntflySlice]),
     dbDeleteIndex: f("antfly_db_delete_index", "uint32_t", [PAntflyDb, AntflySlice, PBoolOut]),

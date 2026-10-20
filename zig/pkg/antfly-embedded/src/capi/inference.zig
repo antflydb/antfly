@@ -40,6 +40,7 @@ const InferenceHandle = struct {
     }
 
     fn destroy(self: *InferenceHandle) void {
+        defer @import("io_lifetime.zig").release();
         self.lifetime.quiesce();
         inference_provider.destroyEmbeddedInferenceNode(self.lifetime.handle, self.lifetime.resource_owner);
         self.io.deinit();
@@ -99,6 +100,8 @@ fn resolveOptions(options: ?*const capi.InferenceOptions) !ResolvedOptions {
 }
 
 fn openInference(options: ?*const capi.InferenceOptions) !*anyopaque {
+    @import("io_lifetime.zig").acquire();
+    errdefer @import("io_lifetime.zig").release();
     if (!db.localInferenceRuntimeAvailable()) return error.UnsupportedOperation;
     var resolved = try resolveOptions(options);
 
@@ -116,9 +119,6 @@ fn openInference(options: ?*const capi.InferenceOptions) !*anyopaque {
     // which the runtime resolves on its own.
     const created = try inference_provider.createEmbeddedInferenceNode(".", io_impl.io(), resolved.node);
     errdefer inference_provider.destroyEmbeddedInferenceNode(created.handle, created.resource_owner);
-    // Unlike a Lite handle, which still serves storage without inference, a
-    // handle that cannot run inference is useless: fail the open instead.
-    if (created.configure_error != null) return error.InferenceRuntimeStartupFailed;
     handle.* = .{
         .io = io_impl,
         .lifetime = .{ .handle = created.handle, .resource_owner = created.resource_owner },

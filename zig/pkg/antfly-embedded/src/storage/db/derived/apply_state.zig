@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const Storage = @import("../../lsm_backend.zig").Storage;
 const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
@@ -26,6 +27,9 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const platform_time = @import("antfly_platform").time;
 
 const metadata_prefix = "\x00\x00__metadata__:derived_apply:";
+const projection_metadata_prefix = "\x00\x00__metadata__:derived_projection:";
+const projection_metadata_magic = "AFPRJMD1";
+const projection_metadata_len = 46;
 const checkpoint_file_name = "derived_apply.checkpoint";
 const checkpoint_magic = "AFPRJCP1";
 const projection_checkpoint_format_version: u32 = 3;
@@ -122,6 +126,112 @@ pub const ProjectionCheckpoint = struct {
     format_version: u32 = projection_checkpoint_format_version,
 };
 
+// Keep the legacy scalar watermark for existing readers. Metadata-only
+// backends additionally retain the same lifecycle identity as a sidecar.
+fn projectionMetadataKey(buffer: []u8, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}{s}", .{ projection_metadata_prefix, name });
+}
+
+fn encodeProjectionMetadata(checkpoint: ProjectionCheckpoint) [projection_metadata_len]u8 {
+    var raw: [projection_metadata_len]u8 = undefined;
+    @memcpy(raw[0..8], projection_metadata_magic);
+    raw[8] = @backingInt(checkpoint.status);
+    std.mem.writeInt(u64, raw[9..17], checkpoint.applied_sequence, .little);
+    std.mem.writeInt(u64, raw[17..25], checkpoint.generation, .little);
+    std.mem.writeInt(u64, raw[25..33], checkpoint.config_hash, .little);
+    raw[33] = @intFromBool(checkpoint.published_count != null);
+    std.mem.writeInt(u64, raw[34..42], checkpoint.published_count orelse 0, .little);
+    std.mem.writeInt(u32, raw[42..46], Crc32.hash(raw[0..42]), .little);
+    return raw;
+}
+
+fn decodeProjectionMetadata(raw: []const u8) !ProjectionCheckpoint {
+    if (raw.len != projection_metadata_len or !std.mem.eql(u8, raw[0..8], projection_metadata_magic) or
+        raw[33] > 1 or Crc32.hash(raw[0..42]) != std.mem.readInt(u32, raw[42..46], .little))
+        return error.InvalidDerivedApplyState;
+    return .{
+        .applied_sequence = std.mem.readInt(u64, raw[9..17], .little),
+        .status = std.enums.fromInt(ProjectionStatus, raw[8]) orelse return error.InvalidDerivedApplyState,
+        .generation = std.mem.readInt(u64, raw[17..25], .little),
+        .config_hash = std.mem.readInt(u64, raw[25..33], .little),
+        .published_count = if (raw[33] == 1) std.mem.readInt(u64, raw[34..42], .little) else null,
+    };
+}
+
+fn loadProjectionMetadataTxn(txn: anytype, index_name: []const u8) !?ProjectionCheckpoint {
+    // Legacy writers update only the scalar key. A mismatched or missing
+    // watermark invalidates the richer record's generation/count proof.
+    const sequence = (try loadScalarAppliedSequenceTxn(txn, index_name)) orelse return null;
+    var key_buf: [256]u8 = undefined;
+    const key = try projectionMetadataKey(&key_buf, index_name);
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    const checkpoint = try decodeProjectionMetadata(raw);
+    return if (checkpoint.applied_sequence == sequence) checkpoint else null;
+}
+
+fn loadScalarAppliedSequenceTxn(txn: anytype, index_name: []const u8) !?u64 {
+    var key_buf: [256]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ metadata_prefix, index_name });
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (raw.len != 8) return error.InvalidDerivedApplyState;
+    return std.mem.readInt(u64, raw[0..8], .little);
+}
+
+fn loadProjectionMetadata(alloc: Allocator, store: anytype, index_name: []const u8) !ProjectionCheckpoint {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    if (try loadProjectionMetadataTxn(&txn, index_name)) |checkpoint| return checkpoint;
+    // An old scalar is replay progress, not a generation recovery proof.
+    return .{ .applied_sequence = (try loadScalarAppliedSequenceTxn(&txn, index_name)) orelse 0 };
+}
+
+fn saveProjectionMetadataTxn(txn: anytype, name: []const u8, checkpoint: ProjectionCheckpoint) !void {
+    var key_buf: [256]u8 = undefined;
+    const key = try projectionMetadataKey(&key_buf, name);
+    const encoded = encodeProjectionMetadata(checkpoint);
+    try txn.put(key, &encoded);
+}
+
+const MetadataUpdateMode = enum { replace, set, advance };
+
+fn saveProjectionMetadataUpdates(alloc: Allocator, store: anytype, updates: []const AppliedSequenceUpdate, mode: MetadataUpdateMode) !void {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    for (updates) |update| {
+        // Replacement is an explicit recovery boundary. Neither malformed
+        // metadata record may prevent an authoritative replacement/reset.
+        const previous = if (mode == .replace) null else try loadProjectionMetadataTxn(&txn, update.index_name);
+        var checkpoint = previous orelse ProjectionCheckpoint{
+            .applied_sequence = if (mode == .replace) 0 else (try loadScalarAppliedSequenceTxn(&txn, update.index_name)) orelse 0,
+        };
+        if (mode == .replace) {
+            checkpoint = update.checkpoint();
+        } else {
+            const previous_sequence = checkpoint.applied_sequence;
+            checkpoint.applied_sequence = if (mode == .advance) @max(previous_sequence, update.sequence) else update.sequence;
+            mergeSequenceMetadata(&checkpoint, update, previous_sequence, mode == .set);
+        }
+        if (mode == .replace or invalidatesCompletion(previous, checkpoint)) try @import("../artifact_projection_epoch.zig").revoke(&txn);
+        if (mode == .replace) {
+            try putScalarAppliedSequenceTxn(&txn, update.index_name, checkpoint.applied_sequence);
+        } else {
+            try saveScalarAppliedSequenceTxn(&txn, update.index_name, checkpoint.applied_sequence);
+        }
+        try saveProjectionMetadataTxn(&txn, update.index_name, checkpoint);
+    }
+    try txn.commit();
+}
+
 /// A coherent receiver-local projection checkpoint cut. The file lock remains
 /// held until deinit, including while a caller publishes evidence into primary
 /// metadata. Acquiring an epoch before/after an unguarded file read is NOT
@@ -168,6 +278,16 @@ pub fn tryAcquireProjectionSnapshot(
     store: anytype,
     checkpoint_path: ?[]const u8,
 ) !?ProjectionSnapshot {
+    return tryAcquireProjectionSnapshotWithStorage(null, alloc, io, store, checkpoint_path);
+}
+
+pub fn tryAcquireProjectionSnapshotWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+) !?ProjectionSnapshot {
     if (comptime builtin.os.tag == .freestanding) return null;
     const path = checkpoint_path orelse return null;
     const lock = try retainCheckpointFileLock(path);
@@ -184,7 +304,7 @@ pub fn tryAcquireProjectionSnapshot(
     defer txn.abort();
     const authority = (try @import("../artifact_publication.zig").authority(&txn)) orelse return null;
     const epoch = try @import("../artifact_projection_epoch.zig").load(&txn);
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -242,9 +362,20 @@ pub fn loadAppliedSequenceWithCheckpoint(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !u64 {
+    return loadAppliedSequenceWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, index_name);
+}
+
+pub fn loadAppliedSequenceWithCheckpointWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    index_name: []const u8,
+) !u64 {
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try loadAppliedSequence(alloc, store, index_name);
     const path = checkpoint_path orelse return try loadAppliedSequence(alloc, store, index_name);
-    const checkpoint = loadProjectionCheckpoint(alloc, io, path, index_name) catch |err| switch (err) {
+    const checkpoint = loadProjectionCheckpointWithStorage(storage, alloc, io, path, index_name) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
@@ -258,11 +389,22 @@ pub fn loadProjectionCheckpointWithSidecar(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !ProjectionCheckpoint {
+    return loadProjectionCheckpointWithSidecarWithStorage(null, alloc, io, store, checkpoint_path, index_name);
+}
+
+pub fn loadProjectionCheckpointWithSidecarWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    index_name: []const u8,
+) !ProjectionCheckpoint {
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) {
-        return .{ .applied_sequence = try loadAppliedSequence(alloc, store, index_name) };
+        return try loadProjectionMetadata(alloc, store, index_name);
     }
-    const path = checkpoint_path orelse return .{ .applied_sequence = try loadAppliedSequence(alloc, store, index_name) };
-    const checkpoint = loadProjectionCheckpoint(alloc, io, path, index_name) catch |err| switch (err) {
+    const path = checkpoint_path orelse return try loadProjectionMetadata(alloc, store, index_name);
+    const checkpoint = loadProjectionCheckpointWithStorage(storage, alloc, io, path, index_name) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
@@ -278,19 +420,38 @@ pub fn saveAppliedSequence(store: anytype, index_name: []const u8, sequence: u64
     try txn.commit();
 }
 
-pub fn saveAppliedSequenceTxn(txn: anytype, index_name: []const u8, sequence: u64) !void {
+fn saveScalarAppliedSequenceTxn(txn: anytype, index_name: []const u8, sequence: u64) !void {
+    const previous = try loadScalarAppliedSequenceTxn(txn, index_name);
+    if (previous == null or sequence < previous.?) try @import("../artifact_projection_epoch.zig").revoke(txn);
+    try putScalarAppliedSequenceTxn(txn, index_name, sequence);
+}
+
+fn putScalarAppliedSequenceTxn(txn: anytype, index_name: []const u8, sequence: u64) !void {
     var mutable_txn = txn;
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, sequence, .little);
 
     var key_buf: [256]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ metadata_prefix, index_name });
-    const previous = mutable_txn.get(key) catch |err| if (err == error.NotFound) null else return err;
-    if (previous) |raw| {
-        if (raw.len != 8) return error.InvalidDerivedApplyState;
-        if (sequence < std.mem.readInt(u64, raw[0..8], .little)) try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
-    } else try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
     try mutable_txn.put(key, &buf);
+}
+
+pub fn saveAppliedSequenceTxn(txn: anytype, index_name: []const u8, sequence: u64) !void {
+    const previous = try loadProjectionMetadataTxn(txn, index_name);
+    try saveScalarAppliedSequenceTxn(txn, index_name, sequence);
+    const mutable_txn = txn;
+    if (previous) |previous_checkpoint| {
+        var checkpoint = previous_checkpoint;
+        checkpoint.applied_sequence = sequence;
+        mergeSequenceMetadata(&checkpoint, .{ .index_name = index_name, .sequence = sequence }, previous_checkpoint.applied_sequence, true);
+        if (invalidatesCompletion(previous_checkpoint, checkpoint) and sequence >= previous_checkpoint.applied_sequence)
+            try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
+        try saveProjectionMetadataTxn(mutable_txn, index_name, checkpoint);
+    } else {
+        // Do not resurrect a rejected record if a scalar-only update later
+        // returns to its old sequence number.
+        try clearProjectionMetadataTxn(mutable_txn, index_name);
+    }
 }
 
 pub fn saveAppliedSequences(store: anytype, updates: []const AppliedSequenceUpdate) !void {
@@ -314,9 +475,21 @@ pub fn saveAppliedSequenceWithCheckpoint(
     index_name: []const u8,
     sequence: u64,
 ) !void {
+    return saveAppliedSequenceWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, index_name, sequence);
+}
+
+pub fn saveAppliedSequenceWithCheckpointWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    index_name: []const u8,
+    sequence: u64,
+) !void {
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveAppliedSequence(store, index_name, sequence);
     if (checkpoint_path) |path| {
-        try setAppliedSequencesCheckpoint(alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
+        try setAppliedSequencesCheckpointWithStorage(storage, alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
             .index_name = index_name,
             .sequence = sequence,
         }});
@@ -332,16 +505,25 @@ pub fn saveAppliedSequenceUpdateWithCheckpoint(
     checkpoint_path: ?[]const u8,
     update: AppliedSequenceUpdate,
 ) !void {
+    return saveAppliedSequenceUpdateWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, update);
+}
+
+pub fn saveAppliedSequenceUpdateWithCheckpointWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    update: AppliedSequenceUpdate,
+) !void {
     if (comptime builtin.os.tag == .freestanding) {
-        if (update.status != .clean or update.generation != 0) try revokeCompletion(alloc, store);
-        return try saveAppliedSequence(store, update.index_name, update.sequence);
+        return try saveProjectionMetadataUpdates(alloc, store, &.{update}, .set);
     }
     if (checkpoint_path) |path| {
-        try setAppliedSequencesCheckpoint(alloc, io, path, store, &[_]AppliedSequenceUpdate{update});
+        try setAppliedSequencesCheckpointWithStorage(storage, alloc, io, path, store, &[_]AppliedSequenceUpdate{update});
         return;
     }
-    if (update.status != .clean or update.generation != 0) try revokeCompletion(alloc, store);
-    try saveAppliedSequence(store, update.index_name, update.sequence);
+    try saveProjectionMetadataUpdates(alloc, store, &.{update}, .set);
 }
 
 pub fn saveProjectionCheckpointWithSidecar(
@@ -352,12 +534,23 @@ pub fn saveProjectionCheckpointWithSidecar(
     index_name: []const u8,
     checkpoint: ProjectionCheckpoint,
 ) !void {
+    return saveProjectionCheckpointWithSidecarWithStorage(null, alloc, io, store, checkpoint_path, index_name, checkpoint);
+}
+
+pub fn saveProjectionCheckpointWithSidecarWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    index_name: []const u8,
+    checkpoint: ProjectionCheckpoint,
+) !void {
     if (comptime builtin.os.tag == .freestanding) {
-        try revokeCompletion(alloc, store);
-        return try saveAppliedSequence(store, index_name, checkpoint.applied_sequence);
+        return try saveProjectionMetadataUpdates(alloc, store, &.{.{ .index_name = index_name, .sequence = checkpoint.applied_sequence, .status = checkpoint.status, .generation = checkpoint.generation, .config_hash = checkpoint.config_hash, .published_count = checkpoint.published_count }}, .replace);
     }
     if (checkpoint_path) |path| {
-        try setProjectionCheckpoints(alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
+        try setProjectionCheckpointsWithStorage(storage, alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
             .index_name = index_name,
             .sequence = checkpoint.applied_sequence,
             .status = checkpoint.status,
@@ -367,11 +560,7 @@ pub fn saveProjectionCheckpointWithSidecar(
         }});
         return;
     }
-    // Metadata-only stores cannot compare lifecycle identities in the legacy
-    // scalar watermark. Explicit checkpoint replacement must revoke; ordinary
-    // forward sequence updates retain their cheaper monotonic path.
-    try revokeCompletion(alloc, store);
-    try saveAppliedSequence(store, index_name, checkpoint.applied_sequence);
+    try saveProjectionMetadataUpdates(alloc, store, &.{.{ .index_name = index_name, .sequence = checkpoint.applied_sequence, .status = checkpoint.status, .generation = checkpoint.generation, .config_hash = checkpoint.config_hash, .published_count = checkpoint.published_count }}, .replace);
 }
 
 pub fn saveAppliedSequencesWithCheckpoint(
@@ -381,13 +570,24 @@ pub fn saveAppliedSequencesWithCheckpoint(
     checkpoint_path: ?[]const u8,
     updates: []const AppliedSequenceUpdate,
 ) !void {
+    return saveAppliedSequencesWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, updates);
+}
+
+pub fn saveAppliedSequencesWithCheckpointWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    updates: []const AppliedSequenceUpdate,
+) !void {
     if (updates.len == 0) return;
-    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveAppliedSequences(store, updates);
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveProjectionMetadataUpdates(alloc, store, updates, .advance);
     if (checkpoint_path) |path| {
-        try saveAppliedSequencesCheckpoint(alloc, io, path, store, updates);
+        try saveAppliedSequencesCheckpointWithStorage(storage, alloc, io, path, store, updates);
         return;
     }
-    try saveAppliedSequences(store, updates);
+    try saveProjectionMetadataUpdates(alloc, store, updates, .advance);
 }
 
 pub fn clearAppliedSequence(store: anytype, index_name: []const u8) !void {
@@ -406,9 +606,20 @@ pub fn clearAppliedSequenceWithCheckpoint(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !void {
+    return clearAppliedSequenceWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, index_name);
+}
+
+pub fn clearAppliedSequenceWithCheckpointWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    index_name: []const u8,
+) !void {
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try clearAppliedSequence(store, index_name);
     if (checkpoint_path) |path| {
-        try clearAppliedSequenceCheckpoint(alloc, io, path, store, index_name);
+        try clearAppliedSequenceCheckpointWithStorage(storage, alloc, io, path, store, index_name);
         return;
     }
     try clearAppliedSequence(store, index_name);
@@ -420,6 +631,16 @@ pub fn clearAppliedSequenceTxn(txn: anytype, index_name: []const u8) !void {
     var key_buf: [256]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ metadata_prefix, index_name });
     mutable_txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+    try clearProjectionMetadataTxn(mutable_txn, index_name);
+}
+
+fn clearProjectionMetadataTxn(txn: anytype, index_name: []const u8) !void {
+    const mutable_txn = txn;
+    var projection_key_buf: [256]u8 = undefined;
+    mutable_txn.delete(try projectionMetadataKey(&projection_key_buf, index_name)) catch |err| switch (err) {
         error.NotFound => {},
         else => return err,
     };
@@ -568,6 +789,9 @@ fn mergeSequenceMetadata(
     previous_sequence: u64,
     exact_sequence: bool,
 ) void {
+    // A max update cannot certify identity or counts for a replay prefix it
+    // has not reached. Exact replacements may intentionally rewind the cut.
+    if (!exact_sequence and update.sequence < previous_sequence) return;
     const previous_generation = checkpoint.generation;
     const previous_config_hash = checkpoint.config_hash;
     if (update.generation != 0) checkpoint.generation = update.generation;
@@ -586,12 +810,16 @@ fn mergeSequenceMetadata(
         else
             null;
     } else if (update.published_count) |count| {
-        checkpoint.published_count = count;
+        if (update.sequence == checkpoint.applied_sequence) checkpoint.published_count = count;
     }
 }
 
 fn loadProjectionCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
-    var checkpoint = try loadCheckpoint(alloc, io, path);
+    return loadProjectionCheckpointWithStorage(null, alloc, io, path, index_name);
+}
+
+fn loadProjectionCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
+    var checkpoint = try loadCheckpointWithStorage(storage, alloc, io, path);
     defer checkpoint.deinit(alloc);
     return checkpoint.map.get(index_name);
 }
@@ -769,10 +997,14 @@ pub fn invalidateProjectionCompletion(alloc: Allocator, store: anytype) !void {
 }
 
 fn saveAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
+    return saveAppliedSequencesCheckpointWithStorage(null, alloc, io, path, store, updates);
+}
+
+fn saveAppliedSequencesCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
         else => return err,
     };
@@ -785,14 +1017,18 @@ fn saveAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8
         revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
     }
     if (revoke) try revokeCompletion(alloc, store);
-    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
+    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
 }
 
 fn saveProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
+    return saveProjectionCheckpointsWithStorage(null, alloc, io, path, updates);
+}
+
+fn saveProjectionCheckpointsWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
         else => return err,
     };
@@ -801,14 +1037,18 @@ fn saveProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, upd
     for (updates) |update| {
         try checkpoint.putMax(alloc, update.index_name, update.checkpoint());
     }
-    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
+    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
 }
 
 fn setAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
+    return setAppliedSequencesCheckpointWithStorage(null, alloc, io, path, store, updates);
+}
+
+fn setAppliedSequencesCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
         else => return err,
     };
@@ -821,14 +1061,18 @@ fn setAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8,
         revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
     }
     if (revoke) try revokeCompletion(alloc, store);
-    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
+    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
 }
 
 fn setProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
+    return setProjectionCheckpointsWithStorage(null, alloc, io, path, store, updates);
+}
+
+fn setProjectionCheckpointsWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
         else => return err,
     };
@@ -841,28 +1085,39 @@ fn setProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, stor
         revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
     }
     if (revoke) try revokeCompletion(alloc, store);
-    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
+    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
 }
 
 fn clearAppliedSequenceCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, index_name: []const u8) !void {
+    return clearAppliedSequenceCheckpointWithStorage(null, alloc, io, path, store, index_name);
+}
+
+fn clearAppliedSequenceCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, index_name: []const u8) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
     // Revoke even when the sidecar is already missing. Absence cannot retain
     // a completion prefix captured before a crash or interrupted replacement.
     try revokeCompletion(alloc, store);
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
     defer checkpoint.deinit(alloc);
 
     checkpoint.remove(alloc, index_name);
-    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
+    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
 }
 
 fn loadCheckpoint(alloc: Allocator, io: std.Io, path: []const u8) !CheckpointMap {
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(checkpoint_max_bytes));
+    return loadCheckpointWithStorage(null, alloc, io, path);
+}
+
+fn loadCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8) !CheckpointMap {
+    const raw = if (storage) |files|
+        try files.readFileAlloc(alloc, path, checkpoint_max_bytes)
+    else
+        try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(checkpoint_max_bytes));
     defer alloc.free(raw);
     return try decodeCheckpoint(alloc, raw);
 }
@@ -986,9 +1241,24 @@ fn appendCheckpointInt(
 }
 
 fn writeCheckpointAtomically(alloc: Allocator, io: std.Io, path: []const u8, checkpoint: *const CheckpointMap) !void {
+    return writeCheckpointAtomicallyWithStorage(null, alloc, io, path, checkpoint);
+}
+
+fn writeCheckpointAtomicallyWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, checkpoint: *const CheckpointMap) !void {
     const encoded = try encodeCheckpoint(alloc, checkpoint);
     defer alloc.free(encoded);
 
+    if (storage) |files| {
+        if (std.fs.path.dirname(path)) |parent| try files.createDirPath(parent);
+        const staging = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+        defer alloc.free(staging);
+        try files.writeFileAbsolute(staging, encoded);
+        errdefer files.deleteFileAbsolute(staging) catch {};
+        try files.syncFileContentsAbsolute(staging);
+        try files.renameAbsolute(staging, path);
+        try files.syncParentAbsolute(path);
+        return;
+    }
     if (std.fs.path.dirname(path)) |parent| {
         try fs_paths.createDirPathPortable(io, parent);
     }
@@ -1010,6 +1280,164 @@ fn writeCheckpointAtomically(alloc: Allocator, io: std.Io, path: []const u8, che
         return err;
     };
     try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
+}
+
+test "projection metadata preserves lifecycle without a sidecar (#1207)" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+    // Old files still expose progress without inventing a recovery identity.
+    try saveAppliedSequence(runtime, "text", 7);
+    const legacy = try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text");
+    try std.testing.expectEqual(@as(u64, 7), legacy.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 0), legacy.config_hash);
+    const expected = ProjectionCheckpoint{ .applied_sequence = 8, .status = .degraded, .generation = 3, .config_hash = 42, .published_count = 0 };
+    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text", expected);
+    try std.testing.expectEqualDeep(expected, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
+    try std.testing.expectEqual(@as(u64, 8), try loadAppliedSequence(alloc, runtime, "text"));
+    // Ordinary replay preserves lifecycle and expires a count certificate when
+    // its physical boundary advances. A stale max update cannot move it back.
+    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, null, &.{.{ .index_name = "text", .sequence = 9 }});
+    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, null, &.{.{ .index_name = "text", .sequence = 8, .published_count = 99 }});
+    var advanced = expected;
+    advanced.applied_sequence = 9;
+    advanced.published_count = null;
+    try std.testing.expectEqualDeep(advanced, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
+    try saveAppliedSequence(runtime, "text", 10);
+    advanced.applied_sequence = 10;
+    try std.testing.expectEqualDeep(advanced, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
+    // Explicit replacement admits a clean new incarnation, even at zero.
+    const replacement = ProjectionCheckpoint{ .generation = 4, .config_hash = 43, .published_count = 0 };
+    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text", replacement);
+    try std.testing.expectEqualDeep(replacement, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
+    {
+        var txn = try runtime.beginWrite();
+        defer txn.abort();
+        try clearAppliedSequenceTxn(&txn, "text");
+    }
+    try std.testing.expectEqualDeep(replacement, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
+    try clearAppliedSequence(runtime, "text");
+    try std.testing.expectEqualDeep(ProjectionCheckpoint{}, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
+}
+
+test "projection metadata rejects stale identity after legacy scalar changes (#1207)" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    const certified = ProjectionCheckpoint{ .applied_sequence = 100, .generation = 2, .config_hash = 42, .published_count = 1 };
+    for ([_]?u64{ 101, 99, null }) |legacy_sequence| {
+        try saveProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text", certified);
+        try std.testing.expectEqualDeep(certified, try loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text"));
+        // Model an older binary advancing, rewinding, or clearing only the
+        // legacy key, without knowledge of the enriched record.
+        {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            if (legacy_sequence) |sequence| {
+                var raw: [8]u8 = undefined;
+                std.mem.writeInt(u64, &raw, sequence, .little);
+                try txn.put(metadata_prefix ++ "text", &raw);
+            } else {
+                try txn.delete(metadata_prefix ++ "text");
+            }
+            try txn.commit();
+        }
+        const observed = try loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text");
+        try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = legacy_sequence orelse 0 }, observed);
+        // A new scalar-only write must not resurrect the rejected identity by
+        // returning to the sequence still stored in the old enriched record.
+        try saveAppliedSequence(runtime, "text", 100);
+        try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = 100 }, try loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text"));
+    }
+    // Max replay updates also start from legacy progress and cannot restore
+    // a stale certificate or rewind a more recent scalar watermark.
+    try saveProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text", certified);
+    {
+        var txn = try runtime.beginWrite();
+        errdefer txn.abort();
+        var raw: [8]u8 = undefined;
+        std.mem.writeInt(u64, &raw, 101, .little);
+        try txn.put(metadata_prefix ++ "text", &raw);
+        try txn.commit();
+    }
+    try saveAppliedSequencesWithCheckpoint(a, std.testing.io, runtime, null, &.{.{ .index_name = "text", .sequence = 99, .generation = 2, .config_hash = 42, .published_count = 1 }});
+    try std.testing.expectEqual(@as(u64, 101), try loadAppliedSequence(a, runtime, "text"));
+    try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = 101 }, try loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text"));
+}
+
+test "max replay updates preserve newer projection identity (#1207)" {
+    const a = std.testing.allocator;
+    // The same merge implements primary metadata and sidecar updates. A stale
+    // update must retain a certified identity and must not invent a missing one.
+    for ([_]ProjectionCheckpoint{
+        .{ .applied_sequence = 101 },
+        .{ .applied_sequence = 101, .generation = 2, .config_hash = 42, .published_count = 3 },
+        .{ .applied_sequence = 101, .status = .degraded, .generation = 2, .config_hash = 42 },
+    }) |previous| {
+        var checkpoints = CheckpointMap{};
+        defer checkpoints.deinit(a);
+        try checkpoints.put(a, "text", previous);
+        try checkpoints.putMaxSequenceUpdate(a, .{ .index_name = "text", .sequence = 99, .generation = 7, .config_hash = 77, .published_count = 9 });
+        try std.testing.expectEqualDeep(previous, checkpoints.map.get("text").?);
+        // Once an update reaches a new cut, its own identity/count proof can
+        // be published. No older certificate is rebound to that new sequence.
+        try checkpoints.putMaxSequenceUpdate(a, .{ .index_name = "text", .sequence = 102, .generation = 3, .config_hash = 43, .published_count = 4 });
+        try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = 102, .status = previous.status, .generation = 3, .config_hash = 43, .published_count = 4 }, checkpoints.map.get("text").?);
+        // Explicit sequence replacement remains authoritative at an older cut.
+        try checkpoints.putSequenceUpdate(a, .{ .index_name = "text", .sequence = 99, .generation = 4, .config_hash = 44, .published_count = 2 });
+        try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = 99, .status = previous.status, .generation = 4, .config_hash = 44, .published_count = 2 }, checkpoints.map.get("text").?);
+    }
+}
+
+test "projection metadata replacement recovers corrupt records and revokes proof (#1207)" {
+    const a = std.testing.allocator;
+    const publication = @import("../artifact_publication.zig");
+    const epoch = @import("../artifact_projection_epoch.zig");
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    {
+        var txn = try runtime.beginWrite();
+        errdefer txn.abort();
+        try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try txn.commit();
+    }
+    const certified = ProjectionCheckpoint{ .applied_sequence = 100, .generation = 2, .config_hash = 42, .published_count = 1 };
+    const replacement = ProjectionCheckpoint{ .generation = 3, .config_hash = 42, .published_count = 0 };
+    for ([_]enum { enriched, scalar, both }{ .enriched, .scalar, .both }) |corrupt| {
+        try saveProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text", certified);
+        const prior_epoch = blk: {
+            var txn = try runtime.beginWrite();
+            errdefer txn.abort();
+            if (corrupt != .scalar) try txn.put(projection_metadata_prefix ++ "text", "corrupt");
+            if (corrupt != .enriched) try txn.put(metadata_prefix ++ "text", "corrupt");
+            const previous_epoch = try epoch.load(&txn);
+            try txn.commit();
+            break :blk previous_epoch;
+        };
+        // Ordinary observations and replay remain fail-closed. Only explicit
+        // replacement is authorized to overwrite the damaged recovery proof.
+        try std.testing.expectError(error.InvalidDerivedApplyState, loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text"));
+        try std.testing.expectError(error.InvalidDerivedApplyState, saveAppliedSequencesWithCheckpoint(a, std.testing.io, runtime, null, &.{.{ .index_name = "text", .sequence = 101 }}));
+        try saveProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text", replacement);
+        try std.testing.expectEqualDeep(replacement, try loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text"));
+        try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(a, runtime, "text"));
+        var txn = try runtime.beginProbe();
+        defer txn.abort();
+        try std.testing.expect((try epoch.load(&txn)) > prior_epoch);
+    }
+}
+
+test "projection metadata rejects corrupt recovery identities (#1207)" {
+    var encoded = encodeProjectionMetadata(.{ .applied_sequence = 9, .generation = 3, .config_hash = 42 });
+    try std.testing.expectError(error.InvalidDerivedApplyState, decodeProjectionMetadata(encoded[0..8]));
+    encoded[17] ^= 1;
+    try std.testing.expectError(error.InvalidDerivedApplyState, decodeProjectionMetadata(&encoded));
 }
 
 test "derived apply state works with memory backend store" {
@@ -1366,9 +1794,24 @@ test "applied sequence checkpoint preserves projection metadata" {
     const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
     try std.testing.expectEqual(@as(u64, 45), checkpoint.applied_sequence);
     try std.testing.expectEqual(ProjectionStatus.repair_required, checkpoint.status);
-    try std.testing.expectEqual(@as(u64, 10), checkpoint.generation);
-    try std.testing.expectEqual(@as(u64, 0x5678), checkpoint.config_hash);
+    try std.testing.expectEqual(@as(u64, 9), checkpoint.generation);
+    try std.testing.expectEqual(@as(u64, 0x1234), checkpoint.config_hash);
     try std.testing.expectEqual(@as(?u64, null), checkpoint.published_count);
+
+    // Stale replay cannot relabel the retained cut, but an update that reaches
+    // a newer boundary may publish its own generation/configuration identity.
+    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, &.{.{
+        .index_name = "dense_idx",
+        .sequence = 46,
+        .generation = 10,
+        .config_hash = 0x5678,
+    }});
+    const advanced = try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
+    try std.testing.expectEqual(@as(u64, 46), advanced.applied_sequence);
+    try std.testing.expectEqual(ProjectionStatus.repair_required, advanced.status);
+    try std.testing.expectEqual(@as(u64, 10), advanced.generation);
+    try std.testing.expectEqual(@as(u64, 0x5678), advanced.config_hash);
+    try std.testing.expectEqual(@as(?u64, null), advanced.published_count);
 }
 
 fn writeRawCheckpointTestFile(io: std.Io, path: []const u8, raw: []const u8) !void {
@@ -1513,4 +1956,24 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
         try std.testing.expectEqual(@as(u64, @intCast(i + 1)), checkpoint.applied_sequence);
         try std.testing.expectEqual(ProjectionStatus.clean, checkpoint.status);
     }
+}
+
+test "projection checkpoint external storage keeps shadow progress isolated (#1210)" {
+    const alloc = std.testing.allocator;
+    var primary = mem_backend.Backend.init(alloc, .{});
+    defer primary.close();
+    var runtime = try primary.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+    var files = @import("../../lsm_backend/mod.zig").MemoryStorage.init(alloc);
+    defer files.deinit();
+    const path = "/virtual/shadow/applied-sequences";
+    const checkpoint: ProjectionCheckpoint = .{ .applied_sequence = 8, .generation = 3, .config_hash = 42, .published_count = 2 };
+    try saveProjectionCheckpointWithSidecarWithStorage(files.storage(), alloc, .failing, runtime, path, "img", checkpoint);
+    try std.testing.expectEqualDeep(checkpoint, try loadProjectionCheckpointWithSidecarWithStorage(files.storage(), alloc, .failing, runtime, path, "img"));
+    try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(alloc, runtime, "img"));
+    try saveAppliedSequenceWithCheckpointWithStorage(files.storage(), alloc, .failing, runtime, path, "img", 9);
+    const advanced = try loadProjectionCheckpointWithSidecarWithStorage(files.storage(), alloc, .failing, runtime, path, "img");
+    try std.testing.expectEqual(@as(u64, 9), advanced.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 3), advanced.generation);
+    try std.testing.expectEqual(@as(?u64, null), advanced.published_count);
 }

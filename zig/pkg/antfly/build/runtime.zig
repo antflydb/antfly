@@ -127,6 +127,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     const antfly_main = b.addExecutable(.{
         .name = "antfly",
         .root_module = antfly_main_mod,
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
     });
 
     var runtime_library_artifacts: [@typeInfo(RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile = @splat(null);
@@ -217,10 +218,12 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
                 b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
             .root_module = role_mod,
             .linkage = .static,
+            .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
             .max_rss = compile_max_rss,
         });
-        if (unit == .inference and production_antfly_imports.shared_inference_core)
-            role_artifact.root_module.linkLibrary(options.native_inference);
+        // Final images select their inference provider. Source-level owner
+        // fixtures compile it locally; production images link the archive.
+        // Keep that choice off this shared adapter's transitive link graph.
         const runtime_unit_step = b.step(
             b.fmt("runtime-unit-{s}", .{@tagName(unit)}),
             b.fmt("Build only the {s} runtime library unit", .{@tagName(unit)}),
@@ -250,7 +253,6 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         }
     }
 
-    if (options.native_storage) |owner| antfly_main.root_module.linkLibrary(owner);
     if (options.native_storage) |owner| {
         // Exercise the server's production build/source options against the
         // independently compiled Apache owner, not just the embedded profile.
@@ -290,15 +292,20 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     const linked_inference_abi_integration = b.addExecutable(.{
         .name = "linked-inference-abi-integration",
         .root_module = linked_inference_abi_integration_mod,
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
     });
     linked_inference_abi_integration.root_module.linkLibrary(
         runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?,
     );
+    if (production_antfly_imports.shared_inference_core) linked_inference_abi_integration_mod.linkLibrary(options.native_inference);
     const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
 
     for (runtime_library_link_order) |unit| {
         antfly_main.root_module.linkLibrary(runtime_library_artifacts[@backingInt(unit)].?);
     }
+    // ELF's archive extraction must see the adapter's undefined calls before
+    // the shared physical owner. Mach-O also permits this dependency order.
+    if (options.native_storage) |owner| antfly_main.root_module.linkLibrary(owner);
 
     if (runtime_artifact_role) |role| {
         const role_options = b.addOptions();
@@ -321,6 +328,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         const role_exe = b.addExecutable(.{
             .name = b.fmt("antfly-{s}", .{role_name}),
             .root_module = role_mod,
+            .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
         });
         role_exe.link_gc_sections = true;
         switch (role) {
@@ -334,6 +342,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             },
             .inference => {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
+                if (production_antfly_imports.shared_inference_core) role_exe.root_module.linkLibrary(options.native_inference);
             },
             .standalone => {
                 role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);

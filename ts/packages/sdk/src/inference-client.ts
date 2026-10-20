@@ -12,6 +12,10 @@ import {
 } from "./inference-codec.js";
 import type {
   ChunkConfig,
+  ChunkEmbeddingContext,
+  ChunkEmbeddingRequest,
+  ChunkEmbeddingResponse,
+  ChunkEmbeddingStreamEvent,
   ChunkResponse,
   ClassificationResult,
   DecideRequest,
@@ -23,6 +27,7 @@ import type {
   ExtractResponse,
   ExtractV2Request,
   GenerateChunk,
+  GeneratedExtractRequest,
   GenerateRequest,
   GenerateResponse,
   InferenceConfig,
@@ -355,7 +360,107 @@ export class InferenceClient {
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Chunk failed: unexpected empty response");
+    if (data.object !== "list") throw new Error("Unexpected chunk response type");
     return data;
+  }
+
+  /** Plan and optionally embed text, PDF, image, GIF, audio or video chunks. */
+  async chunkAndEmbed(
+    request: ChunkEmbeddingRequest,
+    options?: RequestOptions
+  ): Promise<ChunkEmbeddingResponse> {
+    const { data, error, response } = await this.client.POST("/ai/v1/chunk", {
+      body: { ...request, stream: false },
+      signal: options?.signal,
+    });
+    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (data?.object !== "chunk.embedding.list")
+      throw new Error("Unexpected chunk embedding response");
+    return data;
+  }
+
+  /** A stream is confirmed only after its terminal coverage record is yielded. */
+  async *chunkAndEmbedStream(
+    request: ChunkEmbeddingRequest,
+    options?: RequestOptions
+  ): AsyncGenerator<ChunkEmbeddingStreamEvent> {
+    const response = await fetch(`${this.baseUrl}/ai/v1/chunk`, {
+      method: "POST",
+      headers: { ...this.headers, Accept: "application/x-ndjson" },
+      body: JSON.stringify({ ...request, stream: true }),
+      signal: options?.signal,
+    });
+    if (!response.ok)
+      throw inferenceAPIError(
+        response.status,
+        await readLimitedResponseText(response, MAX_INFERENCE_ERROR_BYTES)
+      );
+    if (
+      response.headers.get("content-type")?.split(";", 1)[0]?.trim() !== "application/x-ndjson" ||
+      !response.body
+    )
+      throw new Error("Expected chunk embedding NDJSON stream");
+    let plan: string | undefined = request.continuation?.slice(0, 64);
+    let next: number | undefined = request.continuation
+      ? Number(request.continuation.slice(65))
+      : 0;
+    let context: ChunkEmbeddingContext | undefined;
+    for await (const value of parseChunkEmbeddingLines(response.body)) {
+      if (value.object === "chunk.embedding.start") {
+        const header = value.context;
+        if (
+          context ||
+          !header ||
+          !/^[0-9a-f]{64}$/.test(header.plan_id) ||
+          !/^[0-9a-f]{64}$/.test(header.model_identity) ||
+          !/^[0-9a-f]{64}$/.test(header.model_revision) ||
+          !/^[0-9a-f]{64}$/.test(header.source_fingerprint) ||
+          header.model !== request.embedding.model ||
+          header.start_ordinal !== next ||
+          (plan !== undefined && plan !== header.plan_id) ||
+          (request.embedding.model_identity !== undefined &&
+            request.embedding.model_identity !== header.model_identity)
+        )
+          throw new Error("Invalid chunk stream context");
+        context = header;
+        plan = header.plan_id;
+        yield value;
+      } else if (value.object === "chunk.embedding") {
+        if (!context) throw new Error("Missing chunk stream context");
+        const descriptor = value.data.descriptor;
+        const prefix = descriptor.id.slice(0, 64);
+        if (
+          !/^[0-9a-f]{64}$/.test(prefix) ||
+          descriptor.id !== `${prefix}:${descriptor.ordinal}` ||
+          !Number.isSafeInteger(descriptor.ordinal) ||
+          descriptor.ordinal < 0 ||
+          (plan !== undefined && plan !== prefix) ||
+          (next !== undefined && next !== descriptor.ordinal)
+        )
+          throw new Error("Invalid chunk stream identity or order");
+        plan = prefix;
+        next = descriptor.ordinal + 1;
+        yield value;
+      } else if (value.object === "chunk.embedding.complete") {
+        if (
+          !context ||
+          value.response.model_identity !== context.model_identity ||
+          value.response.model_revision !== context.model_revision ||
+          value.response.source_fingerprint !== context.source_fingerprint ||
+          value.response.source_version !== context.source_version ||
+          value.response.model !== context.model ||
+          value.response.task_type !== context.task_type ||
+          value.response.start_ordinal !== context.start_ordinal ||
+          (context.dimensions != null && value.response.dimensions !== context.dimensions) ||
+          (plan !== undefined && value.response.plan_id !== plan) ||
+          (next !== undefined && value.response.covered_through_ordinal !== next)
+        )
+          throw new Error("Chunk terminal coverage does not match delivered results");
+        yield value;
+        return;
+      } else throw new Error("Unknown chunk stream event");
+    }
+    throw new Error("Chunk stream ended before terminal coverage");
   }
 
   /**
@@ -454,6 +559,16 @@ export class InferenceClient {
     if (expectedIds !== undefined) {
       validateExtractionV2Response(data, expectedModel, expectedIds);
     }
+    return data;
+  }
+
+  /** Extract source-grounded mentions with a registered generator. */
+  async extractGenerated(request: GeneratedExtractRequest): Promise<ExtractResponse> {
+    const { data, error, response } = await this.client.POST("/ai/v1/extract", {
+      body: request,
+    });
+    if (!response.ok) throw inferenceAPIError(response.status, error);
+    if (!data) throw new Error("Extract failed: unexpected empty response");
     return data;
   }
 
@@ -868,4 +983,47 @@ function normalizeBaseUrl(baseUrl: string): string {
   }
 
   return trimmed;
+}
+
+async function* parseChunkEmbeddingLines(
+  body: ReadableStream<Uint8Array>
+): AsyncGenerator<ChunkEmbeddingStreamEvent> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let pending = "";
+  let bytes = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        if (pending.trim()) throw new Error("Truncated chunk stream record");
+        return;
+      }
+      let start = 0;
+      for (let offset = 0; offset < value.length; offset++) {
+        if (value[offset] !== 10) continue;
+        const part = value.subarray(start, offset);
+        bytes += part.length;
+        if (bytes > MAX_INFERENCE_JSON_RESPONSE_BYTES)
+          throw new Error("Chunk stream record exceeds response limit");
+        const line = pending + decoder.decode(part, { stream: false });
+        pending = "";
+        bytes = 0;
+        start = offset + 1;
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+        if (event.object === "chunk.embedding.error")
+          throw new Error(`Chunk stream initialization failed: ${event.code}`);
+        yield event as ChunkEmbeddingStreamEvent;
+      }
+      const tail = value.subarray(start);
+      bytes += tail.length;
+      if (bytes > MAX_INFERENCE_JSON_RESPONSE_BYTES)
+        throw new Error("Chunk stream record exceeds response limit");
+      pending += decoder.decode(tail, { stream: true });
+    }
+  } finally {
+    await reader.cancel();
+    reader.releaseLock();
+  }
 }

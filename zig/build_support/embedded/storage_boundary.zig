@@ -25,7 +25,7 @@ pub const Modules = struct {
     ordinals: *std.Build.Module,
     shared_core: bool,
     engine_options: *std.Build.Step.Options,
-    engine_errors: ?*std.Build.Module,
+    engine_errors: *std.Build.Module,
     test_error_logs: *std.Build.Module,
     memory: *std.Build.Module,
     failure: *std.Build.Module,
@@ -49,7 +49,7 @@ pub const Modules = struct {
         module.addImport("antfly_test_error_logs", self.test_error_logs);
         module.addImport("storage_ordinals", self.ordinals);
         module.addOptions("storage_engine_options", self.engine_options);
-        if (self.engine_errors) |errors| module.addImport("storage_engine_errors", errors);
+        module.addImport("storage_engine_errors", self.engine_errors);
         module.addOptions("storage_source_options", if (control) self.control_sources else self.physical_sources);
         module.addOptions("standalone_runtime_options", if (linked) self.linked_runtime else self.direct_runtime);
     }
@@ -122,7 +122,13 @@ pub fn createWithOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimi
         .ordinals = ordinals,
         .shared_core = native,
         .engine_options = engine_options,
-        .engine_errors = options.error_names,
+        // Named callbacks preserve error identities in direct-source builds too,
+        // including Wasm. Native owners can share their existing decoder module.
+        .engine_errors = options.error_names orelse b.createModule(.{
+            .root_source_file = b.path("pkg/inference/src/host/engine_errors.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
         .test_error_logs = test_error_logs,
         .memory = memory,
         .failure = failure,

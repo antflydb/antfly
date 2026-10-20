@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from subprocess_watchdog import run_with_progress_deadline
 
 import antfly_embedded
 from antfly_embedded._library import find_library
@@ -118,6 +119,9 @@ def test_index_readiness_visible_on_open_and_status_only_handles(aflite_path) ->
                     "node:a": {
                         "name": "a",
                         "embedding": [1, 0, 0, 0],
+                        # External vector indexes consume the explicit index
+                        # payload; a document field alone is not replay work.
+                        "_embeddings": {"vec": [1, 0, 0, 0]},
                         "_edges": {"graph": {"KNOWS": [{"target": "node:b"}]}},
                     }
                 }
@@ -144,20 +148,31 @@ def test_index_readiness_visible_on_open_and_status_only_handles(aflite_path) ->
 @pytest.mark.parametrize("wait_mode", ["run_until_idle", "full_index"])
 def test_external_dense_index_wait_finishes(aflite_path, wait_mode: str) -> None:
     # The DocStore unit test proves the lock order. Exercise the real Lite
-    # workload here with a child-process deadline for each wait mode.
+    # workload here with a deadline for each native call, not for all 16
+    # batches combined. A slow runner must still detect an actual stalled call.
     library = find_library()
     assert library is not None
     env = os.environ.copy()
     env["ANTFLY_LIBRARY"] = str(library)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(Path(__file__).parents[1] / "src"), env.get("PYTHONPATH"))))
-    result = subprocess.run(
-        [sys.executable, __file__, str(aflite_path), wait_mode],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-        env=env,
-    )
+    try:
+        result = run_with_progress_deadline(
+            [sys.executable, __file__, str(aflite_path), wait_mode],
+            env=env,
+            progress_prefix=f"{wait_mode}:",
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # The watchdog kills and joins the child before raising. Preserve its
+        # native diagnostics; pytest otherwise reports only the command, hiding
+        # whether this was a replay stall, startup panic, or teardown failure.
+        def output(value: str | bytes | None) -> str:
+            return value.decode(errors="replace") if isinstance(value, bytes) else value or ""
+
+        pytest.fail(
+            f"{wait_mode} made no progress for 30 seconds\nstdout:\n{output(exc.stdout)}\nstderr:\n{output(exc.stderr)}",
+            pytrace=False,
+        )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -187,14 +202,19 @@ def _run_wait_workload(path: str, wait_mode: str) -> None:
                     ),
                 }
             )
-        for batch in batches:
+        for ordinal, batch in enumerate(batches):
+            print(f"{wait_mode}: batch {ordinal} write", flush=True)
             inserts = {key: {field: expand(value) for field, value in doc.items()} for key, doc in batch.items()}
             request: dict[str, object] = {"inserts": inserts}
             if wait_mode == "full_index":
                 request["sync_level"] = "full_index"
             db.batch_json(request)
             if wait_mode == "run_until_idle":
+                print(f"{wait_mode}: batch {ordinal} drain", flush=True)
                 db.run_until_idle()
+            print(f"{wait_mode}: batch {ordinal} complete", flush=True)
+        print(f"{wait_mode}: closing", flush=True)
+    print(f"{wait_mode}: closed", flush=True)
 
 
 if __name__ == "__main__":
@@ -751,7 +771,9 @@ def test_index_upgrade_and_retired_identity_management(tmp_path, storage, order)
         db.merge_resolver_keys("concepts", "entity/ada", "entity/canonical")
         db.run_until_idle()
         reader_version = db.capabilities()["minimum_reader_version"]
-        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 2
+        # Durable curation uses the epoch-6 format; the fence
+        # must survive upgrades, retirement and reopening without weakening.
+        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 6
         with pytest.raises(antfly_embedded.InvalidArgumentError, match="retire"):
             db.drop_resolver_identity("concepts")
         upgraded = json.loads(json.dumps(config))
@@ -850,7 +872,7 @@ def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, stora
         config["resolvers"][0]["promote"] = True
         config["replaces"] = "knowledge_v1"
         db.add_index(config)
-        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.capabilities()["minimum_reader_version"] == 3
         before = db.list_resolver_identities()
         # Existing-target replacement must reject non-graph old indexes before
         # registering changed inline resolver config, for either storage mode.
@@ -863,7 +885,7 @@ def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, stora
         assert db.list_resolver_identities() == before
         db.add_index(config)
     with _open_graph_test(path, options) as db:
-        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.capabilities()["minimum_reader_version"] == 3
         assert db.list_resolver_identities() == before
 
 
@@ -944,7 +966,7 @@ def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path)
         config = _resolver_graph("knowledge", "concepts")
         config["resolvers"][0]["promote"] = True
         db.add_index(config)
-        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.capabilities()["minimum_reader_version"] == 3
     # Hosted maintenance leaves the shadow pending deterministically. The old
     # writer must fail open before it can truncate the retained journal.
     with antfly_embedded.create_hosted(pending) as db:
@@ -1369,7 +1391,120 @@ def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
         with db.open_table("source") as table:
             table.add_index(_resolver_graph("knowledge", "concepts", destination="source"))
         assert db.cancel_replacement("new")
-        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.capabilities()["minimum_reader_version"] == 3
     with _open_graph_test(path, options) as db:
         # Permanent aggregation is durable, even before opening the child.
-        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.capabilities()["minimum_reader_version"] == 3
+
+
+@pytest.mark.parametrize("promote", [False, True])
+@pytest.mark.parametrize("write_count", [1, 10])
+def test_inline_resolver_background_work_settles_after_writes(aflite_path, promote, write_count) -> None:
+    options = antfly_embedded.OpenOptions(
+        profile=antfly_embedded.Profile.NATIVE, generated_enrichment_replay=True, busy_timeout=5.0
+    )
+    with antfly_embedded.create_with_options(aflite_path, options) as db:
+        schema = {"document_schemas": {"default": {"schema": {"type": "object", "additionalProperties": True}}}}
+        db.create_table("concepts", schema)
+        db.create_table("docs", schema)
+        with db.open_table("docs") as docs:
+            request = {
+                "name": "kg",
+                "kind": "graph",
+                "config_json": json.dumps(
+                    {
+                        "source": {
+                            "artifact": "extraction",
+                            "path": "$.relations[*]",
+                            "format": "extraction_relation",
+                            "mention_edge_type": "about",
+                        },
+                        "artifact": {
+                            "name": "extraction",
+                            "kind": "asset",
+                            "source": {"type": "field", "value": "text"},
+                            "content_type": "application/json",
+                        },
+                        "edge_types": [{"name": "about"}],
+                        "resolvers": [
+                            {
+                                "name": "concepts",
+                                "table": "concepts",
+                                "source_artifact": "extraction",
+                                "resolution_artifact": "resolution",
+                                "key_template": "concept/{{ uslug _entity.text }}",
+                                "promote": promote,
+                            }
+                        ],
+                    }
+                ),
+            }
+            docs.add_index(request)
+            extraction = {"entities": [{"id": "a", "text": "Antfly", "label": "technology"}], "relations": []}
+            graph_name = "kg"
+            for ordinal in range(write_count):
+                docs.batch_json({"inserts": {f"d{ordinal}": {"text": json.dumps(extraction)}}, "sync_level": "write"})
+                if ordinal == 5:
+                    graph_name = "kg2"
+                    docs.add_index({**request, "name": graph_name, "replaces": "kg"})
+                if write_count > 1:
+                    time.sleep(0.1)
+            deadline = time.monotonic() + 30
+            while True:
+                stats = docs.pending_work_stats()
+                if (
+                    stats["enrichment"]["applied_sequence"] >= stats["enrichment"]["target_sequence"] > 0
+                    and not stats["resolution"]["catch_up_required"]
+                    and not stats["promotion"]["catch_up_required"]
+                    and graph_name in {index["name"] for index in docs.list_indexes()}
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    pytest.fail(f"background resolver work did not settle: {json.dumps(stats, sort_keys=True)}")
+                time.sleep(0.1)
+            assert docs.edges(graph_name, "d0", "about", antfly_embedded.GraphDirection.OUT)
+            sequence = stats["derived_target_sequence"]
+            # Let the real worker run several further rounds without a write
+            # or a foreground drain that could hide detached publication bugs.
+            time.sleep(2)
+            after = docs.pending_work_stats()
+            assert after["derived_target_sequence"] == sequence, after
+            assert not after["resolution"]["catch_up_required"], after
+            assert not after["promotion"]["catch_up_required"], after
+
+
+def test_native_child_replacement_replays_generated_artifacts_beside_idle_root(tmp_path):
+    options = antfly_embedded.OpenOptions(
+        storage=antfly_embedded.Storage.LITE,
+        profile=antfly_embedded.Profile.NATIVE,
+        generated_enrichment_replay=True,
+    )
+    with antfly_embedded.create_with_options(tmp_path / "child-replacement.aflite", options) as db:
+        db.create_table("child", {})
+        with db.open_table("child") as table:
+            table.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+            table.batch_json(
+                {
+                    "inserts": {
+                        "claim": {"links": ["old"], "kg": {"entities": [{"id": "a", "text": "Ada", "label": "person"}]}}
+                    }
+                }
+            )
+            table.run_until_idle()
+            replacement = _resolver_graph("new", "people", destination="child")
+            replacement["replaces"] = "old"
+            try:
+                table.add_index(dict(replacement, wait={"timeout_ms": 0}))
+            except antfly_embedded.BusyError:
+                pass
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                names = {index["name"] for index in table.list_indexes()}
+                if "new" in names and "old" not in names:
+                    break
+                time.sleep(0.02)
+            else:
+                pytest.fail(f"child replacement starved producer replay: {table.pending_work_stats()}")
+            assert [
+                base64.b64decode(edge["target_b64"]).decode() for edge in table.edges("new", "claim", "mentions", 0)
+            ] == ["entity/ada"]

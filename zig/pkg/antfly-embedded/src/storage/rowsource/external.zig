@@ -36,6 +36,7 @@ pub const Format = enum(u8) {
 };
 
 pub const Binding = struct {
+    identity_version: u8 = 1,
     format: Format,
     source_id: []const u8,
     source_uri: []const u8,
@@ -107,7 +108,9 @@ pub fn validateExternalBatch(binding: Binding, batch: rowsource.ColumnBatch) !vo
     try batch.validate();
     if (!std.mem.eql(u8, batch.snapshot.table_id, binding.source_id)) return error.InvalidExternalRowSource;
     if (!std.mem.eql(u8, batch.snapshot.snapshot_id, binding.snapshot_id)) return error.InvalidExternalRowSource;
-    for (batch.row_refs) |row_ref| {
+    if (batch.external_span != null) return; // validate() checked the shared identity.
+    for (0..batch.rowCount()) |row_index| {
+        const row_ref = batch.rowRef(row_index);
         switch (row_ref) {
             .external => |external| {
                 if (!std.mem.eql(u8, external.source_id, binding.source_id)) return error.InvalidExternalRowSource;
@@ -128,6 +131,7 @@ pub fn makeRowRef(
     try binding.validate();
     if (file_id.len == 0) return error.InvalidExternalRowSource;
     return .{ .external = .{
+        .identity_version = binding.identity_version,
         .source_id = binding.source_id,
         .snapshot_id = binding.snapshot_id,
         .file_id = file_id,

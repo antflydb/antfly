@@ -36,7 +36,16 @@ cleanup_server() {
 }
 
 cleanup() {
+  local smoke_exit=$?
   cleanup_server
+  if [[ "$smoke_exit" != 0 ]]; then
+    local log
+    for log in "$smoke_root"/*.log; do
+      [[ -f "$log" ]] || continue
+      echo "production runtime log: ${log##*/}" >&2
+      cat "$log" >&2
+    done
+  fi
   rm -rf -- "$smoke_root"
 }
 trap cleanup EXIT INT TERM
@@ -143,6 +152,12 @@ run_profile() {
   local tables_url="${catalog_url}/namespaces/public/tables"
   assert_http_status "$profile-catalog-database" 201 POST "$catalog_url" '{}'
   assert_http_status "$profile-catalog-table" 201 POST "$tables_url/events" '{}'
+  # A caller-owned Lite backend and the compiled physical engine have distinct
+  # Zig error domains. Cover absent reads, batch writes and durable reopen.
+  assert_http_status "$profile-document-missing" 404 GET "$tables_url/events/documents/smoke"
+  assert_http_status "$profile-document-write" 201 POST "$tables_url/events/batch" \
+    '{"inserts":{"smoke":{"value":7}},"sync_level":"write"}'
+  assert_http_status "$profile-document-before" 200 GET "$tables_url/events/documents/smoke"
   assert_http_status "$profile-catalog-before" 200 GET "$tables_url"
   cleanup_server
   "$binary" standalone \
@@ -153,6 +168,13 @@ run_profile() {
   server_pid="$!"
   wait_ready "$profile-reopen" "$port" "$log"
   assert_http_status "$profile-catalog-after" 200 GET "$tables_url"
+  assert_http_status "$profile-document-after" 200 GET "$tables_url/events/documents/smoke"
+  python3 -c '
+import json, sys
+before, after = (json.load(open(path)) for path in sys.argv[1:])
+assert before == after == {"value": 7}, (before, after)
+' "$smoke_root/$profile-document-before-response.txt" "$smoke_root/$profile-document-after-response.txt"
+
   python3 -c '
 import json, sys
 before, after = (json.load(open(path)) for path in sys.argv[1:])

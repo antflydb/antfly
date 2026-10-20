@@ -19,6 +19,7 @@ const build_options = @import("build_options");
 const generic = @import("inference_audio");
 
 pub const wav = generic.wav;
+pub const streaming = generic.streaming;
 pub const NormalizationType = generic.NormalizationType;
 pub const AudioConfig = generic.AudioConfig;
 pub const Audio = generic.Audio;

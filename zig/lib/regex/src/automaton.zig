@@ -92,6 +92,8 @@ const PatchList = struct {
 /// Compiled regex automaton for FST traversal.
 pub const RegexAutomaton = struct {
     alloc: Allocator,
+    owns_program: bool = true,
+    allocation_failed: bool = false,
     states: []NFAState,
     num_states: u16,
     char_classes: []CharClass,
@@ -114,19 +116,34 @@ pub const RegexAutomaton = struct {
     dfa_cache_transitions: std.ArrayListUnmanaged(usize),
 
     pub fn deinit(self: *RegexAutomaton) void {
-        self.alloc.free(self.states);
-        self.alloc.free(self.char_classes);
-        self.alloc.free(self.epsilon_closures);
-        for (self.prefix_literals) |prefix| self.alloc.free(prefix);
-        self.alloc.free(self.prefix_literals);
-        self.alloc.free(self.prefix_first_bytes);
-        self.alloc.free(self.prefix_check_offsets);
+        if (self.owns_program) {
+            self.alloc.free(self.states);
+            self.alloc.free(self.char_classes);
+            self.alloc.free(self.epsilon_closures);
+            for (self.prefix_literals) |prefix| self.alloc.free(prefix);
+            self.alloc.free(self.prefix_literals);
+            self.alloc.free(self.prefix_first_bytes);
+            self.alloc.free(self.prefix_check_offsets);
+        }
         self.dfa_cache_keys.deinit(self.alloc);
         self.dfa_cache_match.deinit(self.alloc);
         self.dfa_cache_index.deinit(self.alloc);
         self.dfa_cache_transitions.deinit(self.alloc);
     }
 
+    /// Borrow immutable compiled navigation and start a private DFA cache.
+    /// The program owner must outlive this execution; no mutable state is shared.
+    pub fn fork(self: *const RegexAutomaton, alloc: Allocator) RegexAutomaton {
+        var execution = self.*;
+        execution.alloc = alloc;
+        execution.owns_program = false;
+        execution.allocation_failed = false;
+        execution.dfa_cache_keys = .empty;
+        execution.dfa_cache_match = .empty;
+        execution.dfa_cache_index = .empty;
+        execution.dfa_cache_transitions = .empty;
+        return execution;
+    }
     /// Get an fst.Automaton interface for FST traversal.
     pub fn automaton(self: *RegexAutomaton) fst.Automaton {
         return .{
@@ -174,7 +191,12 @@ pub const RegexAutomaton = struct {
         if (self.dfa_cache_index.get(set)) |idx| return idx;
 
         const idx = self.dfa_cache_keys.items.len;
-        try self.dfa_cache_keys.append(self.alloc, set);
+        // Admit all columns before publishing a DFA state. An allocation
+        // failure must leave every existing transition/state index coherent.
+        try self.dfa_cache_keys.ensureUnusedCapacity(self.alloc, 1);
+        try self.dfa_cache_match.ensureUnusedCapacity(self.alloc, 1);
+        try self.dfa_cache_index.ensureUnusedCapacity(self.alloc, 1);
+        try self.dfa_cache_transitions.ensureUnusedCapacity(self.alloc, self.num_byte_classes);
 
         var is_match = false;
         var it = set.iterator(.{});
@@ -184,9 +206,9 @@ pub const RegexAutomaton = struct {
                 break;
             }
         }
-        try self.dfa_cache_match.append(self.alloc, is_match);
-        try self.dfa_cache_index.put(self.alloc, set, idx);
-        try self.dfa_cache_transitions.ensureUnusedCapacity(self.alloc, self.num_byte_classes);
+        self.dfa_cache_keys.appendAssumeCapacity(set);
+        self.dfa_cache_match.appendAssumeCapacity(is_match);
+        self.dfa_cache_index.putAssumeCapacity(set, idx);
         for (0..self.num_byte_classes) |_| {
             self.dfa_cache_transitions.appendAssumeCapacity(transition_unknown);
         }
@@ -200,7 +222,10 @@ pub const RegexAutomaton = struct {
         var initial = StateBitSet.empty;
         initial.set(self.start_state);
         const start_set = self.epsilonClosure(initial);
-        _ = self.lookupOrInsert(start_set) catch return dead_state;
+        _ = self.lookupOrInsert(start_set) catch {
+            self.allocation_failed = true;
+            return dead_state;
+        };
         return 0;
     }
 
@@ -236,7 +261,10 @@ pub const RegexAutomaton = struct {
             return dead_state;
         }
 
-        const next_state = self.lookupOrInsert(next_set) catch dead_state;
+        const next_state = self.lookupOrInsert(next_set) catch blk: {
+            self.allocation_failed = true;
+            break :blk dead_state;
+        };
         self.dfa_cache_transitions.items[transition_idx] = next_state;
         return next_state;
     }
@@ -258,13 +286,12 @@ pub fn compile(alloc: Allocator, pattern: []const u8) !RegexAutomaton {
         .pos = 0,
         .states = try alloc.alloc(NFAState, max_nfa_states),
         .num_states = 0,
-        .char_classes = try alloc.alloc(CharClass, 64),
+        .char_classes = undefined,
         .num_classes = 0,
     };
-    errdefer {
-        alloc.free(compiler.states);
-        alloc.free(compiler.char_classes);
-    }
+    errdefer alloc.free(compiler.states);
+    compiler.char_classes = try alloc.alloc(CharClass, 64);
+    errdefer alloc.free(compiler.char_classes);
 
     const frag = try compiler.parseExpr();
 

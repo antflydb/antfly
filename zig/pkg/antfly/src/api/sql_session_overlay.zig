@@ -199,7 +199,7 @@ const Cursor = struct {
     fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         var rows: std.ArrayList(catalog.Row) = .empty;
-        var layout: ?catalog.Row.TypedLayout = null;
+        var layout: ?*const catalog.Row.TypedLayout = null;
         while (rows.items.len < limit) {
             const native = try self.peek();
             const staged: ?catalog.Row = if (self.staged_index < self.staged.len) self.staged[self.staged_index] else null;

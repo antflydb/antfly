@@ -34,6 +34,13 @@ pub const Outcome = @import("native_outcome.zig").Outcome;
 pub const ReplayCallbacks = struct { progress: db.ReplayProgressHook };
 pub const ReplayBoundary = @import("named_callback.zig").Boundary(ReplayCallbacks);
 pub const BackupPlan = struct { value: @import("../api/backup_contract.zig").TableBackupPlan, io: ?native.IoBorrow };
+/// Restore owns a disposable generation; keep its record loops and errors in
+/// the physical storage unit. Callbacks here return no Zig error values.
+pub const PortableRestoreImportOptions = struct {
+    identity_namespace: ?@import("db/doc_identity.zig").Namespace = null,
+    embedding_source_fields: []const @import("portable_backup.zig").ImportOptions.EmbeddingSourceField = &.{},
+    cancellation: types.CancellationToken = .none,
+};
 pub const WriterBorrow = @import("native_writer.zig").Borrow;
 pub const PortableExportOptions = struct {
     value: @import("portable_backup.zig").ExportOptions,
@@ -54,6 +61,7 @@ pub const VTable = struct {
     resolutionStart: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
     resolutionStop: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
     resolutionCatchUp: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
+    resolutionCatchUpOnce: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime, deadline_ns: u64) Outcome(void),
     resolutionRequestReresolveBacklog: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
     resolutionHasReresolveBacklog: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(bool),
     resolutionRunReresolveBacklogWindow: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(@import("db/resolution_runtime.zig").ReresolveEnqueueResult),
@@ -143,6 +151,7 @@ pub const VTable = struct {
     prepareRestoreStagingIndexesStep: *const fn (self: *DB, alloc: std.mem.Allocator, scope: [32]u8) Outcome(bool),
     beginRestoreStaging: *const fn (self: *DB, alloc: std.mem.Allocator, scope: @import("db/restore_staging.zig").Scope) Outcome(void),
     finishRestoreStaging: *const fn (self: *DB, alloc: std.mem.Allocator, scope: @import("db/restore_staging.zig").Digest, phase: @import("db/restore_staging.zig").Phase) Outcome(@import("db/restore_staging.zig").Digest),
+    importPortableRestoreFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, options: PortableRestoreImportOptions) Outcome(void),
     importPortableFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, target_identity: @import("db/doc_identity.zig").Namespace) Outcome(void),
     importCohortPortableFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, proof: @import("portable_backup.zig").CohortProof, cancellation: types.CancellationToken) Outcome(void),
     openRelationalReadSession: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) Outcome(*DB.RelationalReadSession),
@@ -206,6 +215,11 @@ pub const VTable = struct {
     listIndexes: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]types.IndexConfig),
     listEnrichments: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]types.EnrichmentConfig),
     listResolvers: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]@import("db/catalog/index_manager.zig").ResolverConfig),
+    curateResolverJsonAlloc: *const fn (self: *DB, alloc: std.mem.Allocator, name: []const u8, request_json: []const u8) Outcome([]u8),
+    resolverCurationJsonAlloc: *const fn (self: *DB, alloc: std.mem.Allocator, name: []const u8) Outcome([]u8),
+    resolverReviewsJsonAlloc: *const fn (self: *DB, alloc: std.mem.Allocator, request_json: []const u8) Outcome([]u8),
+    listResolverIdentities: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig),
+    consumeResolverMetadataDrop: *const fn (self: *DB, alloc: std.mem.Allocator, identity: @import("db/resolver_curation.zig").MetadataIdentity) Outcome(void),
     pendingWorkStats: *const fn (self: *DB) Outcome(@import("db/core.zig").PendingWorkStats),
     runArtifactRepairMetadataMaintenanceUntilIdle: *const fn (self: *DB) Outcome(void),
     publishVectorBlockBasesOnline: *const fn (self: *DB, options: @import("db/catalog/index_manager.zig").IndexManager.OnlineVectorBlockPublicationOptions) Outcome(usize),
@@ -322,11 +336,18 @@ pub const VTable = struct {
     catchUpPendingDerivedReplayWithProgress: *const fn (*DB, *anyopaque, db.ReplayProgressHook, @import("named_callback.zig").Dispatch) Outcome(void),
     relationalSnapshotDeinit: *const fn (*DB.RelationalStatementSnapshot) Outcome(void),
     statementFenceRelease: *const fn (*DB.StatementReadFence) Outcome(void),
+    documentRowsUnderLease: *const fn (*const DB.QueryReadLease, Allocator, u32) Outcome(DB.DocumentRows),
+    documentRowsLookupProjectedBatch: *const fn (*DB.DocumentRows, []const []const u8, []const []const u8, usize) Outcome(DB.DocumentRows.ProjectedBatch),
+    documentRowsLookupBatch: *const fn (*DB.DocumentRows, []const []const u8, usize) Outcome(DB.DocumentRows.Batch),
+    documentRowsLookup: *const fn (*DB.DocumentRows, []const u8) Outcome([]const u8),
+    documentRowsReleasePage: *const fn (*DB.DocumentRows) Outcome(void),
+    documentRowsDeinit: *const fn (*DB.DocumentRows) Outcome(void),
     relationalRowsUnderLease: *const fn (*const DB.QueryReadLease, Allocator, []const []const u8, u32) Outcome(@import("db/relational_rows.zig").Reader),
     relationalReaderDeinit: *const fn (self: *@import("db/relational_rows.zig").Reader) Outcome(void),
     relationalReaderNextPage: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) Outcome(@import("db/relational_rows.zig").Page),
     relationalReaderNextTypedPage: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, io: ?native.IoBorrow, budget: @import("db/relational_rows.zig").Budget) Outcome(@import("db/relational_rows.zig").Page),
-    relationalReaderLookupTypedRow: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8) Outcome(?@import("db/relational_rows.zig").Row),
+    relationalReaderLookupSqlBatch: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, documents: []const []const u8, layout: *const @import("../sql/catalog.zig").Row.TypedLayout, max_bytes: usize) Outcome(@import("db/relational_rows.zig").Reader.Hydrated),
+    relationalReaderLookupTypedRow: *const fn (self: *@import("db/relational_rows.zig").Reader, alloc: Allocator, document: []const u8, native_cells: bool, shared: ?*?*const @import("../sql/catalog.zig").Row.TypedLayout) Outcome(?@import("db/relational_rows.zig").Row),
     relationalSessionDeinit: *const fn (session: *@import("db/relational_read_session.zig").Session) Outcome(void),
     relationalSessionCheckpoint: *const fn (session: *const @import("db/relational_read_session.zig").Session) Outcome(void),
     relationalSessionRangeProofs: *const fn (session: *@import("db/relational_read_session.zig").Session, alloc: Allocator) Outcome([]@import("range_protection.zig").Proof),
@@ -345,6 +366,8 @@ pub const VTable = struct {
     catchUpPendingDerivedReplay: *const fn (self: *DB) Outcome(void),
     derivedAsyncAppendDerivedBatchRecord: *const fn (self: *DB, derived_batch: @import("db/derived/derived_types.zig").DerivedBatch) Outcome(u64),
     runDerivedUntil: *const fn (self: *DB, sequence: u64) Outcome(void),
+    resolvedFilterTextIndexNameAlloc: *const fn (self: *DB, alloc: Allocator, primary: ?[]const u8, singleton: ?[]const u8) Outcome(?[]u8),
+    waitForCurrentIndexTargets: *const fn (self: *DB, index_names: []const []const u8, deadline_ns: u64) Outcome(u64),
     runDerivedUntilTargets: *const fn (self: *DB, sequence: u64, index_names: []const []const u8) Outcome(void),
     runRelationalIndexMaintenancePass: *const fn (self: *DB) Outcome(bool),
     runRelationalIndexMaintenanceUntilIdle: *const fn (self: *DB, cancellation: types.CancellationToken, deadline_ns: ?u64) Outcome(void),
@@ -366,6 +389,7 @@ pub const VTable = struct {
     admitManagedIndex: *const fn (self: *DB, cfg: types.IndexConfig) Outcome(?u128),
     waitForSyncLevelWithCancellation: *const fn (self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: @import("db/execution_resources.zig").ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool) Outcome(void),
     waitForResolvedTransactionSyncWithCancellation: *const fn (self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken) Outcome(void),
+    waitForResolvedTransactionSyncTargetWithCancellation: *const fn (self: *DB, sync_level: types.SyncLevel, sequence: *u64, phase: *u8, cancellation: types.CancellationToken) Outcome(void),
     enrichmentStart: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime) Outcome(void),
     enrichmentReloadDurableState: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime) Outcome(void),
     enrichmentResumeFrom: *const fn (self: *@import("db/enrichment/enrichment_runtime.zig").EnrichmentRuntime, sequence: u64, target_sequence: u64) Outcome(void),
@@ -426,6 +450,7 @@ pub const VTable = struct {
     reconcileArtifactDeleteIndex: *const fn (self: *DB, name: []const u8, context: @import("db/artifact_reconcile_intent.zig").Context) Outcome(bool),
     reconcileArtifactAddEnrichment: *const fn (self: *DB, cfg: types.EnrichmentConfig, context: @import("db/artifact_reconcile_intent.zig").Context) Outcome(void),
     artifactInventoryCommand: *const fn (self: *DB, alloc: std.mem.Allocator) Outcome(@import("db/artifact_inventory.zig").Command),
+    advanceDocumentAuthorityBackfillPage: *const fn (self: *DB) Outcome(bool),
     advanceArtifactFootprintPage: *const fn (self: *DB) Outcome(bool),
     runGraphMetricServiceMaintenanceJsonAlloc: *const fn (self: *DB, alloc: std.mem.Allocator, body: []const u8) Outcome([]u8),
     scheduleGraphMetricBuild: *const fn (self: *DB, alloc: std.mem.Allocator, index_name: []const u8, metric_name: []const u8, force: bool) Outcome(types.GraphMetricStatus),
@@ -481,8 +506,11 @@ pub const VTable = struct {
     deleteIndex: *const fn (*DB, []const u8) Outcome(bool),
     runUntilIdle: *const fn (*DB) Outcome(void),
     runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation: *const fn (*DB, types.CancellationToken) Outcome(void),
+    finishBackgroundGraphReplacement: *const fn (*DB, []const u8, u64) Outcome(bool),
+    runBackgroundTurnWithCancellation: *const fn (*DB, types.CancellationToken, bool) Outcome(bool),
     runBackgroundMaintenanceWithCancellation: *const fn (*DB, types.CancellationToken) Outcome(bool),
     registry: *const fn () Outcome(*anyopaque),
+    writeValidateGroupedSourceBatch: *const fn (std.mem.Allocator, *DB, []const types.BatchWrite, []const []const u8, []const types.DocumentTransform) Outcome(void),
 };
 pub const Boundary = callback.Boundary(VTable);
 pub const FieldLayout = extern struct { name: [*:0]const u8, type_name: [*:0]const u8, offset: usize, size: usize, alignment: usize };
@@ -499,7 +527,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 21,
+    version: u32 = 28,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -571,18 +599,18 @@ pub const resource_manager_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("resource_manager.zig").ResourceManager);
 };
-extern fn antfly_storage_engine_get_descriptor_v21() callconv(.c) *const Descriptor;
+extern fn antfly_storage_engine_get_descriptor_v28() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Wire = @typeInfo(Function).@"fn".return_type.?;
     return anyerror!@FieldType(Wire, "value");
 }
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
-    const descriptor = antfly_storage_engine_get_descriptor_v21();
+    const descriptor = antfly_storage_engine_get_descriptor_v28();
     try validateDescriptor(descriptor);
     // Individual hidden accessors let final links discard unused operations.
     // A global table would retain every physical operation in every consumer.
-    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v21" });
+    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v28" });
     const method: @FieldType(VTable, name) = @ptrCast(@alignCast(getter()));
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Args = std.meta.ArgsTuple(Function);
@@ -615,10 +643,10 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
 }
 
 pub fn descriptorForValidation() *const Descriptor {
-    return antfly_storage_engine_get_descriptor_v21();
+    return antfly_storage_engine_get_descriptor_v28();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 21 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 28 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or

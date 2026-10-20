@@ -517,6 +517,143 @@ pub const CohereGeneratorConfig = struct {
     }
 };
 
+pub const ConstrainedGenerationBatch = struct {
+    max_items_per_call: ?i64 = null,
+    max_input_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_items_per_call", "max_items_per_call", true },
+        .{ "max_input_bytes", "max_input_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_items_per_call) |value| {
+            try jw.objectField("max_items_per_call");
+            try jw.write(value);
+        }
+        if (self.max_input_bytes) |value| {
+            try jw.objectField("max_input_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ConstrainedGeneratorProducerConfig = struct {
+    generator: GeneratorConfig,
+    instructions: ?[]const u8 = null,
+    /// JSON schema enforced before artifact publication. Unsupported schema vocabulary fails admission. Invalid or missing batch items receive one validation retry; successful siblings are retained.
+    output_schema: std.json.ArrayHashMap(std.json.Value),
+    output: ?ConstrainedOutput = null,
+    batch: ?ConstrainedGenerationBatch = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "generator", "generator", false },
+        .{ "instructions", "instructions", true },
+        .{ "output_schema", "output_schema", false },
+        .{ "output", "output", true },
+        .{ "batch", "batch", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("generator");
+        try jw.write(self.generator);
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        try jw.objectField("output_schema");
+        try jw.write(self.output_schema);
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        }
+        if (self.batch) |value| {
+            try jw.objectField("batch");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Provider and model admission selects a supported constrained mechanism. Auto prefers forced tools, then provider JSON schema, then native grammar. Free-text parsing is not a mode.
+pub const ConstrainedOutput = enum {
+    auto,
+    tool_call,
+    json_schema,
+    grammar,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .tool_call => "tool_call",
+            .json_schema => "json_schema",
+            .grammar => "grammar",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "tool_call", .tool_call },
+            .{ "json_schema", .json_schema },
+            .{ "grammar", .grammar },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Token probabilities require complete decoder evidence for the allowed values. Verdict-only is explicit opt-in; model-reported confidence is never used.
+pub const ConstrainedProbabilities = enum {
+    token_logprobs,
+    verdict_only,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .token_logprobs => "token_logprobs",
+            .verdict_only => "verdict_only",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "token_logprobs", .token_logprobs },
+            .{ "verdict_only", .verdict_only },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A content part for multimodal input (text, image URL, or inline media).
 pub const ContentPart = union(enum) {
     media_content_part: *MediaContentPart,
@@ -913,6 +1050,38 @@ pub const MediaContentPart = struct {
     data: []const u8,
     /// MIME type (audio/wav, image/gif, image/png, etc.).
     mime_type: []const u8,
+    sampling: ?VideoSamplingPolicy = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "data", "data", false },
+        .{ "mime_type", "mime_type", false },
+        .{ "sampling", "sampling", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.objectField("mime_type");
+        try jw.write(self.mime_type);
+        if (self.sampling) |value| {
+            try jw.objectField("sampling");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for the Ollama generative AI provider.
@@ -1347,6 +1516,68 @@ pub const VertexGeneratorConfig = struct {
         }
         if (self.top_k) |value| {
             try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Explicit EmbeddingGemma 2 video-group sampling. Timestamp windows are half-open and relative to the first presentation picture.
+pub const VideoSamplingPolicy = struct {
+    policy: []const u8,
+    start_ns: ?i64 = null,
+    end_ns: ?i64 = null,
+    step_ns: ?i64 = null,
+    max_frames: ?i64 = null,
+    overflow: ?[]const u8 = null,
+    /// Sample the displayed picture, including VFR holds, rather than the next picture at or after the target.
+    hold: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", false },
+        .{ "start_ns", "start_ns", true },
+        .{ "end_ns", "end_ns", true },
+        .{ "step_ns", "step_ns", true },
+        .{ "max_frames", "max_frames", true },
+        .{ "overflow", "overflow", true },
+        .{ "hold", "hold", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("policy");
+        try jw.write(self.policy);
+        if (self.start_ns) |value| {
+            try jw.objectField("start_ns");
+            try jw.write(value);
+        }
+        if (self.end_ns) |value| {
+            try jw.objectField("end_ns");
+            try jw.write(value);
+        }
+        if (self.step_ns) |value| {
+            try jw.objectField("step_ns");
+            try jw.write(value);
+        }
+        if (self.max_frames) |value| {
+            try jw.objectField("max_frames");
+            try jw.write(value);
+        }
+        if (self.overflow) |value| {
+            try jw.objectField("overflow");
+            try jw.write(value);
+        }
+        if (self.hold) |value| {
+            try jw.objectField("hold");
             try jw.write(value);
         }
         try jw.endObject();

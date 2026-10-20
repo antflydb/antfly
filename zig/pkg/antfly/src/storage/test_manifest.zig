@@ -22,6 +22,28 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("antfly_local_sources").storage_db_artifact_graph_completion;
+    _ = @import("antfly_local_sources").storage_db_artifact_input_test;
+    _ = @import("antfly_local_sources").storage_db_entity_alias_curation;
+    _ = @import("antfly_local_sources").storage_db_group_prior_context;
+    _ = @import("antfly_local_sources").storage_db_group_source_baseline;
+    _ = @import("antfly_local_sources").storage_db_group_source_bytes;
+    _ = @import("antfly_local_sources").storage_db_group_source_debt;
+    _ = @import("antfly_local_sources").storage_db_group_source_identity;
+    _ = @import("antfly_local_sources").storage_db_group_source_index;
+    _ = @import("antfly_local_sources").storage_db_group_source_lease_test;
+    _ = @import("antfly_local_sources").storage_db_group_source_owner_identity;
+    _ = @import("antfly_local_sources").storage_db_group_source_propagation_test;
+    _ = @import("antfly_local_sources").storage_db_group_source_reads;
+    _ = @import("antfly_local_sources").storage_db_group_source_retirement;
+    _ = @import("antfly_local_sources").storage_db_group_source_snapshot;
+    _ = @import("antfly_local_sources").storage_db_group_source_state;
+    _ = @import("antfly_local_sources").storage_db_group_source_transfer;
+    _ = @import("antfly_local_sources").storage_db_group_source_worker;
+    _ = @import("antfly_local_sources").storage_db_group_sources;
+    _ = @import("antfly_local_sources").storage_db_resolver_curation;
+    _ = @import("antfly_local_sources").storage_db_native_query_reuse;
+    _ = @import("antfly_local_sources").storage_db_runtime_callbacks;
     _ = @import("antfly_local_sources").storage_db_replay_vector_collectors;
     _ = @import("antfly_local_sources").storage_db_owned_keys;
     _ = @import("antfly_local_sources").storage_db_read_projection;
@@ -224,6 +246,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_maintenance_sparse_compaction_runtime;
     _ = @import("antfly_local_sources").storage_db_maintenance_text_merge_runtime;
     _ = @import("antfly_local_sources").storage_db_maintenance_transaction_runtime;
+    _ = @import("antfly_local_sources").storage_db_maintenance_graph_ttl_migration;
     _ = @import("antfly_local_sources").storage_db_maintenance_ttl_runtime;
     _ = @import("antfly_local_sources").storage_db_merge_contract;
     _ = @import("antfly_local_sources").storage_db_merge_page_system_test;
@@ -254,7 +277,12 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_query_graph_exec;
     _ = @import("antfly_local_sources").storage_db_query_document_authority;
     _ = @import("antfly_local_sources").storage_db_query_json_view;
+    _ = @import("antfly_local_sources").storage_db_query_native_array;
+    _ = @import("antfly_local_sources").storage_db_query_streamed_projection;
+    _ = @import("antfly_local_sources").storage_db_query_validated_ranges;
+    _ = @import("antfly_local_sources").storage_db_query_validation_scopes;
     _ = @import("antfly_local_sources").storage_db_query_projection;
+    _ = @import("antfly_local_sources").storage_db_query_projection_output;
     _ = @import("antfly_local_sources").storage_db_query_relational_projection;
     _ = @import("antfly_local_sources").storage_db_query_result_shape;
     _ = @import("antfly_local_sources").storage_db_query_search_exec;
@@ -341,6 +369,7 @@ comptime {
     _ = @import("index_manager_vopr.zig");
     _ = @import("antfly_local_sources").storage_lite_allocator_v4;
     _ = @import("antfly_local_sources").storage_lite_backend;
+    _ = @import("antfly_local_sources").storage_lite_backup_preflight;
     _ = @import("antfly_local_sources").storage_lite_benchmark;
     _ = @import("antfly_local_sources").storage_lite_bridge;
     _ = @import("antfly_local_sources").storage_lite_conformance_test;

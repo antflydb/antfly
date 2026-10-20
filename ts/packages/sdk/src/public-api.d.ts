@@ -3326,6 +3326,776 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/resolvers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolvers */
+        get: operations["listResolvers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** get resolver */
+        get: operations["getResolver"];
+        put?: never;
+        post?: never;
+        /**
+         * drop resolver identity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["dropResolverIdentity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}:render": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * render resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["renderResolverKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}:resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * resolve resolver query
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["resolveResolverQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}:namespace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * set resolver namespace
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["setResolverNamespace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/redirects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver redirects */
+        get: operations["listResolverRedirects"];
+        put?: never;
+        /**
+         * merge resolver keys
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["mergeResolverKeys"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/redirects/{key}": {
+        parameters: {
+            query?: {
+                pin_distinct?: boolean;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * unmerge resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["unmergeResolverKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/suppressions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver suppressions */
+        get: operations["listResolverSuppressions"];
+        put?: never;
+        /**
+         * suppress resolver keys
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["suppressResolverKeys"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * unsuppress resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["unsuppressResolverKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/reviews": {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver reviews */
+        get: operations["listResolverReviews"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * review resolver mention
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["reviewResolverMention"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}/redirects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        /** list entity resolver state */
+        get: operations["listEntityResolverState"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}:merge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * merge entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["mergeEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}:unmerge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * unmerge entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["unmergeEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}:suppress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * suppress entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["suppressEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/entities/{key}:unsuppress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * unsuppress entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["unsuppressEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolvers */
+        get: operations["namespaceListResolvers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** get resolver */
+        get: operations["namespaceGetResolver"];
+        put?: never;
+        post?: never;
+        /**
+         * drop resolver identity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["namespaceDropResolverIdentity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:render": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * render resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceRenderResolverKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * resolve resolver query
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceResolveResolverQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:namespace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * set resolver namespace
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceSetResolverNamespace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver redirects */
+        get: operations["namespaceListResolverRedirects"];
+        put?: never;
+        /**
+         * merge resolver keys
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceMergeResolverKeys"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects/{key}": {
+        parameters: {
+            query?: {
+                pin_distinct?: boolean;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * unmerge resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["namespaceUnmergeResolverKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver suppressions */
+        get: operations["namespaceListResolverSuppressions"];
+        put?: never;
+        /**
+         * suppress resolver keys
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceSuppressResolverKeys"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * unsuppress resolver key
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        delete: operations["namespaceUnsuppressResolverKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews": {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        /** list resolver reviews */
+        get: operations["namespaceListResolverReviews"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * review resolver mention
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceReviewResolverMention"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        /** list entity resolver state */
+        get: operations["namespaceListEntityResolverState"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * merge entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceMergeEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unmerge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * unmerge entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceUnmergeEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * suppress entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceSuppressEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unsuppress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * unsuppress entity
+         * @description Runtime curation is owned by the source table and resolver identity, independent of graph index versions. Accepted changes replay through bounded resolution and promotion journals. Repeating a request is safe. Entity operations report each affected resolver; atomicity is per source table, and partial outcomes must be retried. Render and resolve are reads.
+         */
+        post: operations["namespaceUnsuppressEntity"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/v1/me": {
         parameters: {
             query?: never;
@@ -3716,8 +4486,20 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Chunk text into smaller segments
-         * @description Splits text into smaller chunks with the built-in fixed chunker.
+         * Chunk content with optional model-aware embeddings
+         * @description Splits content into chunks. Without `embedding`, the fixed chunker and
+         *     legacy response remain unchanged. With `embedding`, the resolved target
+         *     model constrains boundaries for text, PDF pages, images or explicit tiles,
+         *     composited GIF frames, audio windows and consecutive video windows.
+         *
+         *     Each model-aware result pairs source coordinates and an optional vector
+         *     or error. `include_content` independently controls payload inclusion;
+         *     video uses the original source and sampling recipe. `execute: false`
+         *     plans without executing the embedding model. `stream: true` delivers
+         *     bounded NDJSON records followed by terminal coverage. A cap, gap or lost
+         *     terminal record must not be treated as complete source coverage.
+         *     Continuations bind the original source version and semantic plan;
+         *     retries may deterministically recompute and must deduplicate chunk IDs.
          *
          *     ## Models
          *
@@ -13077,7 +13859,48 @@ export interface components {
          * @description Managed generated artifact kind.
          * @enum {string}
          */
-        EnrichmentKind: "chunk" | "asset" | "embedding";
+        EnrichmentKind: "chunk" | "asset" | "embedding" | "group";
+        GroupedArtifactSource: {
+            group_by: string;
+            /** @description Field containing an integer ordinal. Ties use the document key. */
+            order_by: string;
+            segment_by?: string;
+            field: string;
+            /** @description Canonical row filter evaluated on the source projection. */
+            filter?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @description UTF-8 text bytes per unit, including joining newlines. An oversized single member fails explicitly.
+             * @default 32768
+             */
+            max_bytes?: number;
+            /**
+             * @description Maximum members per unit; larger partitions emit multiple units.
+             * @default 1024
+             */
+            max_members?: number;
+            /**
+             * @description Fixed ordinal cells bound repartitioning and incremental work for long groups.
+             * @default 128
+             */
+            window_ordinals?: number;
+        };
+        PriorArtifactContext: {
+            /** @description Artifact providing earlier items, including this producer's own artifact. */
+            artifact: string;
+            /** @description Template rendered for each prior item, newest first. */
+            render: string;
+            /** @default 40 */
+            max_items?: number;
+            /** @default 16384 */
+            max_bytes?: number;
+            /**
+             * @description Earlier segments available for context and the maximum later segments invalidated at each affected position of an original source change. A move invalidates the old and new neighborhoods independently; recomputed outputs never extend either interval.
+             * @default 8
+             */
+            horizon_segments?: number;
+        };
         /** @description Options specific to text chunking. */
         TextChunkOptions: {
             /** @description Target number of tokens per chunk. */
@@ -13094,6 +13917,80 @@ export interface components {
             /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
             overlap_duration_ms?: number;
         };
+        ChunkEmbeddingTarget: {
+            model: string;
+            /** @description Optional required embedding-weight/recipe identity; a changed model is rejected before delivery. */
+            model_identity?: string;
+            /** @default RETRIEVAL_DOCUMENT */
+            task_type?: string;
+            dimensions?: number;
+            /**
+             * @description False resolves model limits and plans descriptors without running embedding inference.
+             * @default true
+             */
+            execute?: boolean;
+            /**
+             * @description Return explicit per-chunk failures and gaps instead of aborting on the first non-retryable embedding failure.
+             * @default false
+             */
+            allow_partial?: boolean;
+        };
+        /** @description Semantic chunk policy. Execution batch size and queue depth are deliberately separate. */
+        MediaChunkPolicy: {
+            /**
+             * @description Explicit byte ceiling per text chunk, independently of the target tokenizer budget.
+             * @default 1048576
+             */
+            max_text_bytes?: number;
+            /** @default 500 */
+            target_tokens?: number;
+            /** @default 50 */
+            overlap_tokens?: number;
+            /**
+             * Format: int64
+             * @default 32000000000
+             */
+            window_ns?: number;
+            /**
+             * Format: int64
+             * @default 0
+             */
+            overlap_ns?: number;
+            /**
+             * Format: int64
+             * @default 1000000000
+             */
+            step_ns?: number;
+            /**
+             * @description Select the displayed picture at each video cadence target, including VFR holds. Zero retains at-or-after timestamp sampling.
+             * @default 1
+             */
+            video_hold?: number;
+            /** @default 32 */
+            max_frames?: number;
+            /** @default 0 */
+            tile_width?: number;
+            /** @default 0 */
+            tile_height?: number;
+            /** @default 0 */
+            tile_overlap?: number;
+            /**
+             * Format: int64
+             * @description Optional minimum silence duration for choosing an earlier boundary; no samples are discarded.
+             * @default 0
+             */
+            audio_pause_ns?: number;
+            /**
+             * Format: int64
+             * @default 5000000000
+             */
+            audio_pause_search_ns?: number;
+            /**
+             * @description Absolute normalized PCM amplitude threshold in thousandths.
+             * @default 10
+             */
+            audio_silence_milli?: number;
+        };
         /** @description Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults. */
         ChunkOptions: {
             /** @description Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated. */
@@ -13105,6 +14002,8 @@ export interface components {
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["AudioChunkOptions"];
+            embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            policy?: components["schemas"]["MediaChunkPolicy"];
         };
         /**
          * @description Configuration for the Antfly inference chunking provider.
@@ -13195,6 +14094,840 @@ export interface components {
             threshold?: number;
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["AudioChunkOptions"];
+            embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            policy?: components["schemas"]["MediaChunkPolicy"];
+        };
+        /** @description Configuration for the Google generative AI provider (Gemini). */
+        GoogleGeneratorConfig: {
+            /** @enum {string} */
+            provider: "gemini";
+            /** @description The Google Cloud project ID. */
+            project_id?: string;
+            /** @description The Google Cloud location (e.g., 'us-central1'). */
+            location?: string;
+            /**
+             * @description The name of the generative model to use.
+             * @default gemini-2.5-flash
+             * @example gemini-2.5-flash
+             */
+            model: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+            /** @description The Google API key. */
+            api_key?: string;
+            /**
+             * Format: uri
+             * @description The URL of the Google API endpoint.
+             */
+            url?: string;
+        };
+        /** @description Configuration for Google Cloud Vertex AI generative models. */
+        VertexGeneratorConfig: {
+            /** @enum {string} */
+            provider: "vertex";
+            /**
+             * @description The name of the Vertex AI model to use.
+             * @default gemini-2.5-flash
+             * @example gemini-2.5-flash
+             */
+            model: string;
+            /** @description Google Cloud project ID. */
+            project_id?: string;
+            /**
+             * @description Google Cloud region for Vertex AI API.
+             * @default us-central1
+             */
+            location?: string;
+            /** @description Path to service account JSON key file. */
+            credentials_path?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate in the response. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter (0.0-1.0).
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+        };
+        /** @description Configuration for the Ollama generative AI provider. */
+        OllamaGeneratorConfig: {
+            /** @enum {string} */
+            provider: "ollama";
+            /**
+             * @description The name of the Ollama model to use.
+             * @example llama3.3:70b
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the Ollama API endpoint.
+             */
+            url?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+            /** @description HTTP response timeout in seconds for Ollama API calls. */
+            timeout?: number;
+        };
+        /** @description Configuration for the Antfly inference generative AI provider. */
+        AntflyGeneratorConfig: {
+            /** @enum {string} */
+            provider: "antfly";
+            /**
+             * @description The name of the generator model.
+             * @example ggml-org/gemma-4-E4B-it-GGUF
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+             */
+            api_url?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /** @description Top-k sampling parameter. */
+            top_k?: number;
+            /** @description HTTP response timeout in seconds for Inference API calls. */
+            timeout?: number;
+        };
+        /**
+         * @description OpenAI reasoning effort; model support varies. Omit to use the model default.
+         * @enum {string}
+         */
+        OpenAIReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+        /** @description Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime. */
+        ChatGPTGeneratorConfig: {
+            /** @enum {string} */
+            provider: "chatgpt";
+            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
+            model: string;
+            /** @description Opaque personal registration owned by the authenticated caller. */
+            connection_id: string;
+        };
+        /** @description Configuration for the OpenAI generative AI provider. */
+        OpenAIGeneratorConfig: {
+            /** @enum {string} */
+            provider: "openai";
+            /**
+             * @description The name of the OpenAI model to use.
+             * @default gpt-4.1
+             * @example gpt-4.1
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the OpenAI API endpoint.
+             */
+            url?: string;
+            /** @description The OpenAI API key. */
+            api_key?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate. */
+            max_tokens?: number;
+            /**
+             * @description OpenAI completion budget, including visible output and reasoning tokens.
+             *     Use for reasoning models instead of max_tokens; the two are mutually exclusive.
+             */
+            max_completion_tokens?: number;
+            /** @description Optional reasoning effort. Supported values depend on the selected OpenAI model. */
+            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter.
+             */
+            top_p?: number;
+            /**
+             * Format: float
+             * @description Penalty for token frequency (-2.0 to 2.0).
+             */
+            frequency_penalty?: number;
+            /**
+             * Format: float
+             * @description Penalty for token presence (-2.0 to 2.0).
+             */
+            presence_penalty?: number;
+        };
+        /** @description Configuration for the OpenRouter generative AI provider. */
+        OpenRouterGeneratorConfig: {
+            /** @enum {string} */
+            provider: "openrouter";
+            /**
+             * @description The OpenRouter model identifier to use.
+             * @example openai/gpt-4.1
+             */
+            model: string;
+            /**
+             * Format: uri
+             * @description The URL of the OpenRouter API endpoint.
+             * @default https://openrouter.ai/api/v1
+             */
+            url?: string;
+            /** @description The OpenRouter API key. */
+            api_key?: string;
+            /**
+             * Format: float
+             * @description Controls randomness in generation (0.0-2.0).
+             */
+            temperature?: number;
+            /** @description Maximum number of tokens to generate in the response. */
+            max_tokens?: number;
+            /**
+             * Format: float
+             * @description Nucleus sampling parameter (0.0-1.0).
+             */
+            top_p?: number;
+            /**
+             * Format: float
+             * @description Penalty for token frequency (-2.0 to 2.0).
+             */
+            frequency_penalty?: number;
+            /**
+             * Format: float
+             * @description Penalty for token presence (-2.0 to 2.0).
+             */
+            presence_penalty?: number;
+        };
+        /** @description On-device Apple Foundation Models generation. Requires a macOS Apple provider build, Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling and media attachments are not supported. */
+        AppleGeneratorConfig: {
+            /** @enum {string} */
+            provider?: "apple";
+            /** @default 256 */
+            max_tokens?: number;
+            temperature?: number;
+        };
+        /**
+         * @description Generator providers implemented by Antfly's generation runtime.
+         * @enum {string}
+         */
+        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
+        /**
+         * @description A unified configuration for a generative AI provider.
+         * @example {
+         *       "provider": "openai",
+         *       "model": "gpt-4.1",
+         *       "temperature": 0.7,
+         *       "max_tokens": 2048
+         *     }
+         */
+        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
+            rate_limit?: components["schemas"]["RateLimitConfig"];
+            provider: components["schemas"]["GeneratorProvider"];
+        };
+        /**
+         * @description Provider and model admission selects a supported constrained mechanism. Auto prefers forced tools, then provider JSON schema, then native grammar. Free-text parsing is not a mode.
+         * @default auto
+         * @enum {string}
+         */
+        ConstrainedOutput: "auto" | "tool_call" | "json_schema" | "grammar";
+        ConstrainedGenerationBatch: {
+            /** @default 8 */
+            max_items_per_call?: number;
+            /** @default 65536 */
+            max_input_bytes?: number;
+        };
+        ConstrainedGeneratorProducerConfig: {
+            generator: components["schemas"]["GeneratorConfig"];
+            instructions?: string;
+            /** @description JSON schema enforced before artifact publication. Unsupported schema vocabulary fails admission. Invalid or missing batch items receive one validation retry; successful siblings are retained. */
+            output_schema: {
+                [key: string]: unknown;
+            };
+            output?: components["schemas"]["ConstrainedOutput"];
+            batch?: components["schemas"]["ConstrainedGenerationBatch"];
+        };
+        /** Format: double */
+        ExtractionProbability: number;
+        /** @description Optional source and target labels constrain relation endpoints. A target requires a source. */
+        ExtractionRelationSchema: {
+            type: string;
+            source?: string;
+            target?: string;
+            /** @description Version 2 model-facing relation description. */
+            description?: string;
+            threshold?: components["schemas"]["ExtractionProbability"];
+        };
+        ExtractionLabelDefinition: {
+            /** @description Model-facing label description. */
+            description?: string;
+        };
+        /**
+         * Format: double
+         * @description Finite centered-logit decisions require a threshold strictly between zero and one.
+         */
+        ExtractionClassificationThreshold: number;
+        ExtractionClassificationExample: {
+            input: string;
+            label: string;
+        } | string[];
+        ExtractionClassificationSchema: {
+            name: string;
+            labels: string[];
+            /** @description The server uses false when omitted. Version 1: return highest-ranked labels up to top_k when false, or labels meeting options.threshold when true. Version 2: selects ordinary single or multi classification unless mode is specified; classification.threshold controls the decision threshold. */
+            multi_label?: boolean;
+            /** @description Version 1 NLI hypothesis template with {} as the label placeholder; the server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit hypothesis_template; use prompt/instruction and label_definitions for model conditioning. */
+            hypothesis_template?: string;
+            /** @description Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained classification uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options. */
+            top_k?: number;
+            /**
+             * @description Version 2 ordinary classification mode. Standalone ordinal scores use the decision API.
+             *     Each model rejects modes it does not support.
+             * @enum {string}
+             */
+            mode?: "single" | "multi";
+            label_definitions?: {
+                [key: string]: components["schemas"]["ExtractionLabelDefinition"];
+            };
+            min_labels?: number;
+            /** @description Version 2 maximum selected labels. Explicit null means no maximum; omission preserves mode defaults. */
+            max_labels?: number | null;
+            ordered?: boolean;
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            /** @enum {string} */
+            activation?: "auto" | "sigmoid" | "softmax";
+            /** Format: double */
+            temperature?: number;
+            /** @description Version 2 fallback label; must be declared in labels. */
+            default?: string;
+            /** @description Version 2 model-facing task instruction. Mutually exclusive with instruction. */
+            prompt?: string;
+            /** @description Alias of prompt. */
+            instruction?: string;
+            examples?: components["schemas"]["ExtractionClassificationExample"][];
+        };
+        ExtractionRegexValidator: {
+            /** @enum {string} */
+            type?: "regex";
+            pattern: string;
+            /**
+             * @default full
+             * @enum {string}
+             */
+            mode?: "full" | "partial";
+            /** @default false */
+            exclude?: boolean;
+            /**
+             * @description Python-compatible regex flags supported by the active bounded validator engine; unsupported flags or syntax fail validation.
+             * @default 2
+             */
+            flags?: number;
+        };
+        ExtractionStructureField: string | ({
+            /** @enum {string} */
+            type?: "str" | "string" | "list" | "array";
+            enum?: string[];
+            /** @enum {string} */
+            dtype?: "str" | "list";
+            choices?: string[];
+            description?: string;
+            threshold?: components["schemas"]["ExtractionProbability"];
+            /**
+             * @description Version 2 explicit cardinality. Required fields are validated after record assignment.
+             * @enum {string}
+             */
+            cardinality?: "optional_one" | "required_one" | "zero_or_more" | "one_or_more";
+            /** @description Version 2 field spans cannot be assigned to multiple record instances. */
+            exclusive?: boolean;
+            validators?: components["schemas"]["ExtractionRegexValidator"][];
+        } & {
+            [key: string]: unknown;
+        });
+        ExtractionStructureSchema: {
+            fields: {
+                [key: string]: components["schemas"]["ExtractionStructureField"];
+            };
+            /**
+             * @description Version 2 record grouping. Omission preserves one-record extraction.
+             * @enum {string}
+             */
+            mode?: "natural" | "latent" | "anchorless";
+            /** @description Natural mode only; defaults to the first declared field. */
+            anchor?: string;
+            /** @enum {string} */
+            occurrence_policy?: "all" | "first" | "error_on_ambiguous" | "latent_all";
+        } & {
+            [key: string]: unknown;
+        };
+        ExtractionEntityDefinition: {
+            description?: string;
+            /** @enum {string} */
+            dtype?: "str" | "list";
+            /** @enum {string} */
+            type?: "str" | "string" | "list" | "array";
+            threshold?: components["schemas"]["ExtractionProbability"];
+            validators?: components["schemas"]["ExtractionRegexValidator"][];
+        };
+        /** @description Version 2 attributes are scored on retained entity spans using shared encoded states. Omitted applies_to selects all entities; [] selects none. Raw labels must be unique across groups, including when qualify_labels is true. Group names text,confidence,start,end are reserved. */
+        ExtractionAttributeGroup: {
+            labels: string[];
+            /** @default false */
+            multi_label?: boolean;
+            threshold?: components["schemas"]["ExtractionProbability"];
+            applies_to?: string[];
+            /** @default false */
+            qualify_labels?: boolean;
+        };
+        ExtractionConstraintLabelRef: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "LabelRef";
+            task: string;
+            label: string;
+        };
+        ExtractionConstraintAnySelected: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AnySelected";
+            task: string;
+        };
+        ExtractionConstraintAnyOtherSelected: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AnyOtherSelected";
+            task: string;
+        };
+        ExtractionConstraintIsDefault: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "IsDefault";
+            task: string;
+        };
+        ExtractionConstraintCardinality: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Cardinality";
+            task: string;
+            minimum?: number;
+            maximum?: number | null;
+        };
+        ExtractionConstraintMinLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MinLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintMaxLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintAtLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AtLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintNot: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Not";
+            child: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintAnd: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "And";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintOr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Or";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintExactlyOneOf: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "ExactlyOneOf";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintImplies: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Implies";
+            cond: components["schemas"]["ExtractionClassificationConstraint"];
+            then: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintIff: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Iff";
+            left: components["schemas"]["ExtractionClassificationConstraint"];
+            right: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintExcludes: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Excludes";
+            left: components["schemas"]["ExtractionClassificationConstraint"];
+            right: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        /** @description Declarative, bounded constraint AST. Task and label references are validated before inference. Nesting is bounded by the server schema limit. */
+        ExtractionClassificationConstraint: components["schemas"]["ExtractionConstraintLabelRef"] | components["schemas"]["ExtractionConstraintAnySelected"] | components["schemas"]["ExtractionConstraintAnyOtherSelected"] | components["schemas"]["ExtractionConstraintIsDefault"] | components["schemas"]["ExtractionConstraintCardinality"] | components["schemas"]["ExtractionConstraintMinLevel"] | components["schemas"]["ExtractionConstraintMaxLevel"] | components["schemas"]["ExtractionConstraintAtLevel"] | components["schemas"]["ExtractionConstraintNot"] | components["schemas"]["ExtractionConstraintAnd"] | components["schemas"]["ExtractionConstraintOr"] | components["schemas"]["ExtractionConstraintExactlyOneOf"] | components["schemas"]["ExtractionConstraintImplies"] | components["schemas"]["ExtractionConstraintIff"] | components["schemas"]["ExtractionConstraintExcludes"];
+        ExtractionJointEntity: {
+            description?: string;
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            max_candidates?: number;
+            allow_nested?: boolean;
+        };
+        ExtractionJointRelation: {
+            head: string[];
+            tail: string[];
+            /** @description Retained declarative metadata; model conditioning follows the pinned JointIE compiler. */
+            description?: string;
+            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            /** @default true */
+            directed?: boolean;
+            /** @default false */
+            symmetric?: boolean;
+            inverse?: string;
+            /** @default false */
+            allow_self?: boolean;
+            max_per_head?: number;
+            max_per_tail?: number;
+        };
+        ExtractionJointConstraintTypedEndpoints: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "TypedEndpoints";
+            relation?: string;
+            head_types?: string[];
+            tail_types?: string[];
+        };
+        ExtractionJointConstraintNoSelfLoops: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "NoSelfLoops";
+            relation?: string;
+        };
+        ExtractionJointConstraintUniqueRelationPair: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "UniqueRelationPair";
+            relation?: string;
+            /** @default true */
+            directed?: boolean;
+        };
+        ExtractionJointConstraintUniqueRelationSlot: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "UniqueRelationSlot";
+            relation?: string;
+            /**
+             * @default head
+             * @enum {string}
+             */
+            slot?: "head" | "tail" | "slot";
+        };
+        ExtractionJointConstraintEntityOverlapPolicy: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "EntityOverlapPolicy";
+            /** @enum {string} */
+            policy?: "allow" | "disallow" | "nested";
+        };
+        ExtractionJointConstraintMaxRelationsPerHead: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxRelationsPerHead";
+            relation?: string;
+            limit: number;
+        };
+        ExtractionJointConstraintMaxRelationsPerTail: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxRelationsPerTail";
+            relation?: string;
+            limit: number;
+        };
+        ExtractionJointConstraintSymmetricRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "SymmetricRelation";
+            relation: string;
+        };
+        ExtractionJointConstraintAcyclicRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AcyclicRelation";
+            relation: string;
+        };
+        ExtractionJointConstraintInverseRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "InverseRelation";
+            relation: string;
+            inverse: string;
+        };
+        ExtractionJointConstraint: components["schemas"]["ExtractionJointConstraintTypedEndpoints"] | components["schemas"]["ExtractionJointConstraintNoSelfLoops"] | components["schemas"]["ExtractionJointConstraintUniqueRelationPair"] | components["schemas"]["ExtractionJointConstraintUniqueRelationSlot"] | components["schemas"]["ExtractionJointConstraintEntityOverlapPolicy"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerHead"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerTail"] | components["schemas"]["ExtractionJointConstraintSymmetricRelation"] | components["schemas"]["ExtractionJointConstraintAcyclicRelation"] | components["schemas"]["ExtractionJointConstraintInverseRelation"];
+        /** @description Separate typed graph schema, mutually exclusive with ordinary extraction families. Hard typed endpoints, overlap, uniqueness and declared graph constraints apply to every returned edge, including derived companions. */
+        ExtractionJointSchema: {
+            entities: {
+                [key: string]: string | components["schemas"]["ExtractionJointEntity"];
+            };
+            relations?: {
+                [key: string]: components["schemas"]["ExtractionJointRelation"];
+            };
+            constraints?: components["schemas"]["ExtractionJointConstraint"][];
+        };
+        /**
+         * @description Version 1 selects one extraction family; entities may accompany relations.
+         *     With schema_version 2, entities, attributes, classifications, structures,
+         *     and ordinary relations may share one encoded input. joint_ie is a separate,
+         *     mutually exclusive typed graph schema. The version 2 compiler rejects
+         *     unknown fields and validates all references before model execution.
+         */
+        ExtractionSchema: {
+            entities?: string[];
+            relations?: components["schemas"]["ExtractionRelationSchema"][];
+            classifications?: components["schemas"]["ExtractionClassificationSchema"][];
+            structures?: {
+                [key: string]: components["schemas"]["ExtractionStructureSchema"];
+            };
+            entity_definitions?: {
+                [key: string]: components["schemas"]["ExtractionEntityDefinition"];
+            };
+            entity_attributes?: {
+                [key: string]: components["schemas"]["ExtractionAttributeGroup"];
+            };
+            classification_constraints?: components["schemas"]["ExtractionClassificationConstraint"][];
+            joint_ie?: components["schemas"]["ExtractionJointSchema"];
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * @description Token probabilities require complete decoder evidence for the allowed values. Verdict-only is explicit opt-in; model-reported confidence is never used.
+         * @default token_logprobs
+         * @enum {string}
+         */
+        ConstrainedProbabilities: "token_logprobs" | "verdict_only";
+        /**
+         * @description Half-open offsets into the immutable caller text. Version 2 defaults to utf8_bytes. No normalization, lowercasing or synthetic suffix is included in these coordinates.
+         * @enum {string}
+         */
+        ExtractionOffsetUnit: "utf8_bytes" | "unicode_codepoints" | "utf16_codeunits";
+        /** @description Version 2 never silently truncates. Reject is the default. Windowing requires an enabled runtime capability, reconstructs document-global offsets and revalidates all hard graph constraints after merging. */
+        ExtractionLongDocumentOptions: {
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            mode?: "reject" | "window";
+            /** @description Maximum body words per window; also bounded by the checkpoint and encoded token limits. */
+            window_words?: number;
+            overlap_words?: number;
+            max_windows?: number;
+            /**
+             * @description Identity of latent, anchorless and legacy records across windows. Occurrence uses exact source spans; semantic explicitly merges equal field values. Natural records always use their exact source anchor. This is independent of annotation occurrence_policy.
+             * @default occurrence
+             * @enum {string}
+             */
+            record_identity?: "occurrence" | "semantic";
+        };
+        /** @description Bounded classification and JointIE selection. Exact optimality is with respect to admitted candidates. A completed beam may be feasible without an optimality proof. By default exhausted search is an error; best_effort permits only a validated feasible witness and reports exhausted:true. */
+        ExtractionDecoderOptions: {
+            /**
+             * @description Omit to use the model's per-task default. GLiNER2.5 uses source-compatible beam selection for single-window JointIE and automatic selection for classification. Windowed JointIE uses the native automatic global solver with independent window resources. Explicit values select the native bounded search algorithm.
+             * @enum {string}
+             */
+            algorithm?: "auto" | "exact" | "beam";
+            beam_width?: number;
+            max_search_nodes?: number;
+            max_local_assignments?: number;
+            /** @default false */
+            best_effort?: boolean;
+        };
+        /** @description JointIE proposal admission and utility calibration. Entity candidate caps are bypassed for endpoints of retained relation proposals, subject to server hard bounds. entity_threshold overrides candidate admission, not entity decision thresholds. */
+        ExtractionJointOptions: {
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            entity_threshold?: components["schemas"]["ExtractionProbability"];
+            relation_role_threshold?: components["schemas"]["ExtractionProbability"];
+            top_k_entities?: number;
+            top_k_roles?: number;
+            relation_pair_cap?: number;
+            max_edges_per_type?: number;
+            /** Format: double */
+            entity_weight?: number;
+            /** Format: double */
+            relation_weight?: number;
+        };
+        ExtractionReaderOptions: {
+            provider?: string;
+            model?: string;
+            url?: string;
+            api_url?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /** @description Optional cross-input entity and relation deduplication. */
+        ExtractionResolverOptions: {
+            /**
+             * Format: float
+             * @default 0.85
+             */
+            similarity_threshold?: number;
+            /** @default true */
+            type_must_match?: boolean;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_entity_confidence?: number;
+            /**
+             * Format: float
+             * @default 0
+             */
+            min_relation_confidence?: number;
+            /** @default true */
+            deduplicate_relations?: boolean;
+            /** @default true */
+            track_provenance?: boolean;
+        };
+        ExtractionOptions: {
+            /** Format: float */
+            threshold?: number;
+            flat_ner?: boolean;
+            include_confidence?: boolean;
+            include_spans?: boolean;
+            /**
+             * @description Version 2 source word splitting. char keeps ASCII alphanumeric and @._-+ runs together and splits other non-whitespace codepoints, preserving original source offsets. An input's options replace the shared options in full; omitted word_splitter uses whitespace. Explicit word_splitter is rejected by version 1.
+             * @enum {string}
+             */
+            word_splitter?: "whitespace" | "char";
+            /**
+             * @description Version 2 overlap selection. flat/disallow prohibit overlap, nested permits containment, longest removes strictly contained spans.
+             * @enum {string}
+             */
+            overlap?: "allow" | "nested" | "flat" | "disallow" | "longest";
+            offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
+            long_document?: components["schemas"]["ExtractionLongDocumentOptions"];
+            decoder?: components["schemas"]["ExtractionDecoderOptions"];
+            joint_ie?: components["schemas"]["ExtractionJointOptions"];
+            reader?: components["schemas"]["ExtractionReaderOptions"];
+            resolver?: components["schemas"]["ExtractionResolverOptions"];
+        } & {
+            [key: string]: unknown;
+        };
+        GeneratedExtractorConfig: {
+            /** @enum {string} */
+            method: "generated";
+            generator: components["schemas"]["GeneratorConfig"];
+            schema: components["schemas"]["ExtractionSchema"];
+            entity_definitions?: {
+                [key: string]: string;
+            };
+            instructions?: string;
+            output?: components["schemas"]["ConstrainedOutput"];
+            probabilities?: components["schemas"]["ConstrainedProbabilities"];
+            batch?: components["schemas"]["ConstrainedGenerationBatch"];
+            options?: components["schemas"]["ExtractionOptions"];
+        };
+        EnrichmentProducerConfig: {
+            /** @enum {string} */
+            type: "copy" | "generator" | "extractor" | "decision" | "reader" | "transcriber" | "document_extraction";
+            /** @description Producer-specific configuration. Generator schemas and generated extractors share constrained output admission, batching, validation retry, and immutable artifact replay. */
+            config?: components["schemas"]["ConstrainedGeneratorProducerConfig"] | components["schemas"]["GeneratedExtractorConfig"] | {
+                [key: string]: unknown;
+            };
         };
         /** @description Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer. */
         EnrichmentNeighborContextConfig: {
@@ -13299,6 +15032,10 @@ export interface components {
             /** @description Stable generated artifact name. */
             name: string;
             kind: components["schemas"]["EnrichmentKind"];
+            /** @description Required for kind=group. The covering membership index and ordinary unit artifacts are maintained from source row commits. */
+            source?: components["schemas"]["GroupedArtifactSource"];
+            /** @description Bounded earlier-segment context from an artifact sharing the same grouped source. Only valid for prompt-consuming asset producers. */
+            prior_context?: components["schemas"]["PriorArtifactContext"];
             /** @description Source field to read from the source document or source artifact payload. */
             field?: string;
             /** @description Optional template for generated text input. */
@@ -13328,9 +15065,7 @@ export interface components {
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
             /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle. */
-            producer?: {
-                [key: string]: unknown;
-            };
+            producer?: components["schemas"]["EnrichmentProducerConfig"];
             /**
              * @deprecated
              * @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
@@ -13607,265 +15342,6 @@ export interface components {
             edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
             context?: components["schemas"]["GraphArtifactContextConfig"];
         };
-        /** @description Configuration for the Google generative AI provider (Gemini). */
-        GoogleGeneratorConfig: {
-            /** @enum {string} */
-            provider: "gemini";
-            /** @description The Google Cloud project ID. */
-            project_id?: string;
-            /** @description The Google Cloud location (e.g., 'us-central1'). */
-            location?: string;
-            /**
-             * @description The name of the generative model to use.
-             * @default gemini-2.5-flash
-             * @example gemini-2.5-flash
-             */
-            model: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-            /** @description The Google API key. */
-            api_key?: string;
-            /**
-             * Format: uri
-             * @description The URL of the Google API endpoint.
-             */
-            url?: string;
-        };
-        /** @description Configuration for Google Cloud Vertex AI generative models. */
-        VertexGeneratorConfig: {
-            /** @enum {string} */
-            provider: "vertex";
-            /**
-             * @description The name of the Vertex AI model to use.
-             * @default gemini-2.5-flash
-             * @example gemini-2.5-flash
-             */
-            model: string;
-            /** @description Google Cloud project ID. */
-            project_id?: string;
-            /**
-             * @description Google Cloud region for Vertex AI API.
-             * @default us-central1
-             */
-            location?: string;
-            /** @description Path to service account JSON key file. */
-            credentials_path?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-        };
-        /** @description Configuration for the Ollama generative AI provider. */
-        OllamaGeneratorConfig: {
-            /** @enum {string} */
-            provider: "ollama";
-            /**
-             * @description The name of the Ollama model to use.
-             * @example llama3.3:70b
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Ollama API endpoint.
-             */
-            url?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-            /** @description HTTP response timeout in seconds for Ollama API calls. */
-            timeout?: number;
-        };
-        /** @description Configuration for the Antfly inference generative AI provider. */
-        AntflyGeneratorConfig: {
-            /** @enum {string} */
-            provider: "antfly";
-            /**
-             * @description The name of the generator model.
-             * @example ggml-org/gemma-4-E4B-it-GGUF
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-             */
-            api_url?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /** @description Top-k sampling parameter. */
-            top_k?: number;
-            /** @description HTTP response timeout in seconds for Inference API calls. */
-            timeout?: number;
-        };
-        /**
-         * @description OpenAI reasoning effort; model support varies. Omit to use the model default.
-         * @enum {string}
-         */
-        OpenAIReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-        /** @description Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime. */
-        ChatGPTGeneratorConfig: {
-            /** @enum {string} */
-            provider: "chatgpt";
-            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
-            model: string;
-            /** @description Opaque personal registration owned by the authenticated caller. */
-            connection_id: string;
-        };
-        /** @description Configuration for the OpenAI generative AI provider. */
-        OpenAIGeneratorConfig: {
-            /** @enum {string} */
-            provider: "openai";
-            /**
-             * @description The name of the OpenAI model to use.
-             * @default gpt-4.1
-             * @example gpt-4.1
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the OpenAI API endpoint.
-             */
-            url?: string;
-            /** @description The OpenAI API key. */
-            api_key?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate. */
-            max_tokens?: number;
-            /**
-             * @description OpenAI completion budget, including visible output and reasoning tokens.
-             *     Use for reasoning models instead of max_tokens; the two are mutually exclusive.
-             */
-            max_completion_tokens?: number;
-            /** @description Optional reasoning effort. Supported values depend on the selected OpenAI model. */
-            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter.
-             */
-            top_p?: number;
-            /**
-             * Format: float
-             * @description Penalty for token frequency (-2.0 to 2.0).
-             */
-            frequency_penalty?: number;
-            /**
-             * Format: float
-             * @description Penalty for token presence (-2.0 to 2.0).
-             */
-            presence_penalty?: number;
-        };
-        /** @description Configuration for the OpenRouter generative AI provider. */
-        OpenRouterGeneratorConfig: {
-            /** @enum {string} */
-            provider: "openrouter";
-            /**
-             * @description The OpenRouter model identifier to use.
-             * @example openai/gpt-4.1
-             */
-            model: string;
-            /**
-             * Format: uri
-             * @description The URL of the OpenRouter API endpoint.
-             * @default https://openrouter.ai/api/v1
-             */
-            url?: string;
-            /** @description The OpenRouter API key. */
-            api_key?: string;
-            /**
-             * Format: float
-             * @description Controls randomness in generation (0.0-2.0).
-             */
-            temperature?: number;
-            /** @description Maximum number of tokens to generate in the response. */
-            max_tokens?: number;
-            /**
-             * Format: float
-             * @description Nucleus sampling parameter (0.0-1.0).
-             */
-            top_p?: number;
-            /**
-             * Format: float
-             * @description Penalty for token frequency (-2.0 to 2.0).
-             */
-            frequency_penalty?: number;
-            /**
-             * Format: float
-             * @description Penalty for token presence (-2.0 to 2.0).
-             */
-            presence_penalty?: number;
-        };
-        /** @description On-device Apple Foundation Models generation. Requires a macOS Apple provider build, Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling and media attachments are not supported. */
-        AppleGeneratorConfig: {
-            /** @enum {string} */
-            provider?: "apple";
-            /** @default 256 */
-            max_tokens?: number;
-            temperature?: number;
-        };
-        /**
-         * @description Generator providers implemented by Antfly's generation runtime.
-         * @enum {string}
-         */
-        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly" | "apple";
-        /**
-         * @description A unified configuration for a generative AI provider.
-         * @example {
-         *       "provider": "openai",
-         *       "model": "gpt-4.1",
-         *       "temperature": 0.7,
-         *       "max_tokens": 2048
-         *     }
-         */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
-            rate_limit?: components["schemas"]["RateLimitConfig"];
-            provider: components["schemas"]["GeneratorProvider"];
-        };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
             name: components["schemas"]["GraphEdgeType"];
@@ -13899,9 +15375,7 @@ export interface components {
             content_type?: string;
             execution?: components["schemas"]["ExecutionPolicy"];
             /** @description Write-only producer configuration. Cannot be combined with producer_json. */
-            producer?: {
-                [key: string]: unknown;
-            };
+            producer?: components["schemas"]["EnrichmentProducerConfig"];
             /**
              * @deprecated
              * @description Write-only producer configuration; it may contain credentials and is never returned.
@@ -13946,6 +15420,131 @@ export interface components {
                 review?: number;
             };
         };
+        DeciderConfig: {
+            /** @enum {string} */
+            provider?: "antfly" | "jev" | "openai";
+            /**
+             * @description Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
+             * @default typed
+             * @enum {string}
+             */
+            decision_method?: "typed" | "embedding_similarity" | "generated";
+            /** @description Required with decision_method=generated. Provider configuration belongs here rather than in the outer typed-decider fields. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            instructions?: string;
+            output?: components["schemas"]["ConstrainedOutput"];
+            probabilities?: components["schemas"]["ConstrainedProbabilities"];
+            batch?: components["schemas"]["ConstrainedGenerationBatch"];
+            /** @description Required for Antfly and OpenAI; Jev defaults to jev-latest. */
+            model?: string;
+            /** @description Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity. */
+            model_identity?: string;
+            /** @description EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities. */
+            embedding_options?: {
+                /** @description Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities. */
+                calibration_id?: string;
+                /**
+                 * @default CLUSTERING
+                 * @enum {string}
+                 */
+                task_type?: "CLUSTERING" | "CLASSIFICATION";
+                /**
+                 * @default 768
+                 * @enum {integer}
+                 */
+                dimensions?: 768 | 512 | 256 | 128;
+                min_similarity?: number;
+                min_margin?: number;
+            };
+            /** @description Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions. */
+            url?: string;
+            /** @description API key or secret reference. Defaults to the provider environment variable. */
+            api_key?: string;
+            /** @default 10000 */
+            max_rows?: number;
+            /** @default 1000000 */
+            max_input_tokens?: number;
+            rate_limit?: components["schemas"]["RateLimitConfig"];
+            /** @default 32 */
+            batch_size?: number;
+        };
+        /** @description Local decision models use string choice identifiers. Embedding category examples replace the description with their normalized centroid; trained models reject examples. */
+        DecisionChoice: {
+            value: string;
+            description?: string;
+            examples?: string[];
+        };
+        /** @description Question-specific acceptance policy for embedding similarity. Trained decision models reject it. */
+        EmbeddingDecisionAcceptance: {
+            /** @description Public API identifier for a server-side fitted threshold artifact at model/calibrations/{id}.json. The server verifies qualification and the exact asset identity, prompt profile, dimensions, renderer and this question's label/prototype set. Mutually exclusive with manual thresholds; never produces probabilities. */
+            calibration_id?: string;
+            /** @description For a single choice, abstain when the highest cosine similarity is below this value. It is a similarity threshold, not an accuracy or probability estimate. */
+            min_similarity?: number;
+            /** @description For a single choice, require this gap between the highest and second-highest cosine similarities. For multi_choice, require every score to be at least this distance from its own selection threshold; otherwise abstain. */
+            min_margin?: number;
+        };
+        ChoiceDecisionQuestion: {
+            /** @enum {string} */
+            type: "choice";
+            name: string;
+            instructions: string;
+            choices: components["schemas"]["DecisionChoice"][];
+            embedding_options?: components["schemas"]["EmbeddingDecisionAcceptance"];
+        };
+        GraphResolverAdjudicationAcceptance: {
+            /** @description A choice identifier in the configured question. Accept and reject must differ. */
+            choice: string;
+            /** @description Require this typed probability and a strict majority. Raw cosine is not a probability. */
+            min_probability: number;
+        };
+        /** @description Adjudicate the best deterministic REVIEW candidate with a typed decision. MATCH and NO_MATCH bypass the model. Evidence is authoritative resolution data, retained independently of work caches and reused on recovery. Changes trigger versioned re-resolution. This resolves mentions, not global key merges. */
+        GraphResolverAdjudicationConfig: {
+            /** @description Frozen typed or generated decider configuration. Generated verdict-only thresholds must be zero or one. */
+            decider: components["schemas"]["DeciderConfig"];
+            /** @description Bounded interpolation of m.text, m.surface_form, m.canonical_text, m.label, m.description, c.canonical_name, c.label and c.description. Missing descriptions render empty text, allowing name-only decisions. */
+            template: string;
+            question: components["schemas"]["ChoiceDecisionQuestion"];
+            accept: components["schemas"]["GraphResolverAdjudicationAcceptance"];
+            /** @description Optional confident negative choice. Without it, non-acceptance stays REVIEW. */
+            reject?: components["schemas"]["GraphResolverAdjudicationAcceptance"];
+            /**
+             * @description Failure or budget fallback. REVIEW remains unpromoted; mint explicitly permits a new identity.
+             * @default review
+             * @enum {string}
+             */
+            on_failure?: "review" | "mint";
+            /** @description Optional asset bindings. Resolution reads available data without waiting for promotion or producers. */
+            description_inputs?: {
+                /** @description Source-document asset containing a JSON object mapping local mention ids to description strings. Publication re-drives asset-scoped resolution. */
+                mention_artifact?: string;
+                /** @description Candidate-document text asset, such as a generated summary. Changes affect future decisions; explicitly re-resolve to revisit committed evidence. */
+                candidate_artifact?: string;
+            };
+            /**
+             * @description Total model-time budget per source artifact. Each call also obeys timeout_ms.
+             * @default 10000
+             */
+            budget_ms?: number;
+            /** @default 32 */
+            max_pairs?: number;
+            /** @default 16384 */
+            max_input_bytes?: number;
+            /** @default 10000 */
+            timeout_ms?: number;
+        };
+        /** @description Suppress mentions before candidate search, embedding, adjudication and promotion. Suppressed mentions remain explainable in resolution artifacts and contribute no canonical graph edges. Changes use the normal resolver generation and bounded backfill lifecycle. Redirects to suppressed keys are rejected. Runtime suppressions are additive and outlive index versions. */
+        GraphResolverSuppressionConfig: {
+            /** @description Exact rendered canonical keys in this resolver namespace. */
+            keys?: string[];
+            /** @description Mention texts normalized with the resolver Unicode slug rules. */
+            texts?: string[];
+            /**
+             * Format: uint32
+             * @description Minimum Unicode scalar count after trimming surrounding ASCII whitespace.
+             * @default 0
+             */
+            min_text_chars?: number;
+        };
         /** @description Versioned entity resolver attached to an artifact-backed graph index. */
         GraphResolverConfig: {
             name: string;
@@ -13974,6 +15573,8 @@ export interface components {
             type_must_match?: boolean;
             /** @description Typed matcher scorer. Cannot be combined with scorer_json. */
             scorer?: components["schemas"]["GraphResolverScorerConfig"];
+            adjudicate?: components["schemas"]["GraphResolverAdjudicationConfig"];
+            suppress?: components["schemas"]["GraphResolverSuppressionConfig"];
             /** @deprecated */
             scorer_json?: string;
             /** @enum {string} */
@@ -13994,7 +15595,7 @@ export interface components {
             fusion_prior_weight?: number;
             /**
              * Format: double
-             * @description Mention admission floor: mentions whose extractor-asserted confidence is below this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are withheld. The cheap post-extraction junk filter for score-carrying extractors; 0 (the default) admits everything.
+             * @description Mention admission floor: mentions whose extractor-asserted confidence is below this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are withheld. The cheap post-extraction junk filter for score-carrying extractors; omission defaults to 0 for trained extractors. Resolvers consuming verdict-only generated extraction must set this field explicitly, including when the chosen floor is zero.
              */
             min_confidence?: number;
             /** Format: uint64 */
@@ -14376,7 +15977,13 @@ export interface components {
             table_id: string;
             /** @enum {string} */
             format: "parquet" | "iceberg";
+            /** @description Parquet prefix, Iceberg table, or an explicit Parquet snapshot head ending in .parquet-manifest.json. Snapshot heads name immutable checksummed file-list chunks; each query revalidates the head without listing the data prefix. */
             uri: string;
+            /**
+             * @description Server-assigned public row identity version, fixed when the source is attached and preserved across index creation and schema updates.
+             * @enum {integer}
+             */
+            readonly row_identity_version?: 1 | 2;
             /** @default auto */
             schema_fingerprint?: string;
             /**
@@ -14806,6 +16413,8 @@ export interface components {
         CreatedEnrichmentConfig: {
             name: string;
             kind: components["schemas"]["EnrichmentKind"];
+            source?: components["schemas"]["GroupedArtifactSource"];
+            prior_context?: components["schemas"]["PriorArtifactContext"];
             field?: string;
             template?: string;
             source_artifact_name?: string;
@@ -17030,6 +18639,22 @@ export interface components {
             type: "image_url";
             image_url: components["schemas"]["ImageURL"];
         };
+        /** @description Explicit EmbeddingGemma 2 video-group sampling. Timestamp windows are half-open and relative to the first presentation picture. */
+        VideoSamplingPolicy: {
+            /** @enum {string} */
+            policy: "reference" | "timestamps";
+            /** Format: int64 */
+            start_ns?: number;
+            /** Format: int64 */
+            end_ns?: number;
+            /** Format: int64 */
+            step_ns?: number;
+            max_frames?: number;
+            /** @enum {string} */
+            overflow?: "uniform" | "truncate";
+            /** @description Sample the displayed picture, including VFR holds, rather than the next picture at or after the target. */
+            hold?: boolean;
+        };
         /** @description Inline binary media content (audio, image, etc.). */
         MediaContentPart: {
             /** @enum {string} */
@@ -17041,6 +18666,7 @@ export interface components {
             data: string;
             /** @description MIME type (audio/wav, image/gif, image/png, etc.). */
             mime_type: string;
+            sampling?: components["schemas"]["VideoSamplingPolicy"];
         };
         /** @description A content part for multimodal input (text, image URL, or inline media). */
         ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"];
@@ -18533,6 +20159,310 @@ export interface components {
         IndexMaintenanceResponse: {
             acknowledged_groups: string[];
         };
+        ResolverRedirect: {
+            key: string;
+            target: string;
+        };
+        ResolverDistinctPair: {
+            from: string;
+            to: string;
+        };
+        ResolverCurationState: {
+            /** @enum {integer} */
+            version?: 1;
+            suppress?: components["schemas"]["GraphResolverSuppressionConfig"];
+            distinct?: components["schemas"]["ResolverDistinctPair"][];
+            /** @description Explicitly restored identities; declarative aliases and promotion tombstones cannot recreate the removed redirect. */
+            removed_aliases?: string[];
+        };
+        ResolverReplayStage: {
+            enabled?: boolean;
+            /** Format: uint64 */
+            target_sequence?: number;
+            /** Format: uint64 */
+            applied_sequence?: number;
+            catch_up_required?: boolean;
+            blocked?: boolean;
+            blocked_reason?: string;
+            /** Format: uint64 */
+            error_count?: number;
+        };
+        ResolverGroupProgress: {
+            /** Format: uint64 */
+            group_id: number;
+            available: boolean;
+            fresh: boolean;
+            /** Format: uint64 */
+            curation_revision: number;
+            /** Format: uint64 */
+            config_generation: number;
+            /** Format: uint64 */
+            effective_generation: number;
+            backfill_pending: boolean;
+            resolution: components["schemas"]["ResolverReplayStage"];
+            promotion: components["schemas"]["ResolverReplayStage"];
+        };
+        ResolverReplayProgress: {
+            applied: boolean;
+            shards: components["schemas"]["ResolverGroupProgress"][];
+            /** @description Progress observation failure after acceptance; the metadata commit remains valid and applied is false. */
+            observation_error?: string;
+        };
+        ResolverSummary: {
+            name: string;
+            source_table: string;
+            entity_table: string;
+            key_template?: string;
+            declaring_indexes: string[];
+            retired: boolean;
+            config?: components["schemas"]["GraphResolverConfig"] | null;
+            /** Format: uint64 */
+            revision: number;
+            /** Format: uint64 */
+            namespace_generation?: number;
+            redirects: components["schemas"]["ResolverRedirect"][];
+            curation: components["schemas"]["ResolverCurationState"];
+            progress?: components["schemas"]["ResolverReplayProgress"];
+        };
+        ResolverList: {
+            resolvers: components["schemas"]["ResolverSummary"][];
+        };
+        ResolverMutationResult: {
+            resolver: string;
+            changed: boolean;
+            /** Format: uint64 */
+            revision: number;
+            /** Format: uint64 */
+            replay_sequence: number;
+            /** @enum {string} */
+            replay_sequence_kind: "resolver_revision" | "source_journal";
+            metadata_commit?: {
+                [key: string]: unknown;
+            } | null;
+            applied: boolean;
+            progress?: components["schemas"]["ResolverReplayProgress"];
+        };
+        ResolverRenderRequest: {
+            text: string;
+            label: string;
+            /** @default query */
+            local_id?: string;
+        };
+        ResolverRenderResponse: {
+            minted_key: string;
+            key: string;
+            table: string;
+            /** Format: uint64 */
+            config_generation: number;
+            suppressed: boolean;
+        };
+        /** @description Supply exactly one of text or extraction. Text uses this resolver's configured extractor. Resolution is ephemeral and uses the serving policy, candidate namespace and typed adjudicator without publishing artifacts or entities. */
+        ResolverResolveRequest: {
+            text?: string;
+            extraction?: {
+                [key: string]: unknown;
+            };
+        };
+        ResolverAdjudicationEvidence: {
+            execution_hash?: string;
+            specification_hash?: string;
+            input_hash?: string;
+            candidate_hash?: string;
+            candidate_table?: string;
+            candidate_key?: string;
+            /** Format: double */
+            deterministic_probability?: number;
+            /** @enum {string} */
+            status?: "accepted" | "rejected" | "abstained" | "failed" | "budget_exhausted";
+            response?: {
+                [key: string]: unknown;
+            } | null;
+            failure?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        ResolverResolvedEntity: {
+            local_id: string;
+            doc_ref: {
+                table: string;
+                key: string;
+                storage_table?: string;
+            };
+            /** Format: double */
+            confidence: number;
+            /** @enum {string} */
+            decision: "new" | "match" | "review" | "suppressed";
+            label?: string;
+            canonical_name?: string;
+            surface_form?: string;
+            rendered_key?: string;
+            redirected_from?: string;
+            suppressed?: boolean;
+            /** @enum {string} */
+            suppression_reason?: "key" | "text" | "min_text_chars" | "curator";
+            identity_restored?: boolean;
+            adjudication?: components["schemas"]["ResolverAdjudicationEvidence"];
+        };
+        ResolverResolveResponse: {
+            extraction: {
+                [key: string]: unknown;
+            };
+            resolution: {
+                /** Format: uint64 */
+                config_generation: number;
+                skipped_mentions?: number;
+                entities: components["schemas"]["ResolverResolvedEntity"][];
+                _resolution_work?: {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        /** @description Wait for observed replay completion up to this timeout. A timeout returns accepted state with applied=false; it does not undo the mutation. */
+        ResolverWait: {
+            /**
+             * Format: uint32
+             * @default 1000
+             */
+            timeout_ms?: number;
+        };
+        /** @description Explicit namespace migration. Choose reset_merges=true or a complete key_map. Runtime suppressions and distinct pins must be remapped too, or explicitly reset with reset_curation=true. */
+        ResolverNamespaceRequest: {
+            table: string;
+            key_template: string;
+            /** @default false */
+            reset_merges?: boolean;
+            /** @default false */
+            reset_curation?: boolean;
+            key_map?: components["schemas"]["ResolverRedirect"][];
+            aliases?: components["schemas"]["ResolverRedirect"][];
+            /**
+             * Format: uint64
+             * @description Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+             */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        ResolverRedirectList: {
+            redirects: components["schemas"]["ResolverRedirect"][];
+            distinct: components["schemas"]["ResolverDistinctPair"][];
+            /** Format: uint64 */
+            revision: number;
+        };
+        ResolverMergeRequest: {
+            from: string;
+            to: string;
+            /** @default false */
+            replace?: boolean;
+            /**
+             * @description Pin the replaced former target distinct. Requires an existing different redirect and replace=true.
+             * @default false
+             */
+            pin_distinct?: boolean;
+            /**
+             * Format: uint64
+             * @description Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+             */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        ResolverUnmergeRequest: {
+            /** @default false */
+            pin_distinct?: boolean;
+            /**
+             * Format: uint64
+             * @description Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+             */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        ResolverSuppressionList: {
+            configured: components["schemas"]["GraphResolverSuppressionConfig"];
+            runtime: components["schemas"]["GraphResolverSuppressionConfig"];
+            /** Format: uint64 */
+            revision: number;
+        };
+        ResolverSuppressionSelection: {
+            keys?: string[];
+            texts?: string[];
+        };
+        /** @description Add keys or normalized texts. The add/remove form updates both sets in one revision. Runtime removals do not override declarative suppression. */
+        ResolverSuppressionRequest: {
+            keys?: string[];
+            texts?: string[];
+            add?: components["schemas"]["ResolverSuppressionSelection"];
+            remove?: components["schemas"]["ResolverSuppressionSelection"];
+            /**
+             * Format: uint64
+             * @description Optional revision fence. Explicit zero fences the first edit; omission disables the fence.
+             */
+            expected_revision?: number;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        ResolverReview: {
+            /** @description Opaque revision-bound review identity; treat it as a single URL-encoded path component. */
+            id: string;
+            source_key: string;
+            local_id: string;
+            label: string;
+            surface_form: string;
+            key: string;
+            table?: string;
+            /** Format: double */
+            confidence: number;
+            /** Format: uint64 */
+            config_generation?: number;
+            adjudication?: components["schemas"]["ResolverAdjudicationEvidence"];
+        };
+        ResolverReviewPage: {
+            reviews: components["schemas"]["ResolverReview"][];
+            next_cursor?: string | null;
+        };
+        ResolverReviewDecision: {
+            /** @enum {string} */
+            decision: "match" | "new" | "suppressed";
+            key?: string;
+            table?: string;
+            wait?: components["schemas"]["ResolverWait"];
+        };
+        EntityCurationResult: {
+            entity_table: string;
+            key: string;
+            complete: boolean;
+            /**
+             * @description Server entity corrections commit once on the destination table, atomically across matching namespaces. Source replay remains asynchronous. Lite retains resolver atomicity.
+             * @enum {string}
+             */
+            atomicity: "namespace" | "source_table" | "resolver";
+            results: {
+                source_table: string;
+                resolver: string;
+                key_template?: string;
+                canonical_key?: string;
+                curation?: {
+                    [key: string]: unknown;
+                };
+                /** Format: uint64 */
+                revision?: number;
+                changed?: boolean;
+                /** Format: uint64 */
+                replay_sequence?: number;
+                applied?: boolean;
+                retired?: boolean;
+                error?: string;
+                redirects?: components["schemas"]["ResolverRedirect"][];
+                distinct?: components["schemas"]["ResolverDistinctPair"][];
+                configured_suppressed?: boolean;
+                runtime_suppressed?: boolean;
+            }[];
+        };
+        EntityMergeRequest: {
+            into: string;
+            /** @default false */
+            replace?: boolean;
+            /** @default false */
+            pin_distinct?: boolean;
+            wait?: components["schemas"]["ResolverWait"];
+        };
         InferenceError: {
             /** @description Stable machine-readable error code */
             error: string;
@@ -18619,7 +20549,13 @@ export interface components {
         InferenceImageURLContentPart: components["schemas"]["ImageURLContentPart"];
         InferenceMediaContentPart: components["schemas"]["MediaContentPart"];
         InferenceContentPart: components["schemas"]["ContentPart"];
-        /** @description EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens. */
+        /** @description One ordered input producing one combined embedding. Supported by EmbeddingGemma 2. Text, image, and audio parts may be combined in order. On Linux CUDA, a group containing one video/mp4 media part produces one clip embedding using NVDEC; mixed video groups are unsupported. Video requires progressive SDR H.264 MP4, at most 60 seconds and 256 MiB, subject to narrower request limits. Sampling uses 1 FPS capped uniformly to 32 frames, with at most 140 visual tokens per frame. The expanded input, including task prompts, BOS/EOS, and media tokens, must fit within 8192 tokens. Overflow is rejected without truncation. */
+        InferenceEmbeddingContentInput: {
+            /** @description Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part. */
+            title?: string;
+            content: components["schemas"]["ContentPart"][];
+        };
+        /** @description EmbeddingGemma 2 ordered text, image, audio and video parts producing one joint vector. CPU/Metal video accepts video/mp4, video/quicktime, video/webm or video/mp2t, using 1 FPS sampling, a uniform 32-frame cap and up to 140 soft tokens per frame. Linux CUDA video uses NVDEC and requires one standalone progressive SDR H.264 video/mp4 part, without a title or other parts, at most 60 seconds and 256 MiB subject to narrower request limits. The expanded sequence including all media soft tokens must fit 8192 tokens. */
         InferenceEmbeddingGroup: {
             /** @description Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part. */
             title?: string;
@@ -18637,22 +20573,24 @@ export interface components {
              *     - a single string
              *     - an array of strings
              *     - an array of OpenAI-style content parts for multimodal embedding
-             *     - an array of ordered groups for EmbeddingGemma 2, one vector per group
+             *     - an object with an ordered content array, producing one embedding
+             *     - an array of ordered content objects, producing one embedding per object
+             *     Legacy arrays of content parts continue to produce one embedding per part.
              */
-            input: string | string[] | components["schemas"]["ContentPart"][] | components["schemas"]["InferenceEmbeddingGroup"][];
+            input: string | string[] | components["schemas"]["ContentPart"][] | components["schemas"]["InferenceEmbeddingGroup"][] | components["schemas"]["InferenceEmbeddingContentInput"] | components["schemas"]["InferenceEmbeddingContentInput"][];
             /**
              * @description Encoding format for the embeddings (only "float" supported)
              * @default float
              * @enum {string}
              */
             encoding_format?: "float";
-            /** @description Optional truncation size for dense embeddings. EmbeddingGemma 2 supports 768, 512, 256, or 128 only. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models. */
+            /** @description Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). EmbeddingGemma 2 is trained for 768, 512, 256, and 128 dimensions. Not supported for sparse models. */
             dimensions?: number;
             /**
-             * @description Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 uses the official prefix for each listed task, defaulting to RETRIEVAL_DOCUMENT. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
+             * @description Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 applies its official prompt for each of the eight task types to text-bearing inputs and rejects custom instructions. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction.
              * @enum {string}
              */
-            task_type?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "QUESTION_ANSWERING" | "FACT_VERIFICATION" | "CODE_RETRIEVAL_QUERY" | "CLASSIFICATION" | "CLUSTERING" | "SEMANTIC_SIMILARITY";
+            task_type?: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT" | "QUESTION_ANSWERING" | "FACT_VERIFICATION" | "FACT_CHECKING" | "CODE_RETRIEVAL_QUERY" | "CODE_RETRIEVAL" | "CLASSIFICATION" | "CLUSTERING" | "SEMANTIC_SIMILARITY";
             /** @description Task description for instruction-aware embedding models (Qwen3-Embedding), rendered inside the query instruction wrapper ("Instruct: {instruction}\nQuery:{input}"). Optional for RETRIEVAL_QUERY, which has a model-owned default; required for other non-document task types; rejected for document tasks and models without instruction support. */
             instruction?: string;
             /**
@@ -18674,6 +20612,8 @@ export interface components {
         };
         /** @description OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors */
         InferenceEmbedResponse: {
+            /** @description Execution backend reported for EmbeddingGemma 2 qualification. CUDA requests fail if the resident text encoder cannot execute; this field does not describe preprocessing placement. */
+            backend?: string | null;
             /** @description EmbeddingGemma 2 SHA256 identity of actual weights, tokenizer, processor and recipe. Dimensions and retrieval roles must also match index configuration. */
             model_identity?: string;
             /**
@@ -18739,7 +20679,27 @@ export interface components {
              */
             input: string | components["schemas"]["InferenceChunkContentPart"];
             config?: components["schemas"]["InferenceChunkConfig"];
+            embedding?: components["schemas"]["ChunkEmbeddingTarget"];
+            policy?: components["schemas"]["MediaChunkPolicy"];
+            /** @description Caller source identity; immutable content is independently fingerprinted. */
+            source_id?: string;
+            /** @description Immutable caller version, included in continuation and plan identity. */
+            source_version?: string;
+            /** @description Resume the exact source and semantic plan; changed inputs are rejected. */
+            continuation?: string;
+            /**
+             * @description In model-aware mode include chunk payloads in addition to mandatory descriptors.
+             * @default false
+             */
+            include_content?: boolean;
+            /**
+             * @description In model-aware mode return NDJSON chunk events followed by a terminal coverage response.
+             * @default false
+             */
+            stream?: boolean;
         };
+        InferenceChunkEmbeddingResponse: components["schemas"]["ChunkEmbeddingResponse"];
+        InferenceChunkOperationResponse: components["schemas"]["InferenceChunkResponse"] | components["schemas"]["InferenceChunkEmbeddingResponse"];
         /**
          * @example {
          *       "object": "list",
@@ -19298,6 +21258,27 @@ export interface components {
         /** @description Information about a model including its capabilities */
         InferenceModelInfo: {
             /**
+             * @description Effective model-aware chunk operational ceilings for working/output/event
+             *     bytes, chunk/dependency/index counts and remote fetched bytes, requests
+             *     and cache bytes. Independent of model token limits and object length.
+             *     Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>.
+             *     Scoped and unscoped embedding discovery expose the same values.
+             */
+            chunking_limits?: {
+                [key: string]: number;
+            };
+            /** @description Resolved executor/task facts; generation bits are false when the selected executor does not implement them. */
+            inference_capabilities?: {
+                version?: number;
+                task?: string;
+                generation_grammar_v1?: boolean;
+                generation_token_logprobs_v1?: boolean;
+            } & {
+                [key: string]: unknown;
+            };
+            /** @description Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights. */
+            model_revision?: string;
+            /**
              * @description Pull-time qualified request profiles for this exact artifact,
              *     including backend, supported features and min/max geometry.
              *     Runtime admission revalidates artifact identity and resource limits.
@@ -19310,17 +21291,6 @@ export interface components {
             capabilities?: string[];
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
             inputs?: string[];
-        };
-        /** @description Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
-        InferenceDecideRequest: {
-            model: string;
-            /** @description Pin the exact EmbeddingGemma 2 assets and embedding recipe. */
-            model_identity?: string;
-            input?: string;
-            inputs?: components["schemas"]["DecisionInput"][];
-            long_document?: components["schemas"]["InferenceDecideLongDocument"];
-            questions: components["schemas"]["InferenceDecideQuestion"][];
-            embedding_options?: components["schemas"]["EmbeddingDecisionOptions"];
         };
         /** @description Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage. */
         InferenceDecideResponse: {
@@ -19485,6 +21455,16 @@ export interface components {
             model: string;
             /** @description Conversation messages (OpenAI-compatible format) */
             messages: components["schemas"]["InferenceChatMessage"][];
+            /**
+             * @description Return actual token log-probabilities for non-streaming native grammar decoding. Incompatible routes reject the request.
+             * @default false
+             */
+            logprobs?: boolean;
+            /**
+             * @description Bounded alternatives per decoded token; retained evidence also has a hard byte ceiling.
+             * @default 64
+             */
+            top_logprobs?: number;
             /**
              * @description Maximum tokens to generate
              * @default 256
@@ -20437,6 +22417,289 @@ export interface components {
         ExtensionError: {
             error: string;
         };
+        ChunkSourceReference: {
+            /** @enum {string} */
+            type: "source";
+            /** @description HTTP(S) or S3 object URI resolved through configured content security and credentials. */
+            uri: string;
+            mime_type: string;
+            /** @description Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read. */
+            version: string;
+            /**
+             * @description Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+             * @enum {string}
+             */
+            version_kind?: "strong_etag" | "s3_version_id";
+            /**
+             * Format: int64
+             * @description Exact immutable object length, verified against Content-Range.
+             */
+            length: number;
+        };
+        ChunkEmbeddingContext: {
+            source_reference?: components["schemas"]["ChunkSourceReference"];
+            source_id?: string;
+            source_fingerprint: string;
+            source_version: string;
+            plan_id: string;
+            model: string;
+            model_identity: string;
+            model_revision: string;
+            task_type: string;
+            /** @description Known vector width; may be absent before a planning-only or failed first item. */
+            dimensions?: number;
+            policy: components["schemas"]["MediaChunkPolicy"];
+            /** Format: int64 */
+            start_ordinal: number;
+        };
+        ChunkEmbeddingStartEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding.start";
+            context: components["schemas"]["ChunkEmbeddingContext"];
+        };
+        /** @description Original-source coordinates; time intervals are half-open integer nanoseconds and text spans are UTF-8 byte offsets. */
+        ChunkCoordinates: {
+            /** @enum {string} */
+            kind: "text" | "pdf" | "image" | "gif" | "audio" | "video";
+            /** Format: int64 */
+            start_byte?: number;
+            /** Format: int64 */
+            end_byte?: number;
+            page?: number;
+            /** @description Full-raster coordinates [left, top, right, bottom], end exclusive; raster_width/height declare the basis, including adaptively rendered PDF pages. */
+            region?: number[];
+            /** @description Width of the complete source/prepared-page raster before tiling, not the returned crop width. */
+            raster_width?: number;
+            /** @description Height of the complete source/prepared-page raster before tiling; map PDF regions through page_box and page_rotation. */
+            raster_height?: number;
+            /** Format: int64 */
+            start_ns?: number;
+            /** Format: int64 */
+            end_ns?: number;
+            /** Format: int64 */
+            first_picture?: number;
+            /** @description Ordered selectors in the immutable source index, including repeated cadence selections. */
+            selected_pictures?: number[];
+            /**
+             * @description WebM logical presentation pictures or the first MP4 packet of a completed picture assembly.
+             * @enum {string}
+             */
+            picture_basis?: "logical" | "packet_assembly";
+            picture_count?: number;
+            /** Format: int64 */
+            start_sample?: number;
+            /** Format: int64 */
+            end_sample?: number;
+            /** Format: int64 */
+            sample_rate?: number;
+            /** Format: int64 */
+            start_tick?: number;
+            /** Format: int64 */
+            end_tick?: number;
+            /** Format: int64 */
+            timescale?: number;
+            /** Format: int64 */
+            page_rotation?: number;
+            /** @description Original PDF page box in PDF user-space coordinates. */
+            page_box?: number[];
+        };
+        ChunkDescriptor: {
+            /** @description Opaque source-plan-bound inference identity; not a database artifact ID. */
+            id: string;
+            /** Format: int64 */
+            ordinal: number;
+            coordinates: components["schemas"]["ChunkCoordinates"];
+            input_tokens: number;
+        };
+        ChunkEmbeddingError: {
+            code: string;
+            message: string;
+        };
+        ChunkEmbeddingObject: {
+            descriptor: components["schemas"]["ChunkDescriptor"];
+            mime_type: string;
+            embedding?: number[];
+            error?: components["schemas"]["ChunkEmbeddingError"];
+            text?: string;
+            /**
+             * Format: byte
+             * @description Optional base64 payload; source coordinates remain mandatory.
+             */
+            data?: string;
+        };
+        ChunkEmbeddingEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding";
+            data: components["schemas"]["ChunkEmbeddingObject"];
+        };
+        ChunkEmbeddingResponse: {
+            /** @enum {string} */
+            object: "chunk.embedding.list";
+            data: components["schemas"]["ChunkEmbeddingObject"][];
+            /**
+             * @description Completion of this response's suffix starting at start_ordinal; callers must retain earlier acknowledged coverage.
+             * @enum {string}
+             */
+            status: "complete" | "partial" | "failed";
+            source_reference?: components["schemas"]["ChunkSourceReference"];
+            source_id?: string;
+            source_fingerprint: string;
+            source_version: string;
+            plan_id: string;
+            model: string;
+            model_identity: string;
+            /** @description Model generation revision used by inference capability leases. */
+            model_revision: string;
+            task_type: string;
+            dimensions: number;
+            policy: components["schemas"]["MediaChunkPolicy"];
+            /** Format: int64 */
+            start_ordinal: number;
+            /**
+             * Format: int64
+             * @description Exclusive end of acknowledged output ordinals; failed chunk coordinates are reported in gaps.
+             */
+            covered_through_ordinal: number;
+            error?: components["schemas"]["ChunkEmbeddingError"];
+            next_continuation?: string;
+            gaps: components["schemas"]["ChunkCoordinates"][];
+        };
+        ChunkEmbeddingTerminalEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding.complete";
+            response: components["schemas"]["ChunkEmbeddingResponse"];
+        };
+        ChunkEmbeddingInitializationErrorEvent: {
+            /** @enum {string} */
+            object: "chunk.embedding.error";
+            code: string;
+        };
+        DecisionInput: {
+            id?: string;
+            input: string;
+        };
+        /** @description Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text. */
+        InferenceDecideLongDocument: {
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            mode?: "reject" | "window";
+            /** @default 1024 */
+            window_words?: number;
+            /**
+             * @description Must be smaller than window_words. Only valid in window mode.
+             * @default 32
+             */
+            overlap_words?: number;
+            /** @default 128 */
+            max_windows?: number;
+        };
+        /** @description Antfly multi-label extension for embedding similarity; selected, empty and abstained are distinct results. */
+        MultiChoiceDecisionQuestion: {
+            /** @enum {string} */
+            type: "multi_choice";
+            name: string;
+            instructions: string;
+            choices: components["schemas"]["DecisionChoice"][];
+            embedding_options?: components["schemas"]["EmbeddingDecisionAcceptance"];
+            /** @description Required raw cosine cutoff for every choice, either one common cutoff or a complete choice-to-cutoff map. Alternatively supply a qualified question-specific calibration_id. Mutually exclusive with calibration_id. Scores equal to their cutoff are selected. */
+            similarity_thresholds?: number | {
+                [key: string]: number;
+            };
+        };
+        /** @description Ordered score level, from lowest to highest. Results assign zero-based numeric values to these levels. */
+        DecisionLevel: {
+            label: string;
+            description?: string;
+        };
+        ScoreDecisionQuestion: {
+            /** @enum {string} */
+            type: "score";
+            name: string;
+            instructions: string;
+            levels: components["schemas"]["DecisionLevel"][];
+        };
+        /** @description Estimate whether the condition in instructions holds for the input. The trained answer reports probability in [0,1]. */
+        PredicateDecisionQuestion: {
+            /** @enum {string} */
+            type: "predicate";
+            name: string;
+            instructions: string;
+        };
+        InferenceDecideQuestion: components["schemas"]["ChoiceDecisionQuestion"] | components["schemas"]["MultiChoiceDecisionQuestion"] | components["schemas"]["ScoreDecisionQuestion"] | components["schemas"]["PredicateDecisionQuestion"];
+        /** @description Request-wide embedding geometry defaults. Acceptance thresholds and calibration belong to individual questions. */
+        EmbeddingDecisionOptions: {
+            /**
+             * @description Prompt profile for the decision input and category prototypes. The embedding endpoint also accepts task_type; decision routing restricts it to these two profiles.
+             * @default CLUSTERING
+             * @enum {string}
+             */
+            task_type?: "CLUSTERING" | "CLASSIFICATION";
+            /**
+             * @description Truncate and renormalize embeddings to this dimension before cosine scoring.
+             * @default 768
+             * @enum {integer}
+             */
+            dimensions?: 768 | 512 | 256 | 128;
+        };
+        /** @description Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB. */
+        InferenceDecideRequest: {
+            model: string;
+            /** @description Pin the exact EmbeddingGemma 2 assets and embedding recipe. */
+            model_identity?: string;
+            input?: string;
+            inputs?: components["schemas"]["DecisionInput"][];
+            long_document?: components["schemas"]["InferenceDecideLongDocument"];
+            questions: components["schemas"]["InferenceDecideQuestion"][];
+            embedding_options?: components["schemas"]["EmbeddingDecisionOptions"];
+        };
+        GeneratedChoiceDecisionQuestion: {
+            /** @enum {string} */
+            type: "choice";
+            name: string;
+            /** @description May inherit nonempty generated decider instructions. */
+            instructions?: string;
+            choices: components["schemas"]["DecisionChoice"][];
+        };
+        GeneratedMultiChoiceDecisionQuestion: {
+            /** @enum {string} */
+            type: "multi_choice";
+            name: string;
+            /** @description May inherit nonempty generated decider instructions. */
+            instructions?: string;
+            choices: components["schemas"]["DecisionChoice"][];
+        };
+        GeneratedPredicateDecisionQuestion: {
+            /** @enum {string} */
+            type: "predicate";
+            name: string;
+            /** @description May inherit nonempty generated decider instructions. */
+            instructions?: string;
+        };
+        GeneratedScoreDecisionQuestion: {
+            /** @enum {string} */
+            type: "score";
+            name: string;
+            /** @description May inherit nonempty generated decider instructions. */
+            instructions?: string;
+        };
+        GeneratedDecideQuestion: components["schemas"]["GeneratedChoiceDecisionQuestion"] | components["schemas"]["GeneratedMultiChoiceDecisionQuestion"] | components["schemas"]["GeneratedPredicateDecisionQuestion"] | components["schemas"]["GeneratedScoreDecisionQuestion"];
+        /** @description Supply exactly one of input or inputs. Each question requires instructions unless nonempty decider instructions are supplied. Inference nodes admit registered native generators; hosted execution uses configured producer and SQL runtimes. */
+        GeneratedDecideRequest: {
+            /** @enum {string} */
+            decision_method: "generated";
+            generator: components["schemas"]["GeneratorConfig"];
+            input?: string;
+            inputs?: components["schemas"]["DecisionInput"][];
+            questions: components["schemas"]["GeneratedDecideQuestion"][];
+            instructions?: string;
+            output?: components["schemas"]["ConstrainedOutput"];
+            probabilities?: components["schemas"]["ConstrainedProbabilities"];
+            batch?: components["schemas"]["ConstrainedGenerationBatch"];
+        };
+        /** @description A trained decider request or a constrained generator request. */
+        DecisionRequest: components["schemas"]["InferenceDecideRequest"] | components["schemas"]["GeneratedDecideRequest"];
         /**
          * @description Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime must support every requested feature.
          * @default 1
@@ -20446,529 +22709,6 @@ export interface components {
         ExtractionToken: {
             text: string;
             box?: number[];
-        };
-        /** Format: double */
-        ExtractionProbability: number;
-        /** @description Optional source and target labels constrain relation endpoints. A target requires a source. */
-        ExtractionRelationSchema: {
-            type: string;
-            source?: string;
-            target?: string;
-            /** @description Version 2 model-facing relation description. */
-            description?: string;
-            threshold?: components["schemas"]["ExtractionProbability"];
-        };
-        ExtractionLabelDefinition: {
-            /** @description Model-facing label description. */
-            description?: string;
-        };
-        /**
-         * Format: double
-         * @description Finite centered-logit decisions require a threshold strictly between zero and one.
-         */
-        ExtractionClassificationThreshold: number;
-        ExtractionClassificationExample: {
-            input: string;
-            label: string;
-        } | string[];
-        ExtractionClassificationSchema: {
-            name: string;
-            labels: string[];
-            /** @description The server uses false when omitted. Version 1: return highest-ranked labels up to top_k when false, or labels meeting options.threshold when true. Version 2: selects ordinary single or multi classification unless mode is specified; classification.threshold controls the decision threshold. */
-            multi_label?: boolean;
-            /** @description Version 1 NLI hypothesis template with {} as the label placeholder; the server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit hypothesis_template; use prompt/instruction and label_definitions for model conditioning. */
-            hypothesis_template?: string;
-            /** @description Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained classification uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options. */
-            top_k?: number;
-            /**
-             * @description Version 2 ordinary classification mode. Standalone ordinal scores use the decision API.
-             *     Each model rejects modes it does not support.
-             * @enum {string}
-             */
-            mode?: "single" | "multi";
-            label_definitions?: {
-                [key: string]: components["schemas"]["ExtractionLabelDefinition"];
-            };
-            min_labels?: number;
-            /** @description Version 2 maximum selected labels. Explicit null means no maximum; omission preserves mode defaults. */
-            max_labels?: number | null;
-            ordered?: boolean;
-            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
-            candidate_threshold?: components["schemas"]["ExtractionProbability"];
-            /** @enum {string} */
-            activation?: "auto" | "sigmoid" | "softmax";
-            /** Format: double */
-            temperature?: number;
-            /** @description Version 2 fallback label; must be declared in labels. */
-            default?: string;
-            /** @description Version 2 model-facing task instruction. Mutually exclusive with instruction. */
-            prompt?: string;
-            /** @description Alias of prompt. */
-            instruction?: string;
-            examples?: components["schemas"]["ExtractionClassificationExample"][];
-        };
-        ExtractionRegexValidator: {
-            /** @enum {string} */
-            type?: "regex";
-            pattern: string;
-            /**
-             * @default full
-             * @enum {string}
-             */
-            mode?: "full" | "partial";
-            /** @default false */
-            exclude?: boolean;
-            /**
-             * @description Python-compatible regex flags supported by the active bounded validator engine; unsupported flags or syntax fail validation.
-             * @default 2
-             */
-            flags?: number;
-        };
-        ExtractionStructureField: string | ({
-            /** @enum {string} */
-            type?: "str" | "string" | "list" | "array";
-            enum?: string[];
-            /** @enum {string} */
-            dtype?: "str" | "list";
-            choices?: string[];
-            description?: string;
-            threshold?: components["schemas"]["ExtractionProbability"];
-            /**
-             * @description Version 2 explicit cardinality. Required fields are validated after record assignment.
-             * @enum {string}
-             */
-            cardinality?: "optional_one" | "required_one" | "zero_or_more" | "one_or_more";
-            /** @description Version 2 field spans cannot be assigned to multiple record instances. */
-            exclusive?: boolean;
-            validators?: components["schemas"]["ExtractionRegexValidator"][];
-        } & {
-            [key: string]: unknown;
-        });
-        ExtractionStructureSchema: {
-            fields: {
-                [key: string]: components["schemas"]["ExtractionStructureField"];
-            };
-            /**
-             * @description Version 2 record grouping. Omission preserves one-record extraction.
-             * @enum {string}
-             */
-            mode?: "natural" | "latent" | "anchorless";
-            /** @description Natural mode only; defaults to the first declared field. */
-            anchor?: string;
-            /** @enum {string} */
-            occurrence_policy?: "all" | "first" | "error_on_ambiguous" | "latent_all";
-        } & {
-            [key: string]: unknown;
-        };
-        ExtractionEntityDefinition: {
-            description?: string;
-            /** @enum {string} */
-            dtype?: "str" | "list";
-            /** @enum {string} */
-            type?: "str" | "string" | "list" | "array";
-            threshold?: components["schemas"]["ExtractionProbability"];
-            validators?: components["schemas"]["ExtractionRegexValidator"][];
-        };
-        /** @description Version 2 attributes are scored on retained entity spans using shared encoded states. Omitted applies_to selects all entities; [] selects none. Raw labels must be unique across groups, including when qualify_labels is true. Group names text,confidence,start,end are reserved. */
-        ExtractionAttributeGroup: {
-            labels: string[];
-            /** @default false */
-            multi_label?: boolean;
-            threshold?: components["schemas"]["ExtractionProbability"];
-            applies_to?: string[];
-            /** @default false */
-            qualify_labels?: boolean;
-        };
-        ExtractionConstraintLabelRef: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "LabelRef";
-            task: string;
-            label: string;
-        };
-        ExtractionConstraintAnySelected: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "AnySelected";
-            task: string;
-        };
-        ExtractionConstraintAnyOtherSelected: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "AnyOtherSelected";
-            task: string;
-        };
-        ExtractionConstraintIsDefault: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "IsDefault";
-            task: string;
-        };
-        ExtractionConstraintCardinality: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Cardinality";
-            task: string;
-            minimum?: number;
-            maximum?: number | null;
-        };
-        ExtractionConstraintMinLevel: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "MinLevel";
-            task: string;
-            level: string | number;
-        };
-        ExtractionConstraintMaxLevel: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "MaxLevel";
-            task: string;
-            level: string | number;
-        };
-        ExtractionConstraintAtLevel: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "AtLevel";
-            task: string;
-            level: string | number;
-        };
-        ExtractionConstraintNot: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Not";
-            child: components["schemas"]["ExtractionClassificationConstraint"];
-        };
-        ExtractionConstraintAnd: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "And";
-            children: components["schemas"]["ExtractionClassificationConstraint"][];
-        };
-        ExtractionConstraintOr: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Or";
-            children: components["schemas"]["ExtractionClassificationConstraint"][];
-        };
-        ExtractionConstraintExactlyOneOf: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "ExactlyOneOf";
-            children: components["schemas"]["ExtractionClassificationConstraint"][];
-        };
-        ExtractionConstraintImplies: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Implies";
-            cond: components["schemas"]["ExtractionClassificationConstraint"];
-            then: components["schemas"]["ExtractionClassificationConstraint"];
-        };
-        ExtractionConstraintIff: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Iff";
-            left: components["schemas"]["ExtractionClassificationConstraint"];
-            right: components["schemas"]["ExtractionClassificationConstraint"];
-        };
-        ExtractionConstraintExcludes: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "Excludes";
-            left: components["schemas"]["ExtractionClassificationConstraint"];
-            right: components["schemas"]["ExtractionClassificationConstraint"];
-        };
-        /** @description Declarative, bounded constraint AST. Task and label references are validated before inference. Nesting is bounded by the server schema limit. */
-        ExtractionClassificationConstraint: components["schemas"]["ExtractionConstraintLabelRef"] | components["schemas"]["ExtractionConstraintAnySelected"] | components["schemas"]["ExtractionConstraintAnyOtherSelected"] | components["schemas"]["ExtractionConstraintIsDefault"] | components["schemas"]["ExtractionConstraintCardinality"] | components["schemas"]["ExtractionConstraintMinLevel"] | components["schemas"]["ExtractionConstraintMaxLevel"] | components["schemas"]["ExtractionConstraintAtLevel"] | components["schemas"]["ExtractionConstraintNot"] | components["schemas"]["ExtractionConstraintAnd"] | components["schemas"]["ExtractionConstraintOr"] | components["schemas"]["ExtractionConstraintExactlyOneOf"] | components["schemas"]["ExtractionConstraintImplies"] | components["schemas"]["ExtractionConstraintIff"] | components["schemas"]["ExtractionConstraintExcludes"];
-        ExtractionJointEntity: {
-            description?: string;
-            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
-            candidate_threshold?: components["schemas"]["ExtractionProbability"];
-            max_candidates?: number;
-            allow_nested?: boolean;
-        };
-        ExtractionJointRelation: {
-            head: string[];
-            tail: string[];
-            /** @description Retained declarative metadata; model conditioning follows the pinned JointIE compiler. */
-            description?: string;
-            threshold?: components["schemas"]["ExtractionClassificationThreshold"];
-            candidate_threshold?: components["schemas"]["ExtractionProbability"];
-            /** @default true */
-            directed?: boolean;
-            /** @default false */
-            symmetric?: boolean;
-            inverse?: string;
-            /** @default false */
-            allow_self?: boolean;
-            max_per_head?: number;
-            max_per_tail?: number;
-        };
-        ExtractionJointConstraintTypedEndpoints: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "TypedEndpoints";
-            relation?: string;
-            head_types?: string[];
-            tail_types?: string[];
-        };
-        ExtractionJointConstraintNoSelfLoops: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "NoSelfLoops";
-            relation?: string;
-        };
-        ExtractionJointConstraintUniqueRelationPair: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "UniqueRelationPair";
-            relation?: string;
-            /** @default true */
-            directed?: boolean;
-        };
-        ExtractionJointConstraintUniqueRelationSlot: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "UniqueRelationSlot";
-            relation?: string;
-            /**
-             * @default head
-             * @enum {string}
-             */
-            slot?: "head" | "tail" | "slot";
-        };
-        ExtractionJointConstraintEntityOverlapPolicy: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "EntityOverlapPolicy";
-            /** @enum {string} */
-            policy?: "allow" | "disallow" | "nested";
-        };
-        ExtractionJointConstraintMaxRelationsPerHead: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "MaxRelationsPerHead";
-            relation?: string;
-            limit: number;
-        };
-        ExtractionJointConstraintMaxRelationsPerTail: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "MaxRelationsPerTail";
-            relation?: string;
-            limit: number;
-        };
-        ExtractionJointConstraintSymmetricRelation: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "SymmetricRelation";
-            relation: string;
-        };
-        ExtractionJointConstraintAcyclicRelation: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "AcyclicRelation";
-            relation: string;
-        };
-        ExtractionJointConstraintInverseRelation: {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            type: "InverseRelation";
-            relation: string;
-            inverse: string;
-        };
-        ExtractionJointConstraint: components["schemas"]["ExtractionJointConstraintTypedEndpoints"] | components["schemas"]["ExtractionJointConstraintNoSelfLoops"] | components["schemas"]["ExtractionJointConstraintUniqueRelationPair"] | components["schemas"]["ExtractionJointConstraintUniqueRelationSlot"] | components["schemas"]["ExtractionJointConstraintEntityOverlapPolicy"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerHead"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerTail"] | components["schemas"]["ExtractionJointConstraintSymmetricRelation"] | components["schemas"]["ExtractionJointConstraintAcyclicRelation"] | components["schemas"]["ExtractionJointConstraintInverseRelation"];
-        /** @description Separate typed graph schema, mutually exclusive with ordinary extraction families. Hard typed endpoints, overlap, uniqueness and declared graph constraints apply to every returned edge, including derived companions. */
-        ExtractionJointSchema: {
-            entities: {
-                [key: string]: string | components["schemas"]["ExtractionJointEntity"];
-            };
-            relations?: {
-                [key: string]: components["schemas"]["ExtractionJointRelation"];
-            };
-            constraints?: components["schemas"]["ExtractionJointConstraint"][];
-        };
-        /**
-         * @description Version 1 selects one extraction family; entities may accompany relations.
-         *     With schema_version 2, entities, attributes, classifications, structures,
-         *     and ordinary relations may share one encoded input. joint_ie is a separate,
-         *     mutually exclusive typed graph schema. The version 2 compiler rejects
-         *     unknown fields and validates all references before model execution.
-         */
-        ExtractionSchema: {
-            entities?: string[];
-            relations?: components["schemas"]["ExtractionRelationSchema"][];
-            classifications?: components["schemas"]["ExtractionClassificationSchema"][];
-            structures?: {
-                [key: string]: components["schemas"]["ExtractionStructureSchema"];
-            };
-            entity_definitions?: {
-                [key: string]: components["schemas"]["ExtractionEntityDefinition"];
-            };
-            entity_attributes?: {
-                [key: string]: components["schemas"]["ExtractionAttributeGroup"];
-            };
-            classification_constraints?: components["schemas"]["ExtractionClassificationConstraint"][];
-            joint_ie?: components["schemas"]["ExtractionJointSchema"];
-        } & {
-            [key: string]: unknown;
-        };
-        /**
-         * @description Half-open offsets into the immutable caller text. Version 2 defaults to utf8_bytes. No normalization, lowercasing or synthetic suffix is included in these coordinates.
-         * @enum {string}
-         */
-        ExtractionOffsetUnit: "utf8_bytes" | "unicode_codepoints" | "utf16_codeunits";
-        /** @description Version 2 never silently truncates. Reject is the default. Windowing requires an enabled runtime capability, reconstructs document-global offsets and revalidates all hard graph constraints after merging. */
-        ExtractionLongDocumentOptions: {
-            /**
-             * @default reject
-             * @enum {string}
-             */
-            mode?: "reject" | "window";
-            /** @description Maximum body words per window; also bounded by the checkpoint and encoded token limits. */
-            window_words?: number;
-            overlap_words?: number;
-            max_windows?: number;
-            /**
-             * @description Identity of latent, anchorless and legacy records across windows. Occurrence uses exact source spans; semantic explicitly merges equal field values. Natural records always use their exact source anchor. This is independent of annotation occurrence_policy.
-             * @default occurrence
-             * @enum {string}
-             */
-            record_identity?: "occurrence" | "semantic";
-        };
-        /** @description Bounded classification and JointIE selection. Exact optimality is with respect to admitted candidates. A completed beam may be feasible without an optimality proof. By default exhausted search is an error; best_effort permits only a validated feasible witness and reports exhausted:true. */
-        ExtractionDecoderOptions: {
-            /**
-             * @description Omit to use the model's per-task default. GLiNER2.5 uses source-compatible beam selection for single-window JointIE and automatic selection for classification. Windowed JointIE uses the native automatic global solver with independent window resources. Explicit values select the native bounded search algorithm.
-             * @enum {string}
-             */
-            algorithm?: "auto" | "exact" | "beam";
-            beam_width?: number;
-            max_search_nodes?: number;
-            max_local_assignments?: number;
-            /** @default false */
-            best_effort?: boolean;
-        };
-        /** @description JointIE proposal admission and utility calibration. Entity candidate caps are bypassed for endpoints of retained relation proposals, subject to server hard bounds. entity_threshold overrides candidate admission, not entity decision thresholds. */
-        ExtractionJointOptions: {
-            candidate_threshold?: components["schemas"]["ExtractionProbability"];
-            entity_threshold?: components["schemas"]["ExtractionProbability"];
-            relation_role_threshold?: components["schemas"]["ExtractionProbability"];
-            top_k_entities?: number;
-            top_k_roles?: number;
-            relation_pair_cap?: number;
-            max_edges_per_type?: number;
-            /** Format: double */
-            entity_weight?: number;
-            /** Format: double */
-            relation_weight?: number;
-        };
-        ExtractionReaderOptions: {
-            provider?: string;
-            model?: string;
-            url?: string;
-            api_url?: string;
-        } & {
-            [key: string]: unknown;
-        };
-        /** @description Optional cross-input entity and relation deduplication. */
-        ExtractionResolverOptions: {
-            /**
-             * Format: float
-             * @default 0.85
-             */
-            similarity_threshold?: number;
-            /** @default true */
-            type_must_match?: boolean;
-            /**
-             * Format: float
-             * @default 0
-             */
-            min_entity_confidence?: number;
-            /**
-             * Format: float
-             * @default 0
-             */
-            min_relation_confidence?: number;
-            /** @default true */
-            deduplicate_relations?: boolean;
-            /** @default true */
-            track_provenance?: boolean;
-        };
-        ExtractionOptions: {
-            /** Format: float */
-            threshold?: number;
-            flat_ner?: boolean;
-            include_confidence?: boolean;
-            include_spans?: boolean;
-            /**
-             * @description Version 2 source word splitting. char keeps ASCII alphanumeric and @._-+ runs together and splits other non-whitespace codepoints, preserving original source offsets. An input's options replace the shared options in full; omitted word_splitter uses whitespace. Explicit word_splitter is rejected by version 1.
-             * @enum {string}
-             */
-            word_splitter?: "whitespace" | "char";
-            /**
-             * @description Version 2 overlap selection. flat/disallow prohibit overlap, nested permits containment, longest removes strictly contained spans.
-             * @enum {string}
-             */
-            overlap?: "allow" | "nested" | "flat" | "disallow" | "longest";
-            offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
-            long_document?: components["schemas"]["ExtractionLongDocumentOptions"];
-            decoder?: components["schemas"]["ExtractionDecoderOptions"];
-            joint_ie?: components["schemas"]["ExtractionJointOptions"];
-            reader?: components["schemas"]["ExtractionReaderOptions"];
-            resolver?: components["schemas"]["ExtractionResolverOptions"];
-        } & {
-            [key: string]: unknown;
         };
         ExtractionInput: {
             id?: string;
@@ -20990,6 +22730,27 @@ export interface components {
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };
+        GeneratedExtractionInput: {
+            id?: string;
+            content: string;
+        };
+        GeneratedExtractionRequest: {
+            inputs: components["schemas"]["GeneratedExtractionInput"][];
+            /** @enum {string} */
+            method: "generated";
+            generator: components["schemas"]["GeneratorConfig"];
+            schema: components["schemas"]["ExtractionSchema"];
+            entity_definitions?: {
+                [key: string]: string;
+            };
+            instructions?: string;
+            output?: components["schemas"]["ConstrainedOutput"];
+            probabilities?: components["schemas"]["ConstrainedProbabilities"];
+            batch?: components["schemas"]["ConstrainedGenerationBatch"];
+            options?: components["schemas"]["ExtractionOptions"];
+        };
+        /** @description A trained extractor request or a constrained generator request. */
+        ExtractionInputRequest: components["schemas"]["ExtractionRequest"] | components["schemas"]["GeneratedExtractionRequest"];
         ExtractionAttributeLabel: {
             label: string;
             confidence: components["schemas"]["ExtractionProbability"];
@@ -21076,6 +22837,14 @@ export interface components {
             solver_optimality_scope: "retained_candidate_graph";
         };
         ExtractionObject: {
+            model?: string;
+            /**
+             * @description Generated extraction confidence comes from measured decoder evidence or explicit verdict-only assertions.
+             * @enum {string}
+             */
+            probability_source?: "token_logprobs" | "verdict";
+            /** @description Generated mention proposals dropped because they could not be aligned to the source. */
+            unaligned_mentions?: number;
             id?: string;
             offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
             entities?: components["schemas"]["ExtractionEntity"][];
@@ -21105,7 +22874,7 @@ export interface components {
             };
         };
         /** @description Content part supported by chunking requests. */
-        InferenceChunkContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["MediaContentPart"];
+        InferenceChunkContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["MediaContentPart"] | components["schemas"]["ChunkSourceReference"];
         /** @description Options for Voice Activity Detection (VAD) based audio segmentation. */
         VADOptions: {
             /** @description Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300. */
@@ -21146,101 +22915,67 @@ export interface components {
             text?: components["schemas"]["TextChunkOptions"];
             audio?: components["schemas"]["InferenceAudioChunkConfig"];
         };
-        DecisionInput: {
-            id?: string;
-            input: string;
-        };
-        /** @description Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text. */
-        InferenceDecideLongDocument: {
-            /**
-             * @default reject
-             * @enum {string}
-             */
-            mode?: "reject" | "window";
-            /** @default 1024 */
-            window_words?: number;
-            /**
-             * @description Must be smaller than window_words. Only valid in window mode.
-             * @default 32
-             */
-            overlap_words?: number;
-            /** @default 128 */
-            max_windows?: number;
-        };
-        /** @description Local decision models use string choice identifiers. Embedding category examples replace the description with their normalized centroid; trained models reject examples. */
-        DecisionChoice: {
-            value: string;
-            description?: string;
-            examples?: string[];
-        };
-        /** @description Question-specific acceptance policy for embedding similarity. Trained decision models reject it. */
-        EmbeddingDecisionAcceptance: {
-            /** @description Public API identifier for a server-side fitted threshold artifact at model/calibrations/{id}.json. The server verifies qualification and the exact asset identity, prompt profile, dimensions, renderer and this question's label/prototype set. Mutually exclusive with manual thresholds; never produces probabilities. */
-            calibration_id?: string;
-            /** @description For a single choice, abstain when the highest cosine similarity is below this value. It is a similarity threshold, not an accuracy or probability estimate. */
-            min_similarity?: number;
-            /** @description For a single choice, require this gap between the highest and second-highest cosine similarities. For multi_choice, require every score to be at least this distance from its own selection threshold; otherwise abstain. */
-            min_margin?: number;
-        };
-        ChoiceDecisionQuestion: {
-            /** @enum {string} */
-            type: "choice";
-            name: string;
-            instructions: string;
-            choices: components["schemas"]["DecisionChoice"][];
-            embedding_options?: components["schemas"]["EmbeddingDecisionAcceptance"];
-        };
-        /** @description Antfly multi-label extension for embedding similarity; selected, empty and abstained are distinct results. */
-        MultiChoiceDecisionQuestion: {
-            /** @enum {string} */
-            type: "multi_choice";
-            name: string;
-            instructions: string;
-            choices: components["schemas"]["DecisionChoice"][];
-            embedding_options?: components["schemas"]["EmbeddingDecisionAcceptance"];
-            /** @description Required raw cosine cutoff for every choice, either one common cutoff or a complete choice-to-cutoff map. Alternatively supply a qualified question-specific calibration_id. Mutually exclusive with calibration_id. Scores equal to their cutoff are selected. */
-            similarity_thresholds?: number | {
-                [key: string]: number;
-            };
-        };
-        /** @description Ordered score level, from lowest to highest. Results assign zero-based numeric values to these levels. */
-        DecisionLevel: {
-            label: string;
-            description?: string;
-        };
-        ScoreDecisionQuestion: {
-            /** @enum {string} */
-            type: "score";
-            name: string;
-            instructions: string;
-            levels: components["schemas"]["DecisionLevel"][];
-        };
-        /** @description Estimate whether the condition in instructions holds for the input. The trained answer reports probability in [0,1]. */
-        PredicateDecisionQuestion: {
-            /** @enum {string} */
-            type: "predicate";
-            name: string;
-            instructions: string;
-        };
-        InferenceDecideQuestion: components["schemas"]["ChoiceDecisionQuestion"] | components["schemas"]["MultiChoiceDecisionQuestion"] | components["schemas"]["ScoreDecisionQuestion"] | components["schemas"]["PredicateDecisionQuestion"];
-        /** @description Request-wide embedding geometry defaults. Acceptance thresholds and calibration belong to individual questions. */
-        EmbeddingDecisionOptions: {
-            /**
-             * @description Prompt profile for the decision input and category prototypes. The embedding endpoint also accepts task_type; decision routing restricts it to these two profiles.
-             * @default CLUSTERING
-             * @enum {string}
-             */
-            task_type?: "CLUSTERING" | "CLASSIFICATION";
-            /**
-             * @description Truncate and renormalize embeddings to this dimension before cosine scoring.
-             * @default 768
-             * @enum {integer}
-             */
-            dimensions?: 768 | 512 | 256 | 128;
-        };
         DecisionChoiceProbability: {
             value: string;
             probability: number;
+        };
+        GeneratedChoiceAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "choice";
+            /** @enum {string} */
+            decision_method: "generated";
+            /**
+             * @description Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+             * @enum {string}
+             */
+            probability_source: "token_logprobs" | "verdict";
+            raw_structured_answer: string;
+            choice: string;
+            probabilities: components["schemas"]["DecisionChoiceProbability"][];
+        };
+        GeneratedMultiChoiceAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "multi_choice";
+            /** @enum {string} */
+            decision_method: "generated";
+            /**
+             * @description Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+             * @enum {string}
+             */
+            probability_source: "token_logprobs" | "verdict";
+            raw_structured_answer: string[];
+            choices: string[];
+            probabilities: components["schemas"]["DecisionChoiceProbability"][];
+        };
+        GeneratedPredicateAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "predicate";
+            /** @enum {string} */
+            decision_method: "generated";
+            /**
+             * @description Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+             * @enum {string}
+             */
+            probability_source: "token_logprobs" | "verdict";
+            raw_structured_answer: boolean;
+            probability: number;
+        };
+        GeneratedScoreAnswer: {
+            name: string;
+            /** @enum {string} */
+            type: "score";
+            /** @enum {string} */
+            decision_method: "generated";
+            /**
+             * @description Measured decoder evidence, or an explicit verdict-only 0/1 assertion. No model-written confidence.
+             * @enum {string}
+             */
+            probability_source: "token_logprobs" | "verdict";
+            raw_structured_answer: number;
+            score: number;
         };
         TrainedChoiceAnswer: {
             name: string;
@@ -21345,10 +23080,12 @@ export interface components {
                 [key: string]: number;
             };
         };
-        InferenceDecideAnswer: components["schemas"]["TrainedChoiceAnswer"] | components["schemas"]["TrainedScoreAnswer"] | components["schemas"]["TrainedPredicateAnswer"] | components["schemas"]["EmbeddingChoiceAnswer"] | components["schemas"]["EmbeddingMultiChoiceAnswer"];
+        InferenceDecideAnswer: components["schemas"]["GeneratedChoiceAnswer"] | components["schemas"]["GeneratedMultiChoiceAnswer"] | components["schemas"]["GeneratedPredicateAnswer"] | components["schemas"]["GeneratedScoreAnswer"] | components["schemas"]["TrainedChoiceAnswer"] | components["schemas"]["TrainedScoreAnswer"] | components["schemas"]["TrainedPredicateAnswer"] | components["schemas"]["EmbeddingChoiceAnswer"] | components["schemas"]["EmbeddingMultiChoiceAnswer"];
         DecisionBatchItem: {
             input_index: number;
             id?: string;
+            /** @description Generated batches preserve valid siblings; a failed item has an empty answers array and this error code. */
+            error?: string;
             answers: components["schemas"]["InferenceDecideAnswer"][];
         };
         DecisionUsage: {
@@ -27916,6 +29653,2210 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    listResolvers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getResolver: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverSummary"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropResolverIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    renderResolverKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverRenderRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverRenderResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    resolveResolverQuery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverResolveRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverResolveResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    setResolverNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverNamespaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listResolverRedirects: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverRedirectList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mergeResolverKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverMergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unmergeResolverKey: {
+        parameters: {
+            query?: {
+                pin_distinct?: boolean;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listResolverSuppressions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverSuppressionList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    suppressResolverKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverSuppressionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unsuppressResolverKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listResolverReviews: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverReviewPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    reviewResolverMention: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                resolverName: string;
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverReviewDecision"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listEntityResolverState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mergeEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EntityMergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unmergeEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    suppressEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unsuppressEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListResolvers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceGetResolver: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverSummary"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceDropResolverIdentity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceRenderResolverKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverRenderRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverRenderResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceResolveResolverQuery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverResolveRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverResolveResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceSetResolverNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverNamespaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListResolverRedirects: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverRedirectList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceMergeResolverKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverMergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceUnmergeResolverKey: {
+        parameters: {
+            query?: {
+                pin_distinct?: boolean;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListResolverSuppressions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverSuppressionList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceSuppressResolverKeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverSuppressionRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceUnsuppressResolverKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListResolverReviews: {
+        parameters: {
+            query?: {
+                cursor?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverReviewPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceReviewResolverMention: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                resolverName: string;
+                reviewId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverReviewDecision"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResolverMutationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceListEntityResolverState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceMergeEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EntityMergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceUnmergeEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceSuppressEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    namespaceUnsuppressEntity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolverUnmergeRequest"];
+            };
+        };
+        responses: {
+            /** @description Completed result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Durably accepted; replay remains pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            /** @description Per-source-table fan-out includes partial outcomes */
+            207: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntityCurationResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Curation revision, topology, or namespace conflict; inspect state before retrying */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Resolver owner is busy; retry with backoff */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description Metadata or storage owner is unavailable; retry is safe */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     getCurrentUser: {
         parameters: {
             query?: never;
@@ -29213,13 +33154,14 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Text chunked successfully */
+            /** @description Content chunked with optional model-aware embeddings */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["InferenceChunkResponse"];
+                    "application/json": components["schemas"]["InferenceChunkOperationResponse"];
+                    "application/x-ndjson": components["schemas"]["ChunkEmbeddingStartEvent"] | components["schemas"]["ChunkEmbeddingEvent"] | components["schemas"]["ChunkEmbeddingTerminalEvent"] | components["schemas"]["ChunkEmbeddingInitializationErrorEvent"];
                 };
             };
             /** @description Invalid request */
@@ -29233,6 +33175,15 @@ export interface operations {
             };
             /** @description Authentication is enabled and valid credentials were not supplied */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Source version, continuation plan or required model identity changed; replan against the intended generation. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -30293,7 +34244,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["InferenceDecideRequest"];
+                "application/json": components["schemas"]["DecisionRequest"];
             };
         };
         responses: {
@@ -30355,7 +34306,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ExtractionRequest"];
+                "application/json": components["schemas"]["ExtractionInputRequest"];
             };
         };
         responses: {

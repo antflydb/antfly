@@ -27,6 +27,7 @@ test {
     _ = @import("antfly_local_sources").sql_parameter_frame;
     _ = @import("antfly_local_sources").sql_bound_scalars;
     _ = @import("antfly_local_sources").sql_replay_rows;
+    _ = @import("antfly_local_sources").sql_result_cursor;
     _ = @import("antfly_local_sources").sql_array_value;
     _ = @import("antfly_local_sources").sql_numeric_value;
     _ = @import("antfly_local_sources").sql_numeric_binary;
@@ -49,9 +50,12 @@ test {
     _ = @import("antfly_local_sources").sql_read_stream;
     _ = @import("antfly_local_sources").sql_operators;
     _ = @import("antfly_local_sources").sql_aggregate_partial;
+    _ = @import("antfly_local_sources").sql_aggregate_state;
     _ = @import("antfly_local_sources").sql_aggregate_materialization;
     _ = @import("antfly_local_sources").sql_vector_eval;
+    _ = @import("antfly_local_sources").sql_lake_predicate_kernel;
     _ = @import("antfly_local_sources").sql_parallel_scheduler;
+    _ = @import("antfly_local_sources").sql_parallel_aggregate;
     _ = @import("antfly_local_sources").sql_partition_join;
     _ = @import("antfly_local_sources").sql_spill_grouped;
     _ = @import("antfly_local_sources").sql_spill;

@@ -107,9 +107,7 @@ const CombinedControl = struct {
             if (result.progress == null) result.progress = original.progress;
             if (original.deadline_ns) |deadline| result.deadline_ns = if (result.deadline_ns) |other| @min(deadline, other) else deadline;
         }
-        result.ptr = self;
-        result.check_fn = checkBoth;
-        return result;
+        return result.withCheckpoint(self, checkBoth);
     }
 };
 
@@ -455,7 +453,7 @@ test "resident program preserves backend and request controls without GPU dispat
             try std.testing.expectEqual(@as(*anyopaque, @ptrCast(self.carrier)), active.hard_cancellation.?.ptr);
             try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(self.original)), active.progress.?.ptr);
             active.progress.?.update(.{ .phase = .executing });
-            var guard = try active.enterUninterruptible(.process_required);
+            var guard = try active.enterUninterruptible(.uninterruptible);
             defer guard.deinit();
             const monitor = self.carrier.monitor.?;
             try std.testing.expectEqual(self.expected_deadline, monitor.deadline_ns.?);

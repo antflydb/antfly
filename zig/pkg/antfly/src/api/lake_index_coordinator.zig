@@ -29,6 +29,8 @@ pub const Authority = struct {
     /// Returns only after a full-definition CAS commits. Ambiguous admission
     /// must return its error; callers re-read authority rather than replay it.
     replace: *const fn (*anyopaque, local.common_topology_records.TableRecord, local.common_topology_records.TableRecord) anyerror!void,
+    /// Optional authoritative reread; the returned record is deeply owned by a.
+    read: ?*const fn (*anyopaque, A, u64) anyerror!?local.common_topology_records.TableRecord = null,
 };
 pub const Options = struct {
     lease_ms: u64 = 5 * 60 * 1000,
@@ -59,6 +61,7 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
 
     var lease: Renewal = .{ .a = a, .io = io, .record = pending, .authority = authority, .clock = clock, .lease_ms = options.lease_ms, .parent_context = context };
     defer if (lease.owned) |bytes| a.free(bytes);
+    defer if (lease.owned_read_schema) |bytes| a.free(bytes);
     var build_context = context;
     build_context.io = io;
     build_context.checkpoint = .{ .ptr = &lease, .check = Renewal.check };
@@ -99,9 +102,7 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
         const retry_at = std.math.add(u64, failure_time, options.retry_ms) catch std.math.maxInt(u64);
         const failed_bytes = try catalog.encode(a, try admitted.value.fail(admitted.value.pending.?.token, if (working.limit_exceeded) "LakeSidecarBuildLimitExceeded" else @errorName(build_error), retry_at));
         defer a.free(failed_bytes);
-        var failed = lease.record;
-        failed.lake_index_catalog_json = failed_bytes;
-        try authority.replace(authority.ptr, lease.record, failed);
+        try lease.replaceCatalog(failed_bytes);
         if (working.limit_exceeded) return error.LakeSidecarBuildLimitExceeded;
         return build_error;
     };
@@ -110,9 +111,9 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     heartbeat_active = false;
     try build_context.ensureActive();
     try cancellation.check();
-    var ready = lease.record;
-    ready.lake_index_catalog_json = published_bytes;
-    try authority.replace(authority.ptr, lease.record, ready);
+    // Keep the final publication on the same narrowly rebased definition as
+    // checkpoint and heartbeat writes; its bytes remain build-owned.
+    try lease.replaceCatalog(published_bytes);
 }
 
 /// Historical metadata recovery can restore a publication whose retired
@@ -122,12 +123,19 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
 fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, cancellation: Cancellation) !bool {
     if (ready.namespace == null or ready.reader_protocol != catalog.native_reader_protocol) return false;
     const directory = ready.directory orelse return false;
+    var cloud_binding = try @import("lake_cloud_publication.zig").Binding.init(std.heap.page_allocator, &store.implementation, ready, cancellation);
+    defer if (cloud_binding) |*held| held.deinit();
     var handle = store.artifactStore();
     handle.allocator = a;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const document = @import("lake_index_directory.zig").loadDocument(arena.allocator(), handle, .{ .kind = .external_base_source, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, cancellation, null) catch |err| switch (err) {
-        error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch => return false,
+        error.FileNotFound, error.NotFound, error.ObjectNotFound, error.CloudGenerationMapUnavailable, error.ArtifactIntegrityMismatch => return false,
+        else => return err,
+    };
+    const navigation = ready.source_navigation orelse return false;
+    _ = @import("lake_source_navigation.zig").load(arena.allocator(), handle, navigation, cancellation, null) catch |err| switch (err) {
+        error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeFileState, error.CloudGenerationMapUnavailable => return false,
         else => return err,
     };
     if (document.declarations.len != directory.count) return error.InvalidLakeIndexCatalog;
@@ -148,6 +156,7 @@ const Renewal = struct {
     lease_ms: u64,
     parent_context: Context = .{},
     owned: ?[]u8 = null,
+    owned_read_schema: ?[]u8 = null,
     mutex: std.Io.Mutex = .init,
     terminal_error: ?anyerror = null,
     expires_ms: u64 = 0,
@@ -184,19 +193,52 @@ const Renewal = struct {
         const bytes = try catalog.encode(self.a, try state.value.discardCheckpoint(attempt.token, now));
         try self.commit(bytes);
     }
-    // The caller holds the lease mutex. Ambiguous metadata writes are terminal.
-    fn commit(self: *Renewal, bytes: []u8) !void {
-        errdefer self.a.free(bytes);
+    // Only derived read-schema finalization may rebase this build. The recipe
+    // deliberately excludes that field; every input and the exact lease/catalog
+    // bytes must still match. Never replay an ambiguous write or follow a new
+    // generation. A conflicting write gets at most one reread; healthy
+    // checkpoints require none.
+    fn replaceCatalog(self: *Renewal, bytes: []const u8) !void {
         var replacement = self.record;
         replacement.lake_index_catalog_json = bytes;
         self.authority.replace(self.authority.ptr, self.record, replacement) catch |err| {
+            if (err != error.TableGenerationChanged) return err;
+            const read = self.authority.read orelse return err;
+            try self.parent_context.ensureActive();
+            const current = (try read(self.authority.ptr, self.a, self.record.table_id)) orelse return err;
+            defer @import("../metadata/table_manager.zig").freeTable(self.a, current);
+            if (std.mem.eql(u8, current.read_schema_json, self.record.read_schema_json)) return err;
+            var comparable = current;
+            comparable.read_schema_json = self.record.read_schema_json;
+            if (!@import("../metadata/table_manager.zig").tableDefinitionsEqual(comparable, self.record)) return err;
+            var state = try catalog.parse(self.a, current.lake_index_catalog_json);
+            defer state.deinit();
+            const attempt = state.value.pending orelse return error.LakeIndexPublicationFenceChanged;
+            if (try self.clock.now_ms(self.clock.ptr) >= attempt.lease_expires_at_ms)
+                return error.LakeIndexPublicationFenceChanged;
+            const schema = try self.a.dupe(u8, current.read_schema_json);
+            errdefer self.a.free(schema);
+            var rebased = current;
+            rebased.lake_index_catalog_json = bytes;
+            try self.parent_context.ensureActive();
+            try self.authority.replace(self.authority.ptr, current, rebased);
+            if (self.owned_read_schema) |old| self.a.free(old);
+            self.owned_read_schema = schema;
+            self.record.read_schema_json = schema;
+        };
+    }
+
+    // The caller holds the lease mutex. Ambiguous metadata writes are terminal.
+    fn commit(self: *Renewal, bytes: []u8) !void {
+        errdefer self.a.free(bytes);
+        self.replaceCatalog(bytes) catch |err| {
             self.terminal_error = err;
             self.failed.store(true, .release);
             return err;
         };
         if (self.owned) |old| self.a.free(old);
         self.owned = bytes;
-        self.record = replacement;
+        self.record.lake_index_catalog_json = bytes;
     }
     // Provider cancellation callbacks must remain free of metadata I/O.
     fn check(raw: *anyopaque) !void {
@@ -234,13 +276,7 @@ const Renewal = struct {
         if (now >= attempt.lease_expires_at_ms) return error.LakeIndexPublicationFenceChanged;
         if (attempt.lease_expires_at_ms - now > @max(1, self.lease_ms / 2)) return;
         const bytes = try catalog.encode(self.a, try state.value.renew(attempt.token, now, self.lease_ms));
-        errdefer self.a.free(bytes);
-        var renewed = self.record;
-        renewed.lake_index_catalog_json = bytes;
-        try self.authority.replace(self.authority.ptr, self.record, renewed);
-        if (self.owned) |old| self.a.free(old);
-        self.owned = bytes;
-        self.record = renewed;
+        try self.commit(bytes);
         self.expires_ms = now + self.lease_ms;
     }
 };
@@ -486,7 +522,16 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     try std.testing.expect(try durableDirectoryAvailable(a, &store, recovered.value.published.?, .none));
     // A complete older directory is still a refresh obligation after a
     // reader-format upgrade, even when every source signature is unchanged.
+    const legacy_inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, source.inventory);
+    defer a.free(legacy_inventory_bytes);
+    var legacy_store = store.artifactStore();
+    legacy_store.upload_scope = try @import("../serverless/artifacts/store.zig").uploadScopeFromArtifactId(recovered.value.published.?.inventory.artifact_id);
+    var legacy_inventory = try legacy_store.putWithCancellation(legacy_inventory_bytes, .none);
+    defer legacy_inventory.deinit(a);
+    recovered.value.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
+    recovered.value.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
     recovered.value.published.?.reader_protocol = 33;
+    recovered.value.published.?.source_navigation = null;
     const historical = try catalog.encode(a, recovered.value);
     if (mock.owned) |bytes| a.free(bytes);
     mock.owned = historical;
@@ -531,19 +576,22 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     defer a.free(healthy_catalog);
     try @import("lake_index_directory.zig").hydrateLazy(refreshed.arena.allocator(), artifacts, &refreshed.value.published.?, .none, null);
     const healthy_ref = refreshed.value.published.?.declarations[0].artifact;
-    const healthy_root = try @import("lake_index_native_text.zig").loadRoot(refreshed.arena.allocator(), artifacts, healthy_ref, .none, null);
+    const healthy_root = try @import("lake_index_native_text.zig").loadServing(refreshed.arena.allocator(), artifacts, healthy_ref, .none, null);
     const healthy_segment = try @import("lake_index_seekable_text.zig").loadDirectory(refreshed.arena.allocator(), .{ .store = artifacts, .cache = null, .context = .{}, .cancellation = .none }, healthy_root.file_groups[0].segments[0]);
     for ([_]@import("lake_index_aggregate_artifact.zig").ChunkRef{
         .{ .artifact_id = healthy_ref.artifact_id, .checksum = healthy_ref.checksum, .byte_len = healthy_ref.byte_len },
         healthy_segment.blocks[0].retainedArtifact(),
         healthy_root.file_groups[0].descriptors[0],
-        healthy_root.file_groups[0].physical_manifest.?,
+        healthy_root.file_groups[0].sources[0].physical,
     }) |target| {
         const saved_bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, artifacts, target, .none, null);
         defer a.free(saved_bytes);
         try artifacts.delete(target.artifact_id);
         var forced = refreshed.value;
         forced.published.?.reader_protocol = 31;
+        forced.published.?.source_navigation = null;
+        forced.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
+        forced.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
         const forced_catalog = try catalog.encode(a, forced);
         a.free(mock.owned.?);
         mock.owned = forced_catalog;
@@ -655,6 +703,9 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
             // clearing a checkpoint alone cannot retire a damaged publication.
             var forced = ordered_resumed.value;
             forced.published.?.reader_protocol = 31;
+            forced.published.?.source_navigation = null;
+            forced.published.?.inventory = .{ .kind = .external_base_source, .artifact_id = legacy_inventory.artifact_id, .checksum = legacy_inventory.checksum, .byte_len = legacy_inventory.byte_len };
+            forced.published.?.base_source.external_parquet.file_inventory_artifact = legacy_inventory.artifact_id;
             const forced_catalog = try catalog.encode(a, forced);
             a.free(mock.owned.?);
             mock.owned = forced_catalog;
@@ -722,4 +773,188 @@ test "external lake lease renewal extends a live fence and never replays an ambi
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, renewal.pulse());
     try std.testing.expectError(error.LakeIndexPublicationFenceChanged, Renewal.check(&renewal));
     try std.testing.expectEqual(@as(usize, 3), mock.calls);
+}
+
+test "external lake global frontier coordinator rebuilds missing cloud map directories" {
+    const a = std.testing.allocator;
+    const Provider = @import("../serverless/artifacts/cloud_generations_test_provider.zig").Provider;
+    const maps = @import("../serverless/artifacts/cloud_generations.zig");
+    var provider = Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    var store: Store = .{ .opened = undefined, .implementation = try @import("../serverless/artifacts/object_store.zig").ObjectStore.initWithClient(a, client, "bucket", "native"), .identity = @splat(3), .locator = .{ .protocol = .s3, .connection = "test", .bucket = "bucket", .prefix = "native", .root = "test" } };
+    defer store.implementation.deinit();
+    const scope = try @import("../serverless/artifacts/store.zig").UploadScope.forPublication(@splat(4), 1, std.testing.io);
+    var writer: maps.Writer = .{ .a = a, .io = std.testing.io, .scope = scope, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .complete = true };
+    defer writer.deinit();
+    store.implementation.cloud_writer = &writer;
+    var artifacts = store.artifactStore();
+    artifacts.upload_scope = scope;
+    var inventory = try artifacts.put("inventory");
+    defer inventory.deinit(a);
+    const directory = try @import("lake_index_directory.zig").publish(a, &artifacts, &.{}, .none);
+    defer a.free(directory.artifact_id);
+    defer a.free(directory.checksum);
+    const navigation_bytes = try std.json.Stringify.valueAlloc(a, @import("lake_source_navigation.zig").Root{ .domain = scope.domain, .source = "source", .schema = "schema", .snapshot = "snapshot", .count = 0 }, .{});
+    defer a.free(navigation_bytes);
+    var navigation = try artifacts.put(navigation_bytes);
+    defer navigation.deinit(a);
+    const map = (try writer.finish(.none)).?;
+    defer maps.freeRef(a, map);
+    store.implementation.cloud_writer = null;
+    const published: catalog.Publication = .{ .reader_protocol = catalog.native_reader_protocol, .namespace = @splat(4), .generation = 1, .token = @splat(1), .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = store.identity }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://source/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len }, .source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = navigation.artifact_id, .checksum = navigation.checksum, .byte_len = navigation.byte_len }, .directory = directory, .cloud_generations = .{ .root = map, .complete = true } };
+    try std.testing.expect(try durableDirectoryAvailable(a, &store, published, .none));
+    const suffix = try @import("../serverless/artifacts/store.zig").storageSuffixAlloc(a, map.artifact_id);
+    defer a.free(suffix);
+    const version_key = try std.fmt.allocPrint(a, "native/{s}@{s}", .{ suffix, map.generation });
+    defer a.free(version_key);
+    var memory = provider.memory.client();
+    try memory.deleteObject("bucket", version_key, .{});
+    // A restore can leave derived map pages absent while its schema/source
+    // signature still matches. Availability must become false, admitting repair.
+    try std.testing.expect(!try durableDirectoryAvailable(a, &store, published, .none));
+    const Denied = struct {
+        fn call(_: *anyopaque) !void {
+            return error.AccessDenied;
+        }
+    };
+    var dummy: u8 = 0;
+    provider.get_hook = .{ .ptr = &dummy, .call = Denied.call };
+    try std.testing.expectError(error.AccessDenied, durableDirectoryAvailable(a, &store, published, .none));
+}
+
+test "external lake lease tolerates target read schema finalization" {
+    const a = std.testing.allocator;
+    const tables = @import("../metadata/table_manager.zig");
+    var table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = "target", .read_schema_json = "previous" };
+    const signature: catalog.Signature = .{ .desired = catalog.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+    const initial = try catalog.encode(a, try (catalog.State{}).begin(signature, @splat(1), 100, 10));
+    defer a.free(initial);
+    table.lake_index_catalog_json = initial;
+    const Mock = struct {
+        current: local.common_topology_records.TableRecord,
+        owned: ?local.common_topology_records.TableRecord = null,
+        now: u64 = 107,
+        calls: usize = 0,
+        reads: usize = 0,
+        fn time(raw: *const anyopaque) !u64 {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.now;
+        }
+        fn read(raw: *anyopaque, allocator: A, id: u64) !?local.common_topology_records.TableRecord {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            try std.testing.expectEqual(self.current.table_id, id);
+            return try tables.cloneTable(allocator, self.current);
+        }
+        fn replace(raw: *anyopaque, before: local.common_topology_records.TableRecord, after: local.common_topology_records.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (!tables.tableDefinitionsEqual(before, self.current)) return error.TableGenerationChanged;
+            try std.testing.expectEqualStrings("finalized", after.read_schema_json);
+            const owned = try tables.cloneTable(a, after);
+            if (self.owned) |old| tables.freeTable(a, old);
+            self.owned = owned;
+            self.current = owned;
+        }
+    };
+    var mock: Mock = .{ .current = table };
+    defer if (mock.owned) |owned| tables.freeTable(a, owned);
+    mock.current.read_schema_json = "finalized";
+    var renewal: Renewal = .{ .a = a, .io = std.testing.io, .record = table, .authority = .{ .ptr = &mock, .replace = Mock.replace, .read = Mock.read }, .clock = .{ .ptr = &mock, .now_ms = Mock.time }, .lease_ms = 10 };
+    defer if (renewal.owned) |bytes| a.free(bytes);
+    defer if (renewal.owned_read_schema) |bytes| a.free(bytes);
+    // Derived read schema is deliberately excluded from the publication recipe.
+    try std.testing.expectEqual(signature.desired, catalog.desiredFingerprint(mock.current));
+    try renewal.pulse();
+    try std.testing.expectEqual(@as(usize, 2), mock.calls);
+    try std.testing.expectEqual(@as(usize, 1), mock.reads);
+    try std.testing.expectEqualStrings("finalized", renewal.record.read_schema_json);
+    try std.testing.expectEqual(@as(u64, 117), renewal.expires_ms);
+    // Once rebased, subsequent checkpoints/renewals use that authority directly.
+    mock.now = 114;
+    try renewal.pulse();
+    try std.testing.expectEqual(@as(usize, 3), mock.calls);
+    try std.testing.expectEqual(@as(usize, 1), mock.reads);
+    try std.testing.expectEqual(@as(u64, 124), renewal.expires_ms);
+}
+
+test "external lake lease rebase fences recipes storage leases expiry and ambiguous writes" {
+    const a = std.testing.allocator;
+    const tables = @import("../metadata/table_manager.zig");
+    const Case = enum { recipe, storage, catalog, lease, missing, expiry, ambiguous, ambiguous_retry };
+    for (std.meta.tags(Case)) |mode| {
+        errdefer std.debug.print("lake lease rebase case={s}\n", .{@tagName(mode)});
+        var table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = "target", .read_schema_json = "previous" };
+        const signature: catalog.Signature = .{ .desired = catalog.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+        const initial_state = try (catalog.State{}).begin(signature, @splat(1), 100, 10);
+        const initial = try catalog.encode(a, initial_state);
+        defer a.free(initial);
+        table.lake_index_catalog_json = initial;
+        const changed = switch (mode) {
+            .catalog => try catalog.encode(a, try initial_state.renew(@splat(1), 101, 20)),
+            .lease => try catalog.encode(a, try initial_state.begin(signature, @splat(9), 110, 20)),
+            else => null,
+        };
+        defer if (changed) |bytes| a.free(bytes);
+        const Mock = struct {
+            mode: Case,
+            current: local.common_topology_records.TableRecord,
+            owned: ?local.common_topology_records.TableRecord = null,
+            calls: usize = 0,
+            reads: usize = 0,
+            now: u64 = 107,
+            fn time(raw: *const anyopaque) !u64 {
+                const self: *const @This() = @ptrCast(@alignCast(raw));
+                return self.now;
+            }
+            fn read(raw: *anyopaque, allocator: A, id: u64) !?local.common_topology_records.TableRecord {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.reads += 1;
+                try std.testing.expectEqual(self.current.table_id, id);
+                if (self.mode == .missing) return null;
+                if (self.mode == .expiry) self.now = 111;
+                return try tables.cloneTable(allocator, self.current);
+            }
+            fn replace(raw: *anyopaque, before: local.common_topology_records.TableRecord, after: local.common_topology_records.TableRecord) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                if (!tables.tableDefinitionsEqual(before, self.current)) return error.TableGenerationChanged;
+                // Model a committed write whose reply was lost, including the
+                // rebase CAS itself. Neither outcome may be blindly replayed.
+                if (self.mode != .ambiguous and self.mode != .ambiguous_retry) return error.TestUnexpectedResult;
+                const owned = try tables.cloneTable(a, after);
+                if (self.owned) |old| tables.freeTable(a, old);
+                self.owned = owned;
+                self.current = owned;
+                return error.MetadataMutationOutcomeUnknown;
+            }
+        };
+        var mock: Mock = .{ .mode = mode, .current = table };
+        defer if (mock.owned) |owned| tables.freeTable(a, owned);
+        if (mode != .ambiguous) mock.current.read_schema_json = "finalized";
+        if (mode == .recipe) mock.current.schema_json = "changed target";
+        if (mode == .storage) {
+            mock.current.storage.engine = .object;
+            mock.current.object_storage_generation = 99;
+            mock.current.object_storage_identity = @splat(7);
+        }
+        if (changed) |bytes| mock.current.lake_index_catalog_json = bytes;
+        var renewal: Renewal = .{ .a = a, .io = std.testing.io, .record = table, .authority = .{ .ptr = &mock, .replace = Mock.replace, .read = Mock.read }, .clock = .{ .ptr = &mock, .now_ms = Mock.time }, .lease_ms = 10 };
+        defer if (renewal.owned) |bytes| a.free(bytes);
+        defer if (renewal.owned_read_schema) |bytes| a.free(bytes);
+        const expected: anyerror = switch (mode) {
+            .ambiguous, .ambiguous_retry => error.MetadataMutationOutcomeUnknown,
+            .expiry => error.LakeIndexPublicationFenceChanged,
+            else => error.TableGenerationChanged,
+        };
+        try std.testing.expectError(expected, renewal.pulse());
+        try std.testing.expectEqual(@as(usize, if (mode == .ambiguous_retry) 2 else 1), mock.calls);
+        try std.testing.expectEqual(@as(usize, if (mode == .ambiguous) 0 else 1), mock.reads);
+        try std.testing.expectError(expected, renewal.pulse());
+        try std.testing.expectEqual(@as(usize, if (mode == .ambiguous_retry) 2 else 1), mock.calls);
+        try std.testing.expectEqual(@as(usize, if (mode == .ambiguous) 0 else 1), mock.reads);
+        try std.testing.expectError(error.LakeIndexPublicationFenceChanged, Renewal.check(&renewal));
+    }
 }

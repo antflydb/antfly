@@ -61,8 +61,8 @@ pub const EmbeddedInferenceProviderLifetime = struct {
     handle: *anyopaque,
     // Owns the resource-budget capability `createEmbeddedInferenceNode`
     // configures on `handle`; released by `destroyEmbeddedInferenceNode`
-    // after the node itself is torn down. Null only if configuration failed
-    // (`create()` still succeeded and the node is otherwise usable).
+    // after the node itself is torn down. Production construction either
+    // configures this owner successfully or fails the open.
     resource_owner: ?*LiteInferenceResourceOwner = null,
     // Admission and borrower count share one modification order. A separate
     // accepting flag and counter would leave a check/increment window where
@@ -138,12 +138,8 @@ pub const EmbeddedInferenceProviderLifetime = struct {
 ///
 /// `io` must outlive the returned node; destroy it with
 /// `destroyEmbeddedInferenceNode` before releasing `io`.
-/// Result of `createEmbeddedInferenceNode`: the opaque node handle plus the
-/// resource-budget owner `configureLiteInferenceResourceBudget` installed on
-/// it (null only if that configuration step itself failed; the node is still
-/// usable, but every provider call will fail with the same
-/// `ResourceOwnerNotConfigured`-class error a caller reached before this
-/// existed).
+/// Construction returns a node with its resource-budget owner configured, or
+/// fails and destroys the partial node. No unusable runtime escapes an open.
 /// Explicit resource-budget overrides for `createEmbeddedInferenceNode`, 0
 /// meaning automatic/host-detected sizing. These mirror the CLI's
 /// `--inference-host-budget-mb`/`--inference-backend-budget-mb`/
@@ -191,9 +187,6 @@ const default_scratch_budget_mb: u32 = 16384;
 pub const EmbeddedInferenceNode = struct {
     handle: *anyopaque,
     resource_owner: ?*LiteInferenceResourceOwner,
-    /// Why `resource_owner` is null: the runtime started but cannot serve
-    /// calls, for example because its worker process failed to start.
-    configure_error: ?anyerror = null,
     // The process-memory envelope this node actually resolved -- either the
     // caller's explicit `process_memory_budget_mb` override or, when that is
     // 0 (the default), the same host/cgroup-detected policy
@@ -317,10 +310,10 @@ pub fn createEmbeddedInferenceNode(
         .has_max_loaded_models = 1,
         .content_security_json = .{},
         .s3_credentials_json = .{},
-        // libantfly runs inside the caller's program, which it cannot kill
-        // and restart like a worker, so every backend runs in-process; see
-        // execution_control.allowUninterruptibleInProcess.
-        .runtime_config_json = inference_bridge.String.init("{\"process_isolation\":false}"),
+        // Embedded callers own their process and accept cooperative cancellation
+        // around native calls. This policy is local to this runtime.
+        .execution_host = .embedded,
+        .runtime_config_json = inference_bridge.String.init("{}"),
         .executor = .init(&borrowed_io),
         .out_handle = &out_handle,
     };
@@ -354,19 +347,11 @@ pub fn createEmbeddedInferenceNode(
     // a multi-tenant server, so unconditional admission is the correct
     // policy, matching "antfly inference run"'s own local/host-owned default
     // when no external resource policy is configured.
-    var configure_error: ?anyerror = null;
-    const resource_owner = configureLiteInferenceResourceBudget(handle) catch |err| blk: {
-        std.log.warn(
-            "lite embedded inference resource budget configuration failed, provider calls will fail: {s}",
-            .{@errorName(err)},
-        );
-        configure_error = err;
-        break :blk null;
-    };
+    errdefer destroyEmbeddedInferenceNode(handle, null);
+    const resource_owner = try configureLiteInferenceResourceBudget(handle);
     return .{
         .handle = handle,
         .resource_owner = resource_owner,
-        .configure_error = configure_error,
         .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
         .process_memory_limit_source = process_memory_resolution.effective_source,
         .host_budget_mb = effective_host_budget_mb,
@@ -497,17 +482,9 @@ fn observeLiteInferenceTokenizerCache(context: *anyopaque, observer_id: usize, p
 fn configureLiteInferenceResourceBudget(handle: *anyopaque) !*LiteInferenceResourceOwner {
     const owner = try std.heap.c_allocator.create(LiteInferenceResourceOwner);
     owner.* = .{};
-    // `Client.configure` (pkg/inference/src/host/worker.zig) calls
-    // `retain_context` -- and sets its own `self.budget` field to point at
-    // `owner` -- *before* it can fail (for example the `ensureWorker`
-    // failure this catches at the call site below): a failure after that
-    // point still leaves the client holding a retained reference it will
-    // release exactly once, whenever it deinits. Unconditionally destroying
-    // `owner` here on any error would be a use-after-free/double-free the
-    // instant that later release runs. `releaseBaseReference` is the
-    // correct unwind either way: it only frees `owner` once every retained
-    // reference -- ours here, and the client's if it got far enough to take
-    // one -- has been released.
+    // Configuration may retain this context before a later step fails. Drop
+    // only our base reference on error; node destruction releases any retained
+    // reference after its borrowers have drained.
     errdefer owner.releaseBaseReference();
     var budget = inference_bridge.ResourceBudget{
         .abi_version = inference_bridge.abi_version,
@@ -534,6 +511,15 @@ fn configureLiteInferenceResourceBudget(handle: *anyopaque) !*LiteInferenceResou
         if (!status.isOk()) return inference_bridge.errorFromStatus(status);
     }
     return owner;
+}
+
+pub fn embeddedMemoryAdmissionStats(handle: *anyopaque) !inference_bridge.MemoryAdmissionStats {
+    if (comptime inline_inference_codegen) return inference_host.impl.linkedInferenceMemoryAdmissionStats(handle);
+    var out: inference_bridge.MemoryAdmissionStats = .{};
+    const table = try linkedInferenceApi(inference_bridge.Capability.memory_admission);
+    const status = (table.memory_admission_stats orelse return error.UnsupportedOperation)(handle, &out);
+    if (!status.isOk()) return inference_bridge.errorFromStatus(status);
+    return out;
 }
 
 pub fn inferenceBoundaryProvider(lifetime: *EmbeddedInferenceProviderLifetime) inference.managed_embedder.AntflyProvider {
@@ -1484,7 +1470,7 @@ pub fn inferenceProviderChunkInputControlled(
     cancellation: CancellationToken,
 ) anyerror![]inference_chunker.Chunk {
     return switch (input) {
-        .text => try invokeInferenceProviderControlled([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
+        .text, .source => try invokeInferenceProviderControlled([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
             .model = model,
             .input = input,
             .config = config,

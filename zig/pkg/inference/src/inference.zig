@@ -18,6 +18,8 @@
 // models run on Antfly's own ONNX implementation.
 
 const std = @import("std");
+pub const pull_diagnostics = @import("registry/pull_diagnostics.zig");
+
 const build_options = @import("build_options");
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -36,7 +38,9 @@ pub const chunker = @import("inference_chunker");
 pub const pipelines = @import("pipelines/pipelines.zig");
 pub const extractors = @import("extractors/mod.zig");
 pub const decide_benchmark = @import("server/gliner_decide_1b_service_test.zig");
-pub const server = if (build_options.skip_openapi) struct {} else @import("server/server.zig");
+pub const server = if (build_options.skip_openapi) struct {
+    pub const model_manager = @import("server/model_manager.zig");
+} else @import("server/server.zig");
 pub const executor_microbatch = @import("server/executor_microbatch.zig");
 pub const tensor_microbatch = @import("server/tensor_microbatch.zig");
 pub const cache = @import("cache/cache.zig");
@@ -178,6 +182,9 @@ test {
     _ = linalg;
     _ = graph;
     _ = architectures;
+    _ = architectures.embedding_gemma2;
+    _ = @import("architectures/embedding_gemma2_reference.zig");
+    _ = @import("pipelines/embedding_gemma2_content.zig");
     _ = architectures.deberta_graph;
     _ = @import("architectures/gliner_head.zig");
     _ = @import("architectures/gliner_head_graph.zig");
@@ -202,6 +209,7 @@ test {
     _ = @import("ops/deberta_training_attention_device_test.zig");
     _ = @import("ops/modernbert_training_attention.zig");
     _ = @import("ops/modernbert_training_attention_device_test.zig");
+    _ = @import("ops/segment_training_attention_device_test.zig");
     _ = @import("graph/recomputed_training_test.zig");
     _ = @import("finetune/gliner/boundary_replay_bindings.zig");
     _ = @import("finetune/gliner/boundary_recomputed_graph.zig");
@@ -225,6 +233,8 @@ test {
     _ = @import("architectures/florence.zig");
     _ = @import("architectures/gemma4_runtime.zig");
     _ = @import("architectures/gemma4_projector.zig");
+    _ = @import("architectures/gemma4_multimodal.zig");
+    _ = @import("ops/cuda/video.zig");
     _ = @import("pipelines/embedding_gemma2.zig");
     _ = @import("embedding_trace.zig");
     _ = @import("pipelines/qwen_embedding_batch.zig");
@@ -282,6 +292,7 @@ test {
         _ = native_compute.cuda;
         _ = @import("ops/cuda/a4b_prepared_pack.zig");
         _ = @import("ops/cuda/kernels.zig");
+        _ = @import("ops/cuda/embedding_gemma2.zig");
         // Keep focused boundary-kernel tests discoverable without relying on
         // an unrelated device test to instantiate the resident adapter.
         _ = @import("ops/cuda/gliner25.zig");
