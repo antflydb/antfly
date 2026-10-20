@@ -312,11 +312,7 @@ pub const ResolverConfig = struct {
         if (value.object.fetchSwapRemove("adjudicate_json")) |entry| {
             var policy = try std.json.parseFromSliceLeaky(std.json.Value, a, entry.value.string, .{});
             if (policy.object.getPtr("decider")) |decider| {
-                _ = decider.object.swapRemove("api_key");
-                if (decider.object.get("url")) |url| if (url == .string) {
-                    const safety = @import("../../../common/credential_safety.zig");
-                    if (safety.urlContainsCredentials(url.string) or safety.containsSecretReference(url.string)) _ = decider.object.swapRemove("url");
-                };
+                try @import("../../../common/credential_safety.zig").redactPublicProviderConfig(a, decider);
             }
             try value.object.put(a, "adjudicate", policy);
         }
@@ -1061,7 +1057,8 @@ test "resolver adjudication catalogs fence old readers and redact public credent
 
 test "ordered artifact inventory resolver catalog serialization preserves explicit envelope" {
     const a = std.testing.allocator;
-    for ([_]u32{ 1, 2, 3, 4 }) |version| {
+    for (1..supported_reader_version + 1) |reader_version| {
+        const version: u32 = @intCast(reader_version);
         const encoded = try serializeCatalogWithMinimumVersion(a, &.{}, version);
         defer a.free(encoded);
         try std.testing.expectEqual(version, try catalogReaderVersion(a, encoded));
@@ -1073,5 +1070,23 @@ test "ordered artifact inventory resolver catalog serialization preserves explic
         try std.testing.expectEqualStrings(encoded, roundtrip);
     }
     try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 0));
-    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 5));
+    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, supported_reader_version + 1));
+}
+
+test "resolver public inspection redacts nested generated provider credentials without mutating execution" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const policy =
+        \\{"decider":{"decision_method":"generated","generator":{"provider":"openai","model":"gpt-4.1","api_key":"nested-private-key","credentials_path":"private-credentials-path","capability_token":"private-capability","url":"https://user:password@provider.example/v1","fallbacks":[{"api_key":"fallback-private-key","endpoint":"https://provider.example/v1?access%5Ftoken=private-query"},{"url":"https://safe.example/v1","connection_id":"hosted"}]},"instructions":"Compare these concepts"}}
+    ;
+    const cfg = ResolverConfig{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{_entity.text}}", .adjudicate_json = policy };
+    const public = try cfg.publicValue(a);
+    const encoded = try std.json.Stringify.valueAlloc(a, public, .{});
+    for ([_][]const u8{ "nested-private-key", "private-credentials-path", "private-capability", "password", "fallback-private-key", "private-query", "api_key", "credentials_path", "capability_token" }) |secret| {
+        try std.testing.expect(std.mem.indexOf(u8, encoded, secret) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "https://safe.example/v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "gpt-4.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.adjudicate_json, "nested-private-key") != null);
 }

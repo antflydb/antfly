@@ -58,7 +58,7 @@ from urllib.parse import quote, unquote, urlparse
 
 import pytest
 import requests
-from helpers import create_index_payload, start_http_server
+from helpers import create_index_with_retry, start_http_server
 from port_reservations import LoopbackPortReservations, find_free_port
 
 pytest_plugins = ("e2e_scheduler",)
@@ -2710,10 +2710,7 @@ def serverless_api(serverless_runtime):
             return self.get(f"/tables/{table_name}/indexes/{index_name}")
 
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
-            created = self.post(
-                f"/tables/{table_name}/indexes/{index_name}",
-                create_index_payload(payload, index_name),
-            )
+            created = create_index_with_retry(self, table_name, index_name, payload)
             deadline = time.monotonic() + 10.0
             while True:
                 try:
@@ -3614,10 +3611,7 @@ def stateful_api(request: pytest.FixtureRequest):
             return self.get(f"/tables/{table_name}/indexes/{index_name}")
 
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
-            created = self.post(
-                f"/tables/{table_name}/indexes/{index_name}",
-                create_index_payload(payload, index_name),
-            )
+            created = create_index_with_retry(self, table_name, index_name, payload)
             deadline = time.monotonic() + 10.0
             while True:
                 try:
@@ -3913,10 +3907,7 @@ def backup_api(request: pytest.FixtureRequest):
             return self.get(f"/tables/{table_name}/indexes/{index_name}")
 
         def create_index(self, table_name: str, index_name: str, payload: dict) -> dict:
-            created = self.post(
-                f"/tables/{table_name}/indexes/{index_name}",
-                create_index_payload(payload, index_name),
-            )
+            created = create_index_with_retry(self, table_name, index_name, payload)
             deadline = time.monotonic() + 10.0
             while True:
                 try:

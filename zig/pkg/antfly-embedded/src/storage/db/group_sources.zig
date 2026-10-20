@@ -385,6 +385,7 @@ test "group source unit windows are arrival independent and append preserves com
 
 test {
     _ = @import("group_prior_context.zig");
+    _ = @import("group_prior_scan.zig");
 }
 
 test {

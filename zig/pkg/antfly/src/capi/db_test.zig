@@ -6424,7 +6424,7 @@ test "capi native resolver maintenance retries transient inference and survives 
         extern fn antfly_db_create_table_json(?*anyopaque, capi.Slice, capi.Slice) capi.ErrorCode;
     }.antfly_db_create_table_json(handle, .fromSlice("concepts"), .fromSlice("{}")));
     const config =
-        \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"text"},"content_type":"application/json","producer_json":{"type":"generator","config":{"provider":"mock"}}},"edge_types":[{"name":"about"}],"resolvers":[{"name":"concepts","table":"concepts","source_artifact":"extraction","resolution_artifact":"resolution","key_template":"concept/{{ uslug _entity.text }}"}]}
+        \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"text"},"content_type":"application/json","producer_json":{"type":"generator","config":{"provider":"antfly","model":"test-generator"}}},"edge_types":[{"name":"about"}],"resolvers":[{"name":"concepts","table":"concepts","source_artifact":"extraction","resolution_artifact":"resolution","key_template":"concept/{{ uslug _entity.text }}"}]}
     ;
     const index = try std.json.Stringify.valueAlloc(a, .{ .name = "kg", .kind = "graph", .config_json = config }, .{});
     defer a.free(index);

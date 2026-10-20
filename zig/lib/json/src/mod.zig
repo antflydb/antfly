@@ -74,6 +74,7 @@ pub const parseFromTokenSourceLeaky = std.json.parseFromTokenSourceLeaky;
 pub const innerParse = std.json.innerParse;
 pub const parseValueLossless = @import("lossless.zig").parse;
 pub const parseValueLosslessLeaky = @import("lossless.zig").parseLeaky;
+pub const stringifyValueAlloc = @import("lossless.zig").stringify;
 
 pub const parseFromValue = std.json.parseFromValue;
 pub const parseFromValueLeaky = std.json.parseFromValueLeaky;
