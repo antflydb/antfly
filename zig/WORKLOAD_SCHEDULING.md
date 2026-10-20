@@ -16,18 +16,22 @@ branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `fc9bea9f20194754644605d796c00beeb1f325d0`.
-Native ABI 40, engine descriptor 27, file floor 7 and Raft protocol 25 fence
-persistent participant/route bindings; storage owner ABI remains 101. Required
-BEGIN retains the original binding through prepare, seal and terminal history,
-and receipt fields come from durable record/frame evidence. Legacy commands cannot
-upgrade or drop that agreement. Final source
-`480494a5bb42a7f298bf799022dd67193a79a452` passes seven native targets and 25
-public-package consumer checks, including expired-request cancellation isolation
-for durable apply. Production proposals remain gated pending actual adapters,
-fresh route authority, funded producers, durable original routing for committed
-recovery, large-frame transport and coordinated migration. The global retained
-status path has not activated the stronger binding contract. The broader scheduler
-design and distributed fault/restart qualification remain open.
+Native ABI 41, engine descriptor 27, file floor 7 and Raft protocol 25 fence
+persistent participant/route bindings and original cohort handoff; storage owner
+ABI remains 101. New stable SQL/HTTP sessions retain their complete routed
+cohort before BEGIN. Retry and maintenance use original participants, scopes,
+epochs and inputs without regrouping against current topology. Both preparation
+modes check the original terminal decision before new admission. Versioned
+session records reject older readers; older executing sessions retain their
+compatibility path.
+
+Final source `cdf9393e72e3724f5be6e5e39f46f9fc47cfdee9` passes six focused
+native targets and 25 public-package consumer checks, including actual SQL/HTTP
+handoffs, persistent bound apply and expired-request cancellation isolation.
+Production required proposals remain gated pending binding-aware global status,
+actual adapters/providers, fresh route authority, funded producers, large-frame
+transport and coordinated migration. The broader scheduler design and
+distributed fault/restart qualification remain open.
 
 The full goal remains safe, bounded execution sharing across many connections
 by default, with fair scheduling and bounded waiting, preserving session

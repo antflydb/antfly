@@ -4,6 +4,59 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Original routed cohorts for stable recovery (2026-10-19)
+
+Commit `120da6eb7d999590e292fb4fc5fe846d3bfc00e6` adds a lease-fenced
+participant-plan store to the internal commit authority. New stable HTTP and SQL
+sessions seal the complete ordered cohort before the first BEGIN: original
+groups, epochs, scoped restore locators, pinned fences, guards, row-policy
+evidence and partitioned mutation inputs. A concurrent publisher receives the
+first durable cohort. Failed persistence cannot contact a participant; retries
+and maintenance reload that cohort without fresh logical-write grouping or
+restore-scope discovery.
+
+Recovery observes the original coordinator decision before admission, for both
+legacy preparation and required preparation. A committed decision skips BEGIN,
+prepare, sealing and new topology admission and continues phase two at the
+original participants. An abort remains terminal. Pending work retains its
+original fences and the existing predecision and precommit validation; it cannot
+use an old digest as fresh route authority. The original caller's cancellation
+and deadline still constrain foreground work. Returned outcome labels borrow the
+caller's sealed request, with one indexed key pass rather than repeated scans.
+
+Session records requiring an original cohort use the distinct
+`participant-cohort-v1` array envelope. Older object-only readers reject it;
+upgraded readers also reject stripping its framing. Bytes, row-policy identity
+and scoped locators survive binary-safe encoding and restart. Existing executing
+sessions remain on their legacy compatibility path and cannot be retroactively
+assigned a freshly routed cohort. Migrating those sessions still requires their
+original durable participant evidence. The new port also refuses an unsealed
+session. Native ABI is 41 because commit authority carries this store; engine
+descriptor 27, storage owner ABI 101, file floor 7 and Raft protocol 25 are
+unchanged.
+
+Final source `cdf9393e72e3724f5be6e5e39f46f9fc47cfdee9` includes focused
+SQL/HTTP handoff filters in the session maintenance target.
+`native-original-cohort-v6-verified.json` records six native targets (108/108
+build steps, 16 standard tests and 180 selected cases), including five new
+recovery/codec/persistence regressions covering allocation-failure cleanup,
+failed-save atomicity, hidden binary identity, old-reader refusal, reopen and
+recovery without catalog access. The actual SQL completion, HTTP
+retry/maintenance and persistent bound-apply regressions pass. The immutable
+public package from `120da6eb7d999590e292fb4fc5fe846d3bfc00e6` passes all 25
+ReleaseSafe consumer steps, with all 4,483 exported sources matching final
+source; the later changes affect ELv2 server and test/build files excluded from
+that package. Full Linux qualification remains waived.
+
+This closes the new-session cohort-retention gap. It does not activate required
+preparation: global retained status still proves only mode, actual required
+transport/providers and funded original-authority producers remain unwired, and
+legacy-session migration, large-frame transport and coordinated all-member/
+import/downgrade policy still need qualification. Binding-aware status must
+compare against the retained original cohort, never against freshly regrouped
+writes. The remaining completion-resource and broader scheduler scope remains
+open.
+
 ## Durable participant and route bindings (2026-10-19)
 
 Commit `2d3896d6313deb5e59701d6b24b90a83e6044960` persists the exact group,

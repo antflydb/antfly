@@ -19,6 +19,22 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Original participant cohorts for recovery (2026-10-19)
+
+New stable SQL/HTTP commits durably retain one complete original routed cohort
+before BEGIN. Retry and maintenance use those original groups, scopes, epochs
+and partitioned inputs without fresh grouping. Terminal decisions are observed
+before new admission in either preparation mode. Versioned session framing
+rejects old readers and stripped envelopes; older executing sessions cannot gain
+asserted original routing through a retry. Native ABI is 41; engine descriptor
+27, storage owner ABI 101, file floor 7 and Raft protocol 25 are unchanged.
+
+Final source `cdf9393e72e3724f5be6e5e39f46f9fc47cfdee9` passes six focused
+native targets and 25 immutable public package consumer checks. The
+implementation ledger records exact evidence and limits. Global binding-aware
+status, actual required adapters/providers, funded producers and coordinated
+migration remain required before activation.
+
 ## Durable participant and route binding (2026-10-19)
 
 Bound BEGIN now persists group, topology, scoped participant and pinned-route
