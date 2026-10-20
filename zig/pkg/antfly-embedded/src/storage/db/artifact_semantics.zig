@@ -165,10 +165,12 @@ test "ordered artifact inventory semantic producer catalogs ignore order but bin
 
 test "ordered artifact inventory semantic producer catalogs accept versioned resolver envelopes" {
     const a = std.testing.allocator;
+    const resolver_catalog = @import("catalog/resolver_catalog.zig");
     const definitions = "[{\"name\":\"resolver\",\"config_generation\":1}]";
     const legacy = try digest(a, "", "", definitions);
     const empty = try digest(a, "", "", "[]");
-    for ([_]u32{ 2, 3, 4 }) |version| {
+    for (2..resolver_catalog.supported_reader_version + 1) |reader_version| {
+        const version: u32 = @intCast(reader_version);
         const envelope = try @import("catalog/resolver_catalog.zig").versionedCatalog(a, definitions, version);
         defer a.free(envelope);
         try std.testing.expectEqualDeep(legacy, try digest(a, "", "", envelope));
@@ -177,12 +179,14 @@ test "ordered artifact inventory semantic producer catalogs accept versioned res
         try std.testing.expectEqualDeep(empty, try digest(a, "", "", empty_envelope));
     }
     for ([_][]const u8{
-        "{\"version\":5,\"resolvers\":[]}",
         "{\"version\":1,\"resolvers\":[]}",
         "{\"version\":4}",
         "{\"version\":4,\"resolvers\":{}}",
         "{\"version\":4,\"resolvers\":[{\"name\":\"a\"},{\"name\":\"a\"}]}",
     }) |invalid| try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "", invalid));
+    const future = try std.fmt.allocPrint(a, "{{\"version\":{d},\"resolvers\":[]}}", .{resolver_catalog.supported_reader_version + 1});
+    defer a.free(future);
+    try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "", future));
     try std.testing.expectError(error.InvalidArtifactCatalogCommand, digest(a, "", "{\"version\":4,\"enrichments\":[]}", "[]"));
     const changed = try digest(a, "", "", "{\"version\":4,\"resolvers\":[{\"name\":\"resolver\",\"config_generation\":2}]}");
     try std.testing.expect(!std.mem.eql(u8, &legacy, &changed));

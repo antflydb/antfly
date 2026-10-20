@@ -45,6 +45,7 @@ pub const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
     db_live: bool = true,
+    io_lifetime_lease: bool = false,
     /// Public Lite connections borrow a persistent compatible storage owner.
     lite_connection: ?*@import("lite_connection.zig").Connection = null,
     /// Active connection context while its private SQL state is attached.
@@ -228,6 +229,8 @@ pub fn invalidateQueryProducer(handle: *Handle) void {
 }
 
 pub fn closeHandle(handle: *Handle) void {
+    const io_lifetime_lease = handle.io_lifetime_lease;
+    defer if (io_lifetime_lease) @import("io_lifetime.zig").release();
     invalidateQueryProducer(handle);
     if (handle.lite_connection) |connection| {
         connection.close();

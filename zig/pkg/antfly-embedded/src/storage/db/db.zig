@@ -4835,10 +4835,15 @@ pub const DB = struct {
             zig017_return_error = error.VectorMigrationIdempotencyConflict;
             break :zig017_failure error.VectorMigrationIdempotencyConflict;
         };
-        if (observed.value.phase == .serving) {
+        // Reopening can restore a post-publication receipt before optional
+        // serving projections are ready. Resume their bounded publication in
+        // every destructive phase, not just the first serving transition.
+        if (observed.value.phase == .serving or observed.value.phase == .cleanup or observed.value.phase == .reclaiming) {
             const legacy = blk: {
                 var lease = self.tryAcquireIndexCatalogReadLease() orelse return;
                 defer lease.release();
+                if (self.core.index_manager.dense_indexes.items.len != 0 and
+                    self.core.index_manager.source_payload_store == null) return;
                 for (self.core.index_manager.dense_indexes.items) |entry| {
                     if ((self.core.index_manager.denseNativePhysicalMigrationRequired(entry.config.name) catch |zig017_err| {
                         zig017_return_error = zig017_err;
@@ -4906,6 +4911,11 @@ pub const DB = struct {
             error.VectorMigrationTemporaryBudgetExceeded, error.VectorMigrationDiskReserve, error.VectorMigrationRowExceedsBudget => {},
             else => self.requireVectorMigrationRecovery(),
         };
+        // The durable phase alone is not a proof about this owner lifetime.
+        // Preserve source data and the active receipt until all loaded ANN
+        // indexes can serve from the converted storage after recovery.
+        if ((job.value.phase == .cleanup or job.value.phase == .reclaiming) and
+            !self.core.index_manager.sourceMigrationServingComplete()) return;
         if (job.value.phase == .reclaiming) {
             const backend = self.core.primary_store_owner.lsm.handle.backend;
             if (!job.value.primary_reclamation_requested) {
@@ -134864,6 +134874,7 @@ test "source vector migration consolidates ANN serving while preserving queries 
     const request: vector_migration.contract.Request = .{ .job_id = "ann", .mode = .online, .budget = .{ .batch_rows = 3 } };
     try db.startVectorMigration(request);
     try std.testing.expectError(error.VectorMigrationActive, db.deleteIndex(cfg.name));
+    var checked_reclamation_admission = false;
     for (0..256) |_| {
         var status = (try vector_migration.load(alloc, db.core.store)).?;
         defer status.deinit();
@@ -134872,8 +134883,25 @@ test "source vector migration consolidates ANN serving while preserving queries 
         try std.testing.expectEqual(@as(u32, 2), result.total_hits);
         try std.testing.expectEqualStrings("a", result.hits[0].id);
         if (status.value.phase == .complete) break;
+        if (status.value.phase == .reclaiming and !status.value.primary_reclamation_requested and !checked_reclamation_admission) {
+            // Model the recovery interval before the source binding is ready.
+            // A persisted serving phase must not authorize destructive work
+            // against an unavailable projection in the new owner lifetime.
+            const manager = db.core.index_manager;
+            const source = manager.source_payload_store;
+            manager.source_payload_store = null;
+            defer manager.source_payload_store = source;
+            try db.advanceVectorMigration(request.job_id);
+            var pending = (try vector_migration.load(alloc, db.core.store)).?;
+            defer pending.deinit();
+            try std.testing.expectEqual(vector_migration.contract.Phase.reclaiming, pending.value.phase);
+            try std.testing.expect(!pending.value.primary_reclamation_requested);
+            checked_reclamation_admission = true;
+            continue;
+        }
         if (status.value.phase == .ready) try db.publishVectorMigration(request.job_id) else try db.advanceVectorMigration(request.job_id);
     } else return error.VectorMigrationDidNotFinish;
+    try std.testing.expect(checked_reclamation_admission);
     try std.testing.expect(db.core.index_manager.sourceMigrationServingComplete());
     try std.testing.expect(try db.deleteIndex(cfg.name));
     const key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "a", "shared");

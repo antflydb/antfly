@@ -413,7 +413,43 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
-    inference_wasm_inference_mod.addImport("antfly_decisions", @import("../../lib/decisions/build.zig").create(b, b.path("lib/decisions/root.zig")));
+    // The native decision owner is wired to native structured-generation
+    // providers. Browser inference owns a separate source identity/profile,
+    // just like the standalone inference WASM product.
+    const wasm_decisions_mod = b.createModule(.{
+        .root_source_file = b.path("lib/decisions/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+    });
+    const wasm_schema_mod = b.createModule(.{ .root_source_file = b.path("lib/jsonschema/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_schema_mod.addImport("antfly-json", json_mod);
+    wasm_schema_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_schema_mod.addImport("antfly_regex", regex_mod);
+    const wasm_generating_mod = b.createModule(.{ .root_source_file = b.path("lib/generating/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_generating_mod.addImport("antfly-json", json_mod);
+    wasm_generating_mod.addImport("antfly_generating_openapi", api.generating);
+    const wasm_apple_mod = b.createModule(.{ .root_source_file = b.path("lib/apple_native/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    const apple_options = b.addOptions();
+    apple_options.addOption(bool, "enabled", false);
+    wasm_apple_mod.addOptions("apple_native_options", apple_options);
+    wasm_apple_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_apple_mod.addImport("httpx", httpx_mod);
+    wasm_generating_mod.addImport("antfly_apple_native", wasm_apple_mod);
+    const wasm_extracting_mod = b.createModule(.{ .root_source_file = b.path("lib/extracting/src/mod.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_extracting_mod.addImport("httpx", httpx_mod);
+    wasm_extracting_mod.addImport("antfly_extraction_openapi", api.extraction);
+    const wasm_structured_mod = b.createModule(.{ .root_source_file = b.path("lib/structured/root.zig"), .target = wasm_target, .optimize = optimize });
+    wasm_structured_mod.addImport("antfly_jsonschema", wasm_schema_mod);
+    wasm_structured_mod.addImport("antfly_generating", wasm_generating_mod);
+    wasm_structured_mod.addImport("antfly_extracting", wasm_extracting_mod);
+    wasm_decisions_mod.addImport("antfly_structured", wasm_structured_mod);
+    embedded_support_wasm_mod.addImport("antfly_generating", wasm_generating_mod);
+    embedded_support_wasm_mod.addImport("antfly_structured", wasm_structured_mod);
+    embedded_support_wasm_mod.addImport("antfly_decisions", wasm_decisions_mod);
+    inference_wasm_inference_mod.addImport("antfly_decisions", wasm_decisions_mod);
+    inference_wasm_inference_mod.addImport("antfly_extracting", wasm_extracting_mod);
+    inference_wasm_inference_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
     inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
     inference_wasm_inference_mod.addImport("antfly_media", wasm_inference_audio_mod.import_table.get("antfly_media").?);

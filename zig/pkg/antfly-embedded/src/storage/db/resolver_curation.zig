@@ -818,6 +818,8 @@ test "resolver curation ordered review commits outcomes replay and receipts toge
     const a = arena.allocator();
     var tmp = try @import("../../common/test_directory.zig").TestDirectory.init("ordered-resolver-review");
     defer tmp.cleanup();
+    // Keep this shared contract free of literal physical-DB imports, even
+    // inside tests: Zig records those files in control consumers' cache keys.
     const options: @import("selected_root.zig").db.OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .start_index_workers = false, .start_optional_runtimes = false };
     var db = try DB.open(std.testing.allocator, tmp.path(), options);
     var closed = false;

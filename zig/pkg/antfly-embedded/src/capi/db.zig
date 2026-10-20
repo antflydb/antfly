@@ -2314,6 +2314,8 @@ pub fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) callconv(
 }
 
 pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
+    @import("io_lifetime.zig").acquire();
+    errdefer @import("io_lifetime.zig").release();
     const alloc = std.heap.c_allocator;
     var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .prefer_existing_identity_namespace = true, .online_source_authority = .native });
     errdefer db.close();
@@ -2321,6 +2323,7 @@ pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
     errdefer alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
+        .io_lifetime_lease = true,
         .db = db,
         .embedded_path = try alloc.dupe(u8, path),
     };
@@ -2640,6 +2643,8 @@ pub fn openLiteHandleAllocWithSharedInference(
 ) !*Handle {
     if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
     var handle_owns_resources = false;
+    @import("io_lifetime.zig").acquire();
+    errdefer if (!handle_owns_resources) @import("io_lifetime.zig").release();
     // Each cached generation owns its storage pool. Retired cursors may keep
     // an older generation alive while the same index roots reopen in this one.
     const owned_resources = if (resolved.externally_locked and backend_runtime == null)
@@ -2735,6 +2740,7 @@ pub fn openLiteHandleAllocWithSharedInference(
     errdefer if (!handle_owns_resources) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
+        .io_lifetime_lease = true,
         .db = db,
         .open_mode = resolved.open_mode,
         .owned_lite_backend = backend,
@@ -2826,6 +2832,8 @@ pub fn openDirectoryHandle(
 }
 
 pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOptions) !*Handle {
+    @import("io_lifetime.zig").acquire();
+    errdefer @import("io_lifetime.zig").release();
     const alloc = std.heap.c_allocator;
     var options = dbOpenOptionsFromResolved(resolved, false);
     options.identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 };
@@ -2836,6 +2844,7 @@ pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOpti
     errdefer alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
+        .io_lifetime_lease = true,
         .db = db,
         .open_mode = resolved.open_mode,
         .embedded_path = try alloc.dupe(u8, path),
