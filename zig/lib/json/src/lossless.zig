@@ -102,3 +102,77 @@ test "lossless JSON normalization handles deep untrusted nesting without call st
     for (0..6000) |_| value = value.array.items[0];
     try std.testing.expectEqualStrings("1e-400", value.number_string);
 }
+
+/// Compact JSON serialization for dynamic values of arbitrary nesting depth.
+/// Containers use an explicit work list; std.json handles only scalar escaping
+/// and formatting, avoiding its recursive walk and fixed-depth safety stack.
+pub fn stringify(a: A, value: V) error{OutOfMemory}![]u8 {
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    writeValue(a, value, &output.writer) catch return error.OutOfMemory;
+    return output.toOwnedSlice();
+}
+
+fn writeValue(a: A, value: V, writer: *std.Io.Writer) !void {
+    const Event = union(enum) { value: V, key: []const u8, token: u8 };
+    var pending: std.ArrayList(Event) = .empty;
+    defer pending.deinit(a);
+    try pending.append(a, .{ .value = value });
+    while (pending.pop()) |event| switch (event) {
+        .token => |byte| try writer.writeByte(byte),
+        .key => |key| {
+            try std.json.Stringify.value(key, .{}, writer);
+            try writer.writeByte(':');
+        },
+        .value => |next| switch (next) {
+            .array => |array| {
+                try writer.writeByte('[');
+                try pending.append(a, .{ .token = ']' });
+                var index = array.items.len;
+                while (index > 0) {
+                    index -= 1;
+                    try pending.append(a, .{ .value = array.items[index] });
+                    if (index != 0) try pending.append(a, .{ .token = ',' });
+                }
+            },
+            .object => |object| {
+                try writer.writeByte('{');
+                try pending.append(a, .{ .token = '}' });
+                var index = object.count();
+                while (index > 0) {
+                    index -= 1;
+                    try pending.append(a, .{ .value = object.values()[index] });
+                    try pending.append(a, .{ .key = object.keys()[index] });
+                    if (index != 0) try pending.append(a, .{ .token = ',' });
+                }
+            },
+            else => try std.json.Stringify.value(next, .{}, writer),
+        },
+    };
+}
+
+test "iterative JSON serialization preserves scalars containers and exact numbers" {
+    const a = std.testing.allocator;
+    const raw = "{\"escaped\\\\key\":[\"quote\\\"\",true,false,null,[],{},1.0,1e-400,18446744073709551615]}";
+    var parsed = try parse(a, raw);
+    defer parsed.deinit();
+    const encoded = try stringify(a, parsed.value);
+    defer a.free(encoded);
+    const expected = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, encoded);
+}
+
+test "iterative JSON serialization safely round trips deeply nested objects and arrays" {
+    const a = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(a);
+    for (0..50000) |_| try raw.appendSlice(a, "{\"child\":[");
+    try raw.appendSlice(a, "1e-400");
+    for (0..50000) |_| try raw.appendSlice(a, "]}");
+    var parsed = try parse(a, raw.items);
+    defer parsed.deinit();
+    const encoded = try stringify(a, parsed.value);
+    defer a.free(encoded);
+    try std.testing.expectEqualStrings(raw.items, encoded);
+}

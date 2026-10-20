@@ -12793,7 +12793,7 @@ fn processAsset(
         const Render = struct {
             fn render(ptr: *anyopaque, a: Allocator, prior_template: []const u8, item: std.json.Value) ![]const u8 {
                 const owner: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
-                const json = try std.json.Stringify.valueAlloc(a, item, .{});
+                const json = try @import("antfly-json").stringifyValueAlloc(a, item);
                 defer a.free(json);
                 return renderSourceTemplateText(a, owner.config, json, prior_template);
             }
@@ -34711,7 +34711,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .artifact_name = "conceptualize_v1",
         .doc_key = doc_key,
         .source_field = "name",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .neighbor_context_json = "{\"graph_index\":\"taxonomy\",\"direction\":\"out\",\"limit\":8}",
         .sequence = 3,
     };
@@ -34794,7 +34794,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .name = "conceptualize_v1",
         .kind = .asset,
         .field = "name",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .neighbor_context = .{ .graph_index = "taxonomy" },
     });
     try db.batch(.{ .graph_writes = &.{

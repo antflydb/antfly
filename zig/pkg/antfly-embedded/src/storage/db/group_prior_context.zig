@@ -52,6 +52,35 @@ fn newestFirst(_: void, left: Item, right: Item) bool {
     return order == .gt or (order == .eq and left.ordinal > right.ordinal);
 }
 
+/// A bounded newest-first window. Directory positions are ordered, but cells
+/// with the same position use a physical identity suffix, not unit order.
+/// Keep those ties until the reader reaches a strictly older position.
+pub const Candidates = struct {
+    limit: usize,
+    items: std.ArrayList(Item) = .empty,
+
+    pub fn canStop(self: Candidates, position: Position) bool {
+        return self.items.items.len == self.limit and Position.before(position, self.items.items[self.limit - 1].position);
+    }
+
+    pub fn canSkipUnit(self: Candidates, position: Position, ordinal: i64, unit: groups.Digest) bool {
+        if (self.items.items.len < self.limit) return false;
+        const last = self.items.items[self.limit - 1];
+        if (Position.before(position, last.position)) return true;
+        if (Position.before(last.position, position)) return false;
+        if (ordinal != last.unit_ordinal) return ordinal < last.unit_ordinal;
+        return std.mem.order(u8, &unit, &last.unit) == .lt;
+    }
+
+    pub fn insert(self: *Candidates, a: A, item: Item) !void {
+        var at: usize = 0;
+        while (at < self.items.items.len and !newestFirst({}, item, self.items.items[at])) : (at += 1) {}
+        if (at == self.limit) return;
+        if (self.items.items.len == self.limit) self.items.items.len -= 1;
+        try self.items.insert(a, at, item);
+    }
+};
+
 /// The range reader limits candidate segments to horizon_segments and caps
 /// decoded source bytes. This additional bound prevents an accidentally broad
 /// adapter result from turning context selection into an unbounded sort.

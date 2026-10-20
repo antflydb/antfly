@@ -128,6 +128,39 @@ fn encodedParameterKeyIsSensitive(encoded: []const u8) bool {
     return fieldNameIsSensitive(key);
 }
 
+/// Scrub a request-owned provider configuration before public inspection.
+/// Generated deciders wrap providers under generator; fallback configurations
+/// can add further arrays/objects. Traverse all of them without recursion.
+/// Callers clone first so durable execution credentials remain untouched.
+pub fn redactPublicProviderConfig(a: std.mem.Allocator, root: *std.json.Value) !void {
+    var pending: std.ArrayList(*std.json.Value) = .empty;
+    defer pending.deinit(a);
+    try pending.append(a, root);
+    while (pending.pop()) |value| switch (value.*) {
+        .object => |*object| {
+            var index: usize = 0;
+            while (index < object.count()) {
+                const field = object.keys()[index];
+                const entry = object.values()[index];
+                const endpoint = std.ascii.eqlIgnoreCase(field, "url") or
+                    std.ascii.eqlIgnoreCase(field, "api_url") or
+                    std.ascii.eqlIgnoreCase(field, "base_url") or
+                    std.ascii.eqlIgnoreCase(field, "endpoint") or
+                    std.ascii.eqlIgnoreCase(field, "endpoint_url");
+                if (fieldNameIsSensitive(field) or (entry == .string and
+                    (containsSecretReference(entry.string) or (endpoint and urlContainsCredentials(entry.string)))))
+                {
+                    _ = object.swapRemove(field);
+                } else index += 1;
+            }
+            // Queue children only after removals: map compaction moves values.
+            for (object.values()) |*child| try pending.append(a, child);
+        },
+        .array => |*array| for (array.items) |*child| try pending.append(a, child),
+        else => {},
+    };
+}
+
 test "credential URL detection covers authority query fragment and secret references" {
     try std.testing.expect(urlContainsCredentials("https://alice:password@example.com/v1"));
     try std.testing.expect(urlContainsCredentials("https://example.com/v1?api_key=secret"));

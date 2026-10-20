@@ -27,6 +27,8 @@ pub const Value = union(enum) {
     string: []const u8,
     integer: i64,
     float: f64,
+    /// Valid JSON number token retained without floating-point rounding.
+    number_string: []const u8,
     boolean: bool,
     null,
     undefined,
@@ -40,6 +42,11 @@ pub const Value = union(enum) {
             .boolean => |b| b,
             .integer => |i| i != 0,
             .float => |f| f != 0.0,
+            .number_string => |raw| blk: {
+                const end = std.mem.indexOfAny(u8, raw, "eE") orelse raw.len;
+                for (raw[0..end]) |byte| if (byte >= '1' and byte <= '9') break :blk true;
+                break :blk false;
+            },
             .string => |s| s.len > 0,
             .safe_string => |s| s.len > 0,
             .array => |a| a.len > 0,
@@ -50,7 +57,7 @@ pub const Value = union(enum) {
     pub fn toString(self: Value, arena: Allocator) ![]const u8 {
         return switch (self) {
             .string => |s| s,
-            .safe_string => |s| s,
+            .safe_string, .number_string => |s| s,
             .integer => |i| std.fmt.allocPrint(arena, "{d}", .{i}),
             .float => |f| std.fmt.allocPrint(arena, "{d}", .{f}),
             .boolean => |b| if (b) "true" else "false",
@@ -2344,4 +2351,13 @@ test "eval @root in each" {
 
     const result = try testRender(arena, "{{#each items}}{{@root.sep}}{{this}}{{/each}}", .{ .map = m });
     try std.testing.expectEqualStrings("|x", result);
+}
+
+test "lossless numeric values render verbatim with numeric truthiness" {
+    const a = std.testing.allocator;
+    const tiny = Value{ .number_string = "1e-400" };
+    try std.testing.expect(tiny.isTruthy());
+    try std.testing.expectEqualStrings("1e-400", try tiny.toString(a));
+    try std.testing.expect(!(Value{ .number_string = "-0.000e999" }).isTruthy());
+    try std.testing.expect((Value{ .number_string = "-0.001e-999" }).isTruthy());
 }

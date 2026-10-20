@@ -80428,7 +80428,7 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     try db.addEnrichment(.{
         .name = "image_text_v1",
@@ -80610,7 +80610,7 @@ test "db asset producer enrichments batch compatible generated assets" {
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .execution = .{ .batch_items = 2, .batch_bytes = 1024 },
     });
 
@@ -88971,7 +88971,7 @@ test "db retryable asset producer batches do not block independent dense publica
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     // A distinct producer configuration forces a second native batch. Batch
     // partitioning must remain deferred so the first outage cannot perform
@@ -89064,7 +89064,7 @@ test "db blocked dense embedding lane does not force the independent asset lane 
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     try db.addIndex(.{
         .name = "title_dense",
@@ -89182,7 +89182,7 @@ test "cross-quantum lane pipelining publishes a fast dense quantum while a slowe
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     try db.addIndex(.{
         .name = "title_dense",
@@ -89310,7 +89310,7 @@ test "synchronous window checkpoints never advance the asset cursor past queued 
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     // A copy asset is synchronous scanner work planned after the extractor:
     // it publishes through the shared window, never through an execution
@@ -89434,7 +89434,7 @@ test "cross-quantum dispatch clones queued requests so later caller reuse cannot
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     try db.addIndex(.{
         .name = "title_dense",
