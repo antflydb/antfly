@@ -125623,8 +125623,8 @@ test "db prepared transaction effects required protocol activation rejects unfen
     try db.enablePreparedTransactionProtocol();
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
-    try std.testing.expectEqualStrings("7", try read.get(catalog.replacement_reader_base_key));
-    try std.testing.expectEqualStrings("7", try read.get(catalog.minimum_reader_key));
+    try std.testing.expectEqualStrings(try catalog.readerVersionBytes(catalog.prepared_transaction_reader_version), try read.get(catalog.replacement_reader_base_key));
+    try std.testing.expectEqualStrings(try catalog.readerVersionBytes(catalog.prepared_transaction_reader_version), try read.get(catalog.minimum_reader_key));
 }
 
 test "db prepared transaction effects required protocol rejects incomplete activation" {
@@ -125634,10 +125634,12 @@ test "db prepared transaction effects required protocol rejects incomplete activ
     defer directory.cleanup();
     var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
     defer db.close();
-    try db.core.store.put(catalog.minimum_reader_key, "7");
+    try db.core.store.put(catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.prepared_transaction_reader_version));
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.enablePreparedTransactionProtocol());
-    try db.core.store.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":7,\"resolvers\":[]}");
+    const valid = try catalog.versionedCatalog(a, "[]", catalog.prepared_transaction_reader_version);
+    defer a.free(valid);
+    try db.core.store.put(@import("artifact_inventory.zig").resolver_key, valid);
     try db.core.store.put(catalog.replacement_reader_base_key, "4");
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
 }
@@ -125740,6 +125742,9 @@ test "db prepared transaction effects required catalog attestation avoids alloca
 
 test "db prepared transaction effects required catalog raw transaction batch append and delete invalidate admission" {
     const a = std.testing.allocator;
+    const catalog = @import("catalog/resolver_catalog.zig");
+    const valid = try catalog.versionedCatalog(a, "[]", catalog.prepared_transaction_reader_version);
+    defer a.free(valid);
     const key = @import("artifact_inventory.zig").resolver_key;
     const Mode = enum { transaction_put, batch_put, batch_append, transaction_delete, batch_delete };
     inline for (std.meta.tags(Mode)) |mode| {
@@ -125754,15 +125759,15 @@ test "db prepared transaction effects required catalog raw transaction batch app
                 .transaction_put, .transaction_delete => {
                     var txn = try db.core.store.beginWriteTxn();
                     errdefer txn.abort();
-                    if (mode == .transaction_put) try txn.put(key, "{\"version\":7,\"resolvers\":[]}") else try txn.delete(key);
+                    if (mode == .transaction_put) try txn.put(key, valid) else try txn.delete(key);
                     try txn.commit();
                 },
                 .batch_put, .batch_append, .batch_delete => {
                     var batch = try db.core.store.beginWriteBatch();
                     errdefer batch.abort();
                     switch (mode) {
-                        .batch_put => try batch.put(key, "{\"version\":7,\"resolvers\":[]}"),
-                        .batch_append => try batch.asTxn().appendPut(key, "{\"version\":7,\"resolvers\":[]}"),
+                        .batch_put => try batch.put(key, valid),
+                        .batch_append => try batch.asTxn().appendPut(key, valid),
                         .batch_delete => try batch.delete(key),
                         else => unreachable,
                     }
@@ -125826,6 +125831,9 @@ test "db prepared transaction effects required catalog ambiguous commit invalida
         const vtable: erased.Batch.VTable = .{ .commit = commit, .abort = abort, .get = get, .put = put, .delete = delete, .open_cursor = cursor };
     };
     const a = std.testing.allocator;
+    const catalog = @import("catalog/resolver_catalog.zig");
+    const valid = try catalog.versionedCatalog(a, "[]", catalog.prepared_transaction_reader_version);
+    defer a.free(valid);
     for ([_]bool{ false, true }) |publish| {
         var directory = try TestDirectory.init("prepared-catalog-ambiguous");
         defer directory.cleanup();
@@ -125836,7 +125844,7 @@ test "db prepared transaction effects required catalog ambiguous commit invalida
         defer batch.abort();
         var fault: Fault = .{ .inner = batch.runtime.?, .publish = publish, .revision = &db.core.store.resolver_catalog_revision };
         batch.runtime = .{ .allocator = a, .ptr = &fault, .vtable = &Fault.vtable };
-        try batch.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":7,\"resolvers\":[]}");
+        try batch.put(@import("artifact_inventory.zig").resolver_key, valid);
         try std.testing.expectError(error.TestCommitReplyLost, batch.commit());
         try std.testing.expectEqual(publish, fault.committed);
         try std.testing.expect(db.core.store.resolver_catalog_revision.read() != null);
@@ -125860,6 +125868,9 @@ test "db prepared transaction effects required catalog attestation rejects gener
 
 test "db prepared transaction effects required catalog partial reload cannot publish a format attestation" {
     const a = std.testing.allocator;
+    const catalog = @import("catalog/resolver_catalog.zig");
+    const valid = try catalog.versionedCatalog(a, "[]", catalog.prepared_transaction_reader_version);
+    defer a.free(valid);
     const key = @import("artifact_inventory.zig").resolver_key;
     var directory = try TestDirectory.init("prepared-catalog-incomplete-load");
     defer directory.cleanup();
@@ -125868,10 +125879,12 @@ test "db prepared transaction effects required catalog partial reload cannot pub
     try db.enablePreparedTransactionProtocol();
     // The header is supported, but the resolver definition cannot be loaded.
     // Publishing the cached version before deserialization is insufficient.
-    try db.core.store.put(key, "{\"version\":7,\"resolvers\":[{}]}");
+    const incomplete = try catalog.versionedCatalog(a, "[{}]", catalog.prepared_transaction_reader_version);
+    defer a.free(incomplete);
+    try db.core.store.put(key, incomplete);
     try std.testing.expectError(error.MissingField, db.core.loadIndexCatalogOnly());
     try std.testing.expectError(error.InvalidPreparedTransactionProtocol, db.core.requirePreparedTransactionProtocol(null));
-    try db.core.store.put(key, "{\"version\":7,\"resolvers\":[]}");
+    try db.core.store.put(key, valid);
     try db.core.loadIndexCatalogOnly();
     try db.core.requirePreparedTransactionProtocol(null);
 }
@@ -126129,7 +126142,7 @@ test "db prepared transaction effects required materialization never reruns sync
     var producer = TestAssetProducer{};
     var db = try DB.open(a, std.mem.span(directory.path().ptr), .{ .start_index_workers = false, .enrichment = .{ .asset_producer = producer.producer() } });
     defer db.close();
-    try db.addEnrichment(.{ .name = "accepted", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}" });
+    try db.addEnrichment(.{ .name = "accepted", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
     const id: types.TxnId = @splat(0xc5);
     const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "accepted");
     defer a.free(key);
