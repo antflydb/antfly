@@ -12904,7 +12904,7 @@ fn processAsset(
         return;
     }
 
-    var source_parts_json = if (producer_cfg.type != .copy and request.source_template.len > 0)
+    var source_parts_json = if (producer_cfg.type.rendersTemplateParts() and request.source_template.len > 0)
         try renderSourcePartsJson(runtime.alloc, runtime.config, raw, request)
     else
         null;

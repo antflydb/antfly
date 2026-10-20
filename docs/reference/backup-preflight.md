@@ -76,7 +76,9 @@ Only fields selected by executable index/enrichment definitions are source
 inputs. Ordinary document paths and URLs are not dependencies. Reader,
 transcriber, document-extraction and PDF-page embedding inputs are media
 locators; text producers inspect media directives rather than treating every
-URL in prose as a fetch. Configured artifact consumers inspect their stored
+URL in prose as a fetch. Copy producers preserve literal text, including
+media-looking markers. Their template helper fetches are inventoried independently of the
+copied output. Configured artifact consumers inspect their stored
 asset/chunk input stream. Core validation also covers artifact envelopes and
 retained provenance; a historical source string is not by itself an active
 fetch requirement.
@@ -114,14 +116,19 @@ is shared with runtime; remote helpers are never called. Remote helpers use
 `credentials="name"` (or a supported field reference); quoting and argument order
 follow the runtime parser.
 
-Remote helper output is opaque: it can contain or complete media directives,
-even when the fetch URL is known. Its dependencies remain incomplete and cannot
-be certified by destination evidence. Unsupported helper syntax, opaque helper
-output, and custom loaders are reported as `dependency_uninspectable`. This
-deliberately does not claim to interpret all Handlebars programs. Unsupported
-schemes and structured locators are `source_unresolved`. Local paths/gateways and credential-bearing or expiring
+When output is interpreted as media or a locator, remote helper output is
+opaque: it can contain or complete media directives even when the fetch URL is
+known. Its dependencies remain incomplete and cannot be certified by destination
+evidence. Literal copy output does not undergo that interpretation; its known
+helper fetch URLs and credentials still require destination evidence. Unsupported
+helper syntax, opaque output in interpreted positions, and custom loaders are
+reported as `dependency_uninspectable`. This deliberately does not claim to
+interpret all Handlebars programs. Unsupported schemes and structured locators
+are `source_unresolved`. Local paths/gateways and credential-bearing or expiring
 URLs block compatibility. Archive-member and page/fragment selection generate
-separate destination retrieval requirements. No resolver or URL rewrite occurs.
+separate destination retrieval requirements. Query parameters are split before
+percent-decoding their names; encoded delimiters inside values do not create
+credential or retrieval parameters. No resolver or URL rewrite occurs.
 
 ## Destination capability input
 

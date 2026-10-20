@@ -295,7 +295,7 @@ fn modelBackedProducer(producer: Value) bool {
     };
 }
 
-const SourceInput = enum { text, locator, model_chunk, prior_context };
+const SourceInput = enum { text, literal, locator, model_chunk, prior_context };
 const Selector = struct { field: []const u8, template: []const u8, program: ?hbs.Template = null, artifact: []const u8, input: SourceInput, dynamic: bool, grouped: bool };
 pub const Inspector = struct {
     allocator: Allocator,
@@ -623,7 +623,9 @@ pub const Inspector = struct {
         if (!known) try self.report.add(self.options, .dynamic_loader, "producer", "", field, 0);
         if (is_definition and (field.len > 0 or template.len > 0 or artifact.len > 0)) {
             const locator_mode = eq(producer_type, "reader") or eq(producer_type, "transcriber") or eq(producer_type, "document_extraction") or eq(str(get(value, "embedding_input")), "pdf_page_images") or eq(str(get(value, "input")), "pdf_page_images") or eq(str(get(value, "embedding_input")), "image") or eq(str(get(value, "embedding_input")), "audio") or eq(str(get(value, "embedding_input")), "video") or get(value, "transcriber") != .null;
-            try self.selector(field, template, artifact, if (model_chunk) .model_chunk else if (locator_mode) .locator else .text, !known, group != null);
+            const parsed_type = ProducerType.parse(producer_type) orelse .copy;
+            const literal_output = eq(kind, "asset") and known and !parsed_type.rendersTemplateParts();
+            try self.selector(field, template, artifact, if (model_chunk) .model_chunk else if (locator_mode) .locator else if (literal_output) .literal else .text, !known, group != null);
         }
         if (is_embedding) {
             const name = if (str(get(value, "name")).len > 0) str(get(value, "name")) else catalog_name;
@@ -739,7 +741,7 @@ pub const Inspector = struct {
         self.definition_bytes += field.len + template.len + artifact.len;
         // Empty tables still carry a future-ingestion dependency.
         if (dynamic) try self.report.add(self.options, .dynamic_loader, "loader", "", field, 0);
-        if (program) |parsed| try self.templateSources(parsed.program, .null, "", field, input == .locator, true);
+        if (program) |parsed| try self.templateSources(parsed.program, .null, "", field, input, true);
     }
 
     pub fn document(self: *@This(), id: []const u8, bytes: []const u8, artifact: []const u8) !void {
@@ -750,6 +752,7 @@ pub const Inspector = struct {
             else => {
                 if (artifact.len > 0) {
                     for (self.definitions.items) |s| if (eq(s.artifact, artifact)) {
+                        if (s.input == .literal) continue;
                         if (s.grouped) {
                             try self.report.add(self.options, .source_unresolved, "group_unit_text", id, s.field, 0);
                         } else if (s.input == .prior_context) {
@@ -763,6 +766,9 @@ pub const Inspector = struct {
         };
         defer parsed.deinit();
         for (self.definitions.items) |s| {
+            // A copy's retained output is inert. Its template helpers are still
+            // inspected at definition time and with each document's context.
+            if (s.input == .literal and s.template.len == 0) continue;
             if (s.grouped) {
                 // Retained group assets and private unit documents are the two
                 // runtime representations of the same synthesized source text.
@@ -783,8 +789,8 @@ pub const Inspector = struct {
                 const program = s.program orelse continue; // Unsupported syntax was recorded at definition time.
                 const root = if (s.input == .prior_context) @import("../db/group_prior_context.zig").artifactCollection(parsed.value) else parsed.value;
                 if (s.input == .prior_context and root == .array) {
-                    for (root.array.items) |item| try self.templateSources(program.program, item, id, s.field, false, false);
-                } else try self.templateSources(program.program, root, id, s.field, s.input == .locator, false);
+                    for (root.array.items) |item| try self.templateSources(program.program, item, id, s.field, s.input, false);
+                } else try self.templateSources(program.program, root, id, s.field, s.input, false);
             } else if (artifact.len > 0 and eq(s.field, "text")) {
                 // Reuse runtime chunk payload selection, including historical
                 // _source_field provenance, instead of guessing stored layouts.
@@ -926,7 +932,8 @@ pub const Inspector = struct {
         };
     }
 
-    fn templateSources(self: *@This(), program: *const hbs.Node, root: Value, doc: []const u8, field: []const u8, locator_mode: bool, definition: bool) !void {
+    fn templateSources(self: *@This(), program: *const hbs.Node, root: Value, doc: []const u8, field: []const u8, input: SourceInput, definition: bool) !void {
+        const locator_mode = input == .locator;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -962,7 +969,7 @@ pub const Inspector = struct {
                             // Fetch results can contain or complete media markers. Keep
                             // known surrounding output for inventory, but never certify
                             // an opaque result, even with destination URL evidence.
-                            try self.report.add(self.options, .dynamic_loader, "helper_output", doc, field, 0);
+                            if (input != .literal) try self.report.add(self.options, .dynamic_loader, "helper_output", doc, field, 0);
                             const literal = try a.create(hbs.Node);
                             literal.* = .{ .string_literal = .{ .value = "\x00" } };
                             const inert = try a.create(hbs.Node);
@@ -995,7 +1002,7 @@ pub const Inspector = struct {
             if (program.program.body.len != 1) try self.report.add(self.options, .dynamic_loader, "composed_locator", doc, field, 0);
         } else if (locator_mode) {
             try self.locator(output.items, doc, field);
-        } else {
+        } else if (input != .literal) {
             // Scan the complete known output, including markers assembled from
             // several literals/references, with no producer or helper execution.
             try self.directives(output.items, doc, field);
@@ -1024,10 +1031,16 @@ pub const Inspector = struct {
         const host = if (uri.host) |h| std.mem.trimEnd(u8, try std.ascii.allocLowerString(a, try h.toRawMaybeAlloc(a)), ".") else "";
         if (uri.user != null or uri.password != null) try self.report.add(self.options, .source_expiring, "embedded_credentials", doc, field, 0);
         if (uri.query) |q| {
-            const query = try std.ascii.allocLowerString(a, try q.toRawMaybeAlloc(a));
+            // Split before decoding: escaped '&' and '=' belong to a query
+            // component and must never manufacture another parameter.
+            const query = switch (q) {
+                .raw, .percent_encoded => |encoded| encoded,
+            };
             var parts = std.mem.splitScalar(u8, query, '&');
             while (parts.next()) |part| {
-                const key = part[0 .. std.mem.indexOfScalar(u8, part, '=') orelse part.len];
+                const encoded_key = part[0 .. std.mem.indexOfScalar(u8, part, '=') orelse part.len];
+                const component: std.Uri.Component = .{ .percent_encoded = encoded_key };
+                const key = try std.ascii.allocLowerString(a, try component.toRawMaybeAlloc(a));
                 if (eq(key, "sig") or eq(key, "signature") or eq(key, "token") or eq(key, "expires") or eq(key, "se") or eq(key, "x-amz-signature") or eq(key, "x-goog-signature") or eq(key, "x-amz-credential") or eq(key, "x-goog-credential") or eq(key, "access_token") or eq(key, "auth") or eq(key, "key") or eq(key, "expiry") or eq(key, "expires_at") or eq(key, "x-amz-expires") or eq(key, "x-goog-expires")) try self.report.add(self.options, .source_expiring, "temporary_access", doc, field, 0);
                 if (eq(key, "page") or eq(key, "pages") or eq(key, "range") or eq(key, "page_number") or eq(key, "page_index") or eq(key, "page_range")) try self.report.add(self.options, .page_retrieval, "page_selection", doc, field, 0);
                 if (eq(key, "member") or eq(key, "entry") or eq(key, "archive")) try self.report.add(self.options, .archive_retrieval, "archive_member", doc, field, 0);
@@ -1738,7 +1751,7 @@ test "backup preflight runtime credentials keyword is inspectable" {
     defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "my-credential") == null);
     try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
-    try std.testing.expect(!report.analysis_complete);
+    try std.testing.expect(report.analysis_complete);
 }
 
 test "backup preflight template AST respects argument order quoting and runtime path lookup" {
@@ -1756,7 +1769,7 @@ test "backup preflight template AST respects argument order quoting and runtime 
         defer a.free(metadata);
         try inspector.metadataJson(metadata);
         try inspector.document("doc", "{\"media\":{\"uri\":\"https://example.org/private\"},\"media.uri\":\"file:///decoy\",\"credential\":\"team media\"}", "");
-        try std.testing.expect(!report.analysis_complete);
+        try std.testing.expect(report.analysis_complete);
         try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
         try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
         try std.testing.expect(count(report, .connection) > 0);
@@ -1791,7 +1804,7 @@ test "backup preflight combined substitutions respect escaping and rendered size
         defer report.deinit();
         var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
         defer inspector.deinit();
-        const metadata = try std.json.Stringify.valueAlloc(a, .{ .kind = "asset", .source_template = source, .producer = .{ .type = "copy" } }, .{});
+        const metadata = try std.json.Stringify.valueAlloc(a, .{ .kind = "asset", .source_template = source, .producer = .{ .type = "generator", .config = .{ .provider = "antfly", .model = "mock" } } }, .{});
         defer a.free(metadata);
         try inspector.metadataJson(metadata);
         try inspector.document("doc", raw, "");
@@ -1963,4 +1976,87 @@ test "backup preflight reader credential aliases require separate destination ev
             try std.testing.expectEqual(Verdict.blocked, evaluate(r, .{ .version = 1, .configuration_id = "revoked", .requirements = caps.items }).verdict);
         };
     }
+}
+
+test "backup preflight copy output is inert text" {
+    const a = std.testing.allocator;
+    const text = "Documentation example: <<<dotprompt:media:url file:///private/example.pdf>>>";
+    var client = @import("httpx").Client.initWithConfig(a, std.testing.io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = @import("../../asset_producer_runtime.zig").Runtime.init(a, &client);
+    defer runtime.deinit();
+    const output = try runtime.producer().produce(a, .{ .producer_type = .copy, .config_json = "", .source_text = text });
+    defer a.free(output);
+    try std.testing.expectEqualStrings(text, output);
+    for ([_][]const u8{ "", "{{{body}}}", "{{media url=uri}}" }) |source_template| {
+        const producer = "{\"type\":\"copy\"}";
+        try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "verbatim", .kind = .asset, .field = "body", .template = source_template, .producer_json = producer });
+        const metadata = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "verbatim", .kind = .asset, .source_field = "body", .source_template = source_template, .producer_json = producer }});
+        defer a.free(metadata);
+        const raw = try std.json.Stringify.valueAlloc(a, .{ .body = text, .uri = "file:///private/example.pdf" }, .{});
+        defer a.free(raw);
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", raw, "");
+        const json = try report.jsonAlloc("{\"version\":1,\"configuration_id\":\"empty\"}");
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+        try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+    }
+}
+
+test "backup preflight encoded query values are not credential parameters" {
+    const a = std.testing.allocator;
+    const Case = struct { query: []const u8, expiring: bool = false, page: bool = false, archive: bool = false };
+    for ([_]Case{
+        .{ .query = "note=literal%26token%3Dexample" },
+        .{ .query = "note=literal%26page%3D2%26member%3Dfoo" },
+        .{ .query = "note=literal%2526token%253Dexample" },
+        .{ .query = "note%26token=literal" },
+        .{ .query = "%74oken=example", .expiring = true },
+        .{ .query = "note=literal&%58-Amz-%53ignature=example", .expiring = true },
+        .{ .query = "%70age=2&%6dember=foo", .page = true, .archive = true },
+    }) |case| {
+        const source = try std.fmt.allocPrint(a, "https://cdn.example.org/image.png?{s}", .{case.query});
+        defer a.free(source);
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.locator(source, "doc", "image");
+        try std.testing.expectEqual(@as(u64, @intFromBool(case.expiring)), count(report, .source_expiring));
+        try std.testing.expectEqual(@as(u64, @intFromBool(case.page)), count(report, .page_retrieval));
+        try std.testing.expectEqual(@as(u64, @intFromBool(case.archive)), count(report, .archive_retrieval));
+        const caps = try a.alloc(Capability, report.requirements.items.len);
+        defer a.free(caps);
+        for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true };
+        const destination = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "public-cdn", .requirements = caps }, .{});
+        defer a.free(destination);
+        const json = try report.jsonAlloc(destination);
+        defer a.free(json);
+        const expected = if (case.expiring) "\"compatibility\":{\"verdict\":\"blocked\"" else "\"compatibility\":{\"verdict\":\"compatible\"";
+        try std.testing.expect(std.mem.indexOf(u8, json, expected) != null);
+    }
+}
+
+test "backup preflight literal copy still inventories executed template fetches and active consumers" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(
+        \\[{"name":"verbatim","kind":"asset","source_template":"{{remoteText url=uri}}","producer":{"type":"copy"}}]
+    );
+    try inspector.document("doc", "{\"uri\":\"file:///private/fetched.txt\"}", "");
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
+    try std.testing.expect(report.analysis_complete);
+    try inspector.metadataJson(
+        \\[{"name":"prompt","kind":"asset","source_template":"{{{body}}}","producer":{"type":"generator","config":{"provider":"antfly","model":"mock"}}}]
+    );
+    try inspector.document("doc", "{\"body\":\"<<<dotprompt:media:url file:///private/active.pdf>>>\"}", "");
+    try std.testing.expectEqual(@as(u64, 2), count(report, .source_local));
 }
