@@ -1,6 +1,6 @@
-# Read-only backup preflight
+# Offline backup inspection
 
-`antfly restore --preflight --input snapshot.afb2` emits one JSON report without
+`antfly backup inspect --input snapshot.afb2` emits one JSON report without
 creating a table, connecting to a server, fetching media, rendering helpers, or
 running producers. Input detection uses bytes, so the filename suffix is not
 significant. Supported sources are closed/stable Lite databases, full portable
@@ -8,16 +8,21 @@ AFB1/AFB2 archives, and supported full native AFB2 table archives, including
 multiple shards. Deltas require a base and are not admitted by this interface.
 
 ```sh
-antfly restore --preflight --input snapshot.aflite \
+antfly backup inspect --input snapshot.aflite \
   --destination-capabilities destination.json \
   --max-input-bytes 68719476736 \
   --max-expanded-bytes 137438953472
 ```
 
-Preflight options cannot be combined with restore target, connection, location,
+Inspection options cannot be combined with restore target, connection, location,
 wait, URL, mode, backup ID, or idempotency options. Successful execution means a
 report was emitted; callers must read its completeness and compatibility fields.
 An incomplete, blocked, or unknown report is not admission to restore.
+
+This is source inspection, rather than a dry run of a restore request. It does
+not initialize a server client or read server credentials. Restore target,
+connection and catalog-scope flags are not accepted. The draft
+`restore --preflight` spelling has been replaced by `backup inspect`.
 
 ## Report version 1
 

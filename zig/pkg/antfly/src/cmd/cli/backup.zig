@@ -82,12 +82,56 @@ const BackupArgs = struct {
     list_cursor: ?[]const u8 = null,
 };
 
-const RestoreArgs = struct {
-    preflight: bool = false,
+const InspectArgs = struct {
+    help: bool = false,
+    input_path: ?[]const u8 = null,
     destination_capabilities: ?[]const u8 = null,
     max_input_bytes: u64 = 64 * 1024 * 1024 * 1024,
     max_expanded_bytes: u64 = 128 * 1024 * 1024 * 1024,
-    limits_explicit: bool = false,
+};
+
+/// Offline inspection has no server client, restore target or admission side effects.
+pub fn runInspect(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const opts = parseInspectArgs(args) catch cli.fatal("invalid backup inspect arguments; use antfly backup inspect --help", .{});
+    if (opts.help) {
+        std.debug.print("usage: antfly backup inspect --input FILE [--destination-capabilities FILE] [--max-input-bytes N] [--max-expanded-bytes N]\nEmits a JSON report; command success does not imply restore compatibility.\n", .{});
+        return;
+    }
+    validateInspectArgs(opts) catch cli.fatal("backup inspect requires --input FILE and positive size limits", .{});
+    const capabilities = if (opts.destination_capabilities) |path| try cli.readFileAlloc(io, allocator, path, 1024 * 1024) else null;
+    defer if (capabilities) |bytes| allocator.free(bytes);
+    const json = try lite_restore_staging.inspectInputJsonAlloc(allocator, opts.input_path.?, capabilities, opts.max_input_bytes, opts.max_expanded_bytes);
+    defer allocator.free(json);
+    var report = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer report.deinit();
+    try cli.writeJson(allocator, io, report.value);
+}
+
+fn parseInspectArgs(args: *std.process.Args.Iterator) !InspectArgs {
+    var out: InspectArgs = .{};
+    while (args.next()) |arg| {
+        if (cli.isHelpArg(arg) or std.mem.eql(u8, arg, "help")) {
+            out.help = true;
+        } else if (std.mem.eql(u8, arg, "--input") or std.mem.eql(u8, arg, "-i")) {
+            if (out.input_path != null) return error.DuplicateArgument;
+            out.input_path = try nextRequired(args);
+        } else if (std.mem.eql(u8, arg, "--destination-capabilities")) {
+            if (out.destination_capabilities != null) return error.DuplicateArgument;
+            out.destination_capabilities = try nextRequired(args);
+        } else if (std.mem.eql(u8, arg, "--max-input-bytes")) {
+            out.max_input_bytes = try std.fmt.parseUnsigned(u64, try nextRequired(args), 10);
+        } else if (std.mem.eql(u8, arg, "--max-expanded-bytes")) {
+            out.max_expanded_bytes = try std.fmt.parseUnsigned(u64, try nextRequired(args), 10);
+        } else return error.UnknownArgument;
+    }
+    return out;
+}
+
+fn validateInspectArgs(opts: InspectArgs) !void {
+    if (opts.input_path == null or opts.input_path.?.len == 0 or opts.max_input_bytes == 0 or opts.max_expanded_bytes == 0) return error.InvalidInspectArguments;
+}
+
+const RestoreArgs = struct {
     help: bool = false,
     table_name: ?[]const u8 = null,
     tables_str: ?[]const u8 = null,
@@ -316,17 +360,6 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         printRestoreUsage();
         return;
     }
-    if (opts.preflight) {
-        try validateRestoreArgs(opts);
-        const capabilities = if (opts.destination_capabilities) |path| try cli.readFileAlloc(io, allocator, path, 1024 * 1024) else null;
-        defer if (capabilities) |bytes| allocator.free(bytes);
-        const json = try lite_restore_staging.inspectInputJsonAlloc(allocator, opts.input_path.?, capabilities, opts.max_input_bytes, opts.max_expanded_bytes);
-        defer allocator.free(json);
-        var report = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
-        defer report.deinit();
-        try cli.writeJson(allocator, io, report.value);
-        return;
-    }
     const connection = opts.connection orelse cli.fatal("--connection is required", .{});
 
     validateRestoreArgs(opts) catch |err| switch (err) {
@@ -498,16 +531,6 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
             const seconds = try std.fmt.parseUnsigned(u64, try nextRequired(args), 10);
             out.wait_timeout_ms = try std.math.mul(u64, seconds, 1000);
             out.wait = true;
-        } else if (std.mem.eql(u8, arg, "--preflight")) {
-            out.preflight = true;
-        } else if (std.mem.eql(u8, arg, "--destination-capabilities")) {
-            out.destination_capabilities = try nextRequired(args);
-        } else if (std.mem.eql(u8, arg, "--max-input-bytes")) {
-            out.max_input_bytes = try std.fmt.parseUnsigned(u64, try nextRequired(args), 10);
-            out.limits_explicit = true;
-        } else if (std.mem.eql(u8, arg, "--max-expanded-bytes")) {
-            out.max_expanded_bytes = try std.fmt.parseUnsigned(u64, try nextRequired(args), 10);
-            out.limits_explicit = true;
         } else {
             return error.UnknownArgument;
         }
@@ -538,11 +561,6 @@ fn validateBackupCursor(cursor: []const u8) !void {
 }
 
 fn validateRestoreArgs(opts: RestoreArgs) !void {
-    if (opts.preflight) {
-        if (opts.input_path == null or opts.input_path.?.len == 0 or opts.table_name != null or opts.tables_str != null or opts.connection != null or opts.location_explicit or opts.backup_id != null or opts.restore_mode != null or opts.wait or opts.idempotency_key != null or opts.url != null or opts.max_input_bytes == 0 or opts.max_expanded_bytes == 0) return error.InvalidPreflightArguments;
-        return;
-    }
-    if (opts.destination_capabilities != null or opts.limits_explicit) return error.PreflightRequired;
     if (opts.table_name != null and opts.tables_str != null) return error.ConflictingTableSelection;
     if (opts.input_path) |input| {
         if (opts.tables_str != null or opts.table_name == null) return error.InvalidRestoreInputTarget;
@@ -601,7 +619,6 @@ fn printBackupUsage() void {
 }
 
 fn printRestoreUsage() void {
-    std.debug.print("Read-only JSON preflight: antfly restore --preflight --input FILE [--destination-capabilities FILE] [--max-input-bytes N] [--max-expanded-bytes N]\n", .{});
     std.debug.print(
         \\usage:
         \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
@@ -881,17 +898,22 @@ test "restore table list trims names and rejects ambiguous input" {
     try std.testing.expectError(error.DuplicateTableName, parseTableNames(std.testing.allocator, &names, "alpha,alpha"));
 }
 
-test "restore preflight CLI requires no target connection and detects input by contents" {
-    var args = [_][*:0]const u8{ "--preflight", "--input", "snapshot.bin", "--destination-capabilities", "destination.json", "--max-input-bytes", "1024" };
+test "backup inspect requires a source and rejects restore options" {
+    var args = [_][*:0]const u8{ "--input", "snapshot.bin", "--destination-capabilities", "destination.json", "--max-input-bytes", "1024" };
     var iter = std.process.Args.Iterator.init(.{ .vector = &args });
-    const opts = try parseRestoreArgs(&iter);
-    try validateRestoreArgs(opts);
-    try std.testing.expect(opts.preflight);
+    const opts = try parseInspectArgs(&iter);
+    try validateInspectArgs(opts);
+    try std.testing.expectEqualStrings("snapshot.bin", opts.input_path.?);
     try std.testing.expectEqual(@as(u64, 1024), opts.max_input_bytes);
-    var conflicting = opts;
-    conflicting.table_name = "docs";
-    try std.testing.expectError(error.InvalidPreflightArguments, validateRestoreArgs(conflicting));
-    conflicting = opts;
-    conflicting.preflight = false;
-    try std.testing.expectError(error.PreflightRequired, validateRestoreArgs(conflicting));
+    try std.testing.expectError(error.InvalidInspectArguments, validateInspectArgs(.{}));
+    try std.testing.expectError(error.InvalidInspectArguments, validateInspectArgs(.{ .input_path = "db", .max_expanded_bytes = 0 }));
+    for ([_][]const u8{ "--table", "--connection", "--location", "--url", "--wait", "--dry-run", "--preflight" }) |flag| {
+        var invalid = [_][*:0]const u8{try std.testing.allocator.dupeSentinel(u8, flag, 0)};
+        defer std.testing.allocator.free(std.mem.span(invalid[0]));
+        var bad = std.process.Args.Iterator.init(.{ .vector = &invalid });
+        try std.testing.expectError(error.UnknownArgument, parseInspectArgs(&bad));
+    }
+    var old = [_][*:0]const u8{"--preflight"};
+    var old_iter = std.process.Args.Iterator.init(.{ .vector = &old });
+    try std.testing.expectError(error.UnknownArgument, parseRestoreArgs(&old_iter));
 }

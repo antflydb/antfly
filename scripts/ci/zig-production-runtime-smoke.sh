@@ -235,8 +235,24 @@ PY
       "$binary" lite snapshot "$source" --out "$copy" >"$smoke_root/embedded-snapshot.log" 2>&1
     fi
     cleanup_server
+    if "$binary" lite schema set "$path" --file "$smoke_root/embedded-schema.json" >"$smoke_root/embedded-${phase}-offline-schema.log" 2>&1; then
+      echo "adopted Lite file accepted an offline catalog mutation" >&2
+      return 1
+    fi
+    if ! grep -q 'StandaloneLiteCatalogRequiresApi' "$smoke_root/embedded-${phase}-offline-schema.log"; then
+      cat "$smoke_root/embedded-${phase}-offline-schema.log" >&2
+      return 1
+    fi
+    "$binary" lite batch "$path" --file "$smoke_root/embedded-write.json" >"$smoke_root/embedded-${phase}-offline-write.log" 2>&1
+    ANTFLY_URL='://invalid-server-url' "$binary" backup inspect --input "$path" >"$smoke_root/embedded-${phase}-inspection.json"
+    python3 - "$smoke_root/embedded-${phase}-inspection.json" <<'PYREPORT'
+import json, sys
+report = json.load(open(sys.argv[1]))
+assert report["completeness"]["scan_complete"], report
+assert report["compatibility"]["verdict"] == "unknown", report
+PYREPORT
   done
-  echo "production Lite embedded adoption, reopen and snapshot smoke passed"
+  echo "production Lite embedded adoption, catalog ownership, offline inspection, reopen and snapshot smoke passed"
 }
 
 run_lite_adoption
