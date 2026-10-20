@@ -982,6 +982,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-inference-worker-output-error-test", "Run caller-owned scheduler failures through output callback statuses")
         .dependOn(&b.addRunArtifact(worker_output_error_tests).step);
+    const inference_error_names_tests = b.addTest(.{
+        .name = "inference-error-names-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/inference/src/host/engine_errors.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.step("antfly-inference-error-names-test", "Verify every private inference error name round-trips without numeric wire identities")
+        .dependOn(&b.addRunArtifact(inference_error_names_tests).step);
     const inference_http_deadline_tests = b.addTest(.{
         .name = "inference-http-deadline-tests",
         .root_module = antfly_imports.inference_server,
