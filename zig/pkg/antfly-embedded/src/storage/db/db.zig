@@ -143234,6 +143234,68 @@ fn testLiteExternalDenseLifecycle(recreate: bool) !void {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, db.core.index_manager.base_path, .{}));
 }
 
+test "lite external dense dimension replacement keeps writes available (#1216)" {
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/dimension.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = true, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    _ = try db.admitManagedIndex(.{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+    var keys: [20][32]u8 = undefined;
+    var old_writes: [20]types.BatchWrite = undefined;
+    for (&old_writes, &keys, 0..) |*write, *key, i| write.* = .{
+        .key = try std.fmt.bufPrint(key, "old-{d}", .{i}),
+        .value = "{\"body\":\"old document\",\"_embeddings\":{\"img\":[1,0,0]}}",
+    };
+    try db.batch(.{ .writes = &old_writes });
+    try db.runUntilIdle();
+    try std.testing.expect(try db.deleteIndex("img"));
+    var pages: usize = 0;
+    while (try db.advanceGeneratedArtifactCleanupPage("img") != .idle) : (pages += 1) try std.testing.expect(pages < 10_000);
+    const repair = try db.admitManagedIndex(.{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":4,\"external\":true}" });
+    // Admission must not block either vector or ordinary writes while its
+    // new generation is still rebuilding from retained authored artifacts.
+    try db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"body\":\"new document\",\"_embeddings\":{\"img\":[0,1,0,0]}}" }} });
+    try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{\"body\":\"no vector\"}" }} });
+    if (repair) |id| {
+        var complete = false;
+        for (0..20) |_| {
+            if ((try db.advanceIndexRepairIntent(a, id, repair_completion_test_options)).repaired) {
+                complete = true;
+                break;
+            }
+        }
+        try std.testing.expect(complete);
+    }
+    for (0..2) |round| {
+        if (round == 1) {
+            db.close();
+            handle.deinit();
+            handle = try lite.Handle.open(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+            opts = .{ .start_index_workers = true, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+            try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+            db = try DB.open(a, path, opts);
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"body\":\"new document\",\"_embeddings\":{\"img\":[0,1,0,0]}}" }} });
+        try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{\"body\":\"no vector\"}" }} });
+        try db.runUntilIdle();
+        var result = try db.search(a, .{ .index_name = "img", .query = .{ .dense_knn = .{ .vector = &.{ 0, 1, 0, 0 }, .k = 8 } }, .limit = 8 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqualStrings("new", result.hits[0].id);
+        try std.testing.expectEqual(@as(?u64, 1), try DB.loadDenseArtifactTargetCounter(a, db.core.store, "img"));
+        const checkpoint = try db.core.loadProjectionCheckpoint(a, "img");
+        try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    }
+}
+
 test "lite generation cleanup and capacity accounting survive reopen (#1210)" {
     const a = std.testing.allocator;
     const lite = @import("../lite/backend.zig");

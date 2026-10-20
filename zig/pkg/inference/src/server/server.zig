@@ -32524,6 +32524,7 @@ fn applyDenseEmbeddingRequestOptions(
     manifest: *const manifest_mod.ModelManifest,
     request: ParsedEmbedRequest,
 ) !?[]u8 {
+    pipeline.interactive = request.task_type == .RETRIEVAL_QUERY;
     return applyDenseEmbeddingConfigRequestOptions(allocator, &pipeline.config, manifest, request);
 }
 fn applyDenseEmbeddingConfigRequestOptions(

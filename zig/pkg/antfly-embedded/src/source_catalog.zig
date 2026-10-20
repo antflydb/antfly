@@ -849,6 +849,7 @@ pub const storage_db_native_query_reuse = @import("storage/db/native_query_reuse
 pub const storage_db_artifact_graph_completion = @import("storage/db/artifact_graph_completion.zig");
 pub const storage_db_artifact_input_test = @import("storage/db/artifact_input_test.zig");
 pub const storage_db_group_prior_context = @import("storage/db/group_prior_context.zig");
+pub const storage_db_group_prior_scan = @import("storage/db/group_prior_scan.zig");
 pub const storage_db_group_source_baseline = @import("storage/db/group_source_baseline.zig");
 pub const storage_db_group_source_bytes = @import("storage/db/group_source_bytes.zig");
 pub const storage_db_group_source_debt = @import("storage/db/group_source_debt.zig");
