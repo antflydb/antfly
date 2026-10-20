@@ -47,6 +47,16 @@ every JSON field, including underscore-prefixed fields, through nested arrays
 and schema composition. The document validator's metadata exemptions apply
 only to stored document validation.
 
+The admitted keywords assert independently: a nullable `anyOf` cannot bypass a
+sibling `enum`, `const`, or `type`. Type-specific constraints apply only to that
+instance type, so `minimum` constrains numbers without imposing a numeric type.
+Enums, constants, and unique items use JSON value equality: object member order
+is irrelevant and mathematically equal numbers compare equally. Integer and
+numeric-literal comparisons retain decimal precision instead of rounding through
+floating point. The owned constraint tree compiles once per batch and serves all
+items and repair attempts. Unique items use semantic fingerprints with equality
+checks on collisions, avoiding pairwise comparisons of distinct items.
+
 `auto` selects a forced, actual tool call, provider JSON-schema output, then
 native grammar output, subject to the selected model's admitted capabilities.
 A provider adapter's synthetic tool-call compatibility behavior does not count
@@ -108,7 +118,10 @@ source order retains its execution cause; successful sibling documents remain
 available to embedded producers. The HTTP response uses these same outcomes:
 capacity exhaustion remains retryable `MODEL_RESOURCE_BUSY` (503), deadlines
 remain retryable `INFERENCE_TIMEOUT` (504), and unsupported finite probability
-vocabularies remain permanent admission failures (400).
+vocabularies remain permanent admission failures (400). Input byte-budget and
+extraction materialization limits return `BATCH_TOO_LARGE` (413), without a
+retryable capacity signal. An input exceeding its byte budget is rejected before
+provider invocation.
 
 ```json
 {

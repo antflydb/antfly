@@ -622,6 +622,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     httpx_mod.addImport("antfly-json", json_mod);
     jsonschema_mod.addImport("antfly_regex", regex_mod);
     jsonschema_mod.addImport("antfly-json", json_mod);
+    jsonschema_mod.addImport("antfly_platform", platform_mod);
     const structured_mod = b.addModule("antfly_structured", .{ .root_source_file = b.path("lib/structured/root.zig") });
     structured_mod.addImport("antfly_jsonschema", jsonschema_mod);
     const generating_mod = b.createModule(.{

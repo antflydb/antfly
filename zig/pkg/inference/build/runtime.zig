@@ -212,6 +212,7 @@ pub fn create(config: Config) Graph {
     const jsonschema_mod = shared.jsonschema orelse blk: {
         const mod = createSharedModule(config, "lib/jsonschema/src/mod.zig");
         mod.addImport("antfly-json", json_mod);
+        mod.addImport("antfly_platform", platform_mod);
         mod.addImport("antfly_regex", regex_mod);
         break :blk mod;
     };

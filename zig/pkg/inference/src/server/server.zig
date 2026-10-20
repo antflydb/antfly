@@ -22473,6 +22473,8 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.UnsupportedRebelEntityLabels,
         error.UnsupportedRebelRelationEndpoints,
         => rebelSchemaFailureResponse(ctx, err),
+        error.ConstrainedInputTooLarge,
+        error.GeneratedExtractionLimitExceeded,
         error.ReadBatchTooLarge,
         error.InferenceBatchTooLarge,
         error.InferenceMediaPartLimitExceeded,
@@ -39080,7 +39082,7 @@ test "generated constrained extraction transport retains typed document failures
     defer arena.deinit();
     const scratch = arena.allocator();
     const inputs = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "[{\"content\":\"Alice\",\"id\":\"doc\"}]", .{});
-    for ([_]anyerror{ error.GenerationCapacityUnavailable, error.Timeout, error.UnsupportedConstrainedProbabilities }) |cause| {
+    for ([_]anyerror{ error.GenerationCapacityUnavailable, error.Timeout, error.UnsupportedConstrainedProbabilities, error.ConstrainedInputTooLarge, error.GeneratedExtractionLimitExceeded }) |cause| {
         const outcomes = [_]c.extraction.Outcome{.{ .failure = cause }};
         const err = if (c.extraction.responseValue(scratch, "fixture", inputs.array.items, &outcomes, .{ .values = &.{}, .token_evidence = &.{} })) |_| return error.TestExpectedError else |failure| failure;
         try std.testing.expectEqual(cause, err);
@@ -39093,13 +39095,14 @@ test "generated constrained extraction transport retains typed document failures
         const expected: struct { status: u16, code: []const u8, retryable: bool } = switch (cause) {
             error.GenerationCapacityUnavailable => .{ .status = 503, .code = "MODEL_RESOURCE_BUSY", .retryable = true },
             error.Timeout => .{ .status = 504, .code = "INFERENCE_TIMEOUT", .retryable = true },
+            error.ConstrainedInputTooLarge, error.GeneratedExtractionLimitExceeded => .{ .status = 413, .code = "BATCH_TOO_LARGE", .retryable = false },
             else => .{ .status = 400, .code = "UNSUPPORTED_CONSTRAINED_PROBABILITIES", .retryable = false },
         };
         try std.testing.expectEqual(expected.status, response.status.code);
         var body = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
         defer body.deinit();
         try std.testing.expectEqualStrings(expected.code, body.value.object.get("error").?.string);
-        try std.testing.expectEqual(expected.retryable, body.value.object.get("retryable").?.bool);
+        try std.testing.expectEqual(expected.retryable, if (body.value.object.get("retryable")) |retryable| retryable.bool else false);
         if (cause == error.GenerationCapacityUnavailable) try std.testing.expectEqual(@as(i64, 1000), body.value.object.get("retry_after_ms").?.integer);
     }
 }

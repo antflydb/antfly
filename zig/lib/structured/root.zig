@@ -199,6 +199,8 @@ pub fn execute(a: Allocator, executor: Executor, mode: Output, value_schema: Jso
     try batch.validate();
     try validateSchema(value_schema);
     if (mode == .auto or value_schema != .object) return error.InvalidConstrainedGenerationConfig;
+    var validator = try schema_validator.CompiledSchema.init(a, value_schema);
+    defer validator.deinit();
     var result = Result{
         .values = try a.alloc(?Json, inputs.len),
         .failures = try a.alloc(?anyerror, inputs.len),
@@ -277,7 +279,7 @@ pub fn execute(a: Allocator, executor: Executor, mode: Output, value_schema: Jso
                     const id = itemId(entry, begin, end) orelse continue;
                     if (duplicates[id - begin] or result.values[id] != null) continue;
                     const value = entry.object.get("value") orelse continue;
-                    schema_validator.validateJsonSchemaValue(a, value_schema, value) catch |err| {
+                    validator.validate(a, value) catch |err| {
                         if (err == error.OutOfMemory) return err;
                         validation_error = try std.fmt.allocPrint(a, "Item {d}: {s}. Return exactly one valid result for each requested item.", .{ id, @errorName(err) });
                         continue;
@@ -572,4 +574,34 @@ test "constrained values repair invalid underscore fields before semantic access
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.validations);
     try std.testing.expect(result.failures[0] == null);
+}
+
+test "constrained JSON repair applies sibling assertions and preserves semantic enum matches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fake = struct {
+        calls: usize = 0,
+        fn invoke(ptr: *anyopaque, alloc: Allocator, request: Invocation) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) return .{ .value = try std.json.parseFromSliceLeaky(Json, alloc,
+                \\{"items":[{"item":0,"value":{"b":2,"a":1.0}},{"item":1,"value":null}]}
+            , .{}) };
+            try std.testing.expectEqual(@as(usize, 1), request.items.len);
+            try std.testing.expectEqual(@as(usize, 1), request.items[0].id);
+            try std.testing.expect(request.validation_error != null);
+            return .{ .value = try std.json.parseFromSliceLeaky(Json, alloc,
+                \\{"items":[{"item":1,"value":{"a":1,"b":2}}]}
+            , .{}) };
+        }
+    };
+    var fake = Fake{};
+    const schema = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"anyOf":[{"type":"null"},{"type":"object"}],"enum":[{"a":1,"b":2}]}
+    , .{});
+    const result = try execute(a, .{ .ptr = &fake, .invoke = Fake.invoke }, .json_schema, schema, "", .{}, &.{ "one", "two" });
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expect(result.failures[0] == null and result.failures[1] == null);
+    try std.testing.expect(result.values[0].? == .object and result.values[1].? == .object);
 }
