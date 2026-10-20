@@ -408,6 +408,97 @@ export class Database implements AsyncDisposable {
     return this.#invokeCode(this.#native.dbSetSchemaJson, jsonSlice(schema));
   }
 
+  async renderResolverKey(resolver: string, request: JsonInput): Promise<unknown> {
+    return parseJson(
+      await this.#invokeBuffer(
+        this.#native.dbRenderResolverKeyJson,
+        stringSlice(resolver),
+        jsonSlice(request)
+      )
+    );
+  }
+  async resolveQuery(resolver: string, request: JsonInput): Promise<unknown> {
+    return parseJson(
+      await this.#invokeBuffer(
+        this.#native.dbResolveQueryJson,
+        stringSlice(resolver),
+        jsonSlice(request)
+      )
+    );
+  }
+  async mergeResolverKeys(resolver: string, request: JsonInput): Promise<void> {
+    await this.#invokeCode(
+      this.#native.dbMergeResolverKeysJson,
+      stringSlice(resolver),
+      jsonSlice(request)
+    );
+  }
+  async unmergeResolverKey(resolver: string, request: JsonInput): Promise<unknown> {
+    return parseJson(
+      await this.#invokeBuffer(
+        this.#native.dbUnmergeResolverKeyJson,
+        stringSlice(resolver),
+        jsonSlice(request)
+      )
+    );
+  }
+  async suppressResolverKeys(resolver: string, request: JsonInput): Promise<unknown> {
+    return parseJson(
+      await this.#invokeBuffer(
+        this.#native.dbSuppressResolverKeysJson,
+        stringSlice(resolver),
+        jsonSlice(request)
+      )
+    );
+  }
+  async unsuppressResolverKey(resolver: string, request: JsonInput): Promise<unknown> {
+    return parseJson(
+      await this.#invokeBuffer(
+        this.#native.dbUnsuppressResolverKeyJson,
+        stringSlice(resolver),
+        jsonSlice(request)
+      )
+    );
+  }
+  async resolverCuration(resolver = ""): Promise<unknown> {
+    return parseJson(
+      await this.#invokeBuffer(this.#native.dbResolverCurationJson, stringSlice(resolver))
+    );
+  }
+  async resolverReviews(request: JsonInput): Promise<unknown> {
+    return parseJson(
+      await this.#invokeBuffer(this.#native.dbResolverReviewsJson, jsonSlice(request))
+    );
+  }
+  async curateEntity(table: string, key: string, request: JsonInput): Promise<unknown> {
+    return parseJson(
+      await this.#invokeBuffer(
+        this.#native.dbCurateEntityJson,
+        stringSlice(table),
+        stringSlice(key),
+        jsonSlice(request)
+      )
+    );
+  }
+  async listResolverIdentities(): Promise<unknown> {
+    return parseJson(await this.#invokeBuffer(this.#native.dbListResolverIdentitiesJson));
+  }
+  async setResolverNamespace(resolver: string, request: JsonInput): Promise<void> {
+    await this.#invokeCode(
+      this.#native.dbSetResolverNamespaceJson,
+      stringSlice(resolver),
+      jsonSlice(request)
+    );
+  }
+  dropResolverIdentity(resolver: string): Promise<boolean> {
+    return this.#run(async (handle) => {
+      const out = [false];
+      checkCode(
+        await callAsync(this.#native.dbDropResolverIdentity, handle, stringSlice(resolver), out)
+      );
+      return Boolean(out[0]);
+    });
+  }
   listIndexesRaw(): Promise<Buffer> {
     return this.#invokeBuffer(this.#native.dbListIndexesJson);
   }

@@ -434,6 +434,18 @@ class RuntimeCacheTest(unittest.TestCase):
             "cached",
         )
 
+    def test_control_consumers_ignore_physical_db_implementation(self):
+        physical = self.own("zig/pkg/antfly-embedded/src/storage/db/db.zig")
+        self.build("cache-probe")
+        self.assert_archives(self.build("cache-probe"))
+        physical.write_bytes(physical.read_bytes() + b"\n// physical DB cache fence\n")
+        # Literal imports in shared helper tests are cache inputs too. Preserve
+        # the real module graph while replacing only expensive runtime bodies.
+        # Physical provider bodies are replaced in this fixture; none of the
+        # retained control module graphs may acquire their implementation input.
+        # The production compilation audit separately checks owner rebuilding.
+        self.assert_archives(self.build("cache-probe"))
+
     def test_runtime_owner_dependencies(self):
         owners = (
             ("zig/lib/mcp/src/root.zig", ("api_kernel",)),

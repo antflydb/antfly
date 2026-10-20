@@ -1,0 +1,84 @@
+{
+  "base_commit": "76fe5d05fb9e1f635467297480510002a8783240",
+  "zig_version": "0.17.0",
+  "build": "Debug",
+  "scope": "Deterministic native regression observations; not archive-scale latency, RSS or DuckDB parity claims.",
+  "range_differences": {
+    "keys": 12000,
+    "value_bytes": 250,
+    "cache_bytes": 524288,
+    "physical_page_reads": {
+      "value_edit": 4,
+      "new_minimum": 4,
+      "delete_minimum": 4,
+      "append": 4,
+      "value_growth_split_30000_bytes": 6
+    },
+    "verified_changed_keys_per_case": 1
+  },
+  "unordered_limit": {
+    "limit": 1,
+    "groups_decoded": 1,
+    "prefetch_batches": 0,
+    "unsupported_order_expression_still_reads_complete_input": true
+  },
+  "compact_counter_record": {
+    "slots": 64,
+    "historical_columnar_bytes": 686,
+    "native_record_bytes": 542,
+    "selected_counter_finalization_allocations": 0
+  },
+  "grouped_reduction": {
+    "groups": 2048,
+    "cold_written_bytes_before": 628936,
+    "cold_written_bytes_after": 562976,
+    "one_group_update_written_bytes_after": 35407,
+    "one_group_delete_written_bytes_after": 74558,
+    "scope": "Fixed grouped fixture including ordered tree pages; exact results and retained-page GC reachability verified."
+  },
+  "archive_comparison": {
+    "status": "not_run",
+    "reason": "The 142577-row HN Parquet fixture is not on this machine; use native_search_comparison.py where it is available."
+  },
+  "comparison_runner_smoke": {
+    "rows": 2048,
+    "source": "Synthetic HN-shaped Parquet; not the real HN archive",
+    "source_sha256": "708bcb2ff02d9a7437f531837b38e39dd9c0b07392f9c3b09b718a432063a9c6",
+    "binary_hashes": {
+      "base": {
+        "sha256": "3ad8916c473fd86e97f2c3b4c7d3ff410c7ca2f1256530fcd97725c5f6cbf81c",
+        "revision": "76fe5d05fb9e1f635467297480510002a8783240"
+      },
+      "head": {
+        "sha256": "6c88fd9f234569906e776a281ec8c94f34cc1a9692c927cbe8f22a38171a4046",
+        "revision": "working-tree-after-76fe5d05fb"
+      }
+    },
+    "layouts": [
+      1,
+      16
+    ],
+    "mode": "plain",
+    "cache_state": "empty",
+    "cases_passed": 4,
+    "process_memory_budget_mb": 4096,
+    "repeats": 3,
+    "scope": "Correctness/reporting smoke only; Debug binaries, unpinned macOS, OS caches retained. No latency comparison claimed."
+  },
+  "highlighted_composed_smoke": {
+    "rows": 2048,
+    "current_fixture_rows": 32,
+    "verified": [
+      "union_history",
+      "overlay_nonmatching_suppression",
+      "saved_current_visibility",
+      "mutable_composed_cursor_restart"
+    ],
+    "benchmarked_flows": [
+      "union",
+      "saved_overlay"
+    ],
+    "detailed_counter_reporting_verified": true,
+    "scope": "Synthetic correctness/reporting smoke only; no archive latency attribution."
+  }
+}

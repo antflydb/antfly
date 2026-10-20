@@ -1652,6 +1652,13 @@ pub const EmbeddingStageControl = struct {
     /// restores the composition envelope; zero retains only idle resources.
     workspace_fn: ?*const fn (*anyopaque, ?usize) anyerror!void = null,
     copy_fn: ?*const fn (*anyopaque, usize, u64) void = null,
+    /// A fenced ready-work boundary may keep its provider when uncontended.
+    yield_ready_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    pub fn yieldReady(self: *const @This()) !void {
+        if (self.yield_ready_fn) |run| return run(self.ptr);
+        try self.pause();
+        try self.acquire();
+    }
     pub fn workspace(self: *const @This(), bytes: ?usize) !void {
         if (self.workspace_fn) |run| try run(self.ptr, bytes);
     }
@@ -2234,6 +2241,7 @@ pub const ComputeBackend = struct {
 
         /// Y = X @ W^T (no bias). X:[rows, in_dim], W:[out_dim, in_dim] → Y:[rows, out_dim]
         linearNoBias: *const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT,
+        linearNoBiasInto: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, output: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!bool = null,
 
         /// Planned no-bias linear variant. This is the hot path for quantized
         /// graph command execution because the partitioner can carry row-bucket
@@ -2796,6 +2804,14 @@ pub const ComputeBackend = struct {
         /// Create a tensor from raw f32 data with an explicit logical shape.
         /// Backends that are shape-agnostic may ignore `shape`.
         fromFloat32Shape: *const fn (ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT,
+
+        /// A read-only host borrow. The caller retains storage through every
+        /// operation and frees the tensor before releasing the source memory.
+        fromBorrowedFloat32Shape: ?*const fn (*anyopaque, []const f32, []const i32) anyerror!CT = null,
+        /// Synchronous contiguous host views, valid only while the tensor lives.
+        /// Write access must reject immutable, strided or shared storage.
+        hostFloat32Read: ?*const fn (*anyopaque, CT) anyerror!?[]const f32 = null,
+        hostFloat32Write: ?*const fn (*anyopaque, CT) anyerror!?[]f32 = null,
 
         /// Create a tensor from raw i32 data with an explicit logical shape.
         /// Backends may leave this null when they do not support integer tensors.
@@ -3575,6 +3591,14 @@ pub const ComputeBackend = struct {
 
     pub fn linearNoBias(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
         return self.vtable.linearNoBias(self.ptr, input, weight, rows, in_dim, out_dim);
+    }
+
+    /// Writes to caller-owned storage, preserving it across recyclable frames.
+    pub fn linearNoBiasInto(self: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, weight: CT, output: CT, rows: usize, in_dim: usize, out_dim: usize) !void {
+        if (self.vtable.linearNoBiasInto) |apply| if (try apply(self.ptr, input, weight, output, rows, in_dim, out_dim)) return;
+        const temporary = try self.linearNoBias(input, weight, rows, in_dim, out_dim);
+        defer self.free(temporary);
+        if (!try self.copyRows2D(allocator, output, 0, temporary, 0, rows, out_dim)) return error.UnsupportedPrimitiveOp;
     }
 
     pub fn linearNoBiasWithPlan(
@@ -5124,6 +5148,25 @@ pub const ComputeBackend = struct {
         }
         if (elem_count != data.len) return error.InvalidShape;
         return self.vtable.fromFloat32Shape(self.ptr, data, shape);
+    }
+
+    pub fn fromBorrowedFloat32Shape(self: *const ComputeBackend, data: []const f32, shape: []const i32) !CT {
+        var count: usize = 1;
+        for (shape) |dim| {
+            if (dim < 0) return error.InvalidShape;
+            count = std.math.mul(usize, count, @intCast(dim)) catch return error.InvalidShape;
+        }
+        if (count != data.len) return error.InvalidShape;
+        if (self.vtable.fromBorrowedFloat32Shape) |run| return run(self.ptr, data, shape);
+        return self.fromFloat32Shape(data, shape);
+    }
+    pub fn hostFloat32Read(self: *const ComputeBackend, tensor: CT) !?[]const f32 {
+        if (self.vtable.hostFloat32Read) |run| return run(self.ptr, tensor);
+        return null;
+    }
+    pub fn hostFloat32Write(self: *const ComputeBackend, tensor: CT) !?[]f32 {
+        if (self.vtable.hostFloat32Write) |run| return run(self.ptr, tensor);
+        return null;
     }
 
     pub fn fromInt32Shape(self: *const ComputeBackend, data: []const i32, shape: []const i32) !?CT {

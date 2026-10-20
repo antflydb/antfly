@@ -53,7 +53,7 @@ pub fn renderDocument(
     const arena = arena_state.allocator();
 
     // Parse document JSON
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena, doc_json, .{});
+    const parsed = try @import("antfly-json").parseValueLossless(arena, doc_json);
 
     // Convert JSON into a handlebars root value. Object roots expose top-level
     // fields as variables; scalar roots are still valid and make `this` usable
@@ -89,7 +89,7 @@ pub fn renderDocumentWithHelpers(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, arena, doc_json, .{});
+    const parsed = try @import("antfly-json").parseValueLossless(arena, doc_json);
     const context = try jsonToValue(arena, parsed.value);
 
     // Merge built-in + caller helpers
@@ -229,25 +229,28 @@ fn scrubHtmlHelper(ctx: HelperContext) anyerror!Value {
     return .{ .string = try ctx.arena.dupe(u8, trimmed) };
 }
 
+fn templateNumber(value: Value) ?std.json.Value {
+    return switch (value) {
+        .integer => |n| .{ .integer = n },
+        .float => |n| .{ .float = n },
+        .number_string => |raw| .{ .number_string = raw },
+        else => null,
+    };
+}
+
 /// Equality comparison: {{#if (eq a b)}}
 fn eqHelper(ctx: HelperContext) anyerror!Value {
     if (ctx.params.len < 2) return .{ .boolean = false };
     const a = ctx.params[0];
     const b = ctx.params[1];
 
+    if (templateNumber(a)) |left| {
+        const right = templateNumber(b) orelse return .{ .boolean = false };
+        return .{ .boolean = try @import("antfly_jsonschema").compareNumbers(ctx.arena, left, right) == .eq };
+    }
     const equal = switch (a) {
         .string => |s| switch (b) {
             .string => |s2| std.mem.eql(u8, s, s2),
-            else => false,
-        },
-        .integer => |int_a| switch (b) {
-            .integer => |int_b| int_a == int_b,
-            .float => |f| @as(f64, @floatFromInt(int_a)) == f,
-            else => false,
-        },
-        .float => |f| switch (b) {
-            .float => |f2| f == f2,
-            .integer => |int_b| f == @as(f64, @floatFromInt(int_b)),
             else => false,
         },
         .boolean => |bl| switch (b) {
@@ -642,33 +645,39 @@ fn transcribeAudioHelper(ctx: HelperContext) anyerror!Value {
 // JSON → Value conversion
 // ============================================================================
 
-/// Convert a std.json.Value to a handlebars Value.
+/// Convert JSON without consuming the call stack for nested model output.
 fn jsonToValue(arena: Allocator, json: std.json.Value) Allocator.Error!Value {
-    return switch (json) {
-        .null => .null,
-        .bool => |b| .{ .boolean = b },
-        .integer => |val| .{ .integer = val },
-        .float => |f| .{ .float = f },
-        .number_string => |s| .{ .string = s },
-        .string => |s| .{ .string = s },
-        .array => |arr| blk: {
-            const items = try arena.alloc(Value, arr.items.len);
-            for (arr.items, 0..) |item, j| {
-                items[j] = try jsonToValue(arena, item);
-            }
-            break :blk .{ .array = items };
-        },
-        .object => |obj| blk: {
-            var map: hbs.ValueMap = .{};
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                // Skip internal fields
-                if (entry.key_ptr.*.len > 0 and entry.key_ptr.*[0] == '_') continue;
-                try map.put(arena, entry.key_ptr.*, try jsonToValue(arena, entry.value_ptr.*));
-            }
-            break :blk .{ .map = map };
-        },
-    };
+    const Work = struct { source: std.json.Value, target: *Value };
+    var result: Value = undefined;
+    var pending: std.ArrayList(Work) = .empty;
+    defer pending.deinit(arena);
+    try pending.append(arena, .{ .source = json, .target = &result });
+    while (pending.pop()) |work| {
+        work.target.* = switch (work.source) {
+            .null => .null,
+            .bool => |b| .{ .boolean = b },
+            .integer => |n| .{ .integer = n },
+            .float => |n| .{ .float = n },
+            .number_string => |raw| .{ .number_string = raw },
+            .string => |text| .{ .string = text },
+            .array => |array| blk: {
+                const items = try arena.alloc(Value, array.items.len);
+                for (array.items, items) |source, *target| try pending.append(arena, .{ .source = source, .target = target });
+                break :blk .{ .array = items };
+            },
+            .object => |object| blk: {
+                var map: hbs.ValueMap = .{};
+                for (object.keys()) |key| {
+                    if (key.len > 0 and key[0] == '_') continue;
+                    try map.put(arena, key, .undefined);
+                }
+                // Finish map growth before taking pointers to its values.
+                for (map.keys(), map.values()) |key, *target| try pending.append(arena, .{ .source = object.get(key).?, .target = target });
+                break :blk .{ .map = map };
+            },
+        };
+    }
+    return result;
 }
 
 // ============================================================================
@@ -1050,4 +1059,59 @@ test "renderDocument multimodal template" {
     try std.testing.expect(std.mem.indexOf(u8, result, "<<<dotprompt:media:url data:image/png;base64,abc>>>") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Title: Test") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Content: Hello world") != null);
+}
+
+test "templates retain exact numeric text truthiness and equality through helpers" {
+    const a = std.testing.allocator;
+    const doc = "{\"id\":9007199254740993.0,\"tiny\":1e-400,\"zero\":-0e999,\"one\":1.0,\"same\":100e-2}";
+    const source = "{{id}}|{{tiny}}|{{#if tiny}}tiny{{/if}}|{{#if zero}}bad{{else}}zero{{/if}}|{{#if (eq one same)}}same{{/if}}|{{#if (eq one 1)}}one{{/if}}|{{#if (eq id 9007199254740992)}}bad{{else}}distinct{{/if}}";
+    const expected = "9007199254740993.0|1e-400|tiny|zero|same|one|distinct";
+    const plain = try renderDocument(a, source, doc);
+    defer a.free(plain);
+    try std.testing.expectEqualStrings(expected, plain);
+    const helpers: HelperMap = .{};
+    const extra = try renderDocumentWithHelpers(a, source, doc, &helpers);
+    defer a.free(extra);
+    try std.testing.expectEqualStrings(expected, extra);
+}
+
+test "templates safely convert deeply nested unused model output" {
+    const a = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(a);
+    try raw.appendSlice(a, "{\"title\":\"kept\",\"unused\":");
+    for (0..50000) |_| try raw.appendSlice(a, "{\"child\":[");
+    try raw.append(a, '0');
+    for (0..50000) |_| try raw.appendSlice(a, "]}");
+    try raw.append(a, '}');
+    const rendered = try renderDocument(a, "{{title}}", raw.items);
+    defer a.free(rendered);
+    try std.testing.expectEqualStrings("kept", rendered);
+}
+
+test "template numeric equality never rounds integer operands through float" {
+    const a = std.testing.allocator;
+    const rendered = try renderDocument(a, "{{#if (eq big 9007199254740992.0)}}bad{{else}}distinct{{/if}}|{{#if (eq 9007199254740992.0 big)}}bad{{else}}distinct{{/if}}|{{#if (eq one 1.0)}}equal{{/if}}|{{#if (eq one \"1\")}}bad{{else}}typed{{/if}}", "{\"big\":9007199254740993,\"one\":1}");
+    defer a.free(rendered);
+    try std.testing.expectEqualStrings("distinct|distinct|equal|typed", rendered);
+}
+
+test "template numeric literals compare exactly with document numbers" {
+    const a = std.testing.allocator;
+    const doc = "{\"n\":9007199254740993.0,\"big\":18446744073709551615,\"fraction\":0.10000000000000001}";
+    const source = "{{#if (eq n 9007199254740993.0)}}equal{{else}}bad{{/if}}|" ++
+        "{{#if (eq 9007199254740993.0 n)}}equal{{else}}bad{{/if}}|" ++
+        "{{#if (eq n 9007199254740992.0)}}bad{{else}}distinct{{/if}}|" ++
+        "{{#if (eq big 18446744073709551615)}}large{{else}}bad{{/if}}|" ++
+        "{{#if (eq fraction 0.10000000000000001)}}fraction{{else}}bad{{/if}}|" ++
+        "{{#if (eq fraction 0.1)}}bad{{else}}distinct{{/if}}|" ++
+        "{{#if (eq 001. 1)}}normalized{{else}}bad{{/if}}";
+    const expected = "equal|equal|distinct|large|fraction|distinct|normalized";
+    const rendered = try renderDocument(a, source, doc);
+    defer a.free(rendered);
+    try std.testing.expectEqualStrings(expected, rendered);
+    const helpers: HelperMap = .{};
+    const with_helpers = try renderDocumentWithHelpers(a, source, doc, &helpers);
+    defer a.free(with_helpers);
+    try std.testing.expectEqualStrings(expected, with_helpers);
 }

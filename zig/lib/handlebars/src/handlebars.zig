@@ -242,7 +242,7 @@ test "render simple template" {
     try std.testing.expectEqualStrings("Hello, World!", result);
 }
 
-test "integer literals outside i64 evaluate as floats instead of trapping" {
+test "numeric literals retain exact values and valid JSON spellings" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -251,7 +251,7 @@ test "integer literals outside i64 evaluate as floats instead of trapping" {
         fn helper(ctx: HelperContext) anyerror!Value {
             return switch (ctx.params[0]) {
                 .integer => Value.str("int"),
-                .float => Value.str("float"),
+                .number_string => |raw| Value.str(raw),
                 else => Value.str("other"),
             };
         }
@@ -260,7 +260,12 @@ test "integer literals outside i64 evaluate as floats instead of trapping" {
     try helpers.put(arena, "kind", Helper.from(&Echo.helper));
     const partials: std.StringArrayHashMapUnmanaged([]const u8) = .{};
 
-    try std.testing.expectEqualStrings("float", try render(arena, "{{kind 99999999999999999999}}", .null, &helpers, &partials));
+    try std.testing.expectEqualStrings("99999999999999999999", try render(arena, "{{kind 99999999999999999999}}", .null, &helpers, &partials));
+    try std.testing.expectEqualStrings("9007199254740993.0", try render(arena, "{{kind 9007199254740993.0}}", .null, &helpers, &partials));
+    try std.testing.expectEqualStrings("0.10000000000000001", try render(arena, "{{kind 0.10000000000000001}}", .null, &helpers, &partials));
+    try std.testing.expectEqualStrings("-1.20", try render(arena, "{{kind -0001.20}}", .null, &helpers, &partials));
+    try std.testing.expectEqualStrings("1.0", try render(arena, "{{kind 001.}}", .null, &helpers, &partials));
+    try std.testing.expectEqualStrings("99999999999999999999", try render(arena, "{{kind 00099999999999999999999}}", .null, &helpers, &partials));
     try std.testing.expectEqualStrings("int", try render(arena, "{{kind 9223372036854775807}}", .null, &helpers, &partials));
     try std.testing.expectEqualStrings("int", try render(arena, "{{kind -42}}", .null, &helpers, &partials));
 }

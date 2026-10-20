@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const Storage = @import("../../lsm_backend.zig").Storage;
 const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
@@ -277,6 +278,16 @@ pub fn tryAcquireProjectionSnapshot(
     store: anytype,
     checkpoint_path: ?[]const u8,
 ) !?ProjectionSnapshot {
+    return tryAcquireProjectionSnapshotWithStorage(null, alloc, io, store, checkpoint_path);
+}
+
+pub fn tryAcquireProjectionSnapshotWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+) !?ProjectionSnapshot {
     if (comptime builtin.os.tag == .freestanding) return null;
     const path = checkpoint_path orelse return null;
     const lock = try retainCheckpointFileLock(path);
@@ -293,7 +304,7 @@ pub fn tryAcquireProjectionSnapshot(
     defer txn.abort();
     const authority = (try @import("../artifact_publication.zig").authority(&txn)) orelse return null;
     const epoch = try @import("../artifact_projection_epoch.zig").load(&txn);
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -351,9 +362,20 @@ pub fn loadAppliedSequenceWithCheckpoint(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !u64 {
+    return loadAppliedSequenceWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, index_name);
+}
+
+pub fn loadAppliedSequenceWithCheckpointWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    index_name: []const u8,
+) !u64 {
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try loadAppliedSequence(alloc, store, index_name);
     const path = checkpoint_path orelse return try loadAppliedSequence(alloc, store, index_name);
-    const checkpoint = loadProjectionCheckpoint(alloc, io, path, index_name) catch |err| switch (err) {
+    const checkpoint = loadProjectionCheckpointWithStorage(storage, alloc, io, path, index_name) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
@@ -367,11 +389,22 @@ pub fn loadProjectionCheckpointWithSidecar(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !ProjectionCheckpoint {
+    return loadProjectionCheckpointWithSidecarWithStorage(null, alloc, io, store, checkpoint_path, index_name);
+}
+
+pub fn loadProjectionCheckpointWithSidecarWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    index_name: []const u8,
+) !ProjectionCheckpoint {
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) {
         return try loadProjectionMetadata(alloc, store, index_name);
     }
     const path = checkpoint_path orelse return try loadProjectionMetadata(alloc, store, index_name);
-    const checkpoint = loadProjectionCheckpoint(alloc, io, path, index_name) catch |err| switch (err) {
+    const checkpoint = loadProjectionCheckpointWithStorage(storage, alloc, io, path, index_name) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
@@ -442,9 +475,21 @@ pub fn saveAppliedSequenceWithCheckpoint(
     index_name: []const u8,
     sequence: u64,
 ) !void {
+    return saveAppliedSequenceWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, index_name, sequence);
+}
+
+pub fn saveAppliedSequenceWithCheckpointWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    index_name: []const u8,
+    sequence: u64,
+) !void {
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveAppliedSequence(store, index_name, sequence);
     if (checkpoint_path) |path| {
-        try setAppliedSequencesCheckpoint(alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
+        try setAppliedSequencesCheckpointWithStorage(storage, alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
             .index_name = index_name,
             .sequence = sequence,
         }});
@@ -460,11 +505,22 @@ pub fn saveAppliedSequenceUpdateWithCheckpoint(
     checkpoint_path: ?[]const u8,
     update: AppliedSequenceUpdate,
 ) !void {
+    return saveAppliedSequenceUpdateWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, update);
+}
+
+pub fn saveAppliedSequenceUpdateWithCheckpointWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    update: AppliedSequenceUpdate,
+) !void {
     if (comptime builtin.os.tag == .freestanding) {
         return try saveProjectionMetadataUpdates(alloc, store, &.{update}, .set);
     }
     if (checkpoint_path) |path| {
-        try setAppliedSequencesCheckpoint(alloc, io, path, store, &[_]AppliedSequenceUpdate{update});
+        try setAppliedSequencesCheckpointWithStorage(storage, alloc, io, path, store, &[_]AppliedSequenceUpdate{update});
         return;
     }
     try saveProjectionMetadataUpdates(alloc, store, &.{update}, .set);
@@ -478,11 +534,23 @@ pub fn saveProjectionCheckpointWithSidecar(
     index_name: []const u8,
     checkpoint: ProjectionCheckpoint,
 ) !void {
+    return saveProjectionCheckpointWithSidecarWithStorage(null, alloc, io, store, checkpoint_path, index_name, checkpoint);
+}
+
+pub fn saveProjectionCheckpointWithSidecarWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    index_name: []const u8,
+    checkpoint: ProjectionCheckpoint,
+) !void {
     if (comptime builtin.os.tag == .freestanding) {
         return try saveProjectionMetadataUpdates(alloc, store, &.{.{ .index_name = index_name, .sequence = checkpoint.applied_sequence, .status = checkpoint.status, .generation = checkpoint.generation, .config_hash = checkpoint.config_hash, .published_count = checkpoint.published_count }}, .replace);
     }
     if (checkpoint_path) |path| {
-        try setProjectionCheckpoints(alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
+        try setProjectionCheckpointsWithStorage(storage, alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
             .index_name = index_name,
             .sequence = checkpoint.applied_sequence,
             .status = checkpoint.status,
@@ -502,10 +570,21 @@ pub fn saveAppliedSequencesWithCheckpoint(
     checkpoint_path: ?[]const u8,
     updates: []const AppliedSequenceUpdate,
 ) !void {
+    return saveAppliedSequencesWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, updates);
+}
+
+pub fn saveAppliedSequencesWithCheckpointWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    updates: []const AppliedSequenceUpdate,
+) !void {
     if (updates.len == 0) return;
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveProjectionMetadataUpdates(alloc, store, updates, .advance);
     if (checkpoint_path) |path| {
-        try saveAppliedSequencesCheckpoint(alloc, io, path, store, updates);
+        try saveAppliedSequencesCheckpointWithStorage(storage, alloc, io, path, store, updates);
         return;
     }
     try saveProjectionMetadataUpdates(alloc, store, updates, .advance);
@@ -527,9 +606,20 @@ pub fn clearAppliedSequenceWithCheckpoint(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !void {
+    return clearAppliedSequenceWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, index_name);
+}
+
+pub fn clearAppliedSequenceWithCheckpointWithStorage(
+    storage: ?Storage,
+    alloc: Allocator,
+    io: std.Io,
+    store: anytype,
+    checkpoint_path: ?[]const u8,
+    index_name: []const u8,
+) !void {
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try clearAppliedSequence(store, index_name);
     if (checkpoint_path) |path| {
-        try clearAppliedSequenceCheckpoint(alloc, io, path, store, index_name);
+        try clearAppliedSequenceCheckpointWithStorage(storage, alloc, io, path, store, index_name);
         return;
     }
     try clearAppliedSequence(store, index_name);
@@ -725,7 +815,11 @@ fn mergeSequenceMetadata(
 }
 
 fn loadProjectionCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
-    var checkpoint = try loadCheckpoint(alloc, io, path);
+    return loadProjectionCheckpointWithStorage(null, alloc, io, path, index_name);
+}
+
+fn loadProjectionCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
+    var checkpoint = try loadCheckpointWithStorage(storage, alloc, io, path);
     defer checkpoint.deinit(alloc);
     return checkpoint.map.get(index_name);
 }
@@ -903,10 +997,14 @@ pub fn invalidateProjectionCompletion(alloc: Allocator, store: anytype) !void {
 }
 
 fn saveAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
+    return saveAppliedSequencesCheckpointWithStorage(null, alloc, io, path, store, updates);
+}
+
+fn saveAppliedSequencesCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
         else => return err,
     };
@@ -919,14 +1017,18 @@ fn saveAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8
         revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
     }
     if (revoke) try revokeCompletion(alloc, store);
-    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
+    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
 }
 
 fn saveProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
+    return saveProjectionCheckpointsWithStorage(null, alloc, io, path, updates);
+}
+
+fn saveProjectionCheckpointsWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
         else => return err,
     };
@@ -935,14 +1037,18 @@ fn saveProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, upd
     for (updates) |update| {
         try checkpoint.putMax(alloc, update.index_name, update.checkpoint());
     }
-    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
+    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
 }
 
 fn setAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
+    return setAppliedSequencesCheckpointWithStorage(null, alloc, io, path, store, updates);
+}
+
+fn setAppliedSequencesCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
         else => return err,
     };
@@ -955,14 +1061,18 @@ fn setAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8,
         revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
     }
     if (revoke) try revokeCompletion(alloc, store);
-    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
+    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
 }
 
 fn setProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
+    return setProjectionCheckpointsWithStorage(null, alloc, io, path, store, updates);
+}
+
+fn setProjectionCheckpointsWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => CheckpointMap{},
         else => return err,
     };
@@ -975,28 +1085,39 @@ fn setProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, stor
         revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
     }
     if (revoke) try revokeCompletion(alloc, store);
-    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
+    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
 }
 
 fn clearAppliedSequenceCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, index_name: []const u8) !void {
+    return clearAppliedSequenceCheckpointWithStorage(null, alloc, io, path, store, index_name);
+}
+
+fn clearAppliedSequenceCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, index_name: []const u8) !void {
     var guard = try acquireCheckpointFileLock(path);
     defer guard.release();
 
     // Revoke even when the sidecar is already missing. Absence cannot retain
     // a completion prefix captured before a crash or interrupted replacement.
     try revokeCompletion(alloc, store);
-    var checkpoint = loadCheckpoint(alloc, io, path) catch |err| switch (err) {
+    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
     defer checkpoint.deinit(alloc);
 
     checkpoint.remove(alloc, index_name);
-    try writeCheckpointAtomically(alloc, io, path, &checkpoint);
+    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
 }
 
 fn loadCheckpoint(alloc: Allocator, io: std.Io, path: []const u8) !CheckpointMap {
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(checkpoint_max_bytes));
+    return loadCheckpointWithStorage(null, alloc, io, path);
+}
+
+fn loadCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8) !CheckpointMap {
+    const raw = if (storage) |files|
+        try files.readFileAlloc(alloc, path, checkpoint_max_bytes)
+    else
+        try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(checkpoint_max_bytes));
     defer alloc.free(raw);
     return try decodeCheckpoint(alloc, raw);
 }
@@ -1120,9 +1241,24 @@ fn appendCheckpointInt(
 }
 
 fn writeCheckpointAtomically(alloc: Allocator, io: std.Io, path: []const u8, checkpoint: *const CheckpointMap) !void {
+    return writeCheckpointAtomicallyWithStorage(null, alloc, io, path, checkpoint);
+}
+
+fn writeCheckpointAtomicallyWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, checkpoint: *const CheckpointMap) !void {
     const encoded = try encodeCheckpoint(alloc, checkpoint);
     defer alloc.free(encoded);
 
+    if (storage) |files| {
+        if (std.fs.path.dirname(path)) |parent| try files.createDirPath(parent);
+        const staging = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+        defer alloc.free(staging);
+        try files.writeFileAbsolute(staging, encoded);
+        errdefer files.deleteFileAbsolute(staging) catch {};
+        try files.syncFileContentsAbsolute(staging);
+        try files.renameAbsolute(staging, path);
+        try files.syncParentAbsolute(path);
+        return;
+    }
     if (std.fs.path.dirname(path)) |parent| {
         try fs_paths.createDirPathPortable(io, parent);
     }
@@ -1820,4 +1956,24 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
         try std.testing.expectEqual(@as(u64, @intCast(i + 1)), checkpoint.applied_sequence);
         try std.testing.expectEqual(ProjectionStatus.clean, checkpoint.status);
     }
+}
+
+test "projection checkpoint external storage keeps shadow progress isolated (#1210)" {
+    const alloc = std.testing.allocator;
+    var primary = mem_backend.Backend.init(alloc, .{});
+    defer primary.close();
+    var runtime = try primary.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+    var files = @import("../../lsm_backend/mod.zig").MemoryStorage.init(alloc);
+    defer files.deinit();
+    const path = "/virtual/shadow/applied-sequences";
+    const checkpoint: ProjectionCheckpoint = .{ .applied_sequence = 8, .generation = 3, .config_hash = 42, .published_count = 2 };
+    try saveProjectionCheckpointWithSidecarWithStorage(files.storage(), alloc, .failing, runtime, path, "img", checkpoint);
+    try std.testing.expectEqualDeep(checkpoint, try loadProjectionCheckpointWithSidecarWithStorage(files.storage(), alloc, .failing, runtime, path, "img"));
+    try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(alloc, runtime, "img"));
+    try saveAppliedSequenceWithCheckpointWithStorage(files.storage(), alloc, .failing, runtime, path, "img", 9);
+    const advanced = try loadProjectionCheckpointWithSidecarWithStorage(files.storage(), alloc, .failing, runtime, path, "img");
+    try std.testing.expectEqual(@as(u64, 9), advanced.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 3), advanced.generation);
+    try std.testing.expectEqual(@as(?u64, null), advanced.published_count);
 }

@@ -1004,6 +1004,7 @@ pub const AntflyApiHandler = struct {
         establishInternalTxnPreDecisionDeadline(ctx);
         establishInternalTxnStatusDeadline(ctx);
         establishInternalBackupDeadline(ctx);
+        establishInternalOnlineMergeDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
         const response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
         try self.api_server.reachRequestLifecycle(.response_ready, null);
@@ -1095,6 +1096,27 @@ pub const AntflyApiHandler = struct {
         }
         ctx.application_deadline_ns = platform_time.monotonicNs() +|
             @as(u64, budget_ms) *| std.time.ns_per_ms;
+    }
+
+    fn establishInternalOnlineMergeDeadline(ctx: *httpx.Context) void {
+        if (ctx.application_deadline_invalid) return;
+        const contract = @import("online_merge_io.zig").contract;
+        const path = ctx.request.uri.path;
+        if (!std.mem.startsWith(u8, path, routes.internal_groups_prefix) or
+            !std.mem.endsWith(u8, path, routes.online_merge_io_suffix)) return;
+        const raw = ctx.header(contract.remaining_ms_header) orelse return;
+        const budget_ms = std.fmt.parseUnsigned(u32, raw, 10) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        if (budget_ms == 0 or budget_ms > contract.max_server_budget_ms) {
+            ctx.application_deadline_invalid = true;
+            return;
+        }
+        const deadline = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
+            @as(u64, budget_ms) * std.time.ns_per_ms;
+        ctx.application_deadline_io = ctx.io;
+        ctx.application_deadline_ns = @min(ctx.application_deadline_ns orelse deadline, deadline);
     }
 
     fn establishInternalBackupDeadline(ctx: *httpx.Context) void {
@@ -1450,6 +1472,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.graph_edges_suffix, httpx.Handler.bind(self, internalGraphEdges));
         try server.post(table_prefix ++ routes.graph_edges_batch_suffix, httpx.Handler.bind(self, internalGraphEdges));
         try server.post(table_prefix ++ routes.graph_metric_maintenance_suffix, httpx.Handler.bind(self, internalGraphMetricMaintenance));
+        try server.post(table_prefix ++ routes.resolver_operation_suffix, httpx.Handler.bind(self, internalResolverOperation));
         try server.post(table_prefix ++ routes.text_stats_suffix, httpx.Handler.bind(self, internalTextStats));
         try server.post(table_prefix ++ routes.algebraic_partials_suffix, httpx.Handler.bind(self, internalAlgebraicPartials));
         try server.post(table_prefix ++ routes.routed_batch_suffix, httpx.Handler.bind(self, internalGroupRoutedBatch));
@@ -1945,6 +1968,16 @@ pub const AntflyApiHandler = struct {
     fn tableMutationContext(ctx: *httpx.Context, identity: *const ?AuthenticatedIdentity) operation_contract.RequestContext {
         var request = operationContext(ctx, identity.*);
         request.row_policy_credential = identity;
+        request.table_read_authorization = .{
+            .ptr = identity,
+            .allows = struct {
+                fn allowed(ptr: *const anyopaque, table: []const u8) bool {
+                    const admitted: *const ?AuthenticatedIdentity = @ptrCast(@alignCast(ptr));
+                    const authenticated = admitted.* orelse return true;
+                    return http_server_mod.permissionsAllow(authenticated.permissions, .table, table, .read);
+                }
+            }.allowed,
+        };
         request.table_write_authorization = .{
             .ptr = identity,
             .allows = struct {
@@ -2652,7 +2685,7 @@ pub const AntflyApiHandler = struct {
             defer identity.deinit(self.api_server.alloc);
             if (!identity.is_internal_service) return textResponse(ctx, 403, "internal service credential required");
         }
-        const control_lookup = lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
+        const control_lookup = lookup_options.opts.group_source_query_json.len != 0 or lookup_options.opts.relational_integrity_catalog or lookup_options.opts.relational_integrity_jobs_json.len != 0 or lookup_options.opts.relational_index_status_json.len != 0 or lookup_options.opts.relational_activation_json.len != 0 or lookup_options.opts.relational_topology_json.len != 0;
         const logical_key = if (control_lookup and std.mem.eql(u8, key, "\x00relational_control")) "" else key;
         const consistency = http_server_mod.parseLookupReadConsistency(ctx.request.uri.query orelse "") catch
             return textResponse(ctx, 400, "invalid read consistency");
@@ -3554,6 +3587,16 @@ pub const AntflyApiHandler = struct {
             error.ReadOnly, error.StorageUnavailable => return textResponse(ctx, 503, @errorName(err)),
             else => return internalGroupErrorResponse(ctx, err),
         }) orelse return textResponse(ctx, 404, "not found");
+        defer ctx.allocator.free(json);
+        return jsonResponse(ctx, 200, json);
+    }
+
+    fn internalResolverOperation(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
+        try operationContext(ctx, null).ensureActive();
+        const body = (try ctx.body()) orelse "";
+        const json = self.api_server.executeResolverOperation(ctx.allocator, params.table_name, params.group_id, body, operationContext(ctx, null)) catch |err| return textResponse(ctx, @import("resolvers.zig").failureStatus(err), @errorName(err));
         defer ctx.allocator.free(json);
         return jsonResponse(ctx, 200, json);
     }
@@ -7456,6 +7499,7 @@ pub const AntflyApiHandler = struct {
         while (true) {
             metadata_create_attempts += 1;
             self.createCatalogTable(ctx, decoded_table_name, logical_table_name, create_req, authenticated_identity) catch |err| switch (err) {
+                error.ResolverCurationConflict => return jsonErrorResponse(ctx, system_catalog.httpStatus(err), "resolver configuration conflicts with the destination namespace"),
                 error.ForeignKeyPartialSupportIndexRequired, error.ForeignKeyPartialSupportIndexConflict => return witnessDDLError(ctx, err),
                 error.TableAlreadyExists, error.CatalogAlreadyExists, error.CatalogGenerationChanged => {
                     _ = ctx.status(409);
@@ -9029,6 +9073,216 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse "";
         var response = try public_table_http.handleTableIndexMaintenance(ctx.allocator, decoded_table_name, decoded_index_name, action, body, self.api_server.tableApi(operationContext(ctx, authenticated_identity)));
         return respondOwnedApiResponse(ctx, &response);
+    }
+
+    fn resolverRequest(self: *AntflyApiHandler, ctx: *httpx.Context, op: @import("resolvers.zig").Operation, table_name: []const u8, resolver_name: []const u8, key: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |denied| return denied;
+        const table = (try self.resolvePublicTableName(ctx, table_name, &identity)) orelse return ctx.response.build();
+        defer ctx.allocator.free(table);
+        const name = if (resolver_name.len > 0) (try decodePathParamOrBadRequest(ctx, resolver_name)) orelse return ctx.text("invalid resolver name") else try ctx.allocator.dupe(u8, "");
+        defer ctx.allocator.free(name);
+        const entity_key = if (key.len > 0) (try decodePathParamOrBadRequest(ctx, key)) orelse return ctx.text("invalid entity key") else try ctx.allocator.dupe(u8, "");
+        defer ctx.allocator.free(entity_key);
+        var request = tableMutationContext(ctx, &identity);
+        request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&ctx.io);
+        var result = try @import("resolvers.zig").handle(self.api_server, ctx.allocator, op, table, name, entity_key, (try ctx.body()) orelse "", ctx.request.uri.query orelse "", request);
+        return respondOwnedApiResponse(ctx, &result);
+    }
+
+    pub fn listResolvers(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .list, table_name, "", "");
+    }
+
+    pub fn namespaceListResolvers(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.listResolvers(ctx, table_name);
+    }
+
+    pub fn getResolver(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .get, table_name, resolver_name, "");
+    }
+
+    pub fn namespaceGetResolver(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.getResolver(ctx, table_name, resolver_name);
+    }
+
+    pub fn dropResolverIdentity(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .drop, table_name, resolver_name, "");
+    }
+
+    pub fn namespaceDropResolverIdentity(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.dropResolverIdentity(ctx, table_name, resolver_name);
+    }
+
+    pub fn renderResolverKey(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .render, table_name, resolver_name, "");
+    }
+
+    pub fn namespaceRenderResolverKey(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.renderResolverKey(ctx, table_name, resolver_name);
+    }
+
+    pub fn resolveResolverQuery(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .resolve, table_name, resolver_name, "");
+    }
+
+    pub fn namespaceResolveResolverQuery(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.resolveResolverQuery(ctx, table_name, resolver_name);
+    }
+
+    pub fn setResolverNamespace(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .namespace, table_name, resolver_name, "");
+    }
+
+    pub fn namespaceSetResolverNamespace(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.setResolverNamespace(ctx, table_name, resolver_name);
+    }
+
+    pub fn listResolverRedirects(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .redirects, table_name, resolver_name, "");
+    }
+
+    pub fn namespaceListResolverRedirects(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.listResolverRedirects(ctx, table_name, resolver_name);
+    }
+
+    pub fn mergeResolverKeys(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .merge, table_name, resolver_name, "");
+    }
+
+    pub fn namespaceMergeResolverKeys(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.mergeResolverKeys(ctx, table_name, resolver_name);
+    }
+
+    pub fn unmergeResolverKey(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, key: []const u8, params: anytype) !httpx.Response {
+        _ = params;
+        return self.resolverRequest(ctx, .unmerge, table_name, resolver_name, key);
+    }
+
+    pub fn namespaceUnmergeResolverKey(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, key: []const u8, params: anytype) !httpx.Response {
+        _ = params;
+        _ = database_name;
+        _ = namespace_name;
+        return self.resolverRequest(ctx, .unmerge, table_name, resolver_name, key);
+    }
+
+    pub fn listResolverSuppressions(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .suppressions, table_name, resolver_name, "");
+    }
+
+    pub fn namespaceListResolverSuppressions(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.listResolverSuppressions(ctx, table_name, resolver_name);
+    }
+
+    pub fn suppressResolverKeys(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .suppress, table_name, resolver_name, "");
+    }
+
+    pub fn namespaceSuppressResolverKeys(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.suppressResolverKeys(ctx, table_name, resolver_name);
+    }
+
+    pub fn unsuppressResolverKey(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, key: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .unsuppress, table_name, resolver_name, key);
+    }
+
+    pub fn namespaceUnsuppressResolverKey(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, key: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.unsuppressResolverKey(ctx, table_name, resolver_name, key);
+    }
+
+    pub fn listResolverReviews(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, params: anytype) !httpx.Response {
+        _ = params;
+        return self.resolverRequest(ctx, .reviews, table_name, resolver_name, "");
+    }
+
+    pub fn namespaceListResolverReviews(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, params: anytype) !httpx.Response {
+        _ = params;
+        _ = database_name;
+        _ = namespace_name;
+        return self.resolverRequest(ctx, .reviews, table_name, resolver_name, "");
+    }
+
+    pub fn reviewResolverMention(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, resolver_name: []const u8, review_id: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .review, table_name, resolver_name, review_id);
+    }
+
+    pub fn namespaceReviewResolverMention(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, resolver_name: []const u8, review_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.reviewResolverMention(ctx, table_name, resolver_name, review_id);
+    }
+
+    pub fn listEntityResolverState(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .entity_redirects, table_name, "", key);
+    }
+
+    pub fn namespaceListEntityResolverState(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.listEntityResolverState(ctx, table_name, key);
+    }
+
+    pub fn mergeEntity(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .entity_merge, table_name, "", key);
+    }
+
+    pub fn namespaceMergeEntity(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.mergeEntity(ctx, table_name, key);
+    }
+
+    pub fn unmergeEntity(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .entity_unmerge, table_name, "", key);
+    }
+
+    pub fn namespaceUnmergeEntity(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.unmergeEntity(ctx, table_name, key);
+    }
+
+    pub fn suppressEntity(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .entity_suppress, table_name, "", key);
+    }
+
+    pub fn namespaceSuppressEntity(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.suppressEntity(ctx, table_name, key);
+    }
+
+    pub fn unsuppressEntity(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .entity_unsuppress, table_name, "", key);
+    }
+
+    pub fn namespaceUnsuppressEntity(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.unsuppressEntity(ctx, table_name, key);
     }
 
     pub fn executeGraphMetricAction(
@@ -10612,6 +10866,45 @@ test "internal read-index absence response requires typed native proof" {
             try std.testing.expect(response.headers.get(metadata_api.read_index_absence_header) == null);
         }
     }
+}
+
+test "online merge ingress bounds owner work using the transport clock" {
+    const contract = @import("online_merge_io.zig").contract;
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    for ([_][]const u8{ "250", "0", "5001", "invalid" }) |value| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/internal/v1/groups/7/tables/docs/online-merge-io");
+        defer request.deinit();
+        try request.setHeader(contract.remaining_ms_header, value);
+        var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+        defer ctx.deinit();
+        AntflyApiHandler.establishInternalOnlineMergeDeadline(&ctx);
+        if (!std.mem.eql(u8, value, "250")) {
+            try std.testing.expect(ctx.application_deadline_invalid);
+            try std.testing.expect(ctx.application_deadline_ns == null);
+            continue;
+        }
+        const control = AntflyApiHandler.operationContext(&ctx, null);
+        try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), control.deadline_ns.?);
+        try control.ensureActive();
+        sim.monotonic_ns = 250 * std.time.ns_per_ms;
+        try std.testing.expectError(error.DeadlineExceeded, control.ensureActive());
+        sim.monotonic_ns = 0;
+        // An already-admitted shorter budget must survive middleware unchanged.
+        ctx.application_deadline_ns = 100 * std.time.ns_per_ms;
+        AntflyApiHandler.establishInternalOnlineMergeDeadline(&ctx);
+        try std.testing.expectEqual(@as(?u64, 100 * std.time.ns_per_ms), ctx.application_deadline_ns);
+        ctx.application_deadline_ns = 1000 * std.time.ns_per_ms;
+        AntflyApiHandler.establishInternalOnlineMergeDeadline(&ctx);
+        try std.testing.expectEqual(@as(?u64, 250 * std.time.ns_per_ms), ctx.application_deadline_ns);
+    }
+    var public_request = try httpx.Request.init(std.testing.allocator, .GET, "http://node/tables/docs");
+    defer public_request.deinit();
+    try public_request.setHeader(contract.remaining_ms_header, "250");
+    var public_ctx = httpx.Context.init(std.testing.allocator, sim.io(), &public_request);
+    defer public_ctx.deinit();
+    AntflyApiHandler.establishInternalOnlineMergeDeadline(&public_ctx);
+    try std.testing.expect(public_ctx.application_deadline_ns == null);
 }
 
 test "internal transaction ingress establishes and validates pre-decision deadline" {

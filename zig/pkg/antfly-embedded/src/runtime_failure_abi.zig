@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 61;
+pub const abi_version: u32 = 63;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -738,6 +738,59 @@ pub const Status = enum(u32) {
     seed_replica_policy_mismatch = 778,
     document_artifact_publication_failed = 779,
     decision_limit_exceeded = 780,
+    apple_intelligence_provider_unavailable = 781,
+    artifact_publication_pending = 782,
+    chatgpt_billing_fallback_forbidden = 783,
+    chatgpt_disabled = 784,
+    chatgpt_interactive_only = 785,
+    conflicting_rate_limit_policy = 786,
+    constrained_input_too_large = 787,
+    decide_request_limit_exceeded = 788,
+    durable_root_incarnation_unavailable = 789,
+    enrichment_source_changed = 790,
+    generated_extraction_limit_exceeded = 791,
+    grouped_prior_context_limit_exceeded = 792,
+    grouped_source_baseline_pending = 793,
+    grouped_source_busy = 794,
+    grouped_source_corrupt = 795,
+    grouped_source_earlier_work_pending = 796,
+    grouped_source_identity_conflict = 797,
+    grouped_source_limit_exceeded = 798,
+    grouped_source_member_limit_exceeded = 799,
+    grouped_source_member_too_large = 800,
+    grouped_source_partition_too_large = 801,
+    grouped_source_retirement_pending = 802,
+    invalid_constrained_generation_config = 803,
+    invalid_constrained_output = 804,
+    invalid_constrained_probabilities = 805,
+    invalid_constrained_schema = 806,
+    invalid_decide_request = 807,
+    invalid_decision_output = 808,
+    invalid_generated_extractor_config = 809,
+    invalid_generator_config = 810,
+    invalid_generator_tool_config = 811,
+    invalid_grouped_prior_context = 812,
+    invalid_grouped_source_command = 813,
+    invalid_grouped_source_config = 814,
+    invalid_grouped_source_member = 815,
+    invalid_grouped_source_mutation = 816,
+    invalid_grouped_source_query = 817,
+    invalid_grouped_source_transfer = 818,
+    invalid_rate_limit_policy = 819,
+    invalid_structured_output = 820,
+    missing_generator_credentials = 821,
+    provider_token_budget_exceeded = 822,
+    secret_not_found = 823,
+    unknown_schema_version = 825,
+    unsupported_apple_generation_options = 826,
+    unsupported_constrained_output = 827,
+    unsupported_constrained_probabilities = 828,
+    unsupported_constrained_schema = 829,
+    unsupported_generated_extraction_schema = 830,
+    unsupported_local_rate_limit = 831,
+    unsupported_media_token_budget = 832,
+    grouped_source_topology_unavailable = 833,
+    grouped_source_owner_changed = 834,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

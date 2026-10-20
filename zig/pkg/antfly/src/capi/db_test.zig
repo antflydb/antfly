@@ -6424,7 +6424,7 @@ test "capi native resolver maintenance retries transient inference and survives 
         extern fn antfly_db_create_table_json(?*anyopaque, capi.Slice, capi.Slice) capi.ErrorCode;
     }.antfly_db_create_table_json(handle, .fromSlice("concepts"), .fromSlice("{}")));
     const config =
-        \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"text"},"content_type":"application/json","producer_json":{"type":"generator","config":{"provider":"mock"}}},"edge_types":[{"name":"about"}],"resolvers":[{"name":"concepts","table":"concepts","source_artifact":"extraction","resolution_artifact":"resolution","key_template":"concept/{{ uslug _entity.text }}"}]}
+        \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"text"},"content_type":"application/json","producer_json":{"type":"generator","config":{"provider":"antfly","model":"test-generator"}}},"edge_types":[{"name":"about"}],"resolvers":[{"name":"concepts","table":"concepts","source_artifact":"extraction","resolution_artifact":"resolution","key_template":"concept/{{ uslug _entity.text }}"}]}
     ;
     const index = try std.json.Stringify.valueAlloc(a, .{ .name = "kg", .kind = "graph", .config_json = config }, .{});
     defer a.free(index);
@@ -7106,4 +7106,83 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
     };
     try Fixture.run(std.testing.allocator, false);
     try Fixture.run(std.testing.allocator, true);
+}
+
+test "storage owner remote content source refreshes policy and retains in-flight snapshots (#1221)" {
+    const Source = struct {
+        policy: []const u8 = "{\"allowed_paths\":[\"/first\"]}",
+        failure: ?kernel_owner_abi.Status = null,
+        successful_acquires_before_failure: usize = 0,
+        fn acquire(raw: *anyopaque, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.failure) |failure| {
+                if (self.successful_acquires_before_failure == 0) return failure;
+                self.successful_acquires_before_failure -= 1;
+            }
+            out.* = .{ .ptr = @constCast(self.policy.ptr), .len = self.policy.len };
+            return .ok;
+        }
+        fn release(_: *anyopaque, _: kernel_owner_abi.OwnedBytes) callconv(.c) void {}
+    };
+    var source = Source{};
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextCreate(&.{}, &context));
+    defer std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextDestroy(context)) catch unreachable;
+    const callbacks = server_api.kernel_runtime_services.RemoteContentSource{ .context = &source, .acquire = Source.acquire, .release = Source.release };
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextConfigureRemoteContentSource(context, &callbacks));
+    const owner = asStorageOwnerContext(context).?;
+    owner.acquire();
+    defer owner.release();
+    const facade = owner.remoteContent().?;
+    var before = try facade.acquire();
+    defer before.deinit();
+    source.policy = "{\"allowed_paths\":[\"/second\"]}";
+    var after = try facade.acquire();
+    defer after.deinit();
+    try std.testing.expectEqualStrings("/first", before.config.security.?.allowed_paths.?[0]);
+    try std.testing.expectEqualStrings("/second", after.config.security.?.allowed_paths.?[0]);
+    // Exercise the same remoteMedia helper used by enrichment through the
+    // retained storage facade, including an allowlist expansion and revocation.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "media.png", .data = "png payload" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "media.png", alloc);
+    defer alloc.free(path);
+    const doc = try std.fmt.allocPrint(alloc, "{{\"url\":\"file://{s}\"}}", .{path});
+    defer alloc.free(doc);
+    const remote = @import("antfly_local_sources").template_remote;
+    const render_config = remote.RenderConfig{ .remote_content = facade, .io = std.testing.io };
+    source.policy = "{\"allowed_paths\":[]}";
+    try std.testing.expectError(error.PermanentPromptFailure, remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config));
+    const allowed = try std.json.Stringify.valueAlloc(alloc, .{ .allowed_paths = .{root} }, .{});
+    defer alloc.free(allowed);
+    source.policy = allowed;
+    const rendered = try remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config);
+    defer alloc.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "image/png") != null);
+    source.policy = "{\"allowed_paths\":[]}";
+    try std.testing.expectError(error.PermanentPromptFailure, remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config));
+    // A failed snapshot must never become a permanent permission denial.
+    // Test both the initial render budget snapshot and the fetch snapshot.
+    source.policy = allowed;
+    source.failure = .out_of_memory;
+    try std.testing.expectError(error.OutOfMemory, facade.acquire());
+    try std.testing.expectError(error.OutOfMemory, remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config));
+    source.successful_acquires_before_failure = 1;
+    try std.testing.expectError(error.OutOfMemory, remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config));
+    source.failure = .resource_temporarily_unavailable;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, facade.acquire());
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config));
+    source.successful_acquires_before_failure = 1;
+    try std.testing.expectError(error.TransientPromptFailure, remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config));
+    source.failure = null;
+    source.policy = "invalid JSON";
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, facade.acquire());
+    source.policy = allowed;
+    const recovered = try remote.renderJsonToValidatedTextWithConfig(alloc, "{{remoteMedia url=url}}", doc, render_config);
+    defer alloc.free(recovered);
+    try std.testing.expect(std.mem.indexOf(u8, recovered, "image/png") != null);
 }
