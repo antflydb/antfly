@@ -1870,7 +1870,12 @@ writer with fixed scratch space. Interrupted Lite decisions have a separately bo
 envelope sized for both copies of frozen attribution. Budget exhaustion is explicit; no
 existing decision is silently evicted. Queue records are metadata, never resolver
 declarations, and inference admission parses only execution policy, skipping proposal
-evidence and attribution history.
+evidence and attribution history. Index configuration walkers share an opaque boundary
+for `_curation_proposals`, `_resolver_curation`, and `_resolver_namespaces`: enrichment
+and resolver discovery skip these subtrees without allocating producer state, and
+authorization sealing and namespace edits preserve their payloads verbatim as JSON
+values. Configuration-shaped evidence cannot install producers, require destination
+credentials, or be rewritten as a live resolver declaration.
 
 HTTP stores proposals alongside destination namespace authority. Accept/reject and their
 policy effects share one destination-table metadata CAS, including catalog retries and

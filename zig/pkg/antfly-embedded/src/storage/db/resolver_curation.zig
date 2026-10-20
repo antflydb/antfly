@@ -16,6 +16,7 @@
 //! Shared resolver curation operations. Transports never reconstruct redirects
 //! themselves: one versioned catalog update owns state, fences and replay.
 const std = @import("std");
+const index_metadata = @import("../../api/index_metadata.zig");
 const resolver = @import("antfly_resolver");
 const catalog = @import("catalog/resolver_catalog.zig");
 pub const metadata_key = "_resolver_curation";
@@ -541,7 +542,7 @@ pub fn planNamespaceMetadata(a: std.mem.Allocator, indexes_json: []const u8, nam
                         }
                     };
                     var it = object.iterator();
-                    while (it.next()) |entry| if (!std.mem.eql(u8, entry.key_ptr.*, metadata_key) and !std.mem.eql(u8, entry.key_ptr.*, "resolvers")) try walk(allocator, entry.value_ptr, definition);
+                    while (it.next()) |entry| if (!index_metadata.isOpaqueEntry(entry.key_ptr.*) and !std.mem.eql(u8, entry.key_ptr.*, "resolvers")) try walk(allocator, entry.value_ptr, definition);
                 },
                 .array => |*items| for (items.items) |*item| try walk(allocator, item, definition),
                 else => {},

@@ -361,7 +361,7 @@ fn collectOwners(a: std.mem.Allocator, value: std.json.Value, parent: []const u8
             };
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, proposals_key) or std.mem.eql(u8, entry.key_ptr.*, curation.metadata_key) or std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                if (local.api_local_indexes.index_metadata.isOpaqueEntry(entry.key_ptr.*) or std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
                 try collectOwners(a, entry.value_ptr.*, entry.key_ptr.*, name, out);
             }
         },
@@ -1402,4 +1402,96 @@ test "resolver curation HTTP queue capacity reserves both metadata CAS definitio
         const bytes = try std.json.Stringify.valueAlloc(a, .{ ._curation_proposals = state }, .{});
         try validateProposalPublicationCapacity(std.testing.allocator, .{ .table_id = 1, .name = "entities", .indexes_json = bytes }, state);
     }
+}
+
+test "resolver curation HTTP proposal evidence cannot install enrichment producers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const evidence = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"enrichments":[{"name":"from_evidence","kind":"chunk","field":"body","chunk_size":256}],"nested":{"type":"embeddings","embedder":{"provider":"invalid"},"enrichments":"not configuration"}}
+    , .{});
+    const proposed = try resolver.curation.propose(a, .{}, &.{}, .{ .action = .suppress, .key = "concept/x", .evidence = evidence }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ ._curation_proposals = proposed.state }, .{});
+    const discovered = try local.api_local_indexes.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(std.testing.allocator, bytes, .{});
+    defer types.freeEnrichmentConfigs(std.testing.allocator, discovered);
+    try std.testing.expectEqual(@as(usize, 0), discovered.len);
+}
+
+test "resolver curation HTTP control metadata is opaque to discovery and authorization" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const payload = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"enrichments":"not configuration","resolvers":[{"table":"protected"}],"nested":{"resolvers":"not configuration"},"_antfly_destination_authorization_v1":{"evidence":"preserve me"},"type":"embeddings","embedder":{"provider":"invalid"}}
+    , .{});
+    var root: std.json.Value = .{ .object = .{} };
+    for ([_][]const u8{ "_curation_proposals", "_resolver_curation", "_resolver_namespaces" }) |key| {
+        try root.object.put(a, key, payload);
+    }
+    // After parsing the document, discovery needs no allocations for opaque
+    // payloads, regardless of their configuration-shaped contents.
+    var empty: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&empty);
+    var enrichments: std.ArrayListUnmanaged(types.EnrichmentConfig) = .empty;
+    try local.api_local_indexes.collectArtifactEnrichmentsFromValueWithOptions(fixed.allocator(), root, .{}, &enrichments);
+    try std.testing.expectEqual(@as(usize, 0), enrichments.items.len);
+    var declarations: std.ArrayListUnmanaged(Config) = .empty;
+    try local.metadata_local_index_reconcile.collectDesiredResolvers(fixed.allocator(), root, &declarations);
+    try std.testing.expectEqual(@as(usize, 0), declarations.items.len);
+    const managed = local.inference_managed_embedder;
+    try managed.validateEmbeddingProducerOwnershipValue(a, root);
+    var embedder = try managed.ManagedEmbedder.initFromIndexValueObject(std.testing.allocator, root);
+    defer embedder.deinit();
+    try std.testing.expectEqual(@as(usize, 0), embedder.entries.len);
+    const bytes = try std.json.Stringify.valueAlloc(a, root, .{});
+    const grants = local.api_stored_destination_authorization;
+    try std.testing.expect(!try grants.configurationHasDestinations(a, "[]", bytes));
+    try grants.authorizeIndexesJson(a, bytes, "source", .{ .auth_enabled = true });
+    const sealed = try grants.sealIndexesJsonForPrincipalAlloc(a, bytes, "source", "actor", .{ .auth_enabled = true });
+    // Sealing real declarations must leave opaque evidence (including fields
+    // named like internal credentials) semantically unchanged.
+    const restored = try std.json.parseFromSliceLeaky(std.json.Value, a, sealed, .{});
+    try std.testing.expectEqualStrings(bytes, try std.json.Stringify.valueAlloc(a, restored, .{}));
+
+    const live = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"enrichments":[{"name":"live","kind":"chunk","field":"body","chunk_size":256}],"resolvers":[{"name":"r","table":"entities","source_artifact":"mentions","resolution_artifact":"resolved","key_template":"concept/{{text}}"}]}
+    , .{});
+    // Actual declarations may still appear in nested index objects.
+    try root.object.put(a, "graph", live);
+    try local.api_local_indexes.collectArtifactEnrichmentsFromValueWithOptions(a, root, .{}, &enrichments);
+    try std.testing.expectEqual(@as(usize, 1), enrichments.items.len);
+    try std.testing.expectEqualStrings("live", enrichments.items[0].name);
+    try local.metadata_local_index_reconcile.collectDesiredResolvers(a, root, &declarations);
+    try std.testing.expectEqual(@as(usize, 1), declarations.items.len);
+    const with_live = try std.json.Stringify.valueAlloc(a, root, .{});
+    try std.testing.expect(try grants.configurationHasDestinations(a, "[]", with_live));
+    try std.testing.expectError(error.StoredDestinationAuthorizationMissing, grants.authorizeIndexesJson(a, with_live, "source", .{ .auth_enabled = true }));
+    const live_sealed = try grants.sealIndexesJsonForPrincipalAlloc(a, with_live, "source", grants.auth_disabled_principal, .{ .auth_enabled = false });
+    try grants.authorizeIndexesJson(a, live_sealed, "source", .{ .auth_enabled = false });
+    const sealed_root = try std.json.parseFromSliceLeaky(std.json.Value, a, live_sealed, .{});
+    for ([_][]const u8{ "_curation_proposals", "_resolver_curation", "_resolver_namespaces" }) |key| {
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, payload, .{}), try std.json.Stringify.valueAlloc(a, sealed_root.object.get(key).?, .{}));
+    }
+}
+
+test "resolver curation HTTP namespace edits preserve resolver-shaped proposal evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const declaration = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"resolvers":[{"name":"r","table":"entities","source_artifact":"mentions","resolution_artifact":"resolved","key_template":"concept/{{text}}"}]}
+    , .{});
+    const proposed = try resolver.curation.propose(a, .{}, &.{}, .{ .action = .suppress, .key = "concept/x", .evidence = declaration }, .{});
+    const before = try std.json.Stringify.valueAlloc(a, proposed.state, .{});
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .graph = declaration, ._curation_proposals = proposed.state }, .{});
+    const plan = try curation.planNamespaceMetadata(a, bytes, "r", .{ .table = "new_entities", .key_template = "new/{{text}}", .reset_merges = true, .reset_curation = true });
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, plan.indexes_json, .{});
+    try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, root.object.get("_curation_proposals").?, .{}));
+    const declared = root.object.get("graph").?.object.get("resolvers").?.array.items[0];
+    try std.testing.expectEqualStrings("new_entities", declared.object.get("table").?.string);
+    try std.testing.expectEqualStrings("new/{{text}}", declared.object.get("key_template").?.string);
+    const declaring = try owners(a, plan.indexes_json, "r");
+    try std.testing.expectEqual(@as(usize, 1), declaring.len);
+    try std.testing.expectEqualStrings("graph", declaring[0]);
 }
