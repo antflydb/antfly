@@ -58146,6 +58146,12 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             try context.ensureActive();
             if (call == .resolve_many) {
                 const input = call.resolve_many;
+                if (input.storage_names.len != 0) {
+                    if (input.expected_revision) |revision| try std.testing.expectEqual(self.commits, revision);
+                    const logical = try a.alloc(?[]const u8, input.storage_names.len);
+                    for (input.storage_names, logical) |name, *out| out.* = name;
+                    return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = self.commits, .tables = &.{}, .logical_names = logical }, .{});
+                }
                 try std.testing.expectEqual(@as(?u64, null), input.expected_revision);
                 try std.testing.expectEqual(@as(usize, 1), input.targets.len);
                 return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = self.commits, .tables = &.{.{ .table_id = 2, .name = "entities" }} }, .{});

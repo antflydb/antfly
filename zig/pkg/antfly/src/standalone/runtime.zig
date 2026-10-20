@@ -1853,6 +1853,12 @@ const LocalStandaloneMetadata = struct {
             self.mutex.unlock();
             return error.MetadataMutationOutcomeUnknown;
         }
+        // A failed durable publication/reload must not leave a reusable
+        // projection. Healthy reads keep the in-memory fast path.
+        if (self.lifecycle_store != null and self.durable_revision == 0) self.reloadLifecycleProjectionLocked() catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
         // The metadata mutex is the standalone linearizable-read barrier.
         if (self.routing_generation) |generation| {
             if (generation.indexed.snapshot.value.catalog_revision == self.epoch) {
@@ -1898,6 +1904,12 @@ const LocalStandaloneMetadata = struct {
             self.mutex.unlock();
             return error.MetadataMutationOutcomeUnknown;
         }
+        // A failed durable publication/reload must not leave a reusable
+        // projection. Healthy reads keep the in-memory fast path.
+        if (self.lifecycle_store != null and self.durable_revision == 0) self.reloadLifecycleProjectionLocked() catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
         if (self.join_planning_generation) |generation| {
             if (self.join_planning_epoch == self.epoch) {
                 const retained = generation.retain();
