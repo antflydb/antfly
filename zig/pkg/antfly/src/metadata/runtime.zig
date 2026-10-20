@@ -1196,9 +1196,7 @@ pub fn runFromIterator(
             .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
         });
         storage_kernel_context = context;
-        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
-        defer alloc.free(security_json);
-        try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+        try storage_kernel_context.?.configureRemoteContent(remote_content);
         try storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
     }
 

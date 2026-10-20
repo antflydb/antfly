@@ -143,8 +143,10 @@ pub const StorageOwnerContext = struct {
     resources: antfly.physical_resources.PhysicalStorageResources,
     backend_runtime: db_mod.background_runtime.BackendRuntimeHandle,
     inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
+    remote_content_source: ?kernel_runtime_services.RemoteContentSource = null,
     remote_content_security: ?std.json.Parsed(scraping.ContentSecurityConfig) = null,
-    remote_content: scraping.RemoteContentConfig = .{},
+    // An unconfigured facade denies destinations; acquisition errors propagate.
+    remote_content: scraping.RemoteContentConfig = .{ .security = .{ .allowed_hosts = &.{}, .allowed_paths = &.{} } },
     secret_store: ?*common_secrets.FileStore = null,
     lite_backend: ?lite_backend.Handle = null,
     auth_backend: ?antfly.lsm_backend.BackendHandle = null,
@@ -176,7 +178,7 @@ pub const StorageOwnerContext = struct {
     }
 
     pub fn remoteContent(self: *const StorageOwnerContext) ?*const scraping.RemoteContentConfig {
-        return if (self.remote_content_security != null) &self.remote_content else null;
+        return if (self.remote_content_security != null or self.remote_content_source != null) &self.remote_content else null;
     }
 
     pub fn deinitIfIdle(self: *StorageOwnerContext) bool {
@@ -883,6 +885,57 @@ pub fn storageOwnerContextConfigureNativeQueries(context: ?*anyopaque, setup: ke
     return .ok;
 }
 
+/// A stable facade acquires the current policy for each fetch. In-flight
+/// fetches own their parsed snapshot, so reload cannot invalidate their paths.
+pub fn storageOwnerContextConfigureRemoteContentSource(
+    context: ?*anyopaque,
+    source: *const kernel_runtime_services.RemoteContentSource,
+) callconv(.c) kernel_owner_abi.Status {
+    const owner = asStorageOwnerContext(context) orelse return .invalid_argument;
+    if (source.version != 1 or source._reserved != 0) return .invalid_argument;
+    owner.lock();
+    defer owner.mutex.unlock();
+    if (owner.active_owners != 0) return .busy;
+    if (owner.remote_content_security) |*previous| previous.deinit();
+    owner.remote_content_security = null;
+    owner.remote_content.security = .{ .allowed_hosts = &.{}, .allowed_paths = &.{} };
+    owner.remote_content_source = source.*;
+    owner.remote_content.runtime = .{ .context = owner, .acquire_fn = acquireRemoteContent };
+    return .ok;
+}
+
+const RemoteContentSnapshot = struct {
+    parsed: std.json.Parsed(scraping.ContentSecurityConfig),
+    config: scraping.RemoteContentConfig,
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.parsed.deinit();
+        std.heap.smp_allocator.destroy(self);
+    }
+};
+
+fn acquireRemoteContent(raw: *anyopaque) anyerror!scraping.RemoteContentConfig.Snapshot {
+    const owner: *StorageOwnerContext = @ptrCast(@alignCast(raw));
+    const source = owner.remote_content_source.?;
+    var bytes: kernel_owner_abi.OwnedBytes = .{};
+    switch (source.acquire(source.context, &bytes)) {
+        .ok => {},
+        .out_of_memory => return error.OutOfMemory,
+        .timeout => return error.Timeout,
+        .cancelled => return error.Canceled,
+        else => return error.ResourceTemporarilyUnavailable,
+    }
+    defer source.release(source.context, bytes);
+    const alloc = std.heap.smp_allocator;
+    const snapshot = try alloc.create(RemoteContentSnapshot);
+    const parsed = std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, bytes.slice(), .{ .allocate = .alloc_always }) catch |err| {
+        alloc.destroy(snapshot);
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.ResourceTemporarilyUnavailable;
+    };
+    snapshot.* = .{ .parsed = parsed, .config = .{ .security = parsed.value } };
+    return .{ .config = &snapshot.config, .context = snapshot, .release_fn = RemoteContentSnapshot.release };
+}
+
 pub fn storageOwnerContextConfigureRemoteContentSecurity(
     context: ?*anyopaque,
     security_json: kernel_owner_abi.BorrowedBytes,
@@ -904,6 +957,8 @@ pub fn storageOwnerContextConfigureRemoteContentSecurity(
         return .busy;
     }
     var previous = owner_context.remote_content_security;
+    owner_context.remote_content_source = null;
+    owner_context.remote_content.runtime = null;
     owner_context.remote_content_security = parsed;
     owner_context.remote_content.security = if (owner_context.remote_content_security) |*value| value.value else null;
     owner_context.mutex.unlock();
