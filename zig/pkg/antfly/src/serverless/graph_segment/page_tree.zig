@@ -412,7 +412,7 @@ fn rebalance(alloc: Allocator, store: Store, children: *Children) !void {
         defer freeChildren(alloc, &replacement);
         // Their combined payload fits: merge without unnecessarily splitting
         // it back at the soft target. Otherwise redistribute via pack.
-        if (left.bytes.len + right.bytes.len - header_bytes <= max_page_bytes) {
+        if (left.bytes.len + right.bytes.len - header_bytes <= target_page_bytes) {
             var aggregate: []u8 = undefined;
             const ref = try save(alloc, store, entries, a.ref.height, &aggregate);
             defer alloc.free(aggregate);
@@ -468,6 +468,7 @@ fn edit(alloc: Allocator, store: Store, prior: Ref, changes: []const Mutation, o
     defer freeChildren(alloc, &children);
     var begin: usize = 0;
     var changed = false;
+    var repair_occupancy = false;
     for (page.entries, 0..) |entry, i| {
         var end = begin;
         while (end < changes.len and (i + 1 == page.entries.len or less(changes[end].key, page.entries[i + 1].key))) : (end += 1) {}
@@ -476,12 +477,22 @@ fn edit(alloc: Allocator, store: Store, prior: Ref, changes: []const Mutation, o
         } else {
             const count = children.items.len;
             try edit(alloc, store, entry.child.?, changes[begin..end], &children, entry.key, if (i + 1 < page.entries.len) page.entries[i + 1].key else end_key);
-            if (children.items.len != count + 1 or !children.items[count].ref.eql(entry.child.?)) changed = true;
+            if (children.items.len != count + 1 or !children.items[count].ref.eql(entry.child.?)) {
+                changed = true;
+                // Value-only edits do not owe maintenance for an unrelated
+                // underfull tail. Repair splits/removals and newly shrunken
+                // pages; preserve every other immutable child by reference.
+                if (children.items.len != count + 1) repair_occupancy = true else {
+                    const next = children.items[count].ref;
+                    const old = entry.child.?;
+                    if (next.records != old.records or (next.bytes < target_page_bytes / 2 and next.bytes < old.bytes)) repair_occupancy = true;
+                }
+            }
         }
         begin = end;
     }
     if (!changed) return appendChild(alloc, out, page.entries[0].key, prior, page.aggregate);
-    try rebalance(alloc, store, &children);
+    if (repair_occupancy) try rebalance(alloc, store, &children);
     const entries = try childEntries(alloc, children.items);
     defer alloc.free(entries);
     try pack(alloc, store, entries, prior.height, out);
@@ -2156,4 +2167,50 @@ test "external lake best first traversal preserves ties prunes losing pages and 
     var found: usize = 0;
     while (try old.next(1000)) |_| found += 1;
     try std.testing.expectEqual(@as(usize, 2), found);
+}
+
+test "serverless graph value updates retain unrelated short tails and deletion repairs target pages" {
+    const a = std.testing.allocator;
+    var memory: TestStore = .{ .alloc = a };
+    defer memory.deinit();
+    var builder: SortedBuilder = .{ .alloc = a, .store = memory.store() };
+    defer builder.deinit();
+    var key: [8]u8 = undefined;
+    var value: [220]u8 = @splat('a');
+    for (0..300) |i| {
+        std.mem.writeInt(u64, &key, i, .big);
+        try builder.add(&key, &value);
+    }
+    const before = (try builder.finish()).?;
+    var prior = try readPage(a, memory.store(), before);
+    defer prior.deinit(a);
+    try std.testing.expect(prior.entries.len >= 3 and prior.ref.height == 1);
+    const last = prior.entries[prior.entries.len - 1].child.?;
+    try std.testing.expect(last.bytes < target_page_bytes / 2);
+    std.mem.writeInt(u64, &key, 0, .big);
+    value[0] = 'b';
+    const writes = memory.writes;
+    const after = (try apply(a, memory.store(), before, &.{.{ .key = &key, .value = &value }})).?;
+    try std.testing.expectEqual(@as(usize, 2), memory.writes - writes);
+    var fresh = try readPage(a, memory.store(), after);
+    defer fresh.deinit(a);
+    try std.testing.expectEqual(prior.entries.len, fresh.entries.len);
+    for (prior.entries[1..], fresh.entries[1..]) |l, r| try std.testing.expect(l.child.?.eql(r.child.?));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const edits = try arena.allocator().alloc(Mutation, 200);
+    for (edits, 0..) |*mutation, i| {
+        const bytes = try arena.allocator().alloc(u8, 8);
+        std.mem.writeInt(u64, bytes[0..8], i, .big);
+        mutation.* = .{ .key = bytes, .value = null };
+    }
+    const removed = (try apply(a, memory.store(), after, edits)).?;
+    try std.testing.expectEqual(@as(u64, 100), removed.records);
+    var cursor = try Cursor.init(a, memory.store(), removed, "", null);
+    defer cursor.deinit();
+    for (200..300) |expected| {
+        const record = (try cursor.next()).?;
+        try std.testing.expectEqual(@as(u64, @intCast(expected)), std.mem.readInt(u64, record.key[0..8], .big));
+    }
+    try std.testing.expect((try cursor.next()) == null);
 }

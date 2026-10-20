@@ -115,7 +115,7 @@ fn executeFamily(args: Args, kind: Kind, provider: *Provider, store: *stores.Art
 pub const Unit = struct { kind: Kind, table: local.common_topology_records.TableRecord, incremental: bool = true };
 fn allowance(kind: Kind) usize {
     return switch (kind) {
-        .aggregate => 14 * 1024 * 1024,
+        .aggregate => 22 * 1024 * 1024,
         .ordered => 8 * 1024 * 1024,
         .text => 64 * 1024 * 1024,
         .sparse, .dense => 256 * 1024 * 1024,
@@ -824,9 +824,9 @@ test "external lake file-first publication shares one decode across five native 
         try std.testing.expect(limited_replay.captures < 21);
     }
     try std.testing.expectEqual(@as(usize, 0), modest.live_bytes);
-    // At 240 MiB these three light consumers admit the second source cursor
-    // while retaining borrowed single-batch backpressure (no two-frame queue).
-    var borrowed_budget = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 240 * 1024 * 1024 });
+    // At 248 MiB, including the new 8 MiB state sort, these consumers admit
+    // the second source cursor while retaining single-batch backpressure.
+    var borrowed_budget = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 248 * 1024 * 1024 });
     {
         var borrowed_provider = provider;
         var borrowed_replay = replay_api.Replay.init(borrowed_budget.allocator(), &borrowed_provider, columns);

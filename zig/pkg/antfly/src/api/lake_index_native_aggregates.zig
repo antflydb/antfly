@@ -528,7 +528,7 @@ const LeafResolver = struct {
                     }
                 } else try consumeCohort(self.a, self.provider, self.binding, self.recipe, partial, self.budget, self.cancellation);
             }
-            const published = if (self.recipe.keys.len != 0) try artifacts.publishPartitioned(self.a, self.out, self.store, self.names, partial, self.recipe, self.spill, self.cancellation) else try artifacts.publishCohort(self.a, self.out, self.store, self.names, partial, self.recipe, self.cancellation);
+            const published = if (self.recipe.keys.len != 0) try artifacts.publishKeyed(self.a, self.out, self.store, self.names, partial, self.recipe, self.spill, self.cancellation) else try artifacts.publishCohort(self.a, self.out, self.store, self.names, partial, self.recipe, self.cancellation);
             @memcpy(refs, published);
             self.out.free(published);
         }
@@ -619,7 +619,27 @@ const Reduction = struct {
         const right = try self.reduce(prepared[split..]);
         return self.join(left, right);
     }
+    const Prior = struct { parent: Leaf, left: ?Leaf, right: ?Leaf };
+    fn treeIndex(self: *@This(), refs: []const local.serverless_manifest_artifact_ref.ArtifactRef) !?artifacts.state_tree.Index {
+        if (refs.len != self.recipe.inputs.len or refs[0].metadata_version != 7) return null;
+        var result: ?artifacts.state_tree.Index = null;
+        for (refs, 0..) |ref, slot| {
+            if (ref.metadata_version != 7) return null;
+            const one: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
+            const reader = try artifacts.Reader.openWithCache(self.a, self.store.*, ref, one, self.cancellation, self.cached);
+            defer reader.cursor().close(reader);
+            if (!reader.root.state_recipe.?.eql(self.recipe) or reader.root.state_slot.? != slot) return null;
+            const index = reader.root.state_tree.?;
+            if (result) |previous| {
+                if (!std.meta.eql(previous, index)) return null;
+            } else result = index;
+        }
+        return result;
+    }
     fn join(self: *@This(), left: Leaf, right: Leaf) anyerror!Leaf {
+        return self.joinUpdated(left, right, null);
+    }
+    fn joinUpdated(self: *@This(), left: Leaf, right: Leaf, prior: ?Prior) anyerror!Leaf {
         const lrange = left.range orelse return error.InvalidLakeIndexCatalog;
         const rrange = right.range orelse return error.InvalidLakeIndexCatalog;
         if (std.mem.order(u8, &lrange.last, &rrange.first) != .lt) return error.InvalidLakeIndexCatalog;
@@ -644,6 +664,21 @@ const Reduction = struct {
             for (aliases) |*list| list.deinit(self.out);
             self.out.free(aliases);
         }
+        if (!complete and artifacts.state_tree.eligible(self.recipe)) {
+            if (try self.treeIndex(left.refs)) |l| if (try self.treeIndex(right.refs)) |r| {
+                var previous: ?artifacts.state_tree.Previous = null;
+                if (prior) |old| if (try self.treeIndex(old.parent.refs)) |parent| {
+                    const before_left = if (old.left) |part| try self.treeIndex(part.refs) else null;
+                    const before_right = if (old.right) |part| try self.treeIndex(part.refs) else null;
+                    if ((old.left == null or before_left != null) and (old.right == null or before_right != null)) previous = .{ .parent = parent, .left = before_left, .right = before_right };
+                };
+                const index = try artifacts.state_tree.merge(self.a, self.store, self.recipe, l, r, previous, self.cancellation, null);
+                const published = try artifacts.publishTree(self.a, self.out, self.store, self.names, self.recipe, index, self.cancellation);
+                @memcpy(refs, published);
+                self.out.free(published);
+                complete = true;
+            };
+        }
         const was_complete = complete;
         const routed = self.recipe.keys.len != 0 and (artifacts.isPartitioned(left.refs[0].metadata_version) or artifacts.isPartitioned(right.refs[0].metadata_version));
         var routed_left = left;
@@ -664,7 +699,7 @@ const Reduction = struct {
             if (self.recipe.keys.len == 0) try group.ensureGlobalGroup();
             try importContributionsCached(self.a, self.store, left.refs, self.recipe, group, self.cancellation, self.cached);
             try importContributionsCached(self.a, self.store, right.refs, self.recipe, group, self.cancellation, self.cached);
-            const published = if (self.recipe.keys.len != 0) try artifacts.publishPartitioned(self.a, self.out, self.store, self.names, group, self.recipe, self.spill, self.cancellation) else try artifacts.publishCohort(self.a, self.out, self.store, self.names, group, self.recipe, self.cancellation);
+            const published = if (self.recipe.keys.len != 0) try artifacts.publishKeyed(self.a, self.out, self.store, self.names, group, self.recipe, self.spill, self.cancellation) else try artifacts.publishCohort(self.a, self.out, self.store, self.names, group, self.recipe, self.cancellation);
             @memcpy(refs, published);
             self.out.free(published);
         }
@@ -750,7 +785,7 @@ const Reduction = struct {
         const right = try self.editBatch(parts[1], changes[split..], depth + 1);
         if (left == null) return right;
         if (right == null) return left;
-        return try self.join(left.?, right.?);
+        return try self.joinUpdated(left.?, right.?, .{ .parent = current, .left = parts[0], .right = parts[1] });
     }
     fn reduceAppend(self: *@This(), provider: *@import("lake_index_row_source.zig").Provider) anyerror!?Leaf {
         const work = provider.resume_work orelse return null;
@@ -1483,15 +1518,27 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
             const recipe = try artifacts.loadRecipe(output.allocator(), store, declaration.artifact, .none);
             const reader = try artifacts.Reader.open(a, store, declaration.artifact, recipe, .none);
             defer reader.cursor().close(reader);
-            try std.testing.expectEqual(@as(u16, 5), declaration.artifact.metadata_version);
+            try std.testing.expectEqual(@as(u16, 7), declaration.artifact.metadata_version);
+            try std.testing.expectEqual(@as(u64, 300), reader.root.state_tree.?.count());
             if (phase == 1) {
-                const before = try artifacts.loadPartitions(output.allocator(), store, previous.declarations[slot].artifact, recipe, .none);
-                const after = try artifacts.loadPartitions(output.allocator(), store, declaration.artifact, recipe, .none);
+                const before = try artifacts.Reader.open(a, store, previous.declarations[slot].artifact, recipe, .none);
+                defer before.cursor().close(before);
+                var access: @import("lake_index_native_directory.zig").Access = undefined;
+                access.init(store, reader.root.state_tree.?.domain, .none, null);
+                var old_pages = try artifacts.state_tree.tree.readPage(a, access.backing(), before.root.state_tree.?.page.?);
+                defer old_pages.deinit(a);
+                var new_pages = try artifacts.state_tree.tree.readPage(a, access.backing(), reader.root.state_tree.?.page.?);
+                defer new_pages.deinit(a);
                 var retained: usize = 0;
-                for (before) |old| for (after) |current| {
-                    if (std.mem.eql(u8, old.artifact.artifact_id, current.artifact.artifact_id)) retained += 1;
+                for (old_pages.entries) |old| if (old.child) |prior_page| {
+                    for (new_pages.entries) |fresh| if (fresh.child) |page| {
+                        if (prior_page.eql(page)) {
+                            retained += 1;
+                            break;
+                        }
+                    };
                 };
-                try std.testing.expect(retained >= 1);
+                try std.testing.expect(retained > 0);
             }
             const group = try operators.Grouped.create(a, &.{recipe.inputs[0].spec}, .{});
             defer group.deinit();

@@ -104,7 +104,7 @@ pub fn areGraphArtifactAliases(a: ArtifactRef, b: ArtifactRef) bool {
 /// The selected name/recipe is independently verified by the pack reader.
 pub fn areArtifactAliases(a: ArtifactRef, b: ArtifactRef) bool {
     const std = @import("std");
-    if (a.kind != b.kind or (a.kind != .graph_segment and a.kind != .graph_metric_segment and !(a.kind == .algebraic_segment and a.metadata_version == 6)) or
+    if (a.kind != b.kind or (a.kind != .graph_segment and a.kind != .graph_metric_segment and !(a.kind == .algebraic_segment and (a.metadata_version == 6 or a.metadata_version == 7))) or
         (a.kind == .graph_metric_segment and a.metadata_version != graph_metric_segment_wire_version) or
         a.name.len == 0 or b.name.len == 0 or std.mem.eql(u8, a.name, b.name) or
         !std.mem.eql(u8, a.artifact_id, b.artifact_id) or !std.mem.eql(u8, a.checksum, b.checksum)) return false;
@@ -202,4 +202,18 @@ test "serverless aggregate pack aliases fence interpretation and physical metada
     var legacy = original;
     legacy.metadata_version = 2;
     try std.testing.expect(!areArtifactAliases(legacy, alias));
+}
+
+test "serverless ordered aggregate state aliases preserve complete physical identity" {
+    const std = @import("std");
+    const original: ArtifactRef = .{ .kind = .algebraic_segment, .metadata_version = 7, .name = "stats.count", .artifact_id = "state", .checksum = "checksum", .byte_len = 128 };
+    var alias = original;
+    alias.name = "stats.sum";
+    try std.testing.expect(areArtifactAliases(original, alias));
+    alias.metadata_version = 6;
+    try std.testing.expect(!areArtifactAliases(original, alias));
+    alias = original;
+    alias.name = "stats.sum";
+    alias.byte_len += 1;
+    try std.testing.expect(!areArtifactAliases(original, alias));
 }

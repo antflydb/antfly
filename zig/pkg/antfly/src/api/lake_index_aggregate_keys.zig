@@ -67,6 +67,11 @@ pub fn encode(a: A, values: []const Datum) ![]const u8 {
     for (values) |value| try local.storage_db_relational_index_keys.appendSqlScalar(a, &bytes, value, false);
     return bytes.toOwnedSlice(a);
 }
+pub fn compatible(recipe: local.sql_aggregate_materialization.Recipe, values: []const Datum) bool {
+    if (values.len != recipe.keys.len) return false;
+    for (recipe.keys, values) |key, value| if ((value.sql_null and !key.nullable) or !typed(key, value)) return false;
+    return true;
+}
 pub fn rowBoundsTyped(a: A, rows: []const local.sql_operators.Row, recipe: local.sql_aggregate_materialization.Recipe) !?Bounds {
     for (rows) |row| {
         if (row.keys.len != recipe.keys.len) return error.InvalidNativeAggregateArtifact;

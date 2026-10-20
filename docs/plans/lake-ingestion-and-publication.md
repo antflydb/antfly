@@ -2985,3 +2985,44 @@ run absent from the new native cut is removed even if an old reader still pins
 it. Legacy inline generations migrate through the existing full publication
 path. Native manifests still encode their complete bounded run set; this removes
 the remote retained-file census, not that local serialization cost.
+
+
+### Persistent ordered group state (protocol 64)
+
+Native grouped file reductions can publish version 7 serving roots over one
+ordered copy-on-write page tree. Complete normalized grouping keys route directly
+to native physical transition rows. Forward/reverse LIMIT and typed key ranges
+seek that tree; long common prefixes do not require opening every hash leaf.
+The same tree serves COUNT, integer SUM, exact NUMERIC, and typed extrema.
+Logical slots share one authenticated control object, binding names, the entire
+state recipe, and the state-tree identity. Its decoded lease is shared across
+slots. Compatible slots fuse only when their complete state-tree identities agree.
+
+A changed file still replaces its owned contribution. At each affected file
+reduction ancestor, authenticated child-tree differences identify changed group
+keys. Equal page content skips unchanged subtrees. Each affected group is merged
+from its two current children, then path-copied into the previous parent tree.
+This preserves exact arithmetic and recomputes MIN/MAX winners after removal,
+without inverse transitions or chains of old serving generations.
+Value updates retain unrelated underfull tail pages. Occupancy repair runs for
+splits, membership changes, or newly shrunken pages, and merges toward the normal
+page target rather than growing small tails into objects near the hard cap. Shape changes
+use a bounded streaming comparison; large edit sets fall back to a full streaming
+merge before publishing any new root. File-contribution ownership remains the
+existing counted graph, while ordinary and resumable GC trace state-tree pages.
+
+Cold publication drains resident or spilled reducers into compact key/state
+records with bounded native sorting, then builds ordered pages in one pass.
+Records too large for a page retain the established radix/block publisher; the
+existing sorted partials feed that fallback without rereading Parquet. This is optional
+physical-format admission, not a new SQL key, state, or scan limit. Historical
+roots remain readable and are upgraded when an admitted reduction is rebuilt.
+
+Serving gathers bounded physical records into owned batches and exposes lazy
+transition readers directly to finalization kernels. A single next-batch task
+uses the shared I/O scheduler while SQL finalizes the current batch; at most two
+4 MiB record batches are resident, with scheduler headroom accounting for arena
+overhead. Cancellation and early close join that task before releasing request
+authority. All batch allocations retain the request's memory accounting.
+Explicit proven prefixes also allow the SQL adapter to consume provider batches
+without repeatedly verifying one group per output fragment.
