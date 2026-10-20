@@ -1,6 +1,6 @@
 {
   "base_commit": "ff1a686da80dd03b9533bfeac37fd5a428442ef6",
-  "merged_main": "833e2ffa40959498707390fe10ab5f92bf1bf68a",
+  "merged_main": "beb332c973eaf78876f9ef798d3d959fe41f307d",
   "zig_version": "0.17.0",
   "build": "Debug",
   "scope": "Deterministic correctness and allocation/write-amplification regressions; no archive-scale latency, RSS, cloud-provider or DuckDB parity claim.",
@@ -72,5 +72,28 @@
     "output_peak_bytes": 122684,
     "owned_minimum_survives_reader_close": true,
     "prefetch_enabled": true
+  },
+  "measurement_base_main": "833e2ffa40959498707390fe10ab5f92bf1bf68a",
+  "validation": {
+    "lake_integration_before_main_merge": {
+      "shared_passed": 382,
+      "native_passed": 580,
+      "failed": 0,
+      "leaked": 0
+    },
+    "cached_numeric_cases_passed": 1,
+    "navigation_and_frame_cases_passed": 3,
+    "post_merge_graph_page_cases_passed": 25,
+    "post_merge_real_parquet_iceberg_e2e_passed": 22,
+    "post_merge_e2e_seconds": 214.81,
+    "final_server_build": "Debug, stripped; Zig 0.17.0",
+    "checks": [
+      "Zig formatting",
+      "license headers",
+      "Apache boundary",
+      "source catalogue",
+      "regenerated inference error catalogue",
+      "git diff --check"
+    ]
   }
 }

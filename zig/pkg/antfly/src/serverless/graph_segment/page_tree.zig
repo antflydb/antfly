@@ -534,6 +534,26 @@ fn edit(alloc: Allocator, store: Store, prior: Ref, changes: []const Mutation, o
 /// Overlapping ranges decline without writes so a reducer can merge equal keys.
 /// Descendants retain their original attempt identities and GC reachability.
 pub fn joinDisjoint(alloc: Allocator, store: Store, left: Ref, right: Ref) !?Ref {
+    // Bounds cursors release their decoded leaves before allocating join
+    // spines, so disjoint detection does not inflate the reduction workspace.
+    const reversed = (try disjointOrder(alloc, store, left, right)) orelse return null;
+    var children: Children = .empty;
+    defer freeChildren(alloc, &children);
+    try joinBoundary(alloc, store, if (reversed) right else left, if (reversed) left else right, &children);
+    while (children.items.len > 1) {
+        const height = children.items[0].ref.height + 1;
+        if (height > max_height) return error.GraphPageTreeTooDeep;
+        const entries = try childEntries(alloc, children.items);
+        defer alloc.free(entries);
+        var parents: Children = .empty;
+        errdefer freeChildren(alloc, &parents);
+        try pack(alloc, store, entries, height, &parents);
+        freeChildren(alloc, &children);
+        children = parents;
+    }
+    return children.items[0].ref;
+}
+fn disjointOrder(alloc: Allocator, store: Store, left: Ref, right: Ref) !?bool {
     var lf = try Cursor.init(alloc, store, left, "", null);
     defer lf.deinit();
     var rl = try Cursor.initReverse(alloc, store, right, "", null);
@@ -550,21 +570,7 @@ pub fn joinDisjoint(alloc: Allocator, store: Store, left: Ref, right: Ref) !?Ref
         const first_right = (try rf.next()) orelse return error.InvalidGraphPage;
         if (!less(last_left.key, first_right.key)) return null;
     }
-    var children: Children = .empty;
-    defer freeChildren(alloc, &children);
-    try joinBoundary(alloc, store, if (reversed) right else left, if (reversed) left else right, &children);
-    while (children.items.len > 1) {
-        const height = children.items[0].ref.height + 1;
-        if (height > max_height) return error.GraphPageTreeTooDeep;
-        const entries = try childEntries(alloc, children.items);
-        defer alloc.free(entries);
-        var parents: Children = .empty;
-        errdefer freeChildren(alloc, &parents);
-        try pack(alloc, store, entries, height, &parents);
-        freeChildren(alloc, &children);
-        children = parents;
-    }
-    return children.items[0].ref;
+    return reversed;
 }
 fn joinBoundary(alloc: Allocator, store: Store, left: Ref, right: Ref, out: *Children) anyerror!void {
     var lp = try load(alloc, store, left);

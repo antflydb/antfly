@@ -3152,3 +3152,12 @@ No wire format or reader protocol changes are needed. Archive-scale cold BM25,
 provider latency and post-GC live-byte improvements still require the controlled
 qualification described above; the unavailable HN fixture and deferred live
 provider runs remain separate from these deterministic checks.
+
+Validation for this refinement passed 382 shared lake/SQL and 580 native lake
+checks without leaks. After merging main `beb332c973`, the 25 page-tree checks
+and all 22 selected real Parquet/Iceberg HTTP/pgwire/restart E2Es passed (214.81
+seconds). The final stripped Debug server builds with Zig 0.17.0. Formatting,
+license/boundary and source catalogue checks pass; the inference error catalogue
+was regenerated for the merged main's new video errors. Deterministic fixture
+observations are recorded in
+[`native-lake-leased-navigation-and-publication.json`](../../zig/bench/baselines/native-lake-leased-navigation-and-publication.json).
