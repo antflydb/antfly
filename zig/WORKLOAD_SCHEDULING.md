@@ -15,8 +15,8 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The current merge includes `origin/main` at `51cfaa8f6ef8ccc8b14f7c7b3201b84a36863449`
-(merge commit `9b633a4125766c95a42bf80e75f2cc3599cce691`).
+The current merge includes `origin/main` through `097588bf5d9d2f32cc16574545d95c375bbb24a1`
+(merge commit `1f1d60a4387601fa6d3f88150e4fd98218a2e99d`).
 
 Native ABI 48, storage-owner ABI 109, engine descriptor 29, required preparation
 file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
@@ -35,12 +35,16 @@ resident runtime. The caller retains CPU while holders live; controlled
 preparation leaves provider fanout and PDF prefetch disabled until independent
 producer execution is funded.
 
-The merged source passes 76/76 focused build steps with 42 provider/admission/
-telemetry cases and 21 PDF/funding cases. Two cached private error-name round trips
-retain unchanged-source evidence. The immutable package has 4545 matching public
-sources and passes 25/25 ReleaseSafe consumer build steps. Qualification binds
-5261 unchanged native inputs in `preparation-provider-controls-verified.json`.
-Source-controller coverage is semantic only; the full linked archive/cold-source
+The latest merged source passes 76/76 focused build steps with 42 provider/
+admission/telemetry cases and 21 PDF/funding cases. Two cached private error-name
+round trips retain unchanged-source evidence. Main's foreign-executor lifetime
+case and three Bloom cases also pass with the pinned joinable Zig library.
+The immutable merged package has 4548 matching public sources and passes 25/25
+ReleaseSafe consumer build steps. Qualification binds 5264 unchanged native
+inputs in `preparation-latest-main-verified.json`. Conflict resolution preserves
+both admission and storage-test catalog exports and dynamic reader-version
+coverage. Normal commit hooks pass. The consumer checks module composition;
+source-controller coverage is semantic only. Full linked archive/cold-source
 runtime remain unqualified. The same worktree, branch and PR remain in use.
 
 Source `aec0358112df715a12fac03bd0184a82df57a60d` hardens provider control boundaries. Fallible

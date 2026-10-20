@@ -19,6 +19,35 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Latest main integration after controlled preparation (2026-10-20)
+
+Merged `origin/main` through `097588bf5d9d2f32cc16574545d95c375bbb24a1`
+in `1f1d60a4387601fa6d3f88150e4fd98218a2e99d`, in the same worktree,
+branch and PR. Conflict resolution retains both the admission exports and main's
+storage-test catalog entries, uses the supported reader version in resolver
+catalog fixtures, and preserves the generated error names for this branch.
+Native ABI 48 and all shared status/durable format versions remain unchanged.
+
+`preparation-latest-main-integration-v1` passes 76/76 focused build steps,
+with 42 provider/admission/telemetry cases and 21 PDF/funding cases. The two
+cached error-name round trips retain their unchanged-source evidence. Separate
+checks using the same pinned joinable Zig library pass main's foreign-executor
+signal-owner lifetime case and all three Bloom cases, including exact v1 bits
+and query results across the power-of-two optimization. Normal commit hooks
+pass; all 5264 native inputs remain unchanged after formatting.
+
+`preparation-latest-main-verified.json` binds those inputs and 4548
+matching immutable public sources to the merged commit, plus 25/25 ReleaseSafe
+consumer build steps. The consumer checks module composition without linking
+provider products; source-controller coverage is semantic only. Full linked
+archive/cold-source runtime remain unqualified, and full Linux qualification
+is waived.
+
+The original preparation controls from `fc34f7465f` remain in place. Independent
+producer CPU/children outside retained holders, durable accepted effects and
+completion reservations before PREPARE, required-mode activation and the rest
+of the full design remain open.
+
 ## Original request controls in generated preparation (2026-10-20)
 
 Merged `origin/main` at `51cfaa8f6ef8ccc8b14f7c7b3201b84a36863449` in
