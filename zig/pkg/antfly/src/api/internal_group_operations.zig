@@ -692,13 +692,10 @@ pub const Operations = struct {
         const writes = self.writes orelse return error.NotFound;
         const supports_pre_decision_context =
             writes.vtable.txn_begin_group_local_with_pre_decision_context != null;
-        _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, .{
-            .restore_staging_scope = input.restore_staging_scope,
-            .restore_staging_plan_id = input.restore_staging_plan_id,
-            .deadline_ns = request.deadline_ns,
-            .deadline_io = request.deadline_io,
-            .cancellation = request.cancellation,
-        }) catch |err| switch (err) {
+        var context = distributed_txn.PreDecisionContext.fromRequest(request);
+        context.restore_staging_scope = input.restore_staging_scope;
+        context.restore_staging_plan_id = input.restore_staging_plan_id;
+        _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, context) catch |err| switch (err) {
             error.RetainedEffectsFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.InvalidBatchRequest, error.RelationalCheckViolation => return error.InvalidArgument,
@@ -752,12 +749,9 @@ pub const Operations = struct {
             };
         }
         try ensurePreDecisionRequestActive(request);
-        _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, .{
-            .route_fence = input.route_fence,
-            .deadline_ns = request.deadline_ns,
-            .deadline_io = request.deadline_io,
-            .cancellation = request.cancellation,
-        }) catch |err| switch (err) {
+        var context = distributed_txn.PreDecisionContext.fromRequest(request);
+        context.route_fence = input.route_fence;
+        _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, context) catch |err| switch (err) {
             error.RetainedEffectsFull => return error.RetainedEffectsFull,
             error.OnlineSourcePinPending => return error.TransactionPreDecisionOutcomeUnknown,
             error.TransactionTooLarge => return error.TransactionTooLarge,

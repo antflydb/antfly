@@ -45,11 +45,19 @@ pub const PreDecisionContext = struct {
     restore_staging_plan_id: ?[16]u8 = null,
     deadline_ns: ?u64 = null,
     deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
+    /// Borrowed request executor; independent of the deadline clock domain.
+    fanout_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     cancellation: db_types.CancellationToken = .none,
     /// Per-call worker authority retained through this synchronous participant
     /// operation. Concurrent participants require independently owned children;
     /// never forward the coordinator token to multiple workers or serialize it.
     execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+
+    /// Preserve the local request executor without lending coordinator CPU to
+    /// participant children. Each worker attaches its own runnable separately.
+    pub fn fromRequest(request: @import("operation.zig").RequestContext) PreDecisionContext {
+        return .{ .deadline_ns = request.deadline_ns, .deadline_io = request.deadline_io, .fanout_io = request.fanout_io, .cancellation = request.cancellation };
+    }
 
     /// Clamp an existing budget into the destination clock domain. Sampling
     /// that clock first prevents translation from extending the caller's
@@ -68,7 +76,7 @@ pub const PreDecisionContext = struct {
     /// discarded: its caller requires this context-aware operation contract.
     pub fn requiresAwareCallback(self: PreDecisionContext) bool {
         return self.route_fence != null or self.restore_staging_scope != null or self.restore_staging_plan_id != null or
-            self.deadline_ns != null or self.deadline_io != null or self.execution_runnable != null or self.cancellation.ptr != null or
+            self.deadline_ns != null or self.deadline_io != null or self.fanout_io != null or self.execution_runnable != null or self.cancellation.ptr != null or
             self.cancellation.is_cancelled_fn != null or self.cancellation.check_fn != null;
     }
 };
@@ -98,11 +106,7 @@ pub const CommitControl = struct {
     pub fn fromRequest(request: @import("operation.zig").RequestContext) CommitControl {
         return .{
             .team = request.execution_team,
-            .pre_decision = .{
-                .deadline_ns = request.deadline_ns,
-                .deadline_io = request.deadline_io,
-                .cancellation = request.cancellation,
-            },
+            .pre_decision = PreDecisionContext.fromRequest(request),
         };
     }
 };
@@ -187,3 +191,16 @@ pub const CommitOutcome = union(enum) {
     committed: ExecuteResult,
     conflict: CommitConflict,
 };
+
+test "predecision commit context preserves execution IO separately from deadline clock" {
+    const std = @import("std");
+    const runtime = @import("antfly_runtime_abi");
+    var clock_marker: u8 = 1;
+    var execution_marker: u8 = 2;
+    const clock: std.Io = .{ .userdata = &clock_marker, .vtable = std.Io.failing.vtable };
+    const execution: std.Io = .{ .userdata = &execution_marker, .vtable = std.Io.failing.vtable };
+    const control = CommitControl.fromRequest(.{ .deadline_io = runtime.io_abi.Borrow.init(&clock), .fanout_io = runtime.io_abi.Borrow.init(&execution) });
+    try std.testing.expect(control.pre_decision.deadline_io.?.userdata == @as(?*anyopaque, &clock_marker));
+    try std.testing.expect(control.pre_decision.fanout_io.?.userdata == @as(?*anyopaque, &execution_marker));
+    try std.testing.expect((@as(PreDecisionContext, .{ .fanout_io = runtime.io_abi.Borrow.init(&execution) })).requiresAwareCallback());
+}

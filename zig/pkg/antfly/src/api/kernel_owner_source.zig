@@ -51,6 +51,7 @@ const table_reads = @import("antfly_local_sources").api_local_query_contract;
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const storage_maintenance_source = @import("storage_maintenance_source.zig");
 const table_write_source = @import("antfly_local_sources").api_table_write_source;
+const request_execution_io = @import("request_execution_io.zig");
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
 const common_config = @import("antfly_local_sources").common_config;
@@ -1071,6 +1072,13 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn ensureStorageContext(self: *ProvisionedKernelOwnerSource) !void {
         return self.ensureContextConfigured();
     }
+    fn borrowRequestIo(self: *ProvisionedKernelOwnerSource, receiver: *request_execution_io.Borrow, original: ?@import("antfly_runtime_abi").io_abi.Borrow) !std.Io {
+        // Do not initialize another pool, or replace an invalid explicit
+        // capability with ambient IO. The host runtime outlives owner calls.
+        const configured = if (original == null) if (self.context_runtime) |runtime| runtime.io() else null else null;
+        return receiver.bind(original, configured);
+    }
+
     fn ensureContextConfigured(self: *ProvisionedKernelOwnerSource) !void {
         // Cold hidden-owner reads can arrive concurrently with one another or
         // with an owner acquisition. Context creation and configuration must
@@ -1784,9 +1792,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
     ) !void {
         if (group_id == 0) return error.InvalidArgument;
-        var wait_io_impl = std.Io.Threaded.init(self.alloc, .{});
-        defer wait_io_impl.deinit();
-        const wait_io = wait_io_impl.io();
+        var legacy_wait_io: ?std.Io.Threaded = null;
+        defer if (legacy_wait_io) |*owned| owned.deinit();
+        const wait_io = if (self.context_runtime) |runtime|
+            runtime.io() orelse return error.BackendRuntimeIoUnavailable
+        else blk: {
+            legacy_wait_io = .init(self.alloc, .{});
+            break :blk legacy_wait_io.?.io();
+        };
         const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
         const name_filter: ?[]const u8 = if (table_name.len == 0) null else table_name;
         while (true) {
@@ -2488,6 +2501,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (request.operation != .artifact) try feature_reads.FeatureReads.init(self.read_safety_barrier).prepareLookupWithConsistency(group_id, "", .{
             .execution_deadline_ns = context.deadline_ns,
             .execution_io = context.deadline_io,
+            .fanout_io = context.fanout_io,
             .cancellation = context.cancellation,
         }, .read_index);
         const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
@@ -3423,13 +3437,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         transition_wait: ?*@import("../storage/hot_standby/owner_preflight_admission.zig").OwnerTransition = null,
         execution_deadline_ns: ?u64 = null,
         execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
+        fanout_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
         historical_raft_apply: bool = false,
         online_preparation: bool = false,
         allow_deferred_catalog: bool = false,
 
         fn from(req: anytype) ReadControls {
-            return .{ .execution_runnable = if (@hasField(@TypeOf(req), "execution_runnable")) req.execution_runnable else null, .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
+            return .{ .fanout_io = if (@hasField(@TypeOf(req), "fanout_io")) req.fanout_io else null, .execution_runnable = if (@hasField(@TypeOf(req), "execution_runnable")) req.execution_runnable else null, .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
         }
 
         fn catalogBudget(self: ReadControls, catalog: table_catalog.CatalogSource) table_catalog.RoutingBudget {
@@ -4252,14 +4267,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         controls: ReadControls,
     ) !Lease {
         errdefer if (exclusive) self.clearExclusivePending(group_id, table_name);
-        var wait_io_impl = std.Io.Threaded.init(self.alloc, .{});
-        defer wait_io_impl.deinit();
-        const wait_io = wait_io_impl.io();
+        var receiver: request_execution_io.Borrow = .{};
+        var legacy_wait_io: ?std.Io.Threaded = null;
+        defer if (legacy_wait_io) |*owned| owned.deinit();
+        const wait_io = if (controls.transition_wait) |scope|
+            scope.executionIo()
+        else if (controls.fanout_io != null or self.context_runtime != null)
+            try self.borrowRequestIo(&receiver, controls.fanout_io)
+        else blk: {
+            legacy_wait_io = .init(self.alloc, .{});
+            break :blk legacy_wait_io.?.io();
+        };
         const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
         while (true) {
             try controls.check();
             if (controls.transition_wait) |scope| {
-                try scope.wait(wait_io, .fromMilliseconds(1), deadline_ns);
+                try scope.wait(.fromMilliseconds(1), deadline_ns);
             } else {
                 try @import("runnable_fanout_owner.zig").sleepForProgress(if (controls.retain_cpu) null else controls.execution_runnable, wait_io, .fromMilliseconds(1));
             }
@@ -5588,7 +5611,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn batchGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, context: @import("antfly_local_sources").api_local_transaction_contract.PreDecisionContext) !?void {
-        const original: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
+        const original: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation };
         try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(original, context.execution_runnable);
         if (req.transaction) |transaction| switch (transaction) {
             .acknowledge, .acknowledge_many => return acknowledgeTransactionGroupLocalWithContext(ptr, alloc, group_id, table_name, req, context),
@@ -5619,8 +5642,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         original_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
     ) !?void {
         if (original_context) |original| try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(original, original_runnable);
-        var admission_io: ?std.Io.Threaded = if (original_context != null) .init(self.alloc, .{}) else null;
-        defer if (admission_io) |*owner| owner.deinit();
+        var request_io: request_execution_io.Borrow = .{};
+        const admission_io: ?std.Io = if (original_context) |original| try self.borrowRequestIo(&request_io, original.fanout_io) else null;
         const controlled = @import("../storage/hot_standby/owner_preflight_admission.zig");
         if (self.replication_write_gate) |gate| try gate.check();
         const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
@@ -5632,26 +5655,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer if (capture_root) |*root| root.release();
         var replication_mutation = if (original_context) |original|
             if (capture_root) |*root|
-                try controlled.acquireMutationWithRoot(self.hot_standby_async_mirror, original, admission_io.?.io(), original_runnable, root)
+                try controlled.acquireMutationWithRoot(self.hot_standby_async_mirror, original, admission_io.?, original_runnable, root)
             else
-                try controlled.acquireMutationWithRunnable(self.hot_standby_async_mirror, original, admission_io.?.io(), original_runnable)
+                try controlled.acquireMutationWithRunnable(self.hot_standby_async_mirror, original, admission_io.?, original_runnable)
         else if (self.hot_standby_async_mirror) |mirror|
             if (mirror.mutation_barrier) |barrier| barrier.acquireShared() else null
         else
             null;
         defer if (replication_mutation) |*lease| lease.release();
         if (original_context) |original| {
-            try controlled.preflightWithRunnable(self.hot_standby_async_mirror, original, admission_io.?.io(), original_runnable);
+            try controlled.preflightWithRunnable(self.hot_standby_async_mirror, original, admission_io.?, original_runnable);
         } else try self.preflightHotStandbyMirrorSyncCommit();
         const request_json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(request_json);
         const private_path = if (descriptor != null) try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id }) else null;
         defer if (private_path) |path| alloc.free(path);
         var transition: ?controlled.OwnerTransition = if (original_context != null and req.transaction == null)
-            controlled.OwnerTransition.init(original_context.?, original_runnable, admission_io.?.io(), if (capture_root) |*root| root else null, &replication_mutation, self.replication_write_gate)
+            controlled.OwnerTransition.init(original_context.?, original_runnable, admission_io.?, if (capture_root) |*root| root else null, &replication_mutation, self.replication_write_gate)
         else
             null;
-        const controls: ReadControls = if (original_context) |original| .{ .execution_deadline_ns = original.deadline_ns, .execution_io = original.deadline_io, .cancellation = original.cancellation, .execution_runnable = original_runnable, .retain_cpu = true, .transition_wait = if (transition) |*scope| scope else null } else .{};
+        const controls: ReadControls = if (original_context) |original| .{ .execution_deadline_ns = original.deadline_ns, .execution_io = original.deadline_io, .fanout_io = original.fanout_io, .cancellation = original.cancellation, .execution_runnable = original_runnable, .retain_cpu = true, .transition_wait = if (transition) |*scope| scope else null } else .{};
         var lease = if (descriptor) |owned|
             try self.acquireDescriptorWithMode(group_id, table_name, private_path.?, owned, false, .resident, controls)
         else
@@ -5688,9 +5711,9 @@ pub const ProvisionedKernelOwnerSource = struct {
             null;
         var response: client.Response = .{};
         var execution_admission: controlled.Session = .{};
-        const execution_port = if (original_context) |original| try execution_admission.bindWithRunnable(original, admission_io.?.io(), original_runnable) else null;
+        const execution_port = if (original_context) |original| try execution_admission.bindWithRunnable(original, admission_io.?, original_runnable) else null;
         const batch_admission = @import("antfly_local_sources").api_batch_execution_admission;
-        const producer_io: ?std.Io = if (original_context != null) admission_io.?.io() else null;
+        const producer_io: ?std.Io = if (original_context != null) admission_io.? else null;
         const producer_deadline: ?u64 = if (original_context) |original| (try platformDeadlineContext(original)).deadline_ns else null;
         var batch_payload: ?batch_admission.Payload = if (execution_port) |port| .{
             .original = port,
@@ -6207,7 +6230,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             defer descriptor.deinit(alloc);
             const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
             defer alloc.free(path);
-            return self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation });
+            return self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation });
         }
         if (req.transaction) |txn| switch (txn) {
             .resolve, .acknowledge, .acknowledge_many => if (try self.acquireHiddenTransactionOwner(group_id, table_name)) |lease| return lease,
@@ -6269,14 +6292,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         context: @import("antfly_local_sources").api_distributed_txn_contract.PreDecisionContext,
     ) !?void {
         const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
-        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation };
         try original.checkOriginal(active, context.execution_runnable);
         if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
         if (!context.requiresAwareCallback()) return txnBeginGroupLocal(ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
         if ((context.restore_staging_scope == null) != (context.restore_staging_plan_id == null)) return error.RestoreStagingScopeChanged;
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var receiver = if (context.deadline_io) |borrow| try borrow.receive() else null;
-        const io = if (receiver) |*received| received.io() else if (self.context_runtime) |runtime| runtime.io() orelse return error.BackendRuntimeIoUnavailable else return error.BackendRuntimeIoUnavailable;
+        var receiver: request_execution_io.Borrow = .{};
+        const io = try self.borrowRequestIo(&receiver, context.fanout_io);
         const Controls = NativeTransactionControls;
         const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
         const admission = @import("antfly_local_sources").common_read_admission;
@@ -6288,7 +6311,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (fence.topology_epoch != topology_epoch) return error.TopologyChanged;
             try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
         }
-        const controls: ReadControls = .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true };
+        const controls: ReadControls = .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true };
         var lease = if (context.restore_staging_scope) |scope| block: {
             var descriptor = try self.resolveRestoreDescriptorWithRunnable(alloc, group_id, table_name, scope, context.restore_staging_plan_id, .mutate, active, context.execution_runnable);
             defer descriptor.deinit(alloc);
@@ -6349,15 +6372,15 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn txnPrepareGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_types.TxnId, topology_epoch: u64, req: db_types.TransactionIntentRequest, context: @import("antfly_local_sources").api_distributed_txn_contract.PreDecisionContext) !?void {
         const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
-        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation };
         try original.checkOriginal(active, context.execution_runnable);
         if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
         if (context.restore_staging_scope != null or context.restore_staging_plan_id != null or req.restore_staging_scope != null or req.restore_staging_plan_id != null) return error.UnsupportedOperation;
         if (!context.requiresAwareCallback()) return txnPrepareGroupLocal(ptr, alloc, group_id, table_name, txn_id, topology_epoch, req);
         if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var receiver = if (context.deadline_io) |borrow| try borrow.receive() else null;
-        const io = if (receiver) |*received| received.io() else if (self.context_runtime) |runtime| runtime.io() orelse return error.BackendRuntimeIoUnavailable else return error.BackendRuntimeIoUnavailable;
+        var receiver: request_execution_io.Borrow = .{};
+        const io = try self.borrowRequestIo(&receiver, context.fanout_io);
         const Controls = NativeTransactionControls;
         const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
         const admission = @import("antfly_local_sources").common_read_admission;
@@ -6369,7 +6392,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (fence.topology_epoch != topology_epoch) return error.TopologyChanged;
             try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
         }
-        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
         defer lease.deinit();
         if (lease.entry.restore_bootstrap_json.len != 0) return error.UnsupportedOperation;
         if (context.route_fence) |fence| {
@@ -6409,14 +6432,14 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn txnResolveGroupLocalWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_types.TxnId, status: db_types.TxnStatus, commit_version: u64, topology_epoch: u64, sync_level: db_types.SyncLevel, context: @import("antfly_local_sources").api_distributed_txn_contract.PreDecisionContext) !?void {
         const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
-        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation };
         try original.checkOriginal(active, context.execution_runnable);
         if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
         if (context.restore_staging_scope != null or context.restore_staging_plan_id != null) return error.UnsupportedOperation;
         if (!context.requiresAwareCallback()) return txnResolveGroupLocal(ptr, alloc, group_id, table_name, txn_id, status, commit_version, topology_epoch, sync_level);
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var receiver = if (context.deadline_io) |borrow| try borrow.receive() else null;
-        const io = if (receiver) |*received| received.io() else if (self.context_runtime) |runtime| runtime.io() orelse return error.BackendRuntimeIoUnavailable else return error.BackendRuntimeIoUnavailable;
+        var receiver: request_execution_io.Borrow = .{};
+        const io = try self.borrowRequestIo(&receiver, context.fanout_io);
         const Controls = NativeTransactionControls;
         const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
         const admission = @import("antfly_local_sources").common_read_admission;
@@ -6428,7 +6451,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             if (fence.topology_epoch != topology_epoch) return error.TopologyChanged;
             try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
         }
-        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
         defer lease.deinit();
         if (lease.entry.restore_bootstrap_json.len != 0) return error.UnsupportedOperation;
         if (context.route_fence) |fence| {
@@ -6481,7 +6504,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }, .read_index);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer alloc.free(path);
-        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation });
+        var lease = try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation });
         defer lease.deinit();
         try context.ensureActive();
         return switch (try lease.owner().transactionStatus(table_name, req.txn_id)) {
@@ -6528,8 +6551,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         // Deferred read pins need an independent drainer; a source without
         // that control worker cannot safely advertise this status provider.
         if (!self.apply_control_started.load(.acquire)) return error.PreparedTransactionProtocolUnavailable;
-        var receiver = if (context.deadline_io) |borrow| try borrow.receive() else null;
-        const io = if (receiver) |*received| received.io() else if (self.context_runtime) |runtime| runtime.io() orelse return error.PreparedTransactionProtocolUnavailable else return error.PreparedTransactionProtocolUnavailable;
+        var receiver: request_execution_io.Borrow = .{};
+        const io = self.borrowRequestIo(&receiver, context.fanout_io) catch |err| switch (err) {
+            error.BackendRuntimeIoUnavailable => return error.PreparedTransactionProtocolUnavailable,
+            else => return err,
+        };
         const Controls = struct {
             require_checked_reentry: bool = true,
             context: request_operation.RequestContext,
@@ -6598,7 +6624,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn acknowledgeTransactionGroupLocalWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, context: @import("antfly_local_sources").api_local_transaction_contract.PreDecisionContext) !?void {
         const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
-        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation };
         try original.checkOriginal(active, context.execution_runnable);
         if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
         if (context.restore_staging_scope != null or context.restore_staging_plan_id != null or req.restore_staging_scope != null or req.restore_staging_plan_id != null) return error.UnsupportedOperation;
@@ -6632,8 +6658,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             } else if (!std.meta.eql(value, @field(empty, name))) return error.InvalidBatchRequest;
         }
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        var receiver = if (context.deadline_io) |borrow| try borrow.receive() else null;
-        const io = if (receiver) |*received| received.io() else if (self.context_runtime) |runtime| runtime.io() orelse return error.BackendRuntimeIoUnavailable else return error.BackendRuntimeIoUnavailable;
+        var receiver: request_execution_io.Borrow = .{};
+        const io = try self.borrowRequestIo(&receiver, context.fanout_io);
         const Controls = NativeTransactionControls;
         const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
         const admission = @import("antfly_local_sources").common_read_admission;
@@ -6644,7 +6670,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (context.route_fence) |fence| {
             try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
         }
-        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
         defer lease.deinit();
         if (lease.entry.restore_bootstrap_json.len != 0) return error.UnsupportedOperation;
         if (context.route_fence) |fence| {

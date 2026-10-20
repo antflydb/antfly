@@ -1837,6 +1837,7 @@ fn consumerTests() type {
                 },
                 .deadline_ns = 180,
                 .deadline_io = origin.borrow(),
+                .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io),
                 .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled),
                 .restore_staging_scope = @splat(3),
                 .restore_staging_plan_id = @splat(4),
@@ -1847,6 +1848,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?u64, 10_080), translated.deadline_ns);
             try std.testing.expectEqual(@as(i96, 55), @as(i96, @intCast(translated.deadline_ns.?)) - target.current);
             try std.testing.expectEqualDeep(original.execution_runnable, translated.execution_runnable);
+            try std.testing.expectEqualDeep(original.fanout_io, translated.fanout_io);
             try std.testing.expectEqualDeep(original.route_fence, translated.route_fence);
             try std.testing.expectEqualDeep(original.cancellation, translated.cancellation);
             try std.testing.expectEqualDeep(original.restore_staging_scope, translated.restore_staging_scope);
@@ -1924,6 +1926,7 @@ fn consumerTests() type {
                 .{ .execution_runnable = runnable },
                 .{ .deadline_ns = 123 },
                 .{ .deadline_io = clock },
+                .{ .fanout_io = clock },
                 .{ .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) },
                 .{ .cancellation = .{ .ptr = &canceled } },
                 .{ .cancellation = .{ .check_fn = Fake.fence } },
@@ -1960,7 +1963,7 @@ fn consumerTests() type {
                 try std.testing.expectError(error.Canceled, source.txnPrepareGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 2, .{}, fake.expected));
                 canceled.store(false, .release);
             }
-            try std.testing.expectEqual(@as(usize, 40), fake.aware_calls);
+            try std.testing.expectEqual(@as(usize, 4) * (contexts.len + 1), fake.aware_calls);
         }
 
         test "compiled table write boundary preserves local resolve completion cancellation" {

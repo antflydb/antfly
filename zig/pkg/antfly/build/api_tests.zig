@@ -3313,7 +3313,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const group_batch_context_check = b.addTest(.{
         .name = "group-batch-context-check",
         .root_module = group_batch_context_root,
-        .filters = &.{ "controlled group batch context hosted route", "controlled range tracking lifetime" },
+        .filters = &.{ "controlled group batch context hosted route", "controlled range tracking lifetime", "controlled range tracking context preserves" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-group-batch-context-check", "Analyze actual hosted control-only batch context forwarding without emitting a binary")
@@ -3367,6 +3367,67 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     online_owner_source_run.addArg("--require-no-skips");
     b.step("antfly-online-owner-preparation-source-test", "Exercise actual source scheduling, pending admission and controlled descriptor confirmation")
         .dependOn(&online_owner_source_run.step);
+    const request_execution_admission_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/request_execution_admission_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const request_execution_admission_sources = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/source_catalog.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    request_execution_admission_sources.addImport("antfly_local_test_sources", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_inference_test_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    request_execution_admission_sources.addImport("antfly_cancellation", antfly_imports.cancellation);
+    request_execution_admission_sources.addImport("antfly_platform", antfly_imports.platform);
+    request_execution_admission_sources.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    request_execution_admission_sources.addImport("storage_engine_errors", antfly_imports.storage_boundary.engine_errors);
+    request_execution_admission_sources.addImport("antfly_source_root", request_execution_admission_root);
+    request_execution_admission_root.link_libc = true;
+    request_execution_admission_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    request_execution_admission_root.addImport("antfly_platform", antfly_imports.platform);
+    request_execution_admission_root.addImport("antfly_local_sources", request_execution_admission_sources);
+    request_execution_admission_root.addImport("antfly_source_root", request_execution_admission_root);
+    const request_execution_archive_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/batch_visibility_archive_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    request_execution_archive_root.link_libc = true;
+    request_execution_archive_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    request_execution_archive_root.addImport("antfly_cancellation", antfly_imports.cancellation);
+    request_execution_archive_root.addImport("antfly_platform", antfly_imports.platform);
+    request_execution_archive_root.addImport("antfly_source_root", request_execution_archive_root);
+    const request_execution_archive = b.addLibrary(.{
+        .name = "request-execution-admission-fixture",
+        .linkage = .static,
+        .root_module = request_execution_archive_root,
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    request_execution_admission_root.linkLibrary(request_execution_archive);
+    const request_execution_admission_tests = b.addTest(.{
+        .name = "request-execution-admission-tests",
+        .root_module = request_execution_admission_root,
+        .filters = &.{"controlled owner preflight"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-request-execution-admission-test", "Verify original executor, CPU and holder retirement through native visibility contracts")
+        .dependOn(&b.addRunArtifact(request_execution_admission_tests).step);
+
+    const request_execution_io_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/request_execution_io.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, request_execution_io_root);
+    const request_execution_io_tests = b.addTest(.{ .root_module = request_execution_io_root });
+    b.step("antfly-request-execution-io-test", "Verify borrowed execution IO without a per-request pool or clock fallback")
+        .dependOn(&b.addRunArtifact(request_execution_io_tests).step);
+
     const native_begin_source_check = b.addTest(.{
         .root_module = owner_preflight_context_root,
         .filters = &.{ "controlled native BEGIN source", "controlled native completion source", "controlled native PREPARE source", "controlled native ACK source" },

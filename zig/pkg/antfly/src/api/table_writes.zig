@@ -5136,12 +5136,8 @@ const TestEmbeddingRequest = struct {
 /// retained this route. Both adapters keep the same request lifetime capability.
 fn dispatchRangeTrackingBatch(alloc: std.mem.Allocator, batcher: ?RaftBatcher, local: ?TableWriteSource, fence: metadata_api.CatalogRouteFence, table: []const u8, request: @import("antfly_local_sources").api_operation.RequestContext) !void {
     try request.ensureExecutionActive();
-    const context: distributed_txn.PreDecisionContext = .{
-        .deadline_ns = request.deadline_ns,
-        .deadline_io = request.deadline_io,
-        .cancellation = request.cancellation,
-        .execution_runnable = if (request.execution_team) |team| team.borrow else null,
-    };
+    var context = distributed_txn.PreDecisionContext.fromRequest(request);
+    context.execution_runnable = if (request.execution_team) |team| team.borrow else null;
     if (batcher) |owner| return owner.batchGroupRoutedWithPreDecisionContext(alloc, fence, table, .{ .activate_range_tracking = true }, request.cancellation, context);
     const source = local orelse return error.SqlRangeTrackingRequired;
     _ = (try source.batchGroupLocalWithPreDecisionContext(alloc, fence.route.group_id, table, .{ .activate_range_tracking = true }, context)) orelse return error.StorageKernelOwnerUnavailable;
@@ -21789,6 +21785,7 @@ pub const ProvisionedTableWriteSource = struct {
                 var admission = try self.acquireRoutedWriteAdmissionWithPreDecisionContext(alloc, table, fence, deadline, .{
                     .deadline_ns = context.deadline_ns,
                     .deadline_io = context.deadline_io,
+                    .fanout_io = context.fanout_io,
                     .cancellation = context.cancellation,
                     .execution_runnable = if (context.execution_team) |team| team.borrow else null,
                 });
@@ -65134,8 +65131,8 @@ test "controlled range tracking context preserves routed and local original auth
     var signal = std.atomic.Value(bool).init(false);
     var io = std.testing.io;
     var team: runtime.runnable_abi.Team = .{ .borrow = .{ .context = &capture, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .checkpoint = Capture.checkpoint, .park = Capture.phase, .enter = Capture.phase, .check_lifetime = Capture.lifetime }, .maximum_slots = 1, .allocator = std.testing.allocator };
-    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .execution_team = &team, .deadline_ns = std.math.maxInt(u64), .deadline_io = runtime.io_abi.Borrow.init(&io), .cancellation = .fromAtomic(&signal) };
-    capture.expected = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation, .execution_runnable = team.borrow };
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .fanout_io = runtime.io_abi.Borrow.init(&io), .execution_team = &team, .deadline_ns = std.math.maxInt(u64), .deadline_io = runtime.io_abi.Borrow.init(&io), .cancellation = .fromAtomic(&signal) };
+    capture.expected = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .fanout_io = context.fanout_io, .cancellation = context.cancellation, .execution_runnable = team.borrow };
     const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 5, .topology_epoch = 1, .route = .{ .group_id = 7001, .range_id = 7001, .identity_namespace = .{ .table_id = 5, .shard_id = 7001, .range_id = 7001 } } };
     const batcher: RaftBatcher = .{ .ptr = &capture, .vtable = &.{ .batch_group = Capture.unexpected, .batch_group_local = Capture.unexpected, .batch_group_routed_with_pre_decision_context = Capture.routed } };
     const local: TableWriteSource = .{ .ptr = &capture, .vtable = &.{ .batch = undefined, .batch_group_local_with_pre_decision_context = Capture.local } };

@@ -31,6 +31,20 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const execution_io_context_filters = [_][]const u8{
+        "predecision commit context preserves execution IO",
+        "compiled table write boundary",
+        "controlled group batch context preserves aware dispatch",
+    };
+    const execution_io_context_tests = b.addTest(.{
+        .name = "execution-io-context-tests",
+        .root_module = antfly_test_mod,
+        .filters = &execution_io_context_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-execution-io-context-test", "Verify executor capability transport, clock separation and legacy refusal")
+        .dependOn(&addCuratedTestRunArtifact(b, execution_io_context_tests, &execution_io_context_filters).step);
     const provider_control_filters = [_][]const u8{
         "storage.db.enrichment.embedder.test.",
         "storage.db.enrichment.asset_producer.test.",

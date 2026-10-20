@@ -101,9 +101,12 @@ pub const OwnerTransition = struct {
     pub fn init(context: Context, runnable: ?Runnable, io: std.Io, root: ?*Barrier.RootSharedLease, parent: *?Barrier.SharedLease, gate: ?sources.storage_db_replication_contract.WriteGate) @This() {
         return .{ .budget = .{ .controls = .{ .context = context, .execution_runnable = runnable }, .io = io }, .root = root, .parent = parent, .gate = gate };
     }
-    pub fn wait(self: *@This(), io: std.Io, duration: std.Io.Duration, deadline_ns: u64) !void {
+    pub fn executionIo(self: *const @This()) std.Io {
+        return self.budget.io;
+    }
+    pub fn wait(self: *@This(), duration: std.Io.Duration, deadline_ns: u64) !void {
         self.budget.controls.wait_deadline_ns = deadline_ns;
-        return self.boundary().run(std.Io.sleep, .{ io, duration, std.Io.Clock.awake });
+        return self.boundary().run(std.Io.sleep, .{ self.budget.io, duration, std.Io.Clock.awake });
     }
     pub fn boundary(self: *@This()) sources.common_execution_wait.Boundary {
         return .{ .ptr = self, .begin = begin, .end = end };
@@ -354,7 +357,8 @@ test "controlled owner preflight transition retires capture and lends original C
         vtable.sleep = Fixture.sleep;
         const io: std.Io = .{ .userdata = &fixture, .vtable = &vtable };
         var transition = OwnerTransition.init(.{ .cancellation = .{ .ptr = &fixture, .check_fn = Fixture.check } }, team.borrow, io, &root, &parent, null);
-        const result = transition.boundary().run(std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(1), std.Io.Clock.awake });
+        try std.testing.expect(transition.executionIo().userdata == io.userdata);
+        const result = transition.wait(.fromMilliseconds(1), std.math.maxInt(u64));
         switch (case) {
             .success => try result,
             .cancel, .sleep_failure => try std.testing.expectError(error.Canceled, result),
@@ -415,7 +419,7 @@ test "controlled owner preflight transition refuses retirement with another borr
     try std.testing.expectError(error.InvalidRunnableTransition, transition.boundary().beginWait());
     try std.testing.expect(root.held and parent != null and root.borrowers.load(.acquire) == 2);
     child.release();
-    try std.testing.expectError(error.StorageBusy, transition.wait(std.testing.io, .zero, 0));
+    try std.testing.expectError(error.StorageBusy, transition.wait(.zero, 0));
     try std.testing.expect(root.held and parent != null and root.borrowers.load(.acquire) == 1);
 }
 
