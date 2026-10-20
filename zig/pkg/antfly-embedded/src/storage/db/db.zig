@@ -63215,6 +63215,7 @@ test "db controlled generated providers independently admit CPU at one ordinary 
         db: ?*DB = null,
         parent: native.Execution = .{},
         child: native.Execution = .{},
+        peer: native.Execution = .{},
         child_io: ?runtime.io_abi.Receiver = null,
         cancelled: bool = false,
         scenario: usize,
@@ -63229,7 +63230,7 @@ test "db controlled generated providers independently admit CPU at one ordinary 
                 return @ptrCast(@alignCast(raw));
             }
             fn borrow(self: *@This()) abi.Borrowed {
-                return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(abi.Class.write), .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .reserve_child = reserve, .activate_child = activate, .check_lifetime = lifetime, .current_class = currentClass };
+                return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(abi.Class.write), .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .reserve_child = reserve, .activate_child = activate, .activate_child_checked = activateChecked, .check_lifetime = lifetime, .current_class = currentClass };
             }
             fn checkpoint(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
                 from(raw).execution.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
@@ -63244,7 +63245,10 @@ test "db controlled generated providers independently admit CPU at one ordinary 
                 return .ok;
             }
             fn park(raw: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
-                from(raw).execution.park(.resource_blocked) catch |err| return runtime.error_abi.statusFromError(err);
+                const self = from(raw);
+                self.execution.park(.resource_blocked) catch |err| return runtime.error_abi.statusFromError(err);
+                if (self.execution == &self.fixture.parent and self.fixture.scenario == 4)
+                    self.fixture.peer.start(self.fixture.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query) catch |err| return runtime.error_abi.statusFromError(err);
                 return .ok;
             }
             fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
@@ -63273,6 +63277,10 @@ test "db controlled generated providers independently admit CPU at one ordinary 
                 from(raw).execution.activateChild() catch |err| return runtime.error_abi.statusFromError(err);
                 return .ok;
             }
+            fn activateChecked(raw: *anyopaque, restriction: *const abi.Reentry) callconv(.c) runtime.error_abi.Status {
+                from(raw).execution.activateChildWithCheck(.{ .context = @constCast(restriction), .check = checkRestriction }) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
             fn finish(raw: *anyopaque) callconv(.c) void {
                 const self = from(raw);
                 self.execution.finish();
@@ -63284,6 +63292,7 @@ test "db controlled generated providers independently admit CPU at one ordinary 
         }
         fn original(raw: *const anyopaque) !void {
             const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.scenario == 4) if (self.child.entry) |entry| if (entry.state == .queued) return error.OriginalProducerActivationRejected;
             try self.parent.checkLifetime();
         }
         fn legacy(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
@@ -63340,12 +63349,13 @@ test "db controlled generated providers independently admit CPU at one ordinary 
             return output;
         }
     };
-    for ([_]bool{ false, true }) |relational| for (0..3) |kind| for (0..4) |scenario| {
+    for ([_]bool{ false, true }) |relational| for (0..3) |kind| for (0..5) |scenario| {
         var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
         defer scheduler.close();
         var fixture: Fixture = .{ .scheduler = &scheduler, .scenario = scenario };
         defer fixture.parent.finish();
         defer fixture.child.finish();
+        defer fixture.peer.finish();
         try fixture.parent.start(&scheduler, .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64), .cancellation = .{ .ptr = &fixture, .requested = Fixture.requested } }, .write);
         var parent_capsule: Fixture.Capsule = .{ .fixture = &fixture, .execution = &fixture.parent };
         var child_capsule: Fixture.Capsule = .{ .fixture = &fixture, .execution = &fixture.child };
@@ -63380,14 +63390,16 @@ test "db controlled generated providers independently admit CPU at one ordinary 
             1 => error.Canceled,
             2 => error.ResourceTemporarilyUnavailable,
             3 => error.SchedulerClosed,
+            4 => error.OriginalProducerActivationRejected,
             else => unreachable,
         }, result);
-        if (scenario == 2) try std.testing.expectEqual(@as(usize, 0), fixture.calls) else {
+        if (scenario == 2 or scenario == 4) try std.testing.expectEqual(@as(usize, 0), fixture.calls) else {
             try std.testing.expect(fixture.calls >= 1 and fixture.calls <= (if (kind == 2) @as(usize, 2) else 1));
         }
         try std.testing.expectEqual(@as(usize, if (scenario == 2) 0 else 1), fixture.releases);
         try std.testing.expect(fixture.child.entry == null);
-        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, if (scenario == 4) 2 else 1), scheduler.stats().operations);
+        if (scenario == 4) try std.testing.expectEqual(native.State.running, fixture.peer.entry.?.state);
         try std.testing.expect(db.local_execution.row_policy_gate.quiesced());
         const value = try db.get(std.testing.allocator, "doc:cpu");
         defer if (value) |bytes| std.testing.allocator.free(bytes);

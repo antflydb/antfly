@@ -27,7 +27,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .check_lifetime = checkLifetime, .current_class = currentClass, .cpu_borrow = cpuBorrow, .request_resources = requestResources, .enter_resources = enterResources };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .activate_child_checked = activateChildChecked, .check_lifetime = checkLifetime, .current_class = currentClass, .cpu_borrow = cpuBorrow, .request_resources = requestResources, .enter_resources = enterResources };
     }
 };
 
@@ -160,6 +160,11 @@ fn reserveChildChecked(raw: *anyopaque, options: *const abi.ChildStart) !void {
 }
 fn activateChild(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
     capsule(raw).execution.activateChild() catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+
+fn activateChildChecked(raw: *anyopaque, restriction: *const abi.Reentry) callconv(.c) runtime.error_abi.Status {
+    @import("runnable_reentry.zig").activateChild(&capsule(raw).execution, restriction) catch |err| return runtime.error_abi.statusFromError(err);
     return .ok;
 }
 
@@ -1101,4 +1106,52 @@ test "runnable execution CPU borrow port preserves capsule ownership and returns
     handle = null;
     try std.testing.expectEqual(@as(u64, 0), value.owner.scheduler.stats().retained_bytes);
     try std.testing.expectEqual(@as(usize, 0), value.owner.borrowers);
+}
+
+test "runnable execution checked child activation preserves refusal before queue during queue and after grant" {
+    const Scope = struct {
+        state: *State,
+        execution: *runnable.Execution,
+        reject_at: runnable.State,
+        checks: usize = 0,
+        fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.state.owner.scheduler.stats();
+            self.checks += 1;
+            if (self.execution.entry.?.state == self.reject_at)
+                return runtime.error_abi.statusFromError(error.DeadlineExceeded);
+            return .ok;
+        }
+    };
+    for ([_]runnable.State{ .resource_blocked, .queued, .running }) |reject_at| {
+        var owner_state: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 2, .control_slots = 1 }), .native_now_ns = TestClock.now };
+        defer owner_state.owner.tryDeinit() catch @panic("owner leaked");
+        const port = owner_state.port();
+        const io = std.testing.io;
+        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+        var parent: ?*anyopaque = null;
+        try std.testing.expect(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.Class.query), .out_handle = &parent }).isOk());
+        defer port.finish(parent.?);
+        const parent_borrow = try abi.Borrowed.fromOwner(port, parent.?, 1, .query);
+        var child: abi.Child = undefined;
+        try parent_borrow.reserveChild(&.{ .io = &io_borrow, .out_child = &child });
+        defer child.deinit();
+        try std.testing.expect(parent_borrow.park(parent_borrow.context, @backingInt(abi.Wait.resource)).isOk());
+        var peer: runnable.Execution = .{};
+        defer peer.finish();
+        if (reject_at == .queued)
+            try peer.start(&owner_state.owner.scheduler, .{ .io = io, .allow_wait = false }, .query);
+        var scope: Scope = .{ .state = &owner_state, .execution = &capsule(child.borrow.context).execution, .reject_at = reject_at };
+        const restriction: abi.Reentry = .{ .context = &scope, .check = Scope.check };
+        const retained = owner_state.owner.scheduler.stats().retained_bytes;
+        try std.testing.expectError(error.DeadlineExceeded, child.activateChecked(&restriction));
+        try std.testing.expectEqual(runnable.State.stopped, scope.execution.entry.?.state);
+        const checks = scope.checks;
+        try std.testing.expectError(error.DeadlineExceeded, child.activateChecked(&restriction));
+        try std.testing.expectEqual(checks, scope.checks);
+        try std.testing.expectEqual(retained, owner_state.owner.scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, if (reject_at == .queued) 3 else 2), owner_state.owner.scheduler.stats().operations);
+        child.deinit();
+        try std.testing.expectEqual(@as(usize, if (reject_at == .queued) 2 else 1), owner_state.owner.scheduler.stats().operations);
+    }
 }

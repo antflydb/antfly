@@ -1925,6 +1925,7 @@ pub const Execution = struct {
         enter_checked: ?*const fn (*anyopaque, Class, AdmissionCheck) anyerror!void = null,
         reserve_child: *const fn (*anyopaque, std.Io, u64, *Execution) anyerror!void,
         activate_child: *const fn (*anyopaque) anyerror!void,
+        activate_child_checked: ?*const fn (*anyopaque, AdmissionCheck) anyerror!void = null,
         finish: *const fn (*anyopaque) void,
     };
 
@@ -2158,10 +2159,20 @@ pub const Execution = struct {
     /// Published task ownership survives rejected activation until physical
     /// join and owning finish. This cannot replay an already activated child.
     pub fn activateChild(self: *Execution) !void {
+        return self.activateChildWithCheck(null);
+    }
+
+    /// Synchronous original-scope restriction stays borrowed through queueing
+    /// and the post-grant check. Refusal retains physical child ownership.
+    pub fn activateChildWithCheck(self: *Execution, restriction: ?AdmissionCheck) !void {
         if (self.borrowed) |borrow| {
-            if (!self.child_pending) return error.InvalidRunnableTransition;
+            if (!self.child_pending) {
+                try borrow.check_lifetime(borrow.ptr);
+                return error.InvalidRunnableTransition;
+            }
+            if (restriction != null and borrow.activate_child_checked == null) return error.ExecutionWaitUnsupported;
             self.child_pending = false;
-            try borrow.activate_child(borrow.ptr);
+            if (restriction) |fence| try borrow.activate_child_checked.?(borrow.ptr, fence) else try borrow.activate_child(borrow.ptr);
             self.resume_generation +%= 1;
             return;
         }
@@ -2172,8 +2183,12 @@ pub const Execution = struct {
         }
         self.child_pending = false;
         const owner = try schedulerFor(e, false);
+        if (restriction) |fence| fence.checkpoint() catch |err| {
+            owner.failWait(e, err, true);
+            return err;
+        };
         try owner.unblock(e);
-        try owner.waitRetained(e);
+        try owner.waitRetainedWithCheck(e, restriction);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
         self.read_sample_ns = self.quantum_start_ns;

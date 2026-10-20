@@ -21,7 +21,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 17;
+pub const abi_version: u32 = 18;
 /// Synchronous, non-yielding restriction on the original CPU-return wait.
 /// Borrowed only until enterChecked returns; never retained by the owner.
 /// Rejection stops that execution and does not retire physical ownership.
@@ -209,6 +209,8 @@ pub const Owner = extern struct {
     /// complete bundle with CPU, and detaches the participant on every return.
     /// The caller retains granted physical resources through their actual joins.
     enter_resources: ?*const fn (*anyopaque, *const ResourceBundle, ?*const Reentry) callconv(.c) errors.Status = null,
+    /// Original call-scoped restriction, borrowed synchronously until activation returns.
+    activate_child_checked: ?*const fn (*anyopaque, *const Reentry) callconv(.c) errors.Status = null,
 
     /// Resource-capable owners advertise both initial and parked grants through
     /// request_resources. Require that capability before invoking start, so an
@@ -313,6 +315,14 @@ pub const Owner = extern struct {
         if (!status.isOk()) return errors.errorFromStatus(status);
     }
 
+    pub fn activateChildChecked(self: Owner, child: *anyopaque, restriction: *const Reentry) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        try restriction.validate();
+        const callback = self.activate_child_checked orelse return error.ExecutionWaitUnsupported;
+        const status = callback(child, restriction);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
     pub fn resizeTeam(self: Owner, handle: *anyopaque, slots: usize) !void {
         if (!self.valid()) return error.UnsupportedVersion;
         if (slots == 0) return error.InvalidRunnableDemand;
@@ -393,6 +403,8 @@ pub const Borrowed = extern struct {
     /// A foreground producer may request a scoped parent only after retiring
     /// service holders. This does not activate durable completion authority.
     producer_parent: ?*const fn (*anyopaque, *Borrowed) callconv(.c) errors.Status = null,
+    /// Original call-scoped restriction, borrowed synchronously until activation returns.
+    activate_child_checked: ?*const fn (*anyopaque, *const Reentry) callconv(.c) errors.Status = null,
 
     pub fn producerParent(self: Borrowed) !Borrowed {
         try self.validate();
@@ -464,6 +476,14 @@ pub const Borrowed = extern struct {
         try self.validate();
         const callback = self.activate_child orelse return error.UnsupportedOperation;
         const status = callback(self.context);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn activateChildChecked(self: Borrowed, restriction: *const Reentry) !void {
+        try self.validate();
+        try restriction.validate();
+        const callback = self.activate_child_checked orelse return error.ExecutionWaitUnsupported;
+        const status = callback(self.context, restriction);
         if (!status.isOk()) return errors.errorFromStatus(status);
     }
 
@@ -554,6 +574,7 @@ pub const Borrowed = extern struct {
             .completion_remaining_ns = owner.completion_remaining_ns,
             .reserve_child = owner.reserve_child,
             .activate_child = owner.activate_child,
+            .activate_child_checked = owner.activate_child_checked,
             .check_lifetime = owner.check_lifetime,
             .current_class = owner.current_class,
             .enter_checked = owner.enter_checked,
@@ -583,6 +604,10 @@ pub const Child = extern struct {
     pub fn activate(self: *Child) !void {
         try self.validate();
         try self.borrow.activateChild();
+    }
+    pub fn activateChecked(self: *Child, restriction: *const Reentry) !void {
+        try self.validate();
+        try self.borrow.activateChildChecked(restriction);
     }
     /// Call only after task publication has been abandoned or every physical
     /// consumer has joined. CPU stop/timeout is not proof of physical finish.

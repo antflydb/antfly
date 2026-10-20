@@ -59,7 +59,8 @@ pub const Stage = struct {
         holders.producer_active = true;
         self.active = true;
         try checked(borrowed.park(borrowed.context, @backingInt(abi.Wait.resource)));
-        try self.child.?.activate();
+        const restriction: abi.Reentry = .{ .context = self, .check = checkReentry };
+        try self.child.?.activateChecked(&restriction);
         try original.check();
     }
 

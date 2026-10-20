@@ -2652,7 +2652,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-metadata-runtime-memory-test", "Verify metadata executor budget lifetime, construction rollback and shared-parent control progress")
         .dependOn(&addFilteredTestRunArtifact(b, metadata_memory_tests).step);
     const admission_credit_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/inference/src/runtime/tier/memory.zig"),
+        .root_source_file = b.path("pkg/inference/src/admission_credit_test.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,

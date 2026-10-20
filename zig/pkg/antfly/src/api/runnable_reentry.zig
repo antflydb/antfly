@@ -24,6 +24,10 @@ pub fn enter(execution: *native.Execution, class: native.Class, restriction: *co
     // not imply mutable or retained ownership of the caller's restriction.
     try execution.enterWithCheck(class, .{ .context = @ptrCast(@constCast(restriction)), .check = check });
 }
+pub fn activateChild(execution: *native.Execution, restriction: *const runtime.runnable_abi.Reentry) !void {
+    try restriction.validate();
+    try execution.activateChildWithCheck(.{ .context = @ptrCast(@constCast(restriction)), .check = check });
+}
 pub fn enterWithResources(execution: *native.Execution, resources: native.GrantResources, restriction: ?*const runtime.runnable_abi.Reentry) !void {
     if (restriction) |value| try value.validate();
     try execution.enterWithResources(resources, if (restriction) |value| .{ .context = @ptrCast(@constCast(value)), .check = check } else null);

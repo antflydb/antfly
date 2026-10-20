@@ -52,6 +52,7 @@ pub const Bridge = struct {
             .enter_checked = if (self.borrow.enter_checked != null) enterChecked else null,
             .reserve_child = reserveChild,
             .activate_child = activateChild,
+            .activate_child_checked = if (self.borrow.activate_child_checked != null) activateChildChecked else null,
             .finish = finish,
         });
     }
@@ -160,6 +161,32 @@ pub const Bridge = struct {
         const self = from(raw);
         const receiver = self.owned_child orelse return error.InvalidRunnableTransition;
         try receiver.child.activate();
+    }
+    fn activateChildChecked(raw: *anyopaque, restriction: native.AdmissionCheck) !void {
+        const self = from(raw);
+        if (self.resource_rejection) |cause| return cause;
+        const receiver = self.owned_child orelse return error.InvalidRunnableTransition;
+        const Forward = struct {
+            restriction: native.AdmissionCheck,
+            rejection: ?anyerror = null,
+            fn check(context: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const value: *@This() = @ptrCast(@alignCast(context));
+                if (value.rejection) |cause| return runtime.error_abi.statusFromError(cause);
+                value.restriction.checkpoint() catch |err| {
+                    value.rejection = err;
+                    return runtime.error_abi.statusFromError(err);
+                };
+                return .ok;
+            }
+        };
+        var forwarded: Forward = .{ .restriction = restriction };
+        receiver.child.activateChecked(&.{ .context = &forwarded, .check = Forward.check }) catch |err| {
+            if (forwarded.rejection) |cause| {
+                self.resource_rejection = cause;
+                return cause;
+            }
+            return err;
+        };
     }
     fn finish(raw: *anyopaque) void {
         const self = from(raw);
@@ -804,4 +831,49 @@ test "native execution borrow checked reentry retains caller restrictions across
             try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
         }
     }
+}
+
+test "native execution borrow checked child activation rejects queued private authority and retains ownership" {
+    const Scope = struct {
+        owner: *native.Scheduler,
+        checks: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // stats takes the owner lock: restrictions must run outside it.
+            const stats = self.owner.stats();
+            self.checks += 1;
+            if (stats.queued != 0) return error.OriginalProducerActivationRejected;
+        }
+    };
+    var owner = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer owner.close();
+    var original: native.Execution = .{};
+    defer original.finish();
+    try original.start(&owner, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+    var authority: TestAuthority = .{ .execution = &original };
+    var bridge = try Bridge.init(&authority.borrowed(), std.testing.allocator);
+    var parent: native.Execution = .{};
+    try bridge.bind(&parent);
+    defer parent.finish();
+    var child: native.Execution = .{};
+    defer child.finish();
+    try child.reserveChild(&parent, std.testing.io, @sizeOf(native.Execution) + 31);
+    try parent.park(.resource_blocked);
+    var peer: native.Execution = .{};
+    defer peer.finish();
+    try peer.start(&owner, .{ .io = std.testing.io, .allow_wait = false }, .query);
+    const retained = owner.stats().retained_bytes;
+    var scope: Scope = .{ .owner = &owner };
+    const restriction: native.AdmissionCheck = .{ .context = &scope, .check = Scope.check };
+    try std.testing.expectError(error.OriginalProducerActivationRejected, child.activateChildWithCheck(restriction));
+    try std.testing.expectEqual(@as(usize, 2), scope.checks);
+    try std.testing.expectError(error.OriginalProducerActivationRejected, child.activateChildWithCheck(restriction));
+    try std.testing.expectError(error.OriginalProducerActivationRejected, child.checkLifetime());
+    try std.testing.expectEqual(@as(usize, 2), scope.checks);
+    try std.testing.expectEqual(@as(usize, 3), owner.stats().operations);
+    try std.testing.expectEqual(retained, owner.stats().retained_bytes);
+    try std.testing.expectEqual(native.State.running, peer.entry.?.state);
+    child.finish();
+    try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
 }

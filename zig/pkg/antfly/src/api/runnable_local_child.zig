@@ -64,6 +64,7 @@ const Receiver = struct {
             .enter_checked = enterChecked,
             .reserve_child = reserveNested,
             .activate_child = activate,
+            .activate_child_checked = activateChecked,
             .check_lifetime = lifetime,
             .current_class = currentClass,
             .completion_remaining_ns = remaining,
@@ -119,6 +120,19 @@ const Receiver = struct {
         self.precheck() catch |err| return runtime.error_abi.statusFromError(err);
         self.execution.activateChild() catch |err| return runtime.error_abi.statusFromError(err);
         self.validateCurrent() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn activateChecked(raw: *anyopaque, restriction: *const abi.Reentry) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        self.precheck() catch |err| return runtime.error_abi.statusFromError(err);
+        @import("runnable_reentry.zig").activateChild(&self.execution, restriction) catch |err| return runtime.error_abi.statusFromError(err);
+        const generation = self.execution.resume_generation;
+        const validation_needed = if (self.validation) |hook| !hook.active and hook.last_generation != generation else false;
+        self.validateCurrent() catch |err| return runtime.error_abi.statusFromError(err);
+        if (validation_needed or generation != self.execution.resume_generation) restriction.checkpoint() catch |err| {
+            if (self.validation) |*hook| hook.reject(&self.execution, err);
+            return runtime.error_abi.statusFromError(err);
+        };
         return .ok;
     }
     fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
