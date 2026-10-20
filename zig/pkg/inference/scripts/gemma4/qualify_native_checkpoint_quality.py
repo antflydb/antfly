@@ -47,9 +47,32 @@ def coverage(cases, baseline, resumed, checkpoints):
             group['compacted_case_ids'].append(case['case_id'])
         else:
             group['fallback_case_ids'].append(case['case_id'])
+    for group in categories.values():
+        group['compacted_drop_percentage_points'] = (
+            100 * (group['compacted_baseline_correct'] - group['compacted_resume_correct']) / group['compacted']
+            if group['compacted'] else None)
+    count = sum(g['compacted'] for g in categories.values())
+    drop = (100 * sum(g['compacted_baseline_correct'] - g['compacted_resume_correct'] for g in categories.values()) / count
+            if count else None)
+    exercised = bool(categories) and all(g['compacted'] > 0 for g in categories.values())
     return {'categories': categories,
         'outcomes': dict(Counter(c['metadata']['outcome'] for c in checkpoints)),
-        'every_category_exercised_compaction': all(g['compacted'] > 0 for g in categories.values())}
+        'every_category_exercised_compaction': exercised,
+        'compacted_drop_percentage_points': drop,
+        'compacted_quality_passed': exercised and drop <= 2 and all(
+            g['compacted_drop_percentage_points'] <= 5 for g in categories.values())}
+
+
+def completed_summary(cases, baseline, resumed, checkpoints):
+    """Report only complete pairs; an interrupted run cannot satisfy full gates."""
+    count = len(resumed)
+    if count > len(cases) or count > len(baseline) or count > len(checkpoints):
+        raise ValueError('incomplete paired quality evidence')
+    if not count:
+        return {'completed_cases': 0, 'requested_cases': len(cases)}
+    return {'completed_cases': count, 'requested_cases': len(cases),
+        'quality': evaluate(cases[:count], baseline[:count], resumed),
+        'coverage': coverage(cases[:count], baseline[:count], resumed, checkpoints[:count])}
 
 
 def main():
@@ -105,24 +128,34 @@ def main():
                     evidence['baseline'].append({'fixture': case['case_id'], 'body': case['body'], 'response': baseline})
                     body = copy.deepcopy(case['body']); body.pop('context_management', None)
                     request = InferenceGenerateRequest.from_dict(body)
+                    prepare_body = copy.deepcopy(case.get('checkpoint_body', case['body']))
+                    prepare_body.pop('context_management', None)
+                    prepare_request = InferenceGenerateRequest.from_dict(prepare_body)
                     print(json.dumps({'case': case['case_id'], 'phase': 'prepare'}), flush=True)
                     prepare_start = time.monotonic()
-                    checkpoint = client.prepare_native_kv_checkpoint(request, args.checkpoint)
-                    if checkpoint.metadata['logical_tokens'] != baseline['usage']['prompt_tokens']:
-                        raise AssertionError('checkpoint and baseline have different prompt token counts')
+                    checkpoint = client.prepare_native_kv_checkpoint(prepare_request, args.checkpoint)
+                    appended_tokens = baseline['usage']['prompt_tokens'] - checkpoint.metadata['logical_tokens']
+                    if ('checkpoint_body' in case and not 0 < appended_tokens <= 8192) or ('checkpoint_body' not in case and appended_tokens != 0):
+                        raise AssertionError('invalid checkpoint/question token boundary')
                     evidence['checkpoints'].append({'case_id': case['case_id'], 'metadata': dict(checkpoint.metadata),
                         'identity': dict(checkpoint.identity), 'sha256': checkpoint.sha256,
-                        'prepare_wall_seconds': time.monotonic() - prepare_start, 'wire_request': body})
+                        'prepare_wall_seconds': time.monotonic() - prepare_start, 'wire_request': prepare_body})
                     print(json.dumps({'case': case['case_id'], 'phase': 'resume', 'outcome': checkpoint.metadata['outcome']}), flush=True)
                     resume_start = time.monotonic()
                     result = client.resume_native_kv_checkpoint(request, checkpoint).to_dict()
                     if result['usage']['cached_prompt_tokens'] != checkpoint.metadata['logical_tokens']:
                         raise AssertionError('resume did not attest saved prefix reuse')
+                    if result['usage']['prompt_tokens'] != baseline['usage']['prompt_tokens']:
+                        raise AssertionError('full-KV and restored requests have different token counts')
                     evidence['resumed'].append({'fixture': case['case_id'], 'body': case['body'], 'response': result,
-                        'resume_wall_seconds': time.monotonic() - resume_start})
+                        'resume_wall_seconds': time.monotonic() - resume_start,
+                        'appended_prompt_tokens': appended_tokens})
                     # Reuse bounded disk space. Digests and model identities remain in evidence.
                     args.checkpoint.unlink()
-                    evidence['completed_cases'] = len(evidence['resumed']); publish()
+                    evidence['completed_cases'] = len(evidence['resumed'])
+                    evidence['completed_summary'] = completed_summary(
+                        cases, evidence['baseline'], evidence['resumed'], evidence['checkpoints'])
+                    publish()
                     print(json.dumps({'case': case['case_id'], 'phase': 'complete', 'seconds': time.monotonic()-started,
                         'baseline_correct': score(case, baseline), 'resume_correct': score(case, result)}), flush=True)
             finally:
@@ -139,9 +172,9 @@ def main():
             raise AssertionError('binary or suite changed')
         for path, digest in evidence['sources'].items():
             if sha256_file(Path(path)) != digest: raise AssertionError('harness changed')
-        evidence['passed'] = evidence['quality']['passed']
+        evidence['passed'] = evidence['quality']['passed'] and evidence['coverage']['compacted_quality_passed']
         evidence.pop('active_case', None)
-    except Exception as error:
+    except (Exception, KeyboardInterrupt) as error:
         evidence['error'] = f'{type(error).__name__}: {error}'
     finally:
         publish()

@@ -7,6 +7,107 @@ deferred. There is no llguidance or Rust serving dependency. The paper's 50x
 results are research results on particular workloads, not an Antfly release
 claim or a guarantee for Gemma 4 E4B.
 
+## Broader answer quality follow-up, 2026-10-20
+
+`prepare_native_quality_suite_v2.py` creates 64 deterministic long-context cases:
+16 each for multi-step facts, instruction priority and formatting, code reasoning,
+and actual typed tool calls. Each category has four task families crossed with
+four archive positions (10%, 25%, 45%, 60%); the first four cases in each category
+are designated critical before execution. This is a synthetic regression suite,
+not an external task benchmark.
+
+The checkpoint contains the archive but not the final question. Resume appends
+an acknowledgement and a fresh question; the exact-cache baseline evaluates
+that same complete conversation. The harness requires positive appended-token
+counts, equal baseline/resume prompt lengths, and attested checkpoint reuse.
+This avoids treating saved pre-compaction answer logits as evidence of retrieval
+from a compacted cache. The original V1 suite remains available.
+
+Scoring checks exact requested text, structurally equal JSON, and tool names
+and typed arguments, rejecting duplicate keys, nonfinite numbers, extra fields,
+extra calls, and truncated answers. Unchanged fallbacks are reported separately.
+Passing requires the original aggregate/category/critical quality gates plus
+actual compaction in every category and the same degradation limits on the
+compacted subset. Fallback results cannot conceal compacted-answer regressions.
+Completed-pair summaries survive interrupted runs; incomplete runs cannot pass
+the full-suite gate. Code answer keys are also checked by executing the
+generator's trusted synthetic snippets in Python.
+
+The merged-source ReleaseFast CUDA inference server
+`6a43b29c70a0ad1eee752d223dd1117311dbbce41398e3088ddfe17538607d8d`
+has now exercised all 16 predesignated critical cases, in two diagnostic runs.
+The suite digest is
+`11b587964826b3e84a90881363b845964e5d857294ec148d2bf799a12dd8a14e`.
+This uses the production resident inference endpoints, not the separately
+linked standalone listener/storage executable.
+
+| Category | Full-KV correct | Restored correct | Actually compacted |
+| --- | ---: | ---: | ---: |
+| Multi-step facts | 4/4 | 4/4 | 0/4 |
+| Instructions | 3/4 | 3/4 | 0/4 |
+| Code reasoning | 2/4 | 2/4 | 0/4 |
+| Typed tool calls | 4/4 | 4/4 | 0/4 |
+
+All 16 returned `unchanged_insufficient_savings`. The equal 13/16 scores show
+no added answer failures on exact fallback; they do **not** establish quality
+after actual compaction. The critical gate and compaction-coverage gate remain
+open, and the complete 64-case campaign has not passed. The three failures are:
+
+- `v2-code-01`: the filtered sum should be `25`; both paths return `17`.
+  On identical native prompt token IDs, pinned llama.cpp b11669 also returns
+  `17` at 8K and `15` at 119 tokens, matching Antfly's respective full-KV outputs.
+  This reproduces the failure without compaction; it is not an independent
+  chat-template or broad runtime-parity qualification.
+- `v2-instruction-03`: both paths return `ready.` instead of `ready`.
+  This is a strict punctuation mismatch; the private credential is not exposed.
+- `v2-code-03`: both paths return JSON count `16` instead of `19`, with the
+  correct boolean field. The answer key agrees with Python execution.
+
+The existing 8K `violet-729` reference still compacts to 1.686994x global savings,
+with six validated heads and two preserved heads. Its checkpoint digest remains
+`5b09989a64944c79c14990b9d7bea167dc45509323527452ce038825b7a63c8a`,
+byte-identical to the pre-merge reference, and its restored answer is correct.
+The code archive with its final question already included also compacts
+(1.513153x, five validated heads), whereas the archive-only prefix falls back.
+That observation does not validate answering new questions from the former cache.
+
+A private fit-only diagnostic on the 8,253-token code archive compared
+calibration strategies with unchanged numerical thresholds:
+
+| Calibration replay | Validated/preserved heads | Candidate global savings | Query collection |
+| --- | ---: | ---: | ---: |
+| Last 512 tokens | 3/5 | 1.248935x | 0.941 s |
+| Full prefix | 2/6 | 1.148928x | 16.840 s |
+
+The diagnostic measures candidates below the public 1.5x savings gate without
+installing them. Neither qualifies; full replay is slower and gives worse
+coverage on this fixture. Production defaults and acceptance thresholds remain
+unchanged. These are individual diagnostic timings, not latency percentiles.
+
+Evidence under `zig/zig-out/qualification/context-cuda/`:
+`quality-v2-critical-summary.json` links the two critical-case runs and their
+separate source fingerprints; `quality-v2-merged-reference-diagnostic.json`,
+`quality-v2-code-token-capture.json`, `quality-v2-llama-code-diagnostic.json`, and
+`quality-v2-calibration-diagnostic.json` retain the supporting diagnostics.
+The first run was deliberately interrupted after eight complete cases; the
+second completed normally with `passed=false` and no infrastructure error.
+Subsequent changes only harden JSON-overflow rejection, add oracle tests and
+document results; the measured responses contain no overflowing JSON numbers.
+
+Next work:
+
+1. Capture per-head rejection metrics on these archive-only prefixes and
+   evaluate bounded retention/fit alternatives. Any retry must fit the existing
+   memory plan; retain numerical validation and the 1.5x acceptance gate.
+   Full-prefix replay alone is not a supported remedy.
+2. Keep baseline reasoning failures and strict-format failures separate from
+   compaction regressions. Evaluate any reasoning/format configuration change
+   with matched baseline and restored requests; preserve these frozen results.
+3. Freeze a candidate before running the remaining 48 cases, then the complete
+   64-case matrix. Actual compaction must be represented in every category.
+   Broaden to varied document/chat histories and 32K contexts before making
+   general answer-quality claims.
+
 ## Upload concurrency follow-up, 2026-10-20
 
 The exact-host-plan ReleaseFast candidate

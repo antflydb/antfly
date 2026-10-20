@@ -1,6 +1,6 @@
 import copy
 import unittest
-from qualify_native_checkpoint_quality import coverage
+from qualify_native_checkpoint_quality import completed_summary, coverage
 
 class CoverageTests(unittest.TestCase):
     def setUp(self):
@@ -17,6 +17,7 @@ class CoverageTests(unittest.TestCase):
         result = self.evaluate()
         self.assertEqual(result['outcomes'], {'compacted': 1, 'unchanged_insufficient_savings': 1})
         self.assertFalse(result['every_category_exercised_compaction'])
+        self.assertFalse(result['compacted_quality_passed'])
         self.assertEqual(result['categories']['tool_call']['compacted'], 0)
         self.assertEqual(result['categories']['fact']['compacted_resume_correct'], 1)
     def test_reordered_or_incomplete_evidence_rejected(self):
@@ -35,5 +36,29 @@ class CoverageTests(unittest.TestCase):
     def test_wrong_compacted_answer_is_scored(self):
         self.responses[0]['response']['choices'][0]['message']['content'] = 'wrong'
         self.assertEqual(self.evaluate()['categories']['fact']['compacted_resume_correct'], 0)
+    def test_fallback_improvement_cannot_hide_compacted_regression(self):
+        cases = [dict(self.cases[0], case_id=f'fact-{i}') for i in range(2)]
+        good = self.responses[0]
+        bad = copy.deepcopy(good)
+        bad['response']['choices'][0]['message']['content'] = 'wrong'
+        checkpoints = [dict(self.checkpoints[0], case_id='fact-0'),
+                       dict(self.checkpoints[1], case_id='fact-1')]
+        result = coverage(cases, [good, bad], [bad, good], checkpoints)
+        self.assertTrue(result['every_category_exercised_compaction'])
+        self.assertEqual(result['compacted_drop_percentage_points'], 100)
+        self.assertFalse(result['compacted_quality_passed'])
+    def test_interrupted_run_reports_only_complete_pairs_without_passing(self):
+        cases = [dict(c, body={'case': c['case_id']}) for c in self.cases]
+        rows = [dict(r, fixture=c['case_id'], body=c['body'])
+                for c, r in zip(cases, self.responses)]
+        result = completed_summary(cases, rows, rows[:1], self.checkpoints)
+        self.assertEqual(result['completed_cases'], 1)
+        self.assertEqual(result['requested_cases'], 2)
+        self.assertEqual(result['quality']['overall']['cases'], 1)
+        self.assertFalse(result['quality']['passed'])
+        self.assertEqual(result['coverage']['outcomes'], {'compacted': 1})
+        self.assertEqual(completed_summary(cases, [], [], [])['completed_cases'], 0)
+        with self.assertRaises(ValueError):
+            completed_summary(cases, rows[:1], rows, self.checkpoints)
 
 if __name__ == '__main__': unittest.main()

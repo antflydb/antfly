@@ -19,6 +19,8 @@ class QualityTests(unittest.TestCase):
         self.assertLess(report['overall']['drop_percentage_points'],2)
         self.assertEqual(report['categories']['fact']['drop_percentage_points'],6.25)
         self.assertFalse(report['passed'])
+        self.assertEqual(report['regression_case_ids'], ['fact-10'])
+        self.assertEqual(report['baseline_failure_case_ids'], [])
         changed=copy.deepcopy(self.requests);changed[0]['response']['choices'][0]['message']['content']='wrong'
         self.assertFalse(evaluate(self.cases,changed,changed)['critical_passed'])
     def test_body_and_order_cannot_change(self):
