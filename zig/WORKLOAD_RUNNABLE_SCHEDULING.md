@@ -19,6 +19,45 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Original-scope checks during producer CPU admission (2026-10-20)
+
+Source `c7de4b1b80ee26ce2643229f7cc39e6aaef21dbf` adds checked child activation to the native scheduler,
+owner port and borrowed child bridge. The original call-scoped restriction is
+polled before queueing, during bounded CPU waiting and after a grant, outside
+the scheduler lock. Retired-holder producer preparation uses this capability.
+A stricter deadline or fallible authority can reject a queued producer while a
+peer still holds the only ordinary CPU. Refusal releases runnable capacity but
+retains child metadata, operation ownership and parent linkage until owning
+finish. The borrowed bridge preserves the first private failure across status
+aliases and repeated activation/lifetime checks. Checked activation never falls
+back to an unchecked callback.
+
+Merge `66b5522209` includes `origin/main` through `beb332c973eaf78876f9ef798d3d959fe41f307d`.
+The inference merge preserves both transferred admission credit and main's
+refundable settled residency: pending and settled ownership partition together,
+only newly retained pending bytes consume capacity, and stale epochs cannot
+refund a newer sample. Regression coverage includes mixed credits and transfers
+across pressure epochs.
+
+Native 51, runnable 18 and API 57 fence the changed private layouts. Storage-owner
+109, failure 66, engine descriptor 29, reader floor 10 and durable formats are
+unchanged. `Build Summary: 90/90 steps succeeded; 8/8 tests passed` covers owner ports, borrowed execution,
+producer authority, PDF/funding, write teams, admission, memory credits and the
+semantic source-controller check. The DB fixture adds queued authority rejection
+for document/relational dense, sparse and nested asset producers, without any
+provider call or row commit. The immutable package matches 4551
+public sources and passes 25/25 ReleaseSafe consumer build steps; this checks
+module composition, without linking provider products.
+
+Evidence: `checked-activation-main-verified.json` in the cumulative integration
+receipts. Earlier receipts retain their historical source/version scope. Full
+storage archive/cold-source runtime remain unqualified; the full Linux sweep is
+waived. Complete producer eligibility, separately funded parallel children,
+durable accepted effects plus completion reservations before PREPARE, required
+provider activation/readiness and remaining route/backend/default integration
+remain unfinished. Required-mode providers remain disabled; the full design is
+incomplete.
+
 ## Independent CPU for retired-holder producer work (2026-10-20)
 
 Source `97e121f317cb2c742730edd30e243a2d48ef9809` reserves a distinct producer

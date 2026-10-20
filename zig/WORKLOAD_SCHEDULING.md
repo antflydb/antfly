@@ -15,15 +15,22 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
-The current merge includes `origin/main` through `097588bf5d9d2f32cc16574545d95c375bbb24a1`
-(merge commit `1f1d60a4387601fa6d3f88150e4fd98218a2e99d`).
+The current merge includes `origin/main` through `beb332c973eaf78876f9ef798d3d959fe41f307d`
+(merge commit `66b5522209`).
 
-Native ABI 50, storage-owner ABI 109, engine descriptor 29, required preparation
+Native ABI 51, storage-owner ABI 109, engine descriptor 29, required preparation
 file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
+
+Source `c7de4b1b80ee26ce2643229f7cc39e6aaef21dbf` adds original call-scoped checks before,
+during and after producer child CPU admission, preserving the first refusal and
+physical child ownership until owning finish. Native 51/runnable 18/API 57 fence
+the private layouts. The current focused run and immutable public consumer pass;
+see the [implementation ledger](WORKLOAD_POOLING_IMPLEMENTATION.md) for evidence
+and the separate remaining completion-funding work before PREPARE.
 
 Source `97e121f317cb2c742730edd30e243a2d48ef9809` independently admits producer
 CPU after eligible holder retirement. The parent parks, the child inherits its
