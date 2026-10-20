@@ -1835,7 +1835,9 @@ suppressions retain the compatible `keys`/`texts` sets and add attributed
 `entries`/`text_entries`. Cascades name their original target in `cascade_from`;
 review acceptance names its proposal in `proposal_id`. Legacy attribution remains absent or has zero creation time/revision; table-level
 proposals can also have revision zero until an individual policy edit is recorded. Persisting this extended
-curation format requires reader version 10.
+curation format requires reader version 10. Cluster metadata writers require
+coordinated decoder version 36 before publishing resolver policy or proposal
+queues, including queue-only and retired resolver metadata restored from backups.
 
 `/tables/{entity_table}/curation/proposals` is the entity-level review surface;
 it does not replace mention-level resolver reviews. Create a typed entity action
@@ -1865,9 +1867,15 @@ one catalog publication. A durable pending decision fences competing decisions
 and supports resuming a partial fanout after reopening. `complete: false` means
 the caller should retry the same decision. Effect options and attribution remain
 frozen, while revision fences and wait budgets belong to the current request.
-Both initial decisions and terminal retries use the ordinary post-commit replay
-observer after releasing writer admission. Ordered/HA maintenance is rejected by
-the raw embedded queue path rather than bypassing ordered mutation admission.
+HTTP initial decisions and terminal retries return the same decision envelope,
+including the proposal, `changed`, `complete`, `applied`, and per-consumer results.
+HTTP terminal retries observe current authoritative namespace revisions using
+paged consumer discovery without replanning or republishing policy. A pending
+replay returns HTTP 202 and honors the retry's `wait` budget; a plain rejection
+has no replay and returns HTTP 200 with empty results. Lite uses the ordinary
+post-commit replay observer after releasing writer admission. Ordered/HA
+maintenance is rejected by the raw embedded queue path rather than bypassing
+ordered mutation admission.
 
 The C ABI and Rust embedded crate expose `propose_curation_json`,
 `list_curation_proposals_json`, `get_curation_proposal_json`, and

@@ -725,6 +725,55 @@ fn findProposal(state: resolver.curation.State, id: []const u8) !resolver.curati
     for (state.proposals) |proposal| if (std.mem.eql(u8, proposal.id, id)) return proposal;
     return error.NotFound;
 }
+/// A terminal decision observes current authoritative namespaces without
+/// planning, folding legacy policy or publishing another correction. Only
+/// compact consumer identities survive each fenced catalog page.
+const ProposalReplay = struct {
+    a: std.mem.Allocator,
+    namespaces: std.StringArrayHashMapUnmanaged(curation.Namespace) = .empty,
+    consumers: std.ArrayListUnmanaged(EntityConsumer) = .empty,
+
+    fn consume(self: *ProposalReplay, _: std.mem.Allocator, table_name: []const u8, cfg: Config) !void {
+        const namespace = self.namespaces.get(cfg.key_template) orelse return;
+        try self.consumers.append(self.a, .{ .table_name = try self.a.dupe(u8, table_name), .key_template = namespace.key_template, .target = .{
+            .name = try self.a.dupe(u8, cfg.name),
+            .config_generation = cfg.config_generation,
+            .promote = cfg.promote,
+        } });
+    }
+};
+
+fn observeProposalDecision(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, table: anytype, root: std.json.Value, proposal: resolver.curation.Proposal, wait: ?resolver.curation.Wait, request: operation.RequestContext, adoption_revision: ?u64) !@import("public_table_http.zig").OwnedResponse {
+    // Plain rejections have no policy publication to wait for. Rejections
+    // that pinned a pair carry a nonzero namespace revision like acceptances.
+    const has_policy = proposal.state == .accepted or (proposal.decided != null and proposal.decided.?.revision > 0);
+    var results = std.json.Array.init(a);
+    var applied = true;
+    if (has_policy) {
+        const stored = try curation.namespacesFromValue(a, root);
+        var replay: ProposalReplay = .{ .a = a };
+        for (stored.namespaces) |namespace| if (curation.keyInNamespace(namespace.key_template, proposal.key)) try replay.namespaces.put(a, namespace.key_template, namespace);
+        scanEntityConsumers(server, alloc, snapshot, table, proposal.key, request, adoption_revision, stored, &replay) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                // A committed decision remains accepted when its consumers
+                // cannot be observed. Surface that uncertainty as pending.
+                try results.append(try json(a, .{ .accepted = true, .applied = false, .@"error" = @errorName(err) }));
+                return response(alloc, 202, .{ .proposal = proposal, .changed = false, .complete = true, .atomicity = "namespace", .applied = false, .results = std.json.Value{ .array = results } });
+            },
+        };
+        const deadline = @import("antfly_platform").time.monotonicNs() +| @as(u64, if (wait) |w| w.timeout_ms else 0) * std.time.ns_per_ms;
+        for (replay.consumers.items) |consumer| {
+            const namespace = replay.namespaces.get(consumer.key_template).?;
+            const remaining = (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms;
+            const progress = try observeAccepted(server, a, consumer.table_name, consumer.target, namespace.revision, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request);
+            applied = applied and progress.applied;
+            try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .changed = false, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
+        }
+    }
+    return response(alloc, if (applied) 200 else 202, .{ .proposal = proposal, .changed = false, .complete = true, .atomicity = "namespace", .applied = applied, .results = std.json.Value{ .array = results } });
+}
+
 fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocator, snapshot: anytype, table: anytype, op: Operation, id: []const u8, body: []const u8, query: []const u8, request: operation.RequestContext, adoption_revision: ?u64) !@import("public_table_http.zig").OwnedResponse {
     if (readOnly(op)) try server.authorizeTableReads(a, request, &.{table.name}) else try server.authorizeIntegrityMutations(request, &.{.{ .table_name = table.name, .deletes = &.{id} }});
     var root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (table.indexes_json.len == 0) "{}" else table.indexes_json, .{});
@@ -756,7 +805,8 @@ fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloc
         const decision: resolver.curation.ProposalDecision = .{ .accept = op == .proposal_accept, .options = input.options, .pin_distinct = input.pin_distinct, .actor = input.actor, .reason = input.reason, .expected_revision = input.expected_revision, .wait = input.wait };
         const proposal = try findProposal(state, id);
         const wanted: resolver.curation.ProposalState = if (decision.accept) .accepted else .rejected;
-        if (proposal.state == wanted) return response(alloc, 200, .{ .proposal = proposal, .changed = false, .complete = true, .atomicity = "namespace" });
+        if (decision.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return error.InvalidResolverCurationRequest;
+        if (proposal.state == wanted) return observeProposalDecision(server, alloc, a, snapshot, table, root, proposal, decision.wait, request, adoption_revision);
         if (proposal.state != .open) return error.ResolverCurationConflict;
         if (decision.accept or decision.pin_distinct) {
             const options = input.options orelse proposal.options;
@@ -777,7 +827,8 @@ fn proposalOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Alloc
     replacement.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
     try request.ensureActive();
     _ = try server.source.replaceTableDefinitionStamped(table.*, replacement);
-    return response(alloc, 200, if (op == .proposal_create) try findProposal(state, try resolver.curation.proposalId(a, try std.json.parseFromSliceLeaky(resolver.curation.ProposalRequest, a, body, .{}))) else try findProposal(state, id));
+    if (op == .proposal_create) return response(alloc, 200, try findProposal(state, try resolver.curation.proposalId(a, try std.json.parseFromSliceLeaky(resolver.curation.ProposalRequest, a, body, .{}))));
+    return response(alloc, 200, .{ .proposal = try findProposal(state, id), .changed = true, .complete = true, .atomicity = "namespace", .applied = true, .results = @as([]const std.json.Value, &.{}) });
 }
 
 /// One destination-table CAS owns every matching exact-template namespace.

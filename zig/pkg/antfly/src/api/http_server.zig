@@ -58455,7 +58455,39 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         try std.testing.expectEqual(@as(u16, 202), cascade.status);
         try std.testing.expect(std.mem.indexOf(u8, cascade.body, "\"disposition\":\"suppress\"") != null);
         const before_terminal = source.commits;
-        try Run.call(&server, .proposal_accept, "entities", "", proposal_id, "{}", 200);
+        var retried = try resources.handle(&server, alloc, .proposal_accept, "entities", "", proposal_id, "{}", "", .{});
+        defer retried.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), retried.status);
+        const retry_result = try std.json.parseFromSlice(std.json.Value, alloc, retried.body, .{});
+        defer retry_result.deinit();
+        try std.testing.expect(!retry_result.value.object.get("changed").?.bool);
+        try std.testing.expect(!retry_result.value.object.get("applied").?.bool);
+        try std.testing.expectEqual(@as(usize, 1), retry_result.value.object.get("results").?.array.items.len);
+        // The retry observes today's policy after a subsequent cascade. It
+        // must not restore the accepted proposal's now-removed redirect.
+        try std.testing.expect(std.mem.indexOf(u8, source.tables[1].indexes_json, "\"cascade_from\":\"concept/review-b\"") != null);
+        // Terminal observation keeps only compact identities across 32 MiB
+        // of paged schemas, using the same 16 MiB budget as direct curation.
+        server.source = source.narrowIface();
+        source.forbid_snapshot = true;
+        source.stress_pages = 64;
+        var bounded_retry = try resources.handle(&server, budget.allocator(), .proposal_accept, "entities", "", proposal_id, "{}", "", .{});
+        try std.testing.expectEqual(@as(u16, 202), bounded_retry.status);
+        const bounded_replay = try std.json.parseFromSlice(std.json.Value, alloc, bounded_retry.body, .{});
+        defer bounded_replay.deinit();
+        try std.testing.expectEqual(@as(usize, 64), bounded_replay.value.object.get("results").?.array.items.len);
+        bounded_retry.deinit(budget.allocator());
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        source.stress_pages = 0;
+        source.forbid_snapshot = false;
+        server.source = source.iface();
+        source.expire_wait = true;
+        var waited = try resources.handle(&server, alloc, .proposal_accept, "entities", "", proposal_id, "{\"wait\":{\"timeout_ms\":1}}", "", .{});
+        defer waited.deinit(alloc);
+        source.expire_wait = false;
+        try std.testing.expectEqual(@as(u16, 202), waited.status);
+        try std.testing.expect(std.mem.indexOf(u8, waited.body, "DeadlineExceeded") != null);
+        try Run.call(&server, .proposal_accept, "entities", "", proposal_id, "{\"wait\":{\"timeout_ms\":0}}", 400);
         try std.testing.expectEqual(before_terminal, source.commits);
         try Run.call(&server, .proposal_reject, "entities", "", proposal_id, "{}", 409);
         var denied_proposal = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/forbidden\"}", "", .{ .principal = .{ .kind = .user, .subject = "limited" }, .table_write_authorization = .{ .ptr = &authority_context, .allows = Denied.allows } });
@@ -58467,7 +58499,45 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         const screening = try std.json.parseFromSlice(std.json.Value, alloc, screened.body, .{});
         defer screening.deinit();
         const screen_id = screening.value.object.get("id").?.string;
-        try Run.call(&server, .proposal_reject, "entities", "", screen_id, "{\"reason\":\"specific project term\"}", 200);
+        const before_reject = source.commits;
+        var rejected = try resources.handle(&server, alloc, .proposal_reject, "entities", "", screen_id, "{\"reason\":\"specific project term\"}", "", .{});
+        defer rejected.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), rejected.status);
+        const rejection = try std.json.parseFromSlice(std.json.Value, alloc, rejected.body, .{});
+        defer rejection.deinit();
+        try std.testing.expectEqualStrings("rejected", rejection.value.object.get("proposal").?.object.get("state").?.string);
+        try std.testing.expect(rejection.value.object.get("changed").?.bool);
+        try std.testing.expect(rejection.value.object.get("complete").?.bool);
+        try std.testing.expect(rejection.value.object.get("applied").?.bool);
+        try std.testing.expectEqual(@as(usize, 0), rejection.value.object.get("results").?.array.items.len);
+        try std.testing.expectEqual(before_reject + 1, source.commits);
+        var reject_retry = try resources.handle(&server, alloc, .proposal_reject, "entities", "", screen_id, "{}", "", .{});
+        defer reject_retry.deinit(alloc);
+        const reject_receipt = try std.json.parseFromSlice(std.json.Value, alloc, reject_retry.body, .{});
+        defer reject_receipt.deinit();
+        try std.testing.expectEqual(@as(u16, 200), reject_retry.status);
+        try std.testing.expect(!reject_receipt.value.object.get("changed").?.bool);
+        try std.testing.expect(reject_receipt.value.object.get("applied").?.bool);
+        try std.testing.expectEqualStrings("specific project term", reject_receipt.value.object.get("proposal").?.object.get("decided").?.object.get("reason").?.string);
+        try std.testing.expectEqual(before_reject + 1, source.commits);
+        // A pinned rejection has policy replay even when the retry body
+        // omits pin_distinct. Its durable decision, not this body, owns that.
+        var pin_created = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"merge\",\"key\":\"concept/pin-a\",\"into\":\"concept/pin-b\"}", "", .{});
+        defer pin_created.deinit(alloc);
+        const pin_record = try std.json.parseFromSlice(std.json.Value, alloc, pin_created.body, .{});
+        defer pin_record.deinit();
+        const pin_id = pin_record.value.object.get("id").?.string;
+        try Run.call(&server, .proposal_reject, "entities", "", pin_id, "{\"pin_distinct\":true}", 202);
+        const before_pin_retry = source.commits;
+        var pin_retry = try resources.handle(&server, alloc, .proposal_reject, "entities", "", pin_id, "{}", "", .{});
+        defer pin_retry.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), pin_retry.status);
+        const pin_receipt = try std.json.parseFromSlice(std.json.Value, alloc, pin_retry.body, .{});
+        defer pin_receipt.deinit();
+        try std.testing.expectEqualStrings("rejected", pin_receipt.value.object.get("proposal").?.object.get("state").?.string);
+        try std.testing.expect(!pin_receipt.value.object.get("applied").?.bool);
+        try std.testing.expectEqual(@as(usize, 1), pin_receipt.value.object.get("results").?.array.items.len);
+        try std.testing.expectEqual(before_pin_retry, source.commits);
         var repeated = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/screened\"}", "", .{});
         defer repeated.deinit(alloc);
         try std.testing.expect(std.mem.indexOf(u8, repeated.body, "\"state\":\"rejected\"") != null);
