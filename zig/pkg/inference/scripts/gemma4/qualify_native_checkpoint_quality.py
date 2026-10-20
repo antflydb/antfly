@@ -80,7 +80,8 @@ def main():
     parser.add_argument('--server', type=Path, required=True)
     parser.add_argument('--server-kind', choices=['inference', 'standalone'], default='inference')
     parser.add_argument('--models-dir', type=Path, default=Path('.models'))
-    parser.add_argument('--suite', type=Path, default=Path('.cache/native-compaction/native-quality-suite-v1.jsonl'))
+    parser.add_argument('--suite', type=Path, required=True,
+                        help='frozen JSONL written by prepare_native_quality_suite.py')
     parser.add_argument('--cases', nargs='+')
     parser.add_argument('--port', type=int, default=8506)
     parser.add_argument('--timeout', type=float, default=1800)

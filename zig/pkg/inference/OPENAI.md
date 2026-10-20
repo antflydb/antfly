@@ -144,9 +144,10 @@ set `ANTFLY_SERVER_DECODE_GRAPH_REPLAY=off`,
 media, draft models, prompt-cache keys, compiled/graph execution, or combining the
 request with `context_management`, `kv_cache` or `cache_compaction_ratio`.
 
-Preparation reserves 3,968 MiB of host scratch for the bounded fitter and auxiliary
-work. The default 768 MiB scratch budget is insufficient. The standalone
-qualification uses these inference budget overrides:
+Preparation reserves host scratch from model geometry and prompt length, bounded
+by a 3,840 MiB fitting ceiling plus 128 MiB auxiliary allowance. The default
+768 MiB scratch budget is insufficient for the designated 8K/32K workloads.
+The standalone qualification uses these inference budget overrides:
 
 ```text
 --inference-host-budget-mb 8192
@@ -157,9 +158,10 @@ qualification uses these inference budget overrides:
 ```
 
 These are admission settings, not measurements of memory consumption. The
-qualification also sets `admission.inference.max_concurrent_requests` to `2` and
-checks the combined listener/worker RSS against 8 GiB and worker GPU memory against
-18 GiB. Live host admission can still reject a request when available memory is
+concurrency qualifier reserves 48 weighted admission units for two designated
+8K requests costing 24 units each. It checks the combined listener/worker RSS
+against 8 GiB and worker GPU memory against 18 GiB. Live host admission can still
+reject a request when available memory is
 insufficient. Keep client timeouts large enough for prompt ingestion, cold model
 loading/identity hashing, fitting and transfer; warm resume timings exclude those
 preparation costs.
@@ -338,30 +340,14 @@ Use an optimized serving binary for latency measurements. Debug builds are usefu
 for functional checks, but their CPU tokenization, planning, and dispatch costs
 are not representative performance evidence.
 
-For a measured llama.cpp comparison, start a CUDA llama.cpp server with the same
-GGUF weights, f16 KV, one request slot, and at least 8256 context tokens. Run both
-servers on an otherwise idle device, then use:
-
-```text
-python3 scripts/gemma4/benchmark_context_cuda.py \
-  --antfly-url http://127.0.0.1:8090 --llama-url http://127.0.0.1:8091 \
-  --model your-gemma4-e4b-model --llama-model gemma4 \
-  --runs 3 --warmups 1 \
-  --output ../../zig-out/qualification/context-cuda/comparison.json
-```
-
-The comparison excludes context preparation from generation latency, disables
-prompt caching on both servers, alternates request order, and records warmups
-separately. It withholds a latency ratio if prompt counts differ or either server
-stops before the requested output length. Matching counts alone do not establish
-identical rendered token IDs. Record binary/model hashes, launch settings, and
-GPU placement with the artifact before drawing performance conclusions. This
-measures generation over prepared history; it does not establish equivalence
-between structured compaction and another engine's context handling. Results are
-measurements, not production qualification or a substitute for quality gates.
-Failed comparison runs also replace the output artifact with
-`evidence_passed: false`; an earlier successful result cannot survive a failed
-rerun at the same path.
+For native-checkpoint workload comparisons, use `qualify_matched_antfly.py`,
+`qualify_matched_llama.py` and `compare_matched_latency.py` under
+`scripts/gemma4/`. These consume a passing public checkpoint reference, compare
+exact token IDs and generation settings, and keep full replay separate from
+portable restore and resident reuse. Run them serially on an idle device.
+The [validation guide](../../../docs/design/inference/native-kv-compaction.md#reproducing-checks)
+lists the maintained runners. Matching prompt counts alone is insufficient,
+and measured latency does not substitute for answer-quality qualification.
 
 Choose competitor baselines by the operation being measured:
 
