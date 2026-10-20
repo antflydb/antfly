@@ -417,7 +417,7 @@ func (r *AntflyClusterReconciler) reconcileHAStartupTargetPVC(ctx context.Contex
 	}
 	key := types.NamespacedName{Name: name, Namespace: cluster.Namespace}
 	existing := &corev1.PersistentVolumeClaim{}
-	if err := r.Get(ctx, key, existing); err != nil {
+	if err := r.haBoundaryReader().Get(ctx, key, existing); err != nil {
 		if !errors.IsNotFound(err) {
 			return nil, err
 		}
@@ -1777,6 +1777,23 @@ func validateExplicitStandalonePVCAccessMode(pvc *corev1.PersistentVolumeClaim, 
 	// an explicit seed claim must provide the same fence as a claim template.
 	if cluster.Spec.Storage.StandaloneAccessMode != "" && (len(pvc.Spec.AccessModes) != 1 || pvc.Spec.AccessModes[0] != cluster.Spec.Storage.EffectiveStandaloneAccessMode()) {
 		return fmt.Errorf("standalone PVC %s access mode migration requires a new volume: existing %v, requested %s", pvc.Name, pvc.Spec.AccessModes, cluster.Spec.Storage.EffectiveStandaloneAccessMode())
+	}
+	return nil
+}
+
+// A retained claim can outlive its StatefulSet and be reused by name. Its
+// access mode, rather than a newly created claim template, is the actual fence.
+func (r *AntflyClusterReconciler) validateRetainedStandalonePVCAccessMode(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	name := fmt.Sprintf("%s-%s-0", standaloneStorageVolumeName(cluster), standaloneStatefulSetName(cluster))
+	claim := &corev1.PersistentVolumeClaim{}
+	if err := r.haBoundaryReader().Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: name}, claim); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if claim.DeletionTimestamp != nil {
+		return fmt.Errorf("standalone PVC %s is terminating", name)
+	}
+	if len(claim.Spec.AccessModes) != 1 || claim.Spec.AccessModes[0] != cluster.Spec.Storage.EffectiveStandaloneAccessMode() {
+		return fmt.Errorf("standalone PVC %s access mode migration requires a new volume: existing %v, requested %s", name, claim.Spec.AccessModes, cluster.Spec.Storage.EffectiveStandaloneAccessMode())
 	}
 	return nil
 }
@@ -4929,7 +4946,7 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 			}
 			if preservedSeedStorage != nil && cluster.Spec.Storage.StandaloneAccessMode != "" {
 				claim := &corev1.PersistentVolumeClaim{}
-				if err := r.Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: preservedSeedStorage.claimName}, claim); err != nil {
+				if err := r.haBoundaryReader().Get(ctx, types.NamespacedName{Namespace: cluster.Namespace, Name: preservedSeedStorage.claimName}, claim); err != nil {
 					return err
 				}
 				if err := validateExplicitStandalonePVCAccessMode(claim, cluster); err != nil {
@@ -4939,6 +4956,11 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 		}
 		if err := validateAndSetStandaloneStorageIdentity(statefulSet, cluster); err != nil {
 			return err
+		}
+		if len(statefulSet.Spec.VolumeClaimTemplates) != 0 {
+			if err := r.validateRetainedStandalonePVCAccessMode(ctx, cluster); err != nil {
+				return err
+			}
 		}
 		if err := controllerutil.SetControllerReference(cluster, statefulSet, r.Scheme); err != nil {
 			return err

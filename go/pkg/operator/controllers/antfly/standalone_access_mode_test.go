@@ -17,6 +17,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -168,5 +169,62 @@ func TestStandaloneSuspendRetainsIdentityAndResumesOneOwner(t *testing.T) {
 	}
 	if *awake.Spec.Replicas != 1 || !reflect.DeepEqual(before.Spec.VolumeClaimTemplates, awake.Spec.VolumeClaimTemplates) {
 		t.Fatal("resume failed to reuse one owner and the same claim")
+	}
+}
+
+func TestStandaloneRetainedPVCAccessMode(t *testing.T) {
+	for _, existingSet := range []bool{false, true} {
+		for _, tc := range []struct {
+			name              string
+			actual, requested corev1.PersistentVolumeAccessMode
+			reject            bool
+		}{
+			{"retained-rwo", corev1.ReadWriteOnce, corev1.ReadWriteOncePod, true},
+			{"retained-rwop", corev1.ReadWriteOncePod, corev1.ReadWriteOncePod, false},
+			{"legacy-default", corev1.ReadWriteOnce, "", false},
+			{"implicit-downgrade", corev1.ReadWriteOncePod, "", true},
+		} {
+			t.Run(fmt.Sprintf("%s/existing-set=%v", tc.name, existingSet), func(t *testing.T) {
+				scheme := runtime.NewScheme()
+				for _, add := range []func(*runtime.Scheme) error{antflyv1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
+					if err := add(scheme); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cluster := baseStandaloneControllerCluster()
+				cluster.Spec.Storage.Engine = "lite"
+				cluster.Spec.Storage.StandaloneAccessMode = tc.requested
+				c := newHAControllerTestClient(t, scheme, cluster)
+				r := &AntflyClusterReconciler{Client: c, Scheme: scheme}
+				r.applyDefaults(cluster)
+				ctx := context.Background()
+				key := types.NamespacedName{Name: standaloneStatefulSetName(cluster), Namespace: cluster.Namespace}
+				if existingSet {
+					if err := r.reconcileStandaloneStatefulSet(ctx, &envFromCache{}, cluster); err != nil {
+						t.Fatal(err)
+					}
+				}
+				claim := &corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-%s-0", standaloneStorageVolumeName(cluster), key.Name), Namespace: key.Namespace},
+					Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{tc.actual}},
+				}
+				// Only the uncached boundary reader sees the retained claim. A cache miss
+				// must never authorize a template that advertises a stronger fence.
+				r.BoundaryReader = newHAControllerTestClient(t, scheme, claim)
+				err := r.reconcileStandaloneStatefulSet(ctx, &envFromCache{}, cluster)
+				if tc.reject {
+					if err == nil || !strings.Contains(err.Error(), "access mode migration") {
+						t.Fatalf("expected retained claim rejection, got %v", err)
+					}
+					observed := &appsv1.StatefulSet{}
+					getErr := c.Get(ctx, key, observed)
+					if !existingSet && getErr == nil {
+						t.Fatal("rejected claim created a workload")
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
 	}
 }

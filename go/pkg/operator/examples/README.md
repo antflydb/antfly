@@ -307,6 +307,7 @@ kubectl delete antflycluster simple-antfly-cluster
 To remove the operator:
 ```bash
 kubectl delete -f https://antfly.io/antfly-operator-install.yaml
+```
 
 ### Standalone Lite storage
 
@@ -331,3 +332,13 @@ mode for both claim templates and explicit recovery claims. The mode is
 immutable; moving an existing volume to another mode requires a separate
 volume and a snapshot transfer. Lite also enforces its process-level writer
 lock. This example does not establish driver support or deployment availability.
+
+Set `spec.standalone.suspend: true` to stop standalone compute while retaining
+its StatefulSet identity and PVC. Clear the flag to resume on the same volume.
+Suspension overrides the StatefulSet's scale-down retention policy to `Retain`;
+normal configured retention applies again on resume. Cluster deletion still
+uses `spec.storage.pvcRetentionPolicy.whenDeleted`.
+
+The controller verifies the actual access mode of an existing retained claim
+before creating or resuming a workload. Recreating a StatefulSet with a stronger
+claim template does not upgrade an old PVC's access mode.
