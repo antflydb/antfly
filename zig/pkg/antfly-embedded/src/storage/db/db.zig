@@ -3133,12 +3133,9 @@ pub const DocumentPrimaryReadWindow = struct {
         if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
         self.retire();
         self.scope = try txn.openReadScope(self.arena.allocator());
-        try readMany(&self.scope.?, physical, output);
-        for (output) |value| if (value) |raw| {
-            self.bytes +|= raw.len;
-        };
+        self.bytes = try readMany(&self.scope.?, physical, output);
     }
-    fn readMany(scope: *@import("../backend_erased.zig").ReadScope, physical: []const []const u8, output: []?[]const u8) !void {
+    fn readMany(scope: *@import("../backend_erased.zig").ReadScope, physical: []const []const u8, output: []?[]const u8) !usize {
         if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
         const Entry = struct {
             key: []const u8,
@@ -3163,6 +3160,13 @@ pub const DocumentPrimaryReadWindow = struct {
         }
         try scope.getManySorted(keys[0..count], values[0..count]);
         for (entries[0..physical.len]) |entry| output[entry.row] = values[entry.value_index];
+        // Duplicate keys borrow the same retained value. Account actual scope
+        // payload once, independently of caller order or repeated rows.
+        var bytes: usize = 0;
+        for (values[0..count]) |value| if (value) |raw| {
+            bytes +|= raw.len;
+        };
+        return bytes;
     }
 
     pub fn finishRow(self: *@This(), uncached: bool) void {
@@ -3188,6 +3192,7 @@ pub const DB = struct {
     closed: bool = false,
     stable_address: bool = false,
     graph_cleanup_owner: graph_cleanup_owner_mod.Owner = .{},
+    group_source_owner: @import("group_source_owner.zig").Owner = .{},
     alloc: Allocator,
     runtime_alloc: Allocator,
     generation_read_lease: ?generation_lifecycle.ReadLease,
@@ -4477,10 +4482,15 @@ pub const DB = struct {
             zig017_return_error = error.VectorMigrationIdempotencyConflict;
             break :zig017_failure error.VectorMigrationIdempotencyConflict;
         };
-        if (observed.value.phase == .serving) {
+        // Reopening can restore a post-publication receipt before optional
+        // serving projections are ready. Resume their bounded publication in
+        // every destructive phase, not just the first serving transition.
+        if (observed.value.phase == .serving or observed.value.phase == .cleanup or observed.value.phase == .reclaiming) {
             const legacy = blk: {
                 var lease = self.tryAcquireIndexCatalogReadLease() orelse return;
                 defer lease.release();
+                if (self.core.index_manager.dense_indexes.items.len != 0 and
+                    self.core.index_manager.source_payload_store == null) return;
                 for (self.core.index_manager.dense_indexes.items) |entry| {
                     if ((self.core.index_manager.denseNativePhysicalMigrationRequired(entry.config.name) catch |zig017_err| {
                         zig017_return_error = zig017_err;
@@ -4548,6 +4558,11 @@ pub const DB = struct {
             error.VectorMigrationTemporaryBudgetExceeded, error.VectorMigrationDiskReserve, error.VectorMigrationRowExceedsBudget => {},
             else => self.requireVectorMigrationRecovery(),
         };
+        // The durable phase alone is not a proof about this owner lifetime.
+        // Preserve source data and the active receipt until all loaded ANN
+        // indexes can serve from the converted storage after recovery.
+        if ((job.value.phase == .cleanup or job.value.phase == .reclaiming) and
+            !self.core.index_manager.sourceMigrationServingComplete()) return;
         if (job.value.phase == .reclaiming) {
             const backend = self.core.primary_store_owner.lsm.handle.backend;
             if (!job.value.primary_reclamation_requested) {
@@ -4928,6 +4943,7 @@ pub const DB = struct {
         self.startArtifactRepairMetadataWorkerIfNeeded();
         self.startQuarantineRetryWorkerIfNeeded();
         self.startGraphEndpointCleanupWorker();
+        self.group_source_owner.start(.{ .ptr = self, .runtime = self.backend_runtime, .run = runLocalGroupSourceSlice });
     }
 
     pub fn closeOwned(self: *DB) void {
@@ -5447,6 +5463,7 @@ pub const DB = struct {
         self.artifact_producer_scheduler.deinit(self.alloc);
         self.stopPortableActivationRetryWorker();
         self.stopQuarantineRetryWorker();
+        self.group_source_owner.stop(self.backend_runtime.io());
         self.stopGraphEndpointCleanupWorker();
         self.transaction_owner.deinitRuntime(self.runtime_alloc);
         self.transaction_runtime = null;
@@ -6275,6 +6292,120 @@ pub const DB = struct {
     pub const canRunLocalGraphEndpointCleanup = db_graph.canRunLocalGraphEndpointCleanup;
 
     pub const maintenanceRequiresOrderedApply = local_mutation.maintenanceRequiresOrderedApply;
+
+    fn runLocalGroupSourceSlice(ptr: *anyopaque) !bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        if (!self.stable_address or self.closed or self.open_mode != .writer or !self.local_execution.optional_runtime_workers_enabled or self.core.index_manager.minimum_reader_version.load(.acquire) < 8) return false;
+        return self.runGroupSourceSlice();
+    }
+
+    fn runGroupSourceSlice(self: *DB) !bool {
+        // A table-wide coordinator must drive partial owners. The native
+        // worker can certify membership only for an unpartitioned Lite DB.
+        if (self.core.byteRange().start.len != 0 or self.core.byteRange().end.len != 0) return false;
+        if (self.open_mode != .writer or self.core.index_manager.minimum_reader_version.load(.acquire) < 8 or self.group_source_owner.stopping.load(.acquire)) return false;
+        if (!self.group_source_owner.slice_mutex.tryLock()) return false;
+        defer self.group_source_owner.slice_mutex.unlock();
+        if (try self.maintenanceRequiresOrderedApply()) return false;
+        try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
+        var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.init(manager, .shard_transition_working_set, self.runtime_alloc, 1) else null;
+        defer if (budget) |*value| value.deinit();
+        var arena = std.heap.ArenaAllocator.init(if (budget) |*value| value.allocator() else self.runtime_alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const work = @import("group_source_worker.zig");
+        const raw = (try self.lookupGroupSource(a, "{\"action\":\"definitions\"}")) orelse return false;
+        const definitions = try std.json.parseFromSliceLeaky([]work.Definition, a, raw.json, .{});
+        if (definitions.len == 0) return false;
+        const definition = definitions[self.group_source_owner.next_definition % definitions.len];
+        self.group_source_owner.next_definition +%= 1;
+        const namespace = definition.namespace;
+        if (self.group_source_owner.worker == null) {
+            const identity = try std.json.Stringify.valueAlloc(a, .{ self.root_incarnation, platform_time.realtimeNs(), namespace }, .{});
+            self.group_source_owner.worker = .{ .allocator = self.runtime_alloc, .identity = @import("group_sources.zig").digest(identity) };
+        }
+        const ports = work.Ports{ .ptr = self, .query_fn = localGroupSourceQuery, .submit_fn = localGroupSourceSubmit, .fan_in_fn = localGroupSourceFanIn, .settled_fn = localGroupSourceSettled };
+        const before = self.group_source_owner.submitted;
+        try self.group_source_owner.worker.?.sourceStep(a, ports, definition);
+        try self.group_source_owner.worker.?.groupStep(a, ports, definition, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_ms)));
+        return self.group_source_owner.submitted != before;
+    }
+
+    fn localGroupSourceQuery(ptr: *anyopaque, a: Allocator, route: []const u8, request: []const u8) ![]const u8 {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        if (!self.core.byteRange().contains(route)) return error.KeyOutOfRange;
+        const result = (try self.lookupGroupSource(a, request)) orelse return error.NotFound;
+        return result.json;
+    }
+
+    fn localGroupSourceSubmit(ptr: *anyopaque, command: @import("group_source_contract.zig").Command) !void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        if (try self.maintenanceRequiresOrderedApply()) return error.ArtifactCatalogDrift;
+        try self.batchInternal(.{ .group_source = command, .sync_level = .write }, null, .{});
+        self.group_source_owner.submitted +%= 1;
+    }
+
+    fn localGroupSourceFanIn(ptr: *anyopaque, a: Allocator, definition: @import("group_source_worker.zig").Definition, partition: @import("group_source_index.zig").Partition, ordinal: i64) !@import("group_source_worker.zig").FanIn {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        // A partial local range cannot certify a table-wide fan-in. The
+        // cluster adapter must enumerate all authoritative table owners.
+        if (self.core.byteRange().start.len != 0 or self.core.byteRange().end.len != 0) return error.GroupedSourceTopologyUnavailable;
+        const contract = @import("group_source_contract.zig");
+        const reads = @import("group_source_reads.zig");
+        var query = contract.Query{ .action = .partition, .artifact = definition.artifact, .definition = definition.definition, .group = partition.group, .segment = partition.segment, .cell = partition.cell, .ordinal = ordinal, .max_bytes = contract.max_partition_bytes };
+        var members: std.ArrayList(@import("group_sources.zig").Member) = .empty;
+        var revision: ?u64 = null;
+        var bytes: usize = 0;
+        var earlier_pending = false;
+        while (true) {
+            const request = try std.json.Stringify.valueAlloc(a, query, .{});
+            const response = try localGroupSourceQuery(self, a, definition.route.value, request);
+            const page = try std.json.parseFromSliceLeaky(reads.SourcePage, a, response, .{ .allocate = .alloc_always });
+            earlier_pending = earlier_pending or page.earlier_pending;
+            if (revision) |expected| {
+                if (expected != page.revision) return error.EnrichmentSourceChanged;
+            } else revision = page.revision;
+            for (page.members) |member| {
+                bytes += member.text.len + member.document.len;
+                if (members.items.len == 65536 or bytes > contract.max_partition_bytes) return error.GroupedSourcePartitionTooLarge;
+                try members.append(a, member);
+            }
+            if (page.done) break;
+            if (page.cursor.len == 0 or std.mem.eql(u8, query.cursor, page.cursor)) return error.GroupedSourceCorrupt;
+            query.cursor = page.cursor;
+        }
+        const sources = try a.alloc(contract.SourceCut, 1);
+        sources[0] = .{ .owner = definition.source_owner, .revision = revision orelse 0 };
+        return .{ .earlier_pending = earlier_pending, .members = try members.toOwnedSlice(a), .sources = sources, .topology_epoch = 0 };
+    }
+
+    pub fn localGroupSourceSettled(ptr: *anyopaque, sequence: u64, units: []const []const u8) !bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
+        defer arena.deinit();
+        var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = arena.allocator(), .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
+        if (try @import("artifact/publication.zig").authority(&overlay) != null) {
+            for (units) |unit| if (!try overlay.sourceSettled(unit)) return false;
+            return true;
+        }
+        // A native standalone owner has no Raft publication authority. Its
+        // ordinary committed replay cursor and per-producer repair receipts
+        // provide completion; replicated owners always require durable proofs.
+        if (try self.maintenanceRequiresOrderedApply()) return false;
+        if (sequence == 0) return true;
+        const runtime = self.enrichment_runtime orelse return false;
+        const status = runtime.stats();
+        if (status.applied_sequence < sequence or status.worker_failed) return false;
+        const check = runtime.failure_pending_fn orelse return status.fatal_error_count == 0;
+        var plan = try self.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        for (units) |unit| for (plan.plan().generated_templates) |template| {
+            if (!enrichment_types.appliesToDocument(template, unit)) continue;
+            const failure = enrichment_runtime_mod.FailureIdentity{ .kind = template.kind, .artifact_name = template.artifact_name, .source_artifact_name = template.upstream_artifact_name, .doc_key = unit, .sequence = sequence };
+            if (try check(runtime.failure_ctx orelse return false, failure, template.index_name)) return false;
+        };
+        return true;
+    }
 
     pub const startGraphEndpointCleanupWorker = db_graph.startGraphEndpointCleanupWorker;
     pub const graphCleanupPort = db_graph.graphCleanupPort;
@@ -8871,6 +9002,7 @@ pub const DB = struct {
         admitted_total_bytes: u64,
         headroom_bytes: u64,
         candidate_root: ?[]const u8 = null,
+        algebraic_index_name: ?[]const u8 = null,
 
         pub fn bindCandidateRoot(ptr: *anyopaque, candidate_root: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -8905,7 +9037,12 @@ pub const DB = struct {
             // final revalidation record a real denial only if it still fails.
             if (try self.reservation.fits(observation, monotonicTimeNs())) return;
             if (self.candidate_root) |candidate_root| {
-                return try RepairCapacityGuard.reconcile(self, try directoryUsageBytes(self.alloc, candidate_root));
+                const candidate_bytes = if (self.algebraic_index_name) |name| blk: {
+                    const namespace = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ std.fs.path.basename(candidate_root), name });
+                    defer self.alloc.free(namespace);
+                    break :blk try self.db.core.index_manager.algebraicStorageNamespaceBytes(namespace);
+                } else try self.db.core.index_manager.generationStorageBytes(candidate_root);
+                return try RepairCapacityGuard.reconcile(self, candidate_bytes);
             }
             try self.reservation.revalidate(observation, monotonicTimeNs());
         }
@@ -9119,7 +9256,7 @@ pub const DB = struct {
                 const candidate = entry.intent.candidate_relative_path.?;
                 try index_repair_state.validateCandidateRelativePath(cfg.name, candidate);
                 const separator = std.mem.indexOfScalar(u8, candidate, '/') orelse return error.InvalidRepairCandidatePath;
-                shadow_base = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
+                shadow_base = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.index_manager.base_path, candidate[0..separator] });
                 resume_candidate = true;
                 resume_building = entry.intent.phase == .building;
                 resume_requires_ready_manifest = entry.intent.phase == .ready or entry.intent.phase == .waiting_for_convergence;
@@ -9128,12 +9265,12 @@ pub const DB = struct {
                 build_resume_key = if (entry.intent.build_resume_key) |key| try alloc.dupe(u8, key) else null;
             } else {
                 try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
-                shadow_base = try createUniqueRepairShadowBase(alloc, self.core.path);
+                shadow_base = try createUniqueRepairShadowBaseWithStorage(alloc, self.core.index_manager.base_path, self.core.index_manager.generation_storage);
             }
         } else {
-            shadow_base = try createUniqueRepairShadowBase(alloc, self.core.path);
+            shadow_base = try createUniqueRepairShadowBaseWithStorage(alloc, self.core.index_manager.base_path, self.core.index_manager.generation_storage);
         }
-        if (!resume_candidate) try index_manager_mod.IndexManager.writeRepairShadowInProgressMarker(alloc, shadow_base);
+        if (!resume_candidate) try self.core.index_manager.markRepairShadow(alloc, shadow_base);
         var shadow_installed = false;
         var candidate_reopenable = resume_candidate;
         defer {
@@ -9144,30 +9281,34 @@ pub const DB = struct {
                     // Leave the index directory as a durable namespace marker.
                     // Once the in-progress marker is cleared, paged orphan
                     // cleanup can resume after failure or process restart.
-                    index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
+                    self.core.index_manager.clearRepairShadow(alloc, shadow_base) catch {};
                     self.scheduleInactiveRepairShadowCleanup();
                 } else {
-                    index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch {};
-                    std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
+                    self.core.index_manager.clearRepairShadow(alloc, shadow_base) catch {};
+                    if (self.core.index_manager.generation_storage) |storage|
+                        storage.deleteTree(shadow_base) catch {}
+                    else
+                        std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_base) catch {};
                 }
             }
             alloc.free(shadow_base);
         }
         const shadow_indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{shadow_base});
         defer alloc.free(shadow_indexes_path);
-        if (!resume_candidate) try ensureDirPath(shadow_indexes_path);
+        if (!resume_candidate) try self.core.index_manager.createGenerationDirectory(shadow_indexes_path);
 
         const shadow_index_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_indexes_path, cfg.name });
         defer alloc.free(shadow_index_path);
         // Generation manifests belong to the repair owner. Storage backends
         // may keep index data in a separate namespace and need not create
         // this filesystem directory as a side effect of opening an index.
-        try ensureDirPath(shadow_index_path);
+        try self.core.index_manager.createGenerationDirectory(shadow_index_path);
         const shadow_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/applied-sequences", .{shadow_base});
         defer alloc.free(shadow_checkpoint_path);
         if (options.capacity_check) |check| try check.bindCandidateRoot(shadow_base);
         if (resume_requires_ready_manifest) {
-            _ = index_generation_manifest.validateReady(
+            _ = index_generation_manifest.validateReadyWithStorage(
+                self.core.index_manager.generation_storage,
                 alloc,
                 shadow_index_path,
                 generation_id,
@@ -9273,7 +9414,8 @@ pub const DB = struct {
         var build_floor_sequence: u64 = if (resume_building)
             persisted_build_floor_sequence
         else if (resume_candidate)
-            try apply_state.loadAppliedSequenceWithCheckpoint(
+            try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
+                shadow_manager.generation_storage,
                 alloc,
                 shadow_manager.checkpointIo(),
                 self.core.store,
@@ -9323,7 +9465,7 @@ pub const DB = struct {
                         const count: u64 = persisted_build_reprocessed +| @as(u64, @intCast(slice.rebuilt));
                         if (!slice.complete()) {
                             if (options.capacity_check) |check| {
-                                try check.current(try directoryUsageBytes(alloc, shadow_base));
+                                try check.current(try shadow_manager.generationStorageBytes(shadow_base));
                             }
                             if (durable_repair_id) |repair_id| {
                                 try self.updateIndexRepairIntent(alloc, repair_id, .{
@@ -9539,7 +9681,8 @@ pub const DB = struct {
             true,
             false,
         );
-        try index_generation_manifest.writeReadyForPhysicalFormat(
+        try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
+            self.core.index_manager.generation_storage,
             alloc,
             shadow_index_path,
             generation_id,
@@ -9622,7 +9765,8 @@ pub const DB = struct {
                 false,
                 false,
             );
-            try index_generation_manifest.writeReadyForPhysicalFormat(
+            try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
+                self.core.index_manager.generation_storage,
                 alloc,
                 shadow_index_path,
                 generation_id,
@@ -9662,7 +9806,8 @@ pub const DB = struct {
             true,
             true,
         );
-        try index_generation_manifest.writeReadyForPhysicalFormat(
+        try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
+            self.core.index_manager.generation_storage,
             alloc,
             shadow_index_path,
             generation_id,
@@ -9671,7 +9816,8 @@ pub const DB = struct {
             converged_sequence,
             try shadowIndexPhysicalFormat(&shadow_manager, index_ref),
         );
-        const ready_sequence = try index_generation_manifest.validateReady(
+        const ready_sequence = try index_generation_manifest.validateReadyWithStorage(
+            self.core.index_manager.generation_storage,
             alloc,
             shadow_index_path,
             generation_id,
@@ -9848,7 +9994,8 @@ pub const DB = struct {
             });
             try ensureRepairActivationDeadline(activation_deadline_ns);
         };
-        try index_generation_manifest.writeReadyForPhysicalFormat(
+        try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
+            self.core.index_manager.generation_storage,
             alloc,
             shadow_index_path,
             generation_id,
@@ -9858,7 +10005,8 @@ pub const DB = struct {
             try shadowIndexPhysicalFormat(&shadow_manager, index_ref),
         );
         try ensureRepairActivationDeadline(activation_deadline_ns);
-        const manifest_sequence = try index_generation_manifest.validateReady(
+        const manifest_sequence = try index_generation_manifest.validateReadyWithStorage(
+            self.core.index_manager.generation_storage,
             alloc,
             shadow_index_path,
             generation_id,
@@ -9898,7 +10046,7 @@ pub const DB = struct {
             .candidate_applied_sequence = final_target,
             .target_sequence = final_target,
         });
-        index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_base) catch |err| {
+        self.core.index_manager.clearRepairShadow(alloc, shadow_base) catch |err| {
             std.log.warn("failed to clear repair shadow in-progress marker index={s} err={s}", .{ cfg.name, @errorName(err) });
         };
         const prior_checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
@@ -10013,7 +10161,8 @@ pub const DB = struct {
         batch_ctx.async_context = null;
         batch_ctx.dense_bulk_session_scope = .external;
 
-        var applied = try apply_state.loadAppliedSequenceWithCheckpoint(
+        var applied = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
+            shadow_manager.generation_storage,
             alloc,
             shadow_manager.checkpointIo(),
             self.core.store,
@@ -10129,7 +10278,8 @@ pub const DB = struct {
         const updates = [_]apply_state.AppliedSequenceUpdate{update};
         try savePhysicalProjectionMetadataForAppliedSequenceUpdates(shadow_manager, &updates);
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(shadow_manager, &updates);
-        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
+        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
+            shadow_manager.generation_storage,
             alloc,
             shadow_manager.checkpointIo(),
             self.core.store,
@@ -10599,6 +10749,130 @@ pub const DB = struct {
 
     pub const enforceRowPolicyIntentsLocked = db_transaction.enforceRowPolicyIntentsLocked;
 
+    fn lookupGroupSource(self: *DB, a: Allocator, raw: []const u8) !?types.LookupResult {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        const contract = @import("group_source_contract.zig");
+        const query = try std.json.parseFromSliceLeaky(contract.Query, owned, raw, .{ .allocate = .alloc_always });
+        try query.validate();
+        var plan = try self.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        const empty_groups = @import("group_source_mutations.zig").Plan{ .arena = undefined, .entries = &.{} };
+        const group_plan = plan.plan().group_sources orelse empty_groups;
+        if (query.action == .definitions) {
+            if (self.core.index_manager.minimum_reader_version.load(.acquire) < 8) return .{ .json = try a.dupe(u8, "[]") };
+            var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = owned, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
+            const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation);
+            var namespace: [24]u8 = undefined;
+            doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+            var source_namespace = namespace;
+            if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], self.root_incarnation, .big);
+            const definitions = try owned.alloc(@import("group_source_worker.zig").Definition, group_plan.entries.len + 1);
+            definitions[group_plan.entries.len] = .{ .artifact = "__group_source_gc", .definition = .{ .table_incarnation = table, .configuration = @splat(1) }, .source = .{ .group_by = "_", .order_by = "_", .field = "_" }, .namespace = namespace, .source_owner = .{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) }, .route = .{ .value = self.core.byteRange().start }, .retirement = true };
+            for (group_plan.entries, definitions[0..group_plan.entries.len]) |entry, *definition| definition.* = .{ .artifact = entry.name, .definition = .{ .table_incarnation = table, .configuration = entry.configuration }, .source = entry.source, .namespace = namespace, .source_owner = .{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) }, .route = .{ .value = self.core.byteRange().start }, .horizon = entry.horizon };
+            return .{ .json = try std.json.Stringify.valueAlloc(a, definitions, .{}) };
+        }
+        var matched = false;
+        for (group_plan.entries) |entry| if (std.mem.eql(u8, entry.name, query.artifact) and std.mem.eql(u8, &entry.configuration, &query.definition.configuration)) {
+            matched = true;
+            break;
+        };
+        if (!matched and query.action != .retirement and query.action != .retirement_page and query.action != .activation) return error.InvalidGroupedSourceQuery;
+        var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = owned, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
+        if (query.definition.table_incarnation != try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation)) return error.InvalidGroupedSourceQuery;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        const baseline = @import("group_source_baseline.zig");
+        const reads = @import("group_source_reads.zig");
+        const state = @import("group_source_state.zig");
+        const group = state.Group{ .definition = query.definition, .key = query.group };
+        var namespace: [24]u8 = undefined;
+        doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+        if (std.mem.allEqual(u8, &namespace, 0)) std.mem.writeInt(u128, namespace[8..24], self.root_incarnation, .big);
+        const owner = state.Owner{ .namespace = namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) };
+        var command_namespace: [24]u8 = undefined;
+        doc_identity.encodeNamespace(&command_namespace, self.core.identity_namespace);
+        const output = switch (query.action) {
+            .definitions => unreachable,
+            .activation => blk: {
+                if (!try self.maintenanceRequiresOrderedApply()) break :blk try a.dupe(u8, "true");
+                const active = try @import("artifact/publication.zig").authority(&read);
+                const catalogs = try @import("artifact/inventory.zig").catalogs(&read);
+                const inventory = @import("artifact/inventory.zig");
+                const status = try inventory.status(owned, &read, command_namespace);
+                const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
+                break :blk try std.json.Stringify.valueAlloc(a, ready, .{});
+            },
+            .retirement => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").load(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try (try @import("artifact/inventory.zig").catalogs(&read)).semanticDigest(owned))), .{}),
+            .retirement_page => try std.json.Stringify.valueAlloc(a, try @import("group_source_retirement.zig").preparePage(owned, &read, baseline.retirementGeneration(baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation), try (try @import("artifact/inventory.zig").catalogs(&read)).semanticDigest(owned))), .{}),
+            .backfill_page => try std.json.Stringify.valueAlloc(a, try baseline.preparePage(owned, &read, query.definition, baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation)), .{}),
+            .readiness => blk: {
+                const completion = @import("artifact/completion_progress.zig");
+                const statuses = try owned.alloc(completion.GroupReadiness, query.documents.len);
+                for (query.documents, statuses) |document, *status| {
+                    if (!self.core.byteRange().contains(document)) return error.KeyOutOfRange;
+                    status.* = try completion.diagnoseGroup(owned, &read, self.root_incarnation, document, plan.plan());
+                }
+                const Replay = struct {
+                    target: u64,
+                    applied: u64,
+                    worker_started: bool,
+                    worker_failed: bool,
+                    lease_owned: bool,
+                    retrying: bool,
+                    consecutive_retries: u32,
+                    fatal_errors: u64,
+                    last_error: []const u8,
+                    asset_backend: bool,
+                };
+                const replay: ?Replay = if (self.enrichment_runtime) |runtime| status: {
+                    const replay_stats = runtime.stats();
+                    break :status .{ .target = replay_stats.target_sequence, .applied = replay_stats.applied_sequence, .worker_started = replay_stats.worker_started, .worker_failed = replay_stats.worker_failed, .lease_owned = replay_stats.lease_owned, .retrying = replay_stats.retrying, .consecutive_retries = replay_stats.consecutive_retry_count, .fatal_errors = replay_stats.fatal_error_count, .last_error = try owned.dupe(u8, replay_stats.last_error_code.slice()), .asset_backend = runtime.config.asset_producer != null };
+                } else null;
+                break :blk try std.json.Stringify.valueAlloc(a, .{ .units = statuses, .replay = replay }, .{});
+            },
+            .settled => blk: {
+                const authority = try @import("artifact/publication.zig").authority(&read);
+                var complete = query.documents.len == 0 or authority != null;
+                if (authority) |active| {
+                    const progress = try @import("artifact/producer_obligations.zig").load(&read);
+                    if (progress) |value| try value.requireAuthority(active);
+                    complete = progress != null and progress.?.baseline_complete;
+                }
+                if (authority == null and !try self.maintenanceRequiresOrderedApply()) complete = try localGroupSourceSettled(self, query.through_sequence, query.documents);
+                for (query.documents) |document| {
+                    if (!self.core.byteRange().contains(document)) return error.KeyOutOfRange;
+                    if (authority != null and !try @import("artifact/completion_progress.zig").groupReady(owned, &read, self.root_incarnation, document)) {
+                        complete = false;
+                        break;
+                    }
+                }
+                break :blk try std.json.Stringify.valueAlloc(a, complete, .{});
+            },
+            .backfill => try std.json.Stringify.valueAlloc(a, try baseline.load(owned, &read, query.definition, baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation)), .{}),
+            .partition => blk: {
+                try baseline.requireReady(owned, &read, query.definition, baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, command_namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation));
+                break :blk try std.json.Stringify.valueAlloc(a, try reads.partition(owned, &read, query, owner, .{ .start = self.core.byteRange().start, .end = self.core.byteRange().end }), .{});
+            },
+            .outbox => try std.json.Stringify.valueAlloc(a, try reads.directory(owned, &read, @import("group_source_queue.zig").source_prefix, query.cursor, query.limit, .{ .start = self.core.byteRange().start, .end = self.core.byteRange().end }), .{}),
+            .pending => if (query.group.len == 0)
+                try std.json.Stringify.valueAlloc(a, try reads.directory(owned, &read, @import("group_source_queue.zig").group_prefix, query.cursor, query.limit, .{ .start = self.core.byteRange().start, .end = self.core.byteRange().end }), .{})
+            else
+                try std.json.Stringify.valueAlloc(a, try state.nextPending(owned, &read, group), .{}),
+            .status => try std.json.Stringify.valueAlloc(a, .{
+                .owner = owner,
+                .namespace = command_namespace,
+                .event_status = if (query.event) |event| try @import("group_source_propagation.zig").status(owned, &read, query.source_owner.?, event) else null,
+                .lease = if (query.group.len > 0) try state.currentLease(owned, &read, group) else null,
+                .pending = if (query.segment.len > 0) try state.pendingFor(owned, &read, group, .{ .group = query.group, .segment = query.segment, .cell = query.cell }) else null,
+                .snapshot = if (query.segment.len > 0) try state.readSnapshot(owned, &read, group, .{ .group = query.group, .segment = query.segment, .cell = query.cell }) else null,
+            }, .{}),
+            .prior => return error.InvalidGroupedSourceQuery,
+        };
+        return .{ .json = output };
+    }
+
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, key, opts });
         try checkLookupOptionsActive(opts);
@@ -10626,6 +10900,7 @@ pub const DB = struct {
             defer staging_read.abort();
             try restore_staging.requireScope(alloc, &staging_read, opts.restore_staging_scope, false);
         }
+        if (opts.group_source_query_json.len != 0) return self.lookupGroupSource(alloc, opts.group_source_query_json);
         if (opts.relational_topology_json.len != 0) return self.lookupRelationalTopology(alloc, opts.relational_topology_json, opts);
         if (opts.relational_index_status_json.len != 0) return self.lookupRelationalIndexStatus(alloc, opts.relational_index_status_json, opts);
         if (opts.relational_activation_json.len != 0) return self.lookupRelationalActivation(alloc, opts.relational_activation_json);
@@ -10840,6 +11115,10 @@ pub const DB = struct {
     pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
         if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, byte_range });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const group_identity = @import("group_source_identity.zig");
+        if (group_identity.splitBoundary(byte_range.start).len != byte_range.start.len or
+            group_identity.splitBoundary(byte_range.end).len != byte_range.end.len) return error.KeyOutOfRange;
+
         var write_fence = try self.beginReplicatedWrite(.gate_then_apply);
         defer write_fence.release();
         {
@@ -10891,7 +11170,9 @@ pub const DB = struct {
         };
         defer alloc.free(internal_key);
 
-        return (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, internal_key)) orelse error.NotFound;
+        const document = (try internal_keys.decodeStoredSourceRowKeyAlloc(alloc, internal_key)) orelse return error.NotFound;
+        defer alloc.free(document);
+        return alloc.dupe(u8, @import("group_source_identity.zig").splitBoundary(document));
     }
 
     pub const getSplitState = db_split.getSplitState;
@@ -13065,7 +13346,7 @@ pub const DB = struct {
             const census_alloc = if (census_budget) |*budget| budget.allocator() else self.alloc;
             // Each receiver certifies its own physical projection, before
             // opening the read snapshot used to prepare ordered completion.
-            if (command.mode == .complete_streams) {
+            if (command.mode == .complete_streams and !command.completion.?.group_producers) {
                 const claim = command.completion.?;
                 self.refreshArtifactProjections(census_alloc, claim.document_key, plan.plan(), .{ .visits = claim.visits, .bytes = claim.bytes, .time_budget_ns = null }) catch |err| {
                     if (err == error.OutOfMemory) if (census_budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
@@ -13280,7 +13561,7 @@ pub const DB = struct {
                     try self.requireOnlineArtifactCatalogMutableLocked(&txn);
                     try relational_integrity_topology.requireUnfenced(&txn);
                     try publication.stageAuthority(&txn, command);
-                    if (ordered_value.value.command.binding.effect_protocol == 15) {
+                    if (ordered_value.value.command.binding.effect_protocol >= 15) {
                         try artifact_producer_obligations.begin(self.alloc, &txn, (try publication.authority(&txn)).?);
                         try artifact_producer_validation.begin(self.alloc, &txn, (try publication.authority(&txn)).?);
                     }
@@ -13431,6 +13712,10 @@ pub const DB = struct {
         apply_held = false;
         if (replication_payload != null) try self.flushDurableReplicationOutboxes();
         DB.notifyQueryVisibilityTargetAdvancedContext(&batch_ctx, sequence);
+        // The journal and receipt are durable before detached consumers wake.
+        // Index projection alone cannot advance resolver/promotion targets:
+        // otherwise the last publication waits forever for another base write.
+        notifyResolverReplayRuntimesForCatalog(batch_ctx.index_manager, batch_ctx.resolution_runtime, batch_ctx.promotion_runtime, sequence);
         if (self.executor.hasWorkers()) self.executor.forceSequence(sequence) else {
             prepared_value.batch.sequence = sequence;
             try self.lockApplyForPortableRuntime();
@@ -14867,6 +15152,31 @@ pub const DB = struct {
         return try self.upsertResolverWithResultOptions(cfg, .{});
     }
 
+    pub fn curateResolverJsonAlloc(self: *DB, alloc: Allocator, name: []const u8, request_json: []const u8) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("curateResolverJsonAlloc", .{ self, alloc, name, request_json });
+        return @import("resolver_curation.zig").mutate(self, alloc, name, request_json);
+    }
+
+    pub fn resolverCurationJsonAlloc(self: *DB, alloc: Allocator, name: []const u8) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolverCurationJsonAlloc", .{ self, alloc, name });
+        return @import("resolver_curation.zig").list(self, alloc, name);
+    }
+
+    pub fn resolverReviewsJsonAlloc(self: *DB, alloc: Allocator, request_json: []const u8) ![]u8 {
+        if (comptime storage_engine.enabled) return storage_engine.call("resolverReviewsJsonAlloc", .{ self, alloc, request_json });
+        return @import("resolver_curation.zig").reviewOperation(self, alloc, request_json);
+    }
+
+    pub fn listResolverIdentities(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
+        if (comptime storage_engine.enabled) return storage_engine.call("listResolverIdentities", .{ self, alloc });
+        return self.core.index_manager.listResolverIdentities(alloc);
+    }
+
+    pub fn consumeResolverMetadataDrop(self: *DB, alloc: Allocator, identity: @import("resolver_curation.zig").MetadataIdentity) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("consumeResolverMetadataDrop", .{ self, alloc, identity });
+        return @import("resolver_curation.zig").consumeMetadataDrop(self, alloc, identity);
+    }
+
     pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
         _ = try self.upsertResolverWithResult(cfg);
     }
@@ -15092,69 +15402,35 @@ pub const DB = struct {
         table: []const u8,
         key: []const u8,
     ) !u64 {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var write_fence = try self.beginReplicatedWrite(.gate);
-        defer write_fence.release();
-        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
-        defer snapshot_mutation.release();
-        try self.lockApplyForPortableRuntime();
-        var apply_mutex_held = true;
-        errdefer if (apply_mutex_held) self.core.unlockApply();
+        return self.recordReviewDecisionChecked(doc_key, source_artifact, resolution_artifact, local_id, decision, table, key, null, null);
+    }
 
-        const resolvers = try self.core.listResolvers(self.alloc);
-        defer {
-            for (resolvers) |*cfg| cfg.deinit(self.alloc);
-            if (resolvers.len > 0) self.alloc.free(resolvers);
-        }
-        for (resolvers) |cfg| {
-            if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and
-                std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact))
-            {
-                break;
-            }
+    pub fn recordReviewDecisionChecked(self: *DB, doc_key: []const u8, source_artifact: []const u8, resolution_artifact: []const u8, local_id: []const u8, decision: resolver_lib.Decision, table: []const u8, key: []const u8, expected_hash: ?[]const u8, expected_revision: ?u64) !u64 {
+        if (try self.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
+        var policy = try self.local_execution.row_policy_gate.enterRaw();
+        defer policy.release();
+        var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const review = @import("resolver_review.zig");
+        const resolvers = try self.core.listResolvers(a);
+        const cfg = for (resolvers) |cfg| {
+            if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) break cfg;
         } else return error.ResolverNotFound;
-
-        const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(self.alloc, doc_key, source_artifact, resolution_artifact);
-        defer self.alloc.free(override_key);
-        const existing = try missingAsNull(self.core.store.get(self.alloc, override_key));
-        defer if (existing) |raw| self.alloc.free(raw);
-        const override_bytes = try resolution_runtime_mod.buildReviewDecisionBytesAlloc(self.alloc, existing, local_id, decision, table, key);
-        defer self.alloc.free(override_bytes);
-
-        const source_key = try internal_keys.artifactNamedPrefixAlloc(self.alloc, doc_key, "asset", source_artifact);
-        defer self.alloc.free(source_key);
-        const sequence = self.core.reserveDerivedAppendSequence();
-        const changed_artifact_keys = [_][]const u8{source_key};
-        const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), .{
-            .sequence = sequence,
-            .changed_artifact_keys = changed_artifact_keys[0..],
-        }, sequence);
-        defer self.alloc.free(replay_payload);
-
-        const writes = [_]docstore_mod.KVPair{.{
-            .key = override_key,
-            .value = override_bytes,
-        }};
-        var backlog_admission = try self.executor.admitBacklogBytes(@intCast(replay_payload.len));
-        defer backlog_admission.cancel();
-        try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..], &.{}, .{
-            .sequence = sequence,
-            .payload = replay_payload,
-        });
-        self.mirrorReplicationReplayPayloadBestEffort(replay_payload);
-        self.executor.commitBacklogAdmission(sequence, &backlog_admission);
-        self.core.unlockApply();
-        apply_mutex_held = false;
-        snapshot_mutation.release();
-        notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
-
-        if (self.executor.hasWorkers()) {
-            self.executor.forceSequence(sequence);
-        } else {
-            self.executor.notifySequence(sequence);
-        }
-        self.notifyResolverReplayRuntimes(sequence);
-        return sequence;
+        const raw = self.core.store.get(a, try internal_keys.resolutionArtifactKeyAlloc(a, doc_key, resolution_artifact)) catch |err| switch (err) {
+            error.NotFound => return error.ResolverCurationConflict,
+            else => return err,
+        };
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(raw, &hash, .{});
+        var namespace: [24]u8 = undefined;
+        doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+        const command: review.Command = .{ .namespace = namespace, .policy_digest = try review.policyDigest(a, self.core.store), .override_digest = try review.overrideDigest(a, self.core.store, doc_key, source_artifact, resolution_artifact), .resolver = cfg.name, .document = doc_key, .source_artifact = source_artifact, .resolution_artifact = resolution_artifact, .local_id = local_id, .expected_hash = expected_hash orelse &std.fmt.bytesToHex(hash, .lower), .config_generation = cfg.effectiveGeneration(), .curation_revision = expected_revision orelse cfg.curation_revision, .decision = decision, .table = table, .key = key };
+        policy.release();
+        try self.batch(.{ .resolver_review = command, .sync_level = .write });
+        const result = (try review.receipt(a, self.core.store, command)) orelse return error.StorageUnavailable;
+        if (!result.accepted) return error.ResolverCurationConflict;
+        return result.sequence;
     }
 
     /// Eager edge rewrite for an entity merge: repoint every inbound edge of
@@ -16300,7 +16576,7 @@ pub const DB = struct {
         return self.runMaintenanceUntilWithEnrichmentCompletion(sequence, sync_targets, cancellation, deadline_ns, .successful_requests);
     }
 
-    pub const EnrichmentCompletion = enum { successful_requests, published_requests };
+    pub const EnrichmentCompletion = enum { successful_requests, published_requests, published_cut };
 
     pub const runMaintenanceUntilWithEnrichmentCompletion = db_enrichment.runMaintenanceUntilWithEnrichmentCompletion;
 
@@ -16343,6 +16619,44 @@ pub const DB = struct {
     pub const waitForResolvedTransactionSync = local_mutation.waitForResolvedTransactionSync;
 
     pub const waitForResolvedTransactionSyncWithCancellation = db_transaction.waitForResolvedTransactionSyncWithCancellation;
+
+    /// The caller retains these scalars while releasing its owner lease
+    /// between bounded waits. Phase 1 owns the source cut; phase 2 owns the
+    /// publication cut captured after that source's grouped work is accepted.
+    pub fn waitForResolvedTransactionSyncTargetWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: *u64, phase: *u8, cancellation: types.CancellationToken) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("waitForResolvedTransactionSyncTargetWithCancellation", .{ self, sync_level, sequence, phase, cancellation });
+        if (phase.* != 1 and phase.* != 2) return error.InvalidArgument;
+        return self.waitForResolvedTransactionSyncImpl(sync_level, sequence.*, cancellation, .{ .sequence = sequence, .phase = phase });
+    }
+
+    const PublicationCut = struct {
+        sequence: *u64,
+        phase: *u8,
+        fn get(self: @This()) ?u64 {
+            return if (self.phase.* == 2) self.sequence.* else null;
+        }
+        fn capture(self: @This(), sequence: u64) void {
+            self.sequence.* = sequence;
+            self.phase.* = 2;
+        }
+    };
+
+    pub fn waitForResolvedTransactionSyncImpl(self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken, publication_cut: ?PublicationCut) !void {
+        try self.executor.checkSyncLevelHealth(sync_level);
+        if (sequence == 0 or sync_level == .propose or sync_level == .write) return;
+        try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
+        var sync_targets = try self.currentManagedSyncTargets(sync_level);
+        defer sync_targets.deinit(self.alloc);
+        if (self.executor.hasWorkers()) {
+            notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, sync_level, sequence, sync_targets);
+        }
+        if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+        self.notifyResolverReplayRuntimes(sequence);
+        try self.waitForSyncLevelWithPublicationCut(sync_level, sequence, sync_targets, cancellation, false, publication_cut);
+        if (sync_level == .full_index and self.text_merge_runtime == null) {
+            try self.drainScheduledTextMerges();
+        }
+    }
 
     pub fn currentManagedSyncTargets(self: *DB, sync_level: types.SyncLevel) !ManagedSyncTargets {
         const managed_indexes = try self.core.managedIndexes(self.alloc);
@@ -18060,12 +18374,15 @@ pub const DB = struct {
     /// `applied_sequence >= sequence`, which is the whole table's enrichment
     /// watermark: a tiny write queued behind an unrelated backlog would wait
     /// for that backlog to drain even though it owes the runtime nothing.
-    /// This does not change `.full_text`/`.full_index` behavior (untouched
-    /// branches below) or the watermark-advance logic itself
-    /// (`markPrecomputedEnrichmentAppliedForSync` stays exactly as
-    /// conservative as before).
+    /// This shortcut replaces only ordinary producer work. Grouped source
+    /// debt and managed index fences remain required; shared replay watermark
+    /// advancement stays conservative.
     pub fn waitForSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool) !void {
-        if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, sync_level, sequence, sync_targets, cancellation, skip_enrichment_runtime_wait });
+        if (comptime storage_engine.enabled) return storage_engine.call("waitForSyncLevelWithCancellation", .{ self, sync_level, sequence, sync_targets, cancellation, skip_enrichment_runtime_wait });
+        return self.waitForSyncLevelWithPublicationCut(sync_level, sequence, sync_targets, cancellation, skip_enrichment_runtime_wait, null);
+    }
+
+    fn waitForSyncLevelWithPublicationCut(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool, publication_cut: ?PublicationCut) !void {
         const timeout_ms = if (self.enrichment_runtime) |runtime|
             runtime.syncWaitTimeoutMs()
         else
@@ -18078,10 +18395,29 @@ pub const DB = struct {
             .deadline_ns = deadline_ns,
             .clock = visibility_clock,
         };
+        const captured_cut = if (publication_cut) |cut| cut.get() else null;
+        const has_groups = captured_cut != null or (self.core.index_manager.hasGroupSources() and (sync_level == .enrichments or sync_level == .full_index));
+        const wait_primary_enrichments = captured_cut == null and !skip_enrichment_runtime_wait and (!has_groups or primary: {
+            var pinned = try self.core.index_manager.acquireWritePlanSnapshot();
+            defer pinned.release();
+            // The grouped debt fence certifies the private producer DAG.
+            // Only producers rooted in primary documents additionally owe an
+            // ordinary replay fence. A private-unit publication can follow
+            // its original source cut and share a replay window with a later,
+            // unrelated provider; its global cursor is not source readiness.
+            for (pinned.plan().generated_templates) |request| {
+                if (request.group_source_json.len == 0 and request.group_artifact_name.len == 0) break :primary true;
+            }
+            break :primary false;
+        });
+        const effective_sequence = captured_cut orelse if (has_groups)
+            try self.waitForGroupSourcesThrough(sequence, wait)
+        else
+            sequence;
         switch (sync_level) {
             .propose, .write => {},
             .enrichments => {
-                if (!skip_enrichment_runtime_wait)
+                if (wait_primary_enrichments)
                     try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
             },
             .full_text => {
@@ -18089,13 +18425,69 @@ pub const DB = struct {
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.full_text_indexes);
             },
             .full_index => {
-                try self.runMaintenanceUntilWithCancellation(sequence, sync_targets, cancellation, deadline_ns);
+                if (has_groups) {
+                    if (wait_primary_enrichments) try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+                    // Own grouped publications have been accepted before
+                    // this cut. Include them once without chasing unrelated
+                    // producer scheduling or publications appended afterward.
+                    const published_cut = captured_cut orelse @max(effective_sequence, self.core.nextDerivedSequence());
+                    if (publication_cut) |cut| if (captured_cut == null) cut.capture(published_cut);
+                    try self.runMaintenanceUntilWithEnrichmentCompletion(published_cut, sync_targets, cancellation, deadline_ns, .published_cut);
+                } else try self.runMaintenanceUntilWithCancellation(sequence, sync_targets, cancellation, deadline_ns);
                 if (self.text_merge_runtime == null) {
                     try wait.check();
                     try self.drainScheduledTextMerges();
                     try wait.check();
                 }
             },
+        }
+    }
+
+    fn waitForGroupSourcesThrough(self: *DB, through: u64, wait: derived_executor_mod.VisibilityWait) !u64 {
+        const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+        var producer_sequence = through;
+        while (true) {
+            try wait.check();
+            if (self.async_context.background_closing.load(.acquire)) return error.Canceled;
+            const ready = blk: {
+                var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
+                defer arena.deinit();
+                const a = arena.allocator();
+                var pinned = try self.core.index_manager.acquireWritePlanSnapshot();
+                defer pinned.release();
+                const plan = pinned.plan().group_sources orelse break :blk true;
+                var overlay = @import("group_source_mutations.zig").Overlay{ .completion_root = self.root_incarnation, .allocator = a, .reader = @import("group_source_mutations.zig").Reader.fromStore(self.core.store) };
+                const table = try @import("group_source_mutations.zig").tableIdentity(&overlay, self.core.identity_namespace.table_id, self.root_incarnation);
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                const baseline = @import("group_source_baseline.zig");
+                var namespace: [24]u8 = undefined;
+                doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+                const generation = baseline.sourceGeneration(self.core.index_manager.activeSchemaVersion() orelse 0, namespace, self.core.byteRange().start, self.core.byteRange().end, self.root_incarnation);
+                var settled = true;
+                for (plan.entries) |entry| {
+                    const definition = @import("group_source_index.zig").Definition{ .table_incarnation = table, .configuration = entry.configuration };
+                    if ((try baseline.load(a, &read, definition, generation)).phase != .ready) settled = false;
+                    if (try @import("group_source_debt.zig").earliest(a, &read, definition, through)) |event| {
+                        settled = false;
+                        var source_namespace = namespace;
+                        if (std.mem.allEqual(u8, &source_namespace, 0)) std.mem.writeInt(u128, source_namespace[8..24], self.root_incarnation, .big);
+                        const owner = @import("group_source_state.zig").Owner{ .namespace = source_namespace, .incarnation = @import("group_source_owner_identity.zig").fromNamespace(self.core.identity_namespace, self.root_incarnation) };
+                        producer_sequence = @max(producer_sequence, try @import("group_source_visibility.zig").producerSequence(a, &read, owner, event));
+                    }
+                }
+                break :blk settled;
+            };
+            if (ready) return producer_sequence;
+            _ = try self.runGroupSourceSlice();
+            if (self.local_execution.optional_runtime_workers_enabled) {
+                // Wake the owner without waiting for a global cursor that
+                // may be blocked on an independent, later request. The
+                // durable source debt above is the completion authority.
+                if (self.enrichment_runtime) |runtime| runtime.notifySequence(producer_sequence);
+            } else try self.runEnrichmentUntilWithVisibilityDeadline(producer_sequence, wait.cancellation, wait.deadline_ns.?);
+            try wait.check();
+            try io.sleep(.fromMilliseconds(5), .awake);
         }
     }
 
@@ -20909,7 +21301,7 @@ pub const DB = struct {
                 // one-row byte limit must not re-read all remaining directories.
                 errdefer self.retireDirectories();
                 if (self.directory_scope == null) self.directory_scope = try self.read.openReadScope(self.directory_arena.allocator());
-                try DocumentPrimaryReadWindow.readMany(&self.directory_scope.?, keys[0..pending_count], fetched[0..pending_count]);
+                _ = try DocumentPrimaryReadWindow.readMany(&self.directory_scope.?, keys[0..pending_count], fetched[0..pending_count]);
                 for (pending[0..pending_count], fetched[0..pending_count]) |index, raw| {
                     self.directories[index] = raw;
                     self.directories_loaded[index] = true;
@@ -23997,7 +24389,7 @@ fn isPrimaryDocumentStoreKey(key: []const u8) bool {
 }
 
 fn skipNonPrimaryMedianKey(key: []const u8) bool {
-    return !isPrimaryDocumentStoreKey(key);
+    return !internal_keys.isStoredSourceRowKey(key);
 }
 
 pub const relationalColumns = local_mutation.relationalColumns;
@@ -30958,7 +31350,8 @@ fn saveAppliedSequencesBatchLockedContext(
         // snapshot.
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
         try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-        try apply_state.saveAppliedSequencesWithCheckpoint(
+        try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
+            ctx.index_manager.generation_storage,
             ctx.alloc,
             ctx.index_manager.checkpointIo(),
             ctx.store,
@@ -30981,7 +31374,8 @@ fn saveAppliedSequencesBatchLockedContext(
     }
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
     try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-    try apply_state.saveAppliedSequencesWithCheckpoint(
+    try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
+        ctx.index_manager.generation_storage,
         ctx.alloc,
         ctx.index_manager.checkpointIo(),
         ctx.store,
@@ -34868,24 +35262,7 @@ pub fn publishSnapshotStaging(io: Io, parent: []const u8, staging: []const u8, d
     try fs_paths.syncDirPortable(io, parent);
 }
 
-pub fn directoryUsageBytes(alloc: Allocator, path: []const u8) !u64 {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    var dir = std.Io.Dir.cwd().openDir(io_impl.io(), path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return 0,
-        else => return err,
-    };
-    defer dir.close(io_impl.io());
-    var total: u64 = 0;
-    var walker = try dir.walk(alloc);
-    defer walker.deinit();
-    while (try walker.next(io_impl.io())) |entry| {
-        if (entry.kind != .file) continue;
-        const stat = try dir.statFile(io_impl.io(), entry.path, .{});
-        total +|= stat.size;
-    }
-    return total;
-}
+
 
 fn repairCandidateStorageBytes(
     alloc: Allocator,
@@ -34894,7 +35271,19 @@ fn repairCandidateStorageBytes(
     shadow_base: []const u8,
 ) !u64 {
     if (cfg.kind == .algebraic) return try manager.activeIndexStorageBytes(cfg.name);
-    return try directoryUsageBytes(alloc, shadow_base);
+    _ = alloc;
+    return try manager.generationStorageBytes(shadow_base);
+}
+
+fn createUniqueRepairShadowBaseWithStorage(alloc: Allocator, base_path: []const u8, storage: ?lsm_backend_mod.Storage) ![]u8 {
+    const files = storage orelse return createUniqueRepairShadowBase(alloc, base_path);
+    // The random repair identity reserves a namespace without relying on host
+    // directory existence or process-local counters surviving a restart.
+    const identity = try index_repair_state.newRepairId(alloc);
+    const candidate = try std.fmt.allocPrint(alloc, "{s}/.repair-shadow-{x}", .{ base_path, identity });
+    errdefer alloc.free(candidate);
+    try files.createDirPath(candidate);
+    return candidate;
 }
 
 pub fn createUniqueRepairShadowBase(alloc: Allocator, base_path: []const u8) ![]u8 {
@@ -36596,7 +36985,8 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         .published_count = serving_count,
     };
     try ctx.index_manager.saveDenseProjectionCheckpointMetadata(index_name, clean_checkpoint);
-    try apply_state.saveProjectionCheckpointWithSidecar(
+    try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
+        ctx.index_manager.generation_storage,
         ctx.alloc,
         ctx.index_manager.checkpointIo(),
         ctx.store,
@@ -36811,7 +37201,8 @@ fn flushFinishedDenseAppliedSequenceLocked(
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
             projection_metadata_ns +|= elapsedSince(metadata_started);
             const checkpoint_started = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpoint(
+            try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
+                ctx.index_manager.generation_storage,
                 ctx.alloc,
                 ctx.index_manager.checkpointIo(),
                 ctx.store,
@@ -36899,7 +37290,8 @@ fn flushPendingAppliedSequencesLocked(
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
             projection_metadata_ns +|= elapsedSince(metadata_started);
             const checkpoint_started = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpoint(
+            try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
+                ctx.index_manager.generation_storage,
                 ctx.alloc,
                 ctx.index_manager.checkpointIo(),
                 ctx.store,
@@ -47525,7 +47917,7 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     try db.addEnrichment(.{
         .name = "image_text_v1",
@@ -47706,7 +48098,7 @@ test "db asset producer enrichments batch compatible generated assets" {
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .execution = .{ .batch_items = 2, .batch_bytes = 1024 },
     });
 
@@ -47791,7 +48183,7 @@ test "db asset producer sync precompute fails closed on permanent item failure" 
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .execution = .{ .batch_items = 2, .batch_bytes = 1024 },
     });
 
@@ -49633,7 +50025,7 @@ test "db sync_level enrichments precompute for document-mode writes does not hol
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
 
     const Writer = struct {
@@ -49715,7 +50107,7 @@ test "db sync_level enrichments returns without waiting on an unrelated enrichme
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
 
     // sync_level: .write defers this document's asset enrichment to the
@@ -50308,7 +50700,7 @@ test "db retryable asset producer batches do not block independent dense publica
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     // A distinct producer configuration forces a second native batch. Batch
     // partitioning must remain deferred so the first outage cannot perform
@@ -50318,7 +50710,7 @@ test "db retryable asset producer batches do not block independent dense publica
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock-secondary\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator-secondary\"}}",
     });
     try db.addIndex(.{
         .name = "title_dense",
@@ -50400,7 +50792,7 @@ test "db blocked dense embedding lane does not force the independent asset lane 
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     try db.addIndex(.{
         .name = "title_dense",
@@ -50517,7 +50909,7 @@ test "cross-quantum lane pipelining publishes a fast dense quantum while a slowe
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     try db.addIndex(.{
         .name = "title_dense",
@@ -50644,7 +51036,7 @@ test "synchronous window checkpoints never advance the asset cursor past queued 
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     // A copy asset is synchronous scanner work planned after the extractor:
     // it publishes through the shared window, never through an execution
@@ -50767,7 +51159,7 @@ test "cross-quantum dispatch clones queued requests so later caller reuse cannot
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     try db.addIndex(.{
         .name = "title_dense",
@@ -53481,7 +53873,7 @@ test "db upstream asset failure dominates downstream coverage in one replay sequ
         .kind = .asset,
         .field = "body",
         .content_type = "text/plain",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
     });
     try db.addEnrichment(.{
         .name = "summary_chunks_v1",
@@ -75659,6 +76051,7 @@ test "source vector migration consolidates ANN serving while preserving queries 
     const request: vector_migration.contract.Request = .{ .job_id = "ann", .mode = .online, .budget = .{ .batch_rows = 3 } };
     try db.startVectorMigration(request);
     try std.testing.expectError(error.VectorMigrationActive, db.deleteIndex(cfg.name));
+    var checked_reclamation_admission = false;
     for (0..256) |_| {
         var status = (try vector_migration.load(alloc, db.core.store)).?;
         defer status.deinit();
@@ -75667,8 +76060,25 @@ test "source vector migration consolidates ANN serving while preserving queries 
         try std.testing.expectEqual(@as(u32, 2), result.total_hits);
         try std.testing.expectEqualStrings("a", result.hits[0].id);
         if (status.value.phase == .complete) break;
+        if (status.value.phase == .reclaiming and !status.value.primary_reclamation_requested and !checked_reclamation_admission) {
+            // Model the recovery interval before the source binding is ready.
+            // A persisted serving phase must not authorize destructive work
+            // against an unavailable projection in the new owner lifetime.
+            const manager = db.core.index_manager;
+            const source = manager.source_payload_store;
+            manager.source_payload_store = null;
+            defer manager.source_payload_store = source;
+            try db.advanceVectorMigration(request.job_id);
+            var pending = (try vector_migration.load(alloc, db.core.store)).?;
+            defer pending.deinit();
+            try std.testing.expectEqual(vector_migration.contract.Phase.reclaiming, pending.value.phase);
+            try std.testing.expect(!pending.value.primary_reclamation_requested);
+            checked_reclamation_admission = true;
+            continue;
+        }
         if (status.value.phase == .ready) try db.publishVectorMigration(request.job_id) else try db.advanceVectorMigration(request.job_id);
     } else return error.VectorMigrationDidNotFinish;
+    try std.testing.expect(checked_reclamation_admission);
     try std.testing.expect(db.core.index_manager.sourceMigrationServingComplete());
     try std.testing.expect(try db.deleteIndex(cfg.name));
     const key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "a", "shared");
@@ -76675,6 +77085,49 @@ test "lite bounded reader integration scans native relational dirty rows" {
     try std.testing.expect(std.mem.indexOf(u8, result.documents[1].json, "updated") != null);
     // Both maintenance and dirty-row scan scopes must release their native pins.
     try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).retained_readers);
+}
+
+test "lite full text status follows writes after adding a sibling index (#1207)" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/status.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptions(&opts);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const empty = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, empty);
+    try std.testing.expectEqual(@as(u64, 0), empty.indexes[0].doc_count);
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"orchard alpha\"}" }} });
+    try db.runUntilIdle();
+    try db.addIndex(.{ .name = "vectors", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}" });
+    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"body\":\"orchard beta\"}" }} });
+    try db.runUntilIdle();
+    const stats = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, stats);
+    try std.testing.expectEqual(@as(u64, 2), stats.indexes[0].doc_count);
+    try std.testing.expect(stats.indexes[0].term_count > 0);
+    db.close();
+    db = try DB.open(a, path, opts);
+    const reopened_stats = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, reopened_stats);
+    try std.testing.expectEqual(@as(u64, 2), reopened_stats.indexes[0].doc_count);
+    try std.testing.expectEqual(@import("publication.zig").Stamp.Order.newer, reopened_stats.indexes[0].serving_publication.?.order(stats.indexes[0].serving_publication.?));
+    try db.batch(.{ .deletes = &.{"a"} });
+    try db.runUntilIdle();
+    const deleted_stats = try db.runtimeStatusStatsConsistent(a);
+    defer types.freeDBStats(a, deleted_stats);
+    try std.testing.expectEqual(@as(u64, 1), deleted_stats.indexes[0].doc_count);
+    var result = try db.search(a, .{ .index_name = "text", .query = .{ .match = .{ .field = "body", .text = "orchard" } }, .limit = 10 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }
 
 test "lite bounded reader integration publishes full text mappings through db" {
@@ -77933,7 +78386,7 @@ test "capi resolver topology busy leaves pending replacement and resolver config
     }
     resolver.min_confidence = 0.4;
     try std.testing.expectError(error.IntegrityTopologyBusy, db.upsertResolverWithResultOptions(resolver, .{ .drain_backfill = false }));
-    try std.testing.expectEqual(@as(f64, 0.2), db.core.index_manager.getResolver("concepts").?.min_confidence);
+    try std.testing.expectEqual(@as(?f64, 0.2), db.core.index_manager.getResolver("concepts").?.min_confidence);
     {
         const pending = try db.graphReplacementStatusAlloc(a);
         defer pending.deinit();
@@ -77950,7 +78403,7 @@ test "capi resolver topology busy leaves pending replacement and resolver config
     _ = try db.upsertResolverWithResultOptions(resolver, .{ .drain_backfill = false });
     try db.runUntilIdle();
     try db.waitGraphReplacement("new", generation, 0);
-    try std.testing.expectEqual(@as(f64, 0.4), db.core.index_manager.getResolver("concepts").?.min_confidence);
+    try std.testing.expectEqual(@as(?f64, 0.4), db.core.index_manager.getResolver("concepts").?.min_confidence);
 }
 
 test "capi resolver replacement clock clamp skips denied and ordered writes" {
@@ -79341,4 +79794,475 @@ test "public graph metric borrowed wire document scan producers preserve project
     visitor = .{ .fail = true };
     try std.testing.expectError(error.Canceled, db.scanVisit(a, "", "", opts, .{ .context = &visitor, .visit = Visitor.visit, .borrow_documents = true }));
     try std.testing.expectEqual(@as(usize, 1), visitor.count);
+}
+
+test "grouped sources production publishes private units incrementally across delete and reopen" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const groups = @import("group_sources.zig");
+    const Snapshot = @import("group_source_state.zig").Snapshot;
+    const Harness = struct {
+        const Status = struct { snapshot: ?Snapshot = null };
+        fn snapshot(db: *DB, alloc: Allocator, definition: @import("group_source_index.zig").Definition, segment: []const u8) !?std.json.Parsed(Status) {
+            const request = try std.json.Stringify.valueAlloc(alloc, @import("group_source_contract.zig").Query{ .action = .status, .artifact = "turns", .definition = definition, .group = "thread", .segment = segment, .cell = 0 }, .{});
+            defer alloc.free(request);
+            const response = (try db.lookup(alloc, "", .{ .group_source_query_json = request })) orelse return null;
+            defer alloc.free(response.json);
+            return try std.json.parseFromSlice(Status, alloc, response.json, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+        }
+        fn waitSnapshot(db: *DB, alloc: Allocator, definition: @import("group_source_index.zig").Definition, segment: []const u8, present: bool) !void {
+            const io = db.backend_runtime.io().?;
+            for (0..300) |_| {
+                var observed = try snapshot(db, alloc, definition, segment);
+                defer if (observed) |*value| value.deinit();
+                if (observed) |value| if (value.value.snapshot) |current| {
+                    if ((current.units.len > 0) == present) return;
+                };
+                try io.sleep(.fromMilliseconds(10), .awake);
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+    const config = groups.Config{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" };
+    var definition: @import("group_source_index.zig").Definition = undefined;
+    var first_digest: groups.Digest = undefined;
+    {
+        const db = try DB.openOwned(a, path, .{ .enrichment = .{ .enable_without_producers = true } });
+        defer db.closeOwned();
+        try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = config });
+        try std.testing.expectError(error.InvalidBatchRequest, @import("../write.zig").validateGroupedSourceBatch(a, db, &.{.{ .key = "invalid", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"a\",\"ordinal\":\"invalid\",\"text\":\"source\"}" }}, &.{}, &.{}));
+        try std.testing.expect((try db.lookup(a, "invalid", .{})) == null);
+        try db.batchInternal(.{ .writes = &.{ .{ .key = "one", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"a\",\"ordinal\":1,\"text\":\"alpha\"}" }, .{ .key = "two", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"a\",\"ordinal\":2,\"text\":\"beta\"}" } }, .sync_level = .enrichments }, null, .{});
+        const definitions = (try db.lookup(a, "", .{ .group_source_query_json = "{\"action\":\"definitions\"}" })).?;
+        defer a.free(definitions.json);
+        var decoded = try std.json.parseFromSlice([]@import("group_source_worker.zig").Definition, a, definitions.json, .{ .allocate = .alloc_always });
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, 2), decoded.value.len);
+        definition = decoded.value[0].definition;
+        try Harness.waitSnapshot(db, a, definition, "a", true);
+        var first = (try Harness.snapshot(db, a, definition, "a")).?;
+        defer first.deinit();
+        first_digest = first.value.snapshot.?.input_digest;
+        try db.batchInternal(.{ .writes = &.{.{ .key = "three", .value = "{\"thread_id\":\"thread\",\"turn_id\":\"b\",\"ordinal\":3,\"text\":\"gamma\"}" }}, .sync_level = .enrichments }, null, .{});
+        try Harness.waitSnapshot(db, a, definition, "b", true);
+        var unchanged = (try Harness.snapshot(db, a, definition, "a")).?;
+        defer unchanged.deinit();
+        try std.testing.expectEqualSlices(u8, &first_digest, &unchanged.value.snapshot.?.input_digest);
+        const unit = first.value.snapshot.?.units[0];
+        try std.testing.expectEqual(@as(?types.LookupResult, null), try db.lookup(a, unit, .{}));
+        try std.testing.expectError(error.KeyOutOfRange, db.updateRange(.{ .start = unit, .end = "" }));
+        const source = try internal_keys.documentKeyAlloc(a, unit);
+        defer a.free(source);
+        try std.testing.expect(internal_keys.isGroupSourceRowKey(source));
+        try std.testing.expectError(error.InvalidBatchRequest, db.batchInternal(.{ .writes = &.{.{ .key = source, .value = "{}" }}, .sync_level = .write }, null, .{}));
+        const private_timestamp = try internal_keys.ttlKeyAlloc(a, unit);
+        defer a.free(private_timestamp);
+        try std.testing.expectError(error.InvalidBatchRequest, db.batchInternal(.{ .deletes = &.{private_timestamp}, .sync_level = .write }, null, .{}));
+        try std.testing.expect(!internal_keys.isStoredDocumentRowKey(source));
+        const row = try db.core.store.get(a, source);
+        defer a.free(row);
+        try std.testing.expect(std.mem.indexOf(u8, row, "alpha\\nbeta") != null);
+    }
+    {
+        const db = try DB.openOwned(a, path, .{ .enrichment = .{ .enable_without_producers = true } });
+        defer db.closeOwned();
+        var reopened = (try Harness.snapshot(db, a, definition, "a")).?;
+        defer reopened.deinit();
+        try std.testing.expectEqualSlices(u8, &first_digest, &reopened.value.snapshot.?.input_digest);
+        try db.batchInternal(.{ .deletes = &.{ "one", "two" }, .sync_level = .enrichments }, null, .{});
+        try Harness.waitSnapshot(db, a, definition, "a", false);
+        var later = (try Harness.snapshot(db, a, definition, "b")).?;
+        defer later.deinit();
+        try std.testing.expect(later.value.snapshot.?.units.len > 0);
+        const old_unit = try internal_keys.documentKeyAlloc(a, later.value.snapshot.?.units[0]);
+        defer a.free(old_unit);
+        var replacement = config;
+        replacement.max_bytes = 64;
+        _ = try db.upsertEnrichment(.{ .name = "turns", .kind = .group, .source = replacement });
+        const next_definition = @import("group_source_index.zig").Definition{ .table_incarnation = definition.table_incarnation, .configuration = groups.definitionDigest("turns", replacement) };
+        try Harness.waitSnapshot(db, a, next_definition, "b", true);
+        var retired = false;
+        for (0..1000) |_| {
+            const old = db.core.store.get(a, old_unit) catch |err| if (err == error.NotFound) {
+                retired = true;
+                break;
+            } else return err;
+            a.free(old);
+            try db.backend_runtime.io().?.sleep(.fromMilliseconds(10), .awake);
+        }
+        try std.testing.expect(retired);
+        // Re-add an identical retired definition after its private records and
+        // baseline checkpoint have been collected. It must rebuild the source.
+        _ = try db.upsertEnrichment(.{ .name = "turns", .kind = .group, .source = config });
+        try Harness.waitSnapshot(db, a, definition, "b", true);
+        inline for (.{ @as(u32, 7), @as(u32, 8) }) |version| {
+            const raw = try @import("catalog/resolver_catalog.zig").readerVersionBytes(version);
+            try std.testing.expectEqual(version, try std.fmt.parseInt(u32, raw, 10));
+        }
+    }
+}
+
+test "grouped sources production visibility retains its publication cut across later primary producer debt" {
+    const Fixture = struct {
+        calls: usize = 0,
+        fn produce(raw: *anyopaque, alloc: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return alloc.dupe(u8, "{\"statement\":\"accepted\"}");
+        }
+    };
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("grouped-publication-cut");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .field = "text" } });
+    try db.addEnrichment(.{ .name = "notes", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"generator\":{\"provider\":\"openai\",\"model\":\"fixture\",\"api_key\":\"fixture\"}}}" });
+    var fixture: Fixture = .{};
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
+    try db.initOptionalEnrichmentRuntime(&config);
+    try db.batch(.{ .writes = &.{.{ .key = "earlier", .value = "{\"body\":\"first\"}" }}, .sync_level = .write });
+    const runtime = db.enrichment_runtime.?;
+    try runtime.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    var sequence = db.core.nextDerivedSequence();
+    var phase: u8 = 1;
+    try db.waitForResolvedTransactionSyncTargetWithCancellation(.full_index, &sequence, &phase, .none);
+    try std.testing.expectEqual(@as(u8, 2), phase);
+    const captured = sequence;
+    const calls = fixture.calls;
+    try std.testing.expect(calls > 0);
+
+    runtime.retrying = true;
+    runtime.next_retry_at_ms = runtime.clock.nowRealtimeMs() + 60_000;
+    defer {
+        runtime.retrying = false;
+        runtime.next_retry_at_ms = 0;
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "later", .value = "{\"body\":\"pending\"}" }}, .sync_level = .write });
+    try std.testing.expect(runtime.stats().applied_sequence < db.core.nextDerivedSequence());
+    // A resumed owner wait retains the accepted cut even when a new primary
+    // producer is pending. It neither invokes that provider nor advances its
+    // watermark to manufacture completion.
+    try db.waitForResolvedTransactionSyncTargetWithCancellation(.full_index, &sequence, &phase, .none);
+    try std.testing.expectEqual(captured, sequence);
+    try std.testing.expectEqual(calls, fixture.calls);
+    try std.testing.expect(runtime.stats().applied_sequence < db.core.nextDerivedSequence());
+    try std.testing.expect(runtime.stats().retrying);
+}
+
+test "grouped sources production ordered transaction resolution never waits on derived publication" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("group-ordered-resolution");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "turns", .kind = .group, .source = .{ .group_by = "thread", .order_by = "ordinal", .segment_by = "turn", .field = "text" } });
+    const txn = try db.beginTransaction(1);
+    try db.writeTransaction(txn, .{ .writes = &.{.{ .key = "member", .value = "{\"thread\":\"t\",\"turn\":\"a\",\"ordinal\":1,\"text\":\"source\"}" }} });
+    const Cancelled = struct {
+        fn check(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    var context: u8 = 0;
+    const cancelled: types.CancellationToken = .{ .ptr = &context, .is_cancelled_fn = Cancelled.check };
+    // Even a derived visibility request that is already cancelled cannot turn
+    // a durable ordered commit into a failed apply or wait for its own replay.
+    try db.resolveReplicatedTransactionAtOrderedReceipt(txn, .committed, 2, .full_index, cancelled, .{ .term = 1, .index = 1 }, null);
+    const row = (try db.lookup(a, "member", .{})).?;
+    defer a.free(row.json);
+    try std.testing.expect(std.mem.indexOf(u8, row.json, "source") != null);
+    try db.resolveReplicatedTransactionAtOrderedReceipt(txn, .committed, 2, .full_index, cancelled, .{ .term = 1, .index = 1 }, null);
+}
+
+test "lite external dense backfills artifacts before admission (#1210)" {
+    try testLiteExternalDenseLifecycle(false);
+}
+
+test "lite external dense recreates and catches up later writes (#1210)" {
+    try testLiteExternalDenseLifecycle(true);
+}
+
+fn testLiteExternalDenseLifecycle(recreate: bool) !void {
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/external.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = recreate, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    var db = try DB.open(a, path, opts);
+    db.run_until_idle_no_progress_timeout_ns = 5 * std.time.ns_per_s;
+    defer db.close();
+    const cfg: types.IndexConfig = .{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}" };
+    if (recreate) _ = try db.admitManagedIndex(cfg);
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"body\":\"alpha\",\"_embeddings\":{\"img\":[1,0,0]}}" },
+        .{ .key = "b", .value = "{\"body\":\"beta\"}" },
+    } });
+    if (recreate) {
+        try db.runUntilIdle();
+        try std.testing.expect(try db.deleteIndex("img"));
+        // Writes continue while the retired physical generation is reclaimed.
+        try db.batch(.{ .writes = &.{.{ .key = "c", .value = "{\"body\":\"gap write\",\"_embeddings\":{\"img\":[0,1,0]}}" }} });
+        var pages: usize = 0;
+        while (try db.advanceGeneratedArtifactCleanupPage("img") != .idle) : (pages += 1) {
+            try std.testing.expect(pages < 10_000);
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    const Hook = struct {
+        called: bool = false,
+        fn afterSnapshot(ptr: *anyopaque, database: *DB, _: []const u8, _: u64) !void {
+            const hook: *@This() = @ptrCast(@alignCast(ptr));
+            if (hook.called) return;
+            hook.called = true;
+            try database.batch(.{ .writes = &.{.{ .key = "during", .value = "{\"body\":\"during repair\",\"_embeddings\":{\"img\":[0,0,1]}}" }} });
+        }
+    };
+    var hook: Hook = .{};
+    if (recreate) db.shadow_index_repair_hook = .{ .ptr = &hook, .after_snapshot_build = Hook.afterSnapshot };
+    const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.ExpectedBackfill;
+    var complete = false;
+    for (0..20) |_| {
+        const step = try db.advanceIndexRepairIntent(a, repair_id, repair_completion_test_options);
+        if (step.repaired) {
+            complete = true;
+            break;
+        }
+    }
+    if (!complete) {
+        var pending = try db.loadIndexRepairEntryById(a, repair_id);
+        defer pending.deinit(a);
+        std.debug.print("repair phase={s} error={s}\n", .{ @tagName(pending.intent.phase), pending.intent.last_error orelse "none" });
+    }
+    try std.testing.expect(complete);
+    db.shadow_index_repair_hook = null;
+    if (recreate) try std.testing.expect(hook.called);
+    try db.runUntilIdle();
+    const expected: u64 = if (recreate) 3 else 1;
+    try std.testing.expectEqual(@as(?u64, expected), try DB.loadDenseArtifactTargetCounter(a, db.core.store, "img"));
+    var result = try db.search(a, .{ .index_name = "img", .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } }, .limit = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("a", result.hits[0].id);
+    db.close();
+    handle.deinit();
+    handle = try lite.Handle.open(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    opts = .{ .start_index_workers = recreate, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    db = try DB.open(a, path, opts);
+    db.run_until_idle_no_progress_timeout_ns = 5 * std.time.ns_per_s;
+    try db.batch(.{ .writes = &.{.{ .key = "later", .value = "{\"body\":\"later write\",\"_embeddings\":{\"img\":[0.6,0.8,0]}}" }} });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(?u64, expected + 1), try DB.loadDenseArtifactTargetCounter(a, db.core.store, "img"));
+    try std.testing.expectEqual(expected + 1, db.core.index_manager.denseIndex("img").?.index.stats().active_count);
+    const checkpoint = try db.core.loadProjectionCheckpoint(a, "img");
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    try std.testing.expectEqual(try db.core.loadAppliedSequence(a, "img"), db.core.nextDerivedSequence());
+    var later = try db.search(a, .{ .index_name = "img", .query = .{ .dense_knn = .{ .vector = &.{ 0.6, 0.8, 0 }, .k = 8 } }, .limit = 8 });
+    defer later.deinit();
+    try std.testing.expectEqual(@as(u32, @intCast(expected + 1)), later.total_hits);
+    var found_later = false;
+    for (later.hits) |hit| {
+        if (std.mem.eql(u8, hit.id, "later")) found_later = true;
+    }
+    try std.testing.expect(found_later);
+    // Logical generation paths must never create host-side shadow directories.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, db.core.index_manager.base_path, .{}));
+}
+
+test "lite external dense dimension replacement keeps writes available (#1216)" {
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/dimension.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = true, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    _ = try db.admitManagedIndex(.{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+    var keys: [20][32]u8 = undefined;
+    var old_writes: [20]types.BatchWrite = undefined;
+    for (&old_writes, &keys, 0..) |*write, *key, i| write.* = .{
+        .key = try std.fmt.bufPrint(key, "old-{d}", .{i}),
+        .value = "{\"body\":\"old document\",\"_embeddings\":{\"img\":[1,0,0]}}",
+    };
+    try db.batch(.{ .writes = &old_writes });
+    try db.runUntilIdle();
+    try std.testing.expect(try db.deleteIndex("img"));
+    var pages: usize = 0;
+    while (try db.advanceGeneratedArtifactCleanupPage("img") != .idle) : (pages += 1) try std.testing.expect(pages < 10_000);
+    const repair = try db.admitManagedIndex(.{ .name = "img", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":4,\"external\":true}" });
+    // Admission must not block either vector or ordinary writes while its
+    // new generation is still rebuilding from retained authored artifacts.
+    try db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"body\":\"new document\",\"_embeddings\":{\"img\":[0,1,0,0]}}" }} });
+    try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{\"body\":\"no vector\"}" }} });
+    if (repair) |id| {
+        var complete = false;
+        for (0..20) |_| {
+            if ((try db.advanceIndexRepairIntent(a, id, repair_completion_test_options)).repaired) {
+                complete = true;
+                break;
+            }
+        }
+        try std.testing.expect(complete);
+    }
+    for (0..2) |round| {
+        if (round == 1) {
+            db.close();
+            handle.deinit();
+            handle = try lite.Handle.open(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+            opts = .{ .start_index_workers = true, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+            try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+            db = try DB.open(a, path, opts);
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"body\":\"new document\",\"_embeddings\":{\"img\":[0,1,0,0]}}" }} });
+        try db.batch(.{ .writes = &.{.{ .key = "plain", .value = "{\"body\":\"no vector\"}" }} });
+        try db.runUntilIdle();
+        var result = try db.search(a, .{ .index_name = "img", .query = .{ .dense_knn = .{ .vector = &.{ 0, 1, 0, 0 }, .k = 8 } }, .limit = 8 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqualStrings("new", result.hits[0].id);
+        try std.testing.expectEqual(@as(?u64, 1), try DB.loadDenseArtifactTargetCounter(a, db.core.store, "img"));
+        const checkpoint = try db.core.loadProjectionCheckpoint(a, "img");
+        try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
+    }
+}
+
+test "lite generation cleanup and capacity accounting survive reopen (#1210)" {
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/maintenance.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    // Isolate explicit collector turns from the one-shot cleanup scheduled by open.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    const base = try a.dupe(u8, db.core.index_manager.base_path);
+    defer a.free(base);
+    const orphan = try std.fs.path.join(a, &.{ base, ".repair-shadow-orphan" });
+    defer a.free(orphan);
+    const orphan_file = try std.fs.path.join(a, &.{ orphan, "indexes/img/payload" });
+    defer a.free(orphan_file);
+    const active_file = try std.fs.path.join(a, &.{ base, ".repair-shadow-active/indexes/img/payload" });
+    defer a.free(active_file);
+    const active_pointer = try std.fs.path.join(a, &.{ base, "indexes/img/.antfly-active-index-root" });
+    defer a.free(active_pointer);
+    const stale = try std.fs.path.join(a, &.{ base, ".repair-shadow-stale/.antfly-repair-shadow-in-progress" });
+    defer a.free(stale);
+    const pending = try std.fs.path.join(a, &.{ base, ".repair-shadow-pending" });
+    defer a.free(pending);
+    const pending_file = try std.fs.path.join(a, &.{ pending, "indexes/img/payload" });
+    defer a.free(pending_file);
+    const corrupt_file = try std.fs.path.join(a, &.{ base, ".repair-shadow-corrupt/indexes/broken/payload" });
+    defer a.free(corrupt_file);
+    const corrupt_pointer = try std.fs.path.join(a, &.{ base, "indexes/broken/.antfly-active-index-root" });
+    defer a.free(corrupt_pointer);
+    const algebraic_path = try std.fs.path.join(a, &.{ base, ".repair-shadow-algebraic/indexes/alg" });
+    defer a.free(algebraic_path);
+    const algebraic_marker = try std.fs.path.join(a, &.{ algebraic_path, ".antfly-generation-directory" });
+    defer a.free(algebraic_marker);
+    const fact_prefix = try algebraic_mod.index.storagePrefixAlloc(a, ".repair-shadow-algebraic/alg");
+    defer a.free(fact_prefix);
+    const fact_key = try std.fmt.allocPrint(a, "{s}|8:orphan", .{fact_prefix});
+    defer a.free(fact_key);
+    const payload = "0123456789012345678901234567890123456789";
+    {
+        const manager = db.core.index_manager;
+        const storage = manager.generation_storage.?;
+        try storage.writeFileAbsolute(orphan_file, payload);
+        try storage.writeFileAbsolute(stale, "antfly-repair-shadow-in-progress-v1\npid=2147483647\n");
+        try storage.writeFileAbsolute(active_file, payload);
+        // The collector must honor pointers even without a loaded catalog row.
+        try storage.writeFileAbsolute(active_pointer, "antfly-active-index-root-v1\n.repair-shadow-active/indexes/img\n");
+        try manager.markRepairShadow(a, pending);
+        try storage.writeFileAbsolute(pending_file, payload);
+        try storage.writeFileAbsolute(corrupt_file, payload);
+        try storage.writeFileAbsolute(corrupt_pointer, "corrupt");
+        try manager.createGenerationDirectory(algebraic_path);
+        try db.core.store.put(fact_key, "fact");
+
+        try std.testing.expectEqual(@as(u64, 40), try manager.activeIndexStorageBytes("img"));
+        const cfg: types.IndexConfig = .{ .name = "img", .kind = .dense_vector, .config_json = "{}" };
+        try std.testing.expectEqual(@as(u64, 40), try repairCandidateStorageBytes(a, cfg, manager, orphan));
+        const Capacity = struct {
+            available: u64 = 100,
+            fn observe(ptr: *anyopaque) anyerror!resource_manager_mod.CapacityObservation {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                return .{ .available_bytes = self.available, .capacity_bytes = 100, .observed_at_ns = monotonicTimeNs(), .valid_for_ns = 5 * std.time.ns_per_s };
+            }
+        };
+        var capacity: Capacity = .{};
+        var resources = resource_manager_mod.ResourceManager.init(.{ .disk_safety_floor_bytes = 0, .disk_safety_floor_divisor = 0 });
+        defer resources.deinit(a);
+        var reservation = try resources.reserveCapacity(a, 9, 80, try Capacity.observe(&capacity), monotonicTimeNs());
+        defer reservation.release();
+        var guard: DB.RepairCapacityGuard = .{
+            .reservation = &reservation,
+            .db = &db,
+            .alloc = a,
+            .repair_id = 0,
+            .options = .{ .capacity_source = .{ .ptr = &capacity, .domain_id = 9, .observe = Capacity.observe } },
+            .admitted_total_bytes = 80,
+            .headroom_bytes = 0,
+        };
+        try DB.RepairCapacityGuard.bindCandidateRoot(&guard, orphan);
+        capacity.available = 60;
+        try DB.RepairCapacityGuard.revalidate(&guard);
+        try std.testing.expectEqual(@as(u64, 40), resources.capacityStats().reserved_bytes);
+        try std.testing.expectEqual(@as(u64, 0), resources.capacityStats().denials);
+        // One bounded deletion page removes the fact, leaving its durable
+        // generation marker for the next collector instance to finish.
+        try std.testing.expect(try manager.cleanupInactiveRepairShadowRootsPage());
+        try std.testing.expectEqual(@as(u64, 0), try storage.fileSize(algebraic_marker));
+    }
+    db.close();
+    handle.deinit();
+    handle = try lite.Handle.open(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    opts = .{ .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptionsForNamespace(&opts, &tmp.sub_path);
+    db = try DB.open(a, path, opts);
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    const manager = db.core.index_manager;
+    const storage = manager.generation_storage.?;
+    var pages: usize = 0;
+    while (try manager.cleanupInactiveRepairShadowRootsPage()) : (pages += 1) try std.testing.expect(pages < 20);
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(orphan_file));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(stale));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(algebraic_marker));
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, fact_key));
+    try std.testing.expectEqual(@as(u64, 40), try storage.fileSize(active_file));
+    try std.testing.expectEqual(@as(u64, 40), try storage.fileSize(pending_file));
+    try std.testing.expectEqual(@as(u64, 40), try storage.fileSize(corrupt_file));
+    try manager.clearRepairShadow(a, pending);
+    try storage.deleteFileAbsolute(corrupt_pointer);
+    while (try manager.cleanupInactiveRepairShadowRootsPage()) {}
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(pending_file));
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(corrupt_file));
+    try std.testing.expectEqual(@as(u64, 40), try storage.fileSize(active_file));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, base, .{}));
 }

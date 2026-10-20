@@ -40,6 +40,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const lib_metadata_runtime_filters = selectTestFilters(b, &.{"metadata."});
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
+    const online_merge_driver_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "metadata.online_merge_driver.", "metadata module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-online-merge-driver-test", "Run bounded online merge probes, authority and preparation contracts")
+        .dependOn(&addFilteredTestRunArtifact(b, online_merge_driver_tests).step);
     const backup_cohort_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "backup cohort", "metadata module compiles", "metadata storage module compiles" },

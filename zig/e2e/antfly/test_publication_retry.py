@@ -245,3 +245,77 @@ def test_invalid_retry_budget_is_rejected(publication_client, field, value):
     api, _ = publication_client
     with pytest.raises(ValueError):
         api.build_table("docs", **{field: value})
+
+
+def test_index_creation_retries_only_uncommitted_catalog_cas(publication_client):
+    from helpers import create_index_with_retry
+
+    _, clock = publication_client
+    calls = []
+    replies = iter(
+        [
+            response(409, body='{"error":"table_mutation_conflict","retryable":true}'),
+            {"created": True},
+        ]
+    )
+
+    def post(path, payload):
+        calls.append((path, payload.copy()))
+        reply = next(replies)
+        if isinstance(reply, requests.Response):
+            raise requests.HTTPError(response=reply)
+        return reply
+
+    api = SimpleNamespace(post=post)
+    payload = {"name": "social", "type": "graph"}
+    assert create_index_with_retry(api, "docs", "social", payload) == {"created": True}
+    assert calls == [("/tables/docs/indexes/social", {"type": "graph"})] * 2
+    assert payload == {"name": "social", "type": "graph"}
+    assert clock.sleeps == [0.05]
+
+
+@pytest.mark.parametrize(
+    "status,body,outcome",
+    [
+        (409, '{"error":"table_mutation_conflict","retryable":false}', None),
+        (409, '{"error":"metadata_mutation_outcome_unknown","retryable":true}', None),
+        (409, '{"error":"table_mutation_conflict","retryable":true}', "unknown-v1"),
+        (503, '{"error":"table_mutation_conflict","retryable":true}', None),
+        (409, "[]", None),
+        (409, "not json", None),
+    ],
+)
+def test_index_creation_does_not_retry_ambiguous_outcomes(
+    publication_client, status, body, outcome
+):
+    from helpers import create_index_with_retry
+
+    _, clock = publication_client
+    calls = []
+    reply = response(status, body=body)
+    if outcome is not None:
+        reply.headers["X-Antfly-Raft-Mutation-Outcome"] = outcome
+
+    def post(*args):
+        calls.append(args)
+        raise requests.HTTPError(response=reply)
+
+    with pytest.raises(requests.HTTPError):
+        create_index_with_retry(SimpleNamespace(post=post), "docs", "social", {})
+    assert len(calls) == 1
+    assert clock.sleeps == []
+
+
+def test_index_creation_contention_has_a_bounded_retry_budget(publication_client):
+    from helpers import create_index_with_retry
+
+    _, clock = publication_client
+    reply = response(409, body='{"error":"table_mutation_conflict","retryable":true}')
+
+    def post(*_):
+        raise requests.HTTPError(response=reply)
+
+    with pytest.raises(requests.HTTPError):
+        create_index_with_retry(SimpleNamespace(post=post), "docs", "social", {})
+    assert clock.now == 10.0
+    assert all(0 < delay <= 0.25 for delay in clock.sleeps)

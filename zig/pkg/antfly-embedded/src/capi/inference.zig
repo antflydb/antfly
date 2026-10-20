@@ -41,6 +41,7 @@ const InferenceHandle = struct {
     }
 
     fn destroy(self: *InferenceHandle) void {
+        defer @import("io_lifetime.zig").release();
         self.lifetime.quiesce();
         inference_provider.destroyEmbeddedInferenceNode(self.lifetime.handle, self.lifetime.resource_owner);
         self.io.deinit();
@@ -98,6 +99,8 @@ fn resolveOptions(options: ?*const capi.InferenceOptions) !ResolvedOptions {
 }
 
 fn openInference(options: ?*const capi.InferenceOptions) !*anyopaque {
+    @import("io_lifetime.zig").acquire();
+    errdefer @import("io_lifetime.zig").release();
     if (!db.localInferenceRuntimeAvailable()) return error.UnsupportedOperation;
     var resolved = try resolveOptions(options);
 

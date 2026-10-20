@@ -329,3 +329,229 @@ test "execution control checkpoint replacement preserves carrier and resets fore
     try std.testing.expectEqual(original.native_call_policy, rebound.native_call_policy);
     try std.testing.expectEqual(original.cancellation_grace_ns, rebound.cancellation_grace_ns);
 }
+
+/// Fair admission to one model's transient working set. Interactive work may
+/// bypass bulk work, with a bounded burst so indexing continues under load.
+/// Waiting requests own no workspace reservation. Stack-owned waiters are removed on cancellation,
+/// so a timed-out request cannot leave a ticket hole or block later work.
+pub const ExecutionLane = struct {
+    const Waiter = struct {
+        next: ?*Waiter = null,
+        interactive: bool = false,
+        ready: std.Io.Event = .unset,
+        io: ?std.Io = null,
+    };
+    mutex: std.atomic.Mutex = .unlocked,
+    head: ?*Waiter = null,
+    tail: ?*Waiter = null,
+    owned: bool = false,
+    interactive_burst: usize = 0,
+
+    pub const Lease = struct {
+        lane: *ExecutionLane,
+        pub fn release(self: Lease) void {
+            self.lane.lock();
+            defer self.lane.mutex.unlock();
+            std.debug.assert(self.lane.owned);
+            self.lane.owned = false;
+            self.lane.wakeHead();
+        }
+    };
+
+    fn lock(self: *ExecutionLane) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn selected(self: *ExecutionLane) ?*Waiter {
+        var interactive: ?*Waiter = null;
+        var background: ?*Waiter = null;
+        var current = self.head;
+        while (current) |waiter| : (current = waiter.next) {
+            if (waiter.interactive) {
+                if (interactive == null) interactive = waiter;
+            } else if (background == null) background = waiter;
+        }
+        if (self.interactive_burst >= 8 and background != null) return background;
+        return interactive orelse background;
+    }
+
+    fn wakeHead(self: *ExecutionLane) void {
+        if (!self.owned) if (self.selected()) |head| if (head.io) |io| head.ready.set(io);
+    }
+
+    fn remove(self: *ExecutionLane, waiter: *Waiter) void {
+        var previous: ?*Waiter = null;
+        var current = self.head;
+        while (current) |item| : (current = item.next) {
+            if (item == waiter) {
+                if (previous) |p| p.next = item.next else self.head = item.next;
+                if (self.tail == item) self.tail = previous;
+                return;
+            }
+            previous = item;
+        }
+        unreachable;
+    }
+
+    pub fn acquire(self: *ExecutionLane, control: InferenceExecutionControl) !Lease {
+        return self.acquireWithPriority(control, false);
+    }
+
+    pub fn acquireWithPriority(self: *ExecutionLane, control: InferenceExecutionControl, interactive: bool) !Lease {
+        try control.check();
+        var waiter = Waiter{ .io = control.io, .interactive = interactive };
+        self.lock();
+        if (self.tail) |tail| tail.next = &waiter else self.head = &waiter;
+        self.tail = &waiter;
+        self.mutex.unlock();
+        errdefer {
+            self.lock();
+            self.remove(&waiter);
+            self.wakeHead();
+            self.mutex.unlock();
+        }
+        while (true) {
+            try control.check();
+            self.lock();
+            if (!self.owned and self.selected() == &waiter) {
+                self.remove(&waiter);
+                self.owned = true;
+                self.interactive_burst = if (interactive) self.interactive_burst +| 1 else 0;
+                self.mutex.unlock();
+                return .{ .lane = self };
+            }
+            // A newly queued query can supersede a signaled bulk waiter. Reset
+            // under the lane lock so that waiter sleeps without losing a wake.
+            waiter.ready.reset();
+            self.mutex.unlock();
+            if (control.io) |io| {
+                // Release signals the next waiter immediately. The bounded
+                // timeout only observes callback cancellation that has no Io
+                // wake capability, and always respects the request deadline.
+                const remaining = if (control.deadline_ns) |deadline|
+                    @min(10 * std.time.ns_per_ms, deadline -| platform_time.monotonicNs())
+                else
+                    10 * std.time.ns_per_ms;
+                waiter.ready.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(@intCast(remaining)), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    else => return err,
+                };
+            } else platform_time.yieldNow();
+        }
+    }
+};
+
+test "execution lane removes cancelled and expired waiters without ticket holes" {
+    var lane = ExecutionLane{};
+    const first = try lane.acquire(.{ .io = std.testing.io });
+    const State = struct {
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const state: *@This() = @ptrCast(@alignCast(raw.?));
+            state.checks += 1;
+            if (state.checks >= 3) return error.Cancelled;
+        }
+    };
+    var state = State{};
+    try std.testing.expectError(error.Cancelled, lane.acquire(.{ .io = std.testing.io, .ptr = &state, .check_fn = State.check }));
+    try std.testing.expect(lane.head == null and lane.tail == null);
+    try std.testing.expectError(error.Timeout, lane.acquire(.{ .io = std.testing.io, .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_ms }));
+    try std.testing.expect(lane.head == null and lane.tail == null);
+    first.release();
+    const next = try lane.acquire(.{});
+    next.release();
+}
+
+test "execution lane gives queued batches FIFO ownership" {
+    const Worker = struct {
+        fn run(lane: *ExecutionLane, next: *std.atomic.Value(usize)) !usize {
+            const lease = try lane.acquire(.{ .io = std.testing.io });
+            defer lease.release();
+            return next.fetchAdd(1, .seq_cst);
+        }
+        fn waitForQueue(lane: *ExecutionLane, count: usize) !void {
+            const deadline = platform_time.monotonicNs() + std.time.ns_per_s * 5;
+            while (true) {
+                lane.lock();
+                var queued: usize = 0;
+                var current = lane.head;
+                while (current) |item| : (current = item.next) queued += 1;
+                lane.mutex.unlock();
+                if (queued == count) return;
+                if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    var lane = ExecutionLane{};
+    var next = std.atomic.Value(usize).init(0);
+    const owner = try lane.acquire(.{});
+    var released = false;
+    defer if (!released) owner.release();
+    var first = try std.testing.io.concurrent(Worker.run, .{ &lane, &next });
+    defer _ = first.cancel(std.testing.io) catch 0;
+    try Worker.waitForQueue(&lane, 1);
+    var second = try std.testing.io.concurrent(Worker.run, .{ &lane, &next });
+    defer _ = second.cancel(std.testing.io) catch 0;
+    try Worker.waitForQueue(&lane, 2);
+    owner.release();
+    released = true;
+    try std.testing.expectEqual(@as(usize, 0), try first.await(std.testing.io));
+    try std.testing.expectEqual(@as(usize, 1), try second.await(std.testing.io));
+}
+
+test "execution lane prioritizes queries with bounded background fairness" {
+    var lane = ExecutionLane{};
+    var bulk: ExecutionLane.Waiter = .{};
+    var first: ExecutionLane.Waiter = .{ .interactive = true };
+    var second: ExecutionLane.Waiter = .{ .interactive = true };
+    lane.head = &bulk;
+    lane.tail = &second;
+    bulk.next = &first;
+    first.next = &second;
+    try std.testing.expectEqual(&first, lane.selected().?);
+    lane.remove(&first);
+    try std.testing.expectEqual(&second, lane.selected().?);
+    lane.interactive_burst = 8;
+    try std.testing.expectEqual(&bulk, lane.selected().?);
+    lane.remove(&bulk);
+    try std.testing.expectEqual(&second, lane.selected().?);
+}
+
+test "execution lane wakes a query ahead of queued enrichment" {
+    const Worker = struct {
+        fn run(lane: *ExecutionLane, order: *std.atomic.Value(usize), interactive: bool) !usize {
+            const lease = try lane.acquireWithPriority(.{ .io = std.testing.io }, interactive);
+            defer lease.release();
+            return order.fetchAdd(1, .seq_cst);
+        }
+        fn queued(lane: *ExecutionLane, count: usize) !void {
+            const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (true) {
+                lane.lock();
+                var length: usize = 0;
+                var current = lane.head;
+                while (current) |item| : (current = item.next) length += 1;
+                lane.mutex.unlock();
+                if (length == count) return;
+                if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    var lane = ExecutionLane{};
+    var order = std.atomic.Value(usize).init(0);
+    const held = try lane.acquire(.{});
+    var released = false;
+    defer if (!released) held.release();
+    var bulk = try std.testing.io.concurrent(Worker.run, .{ &lane, &order, false });
+    defer _ = bulk.cancel(std.testing.io) catch 0;
+    try Worker.queued(&lane, 1);
+    var query = try std.testing.io.concurrent(Worker.run, .{ &lane, &order, true });
+    defer _ = query.cancel(std.testing.io) catch 0;
+    try Worker.queued(&lane, 2);
+    held.release();
+    released = true;
+    try std.testing.expectEqual(@as(usize, 0), try query.await(std.testing.io));
+    try std.testing.expectEqual(@as(usize, 1), try bulk.await(std.testing.io));
+}

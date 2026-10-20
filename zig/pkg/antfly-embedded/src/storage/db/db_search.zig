@@ -1600,7 +1600,7 @@ test "db query capture retains settled terminal repair debt without acknowledgin
     });
     defer db.close();
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "broken", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}" });
+    try db.addEnrichment(.{ .name = "broken", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"generator\":{\"provider\":\"openai\",\"model\":\"fixture\",\"api_key\":\"fixture\"}}}" });
     var fixture: u8 = 0;
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
     try db.initOptionalEnrichmentRuntime(&config);

@@ -1975,7 +1975,15 @@ pub fn artifactInventoryCommand(self: *DB, alloc: Allocator) !artifact_inventory
         var owned = catalogs;
         owned.deinit(alloc);
     }
-    return .{ .namespace = namespace, .previous = observed.ordered, .binding = .{ .epoch = try std.math.add(u64, if (observed.ordered) |value| value.epoch else 0, 1), .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc) }, .catalogs = catalogs };
+    const effect_protocol = @max(try catalogs.requiredEffectProtocol(alloc), if (observed.ordered) |binding| binding.effect_protocol else 14);
+    if (observed.ready and observed.ordered.?.effect_protocol == effect_protocol) {
+        var installed = (try inventory.load(alloc, &txn)).?;
+        defer installed.deinit();
+        var command = installed.value.command;
+        command.catalogs = catalogs;
+        return command;
+    }
+    return .{ .namespace = namespace, .previous = observed.ordered, .binding = .{ .epoch = try std.math.add(u64, if (observed.ordered) |value| value.epoch else 0, 1), .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc), .effect_protocol = effect_protocol }, .catalogs = catalogs };
 }
 
 pub fn completeArtifactUpload(txn: anytype, finalization: ?artifact_publication_transport.Finalization, entry: OrderedApplyReceipt) !void {
@@ -2104,6 +2112,8 @@ pub fn rejectArtifactPublicationAssumeApply(self: *DB, command: artifact_publica
     // A source/catalog race is an ordered outcome, not an apply failure.
     // Keep accepted provenance intact and commit the rejection with the
     // applied watermark, so retries cannot wedge a committed Raft entry.
+    if (command.completion) |page| if (page.group_producers) std.log.debug("group producer completion deferred reason={s}", .{@tagName(reason)});
+    if (command.mode == .publish and command.producer_kind == .enrichment) std.log.debug("producer publication deferred producer={s} reason={s}", .{ command.producer_name, @tagName(reason) });
     const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
     var txn = try self.core.store.beginWriteTxn();
     errdefer txn.abort();
@@ -2206,32 +2216,10 @@ pub fn requireArtifactReconcileUnfenced(self: *DB, txn: anytype, context: ?artif
     } else try relational_integrity_topology.requireUnfenced(txn);
 }
 
-pub fn requireOnlineArtifactCatalogMutableWithContextLocked(self: *DB, txn: anytype, context: ?artifact_reconcile_intent.Context) !void {
-    if (context) |value| try artifact_reconcile_intent.requireContext(self.alloc, txn, value) else try artifact_reconcile_intent.requireAbsent(txn);
+pub fn requireOnlineArtifactCatalogMutableWithContextLocked(self: *DB, txn: anytype, context: ?@import("artifact/reconcile_intent.zig").Context) !void {
     var namespace: [24]u8 = undefined;
     doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
-    try source_pin_state_mod.requireNoPrepared(txn, namespace);
-    if (try retained_effects_mod.load(txn)) |retention| {
-        if (retention.active() and std.mem.eql(u8, &retention.namespace, &namespace))
-            return error.IntegrityTopologyBusy;
-    }
-    // A receiver has no retained source record. Its immutable copy/tail
-    // contract is instead owned by the durable merge checkpoint. This
-    // also closes ordinary merge DDL races, without scanning any rows.
-    const merge = merge_state_mod;
-    const merge_raw = txn.get(merge.key) catch |err| switch (err) {
-        error.NotFound => txn.get(merge.legacy_key) catch |legacy_err| switch (legacy_err) {
-            error.NotFound => null,
-            else => return legacy_err,
-        },
-        else => return err,
-    };
-    if (merge_raw) |raw| {
-        var state = try merge.decodeAlloc(self.alloc, raw);
-        defer state.deinit(self.alloc);
-        if (state.phase != .none and state.phase != .finalized and state.phase != .rolled_back)
-            return error.IntegrityTopologyBusy;
-    }
+    return @import("artifact/catalog_mutability.zig").requireMutable(self.alloc, txn, namespace, context);
 }
 
 pub fn retireResolverArtifactsLocked(self: *DB, cfg: index_manager_mod.ResolverConfig) !?u64 {

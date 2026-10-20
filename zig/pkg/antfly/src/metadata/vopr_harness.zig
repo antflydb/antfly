@@ -6967,6 +6967,7 @@ pub const MetadataAdminVoprSource = struct {
             .read => |request| try store.systemCatalogRead(alloc, group_id, request),
             .list_tables => |request| try store.listSystemCatalogTables(alloc, group_id, request),
             .table_status => |request| try store.listSystemCatalogTables(alloc, group_id, request.listing()),
+            .resolver_catalog_read => |request| try store.resolverCatalogRead(alloc, group_id, request),
             .mutate => unreachable,
         };
         errdefer alloc.free(result);

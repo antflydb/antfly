@@ -42,16 +42,31 @@ void *av_metal_plane_texture(void *, size_t);
 void av_metal_import_release(void *);
 int32_t av_preparer_create(void *, void **);
 void av_preparer_destroy(void *);
-int32_t av_coefficients_create(void *, const uint32_t *, size_t, const int32_t *, size_t, const uint32_t *, size_t, const int32_t *, size_t, void **);
+int32_t av_preparer_output_slab(void *, size_t);
+int32_t av_coefficients_create(void *, const uint32_t *, size_t, const int32_t *, size_t, const uint32_t *, size_t, const int32_t *, size_t, const uint32_t *, void **);
 void av_coefficients_destroy(void *);
-int32_t av_chroma_create(void *, const void *, size_t, const void *, size_t, void **);
+int32_t av_chroma_create(void *, const void *, size_t, const void *, size_t, const uint32_t *, void **);
 void av_chroma_destroy(void *);
 int32_t av_prepare_submit(void *, void *, const uint32_t *, void *, void *, void **);
 int32_t av_prepare_rgba_submit(void *, const uint8_t *, size_t, const uint32_t *, void *, void **);
 // Native integer planes are retained until prepared output is released.
 int32_t av_prepare_native_submit(void *, void *, void *, const uint32_t *, void *, void *, void **);
 int32_t av_prepare_host_submit(void *, const uint8_t *, size_t, const uint8_t *, size_t, const uint32_t *, void *, void *, void **);
+int32_t av_prepare_rgba_into_submit(void *, const uint8_t *, size_t, const uint32_t *, void *, void *, size_t, void **);
+void av_prepared_notify(void *, void *, void (*)(void *));
 int av_prepared_poll(void *);
 void *av_prepared_buffer(void *);
+size_t av_prepared_offset(void *);
 int32_t av_prepared_copy(void *, float *, size_t);
 void av_prepared_destroy(void *);
+
+// Model-owned immutable resize/chroma/LUT cache; request queues remain private.
+int32_t av_preparation_cache_create(void *, size_t, void **);
+void av_preparation_cache_destroy(void *);
+void av_preparation_cache_stats(void *, uint64_t *);
+void av_preparer_set_cache(void *, void *);
+int32_t av_preparation_cache_get(void *, uint32_t, const uint32_t *, size_t, void **, size_t *);
+int av_prepared_wait(void *, uint64_t);
+uint32_t av_preparer_tone_mask(void *, uint32_t);
+void av_preparation_cache_suspend(void *);
+int32_t av_preparation_cache_resume(void *, size_t);

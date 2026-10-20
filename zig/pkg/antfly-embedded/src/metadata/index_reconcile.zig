@@ -15,6 +15,7 @@
 
 pub const std = @import("std");
 pub const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
+const resolver_catalog = @import("../storage/db/catalog/resolver_catalog.zig");
 pub const db_mod = @import("../storage/db/selected_root.zig").db;
 pub const internal_keys = @import("../storage/internal_keys.zig");
 pub const managed_embedder = @import("../inference/managed_embedder.zig");
@@ -628,16 +629,36 @@ pub fn ensureResolversWithOptions(
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
 
-    var desired = std.ArrayListUnmanaged(db_mod.ResolverConfig).empty;
+    var desired = std.ArrayListUnmanaged(resolver_catalog.ResolverConfig).empty;
     defer {
         for (desired.items) |*cfg| cfg.deinit(alloc);
         desired.deinit(alloc);
     }
     try collectDesiredResolvers(alloc, parsed.value, &desired);
 
+    var curation_arena = std.heap.ArenaAllocator.init(alloc);
+    defer curation_arena.deinit();
+    const curation = @import("../storage/db/resolver_curation.zig");
+    const identity_state = try curation.metadataFromValue(curation_arena.allocator(), parsed.value);
+
+    const before = try db.listResolvers(alloc);
+    defer {
+        for (before) |*cfg| cfg.deinit(alloc);
+        alloc.free(before);
+    }
+    var generations: std.StringHashMapUnmanaged(u64) = .empty;
+    defer generations.deinit(alloc);
+    for (before) |cfg| try generations.put(alloc, cfg.name, cfg.namespace_generation);
+    for (identity_state.identities) |identity| if (identity.dropped) try db.consumeResolverMetadataDrop(curation_arena.allocator(), identity);
     var summary: ResolverReconcileSummary = .{};
     for (desired.items) |cfg| {
-        const result = try db.upsertResolverWithResultOptions(cfg, .{
+        var next = cfg;
+        for (identity_state.identities) |identity| if (!identity.dropped and std.mem.eql(u8, identity.name, cfg.name)) {
+            next = try curation.overlayMetadata(curation_arena.allocator(), cfg, identity);
+            break;
+        };
+        const result = try db.upsertResolverWithResultOptions(next, .{
+            .migrate_namespace = next.namespace_generation > (generations.get(next.name) orelse 0),
             .drain_backfill = options.drain_backfill,
         });
         switch (result) {
@@ -660,10 +681,26 @@ pub fn ensureResolversWithOptions(
             try db.removeResolverWithoutDrain(cfg.name);
         if (removed) summary.removed += 1;
     }
+    // Runtime edits of retired identities remain durable without reactivating
+    // their extraction/promotion contracts.
+    const identities = try db.listResolverIdentities(alloc);
+    defer {
+        for (identities) |*cfg| cfg.deinit(alloc);
+        alloc.free(identities);
+    }
+    for (identity_state.identities) |identity| {
+        if (identity.dropped or desiredResolverContains(desired.items, identity.name)) continue;
+        for (identities) |cfg| {
+            if (!cfg.retired or !std.mem.eql(u8, cfg.name, identity.name)) continue;
+            const next = try curation.overlayMetadata(curation_arena.allocator(), cfg, identity);
+            _ = try db.upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .migrate_namespace = next.namespace_generation > cfg.namespace_generation });
+            break;
+        }
+    }
     return summary;
 }
 
-pub fn desiredResolverContains(desired: []const db_mod.ResolverConfig, name: []const u8) bool {
+pub fn desiredResolverContains(desired: []const resolver_catalog.ResolverConfig, name: []const u8) bool {
     for (desired) |cfg| {
         if (std.mem.eql(u8, cfg.name, name)) return true;
     }
@@ -673,7 +710,7 @@ pub fn desiredResolverContains(desired: []const db_mod.ResolverConfig, name: []c
 pub fn collectDesiredResolvers(
     alloc: std.mem.Allocator,
     value: std.json.Value,
-    out: *std.ArrayListUnmanaged(db_mod.ResolverConfig),
+    out: *std.ArrayListUnmanaged(resolver_catalog.ResolverConfig),
 ) !void {
     switch (value) {
         .object => |object| {
@@ -681,15 +718,12 @@ pub fn collectDesiredResolvers(
                 if (resolvers == .array) {
                     for (resolvers.array.items) |item| {
                         if (item != .object) continue;
-                        const parsed = try std.json.parseFromValue(db_mod.ResolverConfig, alloc, item, .{
-                            .allocate = .alloc_always,
-                            .ignore_unknown_fields = true,
-                        });
+                        const parsed = try resolver_catalog.ResolverConfig.parseValue(alloc, item);
                         // `parsed.value` is owned by the parse arena; clone with
                         // `alloc` so `out`'s entries free correctly (and so they
                         // outlive the arena).
                         defer parsed.deinit();
-                        try out.append(alloc, try db_mod.ResolverConfig.clone(alloc, parsed.value));
+                        try out.append(alloc, try resolver_catalog.ResolverConfig.clone(alloc, parsed.value));
                     }
                 }
             }

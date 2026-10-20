@@ -160,13 +160,14 @@ pub fn resumeGeneratedReplayFromJournalIfNeeded(self: *DB) !void {
 
 pub fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, enrichment_cfg });
-    if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return null;
+    if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers and !self.core.index_manager.hasGroupSources()) return null;
     // Producer ownership moves through reconfiguration, but execution and
     // security capabilities belong to the resident DB. Hydrate every
     // replacement at this single construction boundary so live index DDL
     // cannot silently fall back to default remote-content policy or an
     // unrelated executor when it supplies only a new producer set.
     var runtime_cfg = enrichment_cfg.*;
+    if (self.core.index_manager.hasGroupSources()) runtime_cfg.enable_without_producers = true;
     runtime_cfg.root_incarnation = self.root_incarnation;
     if (runtime_cfg.secret_store == null) runtime_cfg.secret_store = self.secret_store;
     if (runtime_cfg.remote_content == null) runtime_cfg.remote_content = self.remote_content;
@@ -758,7 +759,7 @@ pub fn runMaintenanceUntilWithEnrichmentCompletion(
         try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
 
         const next_target = self.core.nextDerivedSequence();
-        if (next_target <= stable_target) {
+        if (completion == .published_cut or next_target <= stable_target) {
             try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
             _ = try self.runArtifactRepairMetadataMaintenancePass();
             return;

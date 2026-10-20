@@ -62,7 +62,20 @@ class OpenApiBuildPathsTest(unittest.TestCase):
         self.assertIn("calibration_id", acceptance)
         self.assertIn("second-highest", acceptance["min_margin"]["description"])
         answer_refs = schemas["InferenceDecideAnswer"]["oneOf"]
-        self.assertEqual(len(answer_refs), 5)
+        self.assertCountEqual(
+            [answer["$ref"].rsplit("/", 1)[-1] for answer in answer_refs],
+            [
+                "GeneratedChoiceAnswer",
+                "GeneratedMultiChoiceAnswer",
+                "GeneratedPredicateAnswer",
+                "GeneratedScoreAnswer",
+                "TrainedChoiceAnswer",
+                "TrainedScoreAnswer",
+                "TrainedPredicateAnswer",
+                "EmbeddingChoiceAnswer",
+                "EmbeddingMultiChoiceAnswer",
+            ],
+        )
 
     def test_joined_relational_query_preserves_optional_zero_epoch(self):
         # Exercise the authoritative metadata input and join pipeline, not a

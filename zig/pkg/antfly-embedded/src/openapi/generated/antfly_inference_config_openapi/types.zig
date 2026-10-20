@@ -981,6 +981,9 @@ pub const GenerateRequest = struct {
     model: []const u8,
     /// Conversation messages (OpenAI-compatible format)
     messages: []const ChatMessage,
+    /// Return actual decoder token evidence for non-streaming native grammar generation.
+    logprobs: ?bool = null,
+    top_logprobs: ?i64 = null,
     /// Maximum tokens to generate
     max_tokens: ?i64 = null,
     /// Sampling temperature (0.0 = deterministic, higher = more random)
@@ -1004,6 +1007,8 @@ pub const GenerateRequest = struct {
     pub const openApiFieldMetadata = .{
         .{ "model", "model", false },
         .{ "messages", "messages", false },
+        .{ "logprobs", "logprobs", true },
+        .{ "top_logprobs", "top_logprobs", true },
         .{ "max_tokens", "max_tokens", true },
         .{ "temperature", "temperature", true },
         .{ "top_p", "top_p", true },
@@ -1029,6 +1034,14 @@ pub const GenerateRequest = struct {
         try jw.write(self.model);
         try jw.objectField("messages");
         try jw.write(self.messages);
+        if (self.logprobs) |value| {
+            try jw.objectField("logprobs");
+            try jw.write(value);
+        }
+        if (self.top_logprobs) |value| {
+            try jw.objectField("top_logprobs");
+            try jw.write(value);
+        }
         if (self.max_tokens) |value| {
             try jw.objectField("max_tokens");
             try jw.write(value);

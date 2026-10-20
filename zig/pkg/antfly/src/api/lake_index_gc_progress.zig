@@ -50,7 +50,7 @@ pub const Job = union(enum) {
     text_directory: artifacts.ChunkRef,
     text_root: artifacts.ChunkRef,
     text_manifest: struct { ref: artifacts.ChunkRef, seekable: bool, maintenance_only: bool = false },
-    page: struct { ref: tree.Ref, ordered_rows: bool, native_files: bool = false, contributions: bool = false, text_files: ?struct { seekable: bool, maintenance_only: bool } = null },
+    page: struct { ref: tree.Ref, ordered_rows: bool, native_files: bool = false, native_generation: bool = false, native_chunks: bool = false, contributions: bool = false, text_files: ?struct { seekable: bool, maintenance_only: bool } = null },
 };
 pub const Progress = struct {
     collector: *gc.Collector,
@@ -158,7 +158,7 @@ pub const Progress = struct {
             },
             .page => |job_page| {
                 const page = job_page.ref;
-                if (!try self.expand(.{ .artifact_id = &try page_store.PageStore.identity(self.value.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes }, if (job_page.text_files) |files| (if (files.maintenance_only) "text-maintenance-file-page" else "text-serving-file-page") else if (job_page.native_files) "native-file-state-page" else if (job_page.contributions) "contribution-index" else if (job_page.ordered_rows) "ordered-page" else "page")) return;
+                if (!try self.expand(.{ .artifact_id = &try page_store.PageStore.identity(self.value.domain, page), .checksum = &std.fmt.bytesToHex(&page.digest, .lower), .byte_len = page.bytes }, if (job_page.text_files) |files| (if (files.maintenance_only) "text-maintenance-file-page" else "text-serving-file-page") else if (job_page.native_generation) "native-generation-files" else if (job_page.native_chunks) "native-generation-chunks" else if (job_page.native_files) "native-file-state-page" else if (job_page.contributions) "contribution-index" else if (job_page.ordered_rows) "ordered-page" else "page")) return;
                 var write_bytes: u64 = 0;
                 var pages: page_store.PageStore = .{ .domain = self.value.domain, .artifacts = &collector.store, .cancellation = collector.cancellation(), .remaining_read_bytes = &collector.remaining_reads, .remaining_write_bytes = &write_bytes };
                 const Visitor = struct {
@@ -166,12 +166,24 @@ pub const Progress = struct {
                     ordered: bool,
                     contributions: bool,
                     native_files: bool,
+                    native_generation: bool,
+                    native_chunks: bool,
                     text_files: @FieldType(@FieldType(Job, "page"), "text_files"),
                     a: A,
                     pub fn child(visitor: *@This(), ref: tree.Ref) !void {
-                        try visitor.progress.enqueue(.{ .page = .{ .ref = ref, .ordered_rows = visitor.ordered, .native_files = visitor.native_files, .contributions = visitor.contributions, .text_files = visitor.text_files } });
+                        try visitor.progress.enqueue(.{ .page = .{ .ref = ref, .ordered_rows = visitor.ordered, .native_files = visitor.native_files, .native_generation = visitor.native_generation, .native_chunks = visitor.native_chunks, .contributions = visitor.contributions, .text_files = visitor.text_files } });
                     }
                     pub fn record(visitor: *@This(), key: []const u8, bytes: []const u8) !void {
+                        if (visitor.native_generation) {
+                            const file = try @import("lake_index_native_directory.zig").decodeFile(visitor.a, key, bytes, visitor.progress.value.domain);
+                            if (file.chunk_root) |chunk_page| try visitor.progress.enqueue(.{ .page = .{ .ref = chunk_page, .ordered_rows = false, .native_chunks = true } });
+                            return;
+                        }
+                        if (visitor.native_chunks) {
+                            if (key.len != 8) return error.InvalidNativeLakeGcReference;
+                            try visitor.progress.enqueue(.{ .chunk = try @import("lake_index_native_directory.zig").decodeChunk(visitor.a, bytes, visitor.progress.value.domain) });
+                            return;
+                        }
                         if (visitor.native_files) {
                             const file = try @import("lake_index_native_state.zig").decodeDirectoryFile(visitor.a, key, bytes, visitor.progress.value.domain);
                             for (file.docs) |ref| try visitor.progress.enqueue(.{ .chunk = ref });
@@ -194,7 +206,7 @@ pub const Progress = struct {
                         if (try @import("lake_index_ordered_rows.zig").coverReference(visitor.a, visitor.progress.value.domain, bytes)) |cover| try visitor.progress.enqueue(.{ .chunk = cover.block });
                     }
                 };
-                var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .native_files = job_page.native_files, .contributions = job_page.contributions, .text_files = job_page.text_files, .a = a };
+                var visitor: Visitor = .{ .progress = self, .ordered = job_page.ordered_rows, .native_files = job_page.native_files, .native_generation = job_page.native_generation, .native_chunks = job_page.native_chunks, .contributions = job_page.contributions, .text_files = job_page.text_files, .a = a };
                 try tree.walkPage(a, pages.store(), page, &visitor);
             },
         }
@@ -520,7 +532,7 @@ test "external lake global frontier resumable GC retains delete-version and nati
     try file_builder.add(&native.Selection.idKey(state_file.id), try std.json.Stringify.valueAlloc(ca, state_file, .{}));
     const file_directory = (try file_builder.finish()).?;
     const sparse_binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .sparse, .source_kind = .external_iceberg, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "first", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"embedding"} };
-    const sparse_root: @import("lake_index_native_sparse.zig").Root = .{ .binding = sparse_binding, .config_json = "{}", .generation = .{ .domain = domain, .files = &.{} }, .file_directory = file_directory };
+    const sparse_root: @import("lake_index_native_sparse.zig").Root = .{ .version = 3, .binding = sparse_binding, .config_json = "{}", .generation = .{ .domain = domain, .files = &.{} }, .file_directory = file_directory };
     var sparse_ref = try store.put(try std.json.Stringify.valueAlloc(ca, sparse_root, .{}));
     defer sparse_ref.deinit(a);
     publication.declarations = &.{.{ .name = "sparse", .binding = sparse_binding, .artifact = .{ .kind = .sparse_segment, .metadata_version = 3, .artifact_id = sparse_ref.artifact_id, .checksum = sparse_ref.checksum, .byte_len = sparse_ref.byte_len } }};

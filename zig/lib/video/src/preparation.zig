@@ -21,22 +21,70 @@ const chroma_filter = @import("chroma.zig");
 const supported = @import("builtin").os.tag == .macos;
 extern fn av_preparer_create(*anyopaque, *?*anyopaque) i32;
 extern fn av_preparer_destroy(*anyopaque) void;
-extern fn av_coefficients_create(*anyopaque, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, *?*anyopaque) i32;
-extern fn av_chroma_create(*anyopaque, [*]const chroma_filter.Tap, usize, [*]const chroma_filter.Tap, usize, *?*anyopaque) i32;
+extern fn av_preparer_output_slab(*anyopaque, usize) i32;
+extern fn av_prepared_offset(*anyopaque) usize;
+extern fn av_coefficients_create(*anyopaque, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, [*]const u32, *?*anyopaque) i32;
+extern fn av_chroma_create(*anyopaque, [*]const chroma_filter.Tap, usize, [*]const chroma_filter.Tap, usize, [*]const u32, *?*anyopaque) i32;
 extern fn av_chroma_destroy(*anyopaque) void;
 extern fn av_coefficients_destroy(*anyopaque) void;
 extern fn av_prepare_submit(*anyopaque, *anyopaque, [*]const u32, *anyopaque, ?*anyopaque, *?*anyopaque) i32;
 extern fn av_prepare_native_submit(*anyopaque, *anyopaque, ?*anyopaque, [*]const u32, *anyopaque, ?*anyopaque, *?*anyopaque) i32;
 extern fn av_prepare_host_submit(*anyopaque, [*]const u8, usize, [*]const u8, usize, [*]const u32, *anyopaque, ?*anyopaque, *?*anyopaque) i32;
+extern fn av_prepare_rgba_into_submit(*anyopaque, [*]const u8, usize, [*]const u32, *anyopaque, *anyopaque, usize, *?*anyopaque) i32;
 extern fn av_prepare_rgba_submit(*anyopaque, [*]const u8, usize, [*]const u32, *anyopaque, *?*anyopaque) i32;
 extern fn av_prepared_gpu_seconds(*anyopaque) f64;
 extern fn av_preparer_device_bytes(*anyopaque) u64;
+extern fn av_prepared_notify(*anyopaque, ?*anyopaque, ?*const fn (?*anyopaque) callconv(.c) void) void;
 extern fn av_prepared_poll(*anyopaque) c_int;
+extern fn av_prepared_wait(*anyopaque, u64) c_int;
 extern fn av_prepared_buffer(*anyopaque) *anyopaque;
 extern fn av_prepared_copy(*anyopaque, [*]f32, usize) i32;
 extern fn av_prepared_release_source(*anyopaque) c_int;
-extern fn av_preparer_tone_mask(*anyopaque) u32;
+extern fn av_preparer_tone_mask(*anyopaque, u32) u32;
 extern fn av_prepared_destroy(*anyopaque) void;
+
+extern fn av_preparation_cache_create(*anyopaque, usize, *?*anyopaque) i32;
+extern fn av_preparation_cache_destroy(*anyopaque) void;
+extern fn av_preparation_cache_suspend(*anyopaque) void;
+extern fn av_preparation_cache_resume(*anyopaque, usize) i32;
+extern fn av_preparation_cache_stats(*anyopaque, *[4]u64) void;
+extern fn av_preparation_cache_get(*anyopaque, u32, [*]const u32, usize, *?*anyopaque, *usize) i32;
+extern fn av_preparer_set_cache(*anyopaque, ?*anyopaque) void;
+
+/// Immutable geometry/chroma/LUT storage shared by independent request queues.
+/// The owner admits host_budget and device_budget for its entire lifetime.
+/// Preparers retain entries across replacement; their private coefficient
+/// allowance covers those pins even after the shared LRU evicts an entry.
+pub const CoefficientCache = struct {
+    pub const host_budget = 64 * 1024;
+    pub const device_budget = 16 * 1024 * 1024;
+    handle: *anyopaque,
+    pub fn init(device: *anyopaque, limit: usize) !CoefficientCache {
+        if (!supported) return error.UnsupportedVideoBackend;
+        var handle: ?*anyopaque = null;
+        if (av_preparation_cache_create(device, limit, &handle) != 0) return error.MetalPreparationUnavailable;
+        return .{ .handle = handle.? };
+    }
+    pub fn deinit(self: *CoefficientCache) void {
+        if (supported) av_preparation_cache_destroy(self.handle);
+        self.* = undefined;
+    }
+    /// Stop publication and drop cache ownership before releasing device credit.
+    /// Active preparers continue with independently admitted private pins.
+    pub fn disable(self: *CoefficientCache) void {
+        if (supported) av_preparation_cache_suspend(self.handle);
+    }
+    /// Call only after independently admitting the device budget again.
+    pub fn enable(self: *CoefficientCache, limit: usize) !void {
+        if (!supported) return error.UnsupportedVideoBackend;
+        if (av_preparation_cache_resume(self.handle, limit) != 0) return error.ResourceLimitExceeded;
+    }
+    pub fn statistics(self: *const CoefficientCache) struct { hits: u64, inserts: u64, bytes: u64, entries: u64 } {
+        var result: [4]u64 = @splat(0);
+        if (supported) av_preparation_cache_stats(self.handle, &result);
+        return .{ .hits = result[0], .inserts = result[1], .bytes = result[2], .entries = result[3] };
+    }
+};
 
 pub const Rotation = enum(u32) { none, clockwise90, half_turn, clockwise270 };
 pub const Matrix = enum(u32) { bt601, bt709, bt2020_ncl, gbr_identity };
@@ -95,6 +143,48 @@ pub fn croppedSize(width: u32, height: u32, crop: media.webm.Crop) ![2]u32 {
     if (horizontal >= width or vertical >= height) return error.InvalidVideoGeometry;
     return .{ width - @as(u32, @intCast(horizontal)), height - @as(u32, @intCast(vertical)) };
 }
+/// Device allocations made by apple_prepare.m, independent of CPU RGB/repack
+/// workspace. Imported decoder textures are charged to their decoder owner.
+/// Coefficients/LUTs have their own retained reservation. The fixed allowance
+/// covers command/encoder metadata and page/texture allocation rounding.
+pub const MetalLayout = struct {
+    upload_bytes: usize = 0,
+    chroma_format: u8 = 1,
+    rgb: bool = false,
+    owns_output: bool = true,
+};
+pub fn metalPlaneUploadBytes(width: u32, height: u32, depth: u8, chroma: u8) !usize {
+    if (depth < 8 or depth > 14 or chroma > 3) return error.UnsupportedSurfaceFormat;
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return error.InvalidVideoGeometry;
+    const sample: usize = if (depth == 8) 1 else 2;
+    const y = std.mem.alignForward(usize, try std.math.mul(usize, width, sample), 256) * @as(usize, height);
+    if (chroma == 0) return std.mem.alignForward(usize, y, 16384);
+    const cw = if (chroma == 3) width else (width + 1) / 2;
+    const ch = if (chroma == 1) (height + 1) / 2 else height;
+    const uv = std.mem.alignForward(usize, try std.math.mul(usize, cw, 2 * sample), 256) * @as(usize, ch);
+    return std.math.add(usize, std.mem.alignForward(usize, y, 16384), std.mem.alignForward(usize, uv, 16384));
+}
+pub fn metalWorkingBytes(width: u32, height: u32, options: Options, layout: MetalLayout) !usize {
+    // Geometry's host scratch cap must not reject this device-only estimate,
+    // especially when preflight bounds a possible reconstruction policy.
+    var geometry_options = options;
+    geometry_options.max_scratch_bytes = std.math.maxInt(usize);
+    const g = try geometry(width, height, geometry_options);
+    if (layout.upload_bytes > std.math.maxInt(usize) - 16383) return error.ResourceLimitExceeded;
+    if (layout.chroma_format > 3) return error.UnsupportedSurfaceFormat;
+    const cropped = try croppedSize(width, height, options.crop);
+    const rows = if (options.rotation == .clockwise90 or options.rotation == .clockwise270) cropped[0] else cropped[1];
+    var bytes = try std.math.add(usize, 256 * 1024, std.mem.alignForward(usize, try std.math.mul(usize, @as(usize, g.width) * 3, rows), 16384));
+    bytes = try std.math.add(usize, bytes, std.mem.alignForward(usize, layout.upload_bytes, 16384));
+    if (layout.owns_output) bytes = try std.math.add(usize, bytes, std.mem.alignForward(usize, g.values() * @sizeOf(f32), 16384));
+    if (!layout.rgb and layout.chroma_format == 0) bytes = try std.math.add(usize, bytes, 16384); // dummy UV texture
+    if (!layout.rgb and options.rgb_rounding == .q13_reconstructed and options.tone_mapping == .none and layout.chroma_format != 0) {
+        const columns = if (width % 2 != 0 or layout.chroma_format == 3) width else (width + 1) / 2;
+        const chroma_rows = if (layout.chroma_format == 1) (height + 1) / 2 else height;
+        bytes = try std.math.add(usize, bytes, std.mem.alignForward(usize, try std.math.mul(usize, @as(usize, columns) * 4, chroma_rows), 16384));
+    }
+    return bytes;
+}
 pub fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Geometry {
     if (source_width == 0 or source_height_u32 == 0 or options.width == 0 or options.height == 0) return error.InvalidVideoGeometry;
     // Match the qualified texture/display bounds even when caller budgets grow.
@@ -111,8 +201,8 @@ pub fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Ge
     const horizontal_bytes = try std.math.mul(usize, try std.math.mul(usize, options.width, source_height), 3);
     const output_bytes = try std.math.mul(usize, pixels, 3 * @sizeOf(f32));
     const rgb_bytes = try std.math.mul(usize, source_pixels, 3);
-    // One conservative bound covers both reference and device paths, including
-    // CPU result/patch repacking. Coefficient storage is checked separately.
+    // CPU conversion and result/patch repacking bound. Metal command admission
+    // uses metalWorkingBytes; coefficient storage is checked separately.
     const reconstruction = if (options.matrix != .gbr_identity and options.rgb_rounding == .q13_reconstructed and options.tone_mapping == .none)
         try std.math.add(usize, try std.math.mul(usize, source_pixels, 4), try std.math.mul(usize, @as(usize, source_width) + source_height_u32, 128))
     else
@@ -613,11 +703,16 @@ pub const Metal = struct {
     coefficient_build_bound: usize = 0,
     coefficient_limit: usize = 16 * 1024 * 1024,
     cache_reservation: media.admission.Token = .{},
+    output_reservation: media.admission.Token = .{},
+    output_slab_bytes: usize = 0,
     pub fn init(device: *anyopaque) !Metal {
         if (!supported) return error.UnsupportedVideoBackend;
         var out: ?*anyopaque = null;
         if (av_preparer_create(device, &out) != 0) return error.MetalPreparationUnavailable;
         return .{ .handle = out.? };
+    }
+    pub fn useCoefficientCache(self: *Metal, cache: ?*const CoefficientCache) void {
+        if (supported) av_preparer_set_cache(self.handle, if (cache) |owner| owner.handle else null);
     }
     pub fn deinit(self: *Metal) void {
         if (supported) {
@@ -625,6 +720,7 @@ pub const Metal = struct {
             if (self.chroma_coefficients) |resident| av_chroma_destroy(resident);
             av_preparer_destroy(self.handle);
             self.cache_reservation.deinit();
+            self.output_reservation.deinit();
         }
         self.* = undefined;
     }
@@ -635,6 +731,18 @@ pub const Metal = struct {
         if (self.coefficients != null or self.chroma_coefficients != null or self.cache_reservation.pool != null) return error.MetalPreparerAlreadyUsed;
         self.cache_reservation = try pool.acquire(.{ .device_bytes = max_coefficient_bytes });
         self.coefficient_limit = max_coefficient_bytes;
+    }
+    /// Append-only final patch storage for one bounded selection. The caller
+    /// drains all Prepared jobs/imports before deinit; no span is reused. This
+    /// reservation is additional to transient per-command preparation scratch.
+    pub fn admitOutputSlab(self: *Metal, pool: ?*media.admission.Pool, bytes: usize) !void {
+        if (!supported) return error.UnsupportedVideoBackend;
+        if (self.output_slab_bytes != 0 or bytes == 0 or bytes > 128 * 1024 * 1024) return error.ResourceLimitExceeded;
+        var reservation = if (pool) |shared| try shared.acquire(.{ .device_bytes = bytes }) else media.admission.Token{};
+        errdefer reservation.deinit();
+        if (av_preparer_output_slab(self.handle, bytes) != 0) return error.MetalPreparationFailed;
+        self.output_reservation = reservation;
+        self.output_slab_bytes = bytes;
     }
     /// Device-wide allocated size, including other work using this device.
     pub fn deviceAllocatedBytes(self: *const Metal) u64 {
@@ -653,12 +761,12 @@ pub const Metal = struct {
         self.coefficient_build_bound = 0;
     }
     fn ensureCoefficients(self: *Metal, allocator: std.mem.Allocator, width: u32, height: u32, g: Geometry, options: Options, control: media.source.Control) !usize {
-        const mask = av_preparer_tone_mask(self.handle);
         const requested: u32 = switch (options.tone_mapping) {
             .none => 0,
             .pq_reinhard_100 => 1,
             .hlg_reinhard_100 => 2,
         };
+        const mask = av_preparer_tone_mask(self.handle, requested);
         const color_bytes = @as(usize, @popCount(mask | requested)) * 16385 * 4;
         if (self.chroma_bytes > self.coefficient_limit) return error.ResourceLimitExceeded;
         if (color_bytes > self.coefficient_limit - self.chroma_bytes) return error.ResourceLimitExceeded;
@@ -671,6 +779,20 @@ pub const Metal = struct {
             if (self.coefficient_bytes > self.coefficient_limit - color_bytes - self.chroma_bytes) return error.ResourceLimitExceeded;
             return color_upload;
         }
+        const build_bound = @max(try Axis.bound(key[0], key[2]), try Axis.bound(key[1], key[3]));
+        if (build_bound > options.max_scratch_bytes / 4) return error.ResourceLimitExceeded;
+        var cached: ?*anyopaque = null;
+        var cached_bytes: usize = 0;
+        if (av_preparation_cache_get(self.handle, 0, &key, key.len, &cached, &cached_bytes) == 1) {
+            errdefer av_coefficients_destroy(cached.?);
+            if (cached_bytes > self.coefficient_limit - color_bytes - self.chroma_bytes) return error.ResourceLimitExceeded;
+            if (self.coefficients) |old| av_coefficients_destroy(old);
+            self.coefficients = cached;
+            self.coefficient_key = key;
+            self.coefficient_bytes = cached_bytes;
+            self.coefficient_build_bound = build_bound;
+            return color_upload;
+        }
         var xaxis = try Axis.init(allocator, key[0], key[2], options.max_scratch_bytes / 4, options.torchvision);
         defer xaxis.deinit();
         var yaxis = try Axis.init(allocator, key[1], key[3], options.max_scratch_bytes / 4, options.torchvision);
@@ -679,7 +801,7 @@ pub const Metal = struct {
         const byte_count = (xaxis.table.len + xaxis.weights.len + yaxis.table.len + yaxis.weights.len) * 4;
         if (byte_count > self.coefficient_limit - color_bytes - self.chroma_bytes) return error.ResourceLimitExceeded;
         var resident: ?*anyopaque = null;
-        if (av_coefficients_create(self.handle, xaxis.table.ptr, xaxis.table.len, xaxis.weights.ptr, xaxis.weights.len, yaxis.table.ptr, yaxis.table.len, yaxis.weights.ptr, yaxis.weights.len, &resident) != 0) return error.MetalPreparationFailed;
+        if (av_coefficients_create(self.handle, xaxis.table.ptr, xaxis.table.len, xaxis.weights.ptr, xaxis.weights.len, yaxis.table.ptr, yaxis.table.len, yaxis.weights.ptr, yaxis.weights.len, &key, &resident) != 0) return error.MetalPreparationFailed;
         if (self.coefficients) |old| av_coefficients_destroy(old);
         self.coefficients = resident.?;
         self.coefficient_key = key;
@@ -691,13 +813,24 @@ pub const Metal = struct {
         if (options.matrix == .gbr_identity or options.rgb_rounding != .q13_reconstructed or options.tone_mapping != .none or chroma == 0) return 0;
         const key = [3]u32{ width, height, chroma };
         if (self.chroma_coefficients != null and std.mem.eql(u32, &key, &self.chroma_key)) return 0;
+        const color_bytes = @as(usize, @popCount(av_preparer_tone_mask(self.handle, 0))) * 16385 * 4;
+        var cached: ?*anyopaque = null;
+        var cached_bytes: usize = 0;
+        if (av_preparation_cache_get(self.handle, 1, &key, key.len, &cached, &cached_bytes) == 1) {
+            errdefer av_chroma_destroy(cached.?);
+            if (self.coefficient_bytes > self.coefficient_limit or color_bytes > self.coefficient_limit - self.coefficient_bytes or cached_bytes > self.coefficient_limit - self.coefficient_bytes - color_bytes) return error.ResourceLimitExceeded;
+            if (self.chroma_coefficients) |old| av_chroma_destroy(old);
+            self.chroma_coefficients = cached;
+            self.chroma_key = key;
+            self.chroma_bytes = cached_bytes;
+            return 0;
+        }
         var plan = try chroma_filter.Plan.init(a, width, height, chroma, control);
         defer plan.deinit();
         const bytes = plan.bytes();
-        const color_bytes = @as(usize, @popCount(av_preparer_tone_mask(self.handle))) * 16385 * 4;
         if (self.coefficient_bytes > self.coefficient_limit or color_bytes > self.coefficient_limit - self.coefficient_bytes or bytes > self.coefficient_limit - self.coefficient_bytes - color_bytes) return error.ResourceLimitExceeded;
         var resident: ?*anyopaque = null;
-        if (av_chroma_create(self.handle, plan.x.taps.ptr, plan.x.taps.len, plan.y.taps.ptr, plan.y.taps.len, &resident) != 0) return error.MetalPreparationFailed;
+        if (av_chroma_create(self.handle, plan.x.taps.ptr, plan.x.taps.len, plan.y.taps.ptr, plan.y.taps.len, &key, &resident) != 0) return error.MetalPreparationFailed;
         if (self.chroma_coefficients) |old| av_chroma_destroy(old);
         self.chroma_coefficients = resident.?;
         self.chroma_key = key;
@@ -711,13 +844,13 @@ pub const Metal = struct {
         defer scope.deinit();
         try validateColorLayout(1, surface.format.fullRange(), options);
         const g = try geometry(surface.width, surface.height, options);
-        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = g.scratch_bytes, .commands = 1 }) else media.admission.Token{};
+        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try metalWorkingBytes(surface.width, surface.height, options, .{ .owns_output = self.output_slab_bytes == 0 }), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control) + try self.ensureChroma(allocator, surface.width, surface.height, 1, options, control);
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.format.bitDepth(), 1, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_submit(self.handle, surface.handle, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
+        return .{ .reservation = reservation, .retained_output_bytes = if (self.output_slab_bytes == 0) std.mem.alignForward(usize, g.values() * @sizeOf(f32), 16384) else 0, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .coefficient_staging_bytes = uploaded };
     }
     /// Caller-owned integer Metal plane textures on this preparer's device.
     /// R8/RG8Uint or R16/RG16Uint contain right-aligned native samples. The
@@ -740,13 +873,13 @@ pub const Metal = struct {
         if (surface.sample_shift > 16 - surface.bit_depth or (surface.bit_depth == 8 and surface.sample_shift != 0)) return error.UnsupportedSurfaceFormat;
         try validateColorLayout(surface.chroma_format, surface.full_range, options);
         const g = try geometry(surface.width, surface.height, options);
-        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = g.scratch_bytes, .commands = 1 }) else media.admission.Token{};
+        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try metalWorkingBytes(surface.width, surface.height, options, .{ .chroma_format = surface.chroma_format, .owns_output = self.output_slab_bytes == 0 }), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control) + try self.ensureChroma(allocator, surface.width, surface.height, surface.chroma_format, options, control);
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.sample_shift, @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_native_submit(self.handle, surface.y, surface.uv, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
+        return .{ .reservation = reservation, .retained_output_bytes = if (self.output_slab_bytes == 0) std.mem.alignForward(usize, g.values() * @sizeOf(f32), 16384) else 0, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .coefficient_staging_bytes = uploaded };
     }
     /// Upload native planes directly, without host RGB conversion. Metal owns
     /// its copies before return; padded byte strides remain explicit.
@@ -758,53 +891,101 @@ pub const Metal = struct {
         const g = try geometry(surface.width, surface.height, options);
         const size = try std.math.add(usize, surface.planes[0].bytes.len, surface.planes[1].bytes.len);
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
-        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try std.math.add(usize, g.scratch_bytes, size), .commands = 1 }) else media.admission.Token{};
+        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try metalWorkingBytes(surface.width, surface.height, options, .{ .upload_bytes = try metalPlaneUploadBytes(surface.width, surface.height, surface.bit_depth, surface.chroma_format), .chroma_format = surface.chroma_format, .owns_output = self.output_slab_bytes == 0 }), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
         const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control) + try self.ensureChroma(allocator, surface.width, surface.height, surface.chroma_format, options, control);
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
         if (av_prepare_host_submit(self.handle, surface.planes[0].bytes.ptr, surface.planes[0].stride, surface.planes[1].bytes.ptr, surface.planes[1].stride, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .native_staging_bytes = size, .coefficient_staging_bytes = uploaded };
+        return .{ .reservation = reservation, .retained_output_bytes = if (self.output_slab_bytes == 0) std.mem.alignForward(usize, g.values() * @sizeOf(f32), 16384) else 0, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .native_staging_bytes = size, .coefficient_staging_bytes = uploaded };
     }
     /// Copies tightly packed RGBA into owned Metal storage before returning.
     /// The producer may free its input immediately. Alpha/matrix are ignored
     /// as in referenceRgba; explicit rotation and centering still apply.
     pub fn submitRgba(self: *Metal, allocator: std.mem.Allocator, bytes: []const u8, width: u32, height: u32, options: Options, control: media.source.Control) !Prepared {
+        const size = try std.math.mul(usize, try std.math.mul(usize, width, height), 4);
+        if (bytes.len != size) return error.InvalidVideoGeometry;
+        return self.submitImageView(allocator, .{ .data = bytes, .width = width, .height = height, .format = .rgba8 }, options, control);
+    }
+    /// RGB/RGBA with explicit byte stride. Alpha and padding are ignored; only
+    /// the validated last-row span is staged. No host color expansion occurs.
+    pub fn submitImageView(self: *Metal, allocator: std.mem.Allocator, view: image.ImageU8, options: Options, control: media.source.Control) !Prepared {
+        return self.submitImageViewTarget(allocator, view, options, control, null, 0);
+    }
+    /// Writes one disjoint final patch span. Caller retains destination until
+    /// completion; commands also retain it. No intermediate patch copy.
+    pub fn submitImageViewInto(self: *Metal, allocator: std.mem.Allocator, view: image.ImageU8, options: Options, control: media.source.Control, destination: *anyopaque, offset: usize) !Prepared {
+        return self.submitImageViewTarget(allocator, view, options, control, destination, offset);
+    }
+    fn submitImageViewTarget(self: *Metal, allocator: std.mem.Allocator, view: image.ImageU8, options: Options, control: media.source.Control, destination: ?*anyopaque, offset: usize) !Prepared {
         if (!supported) return error.UnsupportedVideoBackend;
         try control.check();
+        try view.validate();
         var scope = image.work_control.Scope.enter(.{ .context = control.context, .check_fn = control.check_fn });
         defer scope.deinit();
-        const g = try geometry(width, height, options);
-        const size = std.math.mul(usize, try std.math.mul(usize, width, height), 4) catch return error.ResourceLimitExceeded;
-        if (bytes.len != size) return error.InvalidVideoGeometry;
+        const stride = try view.rowStride();
+        if (stride > std.math.maxInt(u32)) return error.ResourceLimitExceeded;
+        const size = try std.math.add(usize, try std.math.mul(usize, stride, view.height - 1), try std.math.mul(usize, view.width, view.channels()));
+        const g = try geometry(view.width, view.height, options);
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
-        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try std.math.add(usize, g.scratch_bytes, size), .commands = 1 }) else media.admission.Token{};
+        var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try metalWorkingBytes(view.width, view.height, options, .{ .upload_bytes = size, .rgb = true, .owns_output = destination == null and self.output_slab_bytes == 0 }), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
-        const uploaded = try self.ensureCoefficients(allocator, width, height, g, options, control);
-        const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered), 8, 1, @backingInt(options.rgb_rounding), 0, 0, options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
+        const uploaded = try self.ensureCoefficients(allocator, view.width, view.height, g, options, control);
+        // The RGB kernel uses the otherwise inapplicable matrix/range words
+        // for channel count/byte stride; YUV commands retain their ABI.
+        const params = [_]u32{ view.width, view.height, g.width, g.height, @backingInt(options.rotation), @intCast(view.channels()), @intCast(stride), @intFromBool(options.centered), 8, 1, @backingInt(options.rgb_rounding), 0, 0, options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
-        if (av_prepare_rgba_submit(self.handle, bytes.ptr, bytes.len, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .reservation = reservation, .handle = out.?, .geometry = g, .rgba_staging_bytes = bytes.len, .coefficient_staging_bytes = uploaded };
+        const rc = if (destination) |target| av_prepare_rgba_into_submit(self.handle, view.data.ptr, size, &params, self.coefficients.?, target, offset, &out) else av_prepare_rgba_submit(self.handle, view.data.ptr, size, &params, self.coefficients.?, &out);
+        if (rc != 0) return error.MetalPreparationFailed;
+        return .{ .reservation = reservation, .retained_output_bytes = if (destination == null and self.output_slab_bytes == 0) std.mem.alignForward(usize, g.values() * @sizeOf(f32), 16384) else 0, .handle = out.?, .geometry = g, .output_byte_offset = av_prepared_offset(out.?), .rgba_staging_bytes = size, .coefficient_staging_bytes = uploaded };
     }
 };
 /// Owns input import/staging, GPU command, and patch buffer. Destroy fences in-flight
 /// work, including after deadline/cancellation. No pixel readback on submit.
 pub const Prepared = struct {
+    /// Only individually owned outputs remain charged here after completion.
+    /// Shared slabs and caller destinations keep their original owner lease.
+    retained_output_bytes: usize = 0,
     reservation: media.admission.Token = .{},
     handle: *anyopaque,
     geometry: Geometry,
+    /// Byte span in a shared output slab or explicit final destination.
+    /// Add to buffer() when binding that span; readback() applies it internally.
+    output_byte_offset: usize = 0,
     /// Logical bytes copied by newBufferWithBytes, not physical PCIe/DMA bytes.
     rgba_staging_bytes: usize = 0,
     native_staging_bytes: usize = 0,
     coefficient_staging_bytes: usize = 0,
+    /// Notification may run immediately or on the Metal completion thread.
+    /// The callback must not reenter this preparation. Replacement and deinit
+    /// fence any running callback before its context can be released.
+    pub fn notify(self: *const Prepared, context: ?*anyopaque, callback: ?*const fn (?*anyopaque) callconv(.c) void) void {
+        if (supported) av_prepared_notify(self.handle, context, callback);
+    }
+    pub fn isReady(self: *const Prepared) !bool {
+        if (!supported) return error.UnsupportedVideoBackend;
+        return switch (av_prepared_poll(self.handle)) {
+            1 => true,
+            -1 => error.MetalPreparationFailed,
+            else => false,
+        };
+    }
     pub fn wait(self: *const Prepared, io: std.Io, control: media.source.Control) !void {
+        _ = io;
         if (!supported) return error.UnsupportedVideoBackend;
         while (true) {
             try control.check();
-            switch (av_prepared_poll(self.handle)) {
-                1 => return,
+            // Dedicated preparation consumers sleep on driver completion. The
+            // bounded timeout is only for cancellation; normal completion wakes
+            // immediately and already-completed jobs never enter a native wait.
+            if (try self.isReady()) return;
+            switch (av_prepared_wait(self.handle, 10 * std.time.ns_per_ms)) {
+                1 => {
+                    try control.check();
+                    return;
+                },
                 -1 => return error.MetalPreparationFailed,
-                else => try std.Io.sleep(io, .fromMilliseconds(1), .awake),
+                else => {},
             }
         }
     }
@@ -813,7 +994,7 @@ pub const Prepared = struct {
     pub fn releaseSource(self: *Prepared) !void {
         if (!supported) return error.UnsupportedVideoBackend;
         if (av_prepared_release_source(self.handle) != 0) return error.MetalPreparationNotReady;
-        try self.reservation.resize(.{ .device_bytes = self.geometry.values() * @sizeOf(f32) });
+        try self.reservation.resize(.{ .device_bytes = self.retained_output_bytes });
     }
     /// Borrowed id<MTLBuffer>; wait before consuming on another queue. For a
     /// resident inference consumer this is the handoff, not a host tensor copy.

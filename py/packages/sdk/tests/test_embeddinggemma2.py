@@ -66,5 +66,7 @@ def test_grouped_input_keeps_order_title_dimensions_and_identity():
         "input": [{"title": "Access", "content": [{"type": "text", "text": "Reset password"}]}],
     }
     value = InferenceEmbedRequest.from_dict(raw)
+    assert isinstance(value.input_, list)
+    assert len(value.input_) == 1
     assert isinstance(value.input_[0], InferenceEmbeddingGroup)
     assert value.to_dict() == raw

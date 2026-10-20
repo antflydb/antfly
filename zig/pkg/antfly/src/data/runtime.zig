@@ -5502,6 +5502,9 @@ pub const DataServer = struct {
     initial_fk_retirement_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
+    group_source_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
+    group_source_running: std.atomic.Value(bool) = .init(false),
+    group_source_worker: ?@import("antfly_local_sources").storage_db_group_source_worker.Worker = null,
     initial_fk_retirement_last_at_ms: u64 = 0,
     initial_fk_retirement_deadline_ns: u64 = 0,
     initial_fk_retirement_recovery_cursor: @import("fk_retirement_worker.zig").RecoveryCursor = .{},
@@ -6472,32 +6475,198 @@ pub const DataServer = struct {
         return !self.background_jobs_shutdown.load(.acquire) and platform_time.monotonicNs() < self.initial_fk_retirement_deadline_ns;
     }
 
+    const GroupSourceJob = struct {
+        server: *DataServer,
+        table: []const u8,
+        group_id: u64,
+        route: []const u8,
+        deadline_ns: u64 = 0,
+        definition: ?@import("antfly_local_sources").storage_db_group_source_worker.Definition = null,
+    };
+    /// One bounded background slice per server. The control/Raft loops retain
+    /// no owner leases and never wait on a remote source or model provider.
+    fn runGroupSourceRound(self: *DataServer) !void {
+        const runtime = self.backend_runtime orelse return;
+        if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
+        if (self.group_source_running.swap(true, .acq_rel)) return;
+        var scheduled = false;
+        defer if (!scheduled) self.group_source_running.store(false, .release);
+        const deadline = self.write_source.catalog.budget(null).nowNs() +| 100 * std.time.ns_per_ms;
+        for (0..8) |_| {
+            const visit = (try self.group_source_sweep.next(self.alloc, self.write_source.catalog, deadline)) orelse return;
+            const table = visit.table orelse continue;
+            if (self.data_raft) |raft| {
+                lockAtomic(&self.data_raft_mutex);
+                const leader = raft.host.http_host.host.isLocalLeader(visit.range.group_id);
+                self.data_raft_mutex.unlock();
+                if (!leader) continue;
+            }
+            const job = try self.alloc.create(GroupSourceJob);
+            errdefer self.alloc.destroy(job);
+            const name = try self.alloc.dupe(u8, table.name);
+            errdefer self.alloc.free(name);
+            const route = try self.alloc.dupe(u8, visit.range.start_key);
+            errdefer self.alloc.free(route);
+            job.* = .{ .server = self, .table = name, .group_id = visit.range.group_id, .route = route };
+            try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = job, .run = runGroupSourceJob, .deinit = deinitGroupSourceJob });
+            scheduled = true;
+            return;
+        }
+    }
+    fn deinitGroupSourceJob(ptr: *anyopaque) void {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        server.alloc.free(job.table);
+        server.alloc.free(job.route);
+        server.alloc.destroy(job);
+        server.group_source_running.store(false, .release);
+    }
+    fn checkGroupSourceJob(job: *GroupSourceJob) !void {
+        const server = job.server;
+        if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (platform_time.monotonicNs() >= job.deadline_ns) return error.Timeout;
+        if (server.hotStandbyWriteGate()) |gate| try gate.check();
+        if (server.group_leadership_source) |leadership| if (!leadership.isLocalLeader(job.group_id)) return error.NotLeader;
+    }
+    fn runGroupSourceJob(ptr: *anyopaque) !void {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        job.deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+        try checkGroupSourceJob(job);
+        var budget = resource_manager_mod.BudgetedAllocator.init(&server.provisioned_storage.resource_manager, .shard_transition_working_set, server.alloc, 1);
+        defer budget.deinit();
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        const a = arena.allocator();
+        const work = @import("antfly_local_sources").storage_db_group_source_worker;
+        const raw = try groupSourceQuery(job, a, job.route, "{\"action\":\"definitions\"}");
+        const definitions = try std.json.parseFromSliceLeaky([]work.Definition, a, raw, .{ .allocate = .alloc_always });
+        if (definitions.len == 0) return;
+        if (definitions.len > 33) return error.ResourceBudgetExceeded;
+        if (server.group_source_worker == null) server.group_source_worker = .{ .allocator = server.alloc, .identity = @import("antfly_local_sources").storage_db_group_sources.digest(try std.json.Stringify.valueAlloc(a, .{ definitions[0].source_owner, server.backgroundRealtimeMs() }, .{})) };
+        const worker = &server.group_source_worker.?;
+        const selected = try worker.nextDefinition(definitions[0].namespace, definitions.len);
+        const definition = definitions[selected];
+        job.definition = definition;
+        const ports = work.Ports{ .ptr = job, .query_fn = groupSourceQuery, .submit_fn = groupSourceSubmit, .fan_in_fn = groupSourceFanIn, .settled_fn = groupSourceSettled };
+        try worker.sourceStep(a, ports, definition);
+        try worker.groupStep(a, ports, definition, server.backgroundRealtimeMs());
+    }
+    fn groupSourceQuery(ptr: *anyopaque, a: std.mem.Allocator, logical: []const u8, request: []const u8) ![]const u8 {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        try checkGroupSourceJob(job);
+        const catalog = @import("../api/table_catalog.zig");
+        const route = try catalog.routedGroupSnapshotUntil(a, job.server.write_source.catalog, job.table, logical, job.server.write_source.catalog.deadlineFrom(.{ .deadline_ns = job.deadline_ns }));
+        const selected = route.route orelse return error.TopologyChanged;
+        var source = job.server.read_source.source();
+        source.route_fence = route.fence();
+        var response = (try source.lookupGroupLocal(a, selected.group_id, job.table, logical, .{ .group_source_query_json = request, .execution_deadline_ns = job.deadline_ns, .cancellation = .fromAtomic(&job.server.background_jobs_shutdown) }, .read_index)) orelse return error.NotFound;
+        defer response.deinit(a);
+        if (response.json.len > 8 * 1024 * 1024) return error.ResourceBudgetExceeded;
+        return a.dupe(u8, response.json);
+    }
+    fn groupSourceSubmit(ptr: *anyopaque, command: @import("antfly_local_sources").storage_db_group_source_contract.Command) !void {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        try checkGroupSourceJob(job);
+        var arena = std.heap.ArenaAllocator.init(job.server.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const logical = try command.routeAlloc(a);
+        const catalog = @import("../api/table_catalog.zig");
+        const route = try catalog.routedGroupSnapshotUntil(a, job.server.write_source.catalog, job.table, logical, job.server.write_source.catalog.deadlineFrom(.{ .deadline_ns = job.deadline_ns }));
+        const selected = route.route orelse return error.TopologyChanged;
+        var namespace: [24]u8 = undefined;
+        std.mem.writeInt(u64, namespace[0..8], selected.identity_namespace.table_id, .big);
+        std.mem.writeInt(u64, namespace[8..16], selected.identity_namespace.shard_id, .big);
+        std.mem.writeInt(u64, namespace[16..24], selected.identity_namespace.range_id, .big);
+        if (!std.mem.eql(u8, &namespace, &command.namespace) or command.definition.table_incarnation != selected.identity_namespace.table_id) return error.TopologyChanged;
+        if (command.publish) |publication| if (publication.topology_epoch != route.topology_epoch) return error.TopologyChanged;
+        if (job.server.data_raft == null) {
+            const applied = try job.server.write_source.source().batchGroupLocal(a, selected.group_id, job.table, .{ .group_source = command, .sync_level = .write });
+            if (applied == null) return error.StorageKernelOwnerUnavailable;
+            return;
+        }
+        const remaining_ns = job.deadline_ns -| platform_time.monotonicNs();
+        try job.server.proposeRaftBatchGroupWithLeaderWait(a, selected.group_id, job.table, .{ .group_source = command, .sync_level = .write }, .{ .discovery = .cached, .allow_remote_forward = true, .admission_deadline_ns = job.server.dataRaftMonotonicNs() +| remaining_ns, .write_route_fence = route.fence(), .visibility_cancellation = .fromAtomic(&job.server.background_jobs_shutdown) }, remaining_ns);
+    }
+    fn groupSourceFanIn(ptr: *anyopaque, a: std.mem.Allocator, definition: @import("antfly_local_sources").storage_db_group_source_worker.Definition, partition: @import("antfly_local_sources").storage_db_group_source_index.Partition, ordinal: i64) !@import("antfly_local_sources").storage_db_group_source_worker.FanIn {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        try checkGroupSourceJob(job);
+        const catalog = @import("../api/table_catalog.zig");
+        var routes = try catalog.routedSpanSnapshotUntil(a, job.server.write_source.catalog, job.table, "", "", job.server.write_source.catalog.deadlineFrom(.{ .deadline_ns = job.deadline_ns }));
+        defer routes.deinit(a);
+        if (routes.routes.len == 0 or routes.routes.len > 256 or routes.table_id != definition.definition.table_incarnation) return error.GroupedSourceTopologyUnavailable;
+        const collected = try @import("group_source_fan_in.zig").collect(job, a, definition, partition, ordinal, routes, job.server.dataRaftIo() orelse return error.BackendRuntimeUnavailable, checkGroupSourceJob);
+        // A topology replacement during the scatter invalidates even a
+        // successful set of pages; absence is certified by every current owner.
+        var after = try catalog.routedSpanSnapshotUntil(a, job.server.write_source.catalog, job.table, "", "", job.server.write_source.catalog.deadlineFrom(.{ .deadline_ns = job.deadline_ns }));
+        defer after.deinit(a);
+        if (after.topology_epoch != routes.topology_epoch or after.table_id != routes.table_id or after.routes.len != routes.routes.len) return error.TopologyChanged;
+        for (routes.routes, after.routes) |before, current| if (!std.meta.eql(before, current)) return error.TopologyChanged;
+        return collected;
+    }
+    fn groupSourceSettled(ptr: *anyopaque, sequence: u64, units: []const []const u8) !bool {
+        const job: *GroupSourceJob = @ptrCast(@alignCast(ptr));
+        const definition = job.definition orelse return error.InvalidArgument;
+        var arena = std.heap.ArenaAllocator.init(job.server.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const request = try std.json.Stringify.valueAlloc(a, .{ .action = "settled", .artifact = definition.artifact, .definition = definition.definition, .documents = units, .through_sequence = sequence }, .{});
+        const raw = try groupSourceQuery(job, a, definition.route.value, request);
+        return std.json.parseFromSliceLeaky(bool, a, raw, .{});
+    }
+
+    const GraphCleanupJob = struct {
+        server: *DataServer,
+        table: []const u8,
+        group_id: u64,
+    };
+    // Dispatch only: waiting for an applied cleanup entry here would prevent
+    // the control/Raft driver from advancing that very entry.
     fn runGraphEndpointCleanupRound(self: *DataServer) !void {
         const raft = self.data_raft orelse return;
+        const runtime = self.backend_runtime orelse return;
+        if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
         if (self.graph_cleanup_running.swap(true, .acq_rel)) return;
-        defer self.graph_cleanup_running.store(false, .release);
-        if (self.background_jobs_shutdown.load(.acquire)) return;
-        // At most eight range probes per round; one indexed routing capture
-        // per sweep, with current leadership checked before every proposal.
+        var scheduled = false;
+        defer if (!scheduled) self.graph_cleanup_running.store(false, .release);
         const catalog = self.write_source.catalog;
         const deadline = catalog.budget(null).nowNs() +| 100 * std.time.ns_per_ms;
         for (0..8) |_| {
             const visit = (try self.graph_cleanup_sweep.next(self.alloc, catalog, deadline)) orelse return;
-            const range = visit.range;
             lockAtomic(&self.data_raft_mutex);
-            const leader = raft.host.http_host.host.isLocalLeader(range.group_id);
+            const leader = raft.host.http_host.host.isLocalLeader(visit.range.group_id);
             self.data_raft_mutex.unlock();
             if (!leader) continue;
             const table = visit.table orelse continue;
-            var response = (try self.read_source.source().lookupGroupLocal(self.alloc, range.group_id, table.name, "", .{ .relational_topology_json = "{\"mode\":\"graph_endpoint_cleanup\"}" }, .leader_lease)) orelse continue;
-            defer response.deinit(self.alloc);
-            var status = try std.json.parseFromSlice(antfly.db.types.GraphEndpointCleanupStatus, self.alloc, response.json, .{});
-            defer status.deinit();
-            if (status.value.pending) {
-                try self.proposeRaftBatchGroupWithLeaderWait(self.alloc, range.group_id, table.name, status.value.request(), .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) }, 100 * std.time.ns_per_ms);
-                return;
-            }
+            const job = try self.alloc.create(GraphCleanupJob);
+            errdefer self.alloc.destroy(job);
+            const name = try self.alloc.dupe(u8, table.name);
+            errdefer self.alloc.free(name);
+            job.* = .{ .server = self, .table = name, .group_id = visit.range.group_id };
+            try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = job, .run = runGraphCleanupJob, .deinit = deinitGraphCleanupJob });
+            scheduled = true;
+            return;
         }
+    }
+    fn deinitGraphCleanupJob(ptr: *anyopaque) void {
+        const job: *GraphCleanupJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        server.alloc.free(job.table);
+        server.alloc.destroy(job);
+        server.graph_cleanup_running.store(false, .release);
+    }
+    fn runGraphCleanupJob(ptr: *anyopaque) !void {
+        const job: *GraphCleanupJob = @ptrCast(@alignCast(ptr));
+        const server = job.server;
+        if (server.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (server.hotStandbyWriteGate()) |gate| try gate.check();
+        if (server.group_leadership_source) |leadership| if (!leadership.isLocalLeader(job.group_id)) return error.NotLeader;
+        var response = (try server.read_source.source().lookupGroupLocal(server.alloc, job.group_id, job.table, "", .{ .relational_topology_json = "{\"mode\":\"graph_endpoint_cleanup\"}", .execution_deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&server.background_jobs_shutdown) }, .leader_lease)) orelse return;
+        defer response.deinit(server.alloc);
+        var status = try std.json.parseFromSlice(antfly.db.types.GraphEndpointCleanupStatus, server.alloc, response.json, .{});
+        defer status.deinit();
+        if (status.value.pending) try server.proposeRaftBatchGroupWithLeaderWait(server.alloc, job.group_id, job.table, status.value.request(), .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&server.background_jobs_shutdown), .admission_deadline_ns = server.dataRaftMonotonicNs() +| 5 * std.time.ns_per_s }, 5 * std.time.ns_per_s);
     }
 
     fn runInitialFkRetirementRound(self: *DataServer) !void {
@@ -6724,6 +6893,7 @@ pub const DataServer = struct {
         // Distributed session/publication routes may resolve to another data
         // owner, including a hidden initial-FK child not yet publicly listed.
         // Reuse the Raft host's transport unless the caller supplied one.
+        if (api_server_cfg.session_router == null) api_server_cfg.session_router = self.dataReadGroupRouter();
         if (api_server_cfg.session_executor == null) {
             if (self.data_raft) |raft| api_server_cfg.session_executor = raft.host.http_host.request_executor;
         }
@@ -6842,7 +7012,7 @@ pub const DataServer = struct {
         // shard owns the entity table, then hand it to the write source(s) that
         // open managed DBs. Captures `read_source.source()` (ptr+vtable), so
         // later read-source mutations remain visible.
-        self.distributed_candidate_source = .{ .reads = self.read_source.source(), .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
+        self.distributed_candidate_source = .{ .io = self.dataRaftIo(), .producer_options = .{ .ptr = self, .get = resolverAdjudicationOptions }, .reads = self.read_source.source(), .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
         const candidate_source = self.distributed_candidate_source.?.candidateSource();
         _ = self.write_source.withResolutionCandidateSource(candidate_source);
         if (self.data_raft_apply) |apply_sm| {
@@ -6855,7 +7025,7 @@ pub const DataServer = struct {
         // that open managed DBs.
         // Require atomic promotion: one fenced batch for a single shard and
         // 2PC only when the entity set spans multiple shards.
-        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .reads = self.read_source.source(), .atomic_batch_required = true, .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
+        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .reads = self.read_source.source(), .io = if (self.backend_runtime) |runtime| runtime.io() else null, .atomic_batch_required = true, .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
         const entity_sink = self.distributed_entity_sink.?.entitySink();
         _ = self.write_source.withEntitySink(entity_sink);
         if (self.data_raft_apply) |apply_sm| {
@@ -8931,6 +9101,11 @@ pub const DataServer = struct {
         }
     }
 
+    fn resolverAdjudicationOptions(ptr: *anyopaque) @import("antfly_local_sources").asset_producer_runtime.Runtime.Options {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        return .{ .antfly_provider = self.read_source.antfly_provider, .inference_api_url = self.read_source.inference_api_url, .secret_store = self.read_source.secret_store };
+    }
+
     pub fn setAntflyProvider(
         self: *DataServer,
         provider: ?antfly.inference.managed_embedder.AntflyProvider,
@@ -9234,6 +9409,9 @@ pub const DataServer = struct {
         // Durable cleanup epochs survive transient allocation/queue failures;
         // the control loop is their allocation-free watchdog.
         self.write_source.maintainDroppedTableRecovery();
+        self.runGroupSourceRound() catch |err| {
+            std.log.warn("group source dispatch deferred err={s}", .{@errorName(err)});
+        };
         self.runGraphEndpointCleanupRound() catch |err| {
             std.log.warn("graph endpoint cleanup deferred err={s}", .{@errorName(err)});
         };
@@ -9584,6 +9762,8 @@ pub const DataServer = struct {
             self.alloc.destroy(executor);
             self.distributed_read_http_executor = null;
         }
+        self.group_source_sweep.deinit();
+        if (self.group_source_worker) |*worker| worker.deinit();
         self.graph_cleanup_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
         self.initial_fk_retirement_gc_cursor.deinit();
@@ -12276,7 +12456,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null) return proposal_req;
+        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -12299,6 +12479,15 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.artifact_publication) |command| if (command.completion) |page| if (page.group_producers) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
+        if (req.artifact_catalog) |command| if (command.binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
+        if (req.online_source) |command| if (command == .admit) {
+            if (command.admit.artifact_catalog) |binding| if (binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
+        };
+        if (req.merge_page) |page| if (page.source.artifact_catalog) |binding| if (binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
+        if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| if (source.artifact_catalog) |binding| if (binding.effect_protocol == 16) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
+        if (req.resolver_review != null) return @import("../common/data_raft_protocol.zig").batch_resolver_review_protocol_version;
+        if (req.group_source != null) return @import("../common/data_raft_protocol.zig").batch_group_source_protocol_version;
         if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
         if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))
             return @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
@@ -12917,7 +13106,16 @@ pub const DataServer = struct {
                 protocol_activation_entry = activation_entry;
                 if (activation_entry.protocol_version.load(.acquire) >= required_protocol_version) {
                     protocol_preflight.activatable_version = activation_entry.protocol_version.load(.acquire);
-                } else if (activation_entry.activation_mutex.tryLock()) {
+                } else {
+                    // An in-flight capability probe is not evidence that the
+                    // members lack this decoder. Required-format commands,
+                    // including transaction resolution, must join the bounded
+                    // activation singleflight rather than report unsupported
+                    // while another caller is still establishing its barrier.
+                    while (!activation_entry.activation_mutex.tryLock()) {
+                        if (!self.dataRaftProtocolProbeActive(deadline_ns, route.cancellation)) return error.LeaderUnavailable;
+                        try self.sleepDataRaftRetry(std.time.ns_per_ms);
+                    }
                     protocol_activation_lock_owned = true;
                     const durable_version = self.durableDataRaftBatchProtocolVersion(group_id) catch |err| {
                         std.log.warn("data raft pre-admission failed group_id={} phase=protocol_marker err={s}", .{ group_id, @errorName(err) });
@@ -13022,6 +13220,8 @@ pub const DataServer = struct {
                 // exact private owner was checked before reaching Raft.
                 if (req.restore_staging_scope == null and route.initial_child_bootstrap == null and needsDenseRepairWritePreflight(req))
                     try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
+                if (req.restore_staging_scope == null and route.initial_child_bootstrap == null and req.merge_page == null and req.split_replication == null and req.merge_replication == null and (req.writes.len != 0 or req.transforms.len != 0))
+                    try admission_source.preflightGroupedSourceWriteAdmission(alloc, group_id, table_name, req);
                 if (comptime linked_storage) {
                     if (restore_owner_descriptor == null) {
                         const owner_source = try self.ensureKernelOwnerSource();
@@ -15405,7 +15605,7 @@ pub const DataServer = struct {
                         if (!try onlineMergePeerEligible(try client.fetchDataRaftBatchProtocolVersion(remote.base_uri, 10000, null)))
                             return error.GuardedMergeCopyReceiptUnsupported;
                     }
-                    var response = try client.fetchGroupLookupWithMode(remote.base_uri, group_id, table_name, "", null, "read_index", 10000, null, false, false, "", "", "", request, null, null, false);
+                    var response = try client.fetchGroupLookupWithMode(remote.base_uri, group_id, table_name, "", null, "read_index", 10000, null, false, false, "", "", "", request, "", null, null, false);
                     defer response.deinit(alloc);
                     return std.json.parseFromSlice(T, alloc, response.body, .{ .allocate = .alloc_always });
                 },
@@ -23965,12 +24165,7 @@ pub const DataServer = struct {
                     try context.ensureWithRuntime(.{ .io = &borrow, .memory_limit_bytes = cfg.process_memory_limit_bytes });
                 } else try context.ensure();
                 storage_kernel_context = context;
-                const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(
-                    alloc,
-                    cfg.api_server_cfg.remote_content,
-                );
-                defer alloc.free(security_json);
-                try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+                try storage_kernel_context.?.configureRemoteContent(cfg.api_server_cfg.remote_content);
                 try storage_kernel_context.?.configureSecrets(cfg.api_server_cfg.secret_store);
                 if (cfg.api_server_cfg.node_config != null and cfg.api_server_cfg.node_config.?.storage.artifacts.connection != null) {
                     const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg.api_server_cfg.node_config, cfg.api_server_cfg.deployment_mode, cfg.api_server_cfg.native_lake_artifact_base_dir);
@@ -26010,6 +26205,7 @@ const RemoteMetadataSource = struct {
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
                 .supports_query_definitions = true,
+                .supports_resolver_catalog_read = true,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .control_snapshot = remoteControlSnapshot,
@@ -30928,9 +31124,7 @@ pub fn runFromIterator(
             .memory_limit_bytes = process_memory_limit_bytes,
         });
         process_storage_kernel_context = context;
-        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
-        defer alloc.free(security_json);
-        try process_storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+        try process_storage_kernel_context.?.configureRemoteContent(remote_content);
         try process_storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
         if (loaded_config) |*cfg| if (cfg.storage.artifacts.connection != null) {
             const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg, .distributed, null);
@@ -56351,4 +56545,14 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "grouped source protocol dominates coexisting graph envelope features" {
+    const protocol = @import("../common/data_raft_protocol.zig");
+    const request: antfly.db.types.BatchRequest = .{ .artifact_catalog = .{
+        .namespace = @splat(1),
+        .catalogs = .{},
+        .binding = .{ .epoch = 1, .digest = @splat(2), .semantic_digest = @splat(3), .effect_protocol = 16 },
+    }, .graph_endpoint_cleanup = true };
+    try std.testing.expectEqual(protocol.batch_group_source_protocol_version, DataServer.requiredRaftBatchProtocolVersion(request));
 }

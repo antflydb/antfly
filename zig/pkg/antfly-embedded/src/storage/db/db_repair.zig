@@ -862,9 +862,9 @@ pub fn loadOrCreateCurrentIndexRepairState(self: *DB, alloc: Allocator) !index_r
             continue;
         }
         const separator = std.mem.indexOfScalar(u8, candidate, '/') orelse return error.InvalidRepairCandidatePath;
-        const shadow_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
+        const shadow_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.index_manager.base_path, candidate[0..separator] });
         defer alloc.free(shadow_root);
-        if (self.primary_lsm_storage) |storage| {
+        if (self.core.index_manager.generation_storage orelse self.primary_lsm_storage) |storage| {
             try storage.deleteTree(shadow_root);
         } else if (comptime builtin.os.tag == .freestanding) {
             return error.UnsupportedPlatform;
@@ -1225,15 +1225,15 @@ pub fn discardInactiveIndexRepairCandidateWithTerminal(
         return error.RepairCandidateAlreadyActive;
     }
     const separator = std.mem.indexOfScalar(u8, candidate, '/') orelse return error.InvalidRepairCandidatePath;
-    const shadow_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
+    const shadow_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.index_manager.base_path, candidate[0..separator] });
     defer alloc.free(shadow_root);
     if (entry.intent.kind == .algebraic) {
         // Algebraic generations live in the primary store and may be much
         // larger than a scheduler turn. The directory is their durable
         // namespace marker: clear only the writer marker here, detach the
         // intent below, then let paged orphan collection drain the keys.
-        try index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_root);
-    } else if (self.primary_lsm_storage) |storage| {
+        try self.core.index_manager.clearRepairShadow(alloc, shadow_root);
+    } else if (self.core.index_manager.generation_storage orelse self.primary_lsm_storage) |storage| {
         try storage.deleteTree(shadow_root);
     } else if (comptime builtin.os.tag == .freestanding) {
         return error.UnsupportedPlatform;
@@ -1331,9 +1331,10 @@ pub fn reconcileActivatedIndexRepair(
         return .not_active;
     }
 
-    const candidate_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate });
+    const candidate_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.index_manager.base_path, candidate });
     defer alloc.free(candidate_path);
-    const certification = try index_generation_manifest.certifyReady(
+    const certification = try index_generation_manifest.certifyReadyWithStorage(
+        self.core.index_manager.generation_storage,
         alloc,
         candidate_path,
         repair_id,

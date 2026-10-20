@@ -18,6 +18,8 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const resolution_runtime_mod = @import("resolution_runtime.zig");
+const localGroupSourceSettled = DB.localGroupSourceSettled;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const apply_state = @import("derived/apply_state.zig");
 const artifact_ids = @import("artifact/ids.zig");
@@ -828,6 +830,9 @@ pub fn applyReplicatedDerivedEffect(self: *DB, change: change_journal_mod.Record
 pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, req, profile, opts });
     try types.validateGraphEndpointCleanupCommand(req);
+    for (req.writes) |write| if ((@import("group_source_identity.zig").isAnchor(write.key) or @import("group_source_transfer.zig").isKey(write.key))) return error.InvalidBatchRequest;
+    for (req.deletes) |document| if ((@import("group_source_identity.zig").isAnchor(document) or @import("group_source_transfer.zig").isKey(document))) return error.InvalidBatchRequest;
+    for (req.transforms) |transform| if ((@import("group_source_identity.zig").isAnchor(transform.key) or @import("group_source_transfer.zig").isKey(transform.key))) return error.InvalidBatchRequest;
     var lake_schema_view = self.core.acquireSchemaView();
     defer if (lake_schema_view) |*view| view.release();
     if (lake_schema_view) |view| if (view.tableSchema().external_base_source != null and
@@ -899,6 +904,37 @@ pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile
     try online_source_contract.validateRequest(req);
     try artifact_inventory.validateRequest(req);
     try artifact_publication_transport.validateBatchRequest(req);
+    try @import("resolver_review.zig").validateRequest(req);
+    if (req.resolver_review) |command| {
+        var review_opts = opts;
+        review_opts.resolver_review_command = &command;
+        review_opts.restore_replication_request = req;
+        review_opts.wait_for_sync_level = false;
+        return self.batchInternal(.{ .sync_level = .write }, profile, review_opts);
+    }
+    try @import("group_source_contract.zig").validateRequest(req);
+    if (req.group_source) |command| {
+        var control_opts = opts;
+        control_opts.group_source_command = &command;
+        control_opts.restore_replication_request = req;
+        control_opts.wait_for_sync_level = false;
+        if (command.finish) |finish| if (opts.ordered_apply_receipt == null and !try self.maintenanceRequiresOrderedApply()) {
+            var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
+            defer arena.deinit();
+            const owned = arena.allocator();
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const observed = try @import("group_source_state.zig").readSnapshot(owned, &read, finish.held.group, finish.held.partition);
+            if (observed) |observed_snapshot| {
+                const generation = self.core.index_manager.writePlanGeneration();
+                if (try localGroupSourceSettled(self, observed_snapshot.sequence, try std.mem.concat(owned, []const u8, &.{ observed_snapshot.units, observed_snapshot.retired }))) {
+                    control_opts.legacy_group_completed_through = observed_snapshot.sequence;
+                    control_opts.legacy_group_plan_generation = generation;
+                }
+            }
+        };
+        return self.batchInternal(.{ .sync_level = .write }, profile, control_opts);
+    }
     if (req.merge_proof_adoption != null) return self.applyMergeProofAdoptionBatch(req, opts);
     if (req.artifact_catalog != null and req.online_source == null and req.merge_checkpoint == null) return self.applyArtifactCatalogBatch(req, opts);
     if (req.artifact_publication != null) return self.applyArtifactPublicationBatch(req, opts);
@@ -1674,6 +1710,9 @@ pub fn resolverReplayDiagnosticsLocked(self: *DB, alloc: Allocator) !types.Resol
         errdefer alloc.free(resolution_artifact);
         resolvers[initialized] = .{
             .name = name,
+            .config_generation = cfg.config_generation,
+            .effective_generation = cfg.effectiveGeneration(),
+            .curation_revision = cfg.curation_revision,
             .table = table,
             .source_artifact = source_artifact,
             .resolution_artifact = resolution_artifact,
@@ -1682,6 +1721,7 @@ pub fn resolverReplayDiagnosticsLocked(self: *DB, alloc: Allocator) !types.Resol
     }
 
     return .{
+        .reresolve_pending = try resolution_runtime_mod.hasDurableReresolveBacklog(self.core.store),
         .resolver_count = @intCast(catalog.len),
         .resolution_runtime_present = self.resolution_runtime != null,
         .resolution_worker_started = if (self.resolution_runtime) |runtime| runtime.worker_started.load(.acquire) else false,

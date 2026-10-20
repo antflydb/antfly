@@ -16,6 +16,9 @@
 //! Focused storage-owned resolver replay regressions.
 pub const antfly_sources = @import("source_owner_storage.zig");
 test {
+    _ = @import("storage/db/artifact/input_test.zig");
+    _ = @import("storage/db/runtime_callbacks.zig");
+    _ = @import("storage/db/resolver_curation.zig");
     _ = @import("storage/db/resolution_runtime.zig");
     _ = @import("storage/db/db.zig");
 }

@@ -246,7 +246,18 @@ fn proofLower(proofs: []const Proof, id: [32]u8, inclusive: bool) usize {
     return lo;
 }
 const Record = struct { file: local.serverless_external_source_types.FileEntry, digest: [32]u8, deletes: [32]u8 };
+/// Logical census commitment stays stable across attempt-scoped page rewrites.
+/// Include the predecessor separately when authorizing a partial checkpoint.
+fn cutIdentity(a: A, root: Root) ![32]u8 {
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u8, 2), .identity = root.public_identity_version, .domain = root.domain, .source = root.source, .schema = root.schema, .snapshot = root.snapshot, .count = root.count, .summary = root.file_summary, .legacy_files = if (root.file_summary == null and root.count != 0) root.files else null }, .{});
+    defer a.free(bytes);
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &hash, .{});
+    return hash;
+}
 pub const Delta = struct {
+    source_cut: ?[32]u8 = null,
+    prior_cut: ?[32]u8 = null,
     selection: ?native.Selection = null,
     public_navigation: ?@import("lake_index_ordered_files.zig").Public = null,
     source: []const u8,
@@ -604,7 +615,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
                     self.changed[i] = !std.mem.eql(u8, &old.digest, &self.current[i].digest);
                     if (!self.changed[i]) return;
                 }
-                try self.prior_changed.append(self.out, .{ .id = try self.out.dupe(u8, old.file.file_id), .digest = old.digest });
+                try self.prior_changed.append(self.out, .{ .id = try self.out.dupe(u8, old.file.file_id), .digest = old.digest, .aggregate_digest = @import("lake_index_native_aggregates.zig").inventoryFileIdentity(self.provider.source.inventory, old.file) });
                 try self.files.add(id, null);
                 try self.private.add(&old.digest, null);
                 if (self.files.changes.items.len >= 64) {
@@ -702,8 +713,11 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     defer uploaded.deinit(store.allocator);
     const prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null;
     const ref: Ref = .{ .kind = .doc_values, .metadata_version = root.version, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
+    const source_cut = try cutIdentity(a, root);
+    const prior_cut = if (compatible) try cutIdentity(a, prior.?) else null;
+    // Complete every fallible operation before transferring the census lease.
     if (selection) |value| _ = value.census.retain();
-    return .{ .root = root, .stats = stats, .ref = ref, .delta = .{ .public_navigation = .{ .identity_version = root.public_identity_version, .root = root.public, .count = root.count, .source = inv.source_id, .snapshot = inv.snapshot_id }, .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = prior_snapshot, .selection = selection, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
+    return .{ .root = root, .stats = stats, .ref = ref, .delta = .{ .source_cut = source_cut, .prior_cut = prior_cut, .public_navigation = .{ .identity_version = root.public_identity_version, .root = root.public, .count = root.count, .source = inv.source_id, .snapshot = inv.snapshot_id }, .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = prior_snapshot, .selection = selection, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
 }
 /// Incremental per-column, per-file sketches piggyback on native replay.
 /// Each changed leaf replaces its previous sketch; HLLs are never subtracted.

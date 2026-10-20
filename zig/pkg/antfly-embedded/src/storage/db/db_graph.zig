@@ -8143,7 +8143,7 @@ test "db graph fact materialized scopes match journal" {
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
     try db.addIndex(.{ .name = "h", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"context\"}]}" });
     try db.addIndex(.{ .name = "plain", .kind = .full_text, .config_json = "{}" });
     const req: types.BatchRequest = .{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "f", .owner_document = "f" }} };
@@ -8204,7 +8204,7 @@ test "db graph fact enrichment observes pending graph replay" {
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
     try db.initOptionalEnrichmentRuntime(&config);
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"Alice\"}" }}, .sync_level = .write });
@@ -8307,7 +8307,7 @@ test "db graph fact inline mutation wakes incoming producers for additions repla
         var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
         defer db.close();
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-        try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .in } });
+        try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .in } });
         var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &producer, .vtable = &.{
             .produce = GateAssetProducer.produce,
             .produce_with_context = Fixture.produceBounded,
@@ -8351,7 +8351,7 @@ test "db graph fact neighbor context excludes foreign source namespace" {
     try db.core.store.put(internal_keys.graph_owning_table_key, "here");
     db.local_execution.row_policy_table_name = "here";
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
     try db.initOptionalEnrichmentRuntime(&config);
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"Alpha\"}" }}, .sync_level = .write });
@@ -8378,7 +8378,7 @@ test "db graph fact neighbor refresh resumes bounded turns without certifying co
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
     var producer = GateAssetProducer{};
     producer.allowAll();
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
@@ -8429,7 +8429,7 @@ test "db graph fact neighbor context resolves equal-key qualified reverse orient
         try db.core.store.put(internal_keys.graph_owning_table_key, "here");
         db.local_execution.row_policy_table_name = "here";
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-        try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = neighbor_context });
+        try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = neighbor_context });
         var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
         try db.initOptionalEnrichmentRuntime(&config);
         try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"Alpha\"}" }}, .sync_level = .write });
@@ -8484,7 +8484,7 @@ test "db graph fact synchronous neighbor downstream chain" {
         var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
         defer db.close();
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-        try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .in } });
+        try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .in } });
         try db.addEnrichment(.{ .name = "copied_context", .kind = .asset, .source_artifact_name = "context", .producer_json = "{\"type\":\"copy\"}" });
         try db.addEnrichment(.{ .name = "mirrored_context", .kind = .asset, .source_artifact_name = "copied_context", .producer_json = "{\"type\":\"copy\"}" });
         var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &producer, .vtable = &.{
@@ -8531,7 +8531,7 @@ test "db graph fact generated projection wakes endpoint context" {
     try db.addIndex(.{ .name = "facts", .kind = .graph, .config_json =
         \\{"source":{"artifact":"relations_v1","path":"$","nodes":{"source":"{{ _item.source }}","target":"{{ _item.target }}"},"edge":{"edge_id":"{{ _doc.key }}","type":"RELATES_TO"}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
     });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "facts", .direction = .out } });
+    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "facts", .direction = .out } });
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
     try db.initOptionalEnrichmentRuntime(&config);
     try db.batch(.{ .writes = &.{.{ .key = "alice", .value = "{\"body\":\"Alice\"}" }}, .sync_level = .write });
@@ -8560,7 +8560,7 @@ test "db graph fact refresh bounds artifact work within one large record" {
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
     var producer = GateAssetProducer{};
     producer.allowAll();
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
@@ -8612,7 +8612,7 @@ test "db graph fact neighbor dependency admission rejects indirect feedback" {
     defer tmp.cleanup();
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
-    try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "facts", .direction = .out } });
+    try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "facts", .direction = .out } });
     try db.addEnrichment(.{ .name = "copied_relations", .kind = .asset, .source_artifact_name = "relations", .producer_json = "{\"type\":\"copy\"}" });
     try std.testing.expectError(error.InvalidEnrichmentConfig, db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"copied_relations\"}}" }));
     try std.testing.expect(db.core.index_manager.graphIndex("facts") == null);
@@ -8634,7 +8634,7 @@ test "db graph fact failed neighbor producer blocks downstream stale artifact co
     var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.close();
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
-    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
     try db.addEnrichment(.{ .name = "copied_context", .kind = .asset, .source_artifact_name = "context", .producer_json = "{\"type\":\"copy\"}" });
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &fixture, .vtable = &.{ .produce = Fixture.produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } } };
     try db.initOptionalEnrichmentRuntime(&config);

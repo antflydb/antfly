@@ -567,6 +567,10 @@ pub fn writeResolveWritesForSchemaValidation(alloc: std.mem.Allocator, database:
     return .{ .value = @import("write.zig").resolveWritesForSchemaValidation(alloc, database, base_writes, deletes, transforms) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+pub fn writeValidateGroupedSourceBatch(alloc: Allocator, database: *DB, writes: []const types.BatchWrite, deletes: []const []const u8, transforms: []const types.DocumentTransform) engine.Outcome(void) {
+    return .{ .value = @import("write.zig").validateGroupedSourceBatch(alloc, database, writes, deletes, transforms) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 pub fn writeValidateTableBatchAgainstLocalSchema(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, writes: []const @import("db/mod.zig").types.BatchWrite, deletes: []const []const u8, transforms: []const @import("db/mod.zig").types.DocumentTransform) engine.Outcome(void) {
     return .{ .value = @import("write.zig").validateTableBatchAgainstLocalSchema(alloc, database, writes, deletes, transforms) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -935,12 +939,12 @@ comptime {
                 return exportFor(name);
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v24", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v28", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v24", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v28", .visibility = .hidden });
 }

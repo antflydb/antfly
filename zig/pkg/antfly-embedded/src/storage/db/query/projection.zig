@@ -165,7 +165,7 @@ fn parseSpecialFieldSelection(fields: []const []const u8) SpecialFieldSelection 
     var special: SpecialFieldSelection = .{};
     for (fields) |field| {
         if (field.len == 0 or field[0] == '-') continue;
-        if (std.mem.eql(u8, field, "_artifacts") or std.mem.eql(u8, field, "_artifacts.*")) {
+        if (std.mem.eql(u8, field, "_artifacts") or std.mem.startsWith(u8, field, "_artifacts.")) {
             special.all_artifacts = true;
         } else if (std.mem.eql(u8, field, "_chunks") or std.mem.eql(u8, field, "_chunks.*")) {
             special.all_chunks = true;

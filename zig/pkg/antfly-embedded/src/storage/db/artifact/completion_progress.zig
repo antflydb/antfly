@@ -26,6 +26,14 @@ const projection_epoch = @import("projection_epoch.zig");
 const prefix = "\x00\x00__artifact_publication__:completion:";
 pub const Key = [prefix.len + 80]u8;
 const Encoded = [312]u8;
+// Equal-width, separate local namespaces. Producer readiness is never a full
+// table completion claim and cannot discharge resolver/index obligations.
+const group_prefix = prefix[0 .. prefix.len - 1] ++ "g";
+fn domainKey(observation: Observation, root: u128, group_producers: bool) Key {
+    var selected = key(observation, root);
+    if (group_producers) selected[prefix.len - 1] = 'g';
+    return selected;
+}
 
 fn key(observation: Observation, root: u128) Key {
     var result: Key = undefined;
@@ -38,6 +46,7 @@ fn key(observation: Observation, root: u128) Key {
 }
 
 const State = struct {
+    group_producers: bool = false,
     root: u128,
     plan: publication.Digest,
     total: u32,
@@ -74,7 +83,7 @@ fn encode(selected: *const Key, state: State) !Encoded {
     @memcpy(raw[165..197], &state.observation.document_digest);
     if (state.observation.revision) |position| @memcpy(raw[197..230], &try position.encode());
     std.mem.writeInt(u64, raw[230..238], state.observation.validation_epoch, .little);
-    raw[238] = @intFromBool(state.observation.foreign_inputs);
+    raw[238] = @as(u8, @intFromBool(state.observation.foreign_inputs)) | (@as(u8, @intFromBool(state.group_producers)) << 1);
     @memcpy(raw[239..271], &state.chain);
     raw[271] = @intFromBool(state.projection_epoch != null);
     std.mem.writeInt(u64, raw[272..280], state.projection_epoch orelse 0, .little);
@@ -87,25 +96,26 @@ fn decodePosition(raw: []const u8) !?publication.Position {
 }
 
 fn decode(selected: *const Key, raw: []const u8) !State {
-    if (raw.len != @sizeOf(Encoded) or !std.mem.eql(u8, raw[0..4], "ACP2") or raw[238] > 1 or raw[271] > 1 or
+    if (raw.len != @sizeOf(Encoded) or !std.mem.eql(u8, raw[0..4], "ACP2") or raw[238] > 3 or raw[271] > 1 or
         (raw[271] == 0 and !std.mem.allEqual(u8, raw[272..280], 0)) or
         !std.mem.eql(u8, raw[280..312], &checksum(selected, raw[0..280]))) return error.ArtifactCatalogCorrupt;
     const state: State = .{
+        .group_producers = raw[238] & 2 != 0,
         .root = std.mem.readInt(u128, raw[4..20], .little),
         .plan = raw[20..52].*,
         .total = std.mem.readInt(u32, raw[52..56], .little),
         .next = std.mem.readInt(u32, raw[56..60], .little),
         .work_revision = std.mem.readInt(u64, raw[60..68], .little),
         .work_position = try decodePosition(raw[68..101]),
-        .observation = .{ .authority = .{ .namespace = raw[101..125].*, .epoch = std.mem.readInt(u64, raw[125..133], .little), .catalog_digest = raw[133..165].* }, .document_digest = raw[165..197].*, .revision = try decodePosition(raw[197..230]), .validation_epoch = std.mem.readInt(u64, raw[230..238], .little), .foreign_inputs = raw[238] == 1 },
+        .observation = .{ .authority = .{ .namespace = raw[101..125].*, .epoch = std.mem.readInt(u64, raw[125..133], .little), .catalog_digest = raw[133..165].* }, .document_digest = raw[165..197].*, .revision = try decodePosition(raw[197..230]), .validation_epoch = std.mem.readInt(u64, raw[230..238], .little), .foreign_inputs = raw[238] & 1 != 0 },
         .chain = raw[239..271].*,
         .projection_epoch = if (raw[271] == 1) std.mem.readInt(u64, raw[272..280], .little) else null,
     };
-    // Only strict, nonempty prefixes are persisted. Terminal pages discharge
-    // work and delete the checkpoint atomically; no stored EOF grants credit.
-    if (state.root == 0 or state.total == 0 or state.next == 0 or state.next >= state.total or state.work_revision == 0 or
+    // Full-plan checkpoints persist only strict prefixes. The separate group
+    // domain may retain terminal producer readiness without discharging work.
+    if (state.root == 0 or state.total == 0 or state.next == 0 or (state.next > state.total or (state.next == state.total and !state.group_producers)) or state.work_revision == 0 or
         state.observation.authority.epoch == 0 or
-        !std.mem.eql(u8, selected, &key(state.observation, state.root))) return error.ArtifactCatalogCorrupt;
+        !std.mem.eql(u8, selected, &domainKey(state.observation, state.root, state.group_producers))) return error.ArtifactCatalogCorrupt;
     const namespace = publication.namespaceFromBytes(state.observation.authority.namespace);
     if (state.work_position) |value| value.requireNamespace(namespace) catch return error.ArtifactCatalogCorrupt;
     if (state.observation.revision) |value| value.requireNamespace(namespace) catch return error.ArtifactCatalogCorrupt;
@@ -125,6 +135,7 @@ fn catalogStamp(txn: anytype) !?[40]u8 {
 }
 
 pub const Limits = struct {
+    group_producers: bool = false,
     visits: usize = 128,
     bytes: usize = 64 * 1024,
     time_budget_ns: ?u64 = 2 * std.time.ns_per_ms,
@@ -155,13 +166,14 @@ fn fingerprint(state: State) !publication.Digest {
 /// drain a production document's complete plan.
 pub const StreamVerifier = struct {
     plan: *const @import("../catalog/index_manager.zig").IndexManager.WritePlanSnapshot,
+    group_producers: bool = false,
     blocked_unit: ?*const @import("completion_plan.zig").Node = null,
     const streams = @import("stream_progress.zig");
     pub const Witness = struct {
         root: u128,
         requirement: publication.Digest,
         observation: Observation,
-        value: union(enum) { native: @import("native_stream.zig").Closure, document: streams.DocumentClosure, extraction: streams.ExtractionClosure, chunks: streams.Closure, units: @import("unit_progress.zig").Closure, projection: @import("projection_certificate.zig").Closure },
+        value: union(enum) { skipped: Skipped, native: @import("native_stream.zig").Closure, document: streams.DocumentClosure, extraction: streams.ExtractionClosure, chunks: streams.Closure, units: @import("unit_progress.zig").Closure, projection: @import("projection_certificate.zig").Closure, graph: @import("graph_completion.zig").Closure },
         pub fn deinit(self: *@This()) void {
             switch (self.value) {
                 inline else => |*value| value.deinit(),
@@ -175,8 +187,36 @@ pub const StreamVerifier = struct {
         }
     };
 
+    pub const Skipped = struct {
+        arena: std.heap.ArenaAllocator,
+        document: []const u8,
+        observation: Observation,
+        root: u128,
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+        pub fn requireCurrent(self: @This(), txn: anytype, root: u128) !void {
+            if (self.root != root) return error.EnrichmentSourceChanged;
+            try self.observation.requireCurrent(txn, self.document);
+        }
+    };
+    fn skipped(alloc: std.mem.Allocator, txn: anytype, root: u128, document: []const u8, node: *const @import("completion_plan.zig").Node) !Witness {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const observation = try Observation.capture(txn, document);
+        const owned = try arena.allocator().dupe(u8, document);
+        return .{ .root = root, .requirement = node.id, .observation = observation, .value = .{ .skipped = .{ .arena = arena, .document = owned, .observation = observation, .root = root } } };
+    }
+
     pub fn verify(self: *StreamVerifier, alloc: std.mem.Allocator, txn: anytype, root: u128, document: []const u8, node: *const @import("completion_plan.zig").Node) !?Witness {
         self.blocked_unit = null;
+        if (self.group_producers and node.kind != .generated and node.kind != .unit_children) return try skipped(alloc, txn, root, document, node);
+        if (node.template orelse node.parent_template) |ordinal| {
+            if (ordinal >= self.plan.generated_templates.len) return error.ArtifactCatalogDrift;
+            if (!@import("../enrichment/enrichment_types.zig").appliesToDocument(self.plan.generated_templates[ordinal], document)) return try skipped(alloc, txn, root, document, node);
+        }
+        if (node.kind == .native_effects and @import("../group_source_identity.zig").isAnchor(document)) return try skipped(alloc, txn, root, document, node);
         if (node.kind == .unit_children) {
             try node.requireValidIdentity();
             const completion = if (self.plan.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
@@ -198,6 +238,13 @@ pub const StreamVerifier = struct {
                 else => return err,
             };
             return .{ .root = root, .requirement = current.id, .observation = closure.observation, .value = .{ .units = closure } };
+        }
+        if (node.kind == .index_projection and node.index_kind == .graph) {
+            const closure = @import("graph_completion.zig").prepare(alloc, txn, root, document, node, self.plan) catch |err| switch (err) {
+                error.ArtifactPublicationPending, error.EnrichmentSourceChanged => return null,
+                else => return err,
+            };
+            return .{ .root = root, .requirement = closure.requirement, .observation = closure.observation, .value = .{ .graph = closure } };
         }
         if (node.kind == .index_projection) {
             const closure = @import("projection_certificate.zig").prepareClosure(alloc, txn, root, document, node) catch |err| switch (err) {
@@ -276,7 +323,7 @@ pub fn Prepared(comptime Witness: type) type {
         }
         pub fn command(self: *const @This()) !publication.Command {
             const authority = self.state.observation.authority;
-            var result: publication.Command = .{ .mode = .complete_streams, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0), .completion = .{ .document_key = self.document, .visits = @intCast(self.verified()), .bytes = self.limit_bytes, .before = try fingerprint(self.initial), .after = try fingerprint(self.state) } };
+            var result: publication.Command = .{ .mode = .complete_streams, .namespace = authority.namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0), .completion = .{ .group_producers = self.state.group_producers, .document_key = self.document, .visits = @intCast(self.verified()), .bytes = self.limit_bytes, .before = try fingerprint(self.initial), .after = try fingerprint(self.state) } };
             result.publication_digest = result.digest();
             return result;
         }
@@ -310,6 +357,11 @@ pub fn Prepared(comptime Witness: type) type {
             var probe: Probe = .{ .parent = txn };
             for (self.witnesses) |witness| try witness.requireCurrent(&probe, root);
             if (self.atEnd()) {
+                if (self.state.group_producers) {
+                    try txn.put(&self.selected, &self.encoded);
+                    return true;
+                }
+                try txn.delete(&domainKey(self.state.observation, root, true));
                 try obligations.complete(self.arena.child_allocator, txn, self.state.observation.authority, current);
                 if (self.expected != null) try txn.delete(&self.selected);
                 return true;
@@ -330,9 +382,9 @@ fn start(alloc: std.mem.Allocator, txn: anytype, root: u128, plan: *const Plan, 
     if (document.len == 0 or document.len > obligations.max_cursor_bytes or plan.nodes.len == 0 or plan.nodes.len > std.math.maxInt(u32) or limits.visits == 0 or limits.visits > 128 or limits.bytes == 0 or limits.bytes > 64 * 1024) return error.InvalidBatchRequest;
     const observation = try Observation.capture(txn, document);
     const item = (try obligations.lookupWork(alloc, txn, observation.authority, document)) orelse return null;
-    const selected = key(observation, root);
+    const selected = domainKey(observation, root, limits.group_producers);
     const expected = try load(txn, &selected);
-    var state: State = .{ .root = root, .plan = plan.digest, .total = @intCast(plan.nodes.len), .work_revision = item.revision, .work_position = item.position, .observation = observation, .projection_epoch = if (plan.has_projection_requirements) try projection_epoch.load(txn) else null };
+    var state: State = .{ .group_producers = limits.group_producers, .root = root, .plan = plan.digest, .total = @intCast(plan.nodes.len), .work_revision = item.revision, .work_position = item.position, .observation = observation, .projection_epoch = if (!limits.group_producers and plan.has_projection_requirements) try projection_epoch.load(txn) else null };
     if (expected) |raw| {
         const previous = try decode(&selected, &raw);
         if (std.mem.eql(u8, &previous.plan, &plan.digest) and previous.total == plan.nodes.len and previous.work_revision == item.revision and std.meta.eql(previous.work_position, item.position) and std.meta.eql(previous.projection_epoch, state.projection_epoch)) {
@@ -344,6 +396,7 @@ fn start(alloc: std.mem.Allocator, txn: anytype, root: u128, plan: *const Plan, 
                 (!previous.observation.foreign_inputs or previous.observation.validation_epoch == observation.validation_epoch)) state = previous;
         }
     }
+    if (state.group_producers and state.next == state.total) return null;
     return .{ .state = state, .selected = selected, .expected = expected };
 }
 
@@ -394,7 +447,7 @@ pub fn discover(alloc: std.mem.Allocator, txn: anytype, root: u128, document: []
     const catalogs = try @import("inventory.zig").catalogs(txn);
     if (!snapshot.matchesArtifactInventory(catalogs) or !std.mem.eql(u8, &catalogs.digest(), &active.catalog_digest)) return error.ArtifactCatalogDrift;
     const plan = if (snapshot.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
-    var verifier: StreamVerifier = .{ .plan = snapshot };
+    var verifier: StreamVerifier = .{ .plan = snapshot, .group_producers = limits.group_producers };
     return prepare(alloc, txn, root, plan, document, &verifier, limits);
 }
 
@@ -461,7 +514,20 @@ fn discoverNextControlOrBlocked(alloc: std.mem.Allocator, txn: anytype, root: u1
     const catalogs = try @import("inventory.zig").catalogs(txn);
     if (!snapshot.matchesArtifactInventory(catalogs) or !std.mem.eql(u8, &catalogs.digest(), &active.catalog_digest)) return error.ArtifactCatalogDrift;
     const plan = if (snapshot.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
-    var verifier: StreamVerifier = .{ .plan = snapshot };
+    if (!limits.group_producers and @import("../group_source_identity.zig").isAnchor(document) and !try groupReady(alloc, txn, root, document)) {
+        const config = @import("../group_source_identity.zig").configurationOf(document) orelse return error.GroupedSourceCorrupt;
+        const groups = snapshot.group_sources;
+        const current_group = if (groups) |entries| blk: {
+            for (entries.entries) |entry| if (std.mem.eql(u8, &entry.configuration, &config)) break :blk true;
+            break :blk false;
+        } else false;
+        if (current_group) {
+            var producer_limits = limits;
+            producer_limits.group_producers = true;
+            return discoverNextControlOrBlocked(alloc, txn, root, document, snapshot, producer_limits, blocked_unit);
+        }
+    }
+    var verifier: StreamVerifier = .{ .plan = snapshot, .group_producers = limits.group_producers };
     if (try prepare(alloc, txn, root, plan, document, &verifier, limits)) |value| return .{ .completion = value };
     const blocked = verifier.blocked_unit orelse return null;
     blocked_unit.* = blocked;
@@ -602,18 +668,94 @@ pub fn prepareCommand(alloc: std.mem.Allocator, txn: anytype, root: u128, comman
     const active = (try publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
     if (active.epoch != command.authority_epoch or !std.mem.eql(u8, &active.namespace, &command.namespace) or !std.mem.eql(u8, &active.catalog_digest, &command.catalog_digest)) return error.ArtifactCatalogDrift;
     const claim = command.completion.?;
-    var prepared = (try discover(alloc, txn, root, claim.document_key, snapshot, .{ .visits = claim.visits, .bytes = claim.bytes, .time_budget_ns = null })) orelse return error.ArtifactPublicationPending;
+    var prepared = (try discover(alloc, txn, root, claim.document_key, snapshot, .{ .group_producers = claim.group_producers, .visits = claim.visits, .bytes = claim.bytes, .time_budget_ns = null })) orelse return error.ArtifactPublicationPending;
     errdefer prepared.deinit();
     const actual = (try prepared.command()).completion.?;
     if (actual.visits != claim.visits or !std.mem.eql(u8, &actual.before, &claim.before) or !std.mem.eql(u8, &actual.after, &claim.after)) return error.EnrichmentSourceChanged;
     return prepared;
 }
 
+/// A point-checkable receiver-local receipt for grouped producer outputs.
+/// Resolver, promotion and physical index convergence retain their independent
+/// ordinary lifecycle. Advancing the group never pretends those are complete.
+pub const GroupReadiness = struct {
+    phase: enum { inactive, baseline_pending, missing_receipt, stale_work, stale_source, ready },
+    work_revision: u64 = 0,
+    receipt_revision: u64 = 0,
+    next: u32 = 0,
+    total: u32 = 0,
+    next_command_visits: u32 = 0,
+    next_command_rejection: ?publication.Rejection = null,
+    blocked_kind: ?@import("completion_plan.zig").Kind = null,
+    blocked_name: []const u8 = "",
+};
+pub fn groupReady(alloc: std.mem.Allocator, txn: anytype, root: u128, document: []const u8) !bool {
+    return (try groupReadiness(alloc, txn, root, document)).phase == .ready;
+}
+pub fn groupReadiness(alloc: std.mem.Allocator, txn: anytype, root: u128, document: []const u8) !GroupReadiness {
+    if (root == 0) return .{ .phase = .inactive };
+    const active = (try publication.authority(txn)) orelse return .{ .phase = .inactive };
+    const progress = (try obligations.load(txn)) orelse return .{ .phase = .inactive };
+    try progress.requireAuthority(active);
+    if (!progress.baseline_complete) return .{ .phase = .baseline_pending };
+    const work = (try obligations.lookupWork(alloc, txn, active, document)) orelse return .{ .phase = .ready };
+    var result: GroupReadiness = .{ .phase = .missing_receipt, .work_revision = work.revision };
+    const observation = try Observation.capture(txn, document);
+    const selected = domainKey(observation, root, true);
+    const raw = (try load(txn, &selected)) orelse return result;
+    const state = try decode(&selected, &raw);
+    result.receipt_revision = state.work_revision;
+    result.next = state.next;
+    result.total = state.total;
+    if (!state.group_producers or state.work_revision != work.revision or !std.meta.eql(state.work_position, work.position)) {
+        result.phase = .stale_work;
+        return result;
+    }
+    state.observation.requireCurrent(txn, document) catch |err| switch (err) {
+        error.EnrichmentSourceChanged => {
+            result.phase = .stale_source;
+            return result;
+        },
+        else => return err,
+    };
+    if (state.next == state.total) result.phase = .ready;
+    return result;
+}
+/// Private bounded diagnostics use the same canonical verifier as scheduling.
+/// They expose no model input or output, and never create work or a receipt.
+pub fn diagnoseGroup(alloc: std.mem.Allocator, txn: anytype, root: u128, document: []const u8, snapshot: *const @import("../catalog/index_manager.zig").IndexManager.WritePlanSnapshot) !GroupReadiness {
+    var result = try groupReadiness(alloc, txn, root, document);
+    if (result.phase == .ready or result.phase == .inactive or result.phase == .baseline_pending) return result;
+    const plan = if (snapshot.completion_plan) |*value| value else return error.ArtifactCatalogDrift;
+    var verifier: StreamVerifier = .{ .plan = snapshot, .group_producers = true };
+    const initial = (try start(alloc, txn, root, plan, document, .{ .group_producers = true })) orelse return result;
+    var prepared = try prepare(alloc, txn, root, plan, document, &verifier, .{ .group_producers = true });
+    defer if (prepared) |*value| value.deinit();
+    const blocked = if (prepared) |*value| value.state.next else initial.state.next;
+    if (blocked < plan.nodes.len) {
+        result.blocked_kind = plan.nodes[blocked].kind;
+        result.blocked_name = plan.nodes[blocked].name;
+    }
+    if (prepared) |*value| {
+        result.next_command_visits = @intCast(value.verified());
+        if (try publication.rejected(txn, try value.command())) |rejection| result.next_command_rejection = rejection.reason;
+    }
+    return result;
+}
+
+pub fn clearGroupReady(txn: anytype, root: u128, document: []const u8) !void {
+    if (root == 0 or try publication.authority(txn) == null) return;
+    const observation = try Observation.capture(txn, document);
+    try txn.delete(&domainKey(observation, root, true));
+}
+
 pub fn collectObsoletePage(alloc: std.mem.Allocator, store: anytype, root: u128) !bool {
     if (root == 0) return true;
     var identity: [16]u8 = undefined;
     std.mem.writeInt(u128, &identity, root, .big);
-    return obligations.collectObsoleteEpochPageForIdentity(alloc, store, prefix, 48, 48, &identity);
+    const all_done = try obligations.collectObsoleteEpochPageForIdentity(alloc, store, prefix, 48, 48, &identity);
+    const groups_done = try obligations.collectObsoleteEpochPageForIdentity(alloc, store, group_prefix, 48, 48, &identity);
+    return all_done and groups_done;
 }
 
 test "ordered artifact inventory projection completion reconstructs independent receiver evidence" {
@@ -1014,6 +1156,57 @@ test "ordered artifact inventory completion checkpoint resumes all requirements 
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
         for (nodes) |node| try txn.put(&Verifier.guard(node.id), &.{1});
+        try txn.commit();
+    }
+    // Producer readiness uses a separate durable domain. It can release a
+    // grouped partition while the full plan remains an outstanding obligation.
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        try obligations.advanceBaseline(alloc, &txn, authority, "", "", true);
+        try txn.commit();
+    }
+    var group_finished = false;
+    for (0..512) |_| {
+        var page = blk: {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            break :blk (try prepare(alloc, &read, 41, &plan, "doc", &verifier, .{ .group_producers = true, .visits = 17 })).?;
+        };
+        defer page.deinit();
+        try std.testing.expect((try page.command()).completion.?.group_producers);
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        group_finished = try page.stage(&txn, 41, &plan);
+        try txn.commit();
+        if (group_finished) break;
+    }
+    try std.testing.expect(group_finished);
+    {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try groupReady(alloc, &read, 41, "doc"));
+        try std.testing.expectEqual(.ready, (try groupReadiness(alloc, &read, 41, "doc")).phase);
+        try std.testing.expect(!try groupReady(alloc, &read, 42, "doc"));
+        try std.testing.expectEqual(@as(u64, 1), (try obligations.load(&read)).?.pending_documents);
+        try std.testing.expect((try obligations.lookupWork(alloc, &read, authority, "doc")) != null);
+        try std.testing.expect((try prepare(alloc, &read, 41, &plan, "doc", &verifier, .{ .group_producers = true })) == null);
+        // Unrelated table consumers are not prerequisites for producer-ready
+        // sequencing; the same node stays pending in the full-plan verifier.
+        const node: @import("completion_plan.zig").Node = .{ .id = @splat(9), .kind = .resolution, .scope = .resolver_mentions, .name = "resolver" };
+        var group_verifier: StreamVerifier = .{ .plan = undefined, .group_producers = true };
+        var witness = (try group_verifier.verify(alloc, &read, 41, "doc", &node)).?;
+        defer witness.deinit();
+        try witness.requireCurrent(&read, 41);
+        group_verifier.group_producers = false;
+        try std.testing.expect((try group_verifier.verify(alloc, &read, 41, "doc", &node)) == null);
+    }
+    {
+        var txn = try store.beginWriteTxn();
+        errdefer txn.abort();
+        const current = (try obligations.lookupWork(alloc, &txn, authority, "doc")).?;
+        try std.testing.expect(try obligations.mark(alloc, &txn, authority, "doc", current.position));
+        try std.testing.expect(!try groupReady(alloc, &txn, 41, "doc"));
         try txn.commit();
     }
     var first = blk: {

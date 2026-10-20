@@ -100,12 +100,31 @@ pub const Plan = struct {
             const d = node.outputDimensions() orelse continue;
             const bytes = try std.math.mul(usize, try std.math.mul(usize, d.rows, d.out_dim), 4);
             const size = std.mem.alignForward(usize, bytes, 4096);
+            // Keep a partition ordered by offset. Adjacent expired ranges
+            // can satisfy a wider producer without growing retained storage.
+            var cursor: usize = 0;
+            while (cursor + 1 < used) {
+                if (ranges[cursor].end < i and ranges[cursor + 1].end < i) {
+                    std.debug.assert(ranges[cursor].offset + ranges[cursor].bytes == ranges[cursor + 1].offset);
+                    ranges[cursor].bytes += ranges[cursor + 1].bytes;
+                    ranges[cursor].end = @max(ranges[cursor].end, ranges[cursor + 1].end);
+                    std.mem.copyForwards(Range, ranges[cursor + 1 .. used - 1], ranges[cursor + 2 .. used]);
+                    used -= 1;
+                } else cursor += 1;
+            }
             var best: ?usize = null;
             for (ranges[0..used], 0..) |range, j| if (range.end < i and range.bytes >= size) {
                 if (best == null or range.bytes < ranges[best.?].bytes) best = j;
             };
             if (best) |j| {
                 node.arena_offset = ranges[j].offset;
+                if (ranges[j].bytes > size) {
+                    const remainder = Range{ .offset = ranges[j].offset + size, .bytes = ranges[j].bytes - size, .end = ranges[j].end };
+                    std.mem.copyBackwards(Range, ranges[j + 2 .. used + 1], ranges[j + 1 .. used]);
+                    ranges[j + 1] = remainder;
+                    ranges[j].bytes = size;
+                    used += 1;
+                }
                 ranges[j].end = ends[node.output];
             } else {
                 node.arena_offset = peak;
@@ -508,4 +527,49 @@ test "embeddinggemma2 audio arena extends view lifetimes and excludes escaping s
     plan.nodes[1].args = .{ .silu = .{ .input = 2 } };
     try std.testing.expectEqual(@as(usize, 4096), try plan.layout());
     try std.testing.expectEqual(plan.nodes[0].arena_offset, plan.nodes[2].arena_offset);
+}
+
+test "embeddinggemma2 audio arena splits and coalesces expired lifetimes" {
+    var nodes: [5]Node = undefined;
+    for (&nodes, 0..) |*node, i| node.* = .{ .output = @intCast(i + 1), .output_rows = 1, .output_dim = if (i == 3) 3072 else 1024, .args = .{ .clampScalar = .{ .input = 0, .min_value = null, .max_value = null } } };
+    var plan = Plan{ .nodes = &nodes, .count = nodes.len, .output = 5 };
+    plan.last_use[1] = 2;
+    plan.last_use[2] = 2;
+    plan.last_use[3] = 2;
+    plan.last_use[4] = 4;
+    try std.testing.expectEqual(@as(usize, 12288), try plan.layout());
+    try std.testing.expectEqual(@as(?usize, 0), nodes[3].arena_offset);
+    // A smaller producer leaves the remainder available to a live sibling.
+    nodes[0].output_dim = 2048;
+    nodes[1].output_dim = 1024;
+    nodes[2].output_dim = 1024;
+    plan.last_use[1] = 0;
+    plan.last_use[2] = 3;
+    plan.last_use[3] = 3;
+    plan.count = 3;
+    try std.testing.expectEqual(@as(usize, 8192), try plan.layout());
+    try std.testing.expectEqual(@as(?usize, 4096), nodes[2].arena_offset);
+}
+
+test "embeddinggemma2 audio arena randomized lifetimes never overlap live outputs" {
+    var generator = std.Random.DefaultPrng.init(0x616e74666c79);
+    const random = generator.random();
+    for (0..100) |_| {
+        var nodes: [32]Node = undefined;
+        var plan = Plan{ .nodes = &nodes, .count = nodes.len, .output = 32 };
+        for (&nodes, 0..) |*node, i| {
+            node.* = .{ .output = @intCast(i + 1), .output_rows = 1, .output_dim = 512 * (1 + random.uintLessThan(usize, 8)), .args = .{ .clampScalar = .{ .input = 0, .min_value = null, .max_value = null } } };
+            plan.last_use[i + 1] = @intCast(i + random.uintLessThan(usize, nodes.len - i));
+        }
+        const bytes = try plan.layout();
+        for (nodes, 0..) |node, i| if (node.arena_offset) |start| {
+            const end = start + node.output_rows * node.output_dim * 4;
+            try std.testing.expect(end <= bytes);
+            for (nodes[0..i], 0..) |earlier, j| if (earlier.arena_offset) |other| {
+                if (plan.last_use[j + 1] < i) continue;
+                const other_end = other + earlier.output_rows * earlier.output_dim * 4;
+                try std.testing.expect(end <= other or other_end <= start);
+            };
+        };
+    }
 }

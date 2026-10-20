@@ -172,8 +172,14 @@ fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancella
     };
     defer if (artifact_preview) |*preview| preview.catalogs.deinit(alloc);
     const artifact_ready = if (artifact_preview) |preview| try db.artifactMaterializationsReady(&txn, preview.catalogs) else false;
-    if (request.scope.authority == .raft and request.scope.fence.role == .merge_source)
+    if (request.scope.authority == .raft and request.scope.fence.role == .merge_source) {
         eligible = eligible and artifact_ready;
+        if (artifact_preview) |preview| if (preview.binding.effect_protocol == 16) {
+            const active = try @import("artifact/publication.zig").authority(&txn);
+            const baseline = try @import("artifact/producer_obligations.zig").load(&txn);
+            eligible = eligible and active != null and baseline != null and baseline.?.baseline_complete and active.?.epoch == preview.binding.epoch and std.mem.eql(u8, &active.?.catalog_digest, &preview.binding.digest);
+        };
+    }
     if (try topology.current(&txn) != null) return error.IntegrityTopologyBusy;
     if (retained) |value| if (value.active()) {
         return error.IntegrityTopologyBusy;

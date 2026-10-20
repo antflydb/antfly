@@ -323,6 +323,15 @@ pub fn stagePinned(txn: anytype, scope: Scope, seal_digest: [32]u8) !void {
 /// The caller owns the native apply fence and commits this with its Raft/standby
 /// marker and outbox. For final_fence it must additionally check transaction
 /// drainage under that same apply fence before calling stage.
+fn admitRetention(txn: anytype, scope: Scope, limit: u64, binding: ?@import("artifact/inventory.zig").Binding) !u64 {
+    if (binding) |expected| if (expected.effect_protocol == 16) {
+        var ordered = (try @import("artifact/inventory.zig").load(std.heap.page_allocator, txn)) orelse return error.ArtifactCatalogDrift;
+        defer ordered.deinit();
+        if (!std.meta.eql(ordered.value.command.binding, expected)) return error.ArtifactCatalogDrift;
+        return retained.admitWithArtifactCapabilities(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), limit, true, true, true);
+    };
+    return retained.admitWithDirectVectors(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), limit, try directVectorMode(txn, binding));
+}
 fn directVectorMode(txn: anytype, binding: ?@import("artifact/inventory.zig").Binding) !bool {
     const expected = binding orelse return false;
     // Never silently admit the wider effect language into a direct-only
@@ -351,7 +360,7 @@ pub fn stage(txn: anytype, command: Command, applied_index: u64) !void {
         if (existing) |found| {
             if (found.progress.phase == .released) return error.OnlineSourceScopeChanged;
             if (!std.meta.eql(found.progress.artifact_catalog, command.admit.artifact_catalog)) return error.ArtifactCatalogDrift;
-            _ = try retained.admitWithDirectVectors(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), command.admit.limit, try directVectorMode(txn, command.admit.artifact_catalog));
+            _ = try admitRetention(txn, scope, command.admit.limit, command.admit.artifact_catalog);
             return;
         }
         try @import("../source_pin_state.zig").requireNoPrepared(txn, scope.namespace());
@@ -367,7 +376,7 @@ pub fn stage(txn: anytype, command: Command, applied_index: u64) !void {
                 cleanup_pending = cleanup_pending or old.phase == .released;
                 continue;
             };
-            const start = try retained.admitWithDirectVectors(txn, scope.namespace(), scope.consumer_epoch, scope.pin(), command.admit.limit, try directVectorMode(txn, command.admit.artifact_catalog));
+            const start = try admitRetention(txn, scope, command.admit.limit, command.admit.artifact_catalog);
             try txn.put(&key(slot), &encode(.{ .namespace = scope.namespace(), .consumer_epoch = scope.consumer_epoch, .pin = scope.pin(), .start = start, .acknowledged = start, .admitted_applied_index = applied_index, .artifact_catalog = command.admit.artifact_catalog }));
             try txn.put(@import("../source_pin_state.zig").key, &(@import("../source_pin_state.zig").Prepared{ .namespace = scope.namespace(), .pin = scope.pin(), .applied_index = applied_index, .retained_start = start, .scope_bytes = try scope.encode() }).encode());
             return;

@@ -634,7 +634,6 @@ preparation wave. Finished groups release projected tokens promptly; public
 result order, per-group failures, cancellation and shared admission remain
 unchanged. GPU tower and backbone work stay ordered on one leased backend.
 
-
 Metal grouped attention folds query heads sharing a KV head into matrix rows,
 then batches distinct KV heads for dense key envelopes. Partial envelopes
 encode one QK/PV pair per KV head, avoiding padded RHS batch strides and K/V
@@ -674,7 +673,6 @@ zig-out/bin/antfly-embeddinggemma2-attention-check /path/to/model \
   /path/to/attention-timings.json --benchmark
 ```
 
-
 Audio relative-position inputs, query scales, normalization ones and completed
 per-layer relative-key projections are cached as immutable model constants.
 Prepared constants have an 8 MiB/128-entry ceiling within the audio class and
@@ -708,7 +706,6 @@ devices; other Metal devices blit that same generated staging buffer directly
 to private storage, avoiding a second shared upload allocation.
 Publication remains atomic: failed preparation preserves any previous slot,
 and the existing class/admission limits charge the final allocation.
-
 
 Embedding-only calls apply the final token RMSNorm, masked-mean pool hidden
 rows, then project once per item. Token-output callers retain the original
@@ -802,7 +799,6 @@ remain separately reported boundaries. Images, PDF pages and GIF frames share
 the vision path, but source decoding/extraction must also be measured for each
 complete service workload. Passing isolated model cases does not certify those
 wrapper costs or universal PyTorch performance parity.
-
 
 ### Earlier local measurements
 
@@ -1028,7 +1024,6 @@ preserve GLiNER's model-stage HTTP error and metric classification, release
 admission, and allow a subsequent request to recover. The comparison report
 records the initial diagnostic failure and its final passing regression.
 
-
 ## Video groups
 
 Submit MP4, MOV or WebM as a `media` part in an ordered group, for example:
@@ -1053,14 +1048,13 @@ fixtures; broader WebM display/Colour metadata remains an open gate.
 Six pinned pretrained F32 video cases qualify native CPU and Metal numerical
 parity, including ordered mixed groups, repeated frames and HTTP dimensions.
 JPEG RGB uses the independent Pillow/libjpeg reference policy; default FFmpeg
-MJPEG IDCT can differ. See the [pretrained receipt](../../zig/lib/video/testdata/video-pretrained-validation.md)
-and [VIDEO.md](../../zig/lib/video/VIDEO.md#embeddinggemma-2-model-adapter-2026-10-09).
+MJPEG IDCT can differ. See
+[VIDEO.md](../../zig/lib/video/VIDEO.md#inference-admission-and-telemetry).
 
 Model FPS sampling currently requires progressive one-picture-per-sample AVC
 (Baseline/Main/High-family) or MJPEG. PAFF/MBAFF and Extended-profile partition
 transport remain library capabilities; the model adapter rejects them until a
 logical-picture index qualifies their frame-count/FPS semantics.
-
 
 WebM model sampling uses visible decoder outputs rather than packet count. Hidden
 reference frames remain dependencies, and VP9 superframe outputs have individual
@@ -1069,7 +1063,6 @@ selected picture and reuses the existing CPU/Metal projection batching. Each
 pass allows at most 8192 coded packets and 65536 visible picture entries; the
 model selects at most 32 pictures. This bounds memory without retaining a whole
 decoded clip. Equal PTS retain output order; no per-picture timestamps are invented.
-
 
 [Pretrained WebM qualification](../../zig/lib/video/testdata/webm-validation/README.md)
 compares eight vectors and three retrieval rankings against pinned PyTorch.
@@ -1124,7 +1117,6 @@ It changes `model_identity` and remains opt-in pending NVIDIA qualification.
 The BF16 native vision implementation also versions its existing opt-in identity;
 reload and qualify models before using the resulting pin.
 
-
 CUDA `PACKED_PROJECTIONS`, `GRAPH_REPLAY` and `EXTENDED_FLASH` opt-in profiles
 carry updated identities for bounded grouped PLE, cohort replay and portable
 WMMA tail padding. Reload and qualify the new pins before use. Graph replay is
@@ -1177,7 +1169,6 @@ pins with `batched-patches-v2`; reload and run NVIDIA qualification before use.
 The comparison harness can require `audio_constants` and `patch_into` execution.
 Vision scratch now fits four 480×480 frames with packed BF16 preparation into the
 existing 128 MiB graph arena, without raising the cache ceiling.
-
 
 Audio acceleration also batches compatible subsampling lengths and keeps window,
 magnitude, log/mask, channel normalization and flatten preparation on device.
@@ -1373,31 +1364,595 @@ run repeats singleton and cohort audio embeddings, checks every vector against t
 checkpoint oracle, and rejects unsupported schedule capture. Route counters
 must demonstrate replay before treating the run as replay qualification.
 
-Pretrained Metal qualification covers a 492-instruction singleton schedule
+Pretrained Metal qualification covers a 420-instruction singleton schedule
 with 96 prepared linear slots, 132 retained coefficient bindings and zero named
-lookups during replay. The full output arena is 1,200 KiB; retained host bytes
-including descriptors are about 782 KiB. Three four-layer cohort schedules each
-prepare 32 slots and 44 coefficient bindings, with zero named lookups, a
-2,400 KiB arena and about 264 KiB retained host bytes. Repeated singleton,
+lookups during replay. The full output arena is 1,300 KiB; retained host bytes
+including descriptors are about 688 KiB. Three four-layer cohort schedules each
+prepare 32 slots and 44 coefficient bindings in 140 instructions, with zero named
+lookups, a 2,600 KiB arena and about 232 KiB retained host bytes. Repeated singleton,
 cohort and two-wave public audio calls pass the pinned checkpoint oracle.
+Compared with split QKV, packed consumption removes 72 singleton instructions
+and reduces retained host plan metadata by about 12%; its audio arena is about
+8% larger. Split/coalesce layout reduces fragmentation while keeping live ranges
+disjoint.
 The backbone shares 170 norm coefficient bindings in one 304 KiB allocation,
 with validated scalars and 144 indexed projection hits per warmed forward pass
-for the pinned model. Bindings survive request wrappers and yield to model pressure.
+for the pinned model. Twelve output descriptors per geometry serve 264 projection
+and norm operations per warmed forward. Bindings, layouts and token templates
+survive request wrappers and yield to model pressure.
 
 `ANTFLY_EMBEDDINGGEMMA2_BENCH_PREPARED_EXECUTION=1` adds an offline, completed
-comparison to the ordered-media oracle. It alternates phase order across two
-rounds, warms each route, collects twelve samples per route and validates every
-vector. Use a ReleaseFast test binary. The baseline disables prepared backbone
+comparison to the ordered-media oracle. It alternates old/new request pairs
+(AB/BA) across two rounds, warms fourteen pairs per round, then collects twelve
+completed samples per route and validates every vector. Use a ReleaseFast test binary. The baseline disables prepared backbone
 bindings and selects the earlier linear-only arena policy; the optimized route
 uses indexed backbone bindings and reusable descriptors for nonlinear outputs.
 `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PREPARED_BACKBONE=1` and
 `ANTFLY_EMBEDDINGGEMMA2_METAL_LINEAR_ONLY_AUDIO_ARENA=1` select those diagnostic
 policies independently. Audio arena policy participates in the schedule key.
 
-Two local M4 Max ReleaseFast comparisons passed every reference vector. Completed
-singleton medians were 28.53 → 27.37 ms and 25.22 → 23.05 ms; two-clip cohort
-medians were 34.50 → 28.44 ms and 26.38 → 25.09 ms. Each comparison used twelve
-samples per route after warmup, with phase order reversed between rounds.
-The measured gains vary with host load: about 4–9% for singleton audio and 5–18%
-for this cohort fixture. These measurements compare native execution policies;
-they do not establish a speed comparison against PyTorch.
+Metal F32 backbone execution also retains up to two admitted activation layouts,
+keyed by row count and projection geometry. Six non-overlapping projection
+lifetimes share one range; scratch norms, attention/FFN residuals and alternating
+hidden rows have separate ranges. Normal and global-attention QKV shapes retain
+separate descriptors over the shared projection range. Each layout is capped at
+64 MiB for full projections. Longer contexts use 512-row projection tiles and
+full-row norm views, capped at 96 MiB and 8192 rows. Denied layouts keep the
+existing allocation path; transient admission denial retries after eight forward
+visits. Model pressure
+releases layouts before language matrix slots. A replacement that lacks spare
+budget reclaims its inactive victim before retrying; encoded or submitted
+consumers prevent reclamation. Request outputs remain independent.
+Unsupported fused-kernel capabilities decline before encoding to the existing
+device path. Reusable private outputs do not retain host readback snapshots;
+planned writes invalidate any mirror populated by a host fallback. These are
+reusable output views with ordinary command encoding.
+
+Audio arena layout splits oversized expired ranges and coalesces adjacent expired
+ranges before growing storage. This avoids fragmentation when packed producers
+replace several smaller outputs. Seeded randomized lifetime checks verify that
+simultaneously live outputs never overlap.
+
+Audio attention can read packed QKV rows directly, applying each projection's
+optional output clamps at load time. This removes dense Q/K/V slicing and clamp
+intermediates while preserving segmented masks, query scaling and reduction
+order. Backends without this capability keep the split path. Metal pooling and
+final normalization process batch members in batched dispatches and write the
+final rows directly, preserving truncation before normalization.
+
+Single-media token templates use an eight-entry model-owned cache keyed by loaded
+immutable tokenizer generation and instance, media kind, soft-token count and
+token limit. Custom tokenizers without an immutable generation keep normal
+encoding. Misses use the
+original tokenizer; warm requests reuse its exact IDs and masks. Retention is
+admitted and model pressure releases it. Metal composition looks up only wrapper,
+text and padding positions, then merges those rows and projected media in one
+indexed device dispatch. Unsupported kernels retain the row-copy path. Masked
+padding retains its original token lookup values.
+
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP=1` selects the previous execution
+policy for qualification; this policy participates in audio schedule identity.
+`ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_FOLLOWUP=1` adds the completed alternating-route
+comparison to the ReleaseFast pretrained ordered-media oracle, retaining the
+previous prepared bindings and audio arenas on both routes.
+
+`ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_COMPONENTS=1` expands the follow-up comparison
+to workspace reuse, packed QKV, the batched head, general composition and a
+separate public-audio template route. The public route asserts increasing
+template-hit and compositor-dispatch counters.
+Diagnostic controls are `ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_WORKSPACE`,
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV`,
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_BATCHED_HEAD`, and
+`ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES`. Packed-QKV policy also
+participates in audio schedule identity. Controls are restored after qualification.
+
+On an M4 Max, completed ReleaseFast checkpoint measurements gave these median
+latencies. Full encoder measurements include all 24 layers, pooling,
+normalization and output readback; the vision comparison uses the public raster
+embedding API with two real image fixtures.
+
+| Fixture | Reference | Optimized |
+|---|---:|---:|
+| Full encoder, 2560 rows | 262.507 ms | 218.903 ms |
+| Full encoder, 3000 rows, partial final tile | 307.159 ms | 260.519 ms |
+| Full encoder, 4096 rows | 423.597 ms | 363.938 ms |
+| Public raster embeddings, previous / optimized vision | 537.062 ms | 416.280 ms |
+| Public raster embeddings, CPU / device image preparation, separate shared-host run | 586.933 ms | 575.591 ms |
+| Masked backbone, 512 rectangular / 448 active rows | 33.925 ms | 29.868 ms |
+| Masked backbone, 512 rectangular / 511 active rows | 35.430 ms | 32.822 ms |
+
+The full encoder compares dense FFNs, product-only tiling and streamed down
+projection, rotating route order with two warmups and five measured samples.
+Product-only medians were 225.952, 269.174 and 368.678 ms respectively. Streamed
+down projection reduced these full encoder latencies by 14–17% versus dense
+execution and 1–3% versus product-only tiling, while avoiding the full packed
+projection and full intermediate product. The product-only latency difference
+varies with geometry and contention; the memory reduction is consistent.
+
+Compact and vision comparisons use seven samples after two warmups, with
+alternating route order. The vision comparison keeps layer overlap and MPS shape
+caching enabled on both routes, isolating the new arena, packed heads, streamed
+vision FFN, residual fusion and boundary frames. The completed public-path
+latency decreased about 22.5%. All comparisons complete GPU work and check output
+parity. These fixtures do not establish broad workload speedups or parity with
+PyTorch, and near-full masks do not guarantee a latency improvement.
+
+Qualification includes 316 passing checks in both Debug and optimized Metal
+builds (51 skipped), 40 portable checks from a CUDA-enabled Linux build, and
+pretrained ordered-media reference parity. Full encoder checks cover 2560, 3000
+and 4096 rows, active-frame cancellation, cleanup and retry; vision also checks
+active-frame interruption and retry. Focused tests cover strided Q/K/V on CPU
+and Metal, admitted layout reuse/replacement/pressure cleanup, and four warm MPS
+shapes with slot-replacement invalidation. Linux CUDA device execution was not
+exercised.
+
+Metal pooled inference compacts masked rows before backbone execution. Explicit
+original positions preserve RoPE and sliding windows across holes; per-item
+ranges isolate attention, and segmented pooling restores output order without
+reintroducing padded activations. Token-level outputs retain rectangular layout.
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_ROWS=1` selects the rectangular reference.
+Long-context FFNs can project into a reusable 512-row tile, apply GELU into a
+second tile and immediately run the down projection into final hidden rows.
+This avoids both full gate/up and full intermediate product activations. The
+product-only tiled route and ordinary MPS projections remain qualified fallbacks.
+Long layouts add one admitted product descriptor (13 total); layouts remain
+bounded at 96 MiB, including this tile.
+
+General mixed-media and video composition also uses compact wrapper lookups and
+indexed composition. A single resident media tensor is consumed directly;
+multiple media tensors are packed once into one admitted request output instead
+of repeatedly concatenating a growing table. Original tokenizer IDs are committed
+to video IDs only after successful composition.
+
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_COMPACT_FFN=1` adds checkpoint comparisons for
+compact masked execution (including holes and non-finite padding) and a 3000-row
+tiled FFN. `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_STREAMED_ENCODER=1` adds the three-way
+full encoder comparison and cancellation/retry checks.
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_PIPELINED_VISION=1` adds the completed public
+raster comparison. `ANTFLY_EMBEDDINGGEMMA2_BENCH_FFN_PRECISION=1` enables the separate
+`BF16 storage candidate completed projection comparison` test. Its exactly
+BF16-representable synthetic weights compare F32 MPS against native BF16 weight
+storage with F32 activations/accumulation at 1, 128 and 512 rows. Both comparisons
+complete GPU work and read back results; serving precision remains unchanged.
+
+The BF16 storage candidate measured 0.391 versus 0.561 ms for F32 MPS at one
+row, but 1.247 versus 1.159 ms at 128 rows and 4.226 versus 3.498 ms at 512 rows.
+Although BF16 halves the tested weight payload, it was slower for the measured
+media-sized GEMMs. F32 MPS therefore remains the serving policy. This synthetic
+projection comparison does not qualify a new checkpoint precision recipe.
+
+Compact Metal cohorts are selected by summed token counts, capped at 8192 active
+rows and four items. Portable/CUDA policies retain rectangular padding limits.
+Encoder phase admission uses the compact physical shape and explicit output
+bytes; preprocessing and retained source allocations keep their separate host
+and device reservations. Text, prepared groups and resident media compose or
+look up active rows directly, preserving the original rectangular mask solely
+as layout metadata. Capability declines retain the rectangular composition route.
+
+Two model-owned compact-layout entries cache exact masks, original positions,
+per-item offsets, source rows and uploaded attention tables. Retention is admitted,
+evicted by LRU and released under model pressure; position tensors carry no
+request-owner pointer. Denied retention uses request-owned layout construction.
+
+Vision can encode a successor while its predecessor is submitted, using two
+one-layer groups within the existing two-layer scratch envelope. Images that
+admit only one layer and external frame owners keep synchronous execution.
+Cancellation drains or cancels both owned frame slots before freeing views.
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION=1` selects synchronous vision;
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_STREAMED_FFN=1` selects the product-only FFN path,
+and `ANTFLY_EMBEDDINGGEMMA2_DISABLE_TILED_FFN=1` also disables that candidate.
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_CACHE=1` bypasses retained mask metadata.
+
+Live model delivery checks coordinator readiness before admission or snapshot
+allocation. Each prepared window has an independent allocation owner: host
+admission grows in bounded chunks before allocation and uses the same optional
+cache reclamation as model preflight. Preparation scratch and unused admission
+slack are trimmed at phase boundaries; actual retained snapshot, allocation
+bookkeeping and output storage survive delivery or acknowledgement retries.
+The 512 MiB allocation ceiling, cancellation and live-memory checks remain in
+force. Prepared snapshots can use an allocator independent of ingestion state;
+that allocator remains alive through commit or abandoned-output cleanup. Internal
+window/output-retry storage uses reclaiming workspace backing even when the
+caller supplies an arena for independently owned outputs.
+
+Live ingestion shares immutable encoded snapshots through reference-counted
+owners. Packet windows and decoder views allocate their own packet/span metadata;
+contiguous reads borrow payload slices, while cross-span reads use bounded copy
+fallbacks. Validation of coordinator-owned prefixes advances only new packets;
+untrusted reader APIs continue to verify their content bindings. Projection keys
+use a process-local source capability, epoch generation and absolute packet ID,
+so retention rebasing cannot alias another picture or stream.
+
+Strict live validation can retain completed native-depth/chroma pictures for
+preparation, avoiding a second reconstruction of selected frames. Four current
+or near-future sampling windows share a 64 MiB pixel bound, including outstanding
+pins; media admission charges every retained allocation. Targets use rational
+presentation times and stable packet IDs, so B-picture reorder and VFR do not
+publish a provisional candidate under another picture's identity. A failed append
+clears unpublished candidates; prepared pins remain independent of coordinator
+retention and destruction. Capture scratch or cache admission denial is a miss.
+Partial hits preserve preparation slots and decode only missing selections.
+Separate colour planes and explicitly forced Apple decoding use the decoder path.
+Set `max_validated_frame_bytes=0` to disable this optional reuse.
+
+A live stream retains an admitted decoder owner while a GOP grows, including
+portable reference pictures, dynamic parameter registry and eligible VideoToolbox
+state. Retention eviction, configuration/period transitions and failed inference
+reset that owner. Rewinding selections retain the existing replay fallback.
+For sparse forward windows, portable decoders verify a later independent reset
+before discarding references, with a 32-packet hysteresis; unfinished field or
+partition assemblies prevent a restart. Eligible Apple continuations recreate
+their decoder at a verified IDR when it saves more than 32 packets or avoids the
+dependency limit. Configuration epochs keep their own parameter context.
+
+Live model execution combines up to two already sealed windows, including their
+captions, through the existing admitted video batch executor. There is no fill
+wait. One following sealed window can prepare while the current backbone runs.
+Previewed snapshots keep stable reader/selection addresses and independent pixel
+pins. Output acknowledgement and commit stay ordered; a rejected callback retains
+both its exact vector and any later computed row. Commit rebases against current
+preroll after earlier acknowledgements evict units. Speculative pressure falls
+back to serial execution, and all preparation workers join before return.
+Statistics distinguish native batches, prepared successors and validated-frame
+hits from transport overlap; none of these counters measures GPU utilization.
+
+HLS/DASH HTTP reads and framing use a producer with two queued fragments while
+model execution and delivery callbacks remain on the caller thread. The queue
+uses the transport's existing snapshot admission, plus model admission for its
+context. Cancellation stops and joins the producer before returning. Its transient
+request checkpoint reaches the HTTP cancellation watchdog and never escapes into
+snapshot controls. Acknowledged queued fragments survive callback or append
+failure and are consumed before another HTTP request on retry. Custom readers
+without the request-control capability, single-threaded builds and thread-start
+failure retain synchronous operation. Statistics report prefetched fragments and
+publications overlapping caller-side preparation/execution/delivery; these are
+not GPU utilization measurements.
+
+Metal vision retains up to two admitted activation layouts per model. Each uses
+bounded 512-row FFN tiles, snapshots immutable norm coefficients and reuses
+separate norm, residual, alternating hidden and prepared-head ranges. Activation
+storage is capped at 256 MiB per layout; normalization coefficients and tensor-view
+metadata are admitted separately. Layout replacement occurs only with no active
+or submitted frame, and vision pressure releases all retained layouts.
+
+Packed QKV is normalized directly from its projection strides: Q/K retain their
+2D RoPE and Q scale; V uses unweighted RMSNorm without rotation. FFNs stream
+packed projection, GELU and down projection into final hidden rows. Residual
+normalization/addition uses one dispatch. Position gathering/addition and the
+spatial projector each have an owned frame, respecting external frame owners.
+Cancellation drains both layer slots before clearing the request's layout view.
+
+`ANTFLY_GEMMA4_VISION_PROFILE=1` flushes vision phase boundaries and reports
+CPU wall time, completed Metal command-buffer GPU time and host download bytes.
+Use it for attribution; its extra fences change serving latency. The maintained
+video oracle corpus attributed approximately 49% of measured layer GPU time to
+FFNs and 31% to attention, with no layer activation downloads. A larger FFN tile
+candidate did not establish a reliable gain in three alternating process pairs
+and increased median peak process footprint by approximately 53 MiB. Serving
+keeps the bounded 512-row tile policy. Qualify future kernel changes with paired
+completed timings, shape-specific throughput, memory and pretrained parity;
+process-wide medians alone can hide clock drift between paired runs.
+
+Metal image preparation consumes RGB or RGBA bytes with an explicit row stride,
+ignores alpha/padding, and writes exact torchvision bicubic, centered patch rows
+on the device. Encoded images retain decoded RGB until consumption; raster
+attachments borrow caller-owned bytes. Single images import the patch buffer
+directly. Cohorts copy patch rows into one device matrix and perform one patch
+projection per compatible geometry, avoiding batched host F32 pixels and host
+patch packing. Unsupported preparation or denied optional retention keeps the
+CPU torchvision fallback.
+
+The shared model provider owns one preparer and its current geometry/policy
+coefficients. A 16 MiB coefficient ceiling is admitted separately from request
+workspace; geometry replacement reuses shader pipelines. Vision pressure and
+unload fence the preparer before releasing its cache credit. Cancellation fences
+submitted preparation before input/output ownership is released; retry starts
+with a clean request. Prepared vision norm callbacks are consulted before any
+fallback coefficient load, avoiding 64 redundant small weight materializations
+per tower when model-owned snapshots are available.
+
+Dedicated raster CPU preparation runs before the model execution lock and
+backend lease. Raster host preparation is derived from source/target geometry;
+Metal borrowed rasters require no separate decoded host copy. After decoding,
+image requests use actual soft-token geometry and the larger of vision/encoder
+workspace peaks. Projection releases owned preparation pixels before composition
+and encoder execution, reducing the host lease and matching run credit together.
+The encoder phase then retires drained vision workspace. CPU/CUDA retain their
+qualified preparation policies and every phase remains subject to shared model
+and process admission.
+
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_DEVICE_IMAGE_PREPARATION=1` selects CPU torchvision
+preparation for qualification. `ANTFLY_EMBEDDINGGEMMA2_QUALIFY_IMAGE_PREPARATION=1`
+adds a completed alternating CPU/device preparation comparison to the pretrained
+ordered-media oracle, with identical vision/backbone execution on both routes.
+
+A separate completed two-image comparison on the shared M4 Max host measured
+586.933 ms with CPU preparation versus 575.591 ms with Metal preparation (seven
+samples after two warmups, alternating order, parity checked). Both routes used
+the new vision execution. This roughly 1.9% public-path improvement is specific
+to those fixtures; absolute latencies are not comparable with earlier runs or a
+clean-host campaign.
+
+MPS linear slots retain four immutable multiplication shapes and their matrix
+descriptors, including full tiles and tails. Activation-bound matrix views keep
+the existing frame ownership and release boundaries. Slot replacement and model
+unload invalidate all cached shapes.
+
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP=1` selects the previous vision
+execution policy. Individual diagnostics are
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_WORKSPACE`,
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_PACKED_VISION_HEADS`,
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_STREAMED_VISION_FFN`,
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES`, and
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_MPS_SHAPE_CACHE` (all set to `1` to disable).
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP=1` adds an alternating completed
+public-raster comparison to the ordered-media checkpoint oracle, plus active
+vision-frame cancellation and retry parity.
+
+Metal vision cohort selection and request admission share one execution plan:
+8192 patch rows and a 256 MiB activation-layout ceiling, including 512-row FFN
+tiles. Four full-size 2304-patch images therefore execute as three images plus
+one; 2520-patch geometries fit two per cohort. The request reserves bounded
+transient execution and all retained projected outputs; model-owned layouts and
+coefficients retain independent cache leases. Prepared execution is required
+under this estimate. If a capability or cache admission declines, partial work
+is drained and a separate conservative fallback supplement is admitted before
+retry. Failure to admit the supplement returns a resource error.
+
+Retained host source bytes remain charged to host residency. Backend workspace
+uses physical model inputs instead of multiplying encoded files or borrowed
+raster bytes by the generic staging factor. Projection and encoder phase
+reductions preserve the source lease and release only retired workspace.
+
+Four admitted model-owned rotary tables reuse precise Metal sine/cosine
+coefficients across heads and layers. Vision keys include grid, dimension and
+theta; backbone tables cover original positions through 8191, including holes.
+LRU replacement occurs outside active/submitted frames; vision/language pressure
+and unload release the corresponding tables. Denied optional retention keeps
+the original precise kernel math. Set
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_ROTARY_CACHE=1` to qualify that fallback.
+
+EmbeddingGemma 2 sessions share a FIFO of ready execution cohorts. Text and
+media callers use the same model gate; image preparation runs outside it and
+long media requests requeue after each ready wave. Each request retains at most
+one current and one future preparation wave, with host admission shared across
+requests. Waiting cancellation unlinks its queue node and releases owned work.
+The scheduler preserves one backend owner and does not preempt an active
+cohort. It guarantees FIFO handoff among ready participants, without a latency
+SLO or unlimited queued preparation memory.
+
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN=1` selects the previous cohort and
+conservative workspace policy for comparison.
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_PLAN=1` adds an alternating completed
+four-image comparison to the ordered-media checkpoint oracle. It checks vector
+parity, verifies no optimized plan fallback, exercises dedicated raster/image
+routes, and forces a workspace decline to qualify separately admitted fallback.
+
+A completed ReleaseFast four-full-size-image comparison on the shared M4 Max
+host measured 1092.352 ms with the previous cohort/admission policy versus
+880.750 ms with the bounded plan (seven samples per route after two warmups,
+alternating order). Both routes retained precise rotary caching and device image
+preparation. Every vector passed parity, and the optimized route reported zero
+plan fallbacks. This roughly 19% improvement qualifies these fixtures, without
+establishing broad PyTorch parity or a clean-host throughput result. Forced
+workspace decline passed separately admitted fallback parity; active-frame
+cancellation completed 32 checks and a successful retry.
+
+Broker capacity planning uses the same bounded vision scratch, retained
+projections, physical model inputs and encoder geometry as execution. Queue
+planning grants no preprocessing lease credit; encoded-image RGB decoding has
+an explicit host estimate. The portable/CUDA qualification policies remain
+unchanged. The broker can select four logical images while execution splits a
+large uniform geometry into arena-sized tower cohorts.
+
+Mixed groups and standalone Metal media groups share prepared image execution.
+Borrowed rasters enter the device preparer directly; encoded-image preparation
+bounds decoded RGB from inspected headers. Invalid media retain indexed error
+slots. Image tower phases require the prepared plan under its bounded estimate;
+capability decline fences partial work and replaces the phase supplement with
+separately admitted conservative fallback. Source residency remains charged to
+host memory throughout the request.
+
+Metal preparation submits compatible image cohorts into disjoint spans of the
+final patch matrix, with no intermediate patch-buffer copy. A bounded staging
+window covers source uploads and preparation scratch. All submissions precede
+the completion wait on the ordered preparation queue; every command's status
+is checked. Cancellation and partial submission fence all outstanding commands
+before the destination is released. Oversized staging windows or unsupported
+capabilities retain sequential preparation. Destination spans expose their byte
+offset; explicit debug readback supports both shared and private buffers.
+
+Mixed and video pipelines release the model gate and provider lease between
+ready stages, including CPU decode/preparation queue waits. Retained projections
+cross handoff in independent device buffers, preventing aliasing with a peer's
+activation arenas or cache reclamation. Suspending retires request-local backend
+bindings; reacquisition rebuilds them from the current model-owned caches. Idle
+GPU execution scratch is reduced while decoder buffers, source bytes and
+projected rows retain admission. Stage supplements reacquire compute capacity
+before dispatch. Multiple live leases receive combined credit without merging
+external process-owner tokens, and reductions cannot borrow from a peer.
+Cancellation restores ownership for cleanup without requiring another compute
+peak. Each submitted GPU cohort remains nonpreemptive.
+
+`ANTFLY_EMBEDDINGGEMMA2_DISABLE_ASYNC_IMAGE_PREPARATION=1` selects sequential
+image preparation. `ANTFLY_EMBEDDINGGEMMA2_DISABLE_STAGE_SCHEDULING=1` retains
+one execution turn for mixed/video calls. The checkpoint qualifier
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_STAGE_FOLLOWUP=1` exercises the server image
+broker, mixed raster/audio reference parity, stage handoff counters, and a
+completed alternating broker comparison of sequential/asynchronous preparation.
+
+The completed serving-broker comparison measured 840.621 ms with sequential
+preparation and 837.125 ms with asynchronous final-span preparation (seven
+samples after two warmups, alternating order, identical bounded tower/encoder
+policies). This roughly 0.4% difference is modest on the shared host. The
+qualification also passed brokered-vector parity, mixed raster/audio reference
+parity with four stage handoffs and zero plan fallbacks, and all six pinned video
+cases plus their HTTP response check. The preceding bounded-plan comparison
+encountered one live-memory admission retry on its legacy route; these results
+are fixture measurements under shared-host conditions, not a production latency
+or sustained-throughput guarantee.
+
+
+Metal video projection uses the image tower's required prepared-plan contract
+when the pipeline owns phase admission. The geometry planner considers the
+bounded arena and transient workspace, rather than a dense attention matrix.
+At 480x480 it permits eight frames with a 250.03 MiB model-owned arena and
+401.5 MiB transient estimate; actual cohorts remain limited by ready frames,
+queue admission and completed-throughput calibration. A capability decline
+fences the required attempt and separately admits legacy subcohorts within
+the conservative 768 MiB transient ceiling before retrying against the retained
+input. Denied fallback admission propagates; it
+cannot execute under the smaller prepared reservation. Generic projector
+callers keep their conservative contract.
+
+Queued Metal video calls retain source/decode/preparation and projected-input
+capacity. Their model execution supplement is acquired only after the model
+queue grants a turn. Decode waits release this supplement. Ready vision,
+composition and backbone phases replace their execution reservations at fenced
+boundaries; the backbone uses its rendered input geometry. This also applies
+to video within mixed cohorts. CPU/CUDA and callers without staged ownership
+retain the established admission policy.
+
+Mixed image waves stably bucket prepared images by geometry within their
+existing four-item window. Projection output is scattered through original
+part indexes, preserving public content order and indexed decode failures.
+No extra preparation window or wait to fill a geometry bucket is introduced.
+
+`ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VIDEO_PLAN=1` extends the pinned video qualifier
+with eight-frame versus singleton tower parity and alternating completed
+legacy/prepared clip timings. `MediaTimings` exposes stage copy bytes/time,
+explicit backend retirement time and provider reacquisition time. Reacquisition
+excludes lazy binding setup during subsequent dispatch; these counters do not
+alone measure all handoff overhead.
+
+
+The prepared-video qualifier passed eight-frame/singleton tower parity and a
+926-token denser-sampling legacy-retry comparison in Debug and ReleaseFast.
+On the shared M4 Max, the completed two-frame ReleaseFast comparison measured
+182.710 ms with legacy planning and 182.284 ms with prepared planning (seven
+samples after two warmups, alternating order, every output checked). This is
+effectively flat; larger eligible cohorts and reduced queued reservations do
+not imply a short-clip latency gain or sustained-throughput qualification.
+One optimized short-clip call recorded 1,077,248 copied bytes in 0.655 ms,
+0.097 ms of explicit backend retirement and 0.110 ms of provider reacquisition.
+These counters preserve independent tensor ownership and exclude lazy binding
+setup during later dispatch.
+
+Qualified Metal media phases set `RunRequest.workspace_planned` with a positive
+workspace envelope. This replaces the generic model-weight-size allowance;
+physical staging, model-profile estimates, process limits and live-memory checks
+remain enforced. Queued video reserves retained inputs and preparation. Token
+composition adds text lookup, composed rows and an independent handoff copy.
+The backbone uses the shared linear activation envelope over physical rows;
+Metal segmented attention reports unavailable capabilities instead of silently
+materializing dense/host attention. CPU/CUDA retain conservative planning.
+
+A relevant phase-supplement denial retires request-local provider bindings while
+retaining the model's FIFO turn and independent tensor leases. Admission retries
+after retirement, then reclaims optional media and language caches in order.
+Forced denials, permanent size failures and unrelated quotas bypass eviction.
+Provider ownership is restored on success, cancellation and failure before the
+caller can free or consume its tensors. Standalone image helpers use the same
+fenced admission path, including separately admitted legacy fallback.
+
+Completed video calibration considers powers of two plus the exact admitted
+ceiling. A 576x528 frame has 1188 patch rows and admits six frames; six is now a
+measured candidate alongside one, two and four. Smaller caps remain hard bounds.
+Prepared and conservative plans have separate calibration namespaces; a declined
+prepared attempt that retries legacy subcohorts does not train the prepared
+policy. The video qualifier includes alternating completed four/six-frame tower
+measurements and vector checks. The stage qualifier forces a warmed-cache
+admission denial and verifies retained input after provider retirement/recovery.
+
+The completed ReleaseFast 576x528 tower comparison measured 389.054 ms for
+four frames and 572.990 ms for six (97.264 and 95.498 ms/frame), using seven
+samples after two warmups in alternating order with projection parity. This
+falls inside the policy's 5% preference margin and does not establish a larger
+batch throughput win. Debug measured 97.807 versus 95.666 ms/frame, also inside
+the same margin; selection remains based on completed cost. The same ReleaseFast
+shared-host run measured 244.481 versus 246.943 ms for the full short-clip legacy/prepared comparison: effectively flat.
+These admission and candidate-selection changes do not establish PyTorch parity
+or a production latency SLO.
+
+Singleton video projections use the same admitted prepared/legacy execution
+path as larger cohorts. Their completed samples train the prepared namespace,
+so cold calibration can advance beyond width one. The pretrained video
+qualifier checks samples from the serving path as well as direct tower parity.
+
+Video calibration caps exploration by compatible frames already ready and by
+geometry capacity; it never waits to fill a larger batch. Completed costs include
+imports and any required packing. Live vision admission shrinks cohorts before
+consuming preparations; legacy retries also split retained inputs to fit current
+capacity. Cancellation and non-pressure errors propagate without resizing.
+
+Metal video preparation writes into append-only final patch spans sized from
+the selected pictures and their display geometry. The clip owns a separate
+admission token for that buffer until all queued preparations and imported
+inputs drain. Contiguous compatible spans import as one tensor without stacking;
+other layouts retain bounded copying. Tighter caller pools keep independent
+outputs when the slab would displace their transient command window.
+
+Video admission owns cache tickets before charging unique preparation misses.
+The tickets survive producer shutdown and model-input cleanup, preventing cache
+eviction from invalidating reduced reservations. Fully cached selections retain
+full model token/composition costs, but need no preparation commands, slab,
+coefficient upload or preparer creation. All decoder/reference slots remain
+reserved whenever any selected picture needs decoding; only selected-output
+surface counts shrink.
+
+Validated video inspection metadata survives preflight under its own reduced
+host lease. Preparation borrows the selected pictures, container/index metadata
+and AVC configuration epochs instead of repeating those scans. Decoder replay
+keeps its IO and allocations separate from immutable metadata. Ahead producers
+retain their own preparation leases; consumers reserve only their new buffers,
+and drained producer metadata retires before backbone admission grows.
+
+Qualified Metal host bounds describe metadata, one decoder/preparation producer,
+queued CPU patches when applicable, and token composition. GPU activations stay
+in the backend plan. Cached video avoids decoder/conversion allowances as well
+as device preparation, and retained inspection metadata receives explicit credit.
+
+Video consumers wake on preparation completion and project ready prefixes while
+later jobs remain pending. A session-owned, independently admitted eight-entry
+cache shares immutable resize/chroma coefficients and HDR LUTs across requests
+(up to 16 MiB device and 64 KiB host metadata). Eviction preserves active owners;
+cache admission failure uses private preparation. Pressure evicts shared storage
+before releasing its device lease, and reactivation requires new admission.
+Validated reader handoffs and
+request-local binding lookups avoid repeated packet-table traversal.
+
+Video-plan qualification reports median inspection, media preparation (decode,
+preparation, projection and composition), packing, encoder and readback times,
+as well as coefficient cache occupancy. Packing is a subset of media preparation.
+Use paired process runs and model-only controls when assessing code changes;
+these component medians need not sum to the median total.
+
+Metal preparation uses buffer-layout estimates independent of CPU RGB/repacking
+scratch. Uploads, chroma reconstruction and independent outputs are included;
+slab or external destinations exclude duplicate command output credit. Immutable
+shader pipelines share one synchronized device-cache entry; request queues and
+mutable preparation resources remain separate. Version-validated remote ranges
+also avoid a full packet-payload scan when establishing cache identity.
+
+Every Metal group, including preparation/residency opt-outs, admits any actual
+backbone deficit at its fenced transition before reducing its existing leases.
+
+Compact image/audio phase reductions preserve their explicit-workspace policy;
+a generic model-size floor cannot reappear during a qualified reduction. Mixed
+Metal groups inspect image geometry and audio duration before reserving retained
+rows. Their host plan covers metadata, resize/frontend storage and the bounded
+encoded-audio decoder. Declared FLAC sample counts must agree with decoded
+audio before frontend preparation; unknown durations retain maximum sequence bounds;
+unqualified preparation and CPU/CUDA retain conservative envelopes.
+
+Ready encoder cohorts test live admission at each phase and shrink in place
+when a smaller cohort fits. Prepared tensors and independent admission owners
+remain live across those attempts. Completed vectors survive later pressure
+failures; only unfinished items receive indexed errors. After prepared owners
+drain, the broker may retry those failed items independently without replaying
+completed peers. Cancellation and non-pressure errors do not trigger resizing.
+
+Host-only inspection, streaming-window and media preprocessing admission use the
+same bounded cache-recovery policy as model execution. Relevant warm state is
+reclaimed before retrying the original host reservation; no compute workspace
+is reserved, no bound is reduced, and forced/permanent denials still propagate.

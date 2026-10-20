@@ -584,7 +584,8 @@ def test_generate_with_tools_tool_model(api):
                     "content": "Use the get_weather function for San Francisco.",
                 }
             ],
-            "max_tokens": 96,
+            "max_tokens": 32,
+            "chat_template_kwargs": {"enable_thinking": False},
             "temperature": 0.1,
             "tools": [
                 {
@@ -779,7 +780,8 @@ def test_stream_generate_with_tools_tool_model(api):
             "messages": [
                 {"role": "user", "content": "Use the lookup function to find order 42."}
             ],
-            "max_tokens": 96,
+            "max_tokens": 32,
+            "chat_template_kwargs": {"enable_thinking": False},
             "temperature": 0.1,
             "stream": True,
             "tools": [

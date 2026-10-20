@@ -721,6 +721,10 @@ pub fn lookupPrimarySnapshotWithSchemaAndOutput(self: *DB, alloc: Allocator, out
 }
 
 pub fn lookupPrimarySnapshotWithPreparedProjection(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64, prepared: ?*LookupProjectionPlans) !?types.LookupResult {
+    // Virtual group sources have no independently authorized public row.
+    // Owner control queries use the dedicated private lookup path above;
+    // producers read their physical source through authenticated snapshots.
+    if (@import("group_source_identity.zig").isAnchor(key)) return null;
     var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
     defer if (verified_principal) |*principal| principal.deinit();
     var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {

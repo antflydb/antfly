@@ -267,7 +267,7 @@ pub const ReceiverProducerPlan = struct {
     pub fn initForMerge(alloc: std.mem.Allocator, txn: anytype, progress: @import("merge_page_contract.zig").Progress) !ReceiverProducerPlan {
         try progress.validate();
         const donor_binding = progress.source.artifact_catalog orelse return error.ArtifactCatalogDrift;
-        if (!progress.source.provenance_required or donor_binding.effect_protocol != 15) return error.ArtifactCatalogDrift;
+        if (!progress.source.provenance_required or donor_binding.effect_protocol < 15) return error.ArtifactCatalogDrift;
         var source = try @import("merge_artifact_catalog.zig").load(alloc, txn, progress);
         defer source.deinit();
         var receiver = (try inventory.load(alloc, txn)) orelse return error.ArtifactCatalogDrift;
@@ -322,7 +322,7 @@ pub fn prepareReceiverCandidate(
     const owned = arena.allocator();
     const proof = decoded.proof.proof;
     const donor_binding = producer_plan.donor_binding;
-    if (donor_binding.effect_protocol != 15 or donor_binding.epoch != proof.authority_epoch or
+    if (donor_binding.effect_protocol < 15 or donor_binding.epoch != proof.authority_epoch or
         !std.mem.eql(u8, &donor_binding.digest, &proof.catalog_digest)) return error.SourceSnapshotCorrupt;
     const witness = txn.get(&witnessKey(proof.namespace, source_pin, proof.publication_digest)) catch |err| switch (err) {
         error.NotFound => return null,

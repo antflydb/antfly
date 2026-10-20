@@ -973,7 +973,7 @@ pub fn initializeDenseArtifactTargetCounterForAdmission(
     // them without populating the new generation.
     // Table-owned sources can predate even an ordinary ANN admission,
     // including after its last consumer was dropped. Bootstrap them too.
-    if (disposition == .managed_rebuild or (self.local_execution.source_vectors.load(.acquire) != null and try self.externalCoverageHasStoredArtifacts(cfg))) {
+    if (disposition == .managed_rebuild or try self.externalCoverageHasStoredArtifacts(cfg)) {
         try self.deleteDenseArtifactCounterMetadata(cfg.name);
         return;
     }

@@ -267,6 +267,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
+    parser.add_argument(
+        "--root", type=Path, default=MANIFEST.resolve().parents[2] / "zig"
+    )
     parser.add_argument("--cache", type=Path)
     parser.add_argument(
         "--seed", type=Path, help="Optional local verified source archives"
@@ -278,7 +281,7 @@ def main() -> None:
         os.environ.get("ZIG_GLOBAL_CACHE_DIR", "zig/.zig-cache/global")
     )
     manifest = load_manifest(args.manifest)
-    check_remote_declarations(MANIFEST.resolve().parents[2] / "zig", manifest)
+    check_remote_declarations(args.root.resolve(), manifest)
     prepare(
         args.zig, manifest, cache.resolve(), args.seed, args.mirror_only, args.offline
     )

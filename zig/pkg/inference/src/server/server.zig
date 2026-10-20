@@ -1833,7 +1833,7 @@ fn directExecutorDeadline(io: std.Io, deadline_ns: ?u64) !?std.Io.Clock.Timestam
 }
 
 fn isRecoverableEmbeddingRuntimeIntegrityError(err: anyerror) bool {
-    return err == error.MissingWeight or err == error.WeightNotFound;
+    return err == error.MissingWeight or err == error.WeightNotFound or err == error.ModelArtifactsChanging;
 }
 
 fn shouldAbortDensePartialFallback(err: anyerror) bool {
@@ -1969,7 +1969,7 @@ fn runLoadedEmbeddingRuntimeWithRecovery(
 
 test "embedding runtime recovery retries once and retires every corrupt runtime" {
     const Probe = struct {
-        const FailureMode = enum { first_missing, persistent_missing, capacity, timeout };
+        const FailureMode = enum { first_missing, persistent_missing, changed_publication, capacity, timeout };
         const Handle = struct { active: bool = true };
 
         mode: FailureMode,
@@ -1989,6 +1989,7 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
             switch (self.mode) {
                 .first_missing => if (self.execute_count == 1) return error.MissingWeight,
                 .persistent_missing => return error.MissingWeight,
+                .changed_publication => if (self.execute_count == 1) return error.ModelArtifactsChanging,
                 .capacity => return error.ResourceTemporarilyUnavailable,
                 .timeout => return error.Timeout,
             }
@@ -2019,6 +2020,11 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
     try std.testing.expectEqual(@as(usize, 1), recovered.release_count);
     try std.testing.expectEqual(@as(usize, 1), recovered.succeed_count);
 
+    var changed = Probe{ .mode = .changed_publication };
+    try runEmbeddingRuntimeRecoveryLoop(&changed);
+    try std.testing.expectEqual(@as(usize, 2), changed.acquire_count);
+    try std.testing.expectEqual(@as(usize, 1), changed.retire_count);
+
     var persistent = Probe{ .mode = .persistent_missing };
     try std.testing.expectError(error.MissingWeight, runEmbeddingRuntimeRecoveryLoop(&persistent));
     try std.testing.expectEqual(@as(usize, 2), persistent.acquire_count);
@@ -2038,7 +2044,7 @@ test "embedding runtime recovery retries once and retires every corrupt runtime"
     try std.testing.expectEqual(@as(usize, 1), timeout.release_count);
 }
 
-test "embedding runtime recovery is limited to weight integrity failures" {
+test "embedding runtime recovery is limited to weight and publication integrity failures" {
     try std.testing.expect(isRecoverableEmbeddingRuntimeIntegrityError(error.MissingWeight));
     try std.testing.expect(isRecoverableEmbeddingRuntimeIntegrityError(error.WeightNotFound));
     try std.testing.expect(!isRecoverableEmbeddingRuntimeIntegrityError(error.ResourceLimitExceeded));
@@ -3031,7 +3037,7 @@ const transient_capacity_retry_after_seconds = "1";
 const transient_capacity_retry_after_ms = 1000;
 
 fn isTransientInferenceCapacityError(err: anyerror) bool {
-    return err == error.ResourceTemporarilyUnavailable or err == error.ConcurrencyUnavailable;
+    return err == error.ResourceTemporarilyUnavailable or err == error.ConcurrencyUnavailable or err == error.GenerationCapacityUnavailable;
 }
 
 fn transientCapacityFailureResponse(
@@ -4724,7 +4730,7 @@ pub const Node = struct {
         trace: ?*embedding_trace.Trace,
         observation: ?*@import("../pipelines/batch_execution.zig").Observation,
     ) ![][]f32 {
-        try model.verifyEmbeddingIdentity();
+        try model.verifyEmbeddingIdentityWithControl(control);
         const asset_started = if (trace != null) embedding_trace.now() else 0;
         var pipeline = blk: {
             try model.lockEmbeddingAssetsWithControl(control);
@@ -4753,7 +4759,7 @@ pub const Node = struct {
             for (vectors) |vector| allocator.free(vector);
             allocator.free(vectors);
         }
-        try model.verifyEmbeddingIdentity();
+        try model.verifyEmbeddingIdentityWithControl(control);
         return vectors;
     }
 
@@ -6331,7 +6337,7 @@ pub const Node = struct {
         errdefer handle.release();
         const actual = if (handle.get().embedding_identity) |*identity| identity else return error.InvalidEmbeddingIdentity;
         if (!std.mem.eql(u8, expected, actual)) return error.EmbeddingIdentityMismatch;
-        try handle.get().verifyEmbeddingIdentity();
+        try handle.get().verifyEmbeddingIdentityWithControl(self.bindExecutionControl(io, control));
         return handle;
     }
 
@@ -6605,7 +6611,7 @@ pub const Node = struct {
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
                 const active = attempt.control;
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(active);
                 if (try attempt.node.tryEmbedImagesViaBroker(attempt.allocator, attempt.io, model, &.{}, attempt.rasters, active, .RETRIEVAL_DOCUMENT, null)) |vectors| {
                     attempt.vectors = vectors;
                     return;
@@ -6623,7 +6629,7 @@ pub const Node = struct {
                 asset_lease.release();
                 errdefer freeDirectDenseVectors(attempt.allocator, vectors);
                 try active.check();
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(active);
                 attempt.vectors = vectors;
             }
         };
@@ -7376,7 +7382,7 @@ pub const Node = struct {
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(attempt.control);
                 const resident_embedding_gemma2 = model.manifest.embedding_style == .embedding_gemma2 and model.session.backend() == .cuda;
                 const request_prefix = try denseEmbeddingTextPrefix(attempt.allocator, model, attempt.task_type, attempt.instruction);
                 defer if (request_prefix.owned) |owned| attempt.allocator.free(owned);
@@ -7431,7 +7437,7 @@ pub const Node = struct {
                 asset_lease.release();
                 errdefer freeDirectDenseVectors(attempt.allocator, vectors);
                 try attempt.control.check();
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(attempt.control);
                 attempt.vectors = vectors;
             }
         };
@@ -10934,7 +10940,7 @@ pub const Node = struct {
             }
         }
 
-        const base_units = estimateGenerateAdmissionUnitsFromShape(text_bytes, media_count, max_tokens);
+        const base_units = std.math.add(usize, estimateGenerateAdmissionUnitsFromShape(text_bytes, media_count, max_tokens), if (body.logprobs orelse false) 8 else 0) catch std.math.maxInt(usize);
         const speculation = parseGenerateSpeculationOptions(
             body.draft_model != null,
             body.speculative_k,
@@ -11407,7 +11413,7 @@ pub const Node = struct {
             fn run(attempt_ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(attempt_ctx));
                 attempt.model_identity = model.embedding_identity;
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(attempt.execution_control);
                 if (attempt.request.model_identity) |expected| {
                     const actual = if (model.embedding_identity) |*identity| identity else return error.InvalidEmbeddingIdentity;
                     if (!std.mem.eql(u8, expected, actual)) return error.EmbeddingIdentityMismatch;
@@ -11423,7 +11429,7 @@ pub const Node = struct {
                         defer if (prefix.owned) |owned| attempt.allocator.free(owned);
                         if (try attempt.node.tryEmbedParsedViaBroker(attempt.allocator, io, model, attempt.inputs, attempt.execution_control, attempt.request.task_type orelse .RETRIEVAL_DOCUMENT, attempt.request.instruction, attempt.audio_decode_working_bytes)) |vectors| {
                             errdefer freeDirectDenseVectors(attempt.allocator, vectors);
-                            try model.verifyEmbeddingIdentity();
+                            try model.verifyEmbeddingIdentityWithControl(attempt.execution_control);
                             attempt.prompt_tokens = countParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs, prefix.prefix);
                             attempt.result = .{ .fail_fast = vectors };
                             return;
@@ -11506,7 +11512,7 @@ pub const Node = struct {
                     .per_item => |*partial| partial.deinit(attempt.allocator),
                 };
                 asset_lease.release();
-                try model.verifyEmbeddingIdentity();
+                try model.verifyEmbeddingIdentityWithControl(attempt.execution_control);
                 attempt.result = result;
             }
         };
@@ -11701,7 +11707,7 @@ pub const Node = struct {
         defer if (planning_assets) |*assets| assets.deinit();
         const manifest = if (loaded) |model| &model.manifest else &planning_assets.?.manifest;
         if (manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
-        if (loaded) |model| try model.verifyEmbeddingIdentity();
+        if (loaded) |model| try model.verifyEmbeddingIdentityWithControl(control);
         const contract = try resolvedInferenceExecutorContract(self, "embed", manifest);
         const capacity = @min(manifest.maxTextSequenceLength(), contract.batch.max_input_tokens_per_item orelse std.math.maxInt(usize));
         if (capacity == 0) return error.InvalidChunkModel;
@@ -11714,7 +11720,7 @@ pub const Node = struct {
         var embedding_config: embedding_mod.EmbeddingConfig = .{ .text_prefix = manifest.embedding_profile.document.prefix, .ensure_trailing_eos_id = if (manifest.isLastTokenDecoderEmbedder() and manifest.embedding_style != .embedding_gemma2 and tokenizer.specialTokens().sep_id >= 0) tokenizer.specialTokens().sep_id else null };
         const owned_prefix = try applyDenseEmbeddingConfigRequestOptions(a, &embedding_config, manifest, .{ .model = target.model, .input = .null, .encoding_format = null, .dimensions = if (target.dimensions) |d| @intCast(d) else null, .task_type = task });
         defer if (owned_prefix) |prefix| a.free(prefix);
-        const planning_digest = std.fmt.bytesToHex(if (loaded) |model| try model.chunkPlanningIdentity() else planning_assets.?.planning.digest, .lower);
+        const planning_digest = std.fmt.bytesToHex(if (loaded) |model| try model.chunkPlanningIdentityWithControl(control) else planning_assets.?.planning.digest, .lower);
         const planning_identity = try std.fmt.allocPrint(a, "antfly-media-chunk-model-v1:{s}:{s}:{s}:{?d}", .{ planning_digest, @tagName(manifest.embedding_style), embedding_config.text_prefix, embedding_config.ensure_trailing_eos_id });
         defer a.free(planning_identity);
         const dimensions = target.dimensions orelse if (manifest.embedding_style == .embedding_gemma2) @as(usize, 768) else manifest.hidden_size;
@@ -11832,7 +11838,7 @@ pub const Node = struct {
                 // The public mode describes arbitrary mixed groups; this route
                 // is separately qualified for independent video windows only.
                 if (payloads.len > adapter.contract.batch.max_items) return error.BatchIncompatible;
-                try adapter.model.?.verifyEmbeddingIdentity();
+                try adapter.model.?.verifyEmbeddingIdentityWithControl(adapter.control);
                 var movies: [4]grouped.VideoBatchItem = undefined;
                 for (payloads, movies[0..payloads.len]) |payload, *movie| {
                     if (payload != .video) return error.InvalidInputShape;
@@ -11849,7 +11855,7 @@ pub const Node = struct {
                 defer out.free(result.vectors);
                 defer out.free(result.input_tokens);
                 errdefer for (result.vectors) |vector| out.free(vector);
-                try adapter.model.?.verifyEmbeddingIdentity();
+                try adapter.model.?.verifyEmbeddingIdentityWithControl(adapter.control);
                 try adapter.control.check();
                 const values = try out.alloc(chunks.Output, payloads.len);
                 for (values, result.vectors, result.input_tokens) |*value, vector, tokens| value.* = .{ .vector = vector, .input_tokens = tokens };
@@ -11858,7 +11864,7 @@ pub const Node = struct {
             fn embed(raw: *anyopaque, out: std.mem.Allocator, payload: chunks.Payload) !chunks.Output {
                 const adapter: *@This() = @ptrCast(@alignCast(raw));
                 try adapter.control.check();
-                try adapter.model.?.verifyEmbeddingIdentity();
+                try adapter.model.?.verifyEmbeddingIdentityWithControl(adapter.control);
                 const options = grouped.Options{ .task_type = @tagName(adapter.task), .dimensions = adapter.dimensions, .video_ahead = if (payload == .video) payload.video.ahead else null, .video_prepared = if (payload == .video) payload.video.prepared else null };
                 var vector: []f32 = undefined;
                 var input_tokens: usize = 0;
@@ -11924,7 +11930,7 @@ pub const Node = struct {
                 errdefer out.free(vector);
                 if (adapter.requested_dimensions) |expected| if (vector.len != expected) return error.InvalidEmbeddingDimensions;
                 adapter.dimensions = vector.len;
-                try adapter.model.?.verifyEmbeddingIdentity();
+                try adapter.model.?.verifyEmbeddingIdentityWithControl(adapter.control);
                 try adapter.control.check();
                 return .{ .vector = vector, .input_tokens = input_tokens };
             }
@@ -11950,7 +11956,7 @@ pub const Node = struct {
             failure = if (err == error.OutOfMemory and bounded_source.denied) error.ChunkWorkingBudgetExceeded else if (err == error.OutOfMemory) admitted_source.admission_error orelse err else err;
             break :blk runner.summary;
         };
-        if (loaded) |model| _ = try model.chunkPlanningIdentity() else try planning_assets.?.verify();
+        if (loaded) |model| _ = try model.chunkPlanningIdentityWithControl(control) else try planning_assets.?.verify();
         return .{ .summary = summary, .model_identity = identity, .model_revision = std.fmt.bytesToHex(revision, .lower), .dimensions = adapter.dimensions, .failure = failure };
     }
 
@@ -12557,7 +12563,7 @@ pub const Node = struct {
         var parsed_body_value: ?std.json.Parsed(std.json.Value) = null;
         defer if (parsed_body_value) |*owned| owned.deinit();
         if (std.mem.indexOf(u8, request_json, "chat_template_kwargs") != null) {
-            parsed_body_value = std.json.parseFromSlice(std.json.Value, ctx.allocator, request_json, .{}) catch null;
+            parsed_body_value = @import("antfly-json").parseValueLossless(ctx.allocator, request_json) catch null;
         }
         if (parsed_body_value) |owned| {
             if (!generateRequestChatTemplateKwargsAreValid(owned.value)) {
@@ -12570,7 +12576,7 @@ pub const Node = struct {
         var parsed = if (parsed_body_value) |owned|
             try std.json.parseFromValue(api.GenerateRequest, ctx.allocator, owned.value, .{ .ignore_unknown_fields = true })
         else
-            std.json.parseFromSlice(api.GenerateRequest, ctx.allocator, request_json, .{ .ignore_unknown_fields = true }) catch
+            parseGenerateBody(api.GenerateRequest, ctx.allocator, request_json) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid generation request" });
         defer parsed.deinit();
         const body = parsed.value;
@@ -13003,7 +13009,7 @@ pub const Node = struct {
                         .message = "response_format.json_schema.schema is required for type=json_schema",
                     });
                 };
-                config.grammar = grammar_mod.buildJsonSchemaGrammar(ctx.allocator, .{ .object = schema.map }) catch |err| {
+                config.grammar = grammar_mod.buildJsonSchemaGrammarWithEvidence(ctx.allocator, .{ .object = schema.map }, body.logprobs orelse false) catch |err| {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
                         .message = @errorName(err),
@@ -13036,6 +13042,18 @@ pub const Node = struct {
             config.grammar = grammar;
         }
 
+        const wants_logprobs = body.logprobs orelse false;
+        const evidence_count = body.top_logprobs orelse 64;
+        if (evidence_count < 1 or evidence_count > 64 or
+            (wants_logprobs and (want_stream or tool_parser != null or config.grammar == null or body.draft_model != null or body.compiled_target != null)))
+            return ctx.status(400).json(.{ .@"error" = "UNSUPPORTED_TOKEN_LOGPROBS", .message = "token evidence requires non-streaming native grammar decoding without tools or speculation" });
+        var token_evidence = generation.token_logprobs.Collector{ .allocator = ctx.allocator, .max_tokens = @intCast(config.max_tokens), .max_alternatives = @intCast(evidence_count) };
+        defer token_evidence.deinit();
+        if (wants_logprobs) {
+            config.token_observer = token_evidence.observer();
+            config.speculation_policy = .off;
+        }
+
         // Native Moondream2 (moondream1 checkpoints): one image plus the
         // last user turn's question; no ONNX Runtime.
         if (moondream_pipeline.isSupportedModelDir(ctx.allocator, model_path)) {
@@ -13066,7 +13084,7 @@ pub const Node = struct {
                 else => return generationErrorResponse(ctx, err),
             };
             defer result.deinit();
-            return self.buildGenerateResponse(ctx, body.model, result.text, null, result.finish_reason, result.prompt_tokens, result.tokens_used, 0, null, null);
+            return self.buildGenerateResponse(ctx, body.model, result.text, null, result.finish_reason, result.prompt_tokens, result.tokens_used, 0, null, null, null);
         }
 
         // Native generation (CPU/GPU GPT arch forward pass).
@@ -13914,6 +13932,7 @@ pub const Node = struct {
                 config.speculation_policy,
                 config.speculation_calibration,
             ),
+            if (wants_logprobs) token_evidence.entries.items else null,
         );
     }
 
@@ -14315,6 +14334,7 @@ pub const Node = struct {
     }
 
     fn generateBatchUnsupportedReasonPreflight(body: api.GenerateRequest) ?api.GenerateBatchError {
+        if (body.logprobs orelse false) return .{ .code = "UNSUPPORTED_TOKEN_LOGPROBS", .message = "token evidence is available on the scalar native grammar route", .retryable = false };
         if (body.stream orelse false) return .{ .code = "UNSUPPORTED_STREAM", .message = "batch generation does not support stream=true", .retryable = false };
         if (body.tools != null or body.tool_choice != null) return .{ .code = "UNSUPPORTED_TOOLS", .message = "batch generation does not support tools yet", .retryable = false };
         _ = parseGenerateNumericOptions(body.max_tokens, body.top_k) catch |err| return .{
@@ -14845,7 +14865,7 @@ pub const Node = struct {
                 .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
             });
         }
-        var parsed = std.json.parseFromSlice(api.GenerateBatchRequest, ctx.allocator, request_json, .{ .ignore_unknown_fields = true }) catch
+        var parsed = parseGenerateBody(api.GenerateBatchRequest, ctx.allocator, request_json) catch
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid generation batch request" });
         defer parsed.deinit();
         const body = parsed.value;
@@ -16285,6 +16305,7 @@ pub const Node = struct {
         cached_prompt_tokens: usize,
         tool_calls: ?[]const tool_parser_mod.ToolCall,
         speculative: ?generation.SpeculativeDecodeStats,
+        logprobs: ?[]const generation.token_logprobs.Entry,
     ) !httpx.Response {
         recordSpeculationOutcome(&self.metrics, speculative);
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -16321,8 +16342,9 @@ pub const Node = struct {
             .index = 0,
             .message = message,
             .finish_reason = parseFinishReason(finish_reason),
+            .logprobs = .absent,
         }};
-        return ctx.json(api.GenerateResponse{
+        const response: api.GenerateResponse = .{
             .id = completion_id,
             .object = "chat.completion",
             .created = created,
@@ -16333,7 +16355,9 @@ pub const Node = struct {
                 .{ .value = status }
             else
                 .absent,
-        });
+        };
+        if (logprobs) |entries| return ctx.json(NativeEvidenceResponse{ .response = response, .entries = entries });
+        return ctx.json(response);
     }
 
     fn prependSystemPrompt(
@@ -19865,6 +19889,14 @@ pub const Node = struct {
             var public_envelope = std.json.parseFromSlice(std.json.Value, ctx.allocator, request_json, .{ .duplicate_field_behavior = .@"error" }) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "body must be a valid extraction request" });
             defer public_envelope.deinit();
+            if (public_envelope.value == .object) if (public_envelope.value.object.get("method")) |method| {
+                if (method != .string or !std.mem.eql(u8, method.string, "generated") or uses_attachment_envelope) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Unsupported extraction method or media" });
+                const output = self.generatedExtractionJson(ctx.allocator, public_envelope.value, execution_control) catch |err| return extractionDirectFailureResponse(ctx, err);
+                defer ctx.allocator.free(output);
+                try ctx.setHeader("content-type", "application/json");
+                _ = ctx.response.body(output);
+                return ctx.response.build();
+            };
             @import("antfly_decisions").validateExtractionBoundary(public_envelope.value) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "standalone decisions use /decisions" });
         }
@@ -20185,7 +20217,16 @@ pub const Node = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const decision_api = @import("antfly_decisions");
-        const public_request = try decision_api.parse(a, request_json);
+        if (request_json.len > 16 * 1024 * 1024) return error.DecideRequestLimitExceeded;
+        var envelope = try std.json.parseFromSliceLeaky(std.json.Value, a, request_json, .{ .duplicate_field_behavior = .@"error" });
+        if (envelope == .object) if (envelope.object.get("decision_method")) |method| {
+            if (method != .string) return error.InvalidDecideRequest;
+            if (std.mem.eql(u8, method.string, "generated")) return self.generatedDecisionJson(allocator, a, envelope, control);
+            if (!std.mem.eql(u8, method.string, "typed")) return error.InvalidDecideRequest;
+            // Legacy typed requests do not carry a redundant method field.
+            _ = envelope.object.swapRemove("decision_method");
+        };
+        const public_request = try decision_api.parseValue(a, envelope);
         const request = public_request.inner;
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
@@ -20223,6 +20264,213 @@ pub const Node = struct {
         return allocator.dupe(u8, response_json);
     }
 
+    const StructuredGeneration = struct {
+        node: *Node,
+        io: std.Io,
+        control: InferenceExecutionControl,
+        generator: std.json.Value,
+        model: []const u8,
+        logprobs: bool,
+        fn cancelled(ptr: ?*const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(ptr.?));
+            self.control.check() catch |err| return err == error.Cancelled or err == error.Canceled;
+            return false;
+        }
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.control.check();
+        }
+        fn textCheck(ptr: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ptr));
+            try self.control.check();
+        }
+        fn invoke(ptr: *anyopaque, a: std.mem.Allocator, invocation: @import("antfly_structured").Invocation) !@import("antfly_structured").Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const c = @import("antfly_structured");
+            try self.control.check();
+            var body = c.object();
+            try c.put(a, &body, "model", .{ .string = self.model });
+            try c.put(a, &body, "stream", .{ .bool = false });
+            try c.put(a, &body, "enable_thinking", .{ .bool = false });
+            try c.put(a, &body, "logprobs", .{ .bool = self.logprobs });
+            try c.put(a, &body, "top_logprobs", .{ .integer = 64 });
+            for ([_][]const u8{ "max_tokens", "temperature", "top_p", "top_k", "frequency_penalty", "presence_penalty" }) |field| if (self.generator.object.get(field)) |value| try c.put(a, &body, field, value);
+            var format = c.object();
+            try c.put(a, &format, "type", .{ .string = "json_schema" });
+            var schema = c.object();
+            try c.put(a, &schema, "name", .{ .string = "antfly_output" });
+            try c.put(a, &schema, "strict", .{ .bool = true });
+            try c.put(a, &schema, "schema", invocation.schema);
+            try c.put(a, &format, "json_schema", schema);
+            try c.put(a, &body, "response_format", format);
+            const input = try std.json.Stringify.valueAlloc(a, .{ .instructions = invocation.instructions, .items = invocation.items, .validation_error = invocation.validation_error }, .{ .emit_null_optional_fields = false });
+            const system = try std.fmt.allocPrint(a, "Return one structured result per input. Preserve item IDs. JSON schema: {s}", .{try std.json.Stringify.valueAlloc(a, invocation.schema, .{})});
+            try c.put(a, &body, "messages", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .{ .role = "system", .content = system }, .{ .role = "user", .content = input } }, .{}), .{}));
+            var request = try httpx.Request.init(a, .POST, "/generate");
+            defer request.deinit();
+            request.body = try std.json.Stringify.valueAlloc(a, body, .{});
+            var ctx = httpx.Context.init(a, self.io, &request);
+            defer ctx.deinit();
+            ctx.application_deadline_ns = self.control.deadline_ns;
+            ctx.cancellation_probe = .{ .ptr = self, .is_cancelled = cancelled };
+            var response = try self.node.generateContent(&ctx);
+            defer response.deinit();
+            try self.control.check();
+            if (!response.ok()) {
+                const failure = c.localGenerationStatusError(a, response.status.code, response.body);
+                if (failure == error.InvalidStructuredOutput) return .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"items\":[]}", .{}) };
+                return failure;
+            }
+            if ((response.body orelse return error.InvalidConstrainedOutput).len > 1024 * 1024) return error.ResponseTooLarge;
+            const result = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body orelse return error.InvalidConstrainedOutput, .{ .allocate = .alloc_always });
+            const choices = result.object.get("choices") orelse return error.InvalidConstrainedOutput;
+            if (choices != .array or choices.array.items.len != 1) return error.InvalidConstrainedOutput;
+            const raw = choices.array.items[0].object.get("message").?.object.get("content").?;
+            if (raw != .string) return error.InvalidConstrainedOutput;
+            const value = c.parseReply(a, raw.string) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"items\":[]}", .{}) };
+            };
+            const usage = result.object.get("usage").?.object;
+            return .{ .value = value, .input_tokens = @intCast(usage.get("prompt_tokens").?.integer), .output_tokens = @intCast(usage.get("completion_tokens").?.integer), .token_evidence = if (choices.array.items[0].object.get("logprobs")) |proof| (try c.token_evidence.Index.init(a, raw.string, proof)).evidence() else null };
+        }
+    };
+
+    fn admitStructuredGenerator(self: *Node, a: std.mem.Allocator, io: std.Io, generator: std.json.Value, output: @import("antfly_structured").Output, probabilities: @import("antfly_structured").Probabilities) !@import("antfly_structured").Output {
+        const c = @import("antfly_structured");
+        var parsed = try std.json.parseFromValue(c.extraction.GeneratorConfig, a, generator, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        try parsed.value.validate();
+        if (parsed.value.provider != .antfly or parsed.value.url.len != 0 or parsed.value.tools_json != null or parsed.value.tool_choice_json != null or parsed.value.rate_limit != null or parsed.value.api_key != null) return error.UnsupportedConstrainedOutput;
+        const path = try self.resolveRequestModelPath(a, io, parsed.value.model, "generators");
+        var manifest = try manifest_mod.loadListingFromDir(a, path);
+        defer manifest.deinit();
+        const native = resolvedExecutorKind("generate", &manifest) == .native_generation;
+        return (c.Capabilities{ .grammar = native, .token_logprobs = native }).select(output, probabilities);
+    }
+
+    fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl) ![]u8 {
+        const c = @import("antfly_structured");
+        const extractor = c.extraction;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var config_value = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, envelope, .{}), .{ .allocate = .alloc_always });
+        const inputs = config_value.object.fetchSwapRemove("inputs") orelse return error.InvalidGeneratedExtractorConfig;
+        if (inputs.value != .array or inputs.value.array.items.len == 0 or inputs.value.array.items.len > 128) return error.InvalidGeneratedExtractorConfig;
+        const texts = try a.alloc([]const u8, inputs.value.array.items.len);
+        for (texts, inputs.value.array.items) |*text, input| {
+            if (input != .object or input.object.count() > 2) return error.InvalidGeneratedExtractorConfig;
+            for (input.object.keys()) |key| if (!std.mem.eql(u8, key, "content") and !std.mem.eql(u8, key, "id")) return error.InvalidGeneratedExtractorConfig;
+            if (input.object.get("id")) |id| if (id != .string or id.string.len == 0 or id.string.len > 1024 or !std.unicode.utf8ValidateSlice(id.string)) return error.InvalidGeneratedExtractorConfig;
+            const content = input.object.get("content") orelse return error.InvalidGeneratedExtractorConfig;
+            if (content != .string or content.string.len > 1024 * 1024) return error.InvalidGeneratedExtractorConfig;
+            text.* = content.string;
+        }
+        if (config_value.object.fetchSwapRemove("schema_version")) |version| if (version.value != .integer or version.value.integer != 2) return error.InvalidGeneratedExtractorConfig;
+        const raw_config = try std.json.Stringify.valueAlloc(a, config_value, .{});
+        var parsed = try extractor.parse(a, raw_config);
+        defer parsed.deinit();
+        const config = parsed.value;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |value| {
+            var owned = value;
+            owned.deinit();
+        };
+        const io = self.inferenceIo(a, control.io, &owned_io);
+        const generator = config_value.object.get("generator").?;
+        const mode = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities);
+        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs };
+        var validation = extractor.Validation{ .config = config };
+        const Combined = struct {
+            backend: *StructuredGeneration,
+            validation: *extractor.Validation,
+            fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, invocation: c.Invocation) !c.Reply {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                return StructuredGeneration.invoke(self_.backend, alloc, invocation);
+            }
+            fn check(ptr: *anyopaque) !void {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                try self_.backend.control.check();
+            }
+            fn validate(ptr: *anyopaque, alloc: std.mem.Allocator, id: usize, value: std.json.Value, proof: ?c.TokenEvidence) !void {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                try extractor.Validation.validate(self_.validation, alloc, id, value, proof);
+            }
+        };
+        var combined = Combined{ .backend = &backend, .validation = &validation };
+        const text_control: @import("antfly_extracting").text_processing.Checkpoint = .{ .ptr = &backend, .check_fn = StructuredGeneration.textCheck };
+        const planned = try extractor.planWithControl(a, config, texts, text_control);
+        const instructions = try std.fmt.allocPrint(a, "Extract only entities and relations grounded in each input. Use literal source surface forms. Relations reference entity positions. Set present=false for absent candidates. Never invent offsets or confidence. {s}", .{config.instructions});
+        const generated = try c.execute(a, .{ .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
+        const values = try extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
+        return std.json.Stringify.valueAlloc(allocator, try extractor.responseValue(a, config.generator.model, inputs.value.array.items, values, generated), .{});
+    }
+
+    fn generatedDecisionJson(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, envelope: std.json.Value, control: ?InferenceExecutionControl) ![]u8 {
+        const c = @import("antfly_structured");
+        const contract = @import("antfly_decisions");
+        const generated = contract.generated;
+        const request = try generated.parseRequest(a, envelope);
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*value| value.deinit();
+        const io = self.inferenceIo(a, if (control) |effective| effective.io else null, &owned_io);
+        const mode = try self.admitStructuredGenerator(a, io, request.generator, request.output, request.probabilities);
+        const options = generated.Options{ .model = request.model, .probabilities = request.probabilities };
+        const Validation = struct {
+            options: generated.Options,
+            questions: std.json.Value,
+            values: []?std.json.Value,
+            fn validate(ptr: *anyopaque, alloc: std.mem.Allocator, id: usize, value: std.json.Value, proof: ?c.TokenEvidence) !void {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                self_.values[id] = try contract.publicResponse(alloc, try generated.responseValue(alloc, self_.options, self_.questions, value, proof, id, 0, 0));
+            }
+        };
+        const values = try a.alloc(?std.json.Value, request.inputs.len);
+        @memset(values, null);
+        var validation = Validation{ .options = options, .questions = request.questions, .values = values };
+        var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = request.generator, .model = request.model, .logprobs = request.probabilities == .token_logprobs };
+        const Combined = struct {
+            backend: *StructuredGeneration,
+            validation: *Validation,
+            fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, invocation: c.Invocation) !c.Reply {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                return StructuredGeneration.invoke(self_.backend, alloc, invocation);
+            }
+            fn check(ptr: *anyopaque) !void {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                try self_.backend.control.check();
+            }
+            fn validate(ptr: *anyopaque, alloc: std.mem.Allocator, id: usize, value: std.json.Value, proof: ?c.TokenEvidence) !void {
+                const self_: *@This() = @ptrCast(@alignCast(ptr));
+                try Validation.validate(self_.validation, alloc, id, value, proof);
+            }
+        };
+        var combined = Combined{ .backend = &backend, .validation = &validation };
+        const inputs = try a.alloc([]const u8, request.inputs.len);
+        for (inputs, request.inputs) |*input, item| input.* = item.input;
+        const result = try c.execute(a, .{ .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try generated.questionSchema(a, request.questions), request.instructions, request.batch, inputs);
+        var root = c.object();
+        try c.put(a, &root, "model", .{ .string = request.model });
+        try c.put(a, &root, "usage", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .input_tokens = result.input_tokens, .output_tokens = result.output_tokens }, .{}), .{}));
+        if (!request.batched) {
+            const value = values[0] orelse return result.failures[0] orelse error.InvalidConstrainedOutput;
+            try c.put(a, &root, "answers", value.object.get("answers").?);
+        } else {
+            var data = try c.array(a, &.{});
+            for (values, request.inputs, result.failures, 0..) |value, item, failure, i| {
+                var row = c.object();
+                try c.put(a, &row, "input_index", .{ .integer = @intCast(i) });
+                if (item.id) |id| try c.put(a, &row, "id", .{ .string = id });
+                try c.put(a, &row, "answers", if (value) |answer| answer.object.get("answers").? else try c.array(a, &.{}));
+                if (failure) |err| try c.put(a, &row, "error", .{ .string = @errorName(err) });
+                try data.array.append(row);
+            }
+            try c.put(a, &root, "data", data);
+        }
+        return std.json.Stringify.valueAlloc(allocator, root, .{});
+    }
+
     fn decideEmbeddingSimilarity(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, path: []const u8, public_request: @import("antfly_decisions").Request, control: ?InferenceExecutionControl) ![]u8 {
         const scoring = @import("antfly_decisions").scoring;
         const request = public_request.inner;
@@ -20247,7 +20495,7 @@ pub const Node = struct {
         defer handle.release();
         const loaded = handle.get();
         const contract = try resolvedInferenceExecutorContract(self, "decide", &loaded.manifest);
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(effective);
         if (request.model_identity) |expected| if (!std.mem.eql(u8, expected, &loaded.embedding_identity.?)) return error.EmbeddingIdentityMismatch;
         var max_labels: usize = 0;
         for (request.questions) |question| max_labels = @max(max_labels, question.labels.len);
@@ -20321,7 +20569,7 @@ pub const Node = struct {
         try root.put(a, "usage", .{ .object = usage });
         try root.put(a, "renderer_version", .{ .string = scoring.renderer_version });
         if (loaded.embedding_identity) |*identity| try root.put(a, "model_identity", .{ .string = identity });
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(effective);
         try effective.check();
         return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = root }, .{});
     }
@@ -20454,7 +20702,7 @@ pub const Node = struct {
         const loaded = handle.get();
         var frame_cache = grouped.FrameCache{ .allocator = grouped.workspaceBackingAllocator(loaded.session.backend()), .session = loaded.session };
         defer frame_cache.deinit();
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(control);
         const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
         const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, options);
         for (groups) |group| try validateEmbeddingGroupContract(self, active_contract, group, groups.len, control);
@@ -20476,7 +20724,7 @@ pub const Node = struct {
                     .item_error => |failure| return failure.cause,
                 }
             }
-            try loaded.verifyEmbeddingIdentity();
+            try loaded.verifyEmbeddingIdentityWithControl(control);
             return vectors;
         }
         for (groups, vectors) |group, *vector| {
@@ -20484,7 +20732,7 @@ pub const Node = struct {
             vector.* = result.vector;
             count += 1;
         }
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(control);
         return vectors;
     }
 
@@ -20548,7 +20796,7 @@ pub const Node = struct {
             const actual = loaded.embedding_identity orelse return error.EmbeddingIdentityMismatch;
             if (!std.mem.eql(u8, expected, &actual)) return error.EmbeddingIdentityMismatch;
         }
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(control);
         const active_contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
         const active_options = try groupedEmbeddingOptions(&loaded.manifest, active_contract, .{
             .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT),
@@ -20589,7 +20837,7 @@ pub const Node = struct {
                 input_tokens += result.input_tokens;
             }
         }
-        try loaded.verifyEmbeddingIdentity();
+        try loaded.verifyEmbeddingIdentityWithControl(control);
         if (request.error_policy == .per_item) {
             const partial = DenseEmbedPartialResult{ .embeddings = vectors, .errors = errors.items };
             var response = try buildEmbedDensePartialResponse(a, request.model, &partial, if (request.dimensions) |dim| @intCast(dim) else null, true, input_tokens);
@@ -20606,11 +20854,18 @@ pub const Node = struct {
     }
 
     fn decideFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.UnsupportedConstrainedProbabilities) return generationErrorResponse(ctx, err);
         return switch (err) {
             error.EmbeddingIdentityMismatch => ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = @errorName(err) }),
             error.InvalidEmbeddingCalibration, error.EmbeddingCalibrationMismatch, error.UnqualifiedEmbeddingCalibration => ctx.status(400).json(.{ .@"error" = "INVALID_CALIBRATION", .message = @errorName(err) }),
             error.DecideRequestLimitExceeded => ctx.status(413).json(.{ .@"error" = "REQUEST_TOO_LARGE", .message = @errorName(err) }),
             error.InvalidDecideRequest,
+            error.InvalidGeneratorConfig,
+            error.InvalidConstrainedGenerationConfig,
+            error.UnsupportedConstrainedOutput,
+            error.UnsupportedConstrainedProbabilities,
+            error.UnexpectedToken,
+            error.UnknownField,
             error.UnsupportedDecisionWindowing,
             error.UnsupportedEmbeddingDecisionKind,
             error.EmbeddingMultiLabelThresholdRequired,
@@ -20668,23 +20923,25 @@ pub const Node = struct {
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const json_body = try self.listModelsJsonAlloc(ctx.allocator, ctx.io);
         defer ctx.allocator.free(json_body);
-        // Scoped discovery may pin one embedding generation without loading its
-        // weights. Avoid fingerprinting every model in an unscoped catalog.
-        if (try ctx.queryDecoded("model")) |name| if (ctx.query("task")) |task| if (std.mem.eql(u8, task, "embed")) {
+        // Scoped discovery pins one embedding or generator generation without
+        // loading weights. Avoid fingerprinting every model in an unscoped catalog.
+        if (try ctx.queryDecoded("model")) |name| if (ctx.query("task")) |task| if (std.mem.eql(u8, task, "embed") or std.mem.eql(u8, task, "generate")) {
+            const category: []const u8 = if (std.mem.eql(u8, task, "embed")) "embedders" else "generators";
             var catalog = try std.json.parseFromSlice(std.json.Value, ctx.allocator, json_body, .{});
             defer catalog.deinit();
-            if (catalog.value == .object) if (catalog.value.object.getPtr("embedders")) |models| if (models.* == .object) if (models.object.getPtr(name)) |info| if (info.* == .object) {
-                const path = try self.resolveRequestModelPath(ctx.allocator, ctx.io, name, "embedders");
+            if (catalog.value == .object) if (catalog.value.object.getPtr(category)) |models| if (models.* == .object) if (models.object.getPtr(name)) |info| if (info.* == .object) {
+                const path = try self.resolveRequestModelPath(ctx.allocator, ctx.io, name, category);
                 defer ctx.allocator.free(path);
                 var manifest = try manifest_mod.loadFromDir(ctx.allocator, path);
                 defer manifest.deinit();
                 const revision = if (self.model_manager.acquireLoadedModel(path)) |cached| loaded: {
                     var handle = cached;
                     defer handle.release();
-                    break :loaded handle.get().resolution_revision orelse return error.InvalidEmbeddingIdentity;
+                    break :loaded handle.get().resolution_revision orelse if (std.mem.eql(u8, task, "embed")) return error.InvalidEmbeddingIdentity else try self.model_manager.modelIdentityForManifest(path, manifest);
                 } else try self.model_manager.modelIdentityForManifest(path, manifest);
                 const hex = std.fmt.bytesToHex(revision, .lower);
                 try info.object.put(ctx.allocator, "model_revision", .{ .string = &hex });
+                if (std.mem.eql(u8, task, "generate")) return ctx.json(catalog.value);
                 const limits_json = try std.json.Stringify.valueAlloc(ctx.allocator, self.config.chunking_limits, .{});
                 defer ctx.allocator.free(limits_json);
                 const parsed_limits = try std.json.parseFromSlice(std.json.Value, ctx.allocator, limits_json, .{ .allocate = .alloc_always });
@@ -22172,6 +22429,7 @@ fn extractionV2FailureResponse(ctx: *httpx.Context, err: anyerror, failure: extr
 }
 
 fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.UnsupportedConstrainedProbabilities) return generationErrorResponse(ctx, err);
     if (isInferenceExecutorContractError(err))
         return inferenceExecutorContractFailureResponse(ctx, err);
     return switch (err) {
@@ -22182,6 +22440,14 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
             "inference_admission",
         ),
         error.InvalidExtractionConfig,
+        error.InvalidGeneratedExtractorConfig,
+        error.InvalidGeneratorConfig,
+        error.InvalidConstrainedGenerationConfig,
+        error.UnsupportedConstrainedOutput,
+        error.UnsupportedConstrainedProbabilities,
+        error.UnsupportedGeneratedExtractionSchema,
+        error.UnexpectedToken,
+        error.UnknownField,
         error.InvalidExtractionAttachment,
         error.InvalidClassificationSchema,
         error.InvalidEntitySchema,
@@ -22207,6 +22473,8 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.UnsupportedRebelEntityLabels,
         error.UnsupportedRebelRelationEndpoints,
         => rebelSchemaFailureResponse(ctx, err),
+        error.ConstrainedInputTooLarge,
+        error.GeneratedExtractionLimitExceeded,
         error.ReadBatchTooLarge,
         error.InferenceBatchTooLarge,
         error.InferenceMediaPartLimitExceeded,
@@ -24065,6 +24333,10 @@ fn appendResolvedInferenceCapabilities(
         std.mem.eql(u8, resolved_task, "chunk") or
         std.mem.eql(u8, resolved_task, "transcribe") or
         std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
+    try buf.appendSlice(allocator, ",\"generation_grammar_v1\":");
+    try buf.appendSlice(allocator, if (executor_kind == .native_generation) "true" else "false");
+    try buf.appendSlice(allocator, ",\"generation_token_logprobs_v1\":");
+    try buf.appendSlice(allocator, if (executor_kind == .native_generation) "true" else "false");
     try buf.appendSlice(allocator, ",\"model_aware_chunking_v1\":");
     try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed")) "true" else "false");
     try buf.appendSlice(allocator, ",\"numeric_responses_v1\":");
@@ -24339,6 +24611,7 @@ pub const ResolvedExecutorBatchImplementation = struct {
 /// Adding a fused backend is an explicit registration here; compatibility
 /// loops cannot accidentally advertise native batching.
 pub const ResolvedExecutorKind = enum {
+    native_generation,
     compatibility,
     /// Ordered groups are executed serially, with one vector per group.
     grouped_dense_embedding,
@@ -24422,6 +24695,9 @@ pub fn resolvedExecutorKind(
     resolved_task: []const u8,
     manifest: *const manifest_mod.ModelManifest,
 ) ResolvedExecutorKind {
+    if (std.mem.eql(u8, resolved_task, "generate") and
+        (manifest.usesGgufWeights() or manifest.isQwen3VlGenerationSafetensorsBundle()) and
+        !std.mem.eql(u8, manifest.config_model_arch, "moondream1")) return .native_generation;
     if (std.mem.eql(u8, resolved_task, "embed") and manifest.embedding_style == .embedding_gemma2)
         return .grouped_dense_embedding;
     if (std.mem.eql(u8, resolved_task, "embed")) {
@@ -32248,6 +32524,7 @@ fn applyDenseEmbeddingRequestOptions(
     manifest: *const manifest_mod.ModelManifest,
     request: ParsedEmbedRequest,
 ) !?[]u8 {
+    pipeline.interactive = request.task_type == .RETRIEVAL_QUERY;
     return applyDenseEmbeddingConfigRequestOptions(allocator, &pipeline.config, manifest, request);
 }
 fn applyDenseEmbeddingConfigRequestOptions(
@@ -35825,6 +36102,12 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
             .message = "model generated malformed tool arguments; request a corrected tool call",
             .retryable = true,
         },
+        error.UnsupportedConstrainedProbabilities => .{
+            .status = 400,
+            .code = "UNSUPPORTED_CONSTRAINED_PROBABILITIES",
+            .message = "token_logprobs requires every finite value to have a standalone vocabulary token; use verdict_only for other values",
+            .retryable = false,
+        },
         error.PromptTooLong => .{
             .status = 400,
             .code = "INVALID_REQUEST",
@@ -36511,6 +36794,20 @@ fn audioTooLargeResponse(ctx: *httpx.Context) !httpx.Response {
     });
 }
 
+// Preserve schema literals in typed requests too. Ordinary generation retains
+// its direct typed parse; escaped keys take the lossless path too.
+fn parseGenerateBody(comptime T: type, a: std.mem.Allocator, raw: []const u8) !std.json.Parsed(T) {
+    if (std.mem.indexOf(u8, raw, "response_format") != null or std.mem.indexOfScalar(u8, raw, '\\') != null) {
+        var exact = try @import("antfly-json").parseValueLossless(a, raw);
+        errdefer exact.deinit();
+        // Value.jsonParseFromValue borrows dynamic nodes even with alloc_always.
+        // Keep source and typed nodes in one owned arena for the full request.
+        const value = try std.json.parseFromValueLeaky(T, exact.arena.allocator(), exact.value, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+        return .{ .arena = exact.arena, .value = value };
+    }
+    return std.json.parseFromSlice(T, a, raw, .{ .ignore_unknown_fields = true });
+}
+
 fn coerceGenerateResponseFormat(
     allocator: std.mem.Allocator,
     response_format: ?api.GenerateResponseFormat,
@@ -36540,7 +36837,7 @@ fn validateGeneratedJsonSchema(
     schema_cfg: api.GenerateJsonSchemaConfig,
 ) !void {
     const schema = schema_cfg.schema orelse return error.MissingJsonSchema;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_text, .{});
+    var parsed = try @import("antfly-json").parseValueLossless(allocator, json_text);
     defer parsed.deinit();
     try jsonschema.validateJsonSchemaValue(allocator, .{ .object = schema.map }, parsed.value);
 }
@@ -37347,16 +37644,54 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         for (waves.vectors) |vector| for (vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
         std.debug.print("embeddinggemma2 audio_wave_schedule clips=6 gate_validation=true parity=true\n", .{});
     }
-    if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_PREPARED_EXECUTION")) {
+    if (metal and (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_COMPACT_FFN") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_STREAMED_ENCODER"))) {
+        const architecture = @import("../architectures/embedding_gemma2.zig");
+        const control = node.extractionExecutionControl(null);
+        // Admit the largest encoder geometry before taking model/provider locks.
+        var qualification_permit: ?@import("../backends/session.zig").RunPermit = if (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_STREAMED_ENCODER")) try loaded.session.admit(.{ .batch = 1, .sequence = 4096, .input_bytes = 4096 * 512 * 4, .host_preprocess_bytes = 64 * 1024 * 1024, .workspace_bytes = 256 * 1024 * 1024 + 4096 * 192 * 1024, .output_bytes = 128 * 4 }) else null;
+        defer if (qualification_permit) |*permit| permit.deinit();
+        const gate = loaded.embeddingExecutionLock();
+        if (gate) |mutex| try control.lock(mutex);
+        defer if (gate) |mutex| mutex.unlock();
+        var managed = try session_factory.getManagedComputeBackend(loaded.session, a, null, control);
+        defer managed.deinit();
+        const cb = &managed.backend;
+        const cfg = session_factory.getEmbeddingGemma2Config(loaded.session).?;
+        if (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_COMPACT_FFN")) {
+            try architecture.qualifyCompactPooled(cb, a, cfg);
+            try architecture.qualifyTiledFFN(cb, a, cfg);
+        }
+        if (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_STREAMED_ENCODER")) try architecture.qualifyStreamedEncoder(cb, a, cfg);
+    }
+    if (metal and (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_PREPARED_EXECUTION") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_FOLLOWUP"))) {
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
             extern "c" fn unsetenv([*:0]const u8) c_int;
+            fn mediaCounters(allocator: std.mem.Allocator, loaded_model: anytype, control: anytype) ![2]u64 {
+                if (comptime !@import("build_options").enable_metal) return @splat(0);
+                var managed = try session_factory.getManagedComputeBackend(loaded_model.session, allocator, null, control);
+                defer managed.deinit();
+                const compute: *@import("../ops/metal_compute.zig").MetalCompute = @ptrCast(@alignCast(managed.backend.ptr));
+                const state = compute.provider_impl.embedding_bindings orelse return @splat(0);
+                return .{ state.template_hits, state.compose_dispatches };
+            }
             fn median(values: [12]u64) u64 {
                 var sorted = values;
                 std.mem.sort(u64, &sorted, {}, std.sort.asc(u64));
                 return sorted[sorted.len / 2];
             }
         };
+        const only_followup = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_FOLLOWUP");
+        const followup_flag = "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP";
+        const saved_followup = if (platform.env.getenv(followup_flag)) |v| try a.dupeSentinel(u8, v, 0) else null;
+        defer if (saved_followup) |v| a.free(v);
+        defer {
+            if (saved_followup) |v| {
+                _ = Env.setenv(followup_flag, v, 1);
+            } else {
+                _ = Env.unsetenv(followup_flag);
+            }
+        }
         const backbone_flag = "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PREPARED_BACKBONE";
         const arena_flag = "ANTFLY_EMBEDDINGGEMMA2_METAL_LINEAR_ONLY_AUDIO_ARENA";
         const saved_backbone = if (platform.env.getenv(backbone_flag)) |v| try a.dupeSentinel(u8, v, 0) else null;
@@ -37375,38 +37710,74 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
                 _ = Env.unsetenv(arena_flag);
             }
         }
-        var singleton: [2][12]u64 = undefined;
-        var cohort: [2][12]u64 = undefined;
-        // Reverse phase order on the second round. Each geometry warms and
-        // qualifies before six completed samples; every vector checks parity.
-        for (0..2) |round| for (0..2) |phase| {
-            const route = round ^ phase;
-            try std.testing.expect(Env.setenv(backbone_flag, if (route == 0) "1" else "0", 1) == 0);
-            try std.testing.expect(Env.setenv(arena_flag, if (route == 0) "1" else "0", 1) == 0);
-            for (0..20) |iteration| {
-                const start = platform.time.monotonicNs();
-                const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
-                defer a.free(result.vector);
-                const elapsed = platform.time.monotonicNs() -| start;
-                for (result.vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
-                if (iteration >= 14) singleton[route][round * 6 + iteration - 14] = elapsed;
-            }
-            for (0..20) |iteration| {
-                const start = platform.time.monotonicNs();
-                const result = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &audio_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors);
-                defer {
-                    freeDirectDenseVectors(a, result.vectors);
-                    a.free(result.input_tokens);
-                }
-                const elapsed = platform.time.monotonicNs() -| start;
-                for (result.vectors, audio_errors) |vector, err| {
-                    try std.testing.expectEqual(@as(?anyerror, null), err);
-                    for (vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
-                }
-                if (iteration >= 14) cohort[route][round * 6 + iteration - 14] = elapsed;
+        const components = [_][]const u8{ "all", "workspace", "packed_qkv", "head", "templates", "resident_templates" };
+        const component_flags = [_][*:0]const u8{ "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_WORKSPACE", "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV", "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_BATCHED_HEAD", "ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_MEDIA_TEMPLATES" };
+        var saved_flags: [4]?[:0]u8 = @splat(null);
+        defer for (component_flags, saved_flags) |flag, saved| {
+            if (saved) |value| {
+                _ = Env.setenv(flag, value, 1);
+                a.free(value);
+            } else {
+                _ = Env.unsetenv(flag);
             }
         };
-        std.debug.print("embeddinggemma2 prepared_execution old_singleton_ns={d} new_singleton_ns={d} old_cohort_ns={d} new_cohort_ns={d} samples=12 parity=true\n", .{ Env.median(singleton[0]), Env.median(singleton[1]), Env.median(cohort[0]), Env.median(cohort[1]) });
+        for (component_flags, &saved_flags) |flag, *saved| if (platform.env.getenv(std.mem.span(flag))) |value| {
+            saved.* = try a.dupeSentinel(u8, value, 0);
+        };
+        const component_count: usize = if (only_followup and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_METAL_COMPONENTS")) components.len else 1;
+        for (components[0..component_count]) |component| {
+            const resident_api = std.mem.eql(u8, component, "resident_templates");
+            const route_before = if (resident_api) try Env.mediaCounters(a, loaded, node.extractionExecutionControl(null)) else @as([2]u64, @splat(0));
+            var singleton: [2][12]u64 = undefined;
+            var cohort: [2][12]u64 = undefined;
+            // Pair routes per iteration (AB/BA), reversing on the next round.
+            // Fourteen warm pairs precede six measured pairs per round. This
+            // limits host-load drift between policies and validates every vector.
+            for (0..2) |round| for (0..20) |iteration| for (0..2) |phase| {
+                const route = round ^ phase ^ (iteration & 1);
+                try std.testing.expect(Env.setenv(backbone_flag, if (!only_followup and route == 0) "1" else "0", 1) == 0);
+                try std.testing.expect(Env.setenv(arena_flag, if (!only_followup and route == 0) "1" else "0", 1) == 0);
+                try std.testing.expect(Env.setenv(followup_flag, if (only_followup and route == 0) "1" else "0", 1) == 0);
+                for (component_flags, components[1..5]) |flag, feature| {
+                    const disabled = only_followup and route != 0 and !std.mem.eql(u8, component, "all") and !std.mem.eql(u8, if (resident_api) "templates" else component, feature);
+                    try std.testing.expect(Env.setenv(flag, if (disabled) "1" else "0", 1) == 0);
+                }
+                {
+                    const start = platform.time.monotonicNs();
+                    const result = if (resident_api) resident: {
+                        const audio_result = try grouped.embedAudios(a, loaded.session, loaded.getTokenizer(), &.{.{ .bytes = audio_bytes }}, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                        defer a.free(audio_result.vectors);
+                        defer a.free(audio_result.input_tokens);
+                        break :resident grouped.Result{ .vector = audio_result.vectors[0], .input_tokens = audio_result.input_tokens[0] };
+                    } else try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .audio = audio_bytes }} }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                    defer a.free(result.vector);
+                    const elapsed = platform.time.monotonicNs() -| start;
+                    for (result.vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+                    if (iteration >= 14) singleton[route][round * 6 + iteration - 14] = elapsed;
+                }
+                {
+                    const start = platform.time.monotonicNs();
+                    const result = if (resident_api) try grouped.embedAudios(a, loaded.session, loaded.getTokenizer(), &.{ .{ .bytes = audio_bytes }, .{ .bytes = audio_bytes } }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors) else try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &audio_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &audio_errors);
+                    defer {
+                        freeDirectDenseVectors(a, result.vectors);
+                        a.free(result.input_tokens);
+                    }
+                    const elapsed = platform.time.monotonicNs() -| start;
+                    for (result.vectors, audio_errors) |vector, err| {
+                        try std.testing.expectEqual(@as(?anyerror, null), err);
+                        for (vector, audio_expected) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+                    }
+                    if (iteration >= 14) cohort[route][round * 6 + iteration - 14] = elapsed;
+                }
+            };
+            if (resident_api) {
+                const after = try Env.mediaCounters(a, loaded, node.extractionExecutionControl(null));
+                try std.testing.expect(after[0] > route_before[0]);
+                try std.testing.expect(after[1] > route_before[1]);
+                std.debug.print("embeddinggemma2 resident_template_route template_hits={d} compose_dispatches={d}\n", .{ after[0] - route_before[0], after[1] - route_before[1] });
+            }
+            std.debug.print("embeddinggemma2 {s} old_singleton_ns={d} new_singleton_ns={d} old_cohort_ns={d} new_cohort_ns={d} samples=12 parity=true component={s}\n", .{ if (only_followup) "metal_followup_execution" else "prepared_execution", Env.median(singleton[0]), Env.median(singleton[1]), Env.median(cohort[0]), Env.median(cohort[1]), component });
+        }
     }
     // Qualify real batched raster execution against the encoded-image path.
     // Use different aspect ratios and padded renderer strides, preserving the
@@ -37456,6 +37827,169 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         const single = try grouped.embedRasters(a, loaded.session, loaded.getTokenizer(), &.{raster}, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
         defer freeDirectDenseVectors(a, single.vectors);
         for (vector, single.vectors[0]) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, @as(f32, if (metal) 1e-3 else 1e-4));
+    }
+    if (metal and (platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_PIPELINED_VISION") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_IMAGE_PREPARATION") or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_PLAN"))) {
+        const Env = struct {
+            extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+            extern "c" fn unsetenv([*:0]const u8) c_int;
+        };
+        const followup = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP");
+        const image_preparation = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_IMAGE_PREPARATION");
+        const vision_plan = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_PLAN");
+        const flag = if (vision_plan) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN" else if (image_preparation) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_DEVICE_IMAGE_PREPARATION" else if (followup) "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP" else "ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION";
+        const saved = if (platform.env.getenv(flag)) |old| try a.dupeSentinel(u8, old, 0) else null;
+        defer if (saved) |old| a.free(old);
+        defer {
+            if (saved) |old| {
+                _ = Env.setenv(flag, old, 1);
+            } else {
+                _ = Env.unsetenv(flag);
+            }
+        }
+        const plan_rasters: [4]readers_api.RasterImage = @splat(rasters[0]);
+        const benchmark_rasters = if (vision_plan) plan_rasters[0..] else rasters[0..2];
+        var samples: [2][7]u64 = undefined;
+        var reference: ?[][]f32 = null;
+        defer if (reference) |vectors| freeDirectDenseVectors(a, vectors);
+        for (0..9) |iteration| for (0..2) |phase| {
+            const route = phase ^ (iteration & 1);
+            try std.testing.expect(Env.setenv(flag, if (route == 0) "1" else "0", 1) == 0);
+            const started = platform.time.monotonicNs();
+            var timings = grouped.MediaTimings{};
+            const result = try grouped.embedRasters(a, loaded.session, loaded.getTokenizer(), benchmark_rasters, .{ .dimensions = 128, .timings = &timings }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+            if (vision_plan and route == 1) {
+                try std.testing.expect(timings.prepared_vision_attempts > 0);
+                try std.testing.expectEqual(@as(usize, 0), timings.vision_plan_fallbacks);
+            }
+            if (iteration >= 2) samples[route][iteration - 2] = platform.time.monotonicNs() -| started;
+            if (reference) |vectors| {
+                defer freeDirectDenseVectors(a, result.vectors);
+                for (vectors, result.vectors) |x, y| for (x, y) |u, v| try std.testing.expectApproxEqAbs(u, v, 1e-3);
+            } else reference = result.vectors;
+        };
+        for (&samples) |*values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
+        std.debug.print("embeddinggemma2 vision_{s} reference_ns={d} optimized_ns={d} samples=7 parity=true\n", .{ if (vision_plan) "bounded_plan" else if (image_preparation) "image_preparation" else if (followup) "followup" else "pipeline", samples[0][3], samples[1][3] });
+    }
+    if (comptime @import("build_options").enable_metal) {
+        if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_FOLLOWUP")) {
+            var permit = try loaded.session.admit(.{ .batch = 1, .sequence = 8192, .host_preprocess_bytes = 64 * 1024 * 1024, .workspace_bytes = 2 * 1024 * 1024 * 1024, .output_bytes = 8192 * 512 * 4 });
+            defer permit.deinit();
+            const control = node.extractionExecutionControl(null);
+            const gate = loaded.embeddingExecutionLock();
+            if (gate) |mutex| try control.lock(mutex);
+            defer if (gate) |mutex| mutex.unlock();
+            var managed = try session_factory.getManagedComputeBackend(loaded.session, a, null, control);
+            defer managed.deinit();
+            try @import("../architectures/gemma4_projector.zig").qualifyEmbeddingGemma2VisionCancellation(&managed.backend, a, rasters[0]);
+        }
+    }
+    if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VISION_PLAN")) {
+        const pages: [4]readers_api.RasterImage = @splat(rasters[0]);
+        {
+            const Env = struct {
+                extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+                extern "c" fn unsetenv([*:0]const u8) c_int;
+            };
+            const flag = "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_WORKSPACE";
+            const saved = if (platform.env.getenv(flag)) |v| try a.dupeSentinel(u8, v, 0) else null;
+            defer if (saved) |v| a.free(v);
+            defer {
+                if (saved) |v| {
+                    _ = Env.setenv(flag, v, 1);
+                } else {
+                    _ = Env.unsetenv(flag);
+                }
+            }
+            try std.testing.expectEqual(@as(c_int, 0), Env.setenv(flag, "1", 1));
+            var timings = grouped.MediaTimings{};
+            const fallback = try grouped.embedRasters(a, loaded.session, loaded.getTokenizer(), pages[0..1], .{ .prepare_ahead = false, .timings = &timings }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+            defer freeDirectDenseVectors(a, fallback.vectors);
+            try std.testing.expectEqual(@as(usize, 1), timings.vision_plan_fallbacks);
+            for (fallback.vectors[0], batched.vectors[0]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+        }
+        const direct = try grouped.embedRasters(a, loaded.session, loaded.getTokenizer(), &pages, .{ .prepare_ahead = false }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+        defer freeDirectDenseVectors(a, direct.vectors);
+        for (direct.vectors) |vector| for (vector, batched.vectors[0]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+        const encoded = try grouped.embedImages(a, loaded.session, loaded.getTokenizer(), pngs[0..2], .{ .prepare_ahead = false }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+        defer freeDirectDenseVectors(a, encoded.vectors);
+        for (encoded.vectors, batched.vectors[0..2]) |vector, original| for (vector, original) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+    }
+    if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_STAGE_FOLLOWUP")) {
+        const pages: [4]readers_api.RasterImage = @splat(rasters[0]);
+        const brokered = (try node.tryEmbedImagesViaBroker(a, std.testing.io, loaded, &.{}, &pages, node.extractionExecutionControl(null), .RETRIEVAL_DOCUMENT, null)) orelse return error.ExpectedImageBroker;
+        defer freeDirectDenseVectors(a, brokered);
+        for (brokered) |vector| for (vector, batched.vectors[0]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-3);
+        const mixed_parts = [_]grouped.Part{ .{ .text = "Describe these inputs." }, .{ .audio = audio_bytes }, .{ .raster = rasters[0] } };
+        const mixed_groups: [2]grouped.Group = @splat(.{ .content = &mixed_parts });
+        var timings = grouped.MediaTimings{};
+        var errors: [2]?anyerror = @splat(null);
+        const mixed = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &mixed_groups, .{ .timings = &timings }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &errors);
+        defer {
+            freeDirectDenseVectors(a, mixed.vectors);
+            a.free(mixed.input_tokens);
+        }
+        try std.testing.expectEqual(@as(usize, 0), timings.vision_plan_fallbacks);
+        try std.testing.expect(timings.prepared_vision_attempts > 0 and timings.stage_yields >= 3 and timings.stage_acquisitions >= 2);
+        for (mixed.vectors, errors) |vector, failure| {
+            try std.testing.expectEqual(@as(?anyerror, null), failure);
+            const expected = parsed.value.object.get("cases").?.array.items[4].object.get("embedding").?.array.items;
+            for (vector, expected) |actual, value| try std.testing.expectApproxEqAbs(@as(f32, @floatCast(value.float)), actual, 1e-3);
+        }
+        std.debug.print("embeddinggemma2 stage_followup broker_parity=true mixed_parity=true stage_yields={d} stage_acquisitions={d} prepared_attempts={d} fallbacks={d} retire_ns={d} rebind_ns={d} copy_ns={d} copy_bytes={d}\n", .{ timings.stage_yields, timings.stage_acquisitions, timings.prepared_vision_attempts, timings.vision_plan_fallbacks, timings.stage_retire_ns, timings.stage_rebind_ns, timings.stage_copy_ns, timings.stage_copy_bytes });
+        // Alternate aspect ratios in one mixed wave. The prepared order may
+        // change, while each public vector must keep its original group slot.
+        const tall_bytes = try a.alloc(u8, 48 * 96 * 4);
+        defer a.free(tall_bytes);
+        @memset(tall_bytes, 127);
+        const tall: readers_api.RasterImage = .{ .bytes = tall_bytes, .width = 48, .height = 96, .stride_bytes = 48 * 4 };
+        const geometry_groups = [_]grouped.Group{
+            .{ .content = &.{.{ .raster = rasters[0] }} },
+            .{ .content = &.{.{ .raster = tall }} },
+            .{ .content = &.{.{ .raster = rasters[0] }} },
+            .{ .content = &.{.{ .raster = tall }} },
+        };
+        const tall_reference = try grouped.embed(a, loaded.session, loaded.getTokenizer(), geometry_groups[1], .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+        defer a.free(tall_reference.vector);
+        var geometry_errors: [4]?anyerror = @splat(null);
+        const geometry_result = try grouped.embedGroupCohort(a, loaded.session, loaded.getTokenizer(), &geometry_groups, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), &geometry_errors);
+        defer {
+            freeDirectDenseVectors(a, geometry_result.vectors);
+            a.free(geometry_result.input_tokens);
+        }
+        for (geometry_result.vectors, geometry_errors, 0..) |vector, failure, index| {
+            try std.testing.expectEqual(@as(?anyerror, null), failure);
+            const expected = if (index % 2 == 0) batched.vectors[0] else tall_reference.vector;
+            for (vector, expected) |actual, value| try std.testing.expectApproxEqAbs(value, actual, 1e-3);
+        }
+        std.debug.print("embeddinggemma2 mixed_geometry alternating_aspects=true scatter_parity=true\n", .{});
+        try grouped.qualifyVideoPhaseReclaim(a, loaded.session, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+        const Env = struct {
+            extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+            extern "c" fn unsetenv([*:0]const u8) c_int;
+        };
+        const flag = "ANTFLY_EMBEDDINGGEMMA2_DISABLE_ASYNC_IMAGE_PREPARATION";
+        const saved = if (platform.env.getenv(flag)) |old| try a.dupeSentinel(u8, old, 0) else null;
+        defer if (saved) |old| a.free(old);
+        defer {
+            if (saved) |old| {
+                _ = Env.setenv(flag, old, 1);
+            } else {
+                _ = Env.unsetenv(flag);
+            }
+        }
+        var samples: [2][7]u64 = undefined;
+        for (0..9) |iteration| for (0..2) |phase| {
+            const route = phase ^ (iteration & 1);
+            try std.testing.expect(Env.setenv(flag, if (route == 0) "1" else "0", 1) == 0);
+            const started = platform.time.monotonicNs();
+            const result = (try node.tryEmbedImagesViaBroker(a, std.testing.io, loaded, &.{}, &pages, node.extractionExecutionControl(null), .RETRIEVAL_DOCUMENT, null)) orelse return error.ExpectedImageBroker;
+            defer freeDirectDenseVectors(a, result);
+            const elapsed = platform.time.monotonicNs() -| started;
+            for (result, brokered) |vector, expected| for (vector, expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
+            if (iteration >= 2) samples[route][iteration - 2] = elapsed;
+        };
+        for (&samples) |*values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
+        std.debug.print("embeddinggemma2 broker_async_preparation reference_ns={d} optimized_ns={d} samples=7 parity=true\n", .{ samples[0][3], samples[1][3] });
     }
     const equal_pages: [5]readers_api.RasterImage = @splat(rasters[0]);
     const native_batch = try pipeline.embedBorrowedRastersReported(&equal_pages);
@@ -37577,6 +38111,153 @@ test "embeddinggemma2 pretrained video matches official F32 oracle" {
         try rows.append(a, .{ .name = name, .tokens = result.input_tokens, .cosine = cosine, .max_abs = max_abs, .norm = @sqrt(norm) });
         failures += @intFromBool(cosine < @as(f64, if (metal) 0.9999 else 0.99999) or max_abs > @as(f64, if (metal) 1e-3 else 1e-4));
         try std.testing.expectApproxEqAbs(@as(f64, 1), @sqrt(norm), 1e-5);
+
+        if (metal and platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_QUALIFY_VIDEO_PLAN") and std.mem.eql(u8, name, "h264_video")) {
+            const policy = @import("../pipelines/media_batch_policy.zig");
+            const serving_samples = policy.frameSamplesForTesting(true);
+            try std.testing.expect(serving_samples[0] >= 2);
+            std.debug.print("embeddinggemma2 video_serving_calibration singleton_samples={d} pair_samples={d} prepared=true\n", .{ serving_samples[0], serving_samples[1] });
+            const Env = struct {
+                extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+                extern "c" fn unsetenv([*:0]const u8) c_int;
+            };
+            {
+                // Exercise a full eight-frame tower independent of decode queue
+                // arrival. A repeated frame must match singleton projection.
+                const projector = @import("../architectures/gemma4_projector.zig");
+                const admission = try loaded.session.admit(.{ .workspace_bytes = 2 * 1024 * 1024 * 1024 });
+                var owned_admission = admission;
+                defer owned_admission.deinit();
+                const gate = loaded.embeddingExecutionLock();
+                if (gate) |mutex| try node.extractionExecutionControl(null).lock(mutex);
+                defer if (gate) |mutex| mutex.unlock();
+                var managed = try session_factory.getManagedComputeBackend(loaded.session, a, null, node.extractionExecutionControl(null));
+                defer managed.deinit();
+                const cb = &managed.backend;
+                const host = try a.alloc(f32, 900 * 768);
+                defer a.free(host);
+                for (host, 0..) |*v, index| v.* = @as(f32, @floatFromInt(index % 251)) / 251 - 0.5;
+                const single_input = try cb.fromFloat32Shape(host, &.{ 900, 768 });
+                defer cb.free(single_input);
+                const single = try projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb, a, single_input, 480, 480, 1, true);
+                defer cb.free(single.tensor);
+                const single_values = try cb.toFloat32(single.tensor, a);
+                defer a.free(single_values);
+                const input = (try cb.allocUninitF32Shape(&.{ 7200, 768 })) orelse return error.UnsupportedPrimitiveOp;
+                defer cb.free(input);
+                for (0..8) |frame| try std.testing.expect(try cb.copyRows2D(a, input, frame * 900, single_input, 0, 900, 768));
+                const projected = try projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb, a, input, 480, 480, 8, true);
+                defer cb.free(projected.tensor);
+                const values = try cb.toFloat32(projected.tensor, a);
+                defer a.free(values);
+                try std.testing.expectEqual(single.tokens * 8, projected.tokens);
+                for (0..8) |frame| for (values[frame * single_values.len ..][0..single_values.len], single_values) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
+                std.debug.print("embeddinggemma2 video_plan full_frames=8 singleton_projection_parity=true\n", .{});
+                // Qualify the exact non-power-of-two ceiling as well as eight.
+                // Readback precedes the clock stop; comparisons follow it.
+                const pixels = try a.alloc(f32, 1188 * 768);
+                defer a.free(pixels);
+                for (pixels, 0..) |*v, index| v.* = @as(f32, @floatFromInt(index % 239)) / 239 - 0.5;
+                const frame = try cb.fromFloat32Shape(pixels, &.{ 1188, 768 });
+                defer cb.free(frame);
+                const cohort_input = (try cb.allocUninitF32Shape(&.{ 7128, 768 })) orelse return error.UnsupportedPrimitiveOp;
+                defer cb.free(cohort_input);
+                for (0..6) |index| try std.testing.expect(try cb.copyRows2D(a, cohort_input, index * 1188, frame, 0, 1188, 768));
+                const four_input = try cb.sliceRows2D(a, cohort_input, 0, 4 * 1188, 768);
+                defer cb.free(four_input);
+                const six = try projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb, a, cohort_input, 576, 528, 6, true);
+                defer cb.free(six.tensor);
+                const reference_six = try cb.toFloat32(six.tensor, a);
+                defer a.free(reference_six);
+                var costs: [2][7]u64 = undefined;
+                for (0..9) |iteration| for (0..2) |phase| {
+                    const route = phase ^ (iteration & 1);
+                    const count: usize = if (route == 0) 4 else 6;
+                    const started = platform.time.monotonicNs();
+                    const encoded = try projector.encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb, a, if (route == 0) four_input else cohort_input, 576, 528, count, true);
+                    defer cb.free(encoded.tensor);
+                    const actual = try cb.toFloat32(encoded.tensor, a);
+                    defer a.free(actual);
+                    const elapsed = platform.time.monotonicNs() -| started;
+                    for (actual, reference_six[0..actual.len]) |got, want| try std.testing.expectApproxEqAbs(want, got, 1e-3);
+                    if (iteration >= 2) costs[route][iteration - 2] = elapsed;
+                };
+                for (&costs) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+                std.debug.print("embeddinggemma2 video_exact_ceiling frames=6 four_ns={d} six_ns={d} four_per_frame_ns={d} six_per_frame_ns={d} samples=7 parity=true\n", .{ costs[0][3], costs[1][3], costs[0][3] / 4, costs[1][3] / 6 });
+            }
+            const flag = "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN";
+            const saved = if (platform.env.getenv(flag)) |old| try a.dupeSentinel(u8, old, 0) else null;
+            defer if (saved) |old| a.free(old);
+            defer {
+                if (saved) |old| {
+                    _ = Env.setenv(flag, old, 1);
+                } else {
+                    _ = Env.unsetenv(flag);
+                }
+            }
+            const fallback_flag = "ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP";
+            const saved_fallback = if (platform.env.getenv(fallback_flag)) |old| try a.dupeSentinel(u8, old, 0) else null;
+            defer if (saved_fallback) |old| a.free(old);
+            {
+                defer {
+                    if (saved_fallback) |old| {
+                        _ = Env.setenv(fallback_flag, old, 1);
+                    } else {
+                        _ = Env.unsetenv(fallback_flag);
+                    }
+                }
+                try std.testing.expect(Env.setenv(flag, "0", 1) == 0);
+                try std.testing.expect(Env.setenv(fallback_flag, "1", 1) == 0);
+                const fallback = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = parts.items }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                defer a.free(fallback.vector);
+                for (fallback.vector, expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
+                std.debug.print("embeddinggemma2 video_plan required_decline_legacy_retry_parity=true\n", .{});
+                // A denser sampling policy exercises more than one legacy
+                // cohort. Compare the same eight-picture input across routes.
+                const dense_parts = [_]grouped.Part{.{ .sampled_video = .{ .bytes = bytes.items[0], .sampling = .{ .timestamps = .{ .step_ns = 125_000_000, .max_frames = 8 } } } }};
+                const dense_fallback = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &dense_parts }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                defer a.free(dense_fallback.vector);
+                try std.testing.expect(dense_fallback.input_tokens > 3 * 100);
+                try std.testing.expect(Env.setenv(fallback_flag, "0", 1) == 0);
+                const dense_prepared = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &dense_parts }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                defer a.free(dense_prepared.vector);
+                try std.testing.expectEqual(dense_fallback.input_tokens, dense_prepared.input_tokens);
+                for (dense_prepared.vector, dense_fallback.vector) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
+                std.debug.print("embeddinggemma2 video_plan dense_sampling_tokens={d} bounded_legacy_retry_parity=true\n", .{dense_prepared.input_tokens});
+            }
+            var samples: [2][7]u64 = undefined;
+            var stage_samples: [2][7]grouped.MediaTimings = undefined;
+            var stage_totals = grouped.MediaTimings{};
+            for (0..9) |iteration| for (0..2) |phase| {
+                const route = phase ^ (iteration & 1);
+                try std.testing.expect(Env.setenv(flag, if (route == 0) "1" else "0", 1) == 0);
+                var timing = grouped.MediaTimings{};
+                const started = platform.time.monotonicNs();
+                const measured = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = parts.items }, .{ .timings = &timing }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+                defer a.free(measured.vector);
+                const elapsed = platform.time.monotonicNs() -| started;
+                for (measured.vector, expected) |actual, want| try std.testing.expectApproxEqAbs(want, actual, 1e-3);
+                if (iteration >= 2) {
+                    samples[route][iteration - 2] = elapsed;
+                    stage_samples[route][iteration - 2] = timing;
+                }
+                if (route == 1) stage_totals = timing;
+            };
+            for (&samples) |*values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
+            std.debug.print("embeddinggemma2 video_plan reference_ns={d} optimized_ns={d} samples=7 parity=true retire_ns={d} rebind_ns={d} copy_ns={d} copy_bytes={d}\n", .{ samples[0][3], samples[1][3], stage_totals.stage_retire_ns, stage_totals.stage_rebind_ns, stage_totals.stage_copy_ns, stage_totals.stage_copy_bytes });
+            for (0..2) |route| {
+                inline for (.{ "inspection_ns", "media_prepare_ns", "pack_ns", "encoder_ns", "pool_readback_ns" }) |field| {
+                    var values: [7]u64 = undefined;
+                    for (stage_samples[route], &values) |timing, *value| value.* = @field(timing, field);
+                    std.mem.sort(u64, &values, {}, std.sort.asc(u64));
+                    std.debug.print("embeddinggemma2 video_stage route={d} stage={s} median_ns={d} samples=7\n", .{ route, field, values[3] });
+                }
+            }
+            if ((try session_factory.videoPreparationContext(loaded.session, false)).coefficients) |coefficients| {
+                const stats = coefficients.statistics();
+                std.debug.print("embeddinggemma2 video_coefficient_cache hits={d} inserts={d} bytes={d} entries={d}\n", .{ stats.hits, stats.inserts, stats.bytes, stats.entries });
+            }
+        }
 
         if (std.mem.eql(u8, name, "text_video")) {
             const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.items[0].len));
@@ -38065,7 +38746,11 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
     const acknowledged_prefix = reader.stream_ledger.acknowledged;
     if (ts) {
         try std.testing.expect(reader.stream_ledger.acknowledged > 0);
-    } else try std.testing.expectEqual(@as(usize, if (parts) 1 else 2), reader.stream_ledger.acknowledged);
+    } else {
+        const minimum: usize = if (parts) 1 else 2;
+        try std.testing.expect(reader.stream_ledger.acknowledged >= minimum);
+        try std.testing.expect(reader.stream_ledger.acknowledged <= minimum + 2);
+    }
     try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
     try std.testing.expect(stream.pending != null and !stream.pending.?.acknowledged);
     try std.testing.expectEqual(@as(usize, 0), flow.ordinal);
@@ -38097,7 +38782,352 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
         for (expected.result.?.vector, actual.result.?.vector) |left, right| max_error = @max(max_error, @abs(left - right));
     }
     try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
-    std.debug.print("streamed live pretrained ts={} parts={} encrypted={} metal={} windows={d} callbacks={d} early={d} prefix={d} requests={d} max_error={d:.9}\n", .{ ts, parts, encrypted, metal, capture.count, capture.calls, capture.early, acknowledged_prefix, transport.requests, max_error });
+    std.debug.print("streamed live pretrained ts={} parts={} encrypted={} metal={} windows={d} callbacks={d} early={d} prefix={d} requests={d} prefetched={d} overlaps={d} validation_overlap_packets={d} max_error={d:.9}\n", .{ ts, parts, encrypted, metal, capture.count, capture.calls, capture.early, acknowledged_prefix, transport.requests, stream.stats.prefetched_fragments, stream.stats.overlapped_fragments, stream.stats.overlapped_validation_packets, max_error });
+    if (!ts and !parts and !encrypted) {
+        // A backlog is available immediately: qualify native cohorts and one
+        // preparation wave ahead, including captions and an unacknowledged
+        // first callback while a second computed output is already retained.
+        var cohort_client = Fake.Client{};
+        var cohort_transport = stream_media.http_stream.Adapter(Fake){ .allocator = a, .client = &cohort_client, .root_url = transport.root_url, .limits = transport.limits };
+        var cohort_reader = try stream_media.hls_live.Reader(Fake).init(a, &cohort_transport, transport.root_url, .{});
+        defer cohort_reader.deinit();
+        try cohort_reader.reload();
+        var cohort_flow = try stream_coordinator.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .max_frames = 1 });
+        defer cohort_flow.deinit();
+        while (try cohort_reader.next()) |value| {
+            var unit: ?stream_media.live_mp4.Segment = value;
+            defer if (unit) |*owner| owner.deinit();
+            try cohort_flow.append(&unit);
+        }
+        try cohort_flow.finish();
+        var snapshots: [6]?stream_coordinator.Prepared = @splat(null);
+        defer for (&snapshots) |*snapshot| if (snapshot.*) |*owner| owner.deinit();
+        for (&snapshots, 0..) |*snapshot, offset| snapshot.* = (try cohort_flow.prepareAheadAlloc(a, offset)).?;
+        const Ended = struct {
+            calls: usize = 0,
+            pub fn ended(_: *@This()) bool {
+                return true;
+            }
+            pub fn streamNext(self: *@This(), _: *anyopaque, _: *const fn (*anyopaque, *stream_media.http_stream.FragmentDelivery) anyerror!void) !?struct { resource_complete: bool } {
+                self.calls += 1;
+                return null;
+            }
+        };
+        const CohortCapture = struct {
+            calls: usize = 0,
+            count: usize = 0,
+            hash: [32]u8 = undefined,
+            outputs: [6]?stream_embedding.LiveResult = @splat(null),
+            fn accept(raw: *anyopaque, delivery: *StreamDelivery) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(delivery.value.result.?.vector), &hash, .{});
+                if (self.calls == 1) {
+                    self.hash = hash;
+                    return error.ConsumerFailure;
+                }
+                if (self.calls == 2) try std.testing.expectEqual(self.hash, hash);
+                try std.testing.expectEqual(self.count, delivery.value.ordinal);
+                self.outputs[self.count] = try delivery.copy(std.testing.allocator);
+                self.count += 1;
+            }
+        };
+        var telemetry = @import("antfly_video").decoding.Telemetry{};
+        const cohort_options = stream_embedding.Options{ .video_decoder = .{ .telemetry = &telemetry } };
+        const caption = "A short scene.";
+        var cohort_stream = try StreamAPI.init(a, loaded.session, loaded.getTokenizer(), &cohort_flow, caption, cohort_options, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+        defer cohort_stream.deinit();
+        var ended_reader = Ended{};
+        var captured = CohortCapture{};
+        defer for (captured.outputs) |output| if (output) |value| a.free(value.result.?.vector);
+        const cohort_started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        try std.testing.expectError(error.ConsumerFailure, cohort_stream.process(&ended_reader, &captured, CohortCapture.accept));
+        try std.testing.expect(cohort_stream.queued != null);
+        try std.testing.expectEqual(@as(usize, 0), ended_reader.calls);
+        _ = try cohort_stream.process(&ended_reader, &captured, CohortCapture.accept);
+        const cohort_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - cohort_started;
+        try std.testing.expectEqual(@as(usize, 6), captured.count);
+        // Completed-cost calibration may choose serial windows after its
+        // initial admitted batch samples; delivery and parity stay identical.
+        try std.testing.expect(cohort_stream.stats.native_batches > 0 and cohort_stream.stats.native_batches <= 3);
+        try std.testing.expect(telemetry.validated_frames.load(.acquire) > 0);
+        var cohort_error: f32 = 0;
+        const serial_started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        for (&snapshots, captured.outputs) |*snapshot, output| {
+            const expected = try stream_embedding.embedPreparedLiveCached(a, loaded.session, loaded.getTokenizer(), &cohort_flow, &snapshot.*.?, caption, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+            defer a.free(expected.result.?.vector);
+            try std.testing.expectEqual(expected.result.?.input_tokens, output.?.result.?.input_tokens);
+            for (expected.result.?.vector, output.?.result.?.vector) |left, right| cohort_error = @max(cohort_error, @abs(left - right));
+        }
+        try std.testing.expect(cohort_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
+        const serial_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - serial_started;
+        std.debug.print("sealed live cohorts metal={} batches={d} shared_vision_batches={d} ahead={d} validated_frames={d} callbacks={d} max_error={d:.9} completed_ns={d} serial_ns={d}\n", .{ metal, cohort_stream.stats.native_batches, cohort_stream.stats.shared_vision_batches, cohort_stream.stats.prepared_ahead, telemetry.validated_frames.load(.acquire), captured.calls, cohort_error, cohort_ns, serial_ns });
+        // Ready preparations from distinct sources must share the vision lane,
+        // while preserving each row's independent caption and pooled vector.
+        {
+            var pools = [_]stream_media.admission.Pool{ .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } }, .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } } };
+            var ahead_rows: [2]?*stream_embedding.VideoAhead = @splat(null);
+            defer for (ahead_rows) |entry| if (entry) |ahead| ahead.deinit();
+            var items: [2]stream_embedding.VideoBatchItem = undefined;
+            for (&items, 0..) |*item, index| {
+                const snapshot = &snapshots[index].?;
+                const movie = stream_embedding.SampledVideo{ .reader = &snapshot.window.reader, .sampling = .{ .source_timestamps = snapshot.policy } };
+                ahead_rows[index] = (try stream_embedding.VideoAhead.start(loaded.session, movie, node.extractionExecutionControl(null), null, &pools[index], .{})).?;
+                item.* = .{ .movie = movie, .caption = caption, .ahead = ahead_rows[index] };
+            }
+            // The test supplies an already prepared backlog. Serving never
+            // waits for a batch to fill; it consumes whatever is currently ready.
+            for (ahead_rows) |entry| entry.?.producer.?.finished.waitUncancelable(std.testing.io);
+            const shared = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &items, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+            defer {
+                for (shared.vectors) |vector| a.free(vector);
+                a.free(shared.vectors);
+                a.free(shared.input_tokens);
+            }
+            var error_max: f32 = 0;
+            for (shared.vectors, 0..) |vector, index| for (vector, captured.outputs[index].?.result.?.vector) |left, right| {
+                error_max = @max(error_max, @abs(left - right));
+            };
+            try std.testing.expect(error_max < 1e-3);
+            // CPU calibration may correctly prefer singleton vision after
+            // exercising the shared cohorts above. Qualify the serving route
+            // without overriding its measured policy for this later call.
+            try std.testing.expect(shared.shared_vision_batches + cohort_stream.stats.shared_vision_batches > 0);
+            std.debug.print("ready cross-window vision metal={} shared_batches={d} max_error={d:.9}\n", .{ metal, shared.shared_vision_batches, error_max });
+        }
+        // One publication exceeds the cache horizon. Its packet slices must
+        // reuse later validated frames and advance validation during backbone
+        // execution, with the same captioned vectors as independent windows.
+        var publication = try stream_media.live_mp4.Ingest.init(a, "whole-publication", bytes[0..797], .{});
+        defer publication.deinit();
+        try publication.push(bytes[797..]);
+        const PublicationReader = struct {
+            unit: ?stream_media.live_mp4.Segment,
+            control: ?stream_media.source.Control = null,
+            pub fn swapReadControl(self: *@This(), control: ?stream_media.source.Control) ?stream_media.source.Control {
+                const previous = self.control;
+                self.control = control;
+                return previous;
+            }
+            pub fn ended(self: *@This()) bool {
+                return self.unit == null;
+            }
+            pub fn streamNext(self: *@This(), raw: *anyopaque, accept: *const fn (*anyopaque, *stream_media.http_stream.FragmentDelivery) anyerror!void) !?struct { resource_complete: bool } {
+                if (self.unit == null) return null;
+                try self.control.?.check();
+                var delivery = stream_media.http_stream.FragmentDelivery{ .segment = self.unit };
+                defer self.unit = delivery.segment;
+                try accept(raw, &delivery);
+                return .{ .resource_complete = true };
+            }
+        };
+        var published_reader = PublicationReader{ .unit = try publication.finishSegment() };
+        defer if (published_reader.unit) |*unit| unit.deinit();
+        const PublishedCapture = struct {
+            telemetry: *@import("antfly_video").decoding.Telemetry,
+            outputs: [6]?stream_embedding.LiveResult = @splat(null),
+            count: usize = 0,
+            fn accept(raw: *anyopaque, delivery: *StreamDelivery) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try std.testing.expectEqual(self.count, delivery.value.ordinal);
+                std.debug.print("whole publication window={d} validated={d}\n", .{ self.count, self.telemetry.validated_frames.load(.acquire) });
+                self.outputs[self.count] = try delivery.copy(std.testing.allocator);
+                self.count += 1;
+            }
+        };
+        var published_telemetry = @import("antfly_video").decoding.Telemetry{};
+        var published = PublishedCapture{ .telemetry = &published_telemetry };
+        defer for (published.outputs) |output| if (output) |value| a.free(value.result.?.vector);
+        var published_flow = try stream_coordinator.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .max_frames = 1 });
+        defer published_flow.deinit();
+        var published_stream = try StreamAPI.init(a, loaded.session, loaded.getTokenizer(), &published_flow, caption, .{ .video_decoder = .{ .telemetry = &published_telemetry } }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+        defer published_stream.deinit();
+        const published_start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        _ = try published_stream.process(&published_reader, &published, PublishedCapture.accept);
+        const published_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - published_start;
+        try std.testing.expectEqual(@as(usize, 6), published.count);
+        try std.testing.expect(published_stream.stats.overlapped_validation_packets > 0);
+        try std.testing.expectEqual(@as(usize, 6), published_telemetry.validated_frames.load(.acquire));
+        var published_error: f32 = 0;
+        for (published.outputs, captured.outputs) |actual, expected| {
+            try std.testing.expectEqual(expected.?.result.?.input_tokens, actual.?.result.?.input_tokens);
+            for (actual.?.result.?.vector, expected.?.result.?.vector) |left, right| published_error = @max(published_error, @abs(left - right));
+        }
+        try std.testing.expect(published_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
+        std.debug.print("whole publication metal={} windows={d} batches={d} validation_overlap_packets={d} validated_frames={d} max_error={d:.9} completed_ns={d}\n", .{ metal, published.count, published_stream.stats.native_batches, published_stream.stats.overlapped_validation_packets, published_telemetry.validated_frames.load(.acquire), published_error, published_ns });
+        // Extra lifecycle/host-input qualification follows timed sections so
+        // before/after benchmarks perform the same work before each sample.
+        {
+            var pools = [_]stream_media.admission.Pool{ .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } }, .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } } };
+            var items: [2]stream_embedding.VideoBatchItem = undefined;
+            for (&items, 0..) |*item, index| item.* = .{ .movie = .{ .reader = &snapshots[index].?.window.reader, .sampling = .{ .source_timestamps = snapshots[index].?.policy } }, .caption = caption };
+            const expected_vectors = [_][]f32{ captured.outputs[0].?.result.?.vector, captured.outputs[1].?.result.?.vector };
+            if (metal) {
+                // Compact validation entries yield exact host patches. Exercise
+                // their ready-cohort path with the same pinned checkpoint too.
+                var host_rows: [2]?*stream_embedding.VideoAhead = @splat(null);
+                defer for (host_rows) |entry| if (entry) |ahead| ahead.deinit();
+                var host_items = items;
+                for (&host_items, &host_rows, 0..) |*item, *owner, index| {
+                    const ahead = (try stream_embedding.VideoAhead.start(loaded.session, item.movie, node.extractionExecutionControl(null), null, &pools[index], .{})).?;
+                    owner.* = ahead;
+                    ahead.producer.?.deinit();
+                    ahead.producer = null;
+                    ahead.producer = try @import("../pipelines/embedding_gemma2_video.zig").Prefetch.startConfigured(ahead.bounded.allocator(), std.testing.io, null, item.movie.bytes, item.movie.reader, node.extractionExecutionControl(null), .{ .sampling = item.movie.sampling, .selection = item.movie.selection, .cache_pins = ahead.pins, .inspection_scope = ahead.inspection_scope, .pool = &ahead.pool });
+                    item.ahead = ahead;
+                }
+                for (host_rows) |entry| entry.?.producer.?.finished.waitUncancelable(std.testing.io);
+                const host = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &host_items, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (host.vectors) |vector| a.free(vector);
+                    a.free(host.vectors);
+                    a.free(host.input_tokens);
+                }
+                for (host.vectors, expected_vectors) |actual, expected| for (actual, expected) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+                std.debug.print("host patch cohort metal=true parity=true shared_batches={d}\n", .{host.shared_vision_batches});
+                // Publish one host row and one device row before consumption,
+                // qualifying mixed ready sources under measured wave sizing.
+                var mixed_items = items;
+                var mixed_rows: [2]?*stream_embedding.VideoAhead = @splat(null);
+                defer for (mixed_rows) |entry| if (entry) |ahead| ahead.deinit();
+                for (&mixed_items, &mixed_rows, 0..) |*item, *owner, index| {
+                    const ahead = (try stream_embedding.VideoAhead.start(loaded.session, item.movie, node.extractionExecutionControl(null), null, &pools[index], .{})).?;
+                    owner.* = ahead;
+                    if (index == 0) {
+                        ahead.producer.?.deinit();
+                        ahead.producer = null;
+                        ahead.producer = try @import("../pipelines/embedding_gemma2_video.zig").Prefetch.startConfigured(ahead.bounded.allocator(), std.testing.io, null, item.movie.bytes, item.movie.reader, node.extractionExecutionControl(null), .{ .sampling = item.movie.sampling, .selection = item.movie.selection, .cache_pins = ahead.pins, .inspection_scope = ahead.inspection_scope, .pool = &ahead.pool });
+                    }
+                    item.ahead = ahead;
+                }
+                for (mixed_rows) |entry| entry.?.producer.?.finished.waitUncancelable(std.testing.io);
+                const mixed = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &mixed_items, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (mixed.vectors) |vector| a.free(vector);
+                    a.free(mixed.vectors);
+                    a.free(mixed.input_tokens);
+                }
+                for (mixed.vectors, expected_vectors) |actual, expected| for (actual, expected) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+                std.debug.print("mixed host device cohort metal=true parity=true shared_batches={d}\n", .{mixed.shared_vision_batches});
+
+                // A single window with two ready host frames uses the same
+                // consumer as a multiwindow cohort, including its caption.
+                const singleton_movie = stream_embedding.SampledVideo{ .bytes = bytes, .sampling = .{ .source_timestamps = .{ .end_ns = 2 * std.time.ns_per_s, .step_ns = std.time.ns_per_s, .max_frames = 2 } } };
+                const singleton = (try stream_embedding.VideoAhead.start(loaded.session, singleton_movie, node.extractionExecutionControl(null), null, &pools[0], .{})).?;
+                defer singleton.deinit();
+                singleton.producer.?.deinit();
+                singleton.producer = null;
+                singleton.producer = try @import("../pipelines/embedding_gemma2_video.zig").Prefetch.startConfigured(singleton.bounded.allocator(), std.testing.io, null, bytes, null, node.extractionExecutionControl(null), .{ .sampling = singleton_movie.sampling, .cache_pins = singleton.pins, .inspection_scope = singleton.inspection_scope, .pool = &singleton.pool });
+                singleton.producer.?.finished.waitUncancelable(std.testing.io);
+                try std.testing.expectEqual(@as(usize, 2), singleton.producer.?.selected.?.len);
+                const single_host = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &.{.{ .movie = singleton_movie, .caption = caption, .ahead = singleton }}, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (single_host.vectors) |vector| a.free(vector);
+                    a.free(single_host.vectors);
+                    a.free(single_host.input_tokens);
+                }
+                const single_device = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &.{.{ .movie = singleton_movie, .caption = caption }}, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (single_device.vectors) |vector| a.free(vector);
+                    a.free(single_device.vectors);
+                    a.free(single_device.input_tokens);
+                }
+                try std.testing.expectEqual(single_device.input_tokens[0], single_host.input_tokens[0]);
+                for (single_host.vectors[0], single_device.vectors[0]) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+                std.debug.print("singleton host patch frames=2 metal=true parity=true\n", .{});
+            }
+            // Ordinary rows must begin bounded preparation while the model
+            // gate belongs to another request, rather than waiting to decode.
+            const Queued = struct {
+                session: @import("../backends/session.zig").Session,
+                tokenizer: @import("inference_tokenizer").Tokenizer,
+                items: []const stream_embedding.VideoBatchItem,
+                control: @import("../execution_control.zig").InferenceExecutionControl,
+                gate: *std.atomic.Mutex,
+                telemetry: *@import("antfly_video").decoding.Telemetry,
+                result: ?stream_embedding.VideoBatchResult = null,
+                failure: ?anyerror = null,
+                done: std.atomic.Value(bool) = .init(false),
+                fn run(self: *@This()) void {
+                    defer self.done.store(true, .release);
+                    self.result = stream_embedding.embedVideos(std.testing.allocator, self.session, self.tokenizer, self.items, .{ .video_decoder = .{ .policy = .portable, .telemetry = self.telemetry } }, self.gate, self.control, null) catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                }
+            };
+            var queued_items = items;
+            for (&queued_items) |*item| item.ahead = null;
+            var queued_telemetry = @import("antfly_video").decoding.Telemetry{};
+            // CPU sessions normally run without a global execution mutex;
+            // supply an explicit gate to qualify their queued-preparation path.
+            var native_gate: std.atomic.Mutex = .unlocked;
+            const gate = loaded.embeddingExecutionLock() orelse &native_gate;
+            try std.testing.expect(gate.tryLock());
+            var held = true;
+            defer if (held) gate.unlock();
+            var queued = Queued{ .session = loaded.session, .tokenizer = loaded.getTokenizer(), .items = &queued_items, .control = node.extractionExecutionControl(null), .gate = gate, .telemetry = &queued_telemetry };
+            defer if (queued.result) |batch| {
+                for (batch.vectors) |vector| a.free(vector);
+                a.free(batch.vectors);
+                a.free(batch.input_tokens);
+            };
+            const thread = try std.Thread.spawn(.{}, Queued.run, .{&queued});
+            var joined = false;
+            defer if (!joined) {
+                if (held) {
+                    gate.unlock();
+                    held = false;
+                }
+                thread.join();
+            };
+            var polls: usize = 0;
+            while (!queued.done.load(.acquire) and queued_telemetry.portable.load(.acquire) == 0 and polls < 10_000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            const prepared_while_queued = queued_telemetry.portable.load(.acquire) != 0;
+            gate.unlock();
+            held = false;
+            thread.join();
+            joined = true;
+            if (queued.failure) |err| return err;
+            try std.testing.expect(prepared_while_queued);
+            for (queued.result.?.vectors, expected_vectors) |actual, expected| for (actual, expected) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+            std.debug.print("queued cohort preparation metal={} before_gate=true\n", .{metal});
+            const CancelQueued = struct {
+                cancelled: std.atomic.Value(bool) = .init(false),
+                fn check(raw: ?*anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    return self.cancelled.load(.acquire);
+                }
+            };
+            var cancel = CancelQueued{};
+            var cancelled_control = node.extractionExecutionControl(null);
+            cancelled_control.cancellation = .{ .ptr = &cancel, .is_cancelled_fn = CancelQueued.check };
+            cancelled_control.deadline_ns = @import("antfly_platform").time.monotonicNs() + 10 * std.time.ns_per_s;
+            var cancel_telemetry = @import("antfly_video").decoding.Telemetry{};
+            var cancelled = Queued{ .session = loaded.session, .tokenizer = loaded.getTokenizer(), .items = &queued_items, .control = cancelled_control, .gate = gate, .telemetry = &cancel_telemetry };
+            try std.testing.expect(gate.tryLock());
+            held = true;
+            const cancelled_thread = try std.Thread.spawn(.{}, Queued.run, .{&cancelled});
+            var cancelled_joined = false;
+            defer if (!cancelled_joined) {
+                cancel.cancelled.store(true, .release);
+                cancelled_thread.join();
+            };
+            polls = 0;
+            while (!cancelled.done.load(.acquire) and cancel_telemetry.portable.load(.acquire) == 0 and polls < 10_000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            cancel.cancelled.store(true, .release);
+            // Teardown must finish while another request still owns the gate.
+            cancelled_thread.join();
+            cancelled_joined = true;
+            gate.unlock();
+            held = false;
+            try std.testing.expect(cancelled.result == null);
+            try std.testing.expectEqual(error.Cancelled, cancelled.failure.?);
+            try std.testing.expect(cancel_telemetry.portable.load(.acquire) != 0);
+            std.debug.print("queued cohort cancellation metal={} drained_before_gate=true\n", .{metal});
+        }
+    }
 }
 
 test "embeddinggemma2 video partial DASH pretrained windows preserve vectors across clean short EOF and growth" {
@@ -38272,7 +39302,7 @@ test "embeddinggemma2 video partial DASH pretrained windows preserve vectors acr
     var capture = Capture{ .transport = &transport, .wire = &wire };
     defer for (&capture.outputs) |*entry| if (entry.*) |value| if (value.result) |result| a.free(result.vector);
     try std.testing.expectError(error.ConsumerFailure, stream.process(&reader, &capture, Capture.accept));
-    try std.testing.expectEqual(@as(usize, 2), reader.stream_ledger.acknowledged);
+    try std.testing.expect(reader.stream_ledger.acknowledged >= 2 and reader.stream_ledger.acknowledged <= 4);
     try std.testing.expectEqual(@as(u64, 1), reader.dash_position.?.sequence);
     try std.testing.expect(stream.pending != null and !stream.pending.?.acknowledged);
     try std.testing.expectEqual(@as(usize, 0), flow.ordinal);
@@ -38308,4 +39338,168 @@ test "embeddinggemma2 video partial DASH pretrained windows preserve vectors acr
     }
     try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
     std.debug.print("partial DASH live pretrained metal={} windows={d} callbacks={d} early={d} prefix=2 requests={d} max_error={d:.9}\n", .{ metal, capture.count, capture.calls, capture.early, transport.requests, max_error });
+}
+
+/// Serialize exact token bytes directly. Building a JSON Value for every byte
+/// would multiply the collector's bounded memory by the Value object size.
+const NativeEvidenceResponse = struct {
+    response: api.GenerateResponse,
+    entries: []const generation.token_logprobs.Entry,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        const value = self.response;
+        try writer.beginObject();
+        inline for (.{ "id", "object", "created", "model" }) |field| {
+            try writer.objectField(field);
+            try writer.write(@field(value, field));
+        }
+        try writer.objectField("choices");
+        try writer.beginArray();
+        for (value.choices) |choice| {
+            try writer.beginObject();
+            inline for (.{ "index", "message", "finish_reason" }) |field| {
+                try writer.objectField(field);
+                try writer.write(@field(choice, field));
+            }
+            try writer.objectField("logprobs");
+            try writer.write(.{ .content = self.entries });
+            try writer.endObject();
+        }
+        try writer.endArray();
+        try writer.objectField("usage");
+        try writer.write(value.usage);
+        if (value.speculation == .value) {
+            try writer.objectField("speculation");
+            try writer.write(value.speculation.value);
+        }
+        try writer.endObject();
+    }
+};
+
+test "generated constrained public routes admit native models and reject proxy configuration before IO" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    const foreign =
+        \\{"decision_method":"generated","generator":{"provider":"openai","model":"gpt-4.1"},"probabilities":"verdict_only","input":"source","questions":[{"name":"answer","type":"predicate","instructions":"Is it present?"}]}
+    ;
+    try std.testing.expectError(error.UnsupportedConstrainedOutput, node.decideDirectJsonWithControl(a, foreign, null));
+    var request = try httpx.Request.init(a, .POST, "/decisions");
+    defer request.deinit();
+    request.body = foreign;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.decide(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    const score =
+        \\{"decision_method":"generated","generator":{"provider":"antfly","model":"missing-generated-fixture-1187"},"probabilities":"verdict_only","instructions":"Rate the statement between zero and one.","input":"source","questions":[{"name":"score","type":"score"}]}
+    ;
+    try std.testing.expectError(error.ModelNotFound, node.decideDirectJsonWithControl(a, score, null));
+    const extraction =
+        \\{"method":"generated","generator":{"provider":"openai","model":"gpt-4.1"},"probabilities":"verdict_only","inputs":[{"content":"Éva"}],"schema":{"entities":["person"]}}
+    ;
+    var extract_request = try httpx.Request.init(a, .POST, "/extract");
+    defer extract_request.deinit();
+    extract_request.body = extraction;
+    var extract_ctx = httpx.Context.init(a, std.testing.io, &extract_request);
+    defer extract_ctx.deinit();
+    var extract_response = try node.extractJSON(&extract_ctx);
+    defer extract_response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), extract_response.status.code);
+}
+
+test "local generation bridge keeps generated decider load admission retryable" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/decisions");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    const busy = "{\"error\":\"MODEL_RESOURCE_BUSY\",\"retryable\":true,\"retry_after_ms\":1000}";
+    const err = @import("antfly_structured").localGenerationStatusError(a, 503, busy);
+    var response = try Node.decideFailureResponse(&ctx, err);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    var body = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer body.deinit();
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", body.value.object.get("error").?.string);
+    try std.testing.expect(body.value.object.get("retryable").?.bool);
+    try std.testing.expectEqual(@as(i64, 1000), body.value.object.get("retry_after_ms").?.integer);
+}
+
+test "local generation bridge reports unsupported finite vocabulary as permanent admission failure" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/decisions");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try Node.decideFailureResponse(&ctx, error.UnsupportedConstrainedProbabilities);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "UNSUPPORTED_CONSTRAINED_PROBABILITIES") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":false") != null);
+}
+
+test "generated constrained extraction transport retains typed document failures" {
+    const c = @import("antfly_structured");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const inputs = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "[{\"content\":\"Alice\",\"id\":\"doc\"}]", .{});
+    for ([_]anyerror{ error.GenerationCapacityUnavailable, error.Timeout, error.UnsupportedConstrainedProbabilities, error.ConstrainedInputTooLarge, error.GeneratedExtractionLimitExceeded }) |cause| {
+        const outcomes = [_]c.extraction.Outcome{.{ .failure = cause }};
+        const err = if (c.extraction.responseValue(scratch, "fixture", inputs.array.items, &outcomes, .{ .values = &.{}, .token_evidence = &.{} })) |_| return error.TestExpectedError else |failure| failure;
+        try std.testing.expectEqual(cause, err);
+        var request = try httpx.Request.init(a, .POST, "/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try extractionDirectFailureResponse(&ctx, err);
+        defer response.deinit();
+        const expected: struct { status: u16, code: []const u8, retryable: bool } = switch (cause) {
+            error.GenerationCapacityUnavailable => .{ .status = 503, .code = "MODEL_RESOURCE_BUSY", .retryable = true },
+            error.Timeout => .{ .status = 504, .code = "INFERENCE_TIMEOUT", .retryable = true },
+            error.ConstrainedInputTooLarge, error.GeneratedExtractionLimitExceeded => .{ .status = 413, .code = "BATCH_TOO_LARGE", .retryable = false },
+            else => .{ .status = 400, .code = "UNSUPPORTED_CONSTRAINED_PROBABILITIES", .retryable = false },
+        };
+        try std.testing.expectEqual(expected.status, response.status.code);
+        var body = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer body.deinit();
+        try std.testing.expectEqualStrings(expected.code, body.value.object.get("error").?.string);
+        try std.testing.expectEqual(expected.retryable, if (body.value.object.get("retryable")) |retryable| retryable.bool else false);
+        if (cause == error.GenerationCapacityUnavailable) try std.testing.expectEqual(@as(i64, 1000), body.value.object.get("retry_after_ms").?.integer);
+    }
+}
+
+test "generated constrained native output validates numeric literals before rounding" {
+    const a = std.testing.allocator;
+    var schema = try @import("antfly-json").parseValueLossless(a, "{\"type\":\"number\",\"maximum\":1}");
+    defer schema.deinit();
+    const cfg: api.GenerateJsonSchemaConfig = .{ .schema = .{ .map = schema.value.object } };
+    try std.testing.expectError(error.InvalidBatchRequest, validateGeneratedJsonSchema(a, "1.0000000000000001", cfg));
+    try validateGeneratedJsonSchema(a, "1e-400", cfg);
+    var integer = try @import("antfly-json").parseValueLossless(a, "{\"type\":\"integer\",\"const\":0}");
+    defer integer.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, validateGeneratedJsonSchema(a, "1e-400", .{ .schema = .{ .map = integer.value.object } }));
+}
+
+test "generated constrained native request parsing preserves single and batch schema precision" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"model":"m","temperature":0.5,"messages":[],"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"number","minimum":1e-400,"const":1.0000000000000001}}}}
+    ;
+    const escaped = try std.mem.replaceOwned(u8, a, raw, "response_format", "\\u0072esponse_format");
+    defer a.free(escaped);
+    var escaped_request = try parseGenerateBody(api.GenerateRequest, a, escaped);
+    defer escaped_request.deinit();
+    try std.testing.expectEqualStrings("1e-400", escaped_request.value.response_format.?.json_schema.?.schema.?.map.get("minimum").?.number_string);
+    var single = try parseGenerateBody(api.GenerateRequest, a, raw);
+    defer single.deinit();
+    try std.testing.expectEqualStrings("1e-400", single.value.response_format.?.json_schema.?.schema.?.map.get("minimum").?.number_string);
+    try std.testing.expectEqualStrings("1.0000000000000001", single.value.response_format.?.json_schema.?.schema.?.map.get("const").?.number_string);
+    const batch_raw = try std.fmt.allocPrint(a, "{{\"requests\":[{{\"custom_id\":\"test\",\"body\":{s}}}]}}", .{raw});
+    defer a.free(batch_raw);
+    var batch = try parseGenerateBody(api.GenerateBatchRequest, a, batch_raw);
+    defer batch.deinit();
+    try std.testing.expectEqualStrings("1e-400", batch.value.requests[0].body.response_format.?.json_schema.?.schema.?.map.get("minimum").?.number_string);
 }

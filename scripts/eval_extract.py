@@ -19,7 +19,9 @@
 Each corpus row: {"id":"unique", "text":"Ada in Paris", "entities":
 [{"label":"person", "start":0, "end":3}]}. Offsets are Unicode code points,
 end-exclusive. An empty entities list is an explicitly labelled negative example.
-Config files are extraction-v2 requests without inputs. No model downloads occur.
+Config files are extraction-v2 requests without inputs. Optional evaluation_pricing
+contains input_usd_per_million/output_usd_per_million; prices are never inferred.
+No model downloads occur.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from collections import Counter
 from copy import deepcopy
 import hashlib
 import json
+import math
 from pathlib import Path
 import time
 
@@ -104,10 +107,66 @@ def metrics(
     }
 
 
+def generation_accounting(outputs: list[dict], pricing: dict | None = None) -> dict:
+    """Report measured usage; missing usage or prices stay unknown, never zero."""
+    aligned = sum(
+        len(row.get("entities", [])) for output in outputs for row in output["data"]
+    )
+    unaligned = 0
+    alignment_known = True
+    for output in outputs:
+        for row in output["data"]:
+            count = row.get("unaligned_mentions")
+            if count is None:
+                alignment_known = False
+            elif type(count) is not int or count < 0:
+                raise ValueError("unaligned_mentions must be a non-negative integer")
+            else:
+                unaligned += count
+    tokens = {}
+    for name in ("input_tokens", "output_tokens"):
+        values = [output.get("usage", {}).get(name) for output in outputs]
+        if any(
+            value is not None and (type(value) is not int or value < 0)
+            for value in values
+        ):
+            raise ValueError("token usage must contain non-negative integers")
+        tokens[name] = (
+            sum(values) if all(value is not None for value in values) else None
+        )
+    cost = None
+    if pricing is not None:
+        rates = [
+            pricing[name]
+            for name in ("input_usd_per_million", "output_usd_per_million")
+        ]
+        if any(
+            type(rate) not in (int, float) or not math.isfinite(rate) or rate < 0
+            for rate in rates
+        ):
+            raise ValueError("token prices must be finite non-negative numbers")
+        if all(value is not None for value in tokens.values()):
+            cost = sum(
+                value * rate / 1_000_000
+                for value, rate in zip(tokens.values(), rates, strict=True)
+            )
+    return {
+        **tokens,
+        "cost_usd": cost,
+        "pricing": pricing,
+        "aligned_mentions": aligned,
+        "unaligned_mentions": unaligned if alignment_known else None,
+        "alignment_rate": aligned / (aligned + unaligned)
+        if alignment_known and aligned + unaligned
+        else None,
+    }
+
+
 def evaluate(inference, config: dict, corpus: list[dict]) -> dict:
     config = deepcopy(config)
     if config.get("schema_version") != 2 or "inputs" in config:
         raise ValueError("configs must be extraction-v2 requests without inputs")
+    pricing = config.pop("evaluation_pricing", None)
     options = config.setdefault("options", {})
     options.update(
         include_spans=True, include_confidence=True, offset_unit="unicode_codepoints"
@@ -141,6 +200,7 @@ def evaluate(inference, config: dict, corpus: list[dict]) -> dict:
             predicted,
             config["schema"].get("entities", []),
         ),
+        "generation_accounting": generation_accounting(outputs, pricing),
         "outputs": outputs,
     }
 

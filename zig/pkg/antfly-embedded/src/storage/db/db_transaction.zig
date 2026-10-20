@@ -1274,9 +1274,9 @@ pub fn advanceIndexRepairIntentOwned(
             defer alloc.free(storage_namespace);
             candidate_bytes = self.core.index_manager.algebraicStorageNamespaceBytes(storage_namespace) catch 0;
         } else {
-            const candidate_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.path, candidate[0..separator] });
+            const candidate_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ self.core.index_manager.base_path, candidate[0..separator] });
             defer alloc.free(candidate_root);
-            candidate_bytes = directoryUsageBytes(alloc, candidate_root) catch 0;
+            candidate_bytes = self.core.index_manager.generationStorageBytes(candidate_root) catch 0;
         }
     }
     const remaining_disk_claim = planned_disk_bytes -| @min(planned_disk_bytes, candidate_bytes);
@@ -1325,6 +1325,7 @@ pub fn advanceIndexRepairIntentOwned(
         .options = effective_options,
         .admitted_total_bytes = planned_disk_bytes,
         .headroom_bytes = cleanup_and_replay_headroom,
+        .algebraic_index_name = if (entry.intent.kind == .algebraic) entry.intent.index_name else null,
     };
 
     const attempt_count = entry.intent.attempt_count +| 1;
@@ -2467,20 +2468,7 @@ pub fn resolveFinalizedTransactionIntentsForRecovery(self: *DB, resolution_times
 
 pub fn waitForResolvedTransactionSyncWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken) !void {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, sync_level, sequence, cancellation });
-    try self.executor.checkSyncLevelHealth(sync_level);
-    if (sequence == 0 or sync_level == .propose or sync_level == .write) return;
-    try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
-    var sync_targets = try self.currentManagedSyncTargets(sync_level);
-    defer sync_targets.deinit(self.alloc);
-    if (self.executor.hasWorkers()) {
-        notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, sync_level, sequence, sync_targets);
-    }
-    if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
-    self.notifyResolverReplayRuntimes(sequence);
-    try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation, false);
-    if (sync_level == .full_index and self.text_merge_runtime == null) {
-        try self.drainScheduledTextMerges();
-    }
+    return self.waitForResolvedTransactionSyncImpl(sync_level, sequence, cancellation, null);
 }
 
 pub fn currentInitialBuildIntentMatches(

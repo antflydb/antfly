@@ -1512,6 +1512,49 @@ pub fn resolveWritesForSchemaValidation(
     return try state.toOwnedWrites(alloc);
 }
 
+/// Reject invalid selected group members before an authoritative Raft proposal.
+/// Tables without grouping take only the immutable plan lease; they do not
+/// repeat row parsing or relational preparation.
+pub fn validateGroupedSourceBatch(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    writes: []const db_mod.types.BatchWrite,
+    deletes: []const []const u8,
+    transforms: []const db_mod.types.DocumentTransform,
+) !void {
+    if (comptime storage_engine.enabled) return storage_engine.call("writeValidateGroupedSourceBatch", .{ alloc, db, writes, deletes, transforms });
+    if (writes.len == 0 and transforms.len == 0) return;
+    var pinned = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pinned.release();
+    const plan = pinned.plan().group_sources orelse return;
+    if (plan.entries.len == 0) return;
+    const effective = try resolveWritesForSchemaValidation(alloc, db, writes, deletes, transforms);
+    defer freeOwnedBatchWrites(alloc, effective);
+    var schema = db.core.acquireSchemaView();
+    defer if (schema) |*view| view.release();
+    for (effective) |write| {
+        if (write.key.len > 0 and (write.key[0] == 0 or write.key[0] == 1)) continue;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        if (schema) |view| if (view.storageMode() == .relational) {
+            var prepared = try @import("db/document/mapper.zig").PreparedRelationalWrite.init(scratch, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout());
+            defer prepared.deinit(scratch);
+            try prepared.requireLogicalRoot();
+            _ = plan.prepareRow(scratch, write.key, prepared.parsedValue()) catch |err| switch (err) {
+                error.InvalidGroupedSourceMember, error.GroupedSourceMemberTooLarge => return error.InvalidBatchRequest,
+                else => return err,
+            };
+            continue;
+        };
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, write.value, .{});
+        _ = plan.prepareRow(scratch, write.key, value) catch |err| switch (err) {
+            error.InvalidGroupedSourceMember, error.GroupedSourceMemberTooLarge => return error.InvalidBatchRequest,
+            else => return err,
+        };
+    }
+}
+
 pub fn validateTableBatchAgainstLocalSchema(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -1521,6 +1564,7 @@ pub fn validateTableBatchAgainstLocalSchema(
 ) !void {
     if (comptime storage_engine.enabled) return storage_engine.call("writeValidateTableBatchAgainstLocalSchema", .{ alloc, db, writes, deletes, transforms });
     if (writes.len == 0 and deletes.len == 0 and transforms.len == 0) return;
+    try validateGroupedSourceBatch(alloc, db, writes, deletes, transforms);
     // Relational writes are validated authoritatively by DB.batch after its
     // final transform resolution and while holding the schema generation's
     // apply lock. Repeating the API-level load/parse/transform pass doubles

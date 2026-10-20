@@ -94,6 +94,7 @@ const Config = struct {
     head_count: usize,
     direct_unified: bool = false,
     embedding_gemma2_f32_attention: bool = false,
+    require_prepared_vision: bool = false,
     image_size: usize,
     patch_size: usize,
     layer_norm_eps: f32,
@@ -704,35 +705,91 @@ pub fn embeddingGemma2VideoBatchCapacityForBackend(width: u32, height: u32, budg
     // intermediates. Its cohort ceiling must not pay Metal's two-layer cost.
     const scratch = if (metal) try imageScratchBytes(embeddingGemma2ImageConfig(), patches) else try imageLayerScratchBytes(embeddingGemma2ImageConfig(), patches);
     if (scratch > budget) return error.ImageBatchBudgetExceeded;
-    return @min(@as(usize, 8), budget / @max(@as(usize, 1), scratch));
+    const count = @min(@as(usize, 8), budget / @max(@as(usize, 1), scratch));
+    return if (metal) @import("../ops/embedding_vision_plan.zig").capacity(patches, count) else count;
+}
+
+/// Prepared-video geometry uses the same arena and transient contract as images.
+pub fn embeddingGemma2VideoPreparedScratch(width: u32, height: u32, frames: usize) !usize {
+    if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0 or frames == 0 or frames > 8) return error.InvalidTensorShape;
+    return @import("../ops/embedding_vision_plan.zig").transientBytes(@as(usize, width / 16) * (height / 16) * frames);
+}
+pub fn embeddingGemma2VideoPreparedCapacity(width: u32, height: u32, budget: usize) !usize {
+    var frames: usize = 8;
+    while (frames > 0) : (frames -= 1) {
+        const scratch = embeddingGemma2VideoPreparedScratch(width, height, frames) catch |err| {
+            if (err == error.InvalidVisionPlan) continue;
+            return err;
+        };
+        if (scratch <= budget) return frames;
+    }
+    return error.ImageBatchBudgetExceeded;
 }
 
 pub fn encodeEmbeddingGemma2VideoBatchTensorResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32, frames: usize) !EncodedDeviceImage {
+    return encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb, allocator, input, width, height, frames, false);
+}
+pub fn encodeEmbeddingGemma2VideoBatchTensorWithPlan(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32, frames: usize, required: bool) !EncodedDeviceImage {
+    return encodeEmbeddingGemma2VideoBatchTensorInto(cb, allocator, input, width, height, frames, required, null);
+}
+
+/// An optional output is borrowed; the caller owns it on success and failure.
+pub fn encodeEmbeddingGemma2VideoBatchTensorInto(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, width: u32, height: u32, frames: usize, required: bool, output: ?CT) !EncodedDeviceImage {
+    return encodeVideoBatchInput(cb, allocator, .{ .tensor = input }, width, height, frames, required, output);
+}
+
+pub const VideoBatchInput = union(enum) {
+    tensor: CT,
+    gather: []const @import("../ops/metal_compute.zig").VideoGatherInput,
+};
+/// Preparation/weight setup precedes the owned input frame. Gather, patch
+/// projection and precise positional addition share one submission and fence.
+pub fn encodeVideoBatchInput(cb: *const ComputeBackend, allocator: std.mem.Allocator, source: VideoBatchInput, width: u32, height: u32, frames: usize, required: bool, output: ?CT) !EncodedDeviceImage {
     var cfg = embeddingGemma2ImageConfig();
     cfg.max_image_tokens = 140;
+    cfg.require_prepared_vision = required;
     if (frames == 0 or frames > 8) return error.InvalidTensorShape;
+    if (source == .gather and source.gather.len != frames) return error.InvalidTensorShape;
     if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0) return error.InvalidTensorShape;
     const g = Geometry{ .batches = frames, .width = width, .height = height, .grid_x = width / 16, .grid_y = height / 16, .pooled_x = width / 48, .pooled_y = height / 48 };
     if (g.tokenCount() / frames > 140) return error.InvalidTensorShape;
+    if (required) {
+        if (!try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingVisionPlan(cb, .{ .rows = frames * g.grid_x * g.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size })) return error.PreparedVisionUnavailable;
+    }
     var store = ProjectorWeights.initHuggingFace(cb, allocator);
     defer store.deinit();
-    const weight = try store.linearCt("v.patch_embd.weight", 768, cfg.vision_hidden);
-    defer cb.free(weight);
-    const projected = try cb.linearNoBias(input, weight, frames * g.grid_x * g.grid_y, 768, cfg.vision_hidden);
-    defer cb.free(projected);
-    if (cb.kind() == .metal) {
+    // Input-only weights and temporaries must drain before the tower: a CPU
+    // position table can otherwise stay pinned through every layer's scratch.
+    const positioned = input_phase: {
+        const weight = try store.linearCt("v.patch_embd.weight", 768, cfg.vision_hidden);
+        defer cb.free(weight);
         const positions = try store.weightCt("v.position_embd.weight");
         defer cb.free(positions);
+        if (cb.kind() == .metal) {
+            const shape = try cb.tensorShape(positions, allocator);
+            defer allocator.free(shape);
+            if (shape.len != 3 or shape[0] != 2 or shape[1] <= 0 or shape[2] != 768) return error.InvalidPositionEmbeddingShape;
+            try @import("../ops/metal_compute.zig").MetalCompute.prepareVideoInput(cb, weight, positions, @intCast(shape[1]));
+        }
+        var input_frame = if (cb.kind() == .metal) try beginVisionBoundary(cb, &store, cfg) else false;
+        defer if (input_frame) cb.decoderRuntimeCancelFrame() catch {};
+        const input = switch (source) {
+            .tensor => |ct| ct,
+            .gather => |sources| try @import("../ops/metal_compute.zig").MetalCompute.gatherVideoInputs(cb, sources, g.grid_x * g.grid_y, 768),
+        };
+        defer if (source == .gather) cb.free(input);
+        const projected = try cb.linearNoBias(input, weight, frames * g.grid_x * g.grid_y, 768, cfg.vision_hidden);
+        defer cb.free(projected);
         const positioned = try addPositionEmbeddingsDevice(cb, allocator, projected, positions, cfg.vision_hidden, g);
-        const result = try encodePositionedBatchResident(cb, allocator, &store, cfg, positioned, singleGeometry(g), frames);
-        return .{ .tensor = result.embeddings, .tokens = frames * result.tokens };
-    }
-    const data = try cb.toFloat32(projected, allocator);
-    defer allocator.free(data);
-    const positioned = try addPositionEmbeddings(allocator, &store, cfg, data, g);
-    defer allocator.free(positioned);
-    const hidden = try cb.fromFloat32Shape(positioned, &.{ @intCast(frames * g.grid_x * g.grid_y), @intCast(cfg.vision_hidden) });
-    const result = try encodePositionedBatchResident(cb, allocator, &store, cfg, hidden, singleGeometry(g), frames);
+        errdefer cb.free(positioned);
+        if (input_frame) {
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            input_frame = false;
+            try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+        }
+        break :input_phase positioned;
+    };
+    const result = try encodePositionedBatchResidentInto(cb, allocator, &store, cfg, positioned, singleGeometry(g), frames, output);
     return .{ .tensor = result.embeddings, .tokens = frames * result.tokens };
 }
 
@@ -1645,7 +1702,7 @@ fn prepareAudioCpuBounded(allocator: std.mem.Allocator, audio_bytes: []const u8,
         else => return if (reference_resample) error.InvalidAudioInput else err,
     };
     defer decoded.deinit();
-    if (reference_resample and audio.detectFormat(audio_bytes) == .flac) {
+    if (audio.detectFormat(audio_bytes) == .flac) {
         // STREAMINFO is useful for admission only when decode agrees. Reject
         // a false duration before allocating resampling/packed feature buffers.
         const info = try @import("inference_audio").flac.parseStreamInfo(audio_bytes);
@@ -2449,21 +2506,23 @@ pub const PreparedImage = struct {
     allocator: std.mem.Allocator,
     pixels: []f32,
     geometry: Geometry,
-    /// Owned decoded RGB bytes. CUDA defers resize/patch extraction until
-    /// consumption, keeping preparation lookahead independent of the stream.
+    /// Decoded RGB/RGBA input. Device preparation defers resize/patch extraction
+    /// until consumption. Borrowed raster bytes outlive this prepared view.
     source: ?image.ImageU8 = null,
+    source_owned: bool = true,
     pub fn retainedBytes(self: PreparedImage) usize {
-        return self.pixels.len * @sizeOf(f32) + if (self.source) |view| view.data.len else 0;
+        return self.pixels.len * @sizeOf(f32) + if (self.source_owned) (if (self.source) |view| view.data.len else 0) else 0;
     }
     pub fn deinit(self: PreparedImage) void {
         self.allocator.free(self.pixels);
-        if (self.source) |view| self.allocator.free(view.data);
+        if (self.source_owned) if (self.source) |view| self.allocator.free(view.data);
     }
 };
 
 fn prepareImageView(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, decoded: image.ImageU8) !PreparedImage {
     const geometry = targetGeometry(cfg, decoded.width, decoded.height);
     try decoded.validate();
+    if (store.cb.kind() == .metal and store.gguf == null and cfg.embedding_gemma2_f32_attention) return .{ .allocator = allocator, .pixels = &.{}, .geometry = geometry, .source = decoded, .source_owned = false };
     const pixel_values = try image.preprocessImageViewRectScaledWithResample(
         allocator,
         decoded,
@@ -2500,15 +2559,16 @@ pub fn prepareEmbeddingGemma2RasterWithResample(a: std.mem.Allocator, raster: an
 }
 
 pub fn prepareEmbeddingGemma2ImageForBackend(a: std.mem.Allocator, bytes: []const u8, backend: @import("../backends/backends.zig").BackendType) !PreparedImage {
-    if (backend != .cuda) return prepareEmbeddingGemma2Image(a, bytes);
+    if (backend != .cuda and backend != .metal) return prepareEmbeddingGemma2Image(a, bytes);
     const decoded = try image.decode(a, bytes);
     errdefer decoded.deinit(a);
     return .{ .allocator = a, .pixels = &.{}, .geometry = targetGeometry(embeddingGemma2ImageConfig(), decoded.width, decoded.height), .source = .{ .data = decoded.data, .width = decoded.width, .height = decoded.height, .format = .rgb8 } };
 }
 pub fn prepareEmbeddingGemma2RasterForBackend(a: std.mem.Allocator, raster: antfly_image.BorrowedRasterAttachment, backend: @import("../backends/backends.zig").BackendType) !PreparedImage {
-    if (backend != .cuda) return prepareEmbeddingGemma2Raster(a, raster);
+    if (backend != .cuda and backend != .metal) return prepareEmbeddingGemma2Raster(a, raster);
     const view = try raster.imageView();
     try image.DecodeLimits.inference_default.validate(view.width, view.height);
+    if (backend == .metal) return .{ .allocator = a, .pixels = &.{}, .geometry = targetGeometry(embeddingGemma2ImageConfig(), view.width, view.height), .source = view, .source_owned = false };
     const stride = try view.rowStride();
     const bytes = try a.alloc(u8, @as(usize, view.width) * view.height * 3);
     errdefer a.free(bytes);
@@ -2523,6 +2583,7 @@ pub fn prepareEmbeddingGemma2RasterForBackend(a: std.mem.Allocator, raster: antf
 pub const ImageBatchOptions = struct {
     max_batch: usize = 4,
     max_patch_tokens: usize = 10080,
+    require_prepared_vision: bool = false,
     max_scratch_bytes: usize = 768 * 1024 * 1024,
     pub fn validate(self: ImageBatchOptions) !void {
         if (self.max_batch == 0 or self.max_batch > 8 or self.max_patch_tokens == 0 or self.max_scratch_bytes == 0) return error.InvalidImageBatch;
@@ -2536,7 +2597,7 @@ fn validatePreparedImage(cfg: Config, prepared: PreparedImage) !void {
     if (patches > cfg.maxPatchCount() or g.grid_x % cfg.spatial_merge_size != 0 or g.grid_y % cfg.spatial_merge_size != 0 or g.width != g.grid_x * cfg.patch_size or g.height != g.grid_y * cfg.patch_size or g.pooled_x != g.grid_x / cfg.spatial_merge_size or g.pooled_y != g.grid_y / cfg.spatial_merge_size) return error.InvalidImageBatch;
     if (prepared.source) |view| {
         try view.validate();
-        if (view.format != .rgb8 or prepared.pixels.len != 0 or !std.meta.eql(g, targetGeometry(cfg, view.width, view.height))) return error.InvalidImageBatch;
+        if (prepared.pixels.len != 0 or !std.meta.eql(g, targetGeometry(cfg, view.width, view.height))) return error.InvalidImageBatch;
         return;
     }
     const area = std.math.mul(usize, g.width, g.height) catch return error.InvalidImageBatch;
@@ -2577,6 +2638,34 @@ pub fn embeddingGemma2PreparedScratch(images: []const PreparedImage, limit: usiz
     return @min(sum, limit);
 }
 
+/// Shared header/execution estimate for a uniform geometry. Includes all
+/// retained projections and the largest bounded tower cohort, never a dense
+/// score matrix. Header planners may use maximum axes/count conservatively.
+pub fn embeddingGemma2GeometryPlanScratch(patches: usize, tokens: usize, count: usize) !usize {
+    if (count == 0 or count > 8) return error.InvalidImageBatch;
+    const take = @import("../ops/embedding_vision_plan.zig").capacity(patches, @min(count, 4));
+    if (take == 0) return error.PreparedVisionUnavailable;
+    return try std.math.add(usize, try @import("../ops/embedding_vision_plan.zig").transientBytes(take * patches), try std.math.mul(usize, try std.math.mul(usize, count, tokens), 512 * 4));
+}
+
+pub fn embeddingGemma2PreparedPlanScratch(images: []const PreparedImage) !usize {
+    var peak: usize = 0;
+    var output: usize = 0;
+    var first: usize = 0;
+    while (first < images.len) {
+        const g = images[first].geometry;
+        const patches = g.grid_x * g.grid_y;
+        const capacity = @import("../ops/embedding_vision_plan.zig").capacity(patches, 4);
+        if (capacity == 0) return error.PreparedVisionUnavailable;
+        var count: usize = 0;
+        while (first + count < images.len and count < capacity and std.meta.eql(g, images[first + count].geometry)) : (count += 1) {}
+        peak = @max(peak, try @import("../ops/embedding_vision_plan.zig").transientBytes(count * patches));
+        output = try std.math.add(usize, output, count * g.tokenCount() * 512 * 4);
+        first += count;
+    }
+    return try std.math.add(usize, peak, output);
+}
+
 pub fn embeddingGemma2RasterScratch(rasters: []const antfly_image.BorrowedRasterAttachment, limit: usize) !usize {
     const cfg = embeddingGemma2ImageConfig();
     var sum: usize = 0;
@@ -2591,7 +2680,7 @@ pub fn embeddingGemma2RasterScratch(rasters: []const antfly_image.BorrowedRaster
     return @min(sum, limit);
 }
 
-fn imageBatchCount(cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !usize {
+fn imageBatchCount(cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions, metal: bool) !usize {
     try options.validate();
     if (prepared.len == 0) return 0;
     for (prepared) |item| try validatePreparedImage(cfg, item);
@@ -2600,8 +2689,12 @@ fn imageBatchCount(cfg: Config, prepared: []const PreparedImage, options: ImageB
     if (patches == 0) return error.InvalidImageBatch;
     // Conservative dense-attention and activation estimate; providers may use
     // less scratch, but a larger batch must fit this bound before execution.
-    const scratch = try imageScratchBytes(cfg, patches);
-    const capacity = @min(options.max_batch, @min(options.max_patch_tokens / patches, options.max_scratch_bytes / @max(scratch, 1)));
+    const scratch = if (options.require_prepared_vision) try @import("../ops/embedding_vision_plan.zig").transientBytes(patches) else try imageScratchBytes(cfg, patches);
+    const model_capacity = if (metal and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_PLAN") and cfg.embedding_gemma2_f32_attention and cfg.vision_hidden == 768 and cfg.intermediate_size == 3072) @import("../ops/embedding_vision_plan.zig").capacity(patches, options.max_batch) else options.max_batch;
+    var capacity = @min(model_capacity, options.max_patch_tokens / patches);
+    if (options.require_prepared_vision) {
+        while (capacity > 0 and try @import("../ops/embedding_vision_plan.zig").transientBytes(capacity * patches) > options.max_scratch_bytes) capacity -= 1;
+    } else capacity = @min(capacity, options.max_scratch_bytes / @max(scratch, 1));
     if (capacity == 0) return error.ImageBatchBudgetExceeded;
     var count: usize = 0;
     for (prepared[0..@min(prepared.len, capacity)]) |item| {
@@ -2613,6 +2706,8 @@ fn imageBatchCount(cfg: Config, prepared: []const PreparedImage, options: ImageB
 
 fn encodePreparedImagesWithWeights(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !ProjectedImages {
     try options.validate();
+    var execution_cfg = cfg;
+    execution_cfg.require_prepared_vision = options.require_prepared_vision;
     var embeddings = std.ArrayList(f32).empty;
     errdefer embeddings.deinit(allocator);
     const lengths = try allocator.alloc(usize, prepared.len);
@@ -2622,8 +2717,8 @@ fn encodePreparedImagesWithWeights(cb: *const ComputeBackend, allocator: std.mem
     var maximum: usize = 0;
     while (offset < prepared.len) {
         try cb.checkExecutionControl();
-        const count = try imageBatchCount(cfg, prepared[offset..], options);
-        const result = try encodePreparedImageBatch(cb, allocator, store, cfg, prepared[offset..][0..count]);
+        const count = try imageBatchCount(cfg, prepared[offset..], options, cb.kind() == .metal);
+        const result = try encodePreparedImageBatch(cb, allocator, store, execution_cfg, prepared[offset..][0..count]);
         defer allocator.free(result.embeddings);
         try embeddings.appendSlice(allocator, result.embeddings);
         @memset(lengths[offset..][0..count], result.tokens);
@@ -2636,6 +2731,8 @@ fn encodePreparedImagesWithWeights(cb: *const ComputeBackend, allocator: std.mem
 
 fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem.Allocator, weights: *ProjectorWeights, cfg: Config, prepared: []const PreparedImage, options: ImageBatchOptions) !ResidentProjectedImages {
     try options.validate();
+    var execution_cfg = cfg;
+    execution_cfg.require_prepared_vision = options.require_prepared_vision;
     if (prepared.len == 0 or prepared.len > 8) return error.InvalidImageBatch;
     // Joining heterogeneous cohorts must never invoke the download fallback.
     if (!cb.supportsCopyRows2D()) return error.ResidentImageOperationUnavailable;
@@ -2655,8 +2752,8 @@ fn encodePreparedImagesResidentWithWeights(cb: *const ComputeBackend, a: std.mem
     var maximum: usize = 0;
     while (offset < prepared.len) {
         try cb.checkExecutionControl();
-        const count = try imageBatchCount(cfg, prepared[offset..], options);
-        const result = try encodePreparedImageBatchResident(cb, a, weights, cfg, prepared[offset..][0..count]);
+        const count = try imageBatchCount(cfg, prepared[offset..], options, cb.kind() == .metal);
+        const result = try encodePreparedImageBatchResident(cb, a, weights, execution_cfg, prepared[offset..][0..count]);
         const added = count * result.tokens;
         defer cb.free(result.embeddings);
         if (!try cb.copyRows2D(a, tensor, rows, result.embeddings, 0, added, cfg.text_hidden)) return error.ResidentImageOperationUnavailable;
@@ -2740,16 +2837,20 @@ fn encodePreparedImageBatchResident(cb: *const ComputeBackend, allocator: std.me
     if (cfg.direct_unified) return encodePreparedUnifiedBatchResident(cb, allocator, store, cfg, prepared);
     const batch = prepared.len;
     const geometry = prepared[0].geometry;
+    if (cfg.require_prepared_vision) {
+        const ready = try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingVisionPlan(cb, .{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
+        if (!ready) return error.PreparedVisionUnavailable;
+    }
     var deferred = false;
     for (prepared) |item| {
         if (!std.meta.eql(geometry, item.geometry)) return error.IncompatibleImageBatch;
         deferred = deferred or item.source != null;
     }
     if (deferred) {
-        if (cb.kind() != .cuda or !store.huggingface or cb.vtable.concatRows2D == null) return error.UnsupportedResidentGemma4Vision;
+        if ((cb.kind() != .cuda and cb.kind() != .metal) or !store.huggingface or cb.vtable.concatRows2D == null) return error.UnsupportedResidentGemma4Vision;
         const sequence = geometry.grid_x * geometry.grid_y;
-        if (batch > 1 and cb.vtable.allocUninitF32Shape != null and cb.supportsCopyRows2D()) {
-            const patches = try prepareCudaBatchPatches(cb, allocator, cfg, prepared);
+        if ((batch > 1 or cb.kind() == .metal) and cb.vtable.allocUninitF32Shape != null and cb.supportsCopyRows2D()) {
+            const patches = try prepareDeviceBatchPatches(cb, allocator, cfg, prepared);
             defer cb.free(patches);
             const dim = cfg.patch_size * cfg.patch_size * 3;
             const weight = try projectorLinearWeightCt(cb, allocator, store, "v.patch_embd.weight", dim, cfg.vision_hidden);
@@ -2783,28 +2884,46 @@ fn encodePreparedImageBatchResident(cb: *const ComputeBackend, allocator: std.me
     return encodeVisionHiddenResident(cb, allocator, store, cfg, hidden, geometry, batch);
 }
 
-/// A single bounded patch matrix. The native resize kernel writes directly to
-/// final row spans. Declined preparation uploads/copies only that item's rows;
-/// no growing concatenations or per-item projection GEMMs remain.
-fn prepareCudaBatchPatches(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, prepared: []const PreparedImage) !CT {
+/// One bounded patch matrix. CUDA writes final row spans; Metal imports a
+/// singleton or copies cohort patches on device. CPU fallback uploads only
+/// that item's rows, without growing concatenations or per-item projections.
+fn prepareDeviceBatchPatches(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, prepared: []const PreparedImage) !CT {
     if (prepared.len == 0 or prepared.len > 8) return error.InvalidImageBatch;
     const geometry = prepared[0].geometry;
     const sequence = geometry.grid_x * geometry.grid_y;
     const dim = cfg.patch_size * cfg.patch_size * 3;
+    if (prepared.len == 1 and cb.kind() == .metal) if (prepared[0].source) |view| {
+        if (try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingImagePatches(cb, view, @intCast(geometry.width), @intCast(geometry.height))) |patches| return patches;
+    };
     const destination = (try cb.allocUninitF32Shape(&.{ @intCast(prepared.len * sequence), @intCast(dim) })) orelse return error.ResidentImageOperationUnavailable;
     errdefer cb.free(destination);
+    if (cb.kind() == .metal and prepared.len > 1) async_batch: {
+        var views: [8]image.ImageU8 = undefined;
+        for (prepared, 0..) |item, index| {
+            if (!std.meta.eql(geometry, item.geometry)) return error.IncompatibleImageBatch;
+            views[index] = item.source orelse break :async_batch;
+        }
+        if (try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingImageBatchInto(cb, views[0..prepared.len], @intCast(geometry.width), @intCast(geometry.height), destination)) return destination;
+    }
     for (prepared, 0..) |item, index| {
         try cb.checkExecutionControl();
         if (!std.meta.eql(geometry, item.geometry)) return error.IncompatibleImageBatch;
         if (item.source) |view| {
-            if (try cb.preprocessEmbeddingGemma2ImagePatchesInto(destination, index * sequence, view.data, view.width, view.height, try view.rowStride(), @intCast(geometry.width), @intCast(geometry.height))) continue;
-            if (try cb.preprocessEmbeddingGemma2ImagePatches(view.data, view.width, view.height, try view.rowStride(), @intCast(geometry.width), @intCast(geometry.height))) |patches| {
+            if (cb.kind() == .metal) {
+                if (try @import("../ops/metal_compute.zig").MetalCompute.prepareEmbeddingImagePatches(cb, view, @intCast(geometry.width), @intCast(geometry.height))) |patches| {
+                    defer cb.free(patches);
+                    if (!try cb.copyRows2D(a, destination, index * sequence, patches, 0, sequence, dim)) return error.ResidentImageOperationUnavailable;
+                    continue;
+                }
+            }
+            if (view.format == .rgb8) if (try cb.preprocessEmbeddingGemma2ImagePatchesInto(destination, index * sequence, view.data, view.width, view.height, try view.rowStride(), @intCast(geometry.width), @intCast(geometry.height))) continue;
+            if (view.format == .rgb8) if (try cb.preprocessEmbeddingGemma2ImagePatches(view.data, view.width, view.height, try view.rowStride(), @intCast(geometry.width), @intCast(geometry.height))) |patches| {
                 defer cb.free(patches);
                 if (!try cb.copyRows2D(a, destination, index * sequence, patches, 0, sequence, dim)) return error.ResidentImageOperationUnavailable;
                 continue;
-            }
+            };
         }
-        const pixels = if (item.source) |view| try image.preprocessImageViewRectScaledWithResample(a, view, @intCast(geometry.width), @intCast(geometry.height), cfg.image_mean, cfg.image_std, 1.0 / 255.0, .pillow_bicubic) else try a.dupe(f32, item.pixels);
+        const pixels = if (item.source) |view| try image.preprocessImageViewRectScaledWithResample(a, view, @intCast(geometry.width), @intCast(geometry.height), cfg.image_mean, cfg.image_std, 1.0 / 255.0, if (cb.kind() == .metal) .torchvision_bicubic else .pillow_bicubic) else try a.dupe(f32, item.pixels);
         defer a.free(pixels);
         const host = try hfPatchRows(a, pixels, cfg, geometry, 1);
         defer a.free(host);
@@ -2818,12 +2937,12 @@ fn prepareCudaBatchPatches(cb: *const ComputeBackend, a: std.mem.Allocator, cfg:
 fn prepareCudaImageHidden(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, prepared: PreparedImage) !CT {
     const geometry = prepared.geometry;
     if (prepared.source) |view| {
-        if (try cb.preprocessEmbeddingGemma2ImagePatches(view.data, view.width, view.height, try view.rowStride(), @intCast(geometry.width), @intCast(geometry.height))) |patches| {
+        if (view.format == .rgb8) if (try cb.preprocessEmbeddingGemma2ImagePatches(view.data, view.width, view.height, try view.rowStride(), @intCast(geometry.width), @intCast(geometry.height))) |patches| {
             defer cb.free(patches);
             const dim = cfg.patch_size * cfg.patch_size * 3;
             const weight = try projectorLinearWeightCt(cb, a, store, "v.patch_embd.weight", dim, cfg.vision_hidden);
             return cb.linearNoBias(patches, weight, geometry.grid_x * geometry.grid_y, dim, cfg.vision_hidden);
-        }
+        };
         const pixels = try image.preprocessImageViewRectScaledWithResample(a, view, @intCast(geometry.width), @intCast(geometry.height), cfg.image_mean, cfg.image_std, 1.0 / 255.0, .pillow_bicubic);
         defer a.free(pixels);
         return patchEmbedBatchTensor(cb, a, store, cfg, pixels, geometry, 1);
@@ -2846,21 +2965,48 @@ fn encodeVisionHiddenResident(cb: *const ComputeBackend, allocator: std.mem.Allo
 }
 
 fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, positioned: CT, geometry: Geometry, batch: usize) !ResidentImage {
+    return encodePositionedBatchResidentInto(cb, allocator, store, cfg, positioned, geometry, batch, null);
+}
+
+fn encodePositionedBatchResidentInto(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, positioned: CT, geometry: Geometry, batch: usize, output: ?CT) !ResidentImage {
     var hidden = positioned;
     var hidden_live = true;
     errdefer if (hidden_live) cb.free(hidden);
+    if (cfg.embedding_gemma2_f32_attention) if (cb.vtable.embeddingRotaryPrepare) |prepare| try prepare(cb.ptr, .{ .vision = true, .dim = @intCast(cfg.vision_hidden / cfg.head_count), .x = @intCast(geometry.grid_x), .y = @intCast(geometry.grid_y), .theta = cfg.rope_theta });
+    const previous = @import("../ops/metal_compute.zig").MetalCompute.requireEmbeddingVisionPlan(cb, cfg.require_prepared_vision);
+    defer _ = @import("../ops/metal_compute.zig").MetalCompute.requireEmbeddingVisionPlan(cb, previous);
+
+    if (visionFollowup(cb, store, cfg)) if (cb.vtable.embeddingVisionWorkspace) |prepare|
+        try prepare(cb.ptr, .{ .rows = batch * geometry.grid_x * geometry.grid_y, .hidden = cfg.vision_hidden, .intermediate = cfg.intermediate_size });
+    defer if (cb.vtable.embeddingVisionWorkspace) |prepare| {
+        prepare(cb.ptr, null) catch {};
+    };
 
     // Group only our own frames. External frame owners keep their lifetime
     // boundary; stage diagnostics keep their synchronized per-layer behavior.
     const can_group = cb.kind() == .metal and cfg.embedding_gemma2_f32_attention and
         !platform.env.getenvBool("TERMITE_METAL_DISABLE_GEMMA4_VISION_FRAMES") and
         platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_STAGES") == null and
-        !cb.decoderRuntimeHasActiveFrame();
+        !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame();
     const policy = @import("../pipelines/media_batch_policy.zig");
-    const group = if (can_group) policy.layerCapacity(@intCast(geometry.width), @intCast(geometry.height), batch, try visionLayerGroup(cfg, geometry.grid_x * geometry.grid_y)) else 1;
+    const admitted_layers = try visionLayerGroup(cfg, geometry.grid_x * geometry.grid_y);
+    // Two live one-layer groups fit the same admitted two-layer envelope.
+    // Larger images that admit only one layer keep the synchronous route.
+    const pipeline = can_group and admitted_layers >= 2 and store.gguf == null and
+        !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_PIPELINED_VISION") and
+        cb.decoderRuntimeSetWhisperPipelinedFrames(true);
+    const group = if (pipeline) @max(@as(usize, 1), admitted_layers / 2) else if (can_group) policy.layerCapacity(@intCast(geometry.width), @intCast(geometry.height), batch, admitted_layers) else 1;
     const started = platform.time.monotonicNs();
     var frame = false;
-    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+    var pending = false;
+    defer {
+        if (frame) cb.decoderRuntimeCancelFrame() catch {};
+        if (pending) cb.decoderRuntimeWaitSubmittedFrame() catch {};
+        if (pipeline) {
+            _ = cb.decoderRuntimeSetWhisperPipelinedFrames(false);
+            @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb) catch {};
+        }
+    }
     const resident_tower = if (store.huggingface and cb.kind() == .cuda)
         try cb.runEmbeddingGemma2VisionTower(hidden, geometry.grid_x * geometry.grid_y, geometry.grid_x, geometry.grid_y, batch)
     else
@@ -2876,9 +3022,24 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
             cb.free(hidden);
             hidden = next;
             if (frame and ((layer + 1) % group == 0 or layer + 1 == cfg.block_count)) {
-                try cb.decoderRuntimeSubmitAndWaitFrame();
-                frame = false;
-                if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+                if (pipeline and layer + 1 < cfg.block_count) {
+                    try @import("../ops/metal_compute.zig").MetalCompute.detachEmbeddingGemma2ActivationViews(cb);
+                    if (pending) {
+                        try cb.decoderRuntimeWaitSubmittedFrame();
+                        pending = false;
+                    }
+                    try cb.decoderRuntimeSubmitFrame();
+                    frame = false;
+                    pending = true;
+                } else {
+                    if (pending) {
+                        try cb.decoderRuntimeWaitSubmittedFrame();
+                        pending = false;
+                    }
+                    try cb.decoderRuntimeSubmitAndWaitFrame();
+                    frame = false;
+                    if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+                }
             }
             store.releaseCompletedNativeLayer();
             if (store.gguf == null) {
@@ -2887,7 +3048,9 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
             }
         }
     }
-    if (can_group) policy.layerCompleted(@intCast(geometry.width), @intCast(geometry.height), batch, group, cfg.block_count, platform.time.monotonicNs() - started);
+    if (can_group and !pipeline) policy.layerCompleted(@intCast(geometry.width), @intCast(geometry.height), batch, group, cfg.block_count, platform.time.monotonicNs() - started);
+    var projector_frame = try beginVisionBoundary(cb, store, cfg);
+    defer if (projector_frame) cb.decoderRuntimeCancelFrame() catch {};
     const standardized = try prepareSpatialProjector(cb, allocator, store, hidden, cfg, geometry, batch);
     cb.free(hidden);
     hidden_live = false;
@@ -2896,8 +3059,16 @@ fn encodePositionedBatchResident(cb: *const ComputeBackend, allocator: std.mem.A
     defer cb.free(normed_pooled);
 
     const projection_w = try projectorLinearWeightCt(cb, allocator, store, "mm.input_projection.weight", cfg.vision_hidden, cfg.text_hidden);
-    const projected = try cb.linearNoBias(normed_pooled, projection_w, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
-    errdefer cb.free(projected);
+    const projected = if (output) |target| blk: {
+        try cb.linearNoBiasInto(allocator, normed_pooled, projection_w, target, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
+        break :blk target;
+    } else try cb.linearNoBias(normed_pooled, projection_w, batch * geometry.tokenCount(), cfg.vision_hidden, cfg.text_hidden);
+    errdefer if (output == null) cb.free(projected);
+    if (projector_frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        projector_frame = false;
+        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+    }
     if (store.gguf == null) try embeddingGemma2StageTensor(cb, allocator, "image_projected", projected);
 
     return .{
@@ -3550,7 +3721,11 @@ fn audioQkvFits(rows: usize, width: usize) bool {
     return rows != 0 and width != 0 and bytes <= 64 * 1024 * 1024;
 }
 
-fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, input: CT, rows: usize, width: usize, layer: usize) !?ops.LinearTripleResult {
+const AudioQkv = union(enum) {
+    separate: ops.LinearTripleResult,
+    interleaved: struct { tensor: CT, specs: [3]ClampSpec },
+};
+fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *ProjectorWeights, input: CT, rows: usize, width: usize, layer: usize) !?AudioQkv {
     if (store.gguf != null or !cb.supportsLinearPackedNamed() or !audioQkvFits(rows, width) or audioHostOps().clamp) return null;
     var specs: [3]ClampSpec = undefined;
     var names: [3][]u8 = undefined;
@@ -3579,7 +3754,12 @@ fn packedAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, store: *Proje
     const clipped = if (specs[0].clipsInput()) try clampScalarCt(cb, a, input, rows, width, specs[0].input_min, specs[0].input_max) else input;
     defer if (clipped != input) cb.free(clipped);
     const packed_rows = (try cb.linearPackedNamed(clipped, &.{ names[0], names[1], names[2] }, &.{ width, width, width }, rows, width)) orelse return null;
+    if (cb.vtable.gemma4AudioPackedAttention != null and !audioHostOps().attention and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_PACKED_QKV")) return .{ .interleaved = .{ .tensor = packed_rows, .specs = specs } };
     defer cb.free(packed_rows);
+    return .{ .separate = try splitAudioQkv(cb, a, packed_rows, rows, width, specs) };
+}
+
+fn splitAudioQkv(cb: *const ComputeBackend, a: std.mem.Allocator, packed_rows: CT, rows: usize, width: usize, specs: [3]ClampSpec) !ops.LinearTripleResult {
     var results: [3]CT = undefined;
     var made: usize = 0;
     errdefer for (results[0..made]) |tensor| cb.free(tensor);
@@ -3606,7 +3786,43 @@ fn audioSelfAttention(
     const valid_mask = inputs.valid_mask;
     const rows = valid_mask.len;
     var buf: [128]u8 = undefined;
-    const packed_rows = try packedAudioQkv(cb, allocator, store, input, rows, cfg.audio_hidden, layer);
+    var key_buf: [192]u8 = undefined;
+    const rel_key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.relative_key.v1.{d}.{d}.{d}", .{ layer, cfg.attention_context_left, cfg.audio_hidden });
+    const cache_relative = store.gguf == null;
+    const rel = if (cache_relative) (try cb.modelConstant(rel_key, null)) orelse blk: {
+        const source = try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
+        break :blk try publishAudioConstant(cb, rel_key, source, true);
+    } else try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
+    defer cb.free(rel);
+    const choice = try packedAudioQkv(cb, allocator, store, input, rows, cfg.audio_hidden, layer);
+    const packed_rows: ?ops.LinearTripleResult = if (choice) |value| switch (value) {
+        .separate => |triple| triple,
+        .interleaved => |interleaved| blk: {
+            defer cb.free(interleaved.tensor);
+            if (cfg.attention_context_right == 0 and (inputs.segments.len == 0 or inputs.segment_valid != null)) {
+                var params = audioLocalAttentionParams(cfg, rows);
+                params.segmented = inputs.segments.len != 0;
+                params.packed_qkv = true;
+                for (interleaved.specs, 0..) |spec, i| {
+                    if (spec.output_min) |v| {
+                        params.packed_bounds[i * 2] = v;
+                        params.packed_clamp_flags |= @as(u32, 1) << @intCast(i * 2);
+                    }
+                    if (spec.output_max) |v| {
+                        params.packed_bounds[i * 2 + 1] = v;
+                        params.packed_clamp_flags |= @as(u32, 2) << @intCast(i * 2);
+                    }
+                }
+                const validity = if (params.segmented) inputs.segment_valid.? else inputs.valid_ct;
+                if (try cb.vtable.gemma4AudioPackedAttention.?(cb.ptr, interleaved.tensor, interleaved.tensor, interleaved.tensor, rel, inputs.scales[layer], validity, params)) |result| {
+                    defer cb.free(result);
+                    audioProfileMark(.attn_kernel);
+                    return linearNoBiasMaybeClipped(cb, allocator, store, result, try fmt(&buf, "a.blk.{d}.attn_out", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
+                }
+            }
+            break :blk try splitAudioQkv(cb, allocator, interleaved.tensor, rows, cfg.audio_hidden, interleaved.specs);
+        },
+    } else null;
     var remaining_k = if (packed_rows) |value| @as(?CT, value.second) else null;
     defer if (remaining_k) |tensor| cb.free(tensor);
     var remaining_v = if (packed_rows) |value| @as(?CT, value.third) else null;
@@ -3619,14 +3835,6 @@ fn audioSelfAttention(
     const v = remaining_v orelse try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(&buf, "a.blk.{d}.attn_v", .{layer}), rows, cfg.audio_hidden, cfg.audio_hidden);
     remaining_v = null;
     defer cb.free(v);
-    var key_buf: [192]u8 = undefined;
-    const rel_key = try std.fmt.bufPrint(&key_buf, "audio_tower.prepared.relative_key.v1.{d}.{d}.{d}", .{ layer, cfg.attention_context_left, cfg.audio_hidden });
-    const cache_relative = store.gguf == null;
-    const rel = if (cache_relative) (try cb.modelConstant(rel_key, null)) orelse blk: {
-        const source = try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
-        break :blk try publishAudioConstant(cb, rel_key, source, true);
-    } else try linearNoBiasMaybeClipped(cb, allocator, store, inputs.rel_in, try fmt(&buf, "a.blk.{d}.attn_k_rel", .{layer}), cfg.attention_context_left, cfg.audio_hidden, cfg.audio_hidden);
-    defer cb.free(rel);
     audioProfileMark(.attn_proj);
 
     const out_ct = try audioLocalAttention(cb, allocator, cfg, q, k, v, rel, layer, inputs);
@@ -4795,6 +5003,11 @@ test "embeddinggemma2 resident position rows preserve asymmetric x y order" {
 
 /// HF positions are axis-first. Gather only the x/y rows needed by this
 /// frame and add their sum on device, preserving the host addition order.
+fn beginVisionBoundary(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: Config) !bool {
+    if (!visionFollowup(cb, store, cfg) or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES") or cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return false;
+    return cb.decoderRuntimeBeginFrame();
+}
+
 fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.Allocator, patches: CT, positions: CT, hidden: usize, geometry: Geometry) !CT {
     const shape = try cb.tensorShape(positions, allocator);
     defer allocator.free(shape);
@@ -4803,6 +5016,28 @@ fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.All
     if (geometry.grid_x > per_axis or geometry.grid_y > per_axis) return error.InvalidPositionEmbeddingShape;
     const rows = geometry.batches * geometry.grid_x * geometry.grid_y;
     if (!(try cb.tensorShapeMatches(patches, &.{ @intCast(rows), @intCast(hidden) }) orelse false)) return error.InvalidPositionEmbeddingShape;
+    if (cb.kind() == .native) if (try cb.hostFloat32Read(patches)) |input| if (try cb.hostFloat32Read(positions)) |table| {
+        if (input.len != rows * hidden or table.len != 2 * per_axis * hidden) return error.InvalidPositionEmbeddingShape;
+        const result = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(hidden) })) orelse return error.UnsupportedPrimitiveOp;
+        errdefer cb.free(result);
+        const target = (try cb.hostFloat32Write(result)) orelse return error.UnsupportedPrimitiveOp;
+        // Portable SIMD preserves the reference's (x + y) + patch ordering.
+        for (0..rows) |row| {
+            const xbase = (row % geometry.grid_x) * hidden;
+            const ybase = (per_axis + (row / geometry.grid_x) % geometry.grid_y) * hidden;
+            const base = row * hidden;
+            var h: usize = 0;
+            while (h + 8 <= hidden) : (h += 8) {
+                const x: @Vector(8, f32) = table[xbase + h ..][0..8].*;
+                const y: @Vector(8, f32) = table[ybase + h ..][0..8].*;
+                const patch: @Vector(8, f32) = input[base + h ..][0..8].*;
+                target[base + h ..][0..8].* = patch + (x + y);
+            }
+            for (h..hidden) |tail| target[base + tail] = input[base + tail] + (table[xbase + tail] + table[ybase + tail]);
+        }
+        return result;
+    };
+    if (hidden == 768) if (try @import("../ops/metal_compute.zig").MetalCompute.videoPosition(cb, patches, positions, rows, geometry.grid_x, geometry.grid_y, per_axis)) |result| return result;
     const x = try allocator.alloc(i64, rows);
     defer allocator.free(x);
     const y = try allocator.alloc(i64, rows);
@@ -4811,13 +5046,22 @@ fn addPositionEmbeddingsDevice(cb: *const ComputeBackend, allocator: std.mem.All
         x[i] = @intCast(i % geometry.grid_x);
         y[i] = std.math.cast(i64, per_axis + (i / geometry.grid_x) % geometry.grid_y) orelse return error.InvalidPositionEmbeddingShape;
     }
+    var frame = if (cb.kind() == .metal and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_BOUNDARY_FRAMES") and !cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame()) try cb.decoderRuntimeBeginFrame() else false;
+    defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
     const xp = try cb.embeddingLookup(positions, x, rows, hidden);
     defer cb.free(xp);
     const yp = try cb.embeddingLookup(positions, y, rows, hidden);
     defer cb.free(yp);
     const offsets = try cb.add(xp, yp);
     defer cb.free(offsets);
-    return cb.add(patches, offsets);
+    const result = try cb.add(patches, offsets);
+    errdefer cb.free(result);
+    if (frame) {
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        frame = false;
+        try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
+    }
+    return result;
 }
 
 fn addPositionEmbeddings(
@@ -5001,6 +5245,34 @@ const VisionProfile = struct {
     }
 };
 
+fn visionFollowup(cb: *const ComputeBackend, store: *const ProjectorWeights, cfg: Config) bool {
+    return cb.kind() == .metal and store.gguf == null and cfg.embedding_gemma2_f32_attention and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_VISION_FOLLOWUP") and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP");
+}
+
+fn visionNorm(cb: *const ComputeBackend, cfg: Config, store: *ProjectorWeights, input: CT, residual: ?CT, index: usize) !CT {
+    if (visionFollowup(cb, store, cfg)) {
+        if (cb.vtable.embeddingVisionNorm) |run| if (try run(cb.ptr, input, residual, cfg.layer_norm_eps, index)) |out| return out;
+    }
+    if (cfg.require_prepared_vision) return error.PreparedVisionUnavailable;
+    var name: [128]u8 = undefined;
+    const suffix = switch (index % 4) {
+        0 => "ln1",
+        1 => "attn_post_norm",
+        2 => "ln2",
+        else => "ffn_post_norm",
+    };
+    const weight = try store.cachedWeightCt(try std.fmt.bufPrint(&name, "v.blk.{d}.{s}.weight", .{ index / 4, suffix }));
+    if (visionFollowup(cb, store, cfg)) {
+        if (residual) |res| if (try cb.rmsNormResidual(input, weight, res, cfg.vision_hidden, cfg.layer_norm_eps, 1, 1)) |out| return out;
+    }
+    const normalized = try cb.rmsNorm(input, weight, cfg.vision_hidden, cfg.layer_norm_eps);
+    if (residual) |res| {
+        defer cb.free(normalized);
+        return cb.add(res, normalized);
+    }
+    return normalized;
+}
+
 fn encoderBlockBatch(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -5022,32 +5294,23 @@ fn encoderBlockBatch(
     defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
     var profile = VisionProfile.init(cb, layer);
 
-    const ln1 = try store.cachedWeightCt(try fmt(&buf, "v.blk.{d}.ln1.weight", .{layer}));
-    const normed1 = try cb.rmsNorm(input, ln1, cfg.vision_hidden, cfg.layer_norm_eps);
+    const normed1 = try visionNorm(cb, cfg, store, input, null, layer * 4);
     defer cb.free(normed1);
 
     try profile.phase(cb, "attention_pre_norm");
     const attn = try selfAttentionBatch(cb, allocator, store, cfg, normed1, geometry, layer, &buf, batch, &profile);
     defer cb.free(attn);
-    const attn_post = try store.cachedWeightCt(try fmt(&buf, "v.blk.{d}.attn_post_norm.weight", .{layer}));
-    const attn_normed = try cb.rmsNorm(attn, attn_post, cfg.vision_hidden, cfg.layer_norm_eps);
-    defer cb.free(attn_normed);
-    const res1 = try cb.add(input, attn_normed);
+    const res1 = try visionNorm(cb, cfg, store, attn, input, layer * 4 + 1);
     errdefer cb.free(res1);
 
-    const ln2 = try store.cachedWeightCt(try fmt(&buf, "v.blk.{d}.ln2.weight", .{layer}));
-    const normed2 = try cb.rmsNorm(res1, ln2, cfg.vision_hidden, cfg.layer_norm_eps);
+    const normed2 = try visionNorm(cb, cfg, store, res1, null, layer * 4 + 2);
     defer cb.free(normed2);
 
     try profile.phase(cb, "attention_post_norm_residual");
     const ffn = try feedForward(cb, allocator, store, cfg, normed2, total, layer, &buf);
     defer cb.free(ffn);
     try profile.phase(cb, "ffn");
-    const ffn_post = try store.cachedWeightCt(try fmt(&buf, "v.blk.{d}.ffn_post_norm.weight", .{layer}));
-    const ffn_normed = try cb.rmsNorm(ffn, ffn_post, cfg.vision_hidden, cfg.layer_norm_eps);
-    defer cb.free(ffn_normed);
-
-    const res2 = try cb.add(res1, ffn_normed);
+    const res2 = try visionNorm(cb, cfg, store, ffn, res1, layer * 4 + 3);
     errdefer cb.free(res2);
     try profile.phase(cb, "ffn_post_norm_residual");
     if (frame) {
@@ -5080,8 +5343,13 @@ fn selfAttentionBatch(
 
     // EmbeddingGemma2 vision linears have no clipping or biases. The backend
     // may cache one admitted packed QKV projection for this immutable model.
-    var packed_qkv: ?@import("../ops/ops.zig").LinearTripleResult = null;
-    if (cfg.embedding_gemma2_f32_attention and store.gguf == null) {
+    const direct_heads = if (visionFollowup(cb, store, cfg) and cb.vtable.embeddingVisionQKV != null) blk: {
+        const params = visionNormRopeParams(total, cfg.vision_hidden, head_dim, geometry, cfg.layer_norm_eps, cfg.rope_theta, true) orelse break :blk null;
+        break :blk try cb.vtable.embeddingVisionQKV.?(cb.ptr, input, layer, params);
+    } else null;
+    if (cfg.require_prepared_vision and direct_heads == null) return error.PreparedVisionUnavailable;
+    var packed_qkv: ?@import("../ops/ops.zig").LinearTripleResult = if (direct_heads) |heads| .{ .first = heads.first, .second = heads.second, .third = heads.third } else null;
+    if (direct_heads == null and cfg.embedding_gemma2_f32_attention and store.gguf == null) {
         var names: [3][128]u8 = undefined;
         const q_name = try std.fmt.bufPrint(&names[0], "vision_tower.encoder.layers.{d}.self_attn.q_proj.linear.weight", .{layer});
         const k_name = try std.fmt.bufPrint(&names[1], "vision_tower.encoder.layers.{d}.self_attn.k_proj.linear.weight", .{layer});
@@ -5094,7 +5362,7 @@ fn selfAttentionBatch(
     defer if (remaining_v) |tensor| cb.free(tensor);
     var q = if (packed_qkv) |triple| triple.first else try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_q", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
     defer cb.free(q);
-    {
+    if (direct_heads == null) {
         const q_norm_w = try store.cachedWeightCt(try fmt(buf, "v.blk.{d}.attn_q_norm.weight", .{layer}));
         const normed = try rmsNormHeadChunksAnd2dRope(cb, allocator, q, q_norm_w, total, cfg.vision_hidden, head_dim, geometry, cfg.layer_norm_eps, cfg.rope_theta, true);
         cb.free(q);
@@ -5105,7 +5373,7 @@ fn selfAttentionBatch(
     var k = remaining_k orelse try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_k", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
     remaining_k = null;
     defer cb.free(k);
-    {
+    if (direct_heads == null) {
         const k_norm_w = try store.cachedWeightCt(try fmt(buf, "v.blk.{d}.attn_k_norm.weight", .{layer}));
         const normed = try rmsNormHeadChunksAnd2dRope(cb, allocator, k, k_norm_w, total, cfg.vision_hidden, head_dim, geometry, cfg.layer_norm_eps, cfg.rope_theta, false);
         cb.free(k);
@@ -5116,7 +5384,7 @@ fn selfAttentionBatch(
     var v = remaining_v orelse try linearNoBiasMaybeClipped(cb, allocator, store, input, try fmt(buf, "v.blk.{d}.attn_v", .{layer}), total, cfg.vision_hidden, cfg.vision_hidden);
     remaining_v = null;
     defer cb.free(v);
-    {
+    if (direct_heads == null) {
         const normed = try rmsNormHeadChunksNoScale(cb, allocator, v, total, cfg.vision_hidden, head_dim, cfg.layer_norm_eps);
         cb.free(v);
         v = normed;
@@ -5289,6 +5557,8 @@ fn feedForward(
     layer: usize,
     buf: *[128]u8,
 ) !CT {
+    if (visionFollowup(cb, store, cfg)) if (try cb.runEmbeddingVisionFFN(input, layer)) |out| return out;
+    if (cfg.require_prepared_vision) return error.PreparedVisionUnavailable;
     if (cfg.embedding_gemma2_f32_attention and store.gguf == null) {
         var names: [2][128]u8 = undefined;
         if (try cb.linearPackedNamed(input, &.{
@@ -6833,13 +7103,13 @@ fn checkGemma4ImageBatch(cb: ComputeBackend, reference: ComputeBackend) !void {
         defer a.free(expected.embeddings);
         for (mixed.embeddings[b * stride ..][0..stride], expected.embeddings) |v, e| try std.testing.expectApproxEqAbs(e, v, 2e-4);
     }
-    try std.testing.expectEqual(@as(usize, 1), try imageBatchCount(cfg, prepared[0..2], .{ .max_patch_tokens = 24 }));
-    try std.testing.expectError(error.ImageBatchBudgetExceeded, imageBatchCount(cfg, &.{prepared[0]}, .{ .max_scratch_bytes = 1 }));
-    try std.testing.expectError(error.InvalidImageBatch, imageBatchCount(cfg, &.{prepared[0]}, .{ .max_batch = 0 }));
+    try std.testing.expectEqual(@as(usize, 1), try imageBatchCount(cfg, prepared[0..2], .{ .max_patch_tokens = 24 }, false));
+    try std.testing.expectError(error.ImageBatchBudgetExceeded, imageBatchCount(cfg, &.{prepared[0]}, .{ .max_scratch_bytes = 1 }, false));
+    try std.testing.expectError(error.InvalidImageBatch, imageBatchCount(cfg, &.{prepared[0]}, .{ .max_batch = 0 }, false));
     try std.testing.expectError(error.IncompatibleImageBatch, encodePreparedImageBatch(&cb, a, &weights, cfg, prepared[1..3]));
     var invalid = prepared[0];
     invalid.geometry.grid_x = std.math.maxInt(usize);
-    try std.testing.expectError(error.InvalidImageBatch, imageBatchCount(cfg, &.{invalid}, .{}));
+    try std.testing.expectError(error.InvalidImageBatch, imageBatchCount(cfg, &.{invalid}, .{}, false));
 }
 
 test "gemma4 image batching native parity and isolation" {
@@ -7803,7 +8073,7 @@ fn checkBatchedPatchPreparation(cb: ComputeBackend, _: ComputeBackend) !void {
     var weights = ProjectorWeights.initHuggingFace(&cb, a);
     defer weights.deinit();
     const before = compute.embedding_gemma2_patch_rows_written;
-    const patches = try prepareCudaBatchPatches(&cb, a, cfg, &prepared);
+    const patches = try prepareDeviceBatchPatches(&cb, a, cfg, &prepared);
     defer cb.free(patches);
     try std.testing.expectEqual(@as(usize, 18), compute.embedding_gemma2_patch_rows_written - before);
     const weight = try projectorLinearWeightCt(&cb, a, &weights, "v.patch_embd.weight", 768, 16);
@@ -7964,9 +8234,9 @@ fn checkPackedAudioScalars(cb: ComputeBackend, _: ComputeBackend) !void {
     for (0..2) |pass| {
         const before = cb.trainingRuntimeStats().d2h_bytes;
         for (0..12) |layer| if (try packedAudioQkv(&cb, std.testing.allocator, &weights, input, 1, 16, layer)) |result| {
-            cb.free(result.first);
-            cb.free(result.second);
-            cb.free(result.third);
+            cb.free(result.separate.first);
+            cb.free(result.separate.second);
+            cb.free(result.separate.third);
         };
         if (pass == 1) try std.testing.expectEqual(before, cb.trainingRuntimeStats().d2h_bytes);
     }
@@ -8887,4 +9157,142 @@ fn checkNormClamp(cb: ComputeBackend, reference: ComputeBackend) !void {
 }
 test "embeddinggemma2 Metal RMS input-clamp fusion preserves weighted normalization and bound semantics" {
     try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkNormClamp);
+}
+
+fn checkPackedVisionHeads(cb: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const rows = 12;
+    const hidden = 128;
+    const dim = 64;
+    var values: [rows * hidden * 3]f32 = undefined;
+    var weights: [dim]f32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.13);
+    for (&weights, 0..) |*value, i| value.* = 0.5 + @as(f32, @floatFromInt(i)) / 64;
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&values, &.{ rows, hidden * 3 }));
+    defer cb.free(input);
+    const weight = try cb.fromFloat32Shape(&weights, &.{dim});
+    defer cb.free(weight);
+    const geometry = Geometry{ .width = 48, .height = 32, .grid_x = 3, .grid_y = 2, .pooled_x = 3, .pooled_y = 2 };
+    for (0..3) |part| {
+        var expected: [rows * hidden]f32 = undefined;
+        for (0..rows) |row| @memcpy(expected[row * hidden ..][0..hidden], values[row * hidden * 3 + part * hidden ..][0..hidden]);
+        var ones: [dim]f32 = @splat(1);
+        activations.rmsNorm(&expected, if (part == 2) &ones else &weights, dim, 1e-6);
+        if (part < 2) apply2dRope(&expected, rows, hidden, dim, geometry, 10000, part == 0);
+        var params = visionNormRopeParams(rows, hidden, dim, geometry, 1e-6, 10000, part == 0).?;
+        params.stride = hidden * 3;
+        params.start = @intCast(part * hidden);
+        params.rotate = @intFromBool(part < 2);
+        params.weighted = @intFromBool(part < 2);
+        const output = (try cb.visionNormRope(input, weight, params)).?;
+        defer cb.free(output);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 5e-6);
+        params.start = hidden * 3;
+        try std.testing.expectError(error.InvalidTensorShape, cb.visionNormRope(input, weight, params));
+    }
+}
+test "embeddinggemma2 packed vision heads preserve strided Q K V normalization rotation and batches on native" {
+    try @import("../ops/media_residency_test.zig").onNative(@import("../ops/media_residency_test.zig").noWeights, checkPackedVisionHeads);
+}
+test "embeddinggemma2 packed vision heads preserve strided Q K V normalization rotation and batches on Metal" {
+    try @import("../ops/media_residency_test.zig").onMetal(@import("../ops/media_residency_test.zig").noWeights, checkPackedVisionHeads);
+}
+
+/// Offline real-checkpoint ownership qualification. Interrupt an encoded layer,
+/// drain both pipeline slots, then compare the retried projection with a warm run.
+pub fn qualifyEmbeddingGemma2VisionCancellation(cb: *const ComputeBackend, a: std.mem.Allocator, raster: antfly_image.BorrowedRasterAttachment) !void {
+    var prepared = try prepareEmbeddingGemma2Raster(a, raster);
+    defer prepared.deinit();
+    var expected = try encodePreparedEmbeddingGemma2ImagesResident(cb, a, &.{prepared}, .{});
+    defer expected.deinit();
+    const values = try cb.toFloat32(expected.embeddings, a);
+    defer a.free(values);
+    const Stop = struct {
+        backend: *const ComputeBackend,
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.backend.decoderRuntimeHasActiveFrame()) {
+                self.checks += 1;
+                if (self.checks >= 32) return error.Cancelled;
+            }
+        }
+    };
+    var stop = Stop{ .backend = cb };
+    var cancelled = cb.*;
+    cancelled.execution_control = .{ .ptr = &stop, .check_fn = Stop.check };
+    try std.testing.expectError(error.Cancelled, encodePreparedEmbeddingGemma2ImagesResident(&cancelled, a, &.{prepared}, .{}));
+    try std.testing.expect(stop.checks >= 32);
+    try std.testing.expect(!cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame());
+    var retry = try encodePreparedEmbeddingGemma2ImagesResident(cb, a, &.{prepared}, .{});
+    defer retry.deinit();
+    const actual = try cb.toFloat32(retry.embeddings, a);
+    defer a.free(actual);
+    for (values, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-3);
+    std.debug.print("embeddinggemma2 vision_active_cancellation checks={d} retry_parity=true\n", .{stop.checks});
+}
+
+fn checkLazyVisionNormWeights(cb: ComputeBackend, _: ComputeBackend) !void {
+    const Probe = struct {
+        fn metal(_: *anyopaque) @import("../ops/ops.zig").BackendKind {
+            return .metal;
+        }
+        fn prepared(_: *anyopaque, input: CT, _: ?CT, _: f32, _: usize) !?CT {
+            return input;
+        }
+        fn decline(_: *anyopaque, _: CT, _: ?CT, _: f32, _: usize) !?CT {
+            return null;
+        }
+        fn missing(_: *anyopaque, _: []const u8) !CT {
+            return error.MissingVisionFallbackCoefficient;
+        }
+    };
+    var vtable = cb.vtable.*;
+    vtable.backendKind = Probe.metal;
+    vtable.embeddingVisionNorm = Probe.prepared;
+    vtable.getWeight = Probe.missing;
+    const backend = ComputeBackend{ .ptr = cb.ptr, .vtable = &vtable };
+    const a = std.testing.allocator;
+    var weights = ProjectorWeights.initHuggingFace(&backend, a);
+    defer weights.deinit();
+    const input = try cb.fromFloat32Shape(&.{1}, &.{ 1, 1 });
+    defer cb.free(input);
+    const cfg = embeddingGemma2ImageConfig();
+    for (0..64) |index| try std.testing.expectEqual(input, try visionNorm(&backend, cfg, &weights, input, null, index));
+    try std.testing.expectEqual(@as(u32, 0), weights.entries.count());
+    vtable.embeddingVisionNorm = Probe.decline;
+    try std.testing.expectError(error.MissingVisionFallbackCoefficient, visionNorm(&backend, cfg, &weights, input, null, 0));
+}
+test "embeddinggemma2 prepared vision norms bypass all fallback coefficient loads and load only on decline" {
+    try @import("../ops/media_residency_test.zig").onNative(@import("../ops/media_residency_test.zig").noWeights, checkLazyVisionNormWeights);
+}
+
+test "embeddinggemma2 FLAC duration admission rejects forged counts on every preparation path" {
+    const a = std.testing.allocator;
+    // One valid mono 16-bit constant subframe with 1024 samples, including
+    // header/frame CRCs. Keep this synthetic fixture local and dependency-free.
+    var storage: [55]u8 = @splat(0);
+    const bytes = &storage;
+    @memcpy(bytes[0..8], "fLaC\x80\x00\x00\x22");
+    std.mem.writeInt(u16, bytes[8..10], 1024, .big);
+    std.mem.writeInt(u16, bytes[10..12], 1024, .big);
+    @memcpy(bytes[42..55], &[_]u8{ 0xff, 0xf8, 0x70, 0x08, 0, 0x03, 0xff, 0xd6, 0, 0, 0, 0x6a, 0x77 });
+    const without_count = (@as(u64, 16000) << 44) | (@as(u64, 15) << 36);
+    std.mem.writeInt(u64, bytes[18..26], without_count | 1024, .big);
+    var valid = try prepareEmbeddingGemma2AudioWithPacking(a, bytes, .{}, true);
+    defer valid.deinit();
+    try std.testing.expect(valid.tokenCount() > 1);
+    std.mem.writeInt(u64, bytes[18..26], without_count | 640, .big);
+    try std.testing.expectEqual(@as(usize, 5), try embeddingGemma2EncodedAudioSequenceBound(bytes));
+    for ([_]bool{ false, true }) |device| {
+        try std.testing.expectError(error.InvalidAudioInput, prepareEmbeddingGemma2AudioWithPacking(a, bytes, .{}, device));
+    }
+    // Unknown sample counts remain valid and keep the full sequence envelope.
+    std.mem.writeInt(u64, bytes[18..26], without_count, .big);
+    try std.testing.expectEqual(@as(usize, 8192), try embeddingGemma2EncodedAudioSequenceBound(bytes));
+    var unknown = try prepareEmbeddingGemma2AudioWithPacking(a, bytes, .{}, true);
+    defer unknown.deinit();
+    try std.testing.expect(unknown.tokenCount() > 1);
 }

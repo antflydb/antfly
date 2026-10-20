@@ -12773,6 +12773,8 @@ fn processAsset(
     defer if (context_owned) if (context) |*value| value.deinit();
     var raw_owned = true;
     defer if (raw_owned) if (observed) |value| runtime.alloc.free(value);
+    var prior_input: ?@import("group_prior_input.zig").Input = null;
+    defer if (prior_input) |*value| value.deinit();
     const accepted = if (context) |*value| accepted: {
         var read = try runtime.store.beginProbe();
         defer read.abort();
@@ -12785,8 +12787,23 @@ fn processAsset(
         try finishAcceptedAssetGraph(runtime, request);
         return;
     }
+    // Accepted provenance already validates the saved causal guards. In
+    // particular, an unchanged segment outside a correction's finite horizon
+    // must not wait for earlier pending work just to reuse its current output.
+    if (request.prior_context_json.len > 0 and observed != null) {
+        const Render = struct {
+            fn render(ptr: *anyopaque, a: Allocator, prior_template: []const u8, item: std.json.Value) ![]const u8 {
+                const owner: *EnrichmentRuntime = @ptrCast(@alignCast(ptr));
+                const json = try @import("antfly-json").stringifyValueAlloc(a, item);
+                defer a.free(json);
+                return renderSourceTemplateText(a, owner.config, json, prior_template);
+            }
+        };
+        prior_input = try @import("group_prior_input.zig").capture(runtime.alloc, runtime.artifact_store orelse return error.ArtifactCatalogDrift, request, observed.?, if (context) |*value| value else null, .{ .ptr = runtime, .render = Render.render });
+    }
     const raw = observed orelse {
         if (context) |*value| {
+            std.log.debug("producer retirement replay artifact={s}", .{requestArtifactName(request)});
             const artifact = requestArtifactName(request);
             const output_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact);
             defer runtime.alloc.free(output_key);
@@ -12848,6 +12865,16 @@ fn processAsset(
     };
     var source_text_owned = true;
     defer if (source_text_owned) runtime.alloc.free(@constCast(source_text));
+    if (consumes_upstream and request.group_artifact_name.len > 0 and std.mem.eql(u8, request.upstream_artifact_name, request.group_artifact_name)) {
+        const wrapper = try std.json.parseFromSlice(std.json.Value, runtime.alloc, source_text, .{});
+        defer wrapper.deinit();
+        if (wrapper.value != .object) return error.GroupedSourceCorrupt;
+        const text = wrapper.value.object.get("text") orelse return error.GroupedSourceCorrupt;
+        if (text != .string) return error.GroupedSourceCorrupt;
+        const selected = try runtime.alloc.dupe(u8, text.string);
+        runtime.alloc.free(@constCast(source_text));
+        source_text = selected;
+    }
     if (source_text.len == 0) {
         if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
@@ -12928,6 +12955,20 @@ fn processAsset(
                     runtime.alloc.free(parts);
                     source_parts_json = amended;
                 }
+            }
+        }
+    }
+
+    if (prior_input) |value| {
+        const marker = try std.fmt.allocPrint(runtime.alloc, "[prior_context {x}]\n{s}", .{ &value.fingerprint, value.text });
+        defer runtime.alloc.free(marker);
+        const combined = try std.mem.join(runtime.alloc, "\n", &.{ source_text, marker });
+        runtime.alloc.free(@constCast(source_text));
+        source_text = combined;
+        if (source_parts_json) |parts| {
+            if (try appendNeighborContextTextPartAlloc(runtime.alloc, parts, marker)) |amended| {
+                runtime.alloc.free(parts);
+                source_parts_json = amended;
             }
         }
     }
@@ -25277,7 +25318,13 @@ fn getOrCreatePlannedRequests(
 
     const doc_store_key = try documentSourceStoreKeyAlloc(runtime, doc_key);
     defer runtime.alloc.free(doc_store_key);
-    const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse {
+    const observed = try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key);
+    defer if (observed) |value| runtime.alloc.free(value);
+    // Private group units own an ordinary producer DAG even after their source
+    // row is deleted. Plan its applicable templates so every descendant can
+    // publish accepted absence and retract its graph contributions. The empty
+    // planning object is never producer input: processAsset re-observes absence.
+    const raw = observed orelse if (@import("../group_source_identity.zig").isAnchor(doc_key)) "{}" else {
         const empty = try runtime.alloc.alloc(enrichment_types.GeneratedEnrichmentRequest, 0);
         try request_plan_cache.append(runtime.alloc, .{
             .doc_key = owned_doc_key,
@@ -25285,7 +25332,6 @@ fn getOrCreatePlannedRequests(
         });
         return request_plan_cache.items[request_plan_cache.items.len - 1].requests;
     };
-    defer runtime.alloc.free(raw);
 
     const explicit_dense: []const mapper.DenseEmbeddingWrite = &.{};
     const explicit_sparse: []const mapper.SparseEmbeddingWrite = &.{};
@@ -25301,6 +25347,54 @@ fn getOrCreatePlannedRequests(
         .requests = planned,
     });
     return request_plan_cache.items[request_plan_cache.items.len - 1].requests;
+}
+
+test "grouped sources production plans deleted unit descendants without source bytes" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "retired-units" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(alloc, store);
+    defer erased.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+    var manager = try index_manager_mod.IndexManager.init(alloc, path);
+    defer manager.deinit();
+    const groups = @import("../group_sources.zig");
+    const config = groups.Config{ .group_by = "thread", .order_by = "ordinal", .segment_by = "turn", .field = "text" };
+    try manager.addEnrichment(&store, .{ .name = "turns", .kind = .group, .source = config });
+    try manager.addEnrichment(&store, .{ .name = "claims", .kind = .asset, .source_artifact_name = "turns", .producer_json = "{\"type\":\"copy\"}" });
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .ownership = undefined,
+        .config = .{},
+    };
+    const anchor = try @import("../group_source_identity.zig").anchor(alloc, 1, groups.definitionDigest("turns", config), @splat(2));
+    defer alloc.free(anchor);
+    const unit = try std.fmt.allocPrint(alloc, "{s}/p/segment/0/u/unit", .{anchor});
+    defer alloc.free(unit);
+    var cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+    defer freeRequestPlanCache(alloc, &cache);
+    const planned = try getOrCreatePlannedRequests(&runtime, unit, &cache);
+    try std.testing.expectEqual(@as(usize, 2), planned.len);
+    try std.testing.expectEqualStrings("turns", planned[0].artifact_name);
+    try std.testing.expectEqualStrings("claims", planned[1].artifact_name);
+    try std.testing.expectEqualStrings("turns", planned[1].upstream_artifact_name);
+    const ordinary = try getOrCreatePlannedRequests(&runtime, "deleted-primary", &cache);
+    try std.testing.expectEqual(@as(usize, 0), ordinary.len);
 }
 
 fn flushGeneratedReplayWindowIfNeeded(
@@ -31834,7 +31928,7 @@ fn documentSourceStoreKeyAlloc(runtime: *EnrichmentRuntime, doc_key: []const u8)
 }
 
 fn documentSourceStoreKeyWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocator, doc_key: []const u8) ![]u8 {
-    return if (runtimeUsesRelationalBaseRows(runtime))
+    return if (runtimeUsesRelationalBaseRows(runtime) and !@import("../group_source_identity.zig").isAnchor(doc_key))
         try relational_store.keyAlloc(alloc, doc_key)
     else
         try internal_keys.documentKeyAlloc(alloc, doc_key);
@@ -32039,7 +32133,11 @@ fn extractModelChunkSource(a: Allocator, config: Config, raw: []const u8, reques
     var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return .{};
-    const field = parsed.value.object.get(request.source_field) orelse return .{};
+    const field = if (request.group_artifact_name.len > 0 and std.mem.eql(u8, request.source_field, "_group_unit.text")) blk: {
+        const unit = parsed.value.object.get("_group_unit") orelse return .{};
+        if (unit != .object) return .{};
+        break :blk unit.object.get("text") orelse return .{};
+    } else parsed.value.object.get(request.source_field) orelse return .{};
     if (field == .null) return .{};
     if (field == .string) {
         const text = try a.dupe(u8, field.string);
@@ -32077,7 +32175,7 @@ fn extractModelChunkSource(a: Allocator, config: Config, raw: []const u8, reques
     // Inline media is versioned with the document. Remote assets first pass
     // through the existing authorized asset materialization/retention path.
     const size = std.base64.standard.Decoder.calcSizeForSlice(data.string) catch return error.InvalidChunkSource;
-    if (size > document_extraction_mod.effectiveRemoteContentMaxDownloadSize(config.remote_content)) return error.SourceTooLarge;
+    if (size > try document_extraction_mod.effectiveRemoteContentMaxDownloadSize(config.remote_content)) return error.SourceTooLarge;
     const bytes = try a.alloc(u8, size);
     errdefer a.free(bytes);
     std.base64.standard.Decoder.decode(bytes, data.string) catch return error.InvalidChunkSource;
@@ -32094,7 +32192,7 @@ fn extractSourceText(
     if (request.source_template.len > 0) {
         // Render via Handlebars template
         const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
         if (rendered.len == 0) {
@@ -32108,7 +32206,11 @@ fn extractSourceText(
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(request.source_field) orelse return null;
+    const source = if (request.group_artifact_name.len > 0 and std.mem.eql(u8, request.source_field, "_group_unit.text")) blk: {
+        const unit = parsed.value.object.get("_group_unit") orelse return null;
+        if (unit != .object) return null;
+        break :blk unit.object.get("text") orelse return null;
+    } else parsed.value.object.get(request.source_field) orelse return null;
     if (source != .string) return null;
     return try alloc.dupe(u8, source.string);
 }
@@ -32143,13 +32245,14 @@ fn extractAssetSourceValue(
 ) !?[]const u8 {
     if (request.source_template.len > 0) {
         const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
         if (rendered.len == 0) {
             alloc.free(rendered);
             return null;
         }
+        errdefer alloc.free(rendered);
         try document_extraction_mod.validateInlineSourceSize(config.remote_content, rendered);
         return rendered;
     }
@@ -32157,7 +32260,11 @@ fn extractAssetSourceValue(
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{ .parse_numbers = false });
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(request.source_field) orelse return null;
+    const source = if (request.group_artifact_name.len > 0 and std.mem.eql(u8, request.source_field, "_group_unit.text")) blk: {
+        const unit = parsed.value.object.get("_group_unit") orelse return null;
+        if (unit != .object) return null;
+        break :blk unit.object.get("text") orelse return null;
+    } else parsed.value.object.get(request.source_field) orelse return null;
     return switch (source) {
         .null => null,
         .string => |value| blk: {
@@ -32183,12 +32290,12 @@ fn renderSourceParts(
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
         template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts)) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         }
     else
         template_remote.renderJsonToParts(alloc, request.source_template, raw_doc) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
     if (parts.len == 0) {
@@ -34173,7 +34280,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
     });
     defer db.close();
     try db.setSchemaJson(alloc, "{}");
-    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "body", .content_type = if (graph) "application/json" else "text/plain", .producer_json = if (generated) "{\"type\":\"generator\",\"config\":{}}" else "" });
+    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "body", .content_type = if (graph) "application/json" else "text/plain", .producer_json = if (generated) "{\"type\":\"generator\",\"config\":{\"provider\":\"ollama\",\"model\":\"fixture\"}}" else "" });
     try db.addEnrichment(.{ .name = "downstream", .kind = .asset, .source_artifact_name = "copy", .content_type = "text/plain" });
     if (graph) try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"copy\"}]}" });
     const asset_body = if (graph) "{\"type\":\"mentions\",\"target\":\"other\"}" else "hello";
@@ -34416,7 +34523,7 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
         .artifact_name = "generated",
         .doc_key = "blocked",
         .source_field = "body",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .execution_json = "{\"batch_items\":8,\"batch_bytes\":1}",
         .sequence = 7,
     };
@@ -34587,7 +34694,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .artifact_name = "conceptualize_v1",
         .doc_key = doc_key,
         .source_field = "name",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .neighbor_context_json = "{\"graph_index\":\"taxonomy\",\"direction\":\"out\",\"limit\":8}",
         .sequence = 3,
     };
@@ -34670,7 +34777,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         .name = "conceptualize_v1",
         .kind = .asset,
         .field = "name",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .neighbor_context = .{ .graph_index = "taxonomy" },
     });
     try db.batch(.{ .graph_writes = &.{
@@ -35527,6 +35634,36 @@ test "extractSourceText with template and invalid JSON returns null" {
     };
     const result = try extractSourceText(alloc, .{}, "not json", request);
     try std.testing.expect(result == null);
+}
+
+test "enrichment preserves snapshot failures instead of skipping source content" {
+    const Probe = struct {
+        fn text(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]const u8 {
+            const failure: *anyerror = @ptrCast(@alignCast(raw.?));
+            return failure.*;
+        }
+        fn parts(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]template.ContentPart {
+            const failure: *anyerror = @ptrCast(@alignCast(raw.?));
+            return failure.*;
+        }
+    };
+    var failure: anyerror = error.ResourceTemporarilyUnavailable;
+    template_remote.setHostRenderer(.{ .ctx = &failure, .render_json_to_text = Probe.text, .render_json_to_parts = Probe.parts });
+    defer template_remote.setHostRenderer(null);
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "url",
+        .source_template = "{{remoteMedia url=url}}",
+    };
+    const doc = "{\"url\":\"file:///media.png\"}";
+    for ([_]anyerror{ error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.Timeout, error.Canceled }) |err| {
+        failure = err;
+        try std.testing.expectError(err, extractSourceText(std.testing.allocator, .{}, doc, request));
+        try std.testing.expectError(err, extractAssetSourceValue(std.testing.allocator, .{}, doc, request));
+        try std.testing.expectError(err, renderSourceParts(std.testing.allocator, .{}, doc, request, null));
+    }
 }
 
 test "enrichment extractSourceText with template error directive fails instead of returning text" {

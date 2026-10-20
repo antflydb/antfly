@@ -72,7 +72,7 @@ pub fn captureSession(alloc: std.mem.Allocator, txn: anytype, request: @import("
     defer ordered.deinit();
     const binding = ordered.value.command.binding;
     const catalogs = try inventory.catalogs(txn);
-    if (binding.effect_protocol != 15 or binding.epoch != authority.epoch or
+    if (binding.effect_protocol < 15 or binding.epoch != authority.epoch or
         !std.mem.eql(u8, &binding.digest, &authority.catalog_digest) or
         !std.mem.eql(u8, &ordered.value.command.namespace, &authority.namespace) or
         !std.mem.eql(u8, &catalogs.digest(), &binding.digest) or !plan.matchesArtifactInventory(catalogs)) return error.ArtifactCatalogDrift;

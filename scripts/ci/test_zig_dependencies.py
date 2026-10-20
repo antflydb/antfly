@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -31,6 +32,70 @@ spec.loader.exec_module(deps)
 
 
 class DependencyTests(unittest.TestCase):
+    def test_workflow_action_bootstraps_an_older_checkout_and_validates_its_sources(
+        self,
+    ):
+        import shutil
+
+        root = Path(__file__).resolve().parents[2]
+        action = root / ".github/actions/prepare-zig-dependencies/action.yml"
+        shell = "\n".join(
+            line[8:]
+            for line in action.read_text().split("      run: |\n", 1)[1].splitlines()
+        )
+        empty = {"schema_version": 1, "mirror": deps.MIRROR, "packages": []}
+        with tempfile.TemporaryDirectory() as temp:
+            checkout = Path(temp)
+            trusted = checkout / ".ci-dependency-policy"
+            action_root = trusted / ".github/actions/prepare-zig-dependencies"
+            action_root.mkdir(parents=True)
+            policy = trusted / "scripts/ci"
+            policy.mkdir(parents=True)
+            shutil.copyfile(Path(deps.__file__), policy / "prepare_zig_dependencies.py")
+            (policy / "zig-dependencies.json").write_text(json.dumps(empty))
+            source = checkout / "zig/build.zig.zon"
+            source.parent.mkdir()
+            source.write_text(".{ .dependencies = .{} }")
+            env = {
+                **os.environ,
+                "ACTION_ROOT": str(action_root),
+                "GITHUB_WORKSPACE": str(checkout),
+                "MIRROR_ONLY": "false",
+                "ZIG_GLOBAL_CACHE_DIR": str(checkout / "cache"),
+            }
+
+            def run():
+                return subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", shell],
+                    cwd=checkout,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+
+            # An older branch has neither the action nor the bootstrap script.
+            accepted = run()
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertFalse(
+                (checkout / "scripts/ci/prepare_zig_dependencies.py").exists()
+            )
+            env["MIRROR_ONLY"] = "true"
+            self.assertEqual(run().returncode, 0)
+            source.write_text(
+                '.{ .dependencies = .{ .x = .{ .url = "https://unlisted.test/source", .hash = "unlisted" }, }, }'
+            )
+            rejected = run()
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn(
+                "remote package missing from pinned dependency inventory",
+                rejected.stderr,
+            )
+            # A proposed inventory must take precedence over the fallback.
+            proposed = checkout / "scripts/ci"
+            proposed.mkdir(parents=True)
+            (proposed / "zig-dependencies.json").write_text('{"schema_version":99}')
+            self.assertIn("unsupported Zig dependency inventory", run().stderr)
+
     def test_mirror_token_is_sent_only_to_the_exact_bucket(self):
         import io
 
