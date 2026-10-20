@@ -7469,10 +7469,64 @@ fn executeResolverCuration(handle: *Handle, name: []const u8, body: []const u8, 
     parsed.value.object.put(parsed.arena.allocator(), "action", .{ .string = effective_action }) catch |err| return capi.mapError(err);
     const request = std.json.Stringify.valueAlloc(handle.alloc, parsed.value, .{}) catch |err| return capi.mapError(err);
     defer handle.alloc.free(request);
-    const result = handle.database().curateResolverJsonAlloc(handle.alloc, name, request) catch |err| return capi.mapErrorContext(err, "curating resolver identity");
+    const result = curateResolverWithProposals(handle, name, request) catch |err| return capi.mapErrorContext(err, "curating resolver identity");
     defer handle.alloc.free(result);
     if (out) |buffer| buffer.* = copyJsonBuffer(result) catch |err| return capi.mapError(err);
     return .ok;
+}
+
+fn curateResolverWithProposals(handle: *Handle, name: []const u8, request_json: []const u8) ![]u8 {
+    if (request_json.len > 4 * 1024 * 1024) return error.ResolverCurationLimitExceeded;
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = handle.database();
+    const root = handle.parent_handle orelse handle;
+    const tables = @import("tables.zig");
+    try tables.loadCatalog(root);
+    const configs = try source.core.index_manager.listResolverIdentities(a);
+    const cfg = for (configs) |cfg| {
+        if (std.mem.eql(u8, cfg.name, name)) break cfg;
+    } else return error.ResolverNotFound;
+    // Resolver policy can precede creation of its destination table.
+    const destination = tables.get(root, cfg.table) catch |err| switch (err) {
+        error.UndefinedTable => return source.curateResolverJsonAlloc(handle.alloc, name, request_json),
+        else => return err,
+    };
+    var manifest = try proposalManifest(a, destination);
+    if (manifest.queue.proposals.len == 0) return source.curateResolverJsonAlloc(handle.alloc, name, request_json);
+    const was_dirty = manifest.refresh_required;
+    try refreshProposalManifest(root, a, cfg.table, &manifest);
+    if (manifest.pending_id != null) return error.ResolverCurationConflict;
+    const pure = @import("antfly_resolver").curation;
+    const owner = @import("../storage/db/resolver_curation.zig");
+    const intent = try std.json.parseFromSliceLeaky(pure.Request, a, request_json, .{});
+    if (intent.expected_revision) |expected| if (expected != cfg.curation_revision) return error.ResolverCurationConflict;
+    const origin = owner.manualOrigin(intent, try std.math.add(u64, cfg.curation_revision, 1));
+    var edit = try pure.planWithOrigin(a, cfg.curation_json, cfg.merges, try cfg.effectiveAliasesAlloc(a), intent, origin);
+    _ = try pure.recordSupersessions(a, &edit, manifest.queue.proposals, intent, origin);
+    var next = cfg;
+    next.merges = edit.merges;
+    next.curation_json = try std.json.Stringify.valueAlloc(a, edit.state, .{});
+    try next.validate();
+    const prospective = try pure.projectReceipts(a, manifest.queue.proposals, edit.state.proposals);
+    const queue_changed = for (manifest.queue.proposals, prospective) |before, after| {
+        if (before.state != after.state) break true;
+    } else false;
+    if (!queue_changed) {
+        if (was_dirty) try saveProposalManifest(a, destination, manifest);
+        return handle.alloc.dupe(u8, try owner.publishPlan(source, a, cfg, edit));
+    }
+    var queue = manifest.queue;
+    queue.proposals = prospective;
+    _ = try pure.parseState(a, try std.json.Stringify.valueAlloc(a, queue, .{}));
+    manifest.refresh_required = true;
+    try saveProposalManifest(a, destination, manifest);
+    const response = try owner.publishPlan(source, a, cfg, edit);
+    manifest.queue = queue;
+    manifest.refresh_required = false;
+    try saveProposalManifest(a, destination, manifest);
+    return handle.alloc.dupe(u8, response);
 }
 
 /// Commit while holding writer admission, then observe detached replay while
@@ -7667,6 +7721,8 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     tables.load(handle) catch |err| return capi.mapError(err);
     const entity_db = tables.get(handle, entity_table.bytes()) catch |err| return capi.mapError(err);
     var manifest = proposalManifest(a, entity_db) catch |err| return capi.mapError(err);
+    const was_dirty = manifest.refresh_required;
+    refreshProposalManifest(handle, a, entity_table.bytes(), &manifest) catch |err| return capi.mapError(err);
     if (input.action != .redirects and manifest.pending_id != null) return capi.mapError(error.ResolverCurationConflict);
     const Pending = struct { db: *db_mod.DB, source: []const u8, cfg: db_mod.ResolverConfig, request: pure.curation.Request, edit: pure.curation.Plan };
     var pending: std.ArrayListUnmanaged(Pending) = .empty;
@@ -7712,9 +7768,14 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     var prospective = manifest.queue;
     for (pending.items) |item| prospective.proposals = pure.curation.projectReceipts(a, prospective.proposals, item.edit.state.proposals) catch |err| return capi.mapError(err);
     _ = pure.curation.parseState(a, std.json.Stringify.valueAlloc(a, prospective, .{}) catch |err| return capi.mapError(err)) catch |err| return capi.mapError(err);
+    const queue_changed = for (manifest.queue.proposals, prospective.proposals) |before, after| {
+        if (before.state != after.state) break true;
+    } else false;
     var complete = true;
-    if (pending.items.len > 0 and manifest.queue.proposals.len > 0) {
+    if (queue_changed) {
         manifest.refresh_required = true;
+        saveProposalManifest(a, entity_db, manifest) catch |err| return capi.mapError(err);
+    } else if (was_dirty and input.action != .redirects) {
         saveProposalManifest(a, entity_db, manifest) catch |err| return capi.mapError(err);
     }
     for (pending.items) |item| {
@@ -7739,8 +7800,10 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
         value.object.put(a, "source_table", .{ .string = item.source }) catch |err| return capi.mapError(err);
         results.append(value) catch |err| return capi.mapError(err);
     }
-    manifest.refresh_required = !complete;
-    if (input.action != .redirects and manifest.queue.proposals.len > 0) saveProposalManifest(a, entity_db, manifest) catch |err| return capi.mapError(err);
+    if (queue_changed) {
+        manifest.refresh_required = !complete;
+        saveProposalManifest(a, entity_db, manifest) catch |err| return capi.mapError(err);
+    }
     const response = std.json.Stringify.valueAlloc(a, .{ .entity_table = entity_table.bytes(), .key = entity_key.bytes(), .atomicity = "resolver", .complete = complete, .results = std.json.Value{ .array = results } }, .{}) catch |err| return capi.mapError(err);
     out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
     admitted = false;
@@ -7767,6 +7830,49 @@ fn proposalManifest(a: std.mem.Allocator, db: *db_mod.DB) !ProposalManifest {
     const bytes = db.core.store.get(a, proposal_store_key) catch |err| return if (err == error.NotFound) .{} else err;
     return @import("antfly_resolver").curation.parseProposalManifest(a, bytes);
 }
+/// Reconcile every durable supersession before any subsequent queue write can
+/// clear the dirty marker. The open-ID index and output records are allocated
+/// once; resolver catalogs and evidence are released after each source scan.
+fn refreshProposalManifest(handle: *Handle, a: std.mem.Allocator, table: []const u8, manifest: *ProposalManifest) !void {
+    if (!manifest.refresh_required) return;
+    const pure = @import("antfly_resolver").curation;
+    const records = try a.dupe(pure.Proposal, manifest.queue.proposals);
+    var open_ids: std.StringHashMapUnmanaged(usize) = .empty;
+    for (records, 0..) |proposal, i| if (proposal.state == .open) try open_ids.put(a, proposal.id, i);
+    if (open_ids.count() > 0) {
+        try @import("tables.zig").load(handle);
+        var sources: std.ArrayListUnmanaged(*db_mod.DB) = .empty;
+        try sources.append(a, &handle.db);
+        var it = handle.embedded_tables.valueIterator();
+        while (it.next()) |entry| try sources.append(a, &entry.*.db);
+        for (sources.items) |source| {
+            var scratch_arena = std.heap.ArenaAllocator.init(handle.alloc);
+            defer scratch_arena.deinit();
+            const scratch = scratch_arena.allocator();
+            for (try source.core.index_manager.listResolverIdentities(scratch)) |cfg| {
+                if (!std.mem.eql(u8, cfg.table, table)) continue;
+                const state = try pure.parseState(scratch, cfg.curation_json);
+                for (state.proposals) |receipt| if (receipt.state == .superseded) {
+                    if (open_ids.get(receipt.id)) |i| {
+                        records[i].state = .superseded;
+                        if (receipt.decided) |old| {
+                            var origin = old;
+                            origin.actor = try a.dupe(u8, old.actor);
+                            origin.reason = try a.dupe(u8, old.reason);
+                            origin.proposal_id = if (old.proposal_id) |value| try a.dupe(u8, value) else null;
+                            origin.cascade_from = if (old.cascade_from) |value| try a.dupe(u8, value) else null;
+                            records[i].decided = origin;
+                        }
+                        _ = open_ids.remove(receipt.id);
+                    }
+                };
+            }
+        }
+    }
+    manifest.queue.proposals = records;
+    manifest.refresh_required = false;
+}
+
 const ProposalObservation = struct { applied: bool, rows: std.json.Value };
 /// A retry observes receipts, never replays the accepted action. Current policy
 /// can contain later corrections, whose progress is a conservative wait floor.
@@ -7826,33 +7932,7 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
         if (db.maintenanceRequiresOrderedApply() catch |err| return capi.mapError(err)) return capi.mapError(error.OrderedResolverReviewRequired);
     }
     var manifest = proposalManifest(a, db) catch |err| return capi.mapError(err);
-    const queue_records = a.dupe(pure.Proposal, manifest.queue.proposals) catch |err| return capi.mapError(err);
-    var open_ids: std.StringHashMapUnmanaged(usize) = .empty;
-    for (queue_records, 0..) |proposal, i| if (proposal.state == .open) {
-        open_ids.put(a, proposal.id, i) catch |err| return capi.mapError(err);
-    };
-    if (manifest.refresh_required and open_ids.count() > 0) {
-        tables.load(handle) catch |err| return capi.mapError(err);
-        var owners: std.ArrayListUnmanaged(*db_mod.DB) = .empty;
-        owners.append(a, &handle.db) catch |err| return capi.mapError(err);
-        var owner_it = handle.embedded_tables.valueIterator();
-        while (owner_it.next()) |entry| owners.append(a, &entry.*.db) catch |err| return capi.mapError(err);
-        for (owners.items) |source| {
-            const configs = source.core.index_manager.listResolverIdentities(a) catch |err| return capi.mapError(err);
-            for (configs) |cfg| {
-                if (!std.mem.eql(u8, cfg.table, table.bytes())) continue;
-                const state = pure.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err);
-                for (state.proposals) |receipt| if (receipt.state == .superseded) {
-                    if (open_ids.get(receipt.id)) |i| {
-                        queue_records[i].state = .superseded;
-                        queue_records[i].decided = receipt.decided;
-                    }
-                };
-            }
-        }
-        manifest.queue.proposals = queue_records;
-        manifest.refresh_required = false;
-    }
+    refreshProposalManifest(handle, a, table.bytes(), &manifest) catch |err| return capi.mapError(err);
     if (operation_name == .list) {
         // JSON options are converted to the same keyset query used by HTTP.
         const Query = struct { state: enum { open, accepted, rejected, superseded, all } = .open, action: ?pure.EntityAction = null, cursor: []const u8 = "", limit: u16 = 64 };

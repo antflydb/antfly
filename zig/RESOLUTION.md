@@ -1846,7 +1846,11 @@ accept or reject it. Both default and database/namespace-qualified routes are
 available. Accept uses the entity planner and returns its curation result. A
 merge rejection can atomically pin the proposed pair distinct. Accepted effects
 carry `origin: review`. Direct entity corrections supersede affected open
-proposals. Terminal proposals retain their identity: repeated screening does not
+proposals. Lite resolver-level edits settle the same destination queue through
+atomic source receipts. HTTP source-only edits are rejected with
+`ResolverNamespaceCurationRequired` once a namespace has entity proposals;
+clients use the entity resources so policy and queue changes share one CAS.
+Terminal proposals retain their identity: repeated screening does not
 reopen a rejection, and repeated acceptance does not override a later correction.
 
 The stable ID hashes the action and length-framed JSON keys, excluding confidence,
@@ -1864,7 +1868,11 @@ catalog retries and Raft replay. Queue-only edits leave resolver policy revision
 unchanged and do not enqueue resolver work. Lite retains the existing per-resolver
 atomicity of entity actions: each accepted effect and its decision receipt share
 one catalog publication. A durable pending decision fences competing decisions
-and supports resuming a partial fanout after reopening. `complete: false` means
+and supports resuming a partial fanout after reopening. Every queue writer first
+reconciles a dirty manifest across all source namespaces, including unrelated
+entity and resolver edits. Recovery indexes open IDs once and releases each
+source catalog's scratch memory before reading the next source. Edits that do
+not affect proposals skip extra queue publications. `complete: false` means
 the caller should retry the same decision. Effect options and attribution remain
 frozen, while revision fences and wait budgets belong to the current request.
 HTTP initial decisions and terminal retries return the same decision envelope,

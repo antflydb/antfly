@@ -555,8 +555,13 @@ fn execute(server: anytype, alloc: std.mem.Allocator, op: Operation, table_name:
 
 fn requireSourceCuration(a: std.mem.Allocator, indexes_json: []const u8, key_template: []const u8) !void {
     if (indexes_json.len == 0) return;
-    const namespaces = try curation.namespacesFromValue(a, try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{}));
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{});
+    const namespaces = try curation.namespacesFromValue(a, root);
     for (namespaces.namespaces) |namespace| if (std.mem.eql(u8, namespace.key_template, key_template)) return error.ResolverNamespaceCurationRequired;
+    // Once entity judgments exist, corrections must use their destination
+    // authority. A source-only CAS cannot atomically settle that table's queue.
+    const queue = try proposalQueue(a, root);
+    for (queue.proposals) |proposal| if (curation.keyInNamespace(key_template, proposal.key)) return error.ResolverNamespaceCurationRequired;
 }
 
 fn namespaceAdopted(stored: curation.Namespaces, key_template: []const u8) bool {
@@ -765,7 +770,8 @@ fn observeProposalDecision(server: anytype, alloc: std.mem.Allocator, a: std.mem
         const deadline = @import("antfly_platform").time.monotonicNs() +| @as(u64, if (wait) |w| w.timeout_ms else 0) * std.time.ns_per_ms;
         for (replay.consumers.items) |consumer| {
             const namespace = replay.namespaces.get(consumer.key_template).?;
-            const remaining = (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms;
+            const remaining_ns = deadline -| @import("antfly_platform").time.monotonicNs();
+            const remaining = (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
             const progress = try observeAccepted(server, a, consumer.table_name, consumer.target, namespace.revision, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request);
             applied = applied and progress.applied;
             try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .changed = false, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));
@@ -951,7 +957,8 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     const deadline = @import("antfly_platform").time.monotonicNs() +| @as(u64, if (input.wait) |wait| wait.timeout_ms else 0) * std.time.ns_per_ms;
     for (discovery.consumers.items) |consumer| {
         const namespace = namespaces.get(consumer.key_template).?;
-        const remaining = (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms;
+        const remaining_ns = deadline -| @import("antfly_platform").time.monotonicNs();
+        const remaining = (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
         const progress = try observeAccepted(server, a, consumer.table_name, consumer.target, namespace.revision, if (remaining > 0) .{ .timeout_ms = @intCast(remaining) } else null, request);
         applied = applied and progress.applied;
         try results.append(try json(a, .{ .source_table = consumer.table_name, .resolver = consumer.target.name, .absorbed = absorbed_results.get(consumer.key_template) orelse &.{}, .changed = changed, .revision = namespace.revision, .replay_sequence = namespace.revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .@"error" = progress.observation_error, .applied = progress.applied, .progress = progress }));

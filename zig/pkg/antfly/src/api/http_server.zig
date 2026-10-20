@@ -58258,6 +58258,30 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/race\",\"to\":\"concept/target\"}", 409);
     try std.testing.expectEqual(@as(u64, 0), source.commits);
     source.destination_cut_changed = false;
+    {
+        // Creating a proposal is queue-only, but establishes destination-owned
+        // judgments. Source-only edits cannot bypass that authority before the
+        // first entity action has materialized a namespace policy.
+        var queued = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/queued\"}", "", .{});
+        defer queued.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), queued.status);
+        try std.testing.expect(std.mem.indexOf(u8, source.tables[1].indexes_json, "_resolver_namespaces") == null);
+        const before_guard = source.commits;
+        for ([_]StatusSource{ source.iface(), source.narrowIface() }) |iface| {
+            source.forbid_snapshot = false;
+            server.source = iface;
+            try Run.call(&server, .suppress, "source", "concepts", "", "{\"keys\":[\"concept/queued\"]}", 409);
+        }
+        try std.testing.expectEqual(before_guard, source.commits);
+        // Remove only this isolated fixture's queue; the legacy-path checks
+        // below start from their original empty destination catalog.
+        if (source.owned[1]) |bytes| alloc.free(bytes);
+        source.owned[1] = null;
+        source.tables[1].indexes_json = "{}";
+        source.commits = 0;
+        source.forbid_snapshot = true;
+        server.source = source.narrowIface();
+    }
     try Run.call(&server, .list, "source", "", "", "", 200);
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
@@ -58507,7 +58531,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         source.forbid_snapshot = false;
         server.source = source.iface();
         source.expire_wait = true;
-        var waited = try resources.handle(&server, alloc, .proposal_accept, "entities", "", proposal_id, "{\"wait\":{\"timeout_ms\":1}}", "", .{});
+        var waited = try resources.handle(&server, alloc, .proposal_accept, "entities", "", proposal_id, "{\"wait\":{\"timeout_ms\":100}}", "", .{});
         defer waited.deinit(alloc);
         source.expire_wait = false;
         try std.testing.expectEqual(@as(u16, 202), waited.status);

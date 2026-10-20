@@ -568,6 +568,8 @@ pub fn supersede(a: std.mem.Allocator, current: []const Proposal, request: Reque
     const key = request.from orelse request.key;
     if (key) |value| try affected.put(a, value, {});
     for (request.keys) |value| try affected.put(a, value, {});
+    if (request.add) |selection| for (selection.keys) |value| try affected.put(a, value, {});
+    if (request.remove) |selection| for (selection.keys) |value| try affected.put(a, value, {});
     for (absorbed) |value| try affected.put(a, value.key, {});
     const other = request.to orelse request.target;
     const proposals = try a.dupe(Proposal, current);
@@ -584,7 +586,7 @@ pub fn supersede(a: std.mem.Allocator, current: []const Proposal, request: Reque
             .merge, .unmerge, .suppress, .unsuppress => references,
             // A distinct assertion settles both directions of a merge judgment.
             .distinct => same_pair and (proposal.action == .distinct or proposal.action == .merge),
-            .suppressions => false,
+            .suppressions => references,
         };
         if (moot) {
             proposal.state = .superseded;
