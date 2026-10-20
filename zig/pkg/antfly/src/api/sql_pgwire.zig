@@ -179,7 +179,7 @@ pub const Adapter = struct {
         try validateRequest(request);
         if (self.server.cfg.user_manager != credential.manager) return error.Unauthorized;
         var job: DeliveryJob = .{ .adapter = self, .credential = credential, .request = request, .work = work };
-        const protected = @import("sql_control.zig").classify(request.statement);
+        const protected = deliveryIsControl(request);
         const io = if (protected) try self.server.sqlControlIo() else try self.server.sqlExecutionIo();
         var future = io.concurrent(DeliveryJob.run, .{&job}) catch return error.SqlWriteCapacityUnavailable;
         job.done.waitUncancelable(request.io);
@@ -1021,6 +1021,13 @@ const OwnedRead = struct {
     }
 };
 
+// Materializing a held cursor during COMMIT delivers an existing immutable
+// page. Its statement remains SELECT; retain the internal completion authority
+// for both physical worker selection and runnable CPU admission.
+fn deliveryIsControl(request: wire.Request) bool {
+    return request.completion_drain or @import("sql_control.zig").classify(request.statement);
+}
+
 // This consumer is independent of OwnedRead's parked producer. The row and
 // allocator are borrowed only until the shared worker has physically joined.
 const DeliveryJob = struct {
@@ -1044,7 +1051,7 @@ const DeliveryJob = struct {
     }
     fn runInner(self: *@This()) !void {
         try self.request.check();
-        const protected = @import("sql_control.zig").classify(self.request.statement);
+        const protected = deliveryIsControl(self.request);
         const options = admissionOptionsWithBytes(self.request, @sizeOf(DeliveryJob));
         // The result already owns its read/memory admission. Reacquiring it
         // here could wait for this very stream to retire. Worker and runnable
@@ -1495,6 +1502,35 @@ test "SQL pgwire dispatch preserves imported executor authority including unavai
         try std.testing.expectEqual(@as(usize, 0), raw_probe.attempts);
         try std.testing.expectEqual(i * 3, imported_probe.attempts);
     }
+
+    // A held cursor keeps its SELECT text while COMMIT drains its page. The
+    // consumer must use imported control IO, while fresh SELECT and mixed
+    // statements still use the ordinary execution owner.
+    var control_probe: Probe = .{};
+    const control_io: std.Io = .{ .userdata = &control_probe, .vtable = &vtable };
+    api.cfg.imported_runtime_io.?.sql_execution = imported_io;
+    api.cfg.imported_runtime_io.?.sql_control = control_io;
+    const identity: wire.Identity = .{ .context = &credential, .release = Credential.release };
+    const Never = struct {
+        fn run(_: *anyopaque, _: ?wire.ReadControl) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const work: wire.DeliveryWork = .{ .context = &raw_probe, .run = Never.run };
+    const execution_before = imported_probe.attempts;
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, Adapter.deliverRow(&adapter, identity, request, work));
+    var drain = request;
+    drain.completion_drain = true;
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, Adapter.deliverRow(&adapter, identity, drain, work));
+    var rollback = request;
+    rollback.statement = "ROLLBACK";
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, Adapter.deliverRow(&adapter, identity, rollback, work));
+    var mixed = request;
+    mixed.statement = "COMMIT; SELECT 1";
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, Adapter.deliverRow(&adapter, identity, mixed, work));
+    try std.testing.expectEqual(execution_before + 2, imported_probe.attempts);
+    try std.testing.expectEqual(@as(usize, 2), control_probe.attempts);
+    try std.testing.expectEqual(@as(usize, 0), raw_probe.attempts);
 }
 
 test "SQL pgwire native execute arguments use bounded scalar semantics without table access" {

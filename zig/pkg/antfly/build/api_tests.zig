@@ -1247,7 +1247,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_protocol_pooling_tests = b.addTest(.{
         .name = "sql-protocol-pooling-tests",
         .root_module = options.api_http_runtime_test_mod,
-        .filters = &.{"httpx SQL executes one relational page with exact integer parameters"},
+        .filters = &.{ "httpx SQL executes one relational page with exact integer parameters", "SQL pgwire dispatch preserves imported executor authority including unavailable views" },
         .max_rss = 12 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });

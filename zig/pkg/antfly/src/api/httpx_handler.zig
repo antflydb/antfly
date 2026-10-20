@@ -15502,9 +15502,21 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql");
     defer directory.cleanup();
     const resources = @import("antfly_local_sources").storage_resource_manager;
-    var storage_manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 64 << 20 }, .identity_allocator = alloc });
+    // The default native control/recovery and Raft lanes prepay their entire
+    // guarded stack ceilings (over 1 GiB with the pinned pthread profile).
+    // Fund that floor plus SQL/request envelopes without shrinking any lane.
+    // Socket qualification later exhausts every remaining storage credit.
+    var storage_manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 2 << 30 }, .identity_allocator = alloc });
     defer storage_manager.deinit(alloc);
-    var db = try db_mod.DB.open(alloc, directory.path(), .{ .resource_manager = &storage_manager });
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .io_threaded,
+        .memory_parent = storage_manager.memoryParentPort(),
+        .shared_sql_memory_parent = storage_manager.memoryParentPort(),
+    });
+    defer backend_runtime.deinit();
+    try std.testing.expect(backend_runtime.ptr().sharedSqlMemoryStats(.control) != null);
+    if (std.Thread.use_pthreads) try std.testing.expect(backend_runtime.ptr().runtimeMemoryStats().?.control_reserved_bytes > 64 << 20);
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .resource_manager = &storage_manager, .backend_runtime = backend_runtime.ptr() });
     defer db.close();
     try db.setSchemaJson(alloc, schema_json);
     {
@@ -15518,8 +15530,6 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
     }
     var reads = table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
-    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
-    defer backend_runtime.deinit();
     var prepared_backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer prepared_backend.close();
     var prepared_store = try prepared_backend.runtimeStore(alloc, .{ .name = "http-prepared-test" });
