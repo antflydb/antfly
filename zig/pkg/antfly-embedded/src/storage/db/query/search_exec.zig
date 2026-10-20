@@ -193,7 +193,16 @@ pub const OrderedTextCandidates = struct {
     close: *const fn (*anyopaque) void,
 };
 
+pub const LogicalSourceRow = @import("../../logical_source.zig").Row;
+pub const LogicalSourceReader = struct {
+    ctx: *anyopaque,
+    load: *const fn (*anyopaque, Allocator, []const []const u8, []const []const u8) anyerror![]LogicalSourceRow,
+    close: *const fn (*anyopaque) void,
+};
+pub const LogicalSourceOpener = *const fn (?*anyopaque, Allocator) anyerror!?LogicalSourceReader;
+
 pub const SearchTextQueryExecutor = struct {
+    open_logical_sources: ?LogicalSourceOpener = null,
     load_many_stored_values: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
 
     open_ordered_candidates: ?*const fn (?*anyopaque, Allocator, types.SearchRequest, *const index_mod.IndexSnapshot) anyerror!?OrderedTextCandidates = null,
@@ -1847,6 +1856,7 @@ const NativeDocIdConstraints = struct {
 };
 
 pub const StructuredFilterResolverExecutor = struct {
+    open_logical_sources: ?LogicalSourceOpener = null,
     load_many_stored_values: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
 
     load_stored: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8 = null,
@@ -8921,7 +8931,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
     const snapshot_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     const snapshot = text_entry.persistent.acquireSnapshot();
     defer snapshot.release();
-    var values = ValueExecution{ .a = alloc, .snapshot = snapshot, .req = if (logical) |l| l.request else .{}, .load_ctx = executor.ctx, .load = executor.load_stored, .load_many = executor.load_many_stored_values };
+    var values = ValueExecution{ .a = alloc, .snapshot = snapshot, .req = if (logical) |l| l.request else .{}, .load_ctx = executor.ctx, .load = executor.load_stored, .load_many = executor.load_many_stored_values, .open_projected = executor.open_logical_sources };
     defer values.deinit();
     const search_query = if (logical) |l| try textQueryToSearchQueryWithValues(arena_alloc, l.query, text_entry.text_analysis, text_entry.runtime_schema, &values) else unresolved_query;
 
@@ -11977,7 +11987,7 @@ pub fn searchTextQuery(
     // The trusted lake coordinator prepared this exact text query once under
     // the pinned index configuration. Borrow its analyzer and syntax identities
     // across windows; subsequent predicate/key transformations remain local.
-    var value_execution = ValueExecution{ .a = alloc, .snapshot = text_source.snapshot, .req = effective_req, .load_ctx = executor.ctx, .load = executor.load_stored, .load_many = executor.load_many_stored_values };
+    var value_execution = ValueExecution{ .a = alloc, .snapshot = text_source.snapshot, .req = effective_req, .load_ctx = executor.ctx, .load = executor.load_stored, .load_many = executor.load_many_stored_values, .open_projected = executor.open_logical_sources };
     defer value_execution.deinit();
     var base_search_query = if (effective_req.text_navigation_plan) |prepared| prepared.query else try textQueryToSearchQueryWithValues(arena_alloc, text_query, text_source.text_analysis, text_source.runtime_schema, &value_execution);
     if (executor.native_key) |native_key| base_search_query = try projectTextQueryKeys(arena_alloc, executor.ctx, native_key, base_search_query);
@@ -18684,14 +18694,69 @@ const ValueExecution = struct {
     producers: std.ArrayListUnmanaged(*ValueProducer) = .empty,
     local_work: value_query.Work = .{},
     load_many: ?*const fn (?*anyopaque, Allocator, []const []const u8) anyerror![]?[]u8 = null,
+    open_projected: ?LogicalSourceOpener = null,
+    projected_reader: ?LogicalSourceReader = null,
+    projected_unavailable: bool = false,
     projection: ?@import("../../../search/value_source.zig").Plan = null,
     projection_attempted: bool = false,
     source_tuner: SourceReadTuner = .{},
+    source_epoch: usize = 0,
+    original_average_bytes: u64 = 0,
     literal_groups: std.ArrayListUnmanaged(LiteralGroup) = .empty,
     cohorts: std.ArrayListUnmanaged(Cohort) = .empty,
     active_cohort: ?usize = null,
     literals_checked: bool = false,
+    fn observeOriginal(self: *@This(), rows: usize, bytes: u64) void {
+        if (rows == 0) return;
+        const mean = bytes / rows;
+        self.original_average_bytes = if (self.original_average_bytes == 0) mean else (self.original_average_bytes *| 3 +| mean) / 4;
+    }
+    fn shouldProject(self: *const @This()) bool {
+        return self.open_projected != null and !self.projected_unavailable and self.original_average_bytes >= @import("../../document_projection.zig").minimum_bytes;
+    }
+    fn projectedSources(self: *@This(), a: Allocator, ids: []const []const u8) !?[]LogicalSourceRow {
+        var fields: [64][]const u8 = undefined;
+        const selected = self.roots(&fields);
+        if (selected.len == 0) {
+            self.projected_unavailable = true;
+            return null;
+        }
+        if (self.projected_reader == null) {
+            self.projected_reader = try self.open_projected.?(self.load_ctx, @import("../../../sql/memory_budget.zig").reclaimingAllocator(self.a));
+            if (self.projected_reader == null) {
+                self.projected_unavailable = true;
+                return null;
+            }
+            // Different source representations have different read costs.
+            // Restart learning without charging one-time snapshot setup to a
+            // steady-state arm, retaining any allocator-imposed row ceiling.
+            self.source_tuner = .{ .max_rows = self.source_tuner.max_rows };
+            self.source_epoch += 1;
+        }
+        const reader = self.projected_reader.?;
+        return try reader.load(reader.ctx, a, ids, selected);
+    }
+    // Immutable query roots, decoded from predicate paths; never synthesized
+    // physical field names. Empty/root-wide predicates require original bytes.
+    fn roots(self: *@This(), output: *[64][]const u8) []const []const u8 {
+        if (self.producers.items.len > output.len) return &.{};
+        var n: usize = 0;
+        for (self.producers.items) |producer| {
+            const field = producer.matcher.spec.field;
+            if (field.len == 0) return &.{};
+            const root = field[0 .. std.mem.indexOfScalar(u8, field, '.') orelse field.len];
+            const duplicate = for (output[0..n]) |prior| {
+                if (std.mem.eql(u8, prior, root)) break true;
+            } else false;
+            if (!duplicate) {
+                output[n] = root;
+                n += 1;
+            }
+        }
+        return output[0..n];
+    }
     fn deinit(self: *@This()) void {
+        if (self.projected_reader) |reader| reader.close(reader.ctx);
         self.clearGroups();
         for (self.producers.items) |producer| {
             producer.matcher.deinit();
@@ -18718,7 +18783,7 @@ const ValueExecution = struct {
         }
         self.literals_checked = false;
     }
-    fn sourceValue(self: *@This(), a: Allocator, bytes: []const u8) !std.json.Value {
+    fn sourceValue(self: *@This(), a: Allocator, bytes: []const u8, stored_projection: bool) !std.json.Value {
         const work = self.req.value_search_work orelse &self.local_work;
         const start = if (self.req.profile) platform_time.monotonicNs() else 0;
         defer if (self.req.profile) {
@@ -18735,7 +18800,7 @@ const ValueExecution = struct {
             }
         }
         const parsed = try @import("../../../search/value_source.zig").parse(a, bytes, if (self.projection) |*plan| plan else null);
-        if (self.req.profile and parsed.projected) _ = work.projected_sources.fetchAdd(1, .monotonic);
+        if (self.req.profile and (parsed.projected or stored_projection)) _ = work.projected_sources.fetchAdd(1, .monotonic);
         return parsed.value;
     }
 
@@ -18962,12 +19027,16 @@ const SourceReadTuner = struct {
         }
         return result;
     }
-    fn observe(self: *@This(), rows: usize, bytes: u64, elapsed_ns: u64) void {
+    fn observe(self: *@This(), mode: enum { scalar, batch }, rows: usize, bytes: u64, elapsed_ns: u64) void {
         if (rows == 0) return;
-        // Attribute a clamped observation to the effective size class, never
-        // teach a 64-row arm using scalar I/O forced by its byte ceiling.
+        const requested = self.desired();
+        const average = @max(1, bytes / rows);
+        self.average_bytes = (self.average_bytes *| 3 +| average) / 4;
+        // A truncated batch is not a sample of a full arm. Scalar fallbacks
+        // always train scalar, independently of the requested window size.
+        if (mode == .batch and rows != requested) return;
         const effective = for (sizes, 0..) |size, i| {
-            if (size == self.desired()) break i;
+            if (size == (if (mode == .scalar) @as(usize, 1) else rows)) break i;
         } else unreachable;
         // Decay completed epochs to adapt without retaining unbounded history.
         if (self.rows[effective] >= 1024) {
@@ -18976,8 +19045,8 @@ const SourceReadTuner = struct {
         }
         self.rows[effective] += rows;
         self.ns[effective] +|= elapsed_ns;
-        const average = @max(1, bytes / rows);
-        self.average_bytes = (self.average_bytes *| 3 +| average) / 4;
+        // Falling back must not complete exploration of an untested arm.
+        if (sizes[effective] != requested) return;
         self.calls += 1;
         if (self.exploring and self.rows[effective] >= 16) {
             self.choice += 1;
@@ -19002,13 +19071,13 @@ test "logical value source tuner learns scalar or batch cost and respects byte b
         for (0..256) |_| {
             const rows = tuner.desired();
             const elapsed: u64 = if (batch_wins) 1000 + rows * 10 else if (rows == 1) 10 else rows * 100;
-            tuner.observe(rows, rows * 4096, elapsed);
+            tuner.observe(if (rows == 1) .scalar else .batch, rows, rows * 4096, elapsed);
         }
         try std.testing.expectEqual(if (batch_wins) @as(usize, 64) else @as(usize, 1), SourceReadTuner.sizes[tuner.best()]);
         tuner.average_bytes = 1024 * 1024;
         try std.testing.expectEqual(@as(usize, 1), tuner.desired());
         const old_scalar_rows = tuner.rows[1];
-        tuner.observe(1, 32 * 1024, 1000);
+        tuner.observe(.scalar, 1, 32 * 1024, 1000);
         try std.testing.expect(tuner.rows[1] > old_scalar_rows);
         try std.testing.expectEqual(@as(usize, 1), SourceReadTuner.sizes[tuner.best()]);
         tuner.average_bytes = 1;
@@ -19018,13 +19087,26 @@ test "logical value source tuner learns scalar or batch cost and respects byte b
     var medium: SourceReadTuner = .{};
     for (0..512) |_| {
         const rows = medium.desired();
-        medium.observe(rows, rows * 18 * 1024, 1000 + rows * 10);
+        medium.observe(if (rows == 1) .scalar else .batch, rows, rows * 18 * 1024, 1000 + rows * 10);
     }
     try std.testing.expectEqual(@as(usize, 16), SourceReadTuner.sizes[medium.best()]);
     medium.average_bytes = 96 * 1024;
     try std.testing.expectEqual(@as(usize, 2), medium.allowedRows());
     medium.average_bytes = 4126;
     try std.testing.expectEqual(@as(usize, 64), medium.allowedRows());
+}
+
+test "logical value tuner distinguishes scalar fallback and truncated batches" {
+    var tuner: SourceReadTuner = .{};
+    tuner.observe(.scalar, 1, 128, 1000);
+    try std.testing.expectEqual(@as(usize, 1), tuner.rows[1]);
+    try std.testing.expectEqual(@as(usize, 0), tuner.rows[0]);
+    try std.testing.expectEqual(@as(usize, 16), tuner.desired());
+    tuner.observe(.batch, 3, 384, 2000);
+    try std.testing.expectEqual(@as(usize, 0), tuner.rows[0]);
+    tuner.observe(.batch, 16, 2048, 2000);
+    try std.testing.expectEqual(@as(usize, 16), tuner.rows[0]);
+    try std.testing.expectEqual(@as(usize, 1), tuner.desired());
 }
 
 const ValueSourceWindow = struct {
@@ -19034,18 +19116,18 @@ const ValueSourceWindow = struct {
     arena: std.heap.ArenaAllocator = undefined,
     ids: [capacity]u32 = undefined,
     keys: [capacity][]const u8 = undefined,
-    values: []?[]u8 = &.{},
+    values: []LogicalSourceRow = &.{},
     count: usize = 0,
     enabled: bool = true,
     admitted: bool = false,
     rows: usize = 16,
     adaptive: bool = true,
     fn reset(self: *@This(), free: bool) void {
-        _ = self.arena.reset(if (free) .free_all else .retain_capacity);
+        _ = self.arena.reset(if (free) .free_all else .{ .retain_with_limit = 512 * 1024 });
         self.count = 0;
         self.values = &.{};
     }
-    fn get(self: *@This(), local: u32) ?struct { bytes: ?[]u8, key: []const u8 } {
+    fn get(self: *@This(), local: u32) ?struct { bytes: ?[]u8, key: []const u8, original_bytes: u64, projected: bool } {
         var lo: usize = 0;
         var hi = self.values.len;
         while (lo < hi) {
@@ -19053,10 +19135,10 @@ const ValueSourceWindow = struct {
             if (self.ids[mid] < local) lo = mid + 1 else hi = mid;
         }
         if (lo == self.values.len or self.ids[lo] != local) return null;
-        return .{ .bytes = self.values[lo], .key = self.keys[lo] };
+        return .{ .bytes = self.values[lo].bytes, .key = self.keys[lo], .original_bytes = self.values[lo].original_bytes, .projected = self.values[lo].projected };
     }
-    fn fill(self: *@This(), producer: *ValueProducer, local: u32, count: u32, offset: u32, iterator: anytype, sequential: u32, deleted: ?*const roaring.RoaringBitmap, known: *const roaring.RoaringBitmap, coverage: ?*const roaring.RoaringBitmap, control: query_mod.ExecutionControl) anyerror!void {
-        self.fillOnce(producer, local, count, offset, iterator, sequential, deleted, known, coverage, control) catch |err| {
+    fn fill(self: *@This(), producer: *ValueProducer, initial_key: []const u8, started_ns: u64, local: u32, count: u32, offset: u32, iterator: anytype, sequential: u32, deleted: ?*const roaring.RoaringBitmap, known: *const roaring.RoaringBitmap, coverage: ?*const roaring.RoaringBitmap, control: query_mod.ExecutionControl) anyerror!void {
+        self.fillOnce(producer, initial_key, started_ns, local, count, offset, iterator, sequential, deleted, known, coverage, control) catch |err| {
             if (err != error.OutOfMemory) return err;
             const attempted = if (self.count == 0) self.rows else @min(self.rows, self.count);
             self.reset(true);
@@ -19066,12 +19148,23 @@ const ValueSourceWindow = struct {
                 const work = producer.owner.req.value_search_work orelse &producer.owner.local_work;
                 _ = work.batch_refusals.fetchAdd(1, .monotonic);
             }
-            if (self.rows < 2) self.enabled = false else try self.fill(producer, local, count, offset, iterator, sequential, deleted, known, coverage, control);
+            if (self.rows < 2) self.enabled = false else try self.fill(producer, initial_key, started_ns, local, count, offset, iterator, sequential, deleted, known, coverage, control);
         };
     }
-    fn fillOnce(self: *@This(), producer: *ValueProducer, local: u32, count: u32, offset: u32, iterator: anytype, sequential: u32, deleted: ?*const roaring.RoaringBitmap, known: *const roaring.RoaringBitmap, coverage: ?*const roaring.RoaringBitmap, control: query_mod.ExecutionControl) anyerror!void {
+    fn load(self: *@This(), owner: *ValueExecution) ![]LogicalSourceRow {
+        const a = self.arena.allocator();
+        if (owner.shouldProject()) if (try owner.projectedSources(a, self.keys[0..self.count])) |rows| return rows;
+        const raw = try owner.load_many.?(owner.load_ctx, a, self.keys[0..self.count]);
+        const rows = try a.alloc(LogicalSourceRow, raw.len);
+        for (raw, rows) |bytes, *row| row.* = .{ .bytes = bytes, .original_bytes = if (bytes) |value| value.len else 0 };
+        return rows;
+    }
+    fn fillOnce(self: *@This(), producer: *ValueProducer, initial_key: []const u8, started_ns: u64, local: u32, count: u32, offset: u32, iterator: anytype, sequential: u32, deleted: ?*const roaring.RoaringBitmap, known: *const roaring.RoaringBitmap, coverage: ?*const roaring.RoaringBitmap, control: query_mod.ExecutionControl) anyerror!void {
         const owner = producer.owner;
-        const load_many = owner.load_many orelse return;
+        if (owner.load_many == null) {
+            self.enabled = false;
+            return;
+        }
         if (!self.enabled) return;
         if (!self.admitted) {
             if (getenv("ANTFLY_BENCH_VALUE_SOURCE_SCALAR")) |value| if (std.mem.eql(u8, value, "1")) {
@@ -19096,6 +19189,7 @@ const ValueSourceWindow = struct {
             self.budget.limit = @min(limit, room.? / 4);
             self.admitted = true;
         }
+        const epoch = owner.source_epoch;
         if (self.adaptive) self.rows = owner.source_tuner.desired();
         self.reset(false);
         if (self.rows < 2) return;
@@ -19115,7 +19209,7 @@ const ValueSourceWindow = struct {
             try control.check();
             const global = offset + id;
             if (!(if (deleted) |d| d.contains(id) else false) and !known.contains(id) and !producer.visited.contains(global) and !(if (coverage) |c| c.contains(global) else false)) {
-                const key = (try owner.snapshot.storedIdScoped(self.arena.allocator(), global)) orelse return error.StoredDocMissing;
+                const key = if (id == local) try self.arena.allocator().dupe(u8, initial_key) else (try owner.snapshot.storedIdScoped(self.arena.allocator(), global)) orelse return error.StoredDocMissing;
                 if (work.sources.get(owner.load_ctx, key) == null) {
                     self.ids[self.count] = id;
                     self.keys[self.count] = key;
@@ -19131,25 +19225,25 @@ const ValueSourceWindow = struct {
             };
         }
         if (self.count < 2) return;
-        const start = platform_time.monotonicNs();
-        defer if (owner.req.profile) {
-            _ = work.source_read_ns.fetchAdd(platform_time.monotonicNs() - start, .monotonic);
-        };
         // Reserve the shared document allowance before speculative I/O, so
         // concurrent components cannot each read the same remaining budget.
         try value_query.Work.charge(&work.documents, self.count, owner.req.value_search_execution.max_documents);
-        self.values = load_many(owner.load_ctx, self.arena.allocator(), self.keys[0..self.count]) catch |err| {
+        self.values = self.load(owner) catch |err| {
             _ = work.documents.fetchSub(self.count, .monotonic);
             return err;
         };
         if (self.values.len != self.count) return error.InvalidArgument;
         var source_bytes: u64 = 0;
-        for (self.values) |row| if (row) |bytes| {
-            source_bytes = std.math.add(u64, source_bytes, bytes.len) catch return error.ValueSearchLimitExceeded;
-        };
+        var payload_bytes: u64 = 0;
+        for (self.values) |row| {
+            source_bytes = std.math.add(u64, source_bytes, row.original_bytes) catch return error.ValueSearchLimitExceeded;
+            if (row.bytes) |bytes| payload_bytes +|= bytes.len;
+            if (owner.req.profile and row.projected) _ = work.stored_field_sources.fetchAdd(1, .monotonic);
+        }
         try value_query.Work.charge(&work.bytes, source_bytes, owner.req.value_search_execution.max_bytes);
-        if (self.adaptive) {
-            owner.source_tuner.observe(self.count, source_bytes, platform_time.monotonicNs() - start);
+        owner.observeOriginal(self.count, source_bytes);
+        if (self.adaptive and owner.source_epoch == epoch) {
+            owner.source_tuner.observe(.batch, self.count, payload_bytes, platform_time.monotonicNs() - started_ns);
         }
         if (owner.req.profile) {
             _ = work.source_batches.fetchAdd(1, .monotonic);
@@ -19280,32 +19374,49 @@ const ValueProducer = struct {
             }
             const work = owner.req.value_search_work orelse &owner.local_work;
             _ = scratch.reset(.retain_capacity);
+            const scalar_start = platform_time.monotonicNs();
             var buffered = source_window.get(local);
             const id = if (buffered) |row| row.key else (try owner.snapshot.storedIdScoped(scratch.allocator(), global)) orelse return error.StoredDocMissing;
             var matched = false;
             if (work.sources.get(owner.load_ctx, id)) |doc| {
                 matched = try owner.matchSource(self, global, doc);
             } else {
+                const already_buffered = buffered != null;
                 if (buffered == null) {
-                    try source_window.fill(self, local, count, offset, iterator, sequential, if (deleted) |*d| d else null, &facts.known, coverage, control);
+                    try source_window.fill(self, id, scalar_start, local, count, offset, iterator, sequential, if (deleted) |*d| d else null, &facts.known, coverage, control);
                     buffered = source_window.get(local);
                 }
                 // Both scalar and batch loaders share the admitted provider.
+                var projected_source = if (buffered) |row| row.projected else false;
+                var original_bytes: u64 = 0;
                 const stored = if (buffered) |row| row.bytes else scalar: {
                     try value_query.Work.charge(&work.documents, 1, owner.req.value_search_execution.max_documents);
-                    const start = platform_time.monotonicNs();
-                    const loaded = try owner.load.?(owner.load_ctx, scratch.allocator(), id);
-                    const elapsed = platform_time.monotonicNs() - start;
-                    if (source_window.enabled and source_window.adaptive) owner.source_tuner.observe(1, if (loaded) |bytes| bytes.len else 0, elapsed);
+                    const epoch = owner.source_epoch;
+                    const loaded = loaded: {
+                        if (owner.shouldProject()) if (try owner.projectedSources(scratch.allocator(), &.{id})) |rows| {
+                            if (rows.len != 1) return error.InvalidArgument;
+                            projected_source = rows[0].projected;
+                            original_bytes = rows[0].original_bytes;
+                            break :loaded rows[0].bytes;
+                        };
+
+                        const bytes = try owner.load.?(owner.load_ctx, scratch.allocator(), id);
+                        original_bytes = if (bytes) |value| value.len else 0;
+                        break :loaded bytes;
+                    };
+                    const elapsed = platform_time.monotonicNs() - scalar_start;
+                    owner.observeOriginal(1, original_bytes);
+                    if (owner.req.profile and projected_source) _ = work.stored_field_sources.fetchAdd(1, .monotonic);
+                    if (source_window.enabled and source_window.adaptive and owner.source_epoch == epoch) owner.source_tuner.observe(.scalar, 1, if (loaded) |bytes| bytes.len else 0, elapsed);
                     if (owner.req.profile) {
-                        _ = work.source_read_ns.fetchAdd(elapsed, .monotonic);
                         _ = work.source_scalar_reads.fetchAdd(1, .monotonic);
                     }
                     break :scalar loaded;
                 };
+                if (owner.req.profile and !already_buffered) _ = work.source_read_ns.fetchAdd(platform_time.monotonicNs() - scalar_start, .monotonic);
                 if (stored) |bytes| {
-                    if (buffered == null) try value_query.Work.charge(&work.bytes, bytes.len, owner.req.value_search_execution.max_bytes);
-                    const shared = if (!stream_membership) remembered: {
+                    if (buffered == null) try value_query.Work.charge(&work.bytes, original_bytes, owner.req.value_search_execution.max_bytes);
+                    const shared = if (!stream_membership and !projected_source) remembered: {
                         const start = if (owner.req.profile) platform_time.monotonicNs() else 0;
                         defer if (owner.req.profile) {
                             _ = work.source_parse_ns.fetchAdd(platform_time.monotonicNs() - start, .monotonic);
@@ -19315,7 +19426,7 @@ const ValueProducer = struct {
                     if (shared) |doc| {
                         matched = try owner.matchSource(self, global, doc);
                     } else {
-                        const value = try owner.sourceValue(scratch.allocator(), bytes);
+                        const value = try owner.sourceValue(scratch.allocator(), bytes, projected_source);
                         matched = try owner.matchSource(self, global, value);
                     }
                 }
@@ -34255,6 +34366,19 @@ test "logical value batched reads preserve candidates budgets and scalar fallbac
             self.scalar += 1;
             return source(alloc, id);
         }
+        fn open(raw: ?*anyopaque, _: Allocator) anyerror!?LogicalSourceReader {
+            return .{ .ctx = raw.?, .load = projected, .close = close };
+        }
+        fn close(_: *anyopaque) void {}
+        fn projected(raw: *anyopaque, alloc: Allocator, ids: []const []const u8, roots: []const []const u8) anyerror![]LogicalSourceRow {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batches += 1;
+            try std.testing.expectEqual(@as(usize, 1), roots.len);
+            try std.testing.expectEqualStrings("content", roots[0]);
+            const rows = try alloc.alloc(LogicalSourceRow, ids.len);
+            for (ids, rows) |id, *row| row.* = .{ .bytes = try source(alloc, id), .original_bytes = 32 * 1024, .projected = true };
+            return rows;
+        }
         fn many(raw: ?*anyopaque, alloc: Allocator, ids: []const []const u8) anyerror![]?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.batches += 1;
@@ -34279,9 +34403,27 @@ test "logical value batched reads preserve candidates budgets and scalar fallbac
         try std.testing.expectEqual(@as(u32, 2), try search_mod.countMatches(a, writer.snapshot(), query));
         try std.testing.expectEqual(@as(usize, 1), loader.batches);
     }
+    for ([_]bool{ false, true }) |limited| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var loader: Loader = .{};
+        var execution: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .profile = true, .value_search_execution = .{ .allow_scan = true, .max_documents = 3, .max_bytes = if (limited) 1024 else 3 * 32 * 1024 } }, .load_ctx = &loader, .load = Loader.load, .load_many = Loader.many, .open_projected = Loader.open, .original_average_bytes = 32 * 1024 };
+        defer execution.deinit();
+        const query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .value = .{ .kind = .contains, .field = "content", .text = "needle" } }, .{}, null, &execution);
+        if (limited) {
+            try std.testing.expectError(error.ValueSearchLimitExceeded, search_mod.countMatches(a, writer.snapshot(), query));
+        } else {
+            try std.testing.expectEqual(@as(u32, 2), try search_mod.countMatches(a, writer.snapshot(), query));
+            try std.testing.expectEqual(@as(u64, 3 * 32 * 1024), execution.local_work.bytes.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 3), execution.local_work.stored_field_sources.load(.monotonic));
+            // A projected document must never impersonate a complete source.
+            try std.testing.expectEqual(@as(usize, 0), execution.local_work.sources.budget.live);
+        }
+    }
 }
 
 // Keep private fact tests reachable under a focused value-search filter.
 test {
     _ = value_query.membership;
+    _ = @import("../../logical_source.zig");
 }

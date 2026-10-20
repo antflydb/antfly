@@ -1360,7 +1360,9 @@ def test_logical_scalable_work_profile(stateful_api):
                         and os.environ.get("ANTFLY_BENCH_VALUE_SOURCE_FULL_DOM") != "1"
                     )
                     assert profile["projected_sources"] == (
-                        count if expected_projected else 0
+                        count
+                        if expected_projected
+                        else profile.get("stored_field_sources", 0)
                     ), profile
                 cpu_after = read_process()["cpu_ns"]
                 runs.append(
@@ -1468,10 +1470,236 @@ def test_logical_scalable_work_profile(stateful_api):
                         "ANTFLY_BENCH_VALUE_SOURCE_SCALAR",
                         "ANTFLY_BENCH_VALUE_SOURCE_FULL_DOM",
                         "ANTFLY_BENCH_VALUE_SOURCE_ROWS",
+                        "ANTFLY_BENCH_VALUE_SOURCE_FULL_READ",
                     )
                 },
                 "binary_sha256": digest.hexdigest(),
                 "scope": "ReleaseFast server; fresh predicate membership per request, warm filesystem caches; shared host; HTTP includes profiling; exact-count first result requires the complete response; process CPU includes background work; RSS/physical footprint sampled every 5 ms, not an allocation bound",
+                "records": records,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def test_logical_stored_field_reads_preserve_updates_and_original_budgets(stateful_api):
+    api = stateful_api
+    table = f"logical_ranges_{time.time_ns()}"
+    api.create_table(table)
+    docs = {
+        f"{i:04}": {
+            "nested": [{"name": "needle"}, {"name": [None, "tail"]}],
+            "unused": "x" * (32 * 1024),
+        }
+        for i in range(96)
+    }
+    api.batch_write(table, inserts=docs, sync_level="full_index")
+    query = {
+        "query": {"contains": "needle", "field": "nested.name"},
+        "count": True,
+        "limit": 0,
+        "fields": [],
+        "profile": True,
+        "value_search_execution": {
+            "allow_scan": True,
+            "max_documents": 96,
+            "max_bytes": 8 * 1024 * 1024,
+        },
+    }
+
+    def check(expected):
+        response = requests.post(
+            api.url + f"/tables/{table}/query", json=query, timeout=60
+        )
+        assert response.status_code == 200, response.text
+        result = response.json()["responses"][0]
+        assert not result.get("error"), result
+        assert result["hits"]["total"]["value"] == expected, result
+        profile = result["profile"]["value_search"]
+        assert profile["documents"] == 96, profile
+        assert profile["bytes"] > 96 * 32 * 1024, profile
+        if os.environ.get("ANTFLY_BENCH_VALUE_SOURCE_FULL_READ") != "1":
+            assert profile["stored_field_sources"] > 0, profile
+        return result
+
+    check(96)
+    # Fresh mutation authority must replace the old directory atomically.
+    api.batch_write(
+        table,
+        inserts={"0000": {"nested": [{"name": "other"}], "unused": "y" * (32 * 1024)}},
+        sync_level="full_index",
+    )
+    check(95)
+    if api.supports_restart:
+        api.restart_server()
+        check(95)
+    small_budget = {
+        **query,
+        "value_search_execution": {
+            **query["value_search_execution"],
+            "max_bytes": 1024,
+        },
+    }
+    rejected = requests.post(
+        api.url + f"/tables/{table}/query", json=small_budget, timeout=60
+    )
+    assert rejected.status_code >= 400 or rejected.json()["responses"][0].get(
+        "error"
+    ), rejected.text
+
+
+def test_logical_source_concurrency_profile(stateful_api):
+    """Opt-in reproducible cold-process and concurrent source-read qualification.
+
+    Restart clears process caches; filesystem/storage caches remain uncontrolled.
+    Run the same fixture with container CPU and memory constraints for controls.
+    """
+    import concurrent.futures
+    import hashlib
+    import platform
+    import statistics
+    import threading
+
+    destination = os.environ.get("ANTFLY_LOGICAL_CONCURRENCY_REPORT")
+    if not destination:
+        pytest.skip("set ANTFLY_LOGICAL_CONCURRENCY_REPORT to qualify concurrent reads")
+    api = stateful_api
+    if not api.supports_restart:
+        pytest.skip("requires an isolated locally managed server")
+    clients = [
+        int(v) for v in os.environ.get("ANTFLY_LOGICAL_CLIENTS", "1,4").split(",")
+    ]
+    assert clients and all(1 <= n <= 32 for n in clients)
+    table = f"logical_concurrent_{time.time_ns()}"
+    api.create_table(table)
+    count = 512
+    docs = {
+        f"{i:06}": {"title": "needle alpha beta", "unused": ["\n" * 16] * 1024}
+        for i in range(count)
+    }
+    corpus = json.dumps(docs, sort_keys=True, separators=(",", ":")).encode()
+    for start in range(0, count, 64):
+        ids = list(docs)[start : start + 64]
+        api.batch_write(
+            table, inserts={i: docs[i] for i in ids}, sync_level="full_index"
+        )
+    query = {
+        "query": {
+            "bool": {
+                "should": [
+                    {"contains": text, "field": "title"}
+                    for text in ("needle", "alpha", "beta")
+                ]
+            }
+        },
+        "count": True,
+        "limit": 0,
+        "fields": [],
+        "profile": True,
+        "value_search_execution": {
+            "allow_scan": True,
+            "max_documents": count,
+            "max_bytes": 64 * 1024 * 1024,
+        },
+    }
+    records = []
+    for concurrency in clients:
+        api.restart_server()
+        pid = api._server.proc.pid
+        read_process = logical_process_reader(pid)
+
+        def request(barrier=None):
+            if barrier is not None:
+                barrier.wait(timeout=30)
+            started = time.perf_counter_ns()
+            with requests.post(
+                api.url + f"/tables/{table}/query", json=query, timeout=90, stream=True
+            ) as response:
+                response.raw.decode_content = True
+                first = response.raw.read(1)
+                first_byte_ms = (time.perf_counter_ns() - started) / 1e6
+                body = first + response.raw.read()
+                assert response.status_code == 200, body
+            result = json.loads(body)["responses"][0]
+            assert not result.get("error"), result
+            assert result["hits"]["total"]["value"] == count, result
+            profile = result["profile"]["value_search"]
+            assert profile["documents"] == count, profile
+            return {
+                "http_ms": (time.perf_counter_ns() - started) / 1e6,
+                "first_byte_ms": first_byte_ms,
+                "profile": profile,
+            }
+
+        cold_process = request()
+        runs = []
+        # Create client workers before timing; synchronize each request group.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            for trial in range(9):
+                barrier = threading.Barrier(concurrency + 1)
+                futures = [pool.submit(request, barrier) for _ in range(concurrency)]
+                before = read_process()
+                started = time.perf_counter_ns()
+                barrier.wait(timeout=30)
+                responses = [future.result(timeout=100) for future in futures]
+                elapsed = (time.perf_counter_ns() - started) / 1e6
+                after = read_process()
+                runs.append(
+                    {
+                        "trial": trial,
+                        "group_ms": elapsed,
+                        "cpu_ms": (after["cpu_ns"] - before["cpu_ns"]) / 1e6,
+                        "process_before": before,
+                        "process_after": after,
+                        "responses": responses,
+                    }
+                )
+        latencies = sorted(r["http_ms"] for trial in runs for r in trial["responses"])
+        records.append(
+            {
+                "clients": concurrency,
+                "cold_process": cold_process,
+                "runs": runs,
+                "median_request_ms": statistics.median(latencies),
+                "p95_request_ms": latencies[
+                    min(len(latencies) - 1, int(len(latencies) * 0.95))
+                ],
+                "mean_cpu_ms_per_request": statistics.mean(
+                    r["cpu_ms"] / concurrency for r in runs
+                ),
+                "requests_per_second": 1000
+                * concurrency
+                / statistics.mean(r["group_ms"] for r in runs),
+            }
+        )
+    binary = Path(os.environ["ANTFLY_BIN"])
+    with binary.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    Path(destination).write_text(
+        json.dumps(
+            {
+                "protocol": 1,
+                "binary_sha256": digest,
+                "platform": platform.platform(),
+                "corpus_sha256": hashlib.sha256(corpus).hexdigest(),
+                "documents": count,
+                "logical_cpus": os.cpu_count(),
+                "cpu_max": Path("/sys/fs/cgroup/cpu.max").read_text().strip()
+                if Path("/sys/fs/cgroup/cpu.max").is_file()
+                else None,
+                "memory_max": Path("/sys/fs/cgroup/memory.max").read_text().strip()
+                if Path("/sys/fs/cgroup/memory.max").is_file()
+                else None,
+                "controls": {
+                    k: os.environ.get(k)
+                    for k in (
+                        "ANTFLY_BENCH_VALUE_SOURCE_FULL_READ",
+                        "ANTFLY_BENCH_VALUE_SOURCE_SCALAR",
+                        "ANTFLY_BENCH_VALUE_SOURCE_ROWS",
+                    )
+                },
+                "scope": "Same-host native ISA; cold process after restart, uncontrolled filesystem caches; process CPU includes background work; endpoint RSS samples are not a peak bound.",
                 "records": records,
             },
             indent=2,

@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Compare logical-source readers with pinned artifacts and raw HTTP trials.
+
+Run on native hosts or inside a constrained container; never label a process
+restart as a cold-storage measurement. Baseline/candidate order alternates by
+round. Existing evidence is never overwritten: use a fresh output directory.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import sys
+import time
+
+
+def digest(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--baseline", type=Path, required=True)
+    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--grep", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument("--clients", default="1,4")
+    parser.add_argument(
+        "--suite", choices=("scalable", "concurrency", "both"), default="both"
+    )
+    parser.add_argument(
+        "--controls",
+        action="store_true",
+        help="also measure candidate full reads, scalar and fixed batch sizes",
+    )
+    args = parser.parse_args()
+    assert args.rounds >= 1
+    root = Path(__file__).resolve().parents[4]
+    args.output = args.output.resolve()
+    args.output.mkdir(parents=True, exist_ok=False)
+    binaries = {
+        "baseline": args.baseline.resolve(),
+        "candidate": args.candidate.resolve(),
+    }
+    report = {
+        "protocol": 1,
+        "host": platform.platform(),
+        "logical_cpus": os.cpu_count(),
+        "driver_sha256": digest(__file__),
+        "fixture_sha256": digest(root / "zig/e2e/antfly/test_grep_indexed.py"),
+        "artifacts": {
+            k: {"path": str(v), "sha256": digest(v)} for k, v in binaries.items()
+        },
+        "scope": "Native ISA as executed; uncontrolled filesystem caches. CPU/RSS includes background work. Process restart is not cold storage.",
+        "experiments": [],
+    }
+    # Clear inherited controls, so one experiment cannot contaminate the next.
+    base_env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("ANTFLY_BENCH_VALUE_SOURCE_")
+        and not k.startswith("ANTFLY_LOGICAL_")
+    }
+    cases = [("baseline", {}), ("candidate", {})]
+    if args.controls:
+        cases += [
+            ("full_read", {"ANTFLY_BENCH_VALUE_SOURCE_FULL_READ": "1"}),
+            ("scalar", {"ANTFLY_BENCH_VALUE_SOURCE_SCALAR": "1"}),
+            *[
+                (f"rows{n}", {"ANTFLY_BENCH_VALUE_SOURCE_ROWS": str(n)})
+                for n in (16, 32, 64)
+            ],
+        ]
+    suites = ("scalable", "concurrency") if args.suite == "both" else (args.suite,)
+    for round_number in range(args.rounds):
+        for label, controls in (
+            cases if round_number % 2 == 0 else list(reversed(cases))
+        ):
+            for suite in suites:
+                name = f"r{round_number}-{label}-{suite}"
+                destination = args.output / (name + ".json")
+                control_key = (
+                    "ANTFLY_LOGICAL_SCALABLE_REPORT"
+                    if suite == "scalable"
+                    else "ANTFLY_LOGICAL_CONCURRENCY_REPORT"
+                )
+                test = (
+                    "logical_scalable_work_profile"
+                    if suite == "scalable"
+                    else "logical_source_concurrency_profile"
+                )
+                binary = binaries["baseline" if label == "baseline" else "candidate"]
+                env = {
+                    **base_env,
+                    **controls,
+                    "ANTFLY_BIN": str(binary),
+                    "ANTFLY_GREP_BIN": str(args.grep.resolve()),
+                    control_key: str(destination),
+                    "ANTFLY_LOGICAL_CLIENTS": args.clients,
+                }
+                command = [
+                    args.python,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "zig/e2e/antfly/test_grep_indexed.py",
+                    "-k",
+                    test,
+                ]
+                started = time.time()
+                with (args.output / (name + ".log")).open("w") as log:
+                    result = subprocess.run(
+                        command, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT
+                    )
+                entry = {
+                    "name": name,
+                    "controls": controls,
+                    "command": command,
+                    "started_unix": started,
+                    "exit_code": result.returncode,
+                }
+                if destination.exists():
+                    entry["raw"] = json.loads(destination.read_text())
+                report["experiments"].append(entry)
+                (args.output / "report.json").write_text(
+                    json.dumps(report, separators=(",", ":")) + "\n"
+                )
+                print(name, "exit", result.returncode, flush=True)
+                if result.returncode:
+                    raise SystemExit(result.returncode)
+
+
+if __name__ == "__main__":
+    main()

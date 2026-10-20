@@ -56,6 +56,7 @@ pub const Work = struct {
     source_batches: std.atomic.Value(u64) = .init(0),
     source_scalar_reads: std.atomic.Value(u64) = .init(0),
     projected_sources: std.atomic.Value(u64) = .init(0),
+    stored_field_sources: std.atomic.Value(u64) = .init(0),
     batch_refusals: std.atomic.Value(u64) = .init(0),
     batch_peak_bytes: std.atomic.Value(usize) = .init(0),
     sources: Sources = .{},
@@ -88,7 +89,7 @@ pub const Work = struct {
     }
     pub fn profileAlloc(self: *Work, a: A) !?[]u8 {
         if (self.plans.items.len == 0) return null;
-        return try std.json.Stringify.valueAlloc(a, .{ .documents = self.documents.load(.monotonic), .bytes = self.bytes.load(.monotonic), .plans = self.plans.items, .verification_metrics_version = @as(u32, 1), .source_read_us = self.source_read_ns.load(.monotonic) / 1000, .source_parse_us = self.source_parse_ns.load(.monotonic) / 1000, .source_batches = self.source_batches.load(.monotonic), .source_scalar_reads = self.source_scalar_reads.load(.monotonic), .projected_sources = self.projected_sources.load(.monotonic), .batch_refusals = self.batch_refusals.load(.monotonic), .batch_peak_bytes = self.batch_peak_bytes.load(.monotonic) }, .{});
+        return try std.json.Stringify.valueAlloc(a, .{ .documents = self.documents.load(.monotonic), .bytes = self.bytes.load(.monotonic), .plans = self.plans.items, .verification_metrics_version = @as(u32, 1), .source_read_us = self.source_read_ns.load(.monotonic) / 1000, .source_parse_us = self.source_parse_ns.load(.monotonic) / 1000, .source_batches = self.source_batches.load(.monotonic), .source_scalar_reads = self.source_scalar_reads.load(.monotonic), .projected_sources = self.projected_sources.load(.monotonic), .stored_field_sources = self.stored_field_sources.load(.monotonic), .batch_refusals = self.batch_refusals.load(.monotonic), .batch_peak_bytes = self.batch_peak_bytes.load(.monotonic) }, .{});
     }
 
     pub fn charge(counter: *std.atomic.Value(u64), amount: u64, maximum: u64) !void {
@@ -388,6 +389,7 @@ pub fn mergeProfilesAlloc(a: A, results: anytype) !?[]u8 {
         source_batches: u64 = 0,
         source_scalar_reads: u64 = 0,
         projected_sources: u64 = 0,
+        stored_field_sources: u64 = 0,
         batch_refusals: u64 = 0,
         batch_peak_bytes: u64 = 0,
     };
@@ -404,7 +406,9 @@ pub fn mergeProfilesAlloc(a: A, results: anytype) !?[]u8 {
             const amount: u64 = @intCast(value.integer);
             @field(counters, name) = if (comptime std.mem.eql(u8, name, "batch_peak_bytes")) @max(@field(counters, name), amount) else try std.math.add(u64, @field(counters, name), amount);
         } else {
-            metrics_complete = false;
+            // Supplementary counter added after metrics v1; old producers can
+            // still attest complete v1 read/parse/window measurements.
+            if (comptime !std.mem.eql(u8, name, "stored_field_sources")) metrics_complete = false;
         };
         const doc_count = object.get("documents") orelse return error.InvalidRemoteResponse;
         const byte_count = object.get("bytes") orelse return error.InvalidRemoteResponse;
@@ -416,7 +420,7 @@ pub fn mergeProfilesAlloc(a: A, results: anytype) !?[]u8 {
         present = true;
     };
     if (!present) return null;
-    return try std.json.Stringify.valueAlloc(a, .{ .documents = documents, .bytes = bytes, .plans = plans.items, .verification_metrics_version = @as(u32, if (metrics_complete) 1 else 0), .source_read_us = counters.source_read_us, .source_parse_us = counters.source_parse_us, .source_batches = counters.source_batches, .source_scalar_reads = counters.source_scalar_reads, .projected_sources = counters.projected_sources, .batch_refusals = counters.batch_refusals, .batch_peak_bytes = counters.batch_peak_bytes }, .{});
+    return try std.json.Stringify.valueAlloc(a, .{ .documents = documents, .bytes = bytes, .plans = plans.items, .verification_metrics_version = @as(u32, if (metrics_complete) 1 else 0), .source_read_us = counters.source_read_us, .source_parse_us = counters.source_parse_us, .source_batches = counters.source_batches, .source_scalar_reads = counters.source_scalar_reads, .projected_sources = counters.projected_sources, .stored_field_sources = counters.stored_field_sources, .batch_refusals = counters.batch_refusals, .batch_peak_bytes = counters.batch_peak_bytes }, .{});
 }
 
 test "logical value verification telemetry survives shard merging and marks legacy coverage" {

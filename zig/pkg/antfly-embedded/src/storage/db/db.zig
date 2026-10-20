@@ -42223,6 +42223,7 @@ pub const DB = struct {
         return try db_query_search.resolveStructuredDocFilterForComposedAlloc(alloc, req, .{
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+            .open_logical_sources = openStoredLogicalSourcesCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42244,6 +42245,7 @@ pub const DB = struct {
         return try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, req, .{
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+            .open_logical_sources = openStoredLogicalSourcesCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42645,6 +42647,7 @@ pub const DB = struct {
             try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
                 .load_stored = loadStoredSearchDocumentCallback,
                 .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+                .open_logical_sources = openStoredLogicalSourcesCallback,
                 .ctx = self,
                 .text_index_entry = textIndexEntryCallback,
                 .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42680,6 +42683,7 @@ pub const DB = struct {
             .project_stored_search = projectStoredBytesForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+            .open_logical_sources = openStoredLogicalSourcesCallback,
             .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .is_expired_key = isNonvisibleStoredSearchKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -44001,6 +44005,7 @@ pub const DB = struct {
         var resolved = (try db_query_search.resolveStructuredDocFilterForComposedAlloc(self.alloc, req, .{
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+            .open_logical_sources = openStoredLogicalSourcesCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -131703,6 +131708,50 @@ fn loadStoredSearchDocumentCallback(
 ) anyerror!?[]u8 {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try self.loadStoredSearchDocumentProbe(alloc, key);
+}
+
+/// Lazily pin one source epoch for the complete logical verification. Reuse
+/// it across windows; never clone mutable LSM state once per batch. All proof,
+/// directory, range and legacy reads share this exact captured generation.
+const StoredLogicalSources = struct {
+    a: Allocator,
+    db: *DB,
+    view: ?schema_registry_mod.SchemaView,
+    txn: docstore_mod.DocStore.Txn,
+    fn close(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.txn.abort();
+        if (self.view) |*v| v.release();
+        const a = self.a;
+        a.destroy(self);
+    }
+    fn load(raw: *anyopaque, alloc: Allocator, ids: []const []const u8, roots: []const []const u8) anyerror![]db_query_search.LogicalSourceRow {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (ids.len > 64) return error.InvalidBatch;
+        var scratch = std.heap.ArenaAllocator.init(@import("../../sql/memory_budget.zig").reclaimingAllocator(alloc));
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var keys: [64][]const u8 = undefined;
+        for (ids, keys[0..ids.len]) |id, *key| key.* = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self.db, a, id, self.view);
+        var scope = try self.txn.openReadScope(a);
+        defer scope.close();
+        return @import("../logical_source.zig").load(alloc, a, &scope, keys[0..ids.len], ids, roots, self.db.core.store.valuesAreAuthenticated());
+    }
+};
+fn openStoredLogicalSourcesCallback(ctx: ?*anyopaque, a: Allocator) anyerror!?db_query_search.LogicalSourceReader {
+    const db: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    if (getenv("ANTFLY_BENCH_VALUE_SOURCE_FULL_READ")) |v| if (std.mem.eql(u8, v, "1")) return null;
+    // Ordinal rows retain their existing schema-versioned decoding path.
+    var view = db.core.acquireSchemaView();
+    errdefer if (view) |*v| v.release();
+    if (view) |v| if (v.storageMode() != .document) {
+        view.?.release();
+        return null;
+    };
+    const owner = try a.create(StoredLogicalSources);
+    errdefer a.destroy(owner);
+    owner.* = .{ .a = a, .db = db, .view = view, .txn = try db.core.store.beginReadTxn() };
+    return .{ .ctx = owner, .load = StoredLogicalSources.load, .close = StoredLogicalSources.close };
 }
 
 fn loadStoredSearchDocumentManyCallback(

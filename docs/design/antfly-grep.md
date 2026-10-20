@@ -87,3 +87,16 @@ planner: first-result latency, server/client CPU, response bytes, index footprin
 and ingestion cost. Prefer existing index/query capabilities and shared query
 observability. Extend safe predicate extraction only with no-false-negative
 properties; avoid a new grep-specific server protocol.
+
+
+### Revision-bound original-value reads
+
+Logical indexed predicates use the shared source reader described in
+[Logical field queries](logical-field-queries.md#remaining-storage-work-and-performance-qualification).
+Large document originals can reuse the existing authenticated `DPD1` root-field
+authority and range reads; ordinary small documents and missing/legacy authority
+retain full-source reads. This changes the physical work, not query semantics or
+original-byte evaluation budgets. The source epoch is pinned for the query,
+selected hashes are checked, arrays remain intact, and projected JSON cannot be
+cached as a complete document. `stored_field_sources` makes this path observable.
+The implementation adds no public scan endpoint or new document schema.

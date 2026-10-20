@@ -3921,3 +3921,36 @@ uv run --project zig/e2e/antfly pytest -q \
 The report records internal scalar, fixed-16/32/64, full-DOM and combined controls.
 Profile counters and source hashes accompany each observation; scanner-only
 ratios above remain separate from complete-query latency.
+
+
+Logical verification now reuses the document store's existing versioned `DPD1`
+root-field range authority. Large originals may read only the roots referenced
+by predicates, bound to the current document revision and authenticated primary
+snapshot. Missing/old authority falls back to full bytes; selected hash corruption
+fails. Nested arrays and string semantics are preserved. Evaluation budgets still
+charge original bytes, and projected sources never populate the complete-source
+cache. The supplementary `stored_field_sources` profile counter exposes usage.
+Small originals keep the existing source reader; ordinal rows keep their existing
+schema-versioned decoding. Unrelated data inside a selected root still needs
+validation.
+
+The source tuner now attributes scalar fallbacks correctly, excludes truncated
+batches from full-arm samples, and measures batch preparation/allocation as well
+as provider time. Representation changes restart learning without attributing
+one-time snapshot setup to an arm. Read windows retain at most 512 KiB of arena
+capacity between batches, within the existing live-allocation/request limits.
+
+`bench/logical_sources.py` preserves pinned artifacts, raw samples and alternating
+baseline/candidate order. `--controls` includes full-original reads, scalar reads
+and fixed 16/32/64-row windows. The concurrent fixture records a cold-process
+query after restart and nine synchronized groups per client count. It measures
+request/first-byte latency, throughput, process CPU and endpoint memory, and
+records container CPU/memory quotas where available. Restarting a process is not
+cold-storage qualification.
+
+```sh
+zig/e2e/antfly/.venv/bin/python zig/pkg/antfly-grep/bench/logical_sources.py \
+  --baseline /path/to/baseline/antfly --candidate /path/to/candidate/antfly \
+  --grep /path/to/antfly-grep --output output/logical-source-comparison \
+  --rounds 2 --clients 1,4 --controls
+```
