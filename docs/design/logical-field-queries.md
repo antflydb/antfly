@@ -218,3 +218,12 @@ real-server HTTP checks. Qualification covers macOS and native one/three-shard
 HTTP execution, including retained remote storage views. It does not establish
 new throughput guarantees, every external provider's original-value support,
 or Linux/Windows runtime qualification of these new server paths.
+
+
+[Verification reuse qualification](../../zig/pkg/antfly-grep/bench/results/logical-reuse-validation.json)
+pins the follow-up implementation and merged-main revision, final artifact hashes,
+all workload records, and native/HTTP/SDK checks. It covers named autocomplete
+mappings, unknown observed source associations, deleted-slot budgets, cache
+isolation after writes, shared source decoding, literal fusion, and lossless
+keyword proof. Its small shared-host Debug workload measures verification loads
+and end-to-end latency; it establishes no production-scale RSS or platform parity.

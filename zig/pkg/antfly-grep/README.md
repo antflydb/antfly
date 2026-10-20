@@ -3604,8 +3604,8 @@ file/byte totals. The older raw-trigram `candidate_index` remains compatible.
 records the earlier companion-routing binary and its exact validation results;
 it is not qualification of the logical-field server planner.
 
-[Logical-field qualification](bench/results/logical-field-validation.json) records
-the implementation commit, source and artifact hashes, and current macOS checks:
+[Initial logical-field qualification](bench/results/logical-field-validation.json) records
+its implementation commit, source and artifact hashes, and macOS checks:
 253 CLI cases (two skipped), 21 native logical-query checks without leaks,
 143 existing query contracts, compiled error identities, generated SDKs, and 11
 real-server HTTP cases across one/three shards. The HTTP suite covers original-value
@@ -3613,6 +3613,52 @@ semantics, policy errors, authorization, retained updates/expiry, narrow project
 capability associations and logical keyword sorting. It includes immutable-storage
 checkpoint reads for retained remote views. This is correctness qualification;
 new indexed throughput and broader provider/platform qualification remain separate.
+
+### Reusing logical value verification
+
+The server resolves named autocomplete representations through declared source
+associations. Observed physical fields with an unknown source do not advertise
+invented logical paths. Lossless keyword equality can use literal postings directly;
+its proof excludes synonym expansion and requires compatible, complete mappings.
+
+Retained pages can reuse exact predicate membership in a process-local 16 MiB
+cache with 128 slots, 2 MiB per entry, and the admitted cut's expiry. The cache
+stores ID bitmaps and a scalar completeness flag; no source bodies, credentials,
+leases, output, or authorization decisions are retained. Every request still
+passes authorization, cut admission/expiry and projection readiness. Current
+candidate constraints apply before using partial facts. Full membership also
+includes the conservative index's proof of absence outside its candidates.
+A different cut or predicate misses; cache refusal and eviction preserve exact
+verification. These cache entries are never written to disk.
+
+Within one request, compatible literal groups share one bounded multi-output
+automaton and one coverage set, while preserving each clause's positive matches
+and boost. Other multi-leaf queries can share decoded originals under an 8 MiB /
+4,096-entry limit. Single-leaf queries retain streaming scratch. Verification
+skips tombstoned physical slots before loading source and checks cancellation
+while advancing over deleted runs. Query output hydration still has its own work;
+zero verification loads does not imply a zero-cost API request.
+
+The [reuse qualification report](bench/results/logical-reuse-validation.json)
+records the exact source and binary identities, before/after workload records,
+validation commands, and measured verification work. Qualification passes 31
+native logical/storage checks without leaks, 143 query contracts, 14 real-server
+HTTP cases, and 253 CLI cases (two skipped), plus generation and SDK checks.
+
+| Workload | Verification loads before → after | Median HTTP time before → after |
+| --- | ---: | ---: |
+| Resumed page, 128 documents | 128 → 0 | 39.71 → 21.55 ms |
+| Three-literal OR, exact count | 384 → 128 | 28.38 → 12.48 ms |
+| Mixed literal/regex OR, exact count | 256 → 128 | 20.44 → 12.78 ms |
+
+Each row has seven trials. Verification bytes fall from 1,052,416 to zero on
+resumed pages, from 3,157,248 to 1,052,416 for literal OR, and from 2,104,832 to
+1,052,416 for mixed OR. These counters exclude response hydration.
+ Its bounded synthetic
+workloads use Debug servers on a shared macOS host with warm caches. They do not
+establish native Linux hardware, cold-storage, production-scale latency or RSS
+parity. The design and memory/ownership rules are in
+[logical field queries](../../../docs/design/logical-field-queries.md).
 
 ### Qualification of namespace and tuple changes
 
