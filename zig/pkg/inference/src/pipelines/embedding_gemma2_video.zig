@@ -277,7 +277,7 @@ pub const DecoderContinuation = struct {
         };
         var forward = Forward{ .target = capture, .base = packet_base };
         const warm = self.apple.?.next_packet != 0;
-        const packets = self.apple.?.decodeTo(absolute[0..selected.len], .{ .context = &forward, .accept = Forward.accept }) catch |err| {
+        const packets = self.apple.?.decodeToControlled(absolute[0..selected.len], .{ .context = &forward, .accept = Forward.accept }, capture.control) catch |err| {
             self.deinit();
             return err;
         };
@@ -287,11 +287,31 @@ pub const DecoderContinuation = struct {
         return true;
     }
     fn decode(self: *@This(), selected: []const usize, packet_base: usize, context: *anyopaque, callback: video.h264.SelectionCallback) !bool {
+        return self.decodeControlled(selected, packet_base, context, callback, self.reader.input.control);
+    }
+    fn decodeControlled(self: *@This(), selected: []const usize, packet_base: usize, context: *anyopaque, callback: video.h264.SelectionCallback, control: media.source.Control) !bool {
+        const Controls = struct {
+            original: media.source.Control,
+            current: media.source.Control,
+            fn check(raw: ?*const anyopaque) !void {
+                const checks: *const @This() = @ptrCast(@alignCast(raw.?));
+                try checks.original.check();
+                try checks.current.check();
+            }
+        };
+        var controls = Controls{ .original = self.reader.input.control, .current = control };
+        var source = self.reader.input.*;
+        source.control = .{ .context = &controls, .check_fn = Controls.check };
+        var reader = self.reader.*;
+        reader.input = &source;
         if (self.reader.track.codec != .avc) return false;
         var absolute: [32]usize = undefined;
         if (selected.len > absolute.len) return error.ResourceLimitExceeded;
         for (selected, absolute[0..selected.len]) |index, *target| target.* = try std.math.add(usize, index, packet_base);
         if (self.parameter_sets) |registry| {
+            const previous_reader = registry.reader;
+            registry.reader = &reader;
+            defer registry.reader = previous_reader;
             if (self.dynamic == null) self.dynamic = .{ .session = registry };
             for (absolute[0..selected.len]) |index| if (index < self.dynamic.?.cursor()) return false;
             const warm = self.dynamic.?.core != null;
@@ -304,10 +324,10 @@ pub const DecoderContinuation = struct {
         if (self.decoder) |decoder| {
             for (absolute[0..selected.len]) |index| if (index < decoder.cursor()) return false;
         } else {
-            self.decoder = try video.h264.Incremental.init(self.allocator, self.reader, .{ .max_dependency_packets = self.max_packets });
+            self.decoder = try video.h264.Incremental.init(self.allocator, &reader, .{ .max_dependency_packets = self.max_packets });
         }
         const was_warm = self.decoder.?.cursor() != 0;
-        const stats = self.decoder.?.decodeSelected(self.reader, absolute[0..selected.len], context, callback) catch |err| {
+        const stats = self.decoder.?.decodeSelected(&reader, absolute[0..selected.len], context, callback) catch |err| {
             self.deinit();
             return err;
         };
@@ -329,6 +349,8 @@ pub fn immutableSourceBinding(reader: *const media.mp4.Reader) [32]u8 {
     return hash.finalResult();
 }
 pub const ReaderSelection = struct {
+    validated: ?*const video.validated_frames.View = null,
+    validated_packet_base: usize = 0,
     continuation: ?*DecoderContinuation = null,
     packet_base: usize = 0,
     allocator: std.mem.Allocator,
@@ -1294,7 +1316,7 @@ pub const Prefetch = struct {
             defer cfg.groups.deinit(a);
             signal = cfg.color;
         }
-        var capture = Capture{ .a = a, .cb = undefined, .track = track, .webm_track = if (webm) webm_reader.track else null, .pool = pool, .control = source.control, .output = &.{}, .frame_tokens = &.{}, .selected = selected, .signal = signal, .metal = if (self.preparer) |*value| value else null, .io = self.io, .prefetch = self, .decoder = self.decoder };
+        var capture = Capture{ .reader_selection = self.reader_selection, .a = a, .cb = undefined, .track = track, .webm_track = if (webm) webm_reader.track else null, .pool = pool, .control = source.control, .output = &.{}, .frame_tokens = &.{}, .selected = selected, .signal = signal, .metal = if (self.preparer) |*value| value else null, .io = self.io, .prefetch = self, .decoder = self.decoder };
         try self.put(.{ .header = selected });
         var misses: [32]usize = undefined;
         var miss_slots: [32]usize = undefined;
@@ -1729,8 +1751,13 @@ fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.w
     } else try video.webm_pictures.walkIndexed(a, reader, options, indexed, selected, capture, Capture.publishWebm);
 }
 
-fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const usize, configurations: ?*video.h264_dynamic.Session, capture: *Capture) !void {
+fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, requested: []const usize, configurations: ?*video.h264_dynamic.Session, capture: *Capture) !void {
     const control = reader.input.control;
+    var selected = requested;
+    var missing: [32]usize = undefined;
+    var slots: [32]usize = undefined;
+    const original_slots = capture.decode_slots;
+    defer capture.decode_slots = original_slots;
     if (reader.track.codec == .mjpeg) {
         if (capture.decoder.policy == .apple) return error.UnsupportedVideoProfile;
         capture.decoder.record(.portable);
@@ -1752,6 +1779,28 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
             try capture.project(slot, patches, options);
         }
     } else {
+        if (capture.decoder.policy != .apple) if (capture.reader_selection) |selection| if (selection.validated) |validated| {
+            if (selected.len > missing.len) return error.ResourceLimitExceeded;
+            var count: usize = 0;
+            var reused: usize = 0;
+            for (selected, 0..) |index, slot| {
+                if (validated.get(try std.math.add(usize, selection.validated_packet_base, index))) |frame| {
+                    try Capture.publishDecoded(capture, slot, frame);
+                    reused += 1;
+                } else {
+                    missing[count] = index;
+                    slots[count] = if (original_slots) |mapping| mapping[slot] else slot;
+                    count += 1;
+                }
+            }
+            if (reused != 0) {
+                if (capture.decoder.telemetry) |stats| _ = stats.validated_frames.fetchAdd(reused, .monotonic);
+                capture.decoder.record(.portable);
+                if (count == 0) return;
+                selected = missing[0..count];
+                capture.decode_slots = slots[0..count];
+            }
+        };
         if (capture.decoder.policy != .portable and appleAllowed(capture.decoder)) {
             if (capture.reader_selection) |selection| if (selection.continuation) |continuation| {
                 const used = continuation.decodeApple(selected, selection.packet_base, capture) catch |err| retry: {
@@ -1763,7 +1812,7 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
         }
         if (try decodeAppleH264(a, reader, selected, capture)) return;
         if (capture.reader_selection) |selection| if (selection.continuation) |continuation| {
-            if (try continuation.decode(selected, selection.packet_base, capture, Capture.publishDecoded)) {
+            if (try continuation.decodeControlled(selected, selection.packet_base, capture, Capture.publishDecoded, capture.control)) {
                 capture.decoder.record(.portable);
                 return;
             }
@@ -4279,4 +4328,103 @@ test "embeddinggemma2 immutable packet binding memo is request local and revalid
     bytes[@intCast(reader.packets[0].offset)] ^= 1;
     const changed = try clipBinding(&.{}, &reader, null, control, &pins, null);
     try std.testing.expect(!std.mem.eql(u8, &first, &changed));
+}
+
+test "embeddinggemma2 video Apple sparse continuation seeks beyond dependency bound" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .identity = "sparse-apple", .storage = .{ .borrowed = @embedFile("../testdata/video/closed.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const original = reader.packets;
+    const packets = try a.alloc(media.mp4.Packet, 10000);
+    defer a.free(packets);
+    @memset(packets, original[0]);
+    reader.packets = packets;
+    defer reader.packets = original;
+    const owner = video.apple.Continuation.create(a, &reader, .{ .require_hardware = false, .max_decode_packets = 64 }) catch |err| {
+        if (video.decoding.unavailable(err)) return error.SkipZigTest;
+        return err;
+    };
+    defer owner.deinit();
+    const CaptureSparse = struct {
+        count: usize = 0,
+        last: usize = 0,
+        fn accept(raw: *anyopaque, frame: *const video.apple.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            self.last = frame.decode_index;
+        }
+    };
+    var captured = CaptureSparse{};
+    const sink = video.apple.Sink{ .context = &captured, .accept = CaptureSparse.accept };
+    try std.testing.expectEqual(@as(usize, 1), try owner.decodeTo(&.{0}, sink));
+    try std.testing.expectEqual(@as(usize, 1), try owner.decodeTo(&.{9000}, sink));
+    try std.testing.expectEqual(@as(usize, 2), captured.count);
+    try std.testing.expectEqual(@as(usize, 9000), captured.last);
+}
+
+test "embeddinggemma2 video partial validated frame reuse preserves preparation slots" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .identity = "partial-validated", .storage = .{ .borrowed = @embedFile("../testdata/video/closed.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var logical = try video.h264_pictures.streaming(a, &reader, .{});
+    defer logical.deinit();
+    try std.testing.expect(logical.pictures.len >= 2);
+    const first = logical.pictures[0];
+    const second = logical.pictures[1];
+    const step = try media.timeline.rescale(second.pts - first.pts, logical.timescale, std.time.ns_per_s);
+    const end = try media.timeline.rescale(second.pts, logical.timescale, std.time.ns_per_s) + 1;
+    const sampling = Sampling{ .source_timestamps = .{ .end_ns = end, .step_ns = @intCast(step), .max_frames = 2 } };
+    var selection = try ReaderSelection.initImmutable(a, &reader, sampling, &logical, null, .{}, immutableSourceBinding(&reader), 0);
+    defer selection.deinit();
+    try std.testing.expectEqual(@as(usize, 2), selection.selected.len);
+    const Collect = struct {
+        fn run(allocator: std.mem.Allocator, input: *media.mp4.Reader, interval: Sampling, bound: *ReaderSelection, telemetry: *video.decoding.Telemetry) !PreparedQualification {
+            var result = PreparedQualification{ .a = allocator };
+            errdefer result.deinit();
+            var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+            defer std.debug.assert(pool.snapshot().host_bytes == 0);
+            const producer = try Prefetch.startConfigured(allocator, std.testing.io, null, &.{}, input, .{}, .{ .pool = &pool, .sampling = interval, .selection = bound, .decoder = .{ .policy = .portable, .telemetry = telemetry } });
+            defer producer.deinit();
+            var header: [1]Prefetch.Job = undefined;
+            _ = try producer.header_queue.getUncancelable(std.testing.io, &header, 1);
+            result.count = header[0].header.len;
+            @memcpy(result.ids[0..result.count], header[0].header);
+            var job: [1]Prefetch.Job = undefined;
+            while (true) {
+                _ = producer.queue.getUncancelable(std.testing.io, &job, 1) catch break;
+                defer producer.discard(&job[0]);
+                if (job[0] == .header) continue;
+                if (job[0] != .native) return error.TestUnexpectedResult;
+                const value = job[0].native;
+                if (result.patches[value.slot] != null) return error.DuplicatePreparedFrame;
+                result.patches[value.slot] = try allocator.dupe(f32, value.patches);
+            }
+            producer.join();
+            if (producer.failure) |err| return err;
+            return result;
+        }
+    };
+    var stats = video.decoding.Telemetry{};
+    var expected = try Collect.run(a, &reader, sampling, &selection, &stats);
+    defer expected.deinit();
+    var frame = try video.h264.decodeFrame(a, &reader, first.first_packet, .{});
+    defer frame.deinit();
+    var cache = try video.validated_frames.Cache.init(a, null, 1024 * 1024);
+    defer cache.deinit();
+    cache.configure(0, end, @intCast(end), @intCast(end), 1, 0, logical.timescale);
+    const observer = cache.observer();
+    observer.accept(observer.context, first, &frame);
+    var pins = cache.pin();
+    defer pins.deinit();
+    try std.testing.expect(pins.get(first.first_packet) != null);
+    try std.testing.expect(pins.get(second.first_packet) == null);
+    selection.validated = &pins;
+    var actual = try Collect.run(a, &reader, sampling, &selection, &stats);
+    defer actual.deinit();
+    try std.testing.expectEqual(@as(usize, 1), stats.validated_frames.load(.acquire));
+    try std.testing.expectEqual(expected.count, actual.count);
+    for (expected.patches[0..expected.count], actual.patches[0..actual.count]) |left, right| try std.testing.expectEqualSlices(f32, left.?, right.?);
 }

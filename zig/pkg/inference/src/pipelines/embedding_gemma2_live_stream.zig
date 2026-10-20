@@ -22,6 +22,7 @@ const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const coordinator_mod = @import("antfly_video").live_coordinator;
 const media = @import("antfly_media");
+const video_model = @import("embedding_gemma2_video.zig");
 /// Borrowed for the callback. Copy a vector for independent retention.
 /// Success acknowledges automatically; explicit acknowledgement survives error.
 pub const Delivery = struct {
@@ -36,7 +37,7 @@ pub const Delivery = struct {
         return value;
     }
 };
-pub const Stats = struct { resources: usize = 0, windows: usize = 0, prefetched_fragments: usize = 0, overlapped_fragments: usize = 0 };
+pub const Stats = struct { resources: usize = 0, windows: usize = 0, prefetched_fragments: usize = 0, overlapped_fragments: usize = 0, native_batches: usize = 0, prepared_ahead: usize = 0 };
 /// Borrows session/tokenizer/coordinator/cache/lock and their stable controls.
 /// These owners outlive this state, including any pending output and permit.
 /// Captions/tasks are copied so retry cannot silently change model inputs.
@@ -53,6 +54,8 @@ pub const Stream = struct {
     control: Control,
     cache: ?*embedding.FrameCache,
     pending: ?Pending = null,
+    queued: ?Pending = null,
+    next: ?*Slot = null,
     decoder: ?*embedding.LiveDecoder = null,
     retained: [3]?media.live_mp4.Segment = @splat(null),
     retained_count: usize = 0,
@@ -70,6 +73,170 @@ pub const Stream = struct {
             self.* = undefined;
         }
     };
+    /// Stable addresses keep ahead workers' reader/selection pointers valid.
+    const Slot = struct {
+        allocation: *embedding.LiveAllocation,
+        prepared: coordinator_mod.Prepared,
+        selection: ?video_model.ReaderSelection = null,
+        ahead: ?*embedding.VideoAhead = null,
+        pool: media.admission.Pool = .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } },
+        fn movie(self: *Slot) embedding.SampledVideo {
+            return .{ .reader = &self.prepared.window.reader, .sampling = .{ .source_timestamps = self.prepared.policy }, .selection = if (self.selection) |*selection| selection else null };
+        }
+        fn releasePreparation(self: *Slot) void {
+            if (self.ahead) |ahead| ahead.deinit();
+            self.ahead = null;
+            if (self.selection) |*selection| selection.deinit();
+            self.selection = null;
+            std.debug.assert(std.meta.eql(self.pool.snapshot(), media.admission.Resources{}));
+        }
+        fn deinit(self: *Slot) void {
+            self.releasePreparation();
+            self.prepared.deinit();
+            const allocation = self.allocation;
+            allocation.allocator().destroy(self);
+            allocation.deinit();
+        }
+        fn finish(self: *Slot, result: ?embedding.Result) Pending {
+            self.releasePreparation();
+            const prepared = self.prepared;
+            const allocation = self.allocation;
+            const output = embedding.LiveResult{ .result = result, .source_start_ns = prepared.source_start_ns, .source_end_ns = prepared.source_end_ns, .policy = prepared.policy, .ordinal = prepared.ordinal, .epoch = prepared.window.epoch, .dash_timing = prepared.dash_timing, .hls_timing = prepared.hls_timing };
+            allocation.allocator().destroy(self);
+            return .{ .allocation = allocation, .prepared = prepared, .output = output };
+        }
+    };
+    const Schedule = struct {
+        stream: *Stream,
+        slot: ?*Slot,
+        previous: ?embedding.VideoPreparedHook = null,
+        thread: ?std.Thread = null,
+        started: bool = false,
+        fn ready(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.started) return;
+            self.started = true;
+            if (self.previous) |hook| try hook.ready(hook.context);
+            if (self.slot == null) return;
+            if (comptime @import("builtin").single_threaded) return;
+            self.thread = std.Thread.spawn(.{}, run, .{self}) catch null;
+        }
+        fn run(self: *@This()) void {
+            const slot = self.slot.?;
+            // Speculation failure is retried synchronously when this window is
+            // current. It must not fail an earlier, successfully computed row.
+            slot.ahead = embedding.VideoAhead.start(self.stream.session, slot.movie(), self.stream.control, self.stream.cache, &slot.pool, self.stream.options.video_decoder) catch null;
+        }
+        fn join(self: *@This()) void {
+            if (self.thread) |thread| thread.join();
+            self.thread = null;
+        }
+    };
+    fn prepareSlot(self: *Stream, offset: usize) !?*Slot {
+        if (!try self.coordinator.readyAhead(offset)) return null;
+        const allocation = try embedding.LiveAllocation.create(embedding.workspaceBackingAllocator(self.session.backend()), self.session, self.control);
+        errdefer allocation.deinit();
+        const slot = try allocation.allocator().create(Slot);
+        errdefer allocation.allocator().destroy(slot);
+        slot.* = .{ .allocation = allocation, .prepared = (try self.coordinator.prepareAheadAlloc(allocation.allocator(), offset)).? };
+        errdefer slot.prepared.deinit();
+        if (slot.prepared.has_pictures and slot.prepared.logical != null) {
+            slot.selection = try video_model.ReaderSelection.initImmutable(allocation.allocator(), &slot.prepared.window.reader, .{ .source_timestamps = slot.prepared.policy }, &slot.prepared.logical.?, self.coordinator.options.window.stream.admission_pool, self.coordinator.options.window.stream.control, self.coordinator.sourceBinding(slot.prepared.window.epoch, slot.prepared.generation), slot.prepared.packet_base);
+            slot.selection.?.validated = &slot.prepared.frames;
+            slot.selection.?.validated_packet_base = slot.prepared.packet_base;
+        }
+        errdefer if (slot.selection) |*selection| selection.deinit();
+        try allocation.trim();
+        return slot;
+    }
+    fn fillPending(self: *Stream) !void {
+        var slots: [2]?*Slot = @splat(null);
+        defer for (slots) |slot| if (slot) |owner| owner.deinit();
+        slots[0] = self.next;
+        self.next = null;
+        if (slots[0] == null) slots[0] = try self.prepareSlot(0);
+        const first = slots[0] orelse return;
+        if (first.prepared.ordinal != self.coordinator.ordinal) return error.InvalidLiveWindowCommit;
+        if (!first.prepared.has_pictures) {
+            self.pending = first.finish(null);
+            slots[0] = null;
+            return;
+        }
+        if (first.ahead == null and first.prepared.window.reader.track.codec == .avc) {
+            if (self.decoder == null) self.decoder = try embedding.LiveDecoder.create(self.session, self.control);
+            if (first.selection) |*selection| selection.continuation = try self.decoder.?.bind(&first.prepared);
+        }
+        var count: usize = 1;
+        slots[1] = self.prepareSlot(1) catch |err| blk: {
+            if (embedding.videoSpeculationPressure(err) or err == error.ResourceLimitExceeded) break :blk null;
+            return err;
+        };
+        if (slots[1]) |second| {
+            if (second.prepared.has_pictures) {
+                count = 2;
+            } else {
+                second.deinit();
+                slots[1] = null;
+            }
+        }
+        // Prepare at most one following sealed window. Nothing fetches or
+        // advances the coordinator while a model row is being executed.
+        if (self.options.prepare_ahead and (self.session.backend() == .metal or self.session.backend() == .cuda)) self.next = self.prepareSlot(count) catch null;
+        errdefer {
+            if (self.next) |next| next.deinit();
+            self.next = null;
+            if (self.decoder) |decoder| decoder.reset();
+        }
+        var schedule = Schedule{ .stream = self, .previous = self.options.video_prepared, .slot = if (self.next) |next| if (next.prepared.has_pictures) next else null else null };
+        defer schedule.join();
+        var options = self.options;
+        if (options.prepare_ahead) options.video_prepared = .{ .context = &schedule, .ready = Schedule.ready };
+        var items: [2]embedding.VideoBatchItem = undefined;
+        for (slots[0..count], items[0..count]) |slot, *item| item.* = .{ .movie = slot.?.movie(), .caption = self.caption, .ahead = slot.?.ahead };
+        // A running ahead producer carries its inspection plan. Other cohort
+        // rows can be inspected independently once it is consumed serially.
+        const batched = if (count == 2 and first.ahead == null) embedding.embedVideos(first.allocation.allocator(), self.session, self.tokenizer, items[0..count], options, self.lock, self.control, self.cache) catch |err| blk: {
+            if (err == error.BatchIncompatible or embedding.videoSpeculationPressure(err)) break :blk null;
+            return err;
+        } else null;
+        schedule.join();
+        if (batched) |batch| {
+            const a = first.allocation.allocator();
+            defer a.free(batch.vectors);
+            defer a.free(batch.input_tokens);
+            defer for (batch.vectors) |vector| a.free(vector);
+            const second = slots[1].?;
+            const vector = try second.allocation.allocator().dupe(f32, batch.vectors[1]);
+            errdefer second.allocation.allocator().free(vector);
+            // The first vector is copied too so batch temporary cleanup stays
+            // uniform before either independently owned output can be delivered.
+            const first_vector = try a.dupe(f32, batch.vectors[0]);
+            self.queued = second.finish(.{ .vector = vector, .input_tokens = batch.input_tokens[1] });
+            slots[1] = null;
+            self.pending = first.finish(.{ .vector = first_vector, .input_tokens = batch.input_tokens[0] });
+            slots[0] = null;
+            self.stats.native_batches += 1;
+        } else {
+            // If a cohort declined, its speculative successor is no longer the
+            // next ordinal. Drop it before serial preparation consumes a row.
+            if (count == 2) {
+                if (self.next) |next| next.deinit();
+                self.next = null;
+                slots[1].?.deinit();
+                slots[1] = null;
+                schedule.slot = null;
+            }
+            options.video_ahead = first.ahead;
+            const parts = [_]embedding.Part{ .{ .sampled_video = first.movie() }, .{ .text = self.caption orelse "" } };
+            const result = try embedding.embedCached(first.allocation.allocator(), self.session, self.tokenizer, .{ .content = parts[0..if (self.caption != null) 2 else 1] }, options, self.lock, self.control, self.cache);
+            schedule.join();
+            self.pending = first.finish(result);
+            slots[0] = null;
+        }
+        if (self.next) |next| if (next.ahead != null) {
+            self.stats.prepared_ahead += 1;
+        };
+    }
     pub fn init(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, coordinator: *coordinator_mod.Coordinator, caption: ?[]const u8, options: embedding.Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*embedding.FrameCache) !Stream {
         const effective = control orelse Control{};
         try effective.check();
@@ -91,6 +258,8 @@ pub const Stream = struct {
         for (&self.retained) |*unit| if (unit.*) |*value| value.deinit();
         if (self.decoder) |decoder| decoder.deinit();
         if (self.pending) |*pending| pending.deinit(self.allocator);
+        if (self.queued) |*pending| pending.deinit(self.allocator);
+        if (self.next) |next| next.deinit();
         if (self.caption) |caption| self.allocator.free(caption);
         self.allocator.free(self.task);
         self.context_permit.deinit();
@@ -101,22 +270,8 @@ pub const Stream = struct {
             try self.control.check();
             if (self.pending == null) {
                 if (!try self.coordinator.ready()) return;
-                const allocation = try embedding.LiveAllocation.create(embedding.workspaceBackingAllocator(self.session.backend()), self.session, self.control);
-                errdefer allocation.deinit();
-                var prepared = (self.coordinator.prepareAlloc(allocation.allocator()) catch |err| return allocation.failure(err)) orelse {
-                    allocation.deinit();
-                    return;
-                };
-                errdefer prepared.deinit();
-                try allocation.trim();
-                if (prepared.has_pictures and prepared.window.reader.track.codec == .avc and self.decoder == null) self.decoder = try embedding.LiveDecoder.create(self.session, self.control);
-                const output = embedding.embedPreparedLiveWithDecoder(allocation.allocator(), self.session, self.tokenizer, self.coordinator, &prepared, self.caption, self.options, self.lock, self.control, self.cache, self.decoder) catch |err| {
-                    if (self.decoder) |decoder| decoder.reset();
-                    return allocation.failure(err);
-                };
-                errdefer if (output.result) |result| allocation.allocator().free(result.vector);
-                try allocation.trim();
-                self.pending = .{ .prepared = prepared, .output = output, .allocation = allocation };
+                try self.fillPending();
+                if (self.pending == null) return;
             }
             try self.deliverPending(context, accept);
             try self.commitPending();
@@ -139,7 +294,8 @@ pub const Stream = struct {
         // The next call retries commit without repeating accepted effects.
         try self.coordinator.commit(&pending.prepared);
         pending.deinit(self.allocator);
-        self.pending = null;
+        self.pending = self.queued;
+        self.queued = null;
         self.stats.windows += 1;
     }
     /// Append acknowledgement precedes model delivery. On failure this unit is
@@ -221,6 +377,13 @@ pub const Stream = struct {
         if (self.active) return error.InvalidMediaStreamState;
         self.active = true;
         defer self.active = false;
+        defer if (self.next) |next| {
+            // A process call never leaves a preparation worker or GPU import
+            // running across callback failure/cancellation. Keep metadata for
+            // retry, but drain speculative pixels before returning.
+            if (next.ahead) |ahead| ahead.deinit();
+            next.ahead = null;
+        };
         try self.drain(context, accept);
         try self.drainRetained(context, accept);
         const Reader = @typeInfo(@TypeOf(reader)).pointer.child;

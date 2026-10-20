@@ -38492,6 +38492,85 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
     }
     try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
     std.debug.print("streamed live pretrained ts={} parts={} encrypted={} metal={} windows={d} callbacks={d} early={d} prefix={d} requests={d} prefetched={d} overlaps={d} max_error={d:.9}\n", .{ ts, parts, encrypted, metal, capture.count, capture.calls, capture.early, acknowledged_prefix, transport.requests, stream.stats.prefetched_fragments, stream.stats.overlapped_fragments, max_error });
+    if (!ts and !parts and !encrypted) {
+        // A backlog is available immediately: qualify native cohorts and one
+        // preparation wave ahead, including captions and an unacknowledged
+        // first callback while a second computed output is already retained.
+        var cohort_client = Fake.Client{};
+        var cohort_transport = stream_media.http_stream.Adapter(Fake){ .allocator = a, .client = &cohort_client, .root_url = transport.root_url, .limits = transport.limits };
+        var cohort_reader = try stream_media.hls_live.Reader(Fake).init(a, &cohort_transport, transport.root_url, .{});
+        defer cohort_reader.deinit();
+        try cohort_reader.reload();
+        var cohort_flow = try stream_coordinator.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .max_frames = 1 });
+        defer cohort_flow.deinit();
+        while (try cohort_reader.next()) |value| {
+            var unit: ?stream_media.live_mp4.Segment = value;
+            defer if (unit) |*owner| owner.deinit();
+            try cohort_flow.append(&unit);
+        }
+        try cohort_flow.finish();
+        var snapshots: [6]?stream_coordinator.Prepared = @splat(null);
+        defer for (&snapshots) |*snapshot| if (snapshot.*) |*owner| owner.deinit();
+        for (&snapshots, 0..) |*snapshot, offset| snapshot.* = (try cohort_flow.prepareAheadAlloc(a, offset)).?;
+        const Ended = struct {
+            calls: usize = 0,
+            pub fn ended(_: *@This()) bool {
+                return true;
+            }
+            pub fn streamNext(self: *@This(), _: *anyopaque, _: *const fn (*anyopaque, *stream_media.http_stream.FragmentDelivery) anyerror!void) !?struct { resource_complete: bool } {
+                self.calls += 1;
+                return null;
+            }
+        };
+        const CohortCapture = struct {
+            calls: usize = 0,
+            count: usize = 0,
+            hash: [32]u8 = undefined,
+            outputs: [6]?stream_embedding.LiveResult = @splat(null),
+            fn accept(raw: *anyopaque, delivery: *StreamDelivery) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(delivery.value.result.?.vector), &hash, .{});
+                if (self.calls == 1) {
+                    self.hash = hash;
+                    return error.ConsumerFailure;
+                }
+                if (self.calls == 2) try std.testing.expectEqual(self.hash, hash);
+                try std.testing.expectEqual(self.count, delivery.value.ordinal);
+                self.outputs[self.count] = try delivery.copy(std.testing.allocator);
+                self.count += 1;
+            }
+        };
+        var telemetry = @import("antfly_video").decoding.Telemetry{};
+        const cohort_options = stream_embedding.Options{ .video_decoder = .{ .telemetry = &telemetry } };
+        const caption = "A short scene.";
+        var cohort_stream = try StreamAPI.init(a, loaded.session, loaded.getTokenizer(), &cohort_flow, caption, cohort_options, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+        defer cohort_stream.deinit();
+        var ended = Ended{};
+        var captured = CohortCapture{};
+        defer for (captured.outputs) |output| if (output) |value| a.free(value.result.?.vector);
+        const cohort_started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        try std.testing.expectError(error.ConsumerFailure, cohort_stream.process(&ended, &captured, CohortCapture.accept));
+        try std.testing.expect(cohort_stream.queued != null);
+        try std.testing.expectEqual(@as(usize, 0), ended.calls);
+        _ = try cohort_stream.process(&ended, &captured, CohortCapture.accept);
+        const cohort_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - cohort_started;
+        try std.testing.expectEqual(@as(usize, 6), captured.count);
+        try std.testing.expect(cohort_stream.stats.native_batches > 0);
+        try std.testing.expect(telemetry.validated_frames.load(.acquire) > 0);
+        var cohort_error: f32 = 0;
+        const serial_started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        for (&snapshots, captured.outputs) |*snapshot, output| {
+            const expected = try stream_embedding.embedPreparedLiveCached(a, loaded.session, loaded.getTokenizer(), &cohort_flow, &snapshot.*.?, caption, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+            defer a.free(expected.result.?.vector);
+            try std.testing.expectEqual(expected.result.?.input_tokens, output.?.result.?.input_tokens);
+            for (expected.result.?.vector, output.?.result.?.vector) |left, right| cohort_error = @max(cohort_error, @abs(left - right));
+        }
+        try std.testing.expect(cohort_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
+        const serial_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - serial_started;
+        std.debug.print("sealed live cohorts metal={} batches={d} ahead={d} validated_frames={d} callbacks={d} max_error={d:.9} completed_ns={d} serial_ns={d}\n", .{ metal, cohort_stream.stats.native_batches, cohort_stream.stats.prepared_ahead, telemetry.validated_frames.load(.acquire), captured.calls, cohort_error, cohort_ns, serial_ns });
+    }
 }
 
 test "embeddinggemma2 video partial DASH pretrained windows preserve vectors across clean short EOF and growth" {

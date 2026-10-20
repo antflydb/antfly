@@ -1563,10 +1563,38 @@ untrusted reader APIs continue to verify their content bindings. Projection keys
 use a process-local source capability, epoch generation and absolute packet ID,
 so retention rebasing cannot alias another picture or stream.
 
+Strict live validation can retain completed native-depth/chroma pictures for
+preparation, avoiding a second reconstruction of selected frames. Four current
+or near-future sampling windows share a 64 MiB pixel bound, including outstanding
+pins; media admission charges every retained allocation. Targets use rational
+presentation times and stable packet IDs, so B-picture reorder and VFR do not
+publish a provisional candidate under another picture's identity. A failed append
+clears unpublished candidates; prepared pins remain independent of coordinator
+retention and destruction. Capture scratch or cache admission denial is a miss.
+Partial hits preserve preparation slots and decode only missing selections.
+Separate colour planes and explicitly forced Apple decoding use the decoder path.
+Set `max_validated_frame_bytes=0` to disable this optional reuse.
+
 A live stream retains an admitted decoder owner while a GOP grows, including
 portable reference pictures, dynamic parameter registry and eligible VideoToolbox
 state. Retention eviction, configuration/period transitions and failed inference
 reset that owner. Rewinding selections retain the existing replay fallback.
+For sparse forward windows, portable decoders verify a later independent reset
+before discarding references, with a 32-packet hysteresis; unfinished field or
+partition assemblies prevent a restart. Eligible Apple continuations recreate
+their decoder at a verified IDR when it saves more than 32 packets or avoids the
+dependency limit. Configuration epochs keep their own parameter context.
+
+Live model execution combines up to two already sealed windows, including their
+captions, through the existing admitted video batch executor. There is no fill
+wait. One following sealed window can prepare while the current backbone runs.
+Previewed snapshots keep stable reader/selection addresses and independent pixel
+pins. Output acknowledgement and commit stay ordered; a rejected callback retains
+both its exact vector and any later computed row. Commit rebases against current
+preroll after earlier acknowledgements evict units. Speculative pressure falls
+back to serial execution, and all preparation workers join before return.
+Statistics distinguish native batches, prepared successors and validated-frame
+hits from transport overlap; none of these counters measures GPU utilization.
 
 HLS/DASH HTTP reads and framing use a producer with two queued fragments while
 model execution and delivery callbacks remain on the caller thread. The queue

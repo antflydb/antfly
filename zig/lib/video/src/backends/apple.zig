@@ -302,8 +302,28 @@ pub const Continuation = struct {
         self.allocator.destroy(self);
     }
     pub fn decodeTo(self: *Continuation, indexes: []const usize, sink: Sink) !usize {
+        return self.decodeToControlled(indexes, sink, self.capture.reader.input.control);
+    }
+    /// All submissions and callbacks drain before the scoped control returns.
+    pub fn decodeToControlled(self: *Continuation, indexes: []const usize, sink: Sink, control: media.source.Control) !usize {
         if (!supported or indexes.len == 0 or indexes.len > self.slots.len) return error.InvalidPacketIndex;
         var reader_view = self.capture.reader.*;
+        const Controls = struct {
+            original: media.source.Control,
+            current: media.source.Control,
+            fn check(raw: ?*const anyopaque) !void {
+                const checks: *const @This() = @ptrCast(@alignCast(raw.?));
+                try checks.original.check();
+                try checks.current.check();
+            }
+        };
+        var controls = Controls{ .original = reader_view.input.control, .current = control };
+        var source = reader_view.input.*;
+        source.control = .{ .context = &controls, .check_fn = Controls.check };
+        reader_view.input = &source;
+        const previous = self.capture.control;
+        self.capture.control = source.control;
+        defer self.capture.control = previous;
         const reader = &reader_view;
         var first = reader.packets.len;
         var last: usize = 0;
@@ -313,11 +333,24 @@ pub const Continuation = struct {
             last = @max(last, index);
         }
         var start = self.next_packet;
-        if (self.next_packet == 0) {
+        if (self.next_packet == 0 or first > self.next_packet +| 32 or last - self.next_packet >= self.options.max_decode_packets) {
             var plan = try decode_plan.create(self.allocator, reader, indexes, .{ .mode = .verified_idr, .max_decode_packets = self.options.max_decode_packets });
             defer plan.deinit();
             if (plan.runs.len == 0) return error.UnverifiedDecodeStart;
-            start = plan.runs[0].first;
+            const restart = plan.runs[0].first;
+            if (self.next_packet == 0 or restart > self.next_packet +| 32 or last - self.next_packet >= self.options.max_decode_packets) {
+                start = restart;
+                if (self.next_packet != 0) {
+                    // A fresh session prevents delayed pictures and reference
+                    // state from the old GOP crossing this verified IDR.
+                    var replacement: ?*anyopaque = null;
+                    const status = av_decoder_create(reader.track.avcc.ptr, reader.track.avcc.len, reader.track.width, reader.track.height, @intFromBool(self.options.require_hardware), Capture.callback, &self.capture, &replacement);
+                    if (status == -108) return error.OutOfMemory;
+                    if (status != 0) return error.VideoDecoderUnavailable;
+                    av_decoder_destroy(self.handle.?);
+                    self.handle = replacement;
+                }
+            }
         }
         if (last - start + 1 > self.options.max_decode_packets) return error.ResourceLimitExceeded;
         if (try surfaceAdmissionBytes(reader.track.width, reader.track.height, indexes.len) > self.options.max_surface_bytes) return error.ResourceLimitExceeded;
@@ -325,6 +358,10 @@ pub const Continuation = struct {
         self.capture.indexes = indexes;
         self.capture.slots = self.slots[0..indexes.len];
         self.capture.seen = self.seen[0..indexes.len];
+        var drained = false;
+        defer if (!drained) {
+            _ = av_decoder_drain(self.handle.?);
+        };
         for (start..last + 1) |index| {
             try reader.input.control.check();
             var lease = try reader.readPacket(index);
@@ -335,7 +372,9 @@ pub const Continuation = struct {
             if (av_decoder_submit(self.handle.?, lease.bytes.ptr, lease.bytes.len, index, packet.pts, packet.dts, packet.duration, reader.track.timescale) != 0) return error.VideoDecodeFailed;
             try flush(&self.capture, sink);
         }
-        if (av_decoder_drain(self.handle.?) != 0) return error.VideoDecodeFailed;
+        const drain_status = av_decoder_drain(self.handle.?);
+        drained = true;
+        if (drain_status != 0) return error.VideoDecodeFailed;
         try flush(&self.capture, sink);
         for (self.seen[0..indexes.len]) |seen| if (!seen) return error.MissingDecodedFrame;
         self.next_packet = last + 1;

@@ -644,7 +644,7 @@ pub const LiveDecoder = struct {
         self.epoch = null;
         self.packets = 0;
     }
-    fn bind(self: *LiveDecoder, prepared: *@import("antfly_video").live_coordinator.Prepared) !*@import("embedding_gemma2_video.zig").DecoderContinuation {
+    pub fn bind(self: *LiveDecoder, prepared: *@import("antfly_video").live_coordinator.Prepared) !*@import("embedding_gemma2_video.zig").DecoderContinuation {
         if (self.epoch != null and (self.epoch.? != prepared.window.epoch or self.generation != prepared.generation or self.packet_base != prepared.packet_base)) self.reset();
         if (prepared.window.reader.packets.len < self.packets) return error.InvalidLivePictureIndex;
         var window = try @import("antfly_video").live_windows.clone(self.allocation.allocator(), &prepared.window, .{ .stream = .{ .control = prepared.window.reader.input.control, .admission_pool = prepared.window.reader.input.admission_pool } });
@@ -684,9 +684,11 @@ pub fn embedPreparedLiveWithDecoder(out: std.mem.Allocator, session: Session, to
     const sampling = @import("embedding_gemma2_video.zig").Sampling{ .source_timestamps = prepared.policy };
     var selection: ?@import("embedding_gemma2_video.zig").ReaderSelection = if (prepared.has_pictures and prepared.logical != null) (@import("embedding_gemma2_video.zig").ReaderSelection.initImmutable(allocation.allocator(), &prepared.window.reader, sampling, &prepared.logical.?, coordinator.options.window.stream.admission_pool, coordinator.options.window.stream.control, coordinator.sourceBinding(prepared.window.epoch, prepared.generation), prepared.packet_base) catch |err| return allocation.failure(err)) else null;
     defer if (selection) |*owner| owner.deinit();
-    if (selection) |*owner| if (decoder) |state| {
-        owner.continuation = try state.bind(prepared);
-    };
+    if (selection) |*owner| {
+        owner.validated = &prepared.frames;
+        owner.validated_packet_base = prepared.packet_base;
+        if (decoder) |state| owner.continuation = try state.bind(prepared);
+    }
     try allocation.trim();
     const parts = [_]Part{ .{ .sampled_video = .{ .reader = &prepared.window.reader, .sampling = sampling, .selection = if (selection) |*owner| owner else null } }, .{ .text = caption orelse "" } };
     const result: ?Result = if (prepared.has_pictures) try embedCached(out, session, tokenizer, .{ .content = parts[0..if (caption != null) 2 else 1] }, options, lock, control, cache) else null;
@@ -906,7 +908,16 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
         if (!singleImageGroup(group) or !options.resident_images) return embedCudaGroup(a, session, tokenizer, group, options, lock, control);
     }
     if (options.video_ahead) |ahead| {
-        if (group.content.len != 1 or group.content[0] != .sampled_video or !ahead.matches(group.content[0].sampled_video, options.video_decoder, session, cache) or ahead.released) return error.InvalidVideoReaderSelection;
+        var movie: ?SampledVideo = null;
+        for (group.content) |part| switch (part) {
+            .text => {},
+            .sampled_video => |value| {
+                if (movie != null) return error.InvalidVideoReaderSelection;
+                movie = value;
+            },
+            else => return error.InvalidVideoReaderSelection,
+        };
+        if (movie == null or !ahead.matches(movie.?, options.video_decoder, session, cache) or ahead.released) return error.InvalidVideoReaderSelection;
     }
     const effective = control orelse Control{};
     const inspection_started = mediaNow();
@@ -1048,7 +1059,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
 /// Decode remains ordered so retained codec continuations can advance safely.
 /// No queue fill delay: callers pass only already available windows (max four).
 pub const VideoBatchResult = struct { vectors: [][]f32, input_tokens: []usize, execution: BatchExecution.Execution };
-pub const VideoBatchItem = struct { movie: SampledVideo, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*VideoAhead = null };
+pub const VideoBatchItem = struct { movie: SampledVideo, caption: ?[]const u8 = null, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*VideoAhead = null };
 pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, items: []const VideoBatchItem, input_options: Options, lock: ?*std.atomic.Mutex, control: Control, cache: ?*FrameCache) !VideoBatchResult {
     var pins = @import("embedding_gemma2_video.zig").CachePins{ .cache = cache };
     defer pins.deinit();
@@ -1084,10 +1095,13 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
         try control.check();
         if (item.ahead) |ahead| if (ahead.released or !ahead.matches(movie, options.video_decoder, session, cache)) return error.InvalidVideoReaderSelection;
         const plan = if (item.ahead) |ahead| ahead.plan else if (item.plan) |plan| try @import("embedding_gemma2_video.zig").pinCachedPlan(plan.*, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = &pins }) else try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, movie.bytes, movie.reader, control, .{ .sampling = movie.sampling, .selection = movie.selection, .webm = movie.webm, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope }, session.backend() == .metal);
-        const sequence = try std.math.add(usize, plan.sequence_tokens, 128);
+        // UTF-8 byte length bounds caption token count conservatively; exact
+        // tokenization and the expanded model limit are enforced by preparation.
+        const raw = try std.math.add(usize, plan.sequence_tokens, if (item.caption) |caption| caption.len else 0);
+        const sequence = try std.math.add(usize, raw, 128);
         longest = @max(longest, sequence);
-        raw_longest = @max(raw_longest, plan.sequence_tokens);
-        total = try std.math.add(usize, total, plan.sequence_tokens);
+        raw_longest = @max(raw_longest, raw);
+        total = try std.math.add(usize, total, raw);
         if (item.ahead == null) {
             device = @max(device, try plan.deviceBytes());
             commands = @max(commands, plan.commands);
@@ -1134,8 +1148,10 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     defer if (cb.embedding_stage) |stage| stage.cleanup();
     for (items) |item| {
         const movie = item.movie;
-        try validateGroup(.{ .content = &.{.{ .sampled_video = movie }} }, options);
-        rows[initialized] = try prepareGroupWithBudget(a, cb, tokenizer, .{ .content = &.{.{ .sampled_video = movie }} }, options, control, &pool, if (item.ahead) |ahead| ahead.producer else null, cache);
+        const parts = [_]Part{ .{ .sampled_video = movie }, .{ .text = item.caption orelse "" } };
+        const group = Group{ .content = parts[0..if (item.caption != null) 2 else 1] };
+        try validateGroup(group, options);
+        rows[initialized] = try prepareGroupWithBudget(a, cb, tokenizer, group, options, control, &pool, if (item.ahead) |ahead| ahead.producer else null, cache);
         if (cb.embedding_stage != null) if (rows[initialized].tensor) |tensor| {
             rows[initialized].tensor = @import("../ops/metal_compute.zig").MetalCompute.escapeEmbeddingStage(cb, tensor) catch |err| {
                 rows[initialized].deinit(a);

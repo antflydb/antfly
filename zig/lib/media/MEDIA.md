@@ -899,3 +899,16 @@ never copied into retained segment snapshots. Live readers expose
 `swapReadControl` for a scoped ingestion producer; callers restore the prior
 checkpoint only after that producer joins. This permits bounded read/model
 overlap without allowing a request-local callback to escape into a window.
+
+Strict video validation may lend completed pixels through independently retained
+frame pins. Their shared byte bound includes outputs held across delivery retries;
+encoded snapshot eviction cannot invalidate them. Optional capture pressure does
+not relax validation or deny its serial decoder fallback. Live model consumers
+preview only sealed windows, batch ready rows without a fill delay, and keep
+transport acknowledgement separate from ordered output acknowledgement/commit.
+A single admitted successor may prepare during backbone execution. Cancellation
+joins that preparation work before releasing its source, controls or frame pins.
+Settled phase residency returns its live-memory credit only within the same
+kernel pressure epoch. Credits from older epochs cannot augment a new sample;
+long-lived stream contexts retain shared quota without accumulating false pressure
+as completed phases release their allocations.

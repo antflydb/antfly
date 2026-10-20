@@ -123,6 +123,14 @@ pub const PictureObserver = struct {
     accept: *const fn (*anyopaque, Picture) anyerror!void,
     /// Allocation-free notification before reconstruction owners are released.
     pending: ?*const fn (*anyopaque, PendingPicture) void = null,
+    frames: ?FrameObserver = null,
+};
+/// Synchronous borrowed pixels, emitted only after complete reconstruction and
+/// deblocking. A consumer must copy before returning; failure is not validation.
+pub const FrameObserver = struct {
+    context: *anyopaque,
+    wants: *const fn (*anyopaque, Picture) bool,
+    accept: *const fn (*anyopaque, Picture, *const Frame) void,
 };
 pub const Frame = struct {
     allocator: std.mem.Allocator,
@@ -1367,6 +1375,32 @@ pub const Incremental = struct {
             last = @max(last, index);
         }
         errdefer self.valid = false;
+        // A warm DPB is useful only while it is cheaper than an independently
+        // verified restart. Never discard an unfinished field/partition pair.
+        if (!self.hasPending() and first > self.cursor() +| 32) {
+            var restart = first;
+            var probes: usize = 0;
+            while (restart > self.cursor() and probes < self.options.max_dependency_packets) : (restart -= 1) {
+                probes += 1;
+                if (!reader.packets[restart].sync and configurations == null) continue;
+                var lease = try reader.readPacket(restart);
+                defer lease.deinit();
+                if (lease.bytes.len > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
+                const probe_cfg = if (configurations) |epoch_context| try epoch_context.session.configAt(epoch_context.base + restart) else self.cfg.?;
+                if (!try isDependencyReset(self.budget.allocator(), probe_cfg, lease.bytes, reader.track.nal_length_bytes, reader.input)) continue;
+                // Apply a hysteresis of 32 packets to avoid resetting for tiny
+                // savings. Dependency-limit recovery takes priority over it.
+                if (restart - self.cursor() > 32 or last - self.cursor() >= self.options.max_dependency_packets) {
+                    switch (self.lanes) {
+                        inline else => |*lanes| for (lanes) |*lane| {
+                            lane.deinit(self.budget.allocator());
+                            lane.* = .{};
+                        },
+                    }
+                }
+                break;
+            }
+        }
         switch (self.lanes) {
             inline else => |*lanes| for (lanes[0..if (self.cfg.?.separate_planes) @as(usize, 3) else 1]) |*lane| for (&lane.workspaces) |*slot| if (slot.*) |*workspace| {
                 workspace.selected = try self.budget.allocator().realloc(workspace.selected, indexes.len);
@@ -1491,6 +1525,7 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
     var temporary = Continuation(Sample){};
     const live = retained orelse &temporary;
     const metadata_only = retained != null and indexes.len == 0;
+    var frame_observer = if (options.picture_observer) |observer| observer.frames else null;
     const allocator = budget.allocator();
     var output_packet = reader.packets[index];
     if (cfg.width != reader.track.width or cfg.height != reader.track.height) return error.UnsupportedDynamicGeometry;
@@ -1506,7 +1541,8 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
         if (reader.packets[start].sync or configurations != null) {
             var probe = try reader.readPacket(start);
             defer probe.deinit();
-            if (try isDependencyReset(allocator, cfg, probe.bytes, reader.track.nal_length_bytes, reader.input)) break;
+            const probe_cfg = if (configurations) |epoch_context| try epoch_context.session.configAt(epoch_context.base + start) else cfg;
+            if (try isDependencyReset(allocator, probe_cfg, probe.bytes, reader.track.nal_length_bytes, reader.input)) break;
         }
         if (start == 0) return error.MissingVideoReference;
         start -= 1;
@@ -1571,7 +1607,7 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
     if (workspaces[0] == null) workspaces[0] = try Workspace.init(allocator, coded_pixels, if (cfg.chroma_format == 0) 0 else sub_x * sub_y, group_size, indexes.len);
     if (!live.initialized) live.references.chroma_format = cfg.chroma_format;
     const references = &live.references;
-    const output = try allocator.alloc(u8, output_size);
+    var output = try allocator.alloc(u8, output_size);
     errdefer allocator.free(output);
     var decoded_packets: usize = 0;
     var field_macroblocks: usize = 0;
@@ -1756,17 +1792,30 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
             }
             for (workspace.metadata) |m| field_macroblocks += @intFromBool(m.field);
             const selected = workspace.wanted();
-            if (options.picture_observer) |observer| {
-                const pts = workspace.pts.?;
-                const duration = std.math.cast(u32, std.math.sub(i64, workspace.end, pts) catch return error.TimestampOverflow) orelse return error.TimestampOverflow;
-                try observer.accept(observer.context, .{ .first_packet = workspace.first_packet + (if (configurations) |epoch_context| epoch_context.base else 0), .last_packet = partition_span.last + (if (configurations) |epoch_context| epoch_context.base else 0), .pts = pts, .duration = duration, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .bit_depth = cfg.bit_depth, .chroma_format = cfg.chroma_format, .independent_plane = if (cfg.separate_planes) cfg.selected_plane else null });
+            const picture = Picture{ .first_packet = workspace.first_packet + (if (configurations) |epoch_context| epoch_context.base else 0), .last_packet = partition_span.last + (if (configurations) |epoch_context| epoch_context.base else 0), .pts = workspace.pts.?, .duration = std.math.cast(u32, std.math.sub(i64, workspace.end, workspace.pts.?) catch return error.TimestampOverflow) orelse return error.TimestampOverflow, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .bit_depth = cfg.bit_depth, .chroma_format = cfg.chroma_format, .independent_plane = if (cfg.separate_planes) cfg.selected_plane else null };
+            if (options.picture_observer) |observer| try observer.accept(observer.context, picture);
+            var capture_frame = if (frame_observer) |observer| observer.wants(observer.context, picture) else false;
+            if (capture_frame and metadata_only) capture: {
+                const bytes = (cfg.width * cfg.height + (if (cfg.chroma_format == 0) @as(usize, 0) else 2 * (cfg.width / sub_x) * (cfg.height / sub_y))) * @sizeOf(Sample);
+                if (output.len >= bytes) break :capture;
+                reservation.resize(.{ .host_bytes = bytes }) catch {
+                    capture_frame = false;
+                    frame_observer = null;
+                    break :capture;
+                };
+                output = allocator.realloc(output, bytes) catch {
+                    reservation.resize(.{ .host_bytes = output.len }) catch {};
+                    capture_frame = false;
+                    frame_observer = null;
+                    break :capture;
+                };
             }
-            if (selected) {
-                output_packet.pts = workspace.pts.?;
-                output_packet.duration = std.math.cast(u32, std.math.sub(i64, workspace.end, output_packet.pts) catch return error.TimestampOverflow) orelse return error.TimestampOverflow;
+            if (selected or capture_frame) {
+                output_packet.pts = picture.pts;
+                output_packet.duration = picture.duration;
             }
             const planes = [3][]Sample{ workspace.planar[0..coded_pixels], workspace.planar[coded_pixels..][0..chroma_pixels], workspace.planar[coded_pixels + chroma_pixels ..] };
-            if (selected) {
+            if (selected or capture_frame) {
                 for (0..cfg.height) |y| {
                     try reader.input.control.check();
                     const source_start = (y + cfg.top) * cfg.coded_width + cfg.left;
@@ -1780,12 +1829,16 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
                     const target_start = (cfg.width * cfg.height + y * width * 2) * @sizeOf(Sample);
                     @import("h264_pixels.zig").interleave(Sample, output[target_start..][0 .. width * 2 * @sizeOf(Sample)], planes[1][source_start..][0..width], planes[2][source_start..][0..width]);
                 }
-                if (callback) |publish| {
+                {
                     const picture_bytes = (cfg.width * cfg.height + (if (cfg.chroma_format == 0) @as(usize, 0) else 2 * (cfg.width / sub_x) * (cfg.height / sub_y))) * @sizeOf(Sample);
                     const metadata_frame = Frame{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .allocator = budget.backing, .nv12 = output[0..picture_bytes], .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .color = cfg.color, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
-                    for (workspace.selected, 0..) |wanted, request_slot| if (wanted) {
+                    if (callback) |publish| for (workspace.selected, 0..) |wanted, request_slot| if (wanted) {
                         try publish(callback_context.?, request_slot, &metadata_frame);
                     };
+                    if (capture_frame) {
+                        const observer = frame_observer.?;
+                        observer.accept(observer.context, picture, &metadata_frame);
+                    }
                 }
             }
             workspace.active = false;

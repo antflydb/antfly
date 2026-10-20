@@ -19,6 +19,7 @@ const media = @import("antfly_media");
 const windows = @import("live_windows.zig");
 const sampling = @import("sampling.zig");
 const pictures = @import("h264_pictures.zig");
+const frames = @import("validated_frames.zig");
 const avc = @import("avc.zig");
 // Cache identities are process-local capabilities for independently owned
 // immutable snapshots, never URL or caller-claimed content hashes.
@@ -34,10 +35,14 @@ pub const Options = struct {
     max_windows: usize = 4096,
     /// Full replay remains available as a differential/benchmark oracle.
     incremental_validation: bool = true,
+    /// Optional pixel reuse; zero disables it. Pins share this bound even after
+    /// coordinator eviction. Admission denial preserves strict validation.
+    max_validated_frame_bytes: usize = 64 * 1024 * 1024,
 };
 pub const Prepared = struct {
     window: windows.Window,
     logical: ?pictures.Index = null,
+    frames: frames.View = .{},
     policy: sampling.TimestampPolicy,
     ordinal: usize,
     packet_base: usize = 0,
@@ -49,6 +54,7 @@ pub const Prepared = struct {
     hls_timing: ?media.live_mp4.HlsTiming = null,
     pub fn deinit(self: *Prepared) void {
         if (self.logical) |*logical| logical.deinit();
+        self.frames.deinit();
         self.window.deinit();
         self.* = undefined;
     }
@@ -79,6 +85,7 @@ pub const Coordinator = struct {
     pending_ns: ?i64 = null,
     logical: ?pictures.Index = null,
     stream: ?*pictures.Stream = null,
+    frame_cache: ?frames.Cache = null,
     parameters: Parameters = .{},
     logical_base: usize = 0,
     packet_base: usize = 0,
@@ -122,6 +129,7 @@ pub const Coordinator = struct {
     }
     pub fn deinit(self: *Coordinator) void {
         self.dropStream();
+        if (self.frame_cache) |*cache| cache.deinit();
         self.parameters.deinit();
         for (self.units[0..self.count]) |*unit| unit.deinit();
         if (self.pending) |*unit| unit.deinit();
@@ -197,7 +205,10 @@ pub const Coordinator = struct {
         self.units[self.count] = value;
         var view = try self.joined("live-probe", self.count + 1);
         defer view.deinit();
-        errdefer self.dropStream();
+        errdefer {
+            self.dropStream();
+            if (self.frame_cache) |*cache| cache.clear();
+        }
         var sealed = self.sealed_ns;
         var pending_ns: ?i64 = null;
         var logical: ?pictures.Index = null;
@@ -209,6 +220,11 @@ pub const Coordinator = struct {
             const picture_options = pictures.Options{ .max_packets = self.options.window.max_packets, .decode = .{ .max_dependency_packets = self.options.window.max_packets, .max_parameter_packets = self.options.window.max_packets } };
             if (self.options.incremental_validation) {
                 if (self.stream == null) self.stream = try pictures.Stream.init(self.allocator, &view.reader, picture_options);
+                if (self.frame_cache == null and self.options.max_validated_frame_bytes != 0) self.frame_cache = frames.Cache.init(self.allocator, self.options.window.stream.admission_pool, self.options.max_validated_frame_bytes) catch null;
+                if (self.frame_cache) |*cache| {
+                    cache.configure(if (self.epoch_committed) self.start_ns.? else start.?, self.options.duration_ns, self.options.advance_ns orelse @as(u64, @intCast(self.options.duration_ns)), self.options.step_ns, self.options.max_frames, self.packet_base, view.reader.track.timescale);
+                    self.stream.?.frames = cache.observer();
+                }
                 _ = try self.stream.?.advanceOwned(&view.reader);
                 logical = try self.stream.?.snapshot(&view.reader);
             } else {
@@ -271,13 +287,21 @@ pub const Coordinator = struct {
     }
     /// Metadata-only readiness: idle polls neither allocate nor reserve a window.
     pub fn ready(self: *const Coordinator) !bool {
+        return self.readyAhead(0);
+    }
+    fn aheadStart(self: *const Coordinator, offset: usize) !?i64 {
+        const start = self.start_ns orelse return null;
+        const advance = self.options.advance_ns orelse @as(u64, @intCast(self.options.duration_ns));
+        return std.math.cast(i64, @as(i128, start) + @as(i128, @intCast(offset)) * advance) orelse error.TimestampOverflow;
+    }
+    pub fn readyAhead(self: *const Coordinator, offset: usize) !bool {
         try self.options.window.stream.control.check();
-        const start = self.start_ns orelse return false;
+        const start = (try self.aheadStart(offset)) orelse return false;
         const sealed = self.sealed_ns orelse return false;
         if (start >= sealed) return false;
         const requested = try std.math.add(i64, start, self.options.duration_ns);
         if (sealed < requested and !self.finished) return false;
-        if (self.ordinal >= self.options.max_windows) return error.ResourceLimitExceeded;
+        if (try std.math.add(usize, self.ordinal, offset) >= self.options.max_windows) return error.ResourceLimitExceeded;
         return true;
     }
     pub fn prepare(self: *Coordinator) !?Prepared {
@@ -286,8 +310,13 @@ pub const Coordinator = struct {
     /// All snapshot allocations belong to this allocator, independently of the
     /// coordinator's retained ingestion state. It outlives the returned owner.
     pub fn prepareAlloc(self: *Coordinator, a: std.mem.Allocator) !?Prepared {
-        if (!try self.ready()) return null;
-        const start = self.start_ns.?;
+        return self.prepareAheadAlloc(a, 0);
+    }
+    /// Preview only already sealed windows. No commit, transport read, or wait.
+    /// Consumers acknowledge these strictly in order; pins survive eviction.
+    pub fn prepareAheadAlloc(self: *Coordinator, a: std.mem.Allocator, offset: usize) !?Prepared {
+        if (!try self.readyAhead(offset)) return null;
+        const start = (try self.aheadStart(offset)).?;
         const end = @min(try std.math.add(i64, start, self.options.duration_ns), self.sealed_ns.?);
         var window = try windows.join(a, "live-model-window", self.units[0..self.count], self.options.window);
         errdefer window.deinit();
@@ -310,7 +339,7 @@ pub const Coordinator = struct {
             }
         }
         if (logical != null) self.stats.metadata_snapshots += 1;
-        return .{ .window = window, .logical = logical, .policy = .{ .start_ns = start, .end_ns = end, .step_ns = self.options.step_ns, .max_frames = self.options.max_frames }, .source_start_ns = start, .source_end_ns = end, .has_pictures = eligible, .ordinal = self.ordinal, .packet_base = self.packet_base, .generation = self.generation, .dash_timing = self.units[0].dash_timing, .hls_timing = self.units[0].hls_timing };
+        return .{ .window = window, .logical = logical, .frames = if (self.frame_cache) |*cache| cache.pin() else .{}, .policy = .{ .start_ns = start, .end_ns = end, .step_ns = self.options.step_ns, .max_frames = self.options.max_frames }, .source_start_ns = start, .source_end_ns = end, .has_pictures = eligible, .ordinal = try std.math.add(usize, self.ordinal, offset), .packet_base = self.packet_base, .generation = self.generation, .dash_timing = self.units[0].dash_timing, .hls_timing = self.units[0].hls_timing };
     }
     /// Latest independently decoded preroll at/before a presentation cursor.
     /// All payload probes are fallible and run before retention state changes.
@@ -372,6 +401,15 @@ pub const Coordinator = struct {
     pub fn commit(self: *Coordinator, prepared: *const Prepared) !void {
         try self.options.window.stream.control.check();
         if (prepared.ordinal != self.ordinal or self.start_ns == null or prepared.source_start_ns != self.start_ns.? or self.count == 0 or prepared.window.epoch != self.units[0].epoch) return error.InvalidLiveWindowCommit;
+        if (prepared.packet_base != self.packet_base) {
+            // A cohort holds older immutable snapshots. Rebase commit against
+            // current retained units after preceding acknowledgements evicted
+            // preroll, without changing the delivered vector or its identity.
+            var current = (try self.prepareAlloc(self.allocator)) orelse return error.InvalidLiveWindowCommit;
+            defer current.deinit();
+            if (current.source_end_ns != prepared.source_end_ns) return error.InvalidLiveWindowCommit;
+            return self.commit(&current);
+        }
         const end = prepared.source_end_ns;
         if (end <= self.start_ns.? or end > (self.sealed_ns orelse 0)) return error.InvalidLiveWindowCommit;
         if (end > try std.math.add(i64, self.start_ns.?, self.options.duration_ns)) return error.InvalidLiveWindowCommit;
@@ -429,6 +467,7 @@ pub const Coordinator = struct {
         self.logical_base = 0;
         self.packet_base = 0;
         self.generation = generation;
+        if (self.frame_cache) |*cache| cache.clear();
         self.finished = false;
         self.epoch_committed = false;
     }
@@ -1180,4 +1219,92 @@ test "live coordinator source capabilities isolate instances and period generati
     try first.resetEpoch();
     try std.testing.expect(!std.mem.eql(u8, &original, &first.sourceBinding(0, first.generation)));
     try std.testing.expectEqualSlices(u8, &original, &first.sourceBinding(0, 0));
+}
+
+test "live coordinator validated frame pins preserve exact pixels beyond eviction and owner lifetime" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var pins = frames.View{};
+    defer pins.deinit();
+    var packet: usize = 0;
+    var digest: [32]u8 = undefined;
+    {
+        var ingest = try media.live_mp4.Ingest.init(a, "frame-pins", fixture[0..797], .{});
+        defer ingest.deinit();
+        var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s / 2, .window = .{ .stream = .{ .admission_pool = &pool } } });
+        defer flow.deinit();
+        var unit = try part(&ingest, 797, 20811);
+        defer if (unit) |*owner| owner.deinit();
+        try flow.append(&unit);
+        var prepared = (try flow.prepare()).?;
+        defer prepared.deinit();
+        const picture = prepared.logical.?.pictures[0];
+        packet = prepared.packet_base + picture.first_packet;
+        const cached = prepared.frames.get(packet) orelse return error.MissingValidatedFrame;
+        var expected = try @import("h264.zig").decodeFrame(a, &prepared.window.reader, picture.first_packet, .{});
+        defer expected.deinit();
+        try std.testing.expectEqualSlices(u8, expected.nv12, cached.nv12);
+        try std.testing.expectEqual(expected.width, cached.width);
+        try std.testing.expectEqual(expected.pts, cached.pts);
+        std.crypto.hash.sha2.Sha256.hash(cached.nv12, &digest, .{});
+        pins = flow.frame_cache.?.pin();
+        try flow.commit(&prepared);
+    }
+    var actual: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(pins.get(packet).?.nv12, &actual, .{});
+    try std.testing.expectEqualSlices(u8, &digest, &actual);
+    try std.testing.expect(pool.snapshot().host_bytes > 0);
+}
+
+test "live coordinator sealed previews commit in order across preroll eviction" {
+    const a = std.testing.allocator;
+    var ingest = try media.live_mp4.Ingest.init(a, "preview", fixture[0..797], .{});
+    defer ingest.deinit();
+    var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s / 2 });
+    defer flow.deinit();
+    var unit = try part(&ingest, 797, 20811);
+    defer if (unit) |*owner| owner.deinit();
+    try flow.append(&unit);
+    var first = (try flow.prepareAheadAlloc(a, 0)).?;
+    defer first.deinit();
+    var second = (try flow.prepareAheadAlloc(a, 1)).?;
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), flow.ordinal);
+    try std.testing.expectError(error.InvalidLiveWindowCommit, flow.commit(&second));
+    try flow.commit(&first);
+    try flow.commit(&second);
+    try std.testing.expectEqual(@as(usize, 2), flow.ordinal);
+}
+
+test "live coordinator sparse retained decoder restarts inside dependency bound" {
+    const a = std.testing.allocator;
+    var ingest = try media.live_mp4.Ingest.init(a, "sparse", fixture[0..797], .{});
+    defer ingest.deinit();
+    var unit = (try part(&ingest, 797, 11206)).?;
+    defer unit.deinit();
+    var reader = unit.reader;
+    const packets = try a.alloc(media.mp4.Packet, 10000);
+    defer a.free(packets);
+    @memset(packets, reader.packets[0]);
+    reader.packets = packets;
+    const h264 = @import("h264.zig");
+    const core = try h264.Incremental.init(a, &reader, .{ .max_dependency_packets = 64 });
+    defer core.deinit();
+    const Capture = struct {
+        count: usize = 0,
+        hash: [32]u8 = undefined,
+        fn accept(raw: *anyopaque, _: usize, frame: *const h264.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            std.crypto.hash.sha2.Sha256.hash(frame.nv12, &self.hash, .{});
+        }
+    };
+    var expected = Capture{};
+    _ = try core.decodeSelected(&reader, &.{0}, &expected, Capture.accept);
+    var actual = Capture{};
+    const stats = try core.decodeSelected(&reader, &.{9000}, &actual, Capture.accept);
+    try std.testing.expectEqual(@as(usize, 1), actual.count);
+    try std.testing.expectEqual(@as(usize, 1), stats.decoded_packets);
+    try std.testing.expectEqualSlices(u8, &expected.hash, &actual.hash);
 }

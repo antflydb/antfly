@@ -138,6 +138,7 @@ pub const Stream = struct {
     prefix: [32]u8,
     valid: bool = true,
     owned_prefix: bool = false,
+    frames: ?h264.FrameObserver = null,
     last_stats: h264.Statistics = .{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 },
     pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !*Stream {
         if (options.max_pictures == 0 or reader.packets.len > options.max_packets) return error.ResourceLimitExceeded;
@@ -201,7 +202,7 @@ pub const Stream = struct {
         self.collector.pending_pts = null;
         self.collector.pending_first_packet = null;
         self.allocations.denied = null;
-        const observer = h264.PictureObserver{ .context = &self.collector, .accept = Collector.accept, .pending = Collector.pending };
+        const observer = h264.PictureObserver{ .context = &self.collector, .accept = Collector.accept, .pending = Collector.pending, .frames = self.frames };
         const stats = (if (self.registry) |owner| self.advanceDynamic(reader, owner, observer) else self.core.advance(reader, observer)) catch |err| return if (err == error.OutOfMemory) self.allocations.denied orelse err else err;
         self.prefix = next;
         self.owned_prefix = owned;

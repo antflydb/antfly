@@ -23,6 +23,7 @@ pub const Telemetry = struct {
     apple_hardware: std.atomic.Value(usize) = .init(0),
     apple_software: std.atomic.Value(usize) = .init(0),
     fallbacks: std.atomic.Value(usize) = .init(0),
+    validated_frames: std.atomic.Value(usize) = .init(0),
     pub fn record(self: *Telemetry, backend: Backend) void {
         const count = switch (backend) {
             .portable => &self.portable,
