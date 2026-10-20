@@ -9127,4 +9127,25 @@ test "capi native memory persists receipts and forgetting across reopen" {
     const hidden = try Call.call(id, "{\"action\":\"recall\",\"body\":{\"query\":\"Terraform\",\"token_budget\":8192}}");
     defer a.free(hidden);
     try std.testing.expect(std.mem.indexOf(u8, hidden, "Use Terraform") == null);
+    // Physical retirement, not only the evidence fence, survives native reopen.
+    for (0..10) |i| {
+        const body = try std.fmt.allocPrint(a, "{{\"action\":\"advance\",\"idempotency_key\":\"cleanup-{d}\"}}", .{i});
+        defer a.free(body);
+        const cleaned = try Call.call(id, body);
+        a.free(cleaned);
+    }
+    antfly_db_close(id);
+    id = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &id));
+    const fresh = try Call.call(id,
+        \\{"action":"observe","idempotency_key":"fresh","body":{"evidence":[{"id":"e2","source_id":"fresh","source_version":"1","text":"New fact"}]}}
+    );
+    defer a.free(fresh);
+    var output: capi.Buffer = .{};
+    const reused = antfly_db_memory_json(id, .fromSlice("personal"), .fromSlice(
+        \\{"action":"assertions","idempotency_key":"reuse","body":{"assertions":[{"id":"a1","subject":"other","predicate":"tool","value":"Other","statement":"Different assertion under a retired ID","evidence":[{"id":"e2"}]}]}}
+    ), &output);
+    defer if (output.ptr) |ptr| std.heap.c_allocator.free(ptr[0..output.len]);
+    try std.testing.expect(reused != .ok);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(capi.lastErrorDetail()), "MemoryForgotten") != null);
 }

@@ -874,3 +874,217 @@ test "memory ontology transition work limit leaves configuration and beliefs unt
     try std.testing.expectEqualStrings("deploys_with", info.state.config.predicates[0].name);
     try std.testing.expect(info.state.pending_config == null);
 }
+
+fn contextDerivedOutput(_: *anyopaque, a: A, _: m.types.Config, _: []const m.types.StoredEvidence) !m.types.Generated {
+    const claims = try a.alloc(m.types.Assertion, 1);
+    claims[0] = .{ .id = "derived", .subject = "production", .predicate = "guidance", .value = "Secret", .statement = "Private context secret", .evidence = &.{.{ .id = "current" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "alternative" }} }} };
+    const entities = try a.alloc(m.types.Entity, 1);
+    entities[0] = .{ .id = "derived-entity", .name = "Private context secret", .evidence = &.{.{ .id = "current" }} };
+    return .{ .assertions = claims, .entities = entities };
+}
+fn contextDerivedSetup(store: *Store, expires: bool) !void {
+    const a = store.arena.allocator();
+    const config: m.types.Config = .{ .processing = .hybrid, .features = .{ .assertion_distillation = true }, .models = .{ .generator = fake_model } };
+    _ = try modelService(store, 1).execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    const context: m.types.Evidence = .{ .id = "context", .source_id = "private-note", .source_version = "1", .text = "Private context secret", .expires_at = if (expires) 50 else null };
+    _ = try store.service("context-owner", false, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{context} }, .{}), "context");
+    const accepted = try modelService(store, 3).execute(a, .observe, "",
+        \\{"evidence":[{"id":"current","source_id":"public-note","source_version":"1","text":"Deploy it","managed":true,"visibility":"team"},{"id":"alternative","source_id":"alternative-note","source_version":"1","text":"Deploy it too","managed":true,"visibility":"team"}],"context_evidence_ids":["context"]}
+    , "capture");
+    const operation = try std.json.parseFromSliceLeaky(m.types.Operation, a, accepted, .{});
+    var service = modelService(store, 4);
+    service.backend.generate = contextDerivedOutput;
+    _ = try service.execute(a, .advance, operation.id, "{}", "advance");
+    _ = try modelService(store, 5).execute(a, .observe, "",
+        \\{"evidence":[{"id":"external","source_id":"external","source_version":"1","text":"Independent child support"}],"assertions":[{"id":"child","subject":"production","predicate":"child","value":"child","statement":"Child of generated guidance","evidence":[{"id":"external"}],"depends_on":["derived"]}]}
+    , "child");
+}
+
+test "memory full generation inputs fence assertions entities and descendants on forgetting or expiry" {
+    for (0..3) |mode| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try contextDerivedSetup(&store, mode == 2);
+        _ = try modelService(&store, 6).execute(a, .get, "derived", "{}", "");
+        _ = try modelService(&store, 6).execute(a, .resolve_entity, "derived-entity", "{}", "");
+        if (mode < 2) _ = try modelService(&store, 7).execute(a, .forget, "", if (mode == 0) "{\"evidence_ids\":[\"context\"]}" else "{\"source_ids\":[\"private-note\"]}", "forget");
+        for ([_][]const u8{ "derived", "child" }) |id| {
+            try std.testing.expectError(error.MemoryNotFound, modelService(&store, 51).execute(a, .get, id, "{}", ""));
+            try std.testing.expectError(error.MemoryNotFound, modelService(&store, 51).execute(a, .history, id, "{}", ""));
+        }
+        try std.testing.expectError(error.MemoryNotFound, modelService(&store, 51).execute(a, .resolve_entity, "derived-entity", "{}", ""));
+        for ([_]m.Action{ .list, .recall, .entities }) |action| {
+            const raw = try modelService(&store, 51).execute(a, action, "", if (action == .entities) "{}" else "{\"known_at\":6,\"include_history\":true,\"token_budget\":8192}", "");
+            const value = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+            try std.testing.expectEqual(@as(usize, 0), value.object.get("items").?.array.items.len);
+        }
+        for (0..12) |i| _ = try modelService(&store, @intCast(52 + i)).execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}));
+        var rows = store.values.iterator();
+        while (rows.next()) |row| if (std.mem.startsWith(u8, row.key_ptr.*, "assertion/") or std.mem.startsWith(u8, row.key_ptr.*, "history/") or std.mem.startsWith(u8, row.key_ptr.*, "entity/")) {
+            try std.testing.expect(std.mem.indexOf(u8, row.value_ptr.*, "Private context secret") == null);
+        };
+        try std.testing.expectError(error.MemoryNotFound, modelService(&store, 70).execute(a, .get, "derived", "{}", ""));
+    }
+}
+
+test "memory replay cannot replace immutable generation provenance with another context plan" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try contextDerivedSetup(&store, false);
+    _ = try modelService(&store, 6).execute(a, .observe, "", "{\"evidence\":[{\"id\":\"other-context\",\"source_id\":\"other\",\"source_version\":\"1\",\"text\":\"Unrelated context\"}]}", "other-context");
+    const accepted = try modelService(&store, 7).execute(a, .observe, "",
+        \\{"evidence":[{"id":"current","source_id":"public-note","source_version":"1","text":"Deploy it","managed":true,"visibility":"team"},{"id":"alternative","source_id":"alternative-note","source_version":"1","text":"Deploy it too","managed":true,"visibility":"team"}],"context_evidence_ids":["other-context"]}
+    , "reprocess");
+    const operation = try std.json.parseFromSliceLeaky(m.types.Operation, a, accepted, .{});
+    var service = modelService(&store, 8);
+    service.backend.generate = contextDerivedOutput;
+    _ = try service.execute(a, .advance, operation.id, "{}", "advance-again");
+    _ = try modelService(&store, 9).execute(a, .forget, "", "{\"evidence_ids\":[\"other-context\"]}", "forget-other");
+    _ = try modelService(&store, 10).execute(a, .get, "derived", "{}", "");
+    _ = try modelService(&store, 10).execute(a, .resolve_entity, "derived-entity", "{}", "");
+    _ = try modelService(&store, 11).execute(a, .forget, "", "{\"evidence_ids\":[\"context\"]}", "forget-original");
+    try std.testing.expectError(error.MemoryNotFound, modelService(&store, 12).execute(a, .get, "derived", "{}", ""));
+}
+
+test "memory distinct constraints cover both complete identity components atomically" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .observe, "",
+        \\{"evidence":[{"id":"entity-e","source_id":"entities","source_version":"1","text":"A B C D"}],"entities":[{"id":"a","name":"Alex","distinct_from":["b"],"evidence":[{"id":"entity-e"}]},{"id":"b","name":"Blair","evidence":[{"id":"entity-e"}]},{"id":"c","name":"Chris","evidence":[{"id":"entity-e"}]},{"id":"d","name":"Drew","evidence":[{"id":"entity-e"}]}]}
+    , "entities", 3);
+    try discard(&store, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"a\",\"to\":\"d\",\"expected_revision\":4}", "ad", 4);
+    try discard(&store, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"b\",\"to\":\"c\",\"expected_revision\":5}", "bc", 5);
+    const revision = store.revision;
+    for ([_][2][]const u8{ .{ "d", "c" }, .{ "c", "d" }, .{ "a", "c" } }, 0..) |pair, i| {
+        const body = try std.json.Stringify.valueAlloc(a, .{ .action = "merge", .from = pair[0], .to = pair[1], .replace = true, .expected_revision = revision + 1 }, .{});
+        try std.testing.expectError(error.MemoryEntityConflict, store.service("alice", true, 6).execute(a, .curate_entity, "", body, try std.fmt.allocPrint(a, "rejected-{d}", .{i})));
+        try std.testing.expectEqual(revision, store.revision);
+    }
+    for ([_][2][]const u8{ .{ "a", "d" }, .{ "b", "c" } }) |pair| {
+        const raw = try store.service("alice", true, 7).execute(a, .resolve_entity, pair[0], "{}", "");
+        const result = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+        try std.testing.expectEqualStrings(pair[1], result.object.get("canonical_id").?.string);
+    }
+}
+
+test "memory cleanup retires assertion identities without poisoning surviving group indexes" {
+    for (0..3) |mode| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try discard(&store, .create, "", "{\"features\":{\"reconciliation\":\"deterministic\"},\"predicates\":[{\"name\":\"deploys_with\",\"cardinality\":\"one\"}]}", "create", 1);
+        const evidence: m.types.Evidence = .{ .id = "e1", .source_id = "runbook", .source_version = "v1", .text = "Production uses Helm", .expires_at = if (mode == 2) 5 else null };
+        _ = try store.service("alice", true, 2).execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence} }, .{}), "source");
+        try discard(&store, .assertions, "", helm, "claim", 3);
+        if (mode < 2) try discard(&store, .forget, "", if (mode == 0) "{\"evidence_ids\":[\"e1\"]}" else "{\"source_ids\":[\"runbook\"]}", "forget", 4);
+        for (0..10) |i| try discard(&store, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}), @intCast(5 + i));
+        try discard(&store, .observe, "", "{\"evidence\":[{\"id\":\"e2\",\"source_id\":\"fresh\",\"source_version\":\"1\",\"text\":\"Other fact\"}]}", "fresh", 20);
+        try std.testing.expectError(error.MemoryForgotten, store.service("alice", true, 21).execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"helm\",\"subject\":\"different-subject\",\"predicate\":\"deploys_with\",\"value\":\"Other\",\"statement\":\"Other fact\",\"evidence\":[{\"id\":\"e2\"}]}]}", "reuse"));
+        try discard(&store, .assertions, "", "{\"assertions\":[{\"id\":\"candidate\",\"subject\":\"production\",\"predicate\":\"deploys_with\",\"value\":\"Other\",\"statement\":\"Other fact\",\"evidence\":[{\"id\":\"e2\"}]}]}", "candidate", 22);
+        try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 23).execute(a, .history, "helm", "{}", ""));
+        // Replaying an old receipt acknowledges admission without restoring data.
+        try discard(&store, .assertions, "", helm, "claim", 24);
+        try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 25).execute(a, .get, "helm", "{}", ""));
+        try std.testing.expectEqual(@as(usize, 1), try recallTestCount(&store, 26));
+    }
+}
+
+fn chainClaim(a: A, i: usize) !m.types.Assertion {
+    const id = try std.fmt.allocPrint(a, "chain-{d}", .{i});
+    const parents = try a.alloc([]const u8, if (i == 0) 0 else 1);
+    if (i > 0) parents[0] = try std.fmt.allocPrint(a, "chain-{d}", .{i - 1});
+    return .{ .id = id, .subject = "chain", .predicate = "fact", .value = id, .statement = id, .evidence = &.{.{ .id = "e1" }}, .depends_on = parents };
+}
+test "memory dependency admission includes the new root and every alternative support branch" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    for (0..32) |i| {
+        const claim = try chainClaim(a, i);
+        _ = try store.service("alice", true, @intCast(i + 3)).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{claim} }, .{}), claim.id);
+    }
+    const revision = store.revision;
+    var overflow = try chainClaim(a, 32);
+    try std.testing.expectError(error.MemoryWorkLimit, store.service("alice", true, 40).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{overflow} }, .{}), "overflow"));
+    try std.testing.expectEqual(revision, store.revision);
+    overflow.depends_on = &.{};
+    overflow.support_sets = &.{.{ .evidence = overflow.evidence, .depends_on = &.{"chain-31"} }};
+    try std.testing.expectError(error.MemoryWorkLimit, store.service("alice", true, 41).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{overflow} }, .{}), "alternative-overflow"));
+    try std.testing.expectEqual(revision, store.revision);
+    _ = try store.service("alice", true, 42).execute(a, .get, "chain-31", "{}", "");
+    _ = try store.service("alice", true, 42).execute(a, .recall, "", "{\"token_budget\":8192}", "");
+}
+
+test "memory over-depth batch admission rolls back all assertions and receipts" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    var claims: [33]m.types.Assertion = undefined;
+    for (&claims, 0..) |*claim, i| claim.* = try chainClaim(a, i);
+    const revision = store.revision;
+    try std.testing.expectError(error.MemoryWorkLimit, store.service("alice", true, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &claims }, .{}), "batch"));
+    try std.testing.expectEqual(revision, store.revision);
+    try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 4).execute(a, .get, "chain-0", "{}", ""));
+    _ = try store.service("alice", true, 5).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims[0..32] }, .{}), "batch");
+    _ = try store.service("alice", true, 6).execute(a, .recall, "", "{\"token_budget\":8192}", "");
+}
+
+test "memory short visible support cannot conceal over-depth alternative ancestors" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    for (0..31) |i| {
+        const claim = try chainClaim(a, i);
+        _ = try store.service("alice", true, @intCast(i + 3)).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{claim} }, .{}), claim.id);
+    }
+    const bridge: m.types.Assertion = .{ .id = "bridge", .subject = "chain", .predicate = "fact", .value = "bridge", .statement = "Short primary with deep independent support", .evidence = &.{.{ .id = "e1" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "e1" }}, .depends_on = &.{"chain-30"} }} };
+    _ = try store.service("alice", true, 40).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{bridge} }, .{}), "bridge");
+    const child: m.types.Assertion = .{ .id = "overflow", .subject = "chain", .predicate = "fact", .value = "child", .statement = "Would be unreadable after support changes", .evidence = &.{.{ .id = "e1" }}, .depends_on = &.{"bridge"} };
+    const revision = store.revision;
+    try std.testing.expectError(error.MemoryWorkLimit, store.service("alice", true, 41).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{child} }, .{}), "overflow"));
+    try std.testing.expectEqual(revision, store.revision);
+    _ = try store.service("alice", true, 42).execute(a, .recall, "", "{\"token_budget\":8192}", "");
+}
+
+test "memory generation context authorization survives loss of administrative visibility" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try contextDerivedSetup(&store, false);
+    const reader = store.service("alice", false, 6);
+    for ([_][]const u8{ "derived", "child" }) |id| {
+        try std.testing.expectError(error.MemoryNotFound, reader.execute(a, .get, id, "{}", ""));
+        try std.testing.expectError(error.MemoryNotFound, reader.execute(a, .history, id, "{}", ""));
+    }
+    try std.testing.expectError(error.MemoryNotFound, reader.execute(a, .resolve_entity, "derived-entity", "{}", ""));
+    for ([_]m.Action{ .recall, .list, .entities }) |action| {
+        const raw = try reader.execute(a, action, "", "{}", "");
+        const result = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+        try std.testing.expectEqual(@as(usize, 0), result.object.get("items").?.array.items.len);
+    }
+    _ = try modelService(&store, 7).execute(a, .get, "derived", "{}", "");
+}
+
+test "memory alias replacement checks the proposed components without moving the old target" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    try discard(&store, .observe, "",
+        \\{"evidence":[{"id":"identity","source_id":"identity","source_version":"1","text":"Three identities"}],"entities":[{"id":"alias","name":"Alias","evidence":[{"id":"identity"}]},{"id":"old","name":"Old","distinct_from":["target"],"evidence":[{"id":"identity"}]},{"id":"target","name":"Target","evidence":[{"id":"identity"}]}]}
+    , "identities", 3);
+    try discard(&store, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"alias\",\"to\":\"old\",\"expected_revision\":4}", "merge", 4);
+    try discard(&store, .curate_entity, "", "{\"action\":\"merge\",\"from\":\"alias\",\"to\":\"target\",\"replace\":true,\"expected_revision\":5}", "replace", 5);
+    for ([_][2][]const u8{ .{ "alias", "target" }, .{ "old", "old" } }) |pair| {
+        const raw = try store.service("alice", true, 6).execute(a, .resolve_entity, pair[0], "{}", "");
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+        try std.testing.expectEqualStrings(pair[1], value.object.get("canonical_id").?.string);
+    }
+}

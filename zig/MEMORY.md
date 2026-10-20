@@ -50,7 +50,11 @@ row policies must be carried through all internal reads or rejected closed.
 
 Evidence IDs identify immutable source versions; a source edit has a new evidence
 ID. Assertion IDs identify immutable assertions, with lifecycle revisions stored
-separately. Validity describes when an assertion holds in the world; recorded
+separately. Physical cleanup retires an assertion ID with a durable tombstone
+before removing its payload, including when support was forgotten or expired.
+Old receipts may acknowledge prior admission but cannot restore a retired ID;
+remaining group and dependency indexes can never resolve to a different assertion.
+Validity describes when an assertion holds in the world; recorded
 revisions describe when Antfly learned or revised it. Unknown validity never
 becomes an update order merely because a document was ingested later.
 
@@ -71,7 +75,12 @@ incompatible changes reject atomically before publishing a configuration or
 starting a vector build. Vector-only changes use bounded asynchronous backfill.
 Typed links connect evidence, decisions, rationale, rejected
 alternatives, episodes and procedures. Alias/name matches never authorize a
-canonical identity merge. Explicit distinct IDs must remain distinct.
+canonical identity merge. Explicit distinct IDs must remain distinct. Merge
+admission checks `distinct_from` constraints on every member of both affected
+alias components against the proposed redirect graph, including distinctions
+declared on noncanonical members. Explicit alias replacement can move an alias
+without moving its old target; it cannot collapse a declared distinct pair.
+A rejected merge changes neither redirects nor belief projections.
 The original assertion fingerprint and asserted upper validity bound survive
 policy-derived interval closure, so source replay cannot overwrite current
 lifecycle and an authorized explicit restoration can recover original bounds.
@@ -163,11 +172,29 @@ this execution detail without changing policy, history or completeness contracts
 source thread/turn/ordinal/time fields preserve ordering and attribution.
 Managed spaces process observations automatically; hybrid spaces use each source's
 explicit `managed` ownership flag. All model output inherits the visibility taint
-of the full input/context plan, not merely the evidence a model chooses to cite. Context
-is disambiguation evidence, not another authoritative extraction stream. Generated
-assertions must cite a current observation as well as any prior support they use.
+of the full input/context plan, not merely the evidence a model chooses to cite.
+Durable internal generation provenance records the admitting operation,
+configuration generation, and full input/context evidence plan for each newly
+created assertion and entity. This is a conjunctive authorization and retention
+dependency, separate from factual citations and alternative `support_sets`:
+losing any inference input fences the output and its descendants, even if a model
+omitted that input from its citations. Point reads, recorded-time history, recall,
+identity resolution, enumeration, vector retention and physical cleanup share this
+gate. Reprocessing an existing immutable ID never replaces its original generation
+provenance. Cleanup includes this quantum's newly appended invalidation history,
+so finishing a scrub cannot leave newly written forgotten text behind. Retired
+outputs discard their internal generation metadata after fencing their identities.
+Context is disambiguation evidence, not another authoritative extraction stream.
+Generated assertions must cite a current observation as well as any prior support they use.
 `support_sets` represents independent alternative support; each individual set is
 conjunctive. Losing one set must not remove a claim with another retained set.
+Dependency admission and all read/retention traversals share a maximum of 32
+assertion levels, counting the new root. Every proposed support branch reserves
+that root level while validating its parents, including alternative branches hidden
+by currently visible primary support. Admission memoizes the full immutable DAG
+and visits at most 4096 distinct ancestors per operation.
+A deeper graph is rejected before committing any assertion or receipt; bounded
+batch imports have the same limit and roll back atomically on rejection.
 
 Model revisions are qualified provider capability digests (`sha256:<64 hex>`),
 not arbitrary descriptive labels. Admission and invocation reject a missing or

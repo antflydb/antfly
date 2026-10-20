@@ -22,6 +22,10 @@ const t = types;
 const A = std.mem.Allocator;
 const eql = std.mem.eql;
 const curation = @import("antfly_resolver").curation;
+const max_dependency_depth: u8 = 32;
+// Causal inference inputs are conjunctive retention/authorization dependencies,
+// independent of the alternative factual support selected by a producer.
+const GenerationProvenance = struct { operation_id: []const u8, config_generation: u64, evidence_ids: []const []const u8 };
 const EntityPolicy = struct { state: curation.State = .{}, redirects: []const curation.Redirect = &.{} };
 
 pub const Row = struct { key: []const u8, json: []const u8, version: u64 = 0, digest: ?[32]u8 = null };
@@ -244,6 +248,8 @@ const Run = struct {
     identity_policy: ?EntityPolicy = null,
     identity_index: ?curation.RedirectIndex = null,
     suppression_index: ?curation.Index = null,
+    dependency_depths: std.StringHashMapUnmanaged(u8) = .empty,
+    dependency_visits: usize = 0,
 
     fn encode(self: *Run, value: anytype) ![]const u8 {
         return std.json.Stringify.valueAlloc(self.a, value, .{});
@@ -321,11 +327,25 @@ const Run = struct {
         }
         return expiration;
     }
+    fn generationVisible(self: *Run, kind: []const u8, id: []const u8) !bool {
+        const provenance = (try self.read(GenerationProvenance, try self.generationKey(kind, id))) orelse return true;
+        for (provenance.evidence_ids) |input| {
+            if (!try self.supportVisible(&.{.{ .id = input }}, &.{}, 0)) return false;
+        }
+        return true;
+    }
+    fn generationKey(self: *Run, kind: []const u8, id: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "generation-input/{s}/{s}", .{ kind, try hash(self.a, id) });
+    }
+    fn entityVisible(self: *Run, record: t.EntityRecord) !bool {
+        return try self.supportVisible(record.entity.evidence, &.{}, 0) and try self.generationVisible("entity", record.entity.id);
+    }
     // Physical retention is independent of current belief/lifecycle. A
     // superseded premise can still support an auditable historical revision.
     fn retained(self: *Run, record: t.StoredAssertion, depth: u8) anyerror!bool {
-        if (depth >= 32) return error.MemoryWorkLimit;
+        if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
         if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-assertion", record.assertion.id)) != null) return false;
+        if (!try self.generationVisible("assertion", record.assertion.id)) return false;
         if (try self.retainedSupport(record.assertion.evidence, record.assertion.depends_on, depth)) return true;
         for (record.assertion.support_sets) |support| if (try self.retainedSupport(support.evidence, support.depends_on, depth)) return true;
         return false;
@@ -368,8 +388,9 @@ const Run = struct {
         return self.evidenceVisibleTime(record, null, null, depth);
     }
     fn evidenceVisibleTime(self: *Run, record: t.StoredAssertion, known: ?i64, valid: ?i64, depth: u8) anyerror!bool {
-        if (depth >= 32) return error.MemoryWorkLimit;
+        if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
         if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-assertion", record.assertion.id)) != null) return false;
+        if (!try self.generationVisible("assertion", record.assertion.id)) return false;
         if (!try self.identityVisible(record.assertion)) return false;
         if (try self.supportVisibleTime(record.assertion.evidence, record.assertion.depends_on, known, valid, depth)) return true;
         for (record.assertion.support_sets) |support| if (try self.supportVisibleTime(support.evidence, support.depends_on, known, valid, depth)) return true;
@@ -468,6 +489,7 @@ const Run = struct {
     fn validateOntology(self: *Run, claim: t.Assertion) !void {
         if (try self.read(t.EntityRecord, try key(self.a, "entity", claim.subject))) |subject| {
             try self.authorize(subject.owner, subject.entity.visibility);
+            if (!try self.entityVisible(subject)) return error.MemoryEntityRequired;
             if (claim.visibility == .team and subject.entity.visibility == .private) return error.MemoryVisibilityConflict;
         }
         for (self.state.config.predicates) |predicate| if (eql(u8, predicate.name, claim.predicate)) {
@@ -484,6 +506,34 @@ const Run = struct {
                 if (claim.visibility == .team and object.entity.visibility == .private) return error.MemoryVisibilityConflict;
             }
         };
+    }
+    // Validate the whole immutable DAG, not just the currently visible support
+    // branch. Losing a short primary branch must not reveal an over-depth one.
+    // Memoization bounds work for shared ancestors and repeated batch inputs.
+    fn dependencyDepth(self: *Run, claim: t.Assertion, depth: u8) anyerror!u8 {
+        if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
+        var levels: u8 = 1;
+        levels = @max(levels, try self.parentDepth(claim.id, claim.depends_on, depth));
+        for (claim.support_sets) |support| levels = @max(levels, try self.parentDepth(claim.id, support.depends_on, depth));
+        if (@as(u16, depth) + levels > max_dependency_depth) return error.MemoryWorkLimit;
+        return levels;
+    }
+    fn parentDepth(self: *Run, child: []const u8, parents: []const []const u8, depth: u8) !u8 {
+        var levels: u8 = 1;
+        for (parents) |id| {
+            try self.service.context.check();
+            if (eql(u8, id, child)) return error.MemoryDependencyCycle;
+            const parent_levels = self.dependency_depths.get(id) orelse value: {
+                if (self.dependency_visits >= 4096) return error.MemoryWorkLimit;
+                self.dependency_visits += 1;
+                const parent = (try self.assertion(id)) orelse return error.MemoryDependencyMissing;
+                const result = try self.dependencyDepth(parent.assertion, depth + 1);
+                try self.dependency_depths.put(self.a, id, result);
+                break :value result;
+            };
+            levels = @max(levels, parent_levels + 1);
+        }
+        return levels;
     }
     fn validateAssertion(self: *Run, claim: t.Assertion) anyerror!void {
         try t.validateId(claim.id);
@@ -507,7 +557,9 @@ const Run = struct {
             if (eql(u8, dependency, claim.id)) return error.MemoryDependencyCycle;
             const parent = (try self.assertion(dependency)) orelse return error.MemoryDependencyMissing;
             try self.authorize(parent.owner, parent.assertion.visibility);
-            if (parent.stale or parent.lifecycle != .active or !try self.evidenceVisible(parent)) return error.MemoryDependencyStale;
+            // The new assertion occupies depth zero. Admission must reserve
+            // its level, using the same bound as recall and retention.
+            if (parent.stale or parent.lifecycle != .active or !try self.evidenceVisibleDepth(parent, 1)) return error.MemoryDependencyStale;
             if (claim.visibility == .team and parent.assertion.visibility == .private) return error.MemoryVisibilityConflict;
         }
         for ([_][]const []const u8{ claim.motivates, claim.rejected_in_favor_of }) |links| {
@@ -519,6 +571,7 @@ const Run = struct {
                 if (claim.visibility == .team and linked.assertion.visibility == .private) return error.MemoryVisibilityConflict;
             }
         }
+        _ = try self.dependencyDepth(claim, 0);
         if (claim.support_sets.len > t.max_items) return error.MemoryInputTooLarge;
         for (claim.support_sets) |support| {
             var branch = claim;
@@ -796,7 +849,7 @@ const Run = struct {
         const input = try self.read(t.EntityRecord, try key(self.a, "entity", id));
         if (input) |record| {
             self.authorize(record.owner, record.entity.visibility) catch return null;
-            if (!try self.supportVisible(record.entity.evidence, &.{}, 0)) return null;
+            if (!try self.entityVisible(record)) return null;
         }
         try self.prepareIdentityIndex();
         const redirects = self.identity_index.?;
@@ -808,23 +861,29 @@ const Run = struct {
             if (input == null) return null;
             const target = (try self.read(t.EntityRecord, try key(self.a, "entity", canonical_id))) orelse return null;
             self.authorize(target.owner, target.entity.visibility) catch return null;
-            if (!try self.supportVisible(target.entity.evidence, &.{}, 0)) return null;
+            if (!try self.entityVisible(target)) return null;
         }
         return canonical_id;
+    }
+    fn requireDistinctIdentities(self: *Run, names: *std.StringHashMapUnmanaged(void), redirects: curation.RedirectIndex) !void {
+        var members = names.keyIterator();
+        while (members.next()) |id| {
+            try self.service.context.check();
+            const record = (try self.read(t.EntityRecord, try key(self.a, "entity", id.*))) orelse continue;
+            for (record.entity.distinct_from) |distinct| if (eql(u8, redirects.canonical(id.*), redirects.canonical(distinct))) return error.MemoryEntityConflict;
+        }
     }
     fn curateEntity(self: *Run, request: t.EntityCorrection) !void {
         try self.requireAdmin();
         if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
         const stored = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
-        const from = (try self.read(struct { entity: t.Entity, owner: []const u8 }, try key(self.a, "entity", request.from))) orelse return error.MemoryNotFound;
+        const from = (try self.read(t.EntityRecord, try key(self.a, "entity", request.from))) orelse return error.MemoryNotFound;
         try self.authorize(from.owner, .private);
         if (request.to) |target| {
-            const to = (try self.read(struct { entity: t.Entity, owner: []const u8 }, try key(self.a, "entity", target))) orelse return error.MemoryNotFound;
+            const to = (try self.read(t.EntityRecord, try key(self.a, "entity", target))) orelse return error.MemoryNotFound;
             try self.authorize(to.owner, .private);
             if (request.action == .merge) {
                 if (from.entity.visibility != to.entity.visibility or (from.entity.visibility == .private and !eql(u8, from.owner, to.owner))) return error.MemoryVisibilityConflict;
-                for (from.entity.distinct_from) |id| if (eql(u8, id, target)) return error.MemoryEntityConflict;
-                for (to.entity.distinct_from) |id| if (eql(u8, id, request.from)) return error.MemoryEntityConflict;
             }
         }
         var affected_names: std.StringHashMapUnmanaged(void) = .empty;
@@ -846,6 +905,9 @@ const Run = struct {
             .pin_distinct = request.pin_distinct,
         });
         const redirects = try curation.RedirectIndex.init(self.a, plan.merges);
+        // Check all members against the proposed graph. Re-pointing one alias
+        // need not move its old component, but no declared distinction may fold.
+        try self.requireDistinctIdentities(&affected_names, redirects);
         var index = try curation.Index.init(self.a, "", try self.encode(plan.state));
         try index.bindRedirects(self.a, redirects);
         try self.put("entity-policy", EntityPolicy{ .state = plan.state, .redirects = plan.merges });
@@ -860,11 +922,11 @@ const Run = struct {
     fn resolveEntity(self: *Run, id: []const u8) ![]const u8 {
         const requested = (try self.read(t.EntityRecord, try key(self.a, "entity", id))) orelse return error.MemoryNotFound;
         try self.authorize(requested.owner, requested.entity.visibility);
-        if (!try self.supportVisible(requested.entity.evidence, &.{}, 0)) return error.MemoryNotFound;
+        if (!try self.entityVisible(requested)) return error.MemoryNotFound;
         const selected = (try self.canonical(id)) orelse return error.MemoryEntitySuppressed;
-        const record = (try self.read(struct { entity: t.Entity, owner: []const u8 }, try key(self.a, "entity", selected))) orelse return error.MemoryNotFound;
+        const record = (try self.read(t.EntityRecord, try key(self.a, "entity", selected))) orelse return error.MemoryNotFound;
         try self.authorize(record.owner, record.entity.visibility);
-        if (!try self.supportVisible(record.entity.evidence, &.{}, 0)) return error.MemoryNotFound;
+        if (!try self.entityVisible(record)) return error.MemoryNotFound;
         return self.encode(.{ .entity = record.entity, .canonical_id = selected, .requested_id = id, .revision = self.state.revision, .identity = "explicit", .uncertainty = "Names and aliases alone do not prove entity identity" });
     }
     fn entity(self: *Run, value: t.Entity) !void {
@@ -884,7 +946,7 @@ const Run = struct {
             if (eql(u8, other, value.id)) return error.MemoryEntityConflict;
         }
         const path = try key(self.a, "entity", value.id);
-        if (try self.read(struct { entity: t.Entity, owner: []const u8 }, path)) |old| {
+        if (try self.read(t.EntityRecord, path)) |old| {
             try self.authorize(old.owner, .private);
             if (!eql(u8, try self.encode(old.entity), try self.encode(value))) return error.MemoryEntityConflict;
             return;
@@ -1190,7 +1252,19 @@ const Run = struct {
             for (claim.support_sets) |support| try self.checkGeneratedEvidence(pending, support.evidence);
         }
         for (generated.entities) |value| try self.checkGeneratedEvidence(pending, value.evidence);
-        for (generated.entities) |value| try self.entity(value);
+        const input_count = pending.inputs.len + pending.context_inputs.len;
+        const inputs = try self.a.alloc([]const u8, input_count);
+        @memcpy(inputs[0..pending.inputs.len], pending.inputs);
+        @memcpy(inputs[pending.inputs.len..], pending.context_inputs);
+        const provenance: GenerationProvenance = .{ .operation_id = pending.id, .config_generation = pending.config_generation, .evidence_ids = inputs };
+        for (generated.entities) |value| {
+            if (try self.read(t.EntityRecord, try key(self.a, "entity", value.id)) == null) try self.put(try self.generationKey("entity", value.id), provenance);
+            try self.entity(value);
+        }
+        for (generated.assertions) |claim| if (try self.assertion(claim.id) == null) {
+            try self.put(try self.generationKey("assertion", claim.id), provenance);
+            for (inputs) |input| try self.put(try dependencyKey(self.a, "evidence", input, claim.id), .{ .child = claim.id });
+        };
         try self.assertions(generated.assertions, true);
     }
     const VectorProjection = struct { assertion_id: []const u8, generation: u64, model: t.Model, statement_hash: []const u8, embedding: []const f32 };
@@ -1280,7 +1354,9 @@ const Run = struct {
             if (page.next) |cursor| try self.put(work.rows[0].key, .{ .kind = item.kind, .id = item.id, .revision = item.revision, .cursor = cursor }) else try self.remove(work.rows[0].key);
         }
         if (try self.read(struct { cursor: ?[]const u8 = null }, "cleanup")) |cleanup| {
-            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "", cleanup.cursor, 64);
+            // Include history appended by this quantum's invalidation work;
+            // completing cleanup cannot leave newly written forgotten text.
+            const page = try self.scanOverlay("", cleanup.cursor, 64);
             for (page.rows) |row| {
                 if (std.mem.startsWith(u8, row.key, "evidence/")) {
                     const source = try parse(t.StoredEvidence, self.a, row.json);
@@ -1293,11 +1369,15 @@ const Run = struct {
                         try self.put(try key(self.a, "forgotten-evidence", source.evidence.id), true);
                     }
                 } else if (std.mem.startsWith(u8, row.key, "entity/")) {
-                    const stored = try parse(struct { entity: t.Entity, owner: []const u8 }, self.a, row.json);
-                    if (try self.read(bool, "forgotten-all") != null or !try self.supportVisible(stored.entity.evidence, &.{}, 0)) {
+                    const stored = try parse(t.EntityRecord, self.a, row.json);
+                    if (try self.read(bool, "forgotten-all") != null or !try self.entityVisible(stored)) {
                         try self.put(try key(self.a, "forgotten-entity", stored.entity.id), true);
+                        try self.remove(try self.generationKey("entity", stored.entity.id));
                         try self.remove(row.key);
                     }
+                } else if (std.mem.startsWith(u8, row.key, "generation-input/")) {
+                    const owner_key = row.key["generation-input/".len..];
+                    if (try self.read(std.json.Value, owner_key) == null) try self.remove(row.key);
                 } else if (std.mem.startsWith(u8, row.key, "vector/")) {
                     const projection = try parse(VectorProjection, self.a, row.json);
                     const record = try self.assertion(projection.assertion_id);
@@ -1313,8 +1393,16 @@ const Run = struct {
                     }
                     if (remove_outcome) try self.remove(row.key);
                 } else if (std.mem.startsWith(u8, row.key, "assertion/") or std.mem.startsWith(u8, row.key, "history/")) {
-                    const record = try parse(t.StoredAssertion, self.a, row.json);
-                    if (!try self.retained(record, 0)) try self.remove(row.key) else try self.put(row.key, try self.publicRecord(record));
+                    const record = (try self.read(t.StoredAssertion, row.key)) orelse continue;
+                    if (!try self.retained(record, 0)) {
+                        if (std.mem.startsWith(u8, row.key, "assertion/")) {
+                            // Retire the immutable identity before removing its payload.
+                            // Reverse/group indexes can never resolve to a reused ID.
+                            try self.put(try key(self.a, "forgotten-assertion", record.assertion.id), true);
+                            try self.remove(try self.generationKey("assertion", record.assertion.id));
+                        }
+                        try self.remove(row.key);
+                    } else try self.put(row.key, try self.publicRecord(record));
                 }
             }
             if (page.next) |cursor| try self.put("cleanup", .{ .cursor = cursor }) else try self.remove("cleanup");
@@ -1509,9 +1597,9 @@ const Run = struct {
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "entity/", try self.decodeCursor("entity/", request.cursor), request.limit);
         var values: std.ArrayList(std.json.Value) = .empty;
         for (page.rows) |row| {
-            const stored = try parse(struct { entity: t.Entity, owner: []const u8 }, self.a, row.json);
+            const stored = try parse(t.EntityRecord, self.a, row.json);
             self.authorize(stored.owner, stored.entity.visibility) catch continue;
-            if (try self.read(bool, "forgotten-all") != null or !try self.supportVisible(stored.entity.evidence, &.{}, 0)) continue;
+            if (try self.read(bool, "forgotten-all") != null or !try self.entityVisible(stored)) continue;
             try values.append(self.a, try parse(std.json.Value, self.a, row.json));
         }
         return self.encode(.{ .items = values.items, .next_cursor = try self.encodeCursor("entity/", page.next), .complete = page.next == null });
