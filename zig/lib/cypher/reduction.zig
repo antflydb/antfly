@@ -173,6 +173,7 @@ pub fn composedList(expression: *const ast.Expr) bool {
     return reversedList(expression) != null or concatenatedList(expression) != null;
 }
 fn knownList(expression: *const ast.Expr) bool {
+    if (expression.execution_range_binding) return true;
     return switch (expression.value) {
         .list, .comprehension, .pattern_comprehension => true,
         .call => |c| reversedList(expression) != null or (!c.star and !c.distinct and (c.args.len == 2 or c.args.len == 3) and std.ascii.eqlIgnoreCase(c.name, "range")),

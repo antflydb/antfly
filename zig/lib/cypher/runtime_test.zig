@@ -3394,7 +3394,14 @@ test "borrowed group reductions own escaped nested values and order keys" {
 
 test "borrowed aggregate projection and cardinality lowering release every failed allocation" {
     const Campaign = struct {
-        fn run(a: std.mem.Allocator) !void {
+        fn run(backing: std.mem.Allocator) !void {
+            // In-place arena growth depends on backing allocation layout.
+            // Force growth through fallible allocations so every injected
+            // failure index refers to the same operation on every run.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             var diagnostic: c.Diagnostic = .{};
             var compiled = try c.compile(a, "MATCH(n:Document) RETURN n.rank%2 AS k,head(collect(n.title)) AS title,size(collect(n.rank)) AS c ORDER BY title", .{}, &diagnostic);
             defer compiled.deinit();
@@ -4087,7 +4094,14 @@ test "ordinary comprehension demands preserve order nulls shadowing and eager er
 
 test "ordinary comprehension scopes and list sources release failed allocations" {
     const Campaign = struct {
-        fn run(a: std.mem.Allocator, text: []const u8) !void {
+        fn run(backing: std.mem.Allocator, text: []const u8) !void {
+            // In-place arena growth depends on backing allocation layout.
+            // Force growth through fallible allocations so every injected
+            // failure index refers to the same operation on every run.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             var diagnostic: c.Diagnostic = .{};
             var compiled = try c.compile(a, text, .{}, &diagnostic);
             defer compiled.deinit();
@@ -4188,6 +4202,9 @@ test "producer summaries and scalar seeds release every failed allocation" {
         "WITH range(1,1000000000) AS xs WITH xs AS ys UNWIND ys AS x RETURN count(*),count(1)",
         "WITH [x IN range(1,3)|toString(x)]+[4] AS xs RETURN head(xs),last(xs),size(xs)",
         "UNWIND [1,2,3] AS n RETURN n IN [x IN [1,null]|x]",
+        "WITH range(1,1000000000) AS xs WITH xs AS ys RETURN 1 IN ys,head(ys)",
+        "UNWIND [[1],[1.0],[1]] AS ys UNWIND [1,2,3] AS n RETURN 0 IN [x IN ys|x/2]",
+        "UNWIND reverse([x IN [1,2,3]|toString(x)]) AS x RETURN collect(x)",
         "UNWIND [1,2] AS n RETURN n IN ([x IN [1,2,3]|x]+[4])",
         "WITH range(1,3) AS xs,toString(4) AS seed UNWIND xs AS x RETURN collect(x),min(seed)",
         "MATCH(a:Document {id:'a'}) UNWIND [1,2,3] AS n RETURN 'Beta' IN [(a)-[:CITES]->(b)|b.title]",
@@ -4383,4 +4400,76 @@ test "bounded membership admission retains narrow reusable indexes" {
     var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 4 << 20, .intermediate_states = 100000 });
     defer result.deinit();
     try std.testing.expectEqual(@as(i64, 500), result.rows[0][0].integer);
+}
+
+test "arithmetic membership survives aliases reversal and concatenation without exposing carriers" {
+    try check("WITH range(1,3) AS xs MATCH(n:Document) WHERE n.rank=size(xs) RETURN 1 IN xs,count(*)", "[[true,1]]");
+    try check("WITH range(1,3) AS xs RETURN 1 IN xs,CASE WHEN size(xs)=3 THEN 1 ELSE 0 END", "[[true,1]]");
+    try check("WITH range(1,3) AS xs WITH xs AS ys RETURN 2 IN ys,size(ys),head(ys),last(ys),ys[-2..]", "[[true,3,1,3,[2,3]]]");
+    try check("WITH range(1,3) AS xs RETURN 2 IN reverse(xs),9 IN (xs+[]),null IN (xs+[])", "[[true,false,null]]");
+    try check("WITH range(1,3) AS xs RETURN 1 IN (0+xs),3 IN (xs+'tail')", "[[true,true]]");
+    try check("WITH range(1,3) AS xs RETURN 2 IN xs,xs", "[[true,[1,2,3]]]");
+    try check("WITH range(1,3) AS xs RETURN 2 IN xs,any(x IN xs WHERE x=3),reduce(s=0,x IN xs|s+x)", "[[true,true,6]]");
+    try check("WITH range(null,3) AS xs RETURN 1 IN xs,size(xs)", "[[null,null]]");
+    for ([_][]const u8{
+        "WITH range(1,1000000000) AS xs RETURN 1 IN xs",
+        "WITH range(1,1000000000) AS xs WITH xs AS ys RETURN 1 IN reverse(ys)",
+        "RETURN 1 IN (range(1,1000000000)+[])",
+        "WITH range(-9223372036854775808,9223372036854775807) AS xs RETURN 9223372036854775807 IN xs",
+        "UNWIND reverse(range(1,1000000000)) AS x RETURN count(*)=1000000000",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{ .memory_bytes = 1 << 20, .intermediate_states = 1000 });
+        defer result.deinit();
+        try std.testing.expect(result.rows[0][0].boolean);
+    }
+}
+
+test "reversal producers preserve encounter order and validate before replay" {
+    try check("UNWIND reverse([x IN range(1,5) WHERE x%2=1|x*2]) AS x RETURN collect(x)", "[[[10,6,2]]]");
+    try check("UNWIND reverse([x IN [1,2]|x]+[3,4]) AS x RETURN collect(x)", "[[[4,3,2,1]]]");
+    try check("UNWIND reverse(reverse([x IN [1,2]|x]+[3,4])) AS x RETURN collect(x)", "[[[1,2,3,4]]]");
+    try check("UNWIND reverse([x IN null|x]) AS x RETURN count(*)", "[[0]]");
+    try check("RETURN null IN reverse([x IN []|x]),1 IN reverse([x IN [null,1]|x])", "[[false,true]]");
+    for ([_][]const u8{
+        "RETURN 1 IN reverse([x IN [1,0]|1/x])",
+        "UNWIND reverse([x IN [0,1]|1/x]) AS x RETURN x LIMIT 1",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "captured memberships cache actual bindings and keep numeric representation" {
+    try check("UNWIND [[1],[1.0],[1]] AS ys UNWIND [1,2,3] AS n RETURN 0 IN [x IN ys|x/2]", "[[true],[true],[true],[false],[false],[false],[true],[true],[true]]");
+    try check("MATCH(a:Document {id:'a'}) UNWIND [1,2,3,4] AS n RETURN 'Beta' IN [(a)-[:CITES]->(b)|b.title]", "[[true],[true],[true],[true]]");
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND range(1,100) AS n WITH n,$xs AS ys RETURN count(CASE WHEN toString(n) IN [x IN ys|toString(x)] THEN 1 END)", .{}, &diagnostic);
+    defer compiled.deinit();
+    var items: [1000]v.Value = undefined;
+    for (&items, 1..) |*item, i| item.* = .{ .integer = @intCast(i) };
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "xs", .value = .{ .list = &items } }}, .{ .memory_bytes = 1 << 20, .intermediate_states = 100000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 100), result.rows[0][0].integer);
+}
+
+test "wide captured membership keeps probe metadata across producer epochs" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [2000,1999] AS n WITH n,$xs AS ys RETURN ($word+toString(n)) IN [x IN ys|$word+toString(x)]", .{}, &diagnostic);
+    defer compiled.deinit();
+    var items: [2000]v.Value = undefined;
+    for (&items, 1..) |*item, i| item.* = .{ .integer = @intCast(i) };
+    const word: [4096]u8 = @splat('A');
+    var fixture: Fixture = .{};
+    var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{ .{ .name = "xs", .value = .{ .list = &items } }, .{ .name = "word", .value = .{ .string = &word } } }, .{ .memory_bytes = 1 << 20, .intermediate_states = 700000 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    for (result.rows) |row| try std.testing.expect(row[0].boolean);
 }

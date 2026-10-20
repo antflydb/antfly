@@ -1125,9 +1125,11 @@ const Engine = struct {
         lists: std.AutoHashMapUnmanaged(u64, @import("invariant_membership.zig").Membership) = .empty,
         producer_lists: std.AutoHashMapUnmanaged(u64, *@import("invariant_membership.zig").Producer) = .empty,
         membership_budget: ?*Budget = null,
+        captured_lists: ?ProducerMemo = null,
         owned_lists: std.AutoHashMapUnmanaged(Identity, @import("invariant_membership.zig").Membership) = .empty,
         fn deinit(self: *@This()) void {
             if (self.bytes) |pool| pool.deinit();
+            if (self.captured_lists) |*memo| memo.deinit();
             var producers = self.producer_lists.valueIterator();
             while (producers.next()) |producer| producer.*.deinit();
         }
@@ -5362,6 +5364,7 @@ const Engine = struct {
         return self.constantBounded(expression, row, &remaining, 0);
     }
     fn constantBounded(self: *Engine, expression: *const ast.Expr, row: Row, remaining: *usize, depth: usize) ?v.Value {
+        if (expression.execution_range_binding) return null; // The carrier is not a logical list constant.
         if (remaining.* == 0 or depth >= @min(64, self.limits.recursion_depth)) return null;
         remaining.* -= 1;
         return switch (expression.value) {
@@ -8573,6 +8576,13 @@ const Engine = struct {
         // Validate only reached affine stages. Hoisting this check to the bag
         // producer would incorrectly evaluate errors behind an earlier filter.
         try self.validateMomentNode(expression);
+        if (expression.execution_range_binding and expression.value == .call) {
+            const range = (try self.rangeInput(expression, row, group)) orelse return .null;
+            return .{ .list = try self.a.dupe(v.Value, &.{
+                .{ .integer = range.start },                                 .{ .integer = range.step },
+                .{ .integer = @bitCast(@as(u64, @truncate(range.length))) }, .{ .integer = @intCast(range.length >> 64) },
+            }) };
+        }
         const memoizable = self.read_only and self.projection_overrides == null and self.aggregate_overrides == null and (expression.value == .pattern_comprehension or expression.value == .exists or (expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "size") and expression.value.call.args.len == 1 and expression.value.call.args[0].value == .pattern_comprehension)) and weightedExpression(expression);
         var key: Row = &.{};
         if (memoizable) {
@@ -8672,7 +8682,98 @@ const Engine = struct {
         parent.* = &owner.work;
         return owner;
     }
-    fn evalMembership(self: *Engine, left: v.Value, right: *const ast.Expr, row: Row, group: ?[]const Row) !v.Value {
+    fn membershipBudget(self: *Engine, owner: *Invariants) !*Budget {
+        if (owner.membership_budget == null) {
+            const budget = try owner.work.a.create(Budget);
+            budget.* = .{ .backing = self.scratch_allocator, .limit = @min(1 << 20, self.limits.memory_bytes / 8) };
+            owner.membership_budget = budget;
+        }
+        return owner.membership_budget.?;
+    }
+    /// Binding-keyed membership state shares the statement's source budget.
+    /// Immutable inputs use allocation identity, so forwarding a large parameter
+    /// through WITH never rehashes or clones that parameter for each probe.
+    const ProducerMemo = struct {
+        const Producer = @import("invariant_membership.zig").Producer;
+        const Entry = struct { key: Row, expression: *const ast.Expr, producer: *Producer };
+        const Allocation = struct { tag: std.meta.Tag(v.Value), address: usize, length: usize };
+        budget: Budget,
+        arena: ?std.heap.ArenaAllocator = null,
+        entries: std.ArrayList(Entry) = .empty,
+        index: value_work.Index = .{},
+        disabled: bool = false,
+        fn deinit(self: *@This()) void {
+            for (self.entries.items) |entry| entry.producer.deinit();
+            if (self.arena) |*arena| arena.deinit();
+        }
+        fn allocation(value: v.Value) ?Allocation {
+            return switch (value) {
+                .list => |x| .{ .tag = .list, .address = @intFromPtr(x.ptr), .length = x.len },
+                .map => |x| .{ .tag = .map, .address = @intFromPtr(x.ptr), .length = x.len },
+                .string => |x| .{ .tag = .string, .address = @intFromPtr(x.ptr), .length = x.len },
+                else => null,
+            };
+        }
+        fn get(self: *@This(), engine: *Engine, expression: *const ast.Expr, key: Row, source_budget: *Budget) !?*Producer {
+            if (self.disabled) return null;
+            return self.lookup(engine, expression, key, source_budget) catch |err| {
+                if (err != error.OutOfMemory or !self.budget.exhausted) return err;
+                self.disabled = true;
+                return null;
+            };
+        }
+        fn lookup(self: *@This(), engine: *Engine, expression: *const ast.Expr, key: Row, source_budget: *Budget) !*Producer {
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            var work: value_work.Work = .{ .a = scratch.allocator(), .ptr = engine, .charge = chargeWork, .binding_identity = true };
+            var hash = std.hash.Wyhash.init(@intFromPtr(expression));
+            for (key) |entry| {
+                try engine.state();
+                hash.update(entry.name);
+                if (engine.immutableOwner(entry.value) != null) {
+                    std.hash.autoHash(&hash, allocation(entry.value).?);
+                } else std.hash.autoHash(&hash, (try work.info(entry.value)).hash);
+            }
+            const code = hash.final();
+            var candidate = self.index.head(code);
+            while (candidate) |position| {
+                const link = self.index.links.items[position];
+                const entry = self.entries.items[link.index];
+                if (entry.expression == expression and entry.key.len == key.len) match: {
+                    for (key, entry.key) |input, saved| {
+                        if (!std.mem.eql(u8, input.name, saved.name)) break :match;
+                        if (engine.immutableOwner(saved.value) != null) {
+                            if (!std.meta.eql(allocation(input.value), allocation(saved.value))) break :match;
+                        } else if (!try work.eql(input.value, saved.value)) break :match;
+                    }
+                    return entry.producer;
+                }
+                candidate = link.next;
+            }
+            if (self.arena == null) self.arena = .init(self.budget.allocator());
+            const a = self.arena.?.allocator();
+            const owned = try a.alloc(v.Entry, key.len);
+            // Read-only entity binding equality uses identity, not properties.
+            // A high-degree anchor can carry a large native edge payload; none
+            // of that payload belongs in a membership cache's captured key.
+            var clone: v.CloneContext = .{ .a = a, .scratch = scratch.allocator(), .identity_only = true };
+            for (key, owned) |entry, *out| out.* = .{
+                .name = try a.dupe(u8, entry.name),
+                .value = if (engine.immutableOwner(entry.value) != null) entry.value else try clone.clone(entry.value),
+            };
+            const producer = try a.create(Producer);
+            producer.* = .{ .budget = source_budget };
+            try self.entries.ensureUnusedCapacity(a, 1);
+            try self.index.insert(a, code, self.entries.items.len);
+            self.entries.appendAssumeCapacity(.{ .key = owned, .expression = expression, .producer = producer });
+            return producer;
+        }
+    };
+    fn evalMembership(self: *Engine, left: v.Value, original_right: *const ast.Expr, row: Row, group: ?[]const Row) !v.Value {
+        // IN observes equality and NULLs, not encounter order. The producer
+        // still completes its original source phase and exposes late errors.
+        var right = original_right;
+        while (reduction_plan.reversedList(right)) |input| right = input;
         if (isRange(right)) {
             const range = (try self.rangeInput(right, row, group)) orelse return .null;
             return range.contains(left);
@@ -8684,13 +8785,8 @@ const Engine = struct {
                 const owner = try self.invariantState();
                 var existing = owner.producer_lists.get(right.execution_invariant.?);
                 if (existing == null) {
-                    if (owner.membership_budget == null) {
-                        const budget = try owner.work.a.create(Budget);
-                        budget.* = .{ .backing = self.scratch_allocator, .limit = @min(1 << 20, self.limits.memory_bytes / 8) };
-                        owner.membership_budget = budget;
-                    }
                     const cache = try owner.work.a.create(@import("invariant_membership.zig").Producer);
-                    cache.* = .{ .budget = owner.membership_budget.? };
+                    cache.* = .{ .budget = try self.membershipBudget(owner) };
                     try owner.producer_lists.put(owner.work.a, right.execution_invariant.?, cache);
                     existing = cache;
                 }
@@ -8701,22 +8797,23 @@ const Engine = struct {
                 if (cache.seen and !cache.disabled) candidate = cache;
                 cache.seen = true;
                 break :blk true;
-            } else if (self.read_only and right.value == .pattern_comprehension) blk: {
-                // Repeated correlated patterns retain their existing bounded
-                // source memo. Probe markers have a separate namespace and
-                // include the actual captured bindings, never just a spelling.
-                if (self.expression_memo == null) self.expression_memo = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(8 << 20, self.limits.memory_bytes / 16) } };
+            } else if (self.read_only and weightedExpression(right) and !aggregates(right)) blk: {
+                const owner = try self.invariantState();
+                if (owner.captured_lists == null) owner.captured_lists = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(1 << 20, self.limits.memory_bytes / 32) } };
                 var references: Names = .empty;
                 try self.retainReferences(&references, row, right);
                 var captured: std.ArrayList(v.Entry) = .empty;
                 for (row) |entry| if (references.contains(entry.name)) try captured.append(self.a, entry);
-                if (try self.expression_memo.?.findKind(self, captured.items, @intFromPtr(right), true) != null) break :blk false;
-                try self.expression_memo.?.putKind(self, captured.items, @intFromPtr(right), .{ .rows = &.{}, .weights = &.{} }, true);
+                if (try owner.captured_lists.?.get(self, right, captured.items, try self.membershipBudget(owner))) |cache| {
+                    if (cache.ready) return cache.membership.contains(&self.values, left);
+                    if (cache.seen and !cache.disabled) candidate = cache;
+                    cache.seen = true;
+                }
                 break :blk true;
             } else true;
             if (stream) {
-                var membership: MembershipReceiver = .{ .left = left, .candidate = candidate };
-                var receiver: ListReceiver = .{ .ptr = &membership, .emit = MembershipReceiver.add, .destination = self.a, .observer = .{ .name = "collect", .args = &.{} } };
+                var membership: MembershipReceiver = .{ .left = left, .left_info = try self.values.info(left), .candidate = candidate };
+                var receiver: ListReceiver = .{ .ptr = &membership, .emit = MembershipReceiver.add, .range = MembershipReceiver.range, .destination = self.a, .observer = .{ .name = "collect", .args = &.{} } };
                 const present = try self.produceList(right, row, group, &receiver);
                 if (candidate) |cache| cache.finish(present);
                 if (!present) return .null;
@@ -8763,10 +8860,20 @@ const Engine = struct {
         values: union(enum) { list: []const v.Value, range: @import("range.zig").Range, scalar: v.Value },
         position: u128 = 0,
         fn next(self: *@This()) ?v.Value {
+            return self.nextDirection(false);
+        }
+        fn nextDirection(self: *@This(), reverse: bool) ?v.Value {
+            const length: u128 = switch (self.values) {
+                .scalar => 1,
+                .list => |x| x.len,
+                .range => |x| x.length,
+            };
+            if (self.position >= length) return null;
+            const ordinal = if (reverse) length - self.position - 1 else self.position;
             const value = switch (self.values) {
                 .scalar => |value| if (self.position == 0) value else return null,
-                .list => |items| if (self.position < items.len) items[@intCast(self.position)] else return null,
-                .range => |sequence| if (self.position < sequence.length) sequence.at(self.position) else return null,
+                .list => |items| items[@intCast(ordinal)],
+                .range => |sequence| sequence.at(ordinal),
             };
             self.position += 1;
             return value;
@@ -8804,6 +8911,7 @@ const Engine = struct {
         destination: A,
         observer: ast.Function,
         failure: ?anyerror = null,
+        range: ?*const fn (*anyopaque, *Engine, @import("range.zig").Range) anyerror!void = null,
         fn accept(self: *@This(), engine: *Engine, value: v.Value, weight: Count, borrowed: ?*const value_work.Work) !void {
             if (self.failure != null) return;
             self.emit(self.ptr, engine, value, weight, borrowed) catch |err| {
@@ -8817,13 +8925,29 @@ const Engine = struct {
     };
     const MembershipReceiver = struct {
         left: v.Value,
+        left_info: value_work.Info,
         found: bool = false,
         unknown: bool = false,
         candidate: ?*@import("invariant_membership.zig").Producer = null,
+        fn range(ptr: *anyopaque, _: *Engine, sequence: @import("range.zig").Range) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.candidate) |cache| {
+                cache.deinit();
+                cache.disabled = true;
+            }
+            const result = sequence.contains(self.left);
+            if (result == .null) self.unknown = true else self.found = self.found or result.boolean;
+        }
         fn add(ptr: *anyopaque, engine: *Engine, value: v.Value, _: Count, _: ?*const value_work.Work) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.candidate) |cache| try cache.add(value, engine, chargeWork);
             if (self.found) return;
+            // Producer pages recycle metadata. Keep the needle's metadata in
+            // the receiver and reject unequal, NULL-free hashes before a wide
+            // equality traversal. Nullable structures still need three-valued
+            // comparison, and every hash match is collision checked.
+            const info = try engine.values.info(value);
+            if (!self.left_info.unknown and !info.unknown and self.left_info.hash != info.hash) return;
             if (try engine.values.equal(self.left, value)) |same| self.found = same else self.unknown = true;
         }
     };
@@ -8972,6 +9096,17 @@ const Engine = struct {
         return true;
     }
     fn produceList(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, receiver: *ListReceiver) anyerror!bool {
+        return self.produceListOrder(expression, row, group, receiver, false);
+    }
+    fn produceListOrder(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, receiver: *ListReceiver, reverse: bool) anyerror!bool {
+        if (self.read_only and reduction_plan.repeatable(expression)) if (reduction_plan.reversedList(expression)) |input| {
+            // Reverse changes encounter order only after its eager input phase.
+            // Validate repeatable projections in original order, then replay
+            // them against a source cursor which walks in the other direction.
+            const summary = try self.listSummary(.{ .name = "collect", .args = &.{input}, .collect_limit = 0, .collect_summary = true }, row, group);
+            if (summary.list[0] == .null) return false;
+            return self.produceListOrder(input, row, group, receiver, !reverse);
+        };
         if (self.read_only and reduction_plan.repeatable(expression)) if (reduction_plan.concatenatedList(expression)) |b| {
             // Addition evaluates both complete operands before exposing a list.
             // Validate into bounded summaries first, including NULL absorption
@@ -8979,8 +9114,8 @@ const Engine = struct {
             // into the consumer without retaining their intermediate payloads.
             const summary = try self.concatSummary(.{ .name = "collect", .args = &.{expression}, .collect_limit = 0, .collect_summary = true }, b.left, b.right, row, group);
             if (summary.list[0] == .null) return false;
-            try self.produceAddedOperand(b.left, row, group, receiver);
-            try self.produceAddedOperand(b.right, row, group, receiver);
+            try self.produceAddedOperand(if (reverse) b.right else b.left, row, group, receiver, reverse);
+            try self.produceAddedOperand(if (reverse) b.left else b.right, row, group, receiver, reverse);
             return true;
         };
         if (expression.value == .comprehension) {
@@ -8999,13 +9134,18 @@ const Engine = struct {
             // A nested mapping is an ordered full observer of its input. Its
             // own output demand still bounds retention in the next receiver.
             var mapped: ListReceiver = .{ .ptr = &mapper, .emit = ListMapper.add, .destination = receiver.destination, .observer = .{ .name = "collect", .args = &.{} } };
-            const present = try self.produceList(expression.value.comprehension.input, row, group, &mapped);
+            const present = try self.produceListOrder(expression.value.comprehension.input, row, group, &mapped, reverse);
             try mapped.check();
             if (mapper.embedding_failure) return error.CypherValueDepthExceeded;
             return present;
         }
         if (expression.value == .pattern_comprehension and try self.producePattern(expression, row, receiver)) return true;
         var source = (try self.listSource(expression, row, group)) orelse return false;
+        if (source.values == .range) if (receiver.range) |consume| {
+            try self.state();
+            try consume(receiver.ptr, self, source.values.range);
+            return true;
+        };
         if (source.values == .range and receiver.observer.collect_limit == 0 and receiver.observer.collect_filters.len == 0 and !receiver.observer.distinct) {
             const length = source.values.range.length;
             if (length != 0) {
@@ -9020,31 +9160,31 @@ const Engine = struct {
         // it is never retained after the source returns or used as a value key.
         const metadata = self.values;
         const borrowed = if (self.a.ptr == receiver.destination.ptr and self.a.vtable == receiver.destination.vtable) &metadata else null;
-        while (source.next()) |value| {
+        while (source.nextDirection(reverse)) |value| {
             try self.state();
             try receiver.accept(self, value, Count.one, borrowed);
         }
         return true;
     }
-    fn produceAddedOperand(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, receiver: *ListReceiver) anyerror!void {
+    fn produceAddedOperand(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, receiver: *ListReceiver, reverse: bool) anyerror!void {
         // The enclosing summary already validated this entire addition tree.
         // Replay nested additions directly, rather than validating every
         // prefix again (which would make a long concatenation quadratic).
         if (reduction_plan.concatenatedList(expression)) |b| {
-            try self.produceAddedOperand(b.left, row, group, receiver);
-            try self.produceAddedOperand(b.right, row, group, receiver);
+            try self.produceAddedOperand(if (reverse) b.right else b.left, row, group, receiver, reverse);
+            try self.produceAddedOperand(if (reverse) b.left else b.right, row, group, receiver, reverse);
             return;
         }
         if (isRange(expression) or projectedSource(expression)) {
-            _ = try self.produceList(expression, row, group, receiver);
+            _ = try self.produceListOrder(expression, row, group, receiver, reverse);
             return;
         }
         const value = try self.eval(expression, row, group);
         if (value == .null) return;
         if (value == .list) {
-            for (value.list) |item| {
+            for (0..value.list.len) |i| {
                 try self.state();
-                try receiver.accept(self, item, Count.one, null);
+                try receiver.accept(self, value.list[if (reverse) value.list.len - i - 1 else i], Count.one, null);
             }
         } else try receiver.accept(self, value, Count.one, null);
     }
@@ -9276,6 +9416,12 @@ const Engine = struct {
         return try self.cloneScoped(value, self.a);
     }
     fn rangeInput(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?@import("range.zig").Range {
+        if (expression.execution_range_binding and expression.value == .variable) {
+            const packet = try self.eval(expression, row, group);
+            if (packet == .null) return null;
+            if (packet != .list or packet.list.len != 4) return error.CypherInvalidAggregate;
+            return .{ .start = packet.list[0].integer, .step = packet.list[1].integer, .length = @as(u128, @intCast(packet.list[3].integer)) << 64 | @as(u64, @bitCast(packet.list[2].integer)) };
+        }
         const call_value = expression.value.call;
         const start = try self.eval(call_value.args[0], row, group);
         const end = try self.eval(call_value.args[1], row, group);
@@ -9283,6 +9429,7 @@ const Engine = struct {
         return @import("range.zig").Range.init(start, end, step);
     }
     fn isRange(expression: *const ast.Expr) bool {
+        if (expression.execution_range_binding) return true;
         return expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "range") and !expression.value.call.star and !expression.value.call.distinct and (expression.value.call.args.len == 2 or expression.value.call.args.len == 3);
     }
     fn rangeCells(self: *Engine, sequence: @import("range.zig").Range, first: u128, length: u128) !v.Value {

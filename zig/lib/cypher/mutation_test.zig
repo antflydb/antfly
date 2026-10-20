@@ -1413,7 +1413,14 @@ test "write folds cache closed scalar work locally without crossing deleted enti
     try std.testing.expectError(error.CypherDeletedEntity, root.runtime.execute(std.testing.allocator, fixture.backend(), graph, &deletion, &.{.{ .name = "entity", .value = .{ .node = fixture.nodes[0] } }}, .{}));
     try std.testing.expectEqual(@as(usize, 1), fixture.nodes.len);
     const Campaign = struct {
-        fn run(a: A) !void {
+        fn run(backing: A) !void {
+            // In-place arena growth depends on backing allocation layout.
+            // Force growth through fallible allocations so every injected
+            // failure index refers to the same operation on every run.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: A = .{ .ptr = backing.ptr, .vtable = &vtable };
             var state = Fixture.init();
             defer state.arena.deinit();
             var diag: root.compiler.Diagnostic = .{};
@@ -1457,7 +1464,14 @@ test "ordinary expression loops own write epoch constants and release them on fa
 
 test "projected producers cannot lend shorter write epochs to receiver state" {
     const Campaign = struct {
-        fn run(a: A) !void {
+        fn run(backing: A) !void {
+            // In-place arena growth depends on backing allocation layout.
+            // Force growth through fallible allocations so every injected
+            // failure index refers to the same operation on every run.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: A = .{ .ptr = backing.ptr, .vtable = &vtable };
             var fixture = Fixture.init();
             defer fixture.arena.deinit();
             var diagnostic: root.compiler.Diagnostic = .{};

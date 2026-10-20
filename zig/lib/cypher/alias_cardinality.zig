@@ -24,7 +24,7 @@ const A = std.mem.Allocator;
 pub const Rewrites = std.AutoHashMapUnmanaged(*const ast.Expr, ast.Expr);
 const Names = std.StringHashMapUnmanaged(usize);
 const FilterUse = struct { expression: *const ast.Expr, input: *const ast.Expr, filter: ast.CollectionFilter, window: bool = false };
-const Candidate = struct { expression: *const ast.Expr, valid: bool = true, window: ?Bounds = null, uses: std.ArrayList(*const ast.Expr) = .empty, windows: std.ArrayList(*const ast.Expr) = .empty, filters: std.ArrayList(FilterUse) = .empty };
+const Candidate = struct { membership: bool = false, range_bindings: std.ArrayList(*const ast.Expr) = .empty, expression: *const ast.Expr, valid: bool = true, window: ?Bounds = null, uses: std.ArrayList(*const ast.Expr) = .empty, windows: std.ArrayList(*const ast.Expr) = .empty, filters: std.ArrayList(FilterUse) = .empty };
 const Cohort = struct { members: std.ArrayList(usize) = .empty, full: bool = false };
 fn collectProducer(expression: *const ast.Expr) bool {
     return expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "collect") and !expression.value.call.star and expression.value.call.args.len == 1;
@@ -106,7 +106,11 @@ const Flow = struct {
         }
     }
     fn consumerInput(self: *@This(), input: *const ast.Expr, names: Names, locals: ?*const expressions.Local, index: ?*Index) !?usize {
-        if (input.value == .variable) return lookup(names, input.value.variable, locals);
+        if (input.value == .variable) {
+            const id = lookup(names, input.value.variable, locals) orelse return null;
+            if (rangeProducer(self.candidates.items[id].expression)) try self.candidates.items[id].range_bindings.append(self.a, input);
+            return id;
+        }
         if (index) |slots| if (producer(input) and !rangeProducer(input)) {
             const slot = try self.cohort(slots, input);
             const id = self.candidates.items.len;
@@ -116,6 +120,25 @@ const Flow = struct {
             return id;
         };
         return null;
+    }
+    fn membershipInput(self: *@This(), input: *const ast.Expr, names: Names, locals: ?*const expressions.Local, index: ?*Index) !void {
+        if (input.value == .variable) if (try self.consumerInput(input, names, locals, index)) |id| {
+            if (rangeProducer(self.candidates.items[id].expression)) {
+                self.candidates.items[id].membership = true;
+                return;
+            }
+        };
+        if (input.value == .binary and input.value.binary.op == .add) {
+            const b = input.value.binary;
+            try self.membershipInput(b.left, names, locals, index);
+            try self.membershipInput(b.right, names, locals, index);
+            return;
+        }
+        if (input.value == .call and std.ascii.eqlIgnoreCase(input.value.call.name, "reverse") and input.value.call.args.len == 1) {
+            try self.membershipInput(input.value.call.args[0], names, locals, index);
+            return;
+        }
+        try self.scan(input, names, locals, index);
     }
     fn scan(self: *@This(), value: anytype, names: Names, locals: ?*const expressions.Local, index: ?*Index) anyerror!void {
         const T = @TypeOf(value);
@@ -129,6 +152,11 @@ const Flow = struct {
                     return self.scan(value, projection.names, locals, index);
                 };
             };
+            if (value.value == .binary and value.value.binary.op == .in) {
+                try self.scan(value.value.binary.left, names, locals, index);
+                try self.membershipInput(value.value.binary.right, names, locals, index);
+                return;
+            }
             // Direct RANGE consumers already evaluate a sparse arithmetic
             // demand. Do not replace them with repeated shared prefix windows.
             if (directRange(value)) |range| {
@@ -341,7 +369,7 @@ const Flow = struct {
             for (cohort_.members.items) |id| {
                 if (self.candidates.items[id].window) |limit| prefix = (prefix orelse Bounds{}).merge(limit);
                 allowed = allowed and self.candidates.items[id].valid;
-                used = used or self.candidates.items[id].uses.items.len != 0;
+                used = used or self.candidates.items[id].uses.items.len != 0 or self.candidates.items[id].membership;
             }
             var filters: std.ArrayList(ast.CollectionFilter) = .empty;
             for (cohort_.members.items) |id| for (self.candidates.items[id].filters.items) |use| try filters.append(self.a, use.filter);
@@ -351,6 +379,18 @@ const Flow = struct {
             var filter_slot: usize = 0;
             for (cohort_.members.items) |id| {
                 const original = self.candidates.items[id].expression;
+                if (rangeProducer(original) and self.candidates.items[id].membership) {
+                    var descriptor = original.*;
+                    descriptor.execution_invariant = null;
+                    descriptor.execution_range_binding = true;
+                    try rewrites.put(self.a, original, descriptor);
+                    for (self.candidates.items[id].range_bindings.items) |binding| {
+                        var licensed = binding.*;
+                        licensed.execution_range_binding = true;
+                        try rewrites.put(self.a, binding, licensed);
+                    }
+                    continue;
+                }
                 var count = original.*;
                 if (list_source) {
                     const source = try self.a.create(ast.Expr);

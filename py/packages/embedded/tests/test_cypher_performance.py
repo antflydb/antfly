@@ -5296,3 +5296,84 @@ def test_unwind_forwarding_retains_sibling_bindings_without_materializing(graph_
             },
         )
         assert [cell["value"] for cell in response["rows"][0]] == ["2", "1000000000"]
+
+
+def test_captured_membership_reuses_indexes_for_immutable_row_bindings(graph_db):
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,100) AS n WITH n,$xs AS ys RETURN count(CASE WHEN toString(n) IN [x IN ys|toString(x)] THEN 1 END)",
+            "parameters": {"xs": list(range(1, 1001))},
+            "limits": {"memory_bytes": 1 << 20, "intermediate_states": 100000},
+        },
+    )
+    assert response["rows"][0][0]["value"] == "100"
+
+
+def test_repeated_graph_membership_keeps_oversized_sources_streaming(graph_db):
+    graph_db.cypher_json("g", {"query": "CREATE(a:D {id:'root'})"})
+    graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH(a:D {id:'root'}) UNWIND range(1,2000) AS i CREATE(b:D {score:i}),(a)-[:R]->(b) RETURN count(*)"
+        },
+    )
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH(a:D {id:'root'}) UNWIND [1,2,3] AS n RETURN ($word+toString(n)) IN [(a)-[:R]->(b)|$word+toString(b.score)]",
+            "parameters": {"word": "A" * 4096},
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 2000000},
+        },
+    )
+    assert [row[0]["value"] for row in response["rows"]] == [True, True, True]
+    # Large anchor payloads do not belong in captured equality keys. Narrow
+    # results can still acquire an index and avoid repeated graph traversals.
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH(a:D {id:'root'}) UNWIND range(1,100) AS n RETURN count(CASE WHEN toString(n) IN [(a)-[:R]->(b)|toString(b.score)] THEN 1 END)",
+            "limits": {"memory_bytes": 4 << 20, "intermediate_states": 1000000},
+        },
+    )
+    assert response["rows"][0][0]["value"] == "100"
+    assert response["stats"]["explored_edges"] <= 4000
+
+
+def test_reverse_producers_stream_membership_and_unwind_without_materialization(graph_db):
+    word = "A" * 4096
+    mapped = "[y IN range(1,2000)|$word+toString(y)]"
+    for query, expected in (
+        (f"RETURN ($word+'1') IN reverse({mapped})", True),
+        (f"UNWIND reverse({mapped}) AS x RETURN x LIMIT 1", word + "2000"),
+    ):
+        response = graph_db.cypher_json(
+            "g",
+            {
+                "query": query,
+                "parameters": {"word": word},
+                "limits": {"memory_bytes": 1 << 20, "intermediate_states": 2000000},
+            },
+        )
+        assert response["rows"][0][0]["value"] == expected
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND reverse(range(1,1000000000)) AS x RETURN count(*)",
+            "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000},
+        },
+    )
+    assert response["rows"][0][0]["value"] == "1000000000"
+
+
+def test_arithmetic_membership_composes_through_aliases_and_addition(graph_db):
+    for query in (
+        "WITH range(1,1000000000) AS xs WITH xs AS ys RETURN 1 IN ys,size(ys),head(ys),last(ys)",
+        "RETURN 1 IN (range(1,1000000000)+[])",
+        "WITH range(1,1000000000) AS xs RETURN 1 IN reverse(xs)",
+        "WITH range(-9223372036854775808,9223372036854775807) AS xs RETURN 9223372036854775807 IN xs",
+    ):
+        response = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000}}
+        )
+        assert response["rows"][0][0]["value"] is True
