@@ -248,10 +248,10 @@ test "required replicated begin bound seal receipts survive restart and reject r
         fn lifetime(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
             return runtime.error_abi.statusFromError(error.Canceled);
         }
-        fn cpu(_: *anyopaque, _: u64) callconv(.c) runtime.error_abi.Status {
+        fn cpu(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
             return runtime.error_abi.statusFromError(error.Canceled);
         }
-        fn phase(_: *anyopaque, _: u32) callconv(.c) runtime.error_abi.Status {
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
             return runtime.error_abi.statusFromError(error.Canceled);
         }
     };
@@ -272,6 +272,13 @@ test "required replicated begin bound seal receipts survive restart and reject r
             try db.enablePreparedTransactionProtocol();
             var begin = request(mode);
             begin.transaction.?.begin.preparation_binding = binding;
+            var malformed = begin;
+            malformed.transaction.?.begin.preparation_requirement = null;
+            try std.testing.expectError(error.PreparedTransactionMigrationRequired, @import("data/runtime.zig").DataServer.ensurePreparedTransactionProposalSupported(malformed));
+            try std.testing.expectError(error.InvalidBatchRequest, batch.encodeBatchRequest(a, malformed));
+            const malformed_prepare: db_mod.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 3, .preparation_binding = binding } } };
+            try std.testing.expectError(error.PreparedTransactionMigrationRequired, @import("data/runtime.zig").DataServer.ensurePreparedTransactionProposalSupported(malformed_prepare));
+            try std.testing.expectError(error.InvalidBatchRequest, batch.encodeBatchRequest(a, malformed_prepare));
             const bytes = try raft_batch.encode(a, "docs", begin);
             defer a.free(bytes);
             var parsed = try raft_batch.decode(a, bytes);

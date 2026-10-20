@@ -12642,8 +12642,8 @@ pub const DataServer = struct {
     /// coordinated migration owns that proof, no direct/private route may
     /// append a required BEGIN or activate its protocol barrier.
     pub fn ensurePreparedTransactionProposalSupported(req: antfly.db.types.BatchRequest) !void {
-        if (req.transaction) |mutation| if ((mutation == .begin and mutation.begin.preparation_requirement != null) or
-            (mutation == .prepare and (mutation.prepare.preparation_requirement != null or mutation.prepare.sealed_effects != null)))
+        if (req.transaction) |mutation| if ((mutation == .begin and (mutation.begin.preparation_requirement != null or mutation.begin.preparation_binding != null)) or
+            (mutation == .prepare and (mutation.prepare.preparation_requirement != null or mutation.prepare.preparation_binding != null or mutation.prepare.sealed_effects != null)))
             return error.PreparedTransactionMigrationRequired;
     }
 
