@@ -4650,3 +4650,47 @@ def test_suffix_collection_retains_only_demanded_payloads(graph_db):
     )
     assert int(result["rows"][0][0]["value"]) == 3000
     assert 0 <= int(result["rows"][0][1]["value"]) < 3000
+
+
+def test_ordered_distinct_retains_only_its_window(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092, unique=True)
+    for direction, scores in (("", range(2, 12)), ("DESC", range(2997, 2987, -1))):
+        result = db.cypher_json(
+            "payloads",
+            {
+                "query": f"MATCH(n:W) RETURN DISTINCT n.payload AS p ORDER BY p {direction} SKIP 2 LIMIT 10",
+                "limits": {"memory_bytes": 8 << 20},
+            },
+        )
+        assert [row[0]["value"][:12] for row in result["rows"]] == [f"{i:012d}" for i in scores]
+
+
+def test_collection_summaries_combine_counts_windows_and_filters(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092, unique=True)
+    for tail in (
+        "WITH collect(n.payload) AS xs RETURN size(xs),head(xs),last(xs)",
+        "WITH collect(n.payload) AS xs WITH xs AS ys RETURN size(ys),head(ys),last(ys)",
+        "RETURN size(collect(n.payload)),head(collect(n.payload)),last(collect(n.payload))",
+    ):
+        result = db.cypher_json("payloads", {"query": "MATCH(n:W) " + tail, "limits": {"memory_bytes": 8 << 20}})
+        count, first, last = result["rows"][0]
+        assert int(count["value"]) == 3000
+        assert first["value"].startswith("000000000000")
+        assert last["value"].startswith("000000000999")
+    for tail in (
+        'WITH collect(n.payload) AS xs RETURN size([x IN xs WHERE x STARTS WITH "000000000001"])',
+        'RETURN size([x IN collect(n.payload) WHERE x STARTS WITH "000000000001" | null])',
+        'WITH collect(n.payload) AS xs RETURN size(xs),size([x IN xs WHERE x STARTS WITH "000000000001"]),size([x IN xs WHERE x ENDS WITH "x" | null])',
+    ):
+        result = db.cypher_json("payloads", {"query": "MATCH(n:W) " + tail, "limits": {"memory_bytes": 8 << 20}})
+        values = [int(cell["value"]) for cell in result["rows"][0]]
+        assert values == ([3000, 1, 3000] if len(values) == 3 else [1])
+
+    sql = db.sql(
+        "SELECT g.total,g.tail FROM GRAPH_TABLE(payloads MATCH(n IS W) "
+        "COLUMNS(size(collect(n.payload)) AS total,last(collect(n.payload)) AS tail)) g"
+    )
+    assert sql["rows"][0][0] == "3000"
+    assert sql["rows"][0][1].startswith("000000000999")

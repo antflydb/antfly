@@ -3638,3 +3638,81 @@ test "group finalization and rolling suffix ownership release every allocation f
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }
+
+test "collection summaries combine cardinality windows and filtered counts" {
+    try check("UNWIND [null,1,2,2,3] AS x WITH collect(x) AS xs RETURN size(xs),head(xs),last(xs),xs[-2..],size([y IN xs WHERE y>1])", "[[4,1,3,[2,3],3]]");
+    try check("UNWIND [null,1,2,2,3] AS x RETURN size(collect(x)),last(collect(x)),size([y IN collect(x) WHERE y>1])", "[[4,3,3]]");
+    try check("UNWIND [null,1,1.0,2,3] AS x WITH collect(DISTINCT x) AS xs WITH xs AS ys RETURN size(ys),head(ys),last(ys),size([y IN ys WHERE y>1 | null])", "[[3,1,3,2]]");
+    try check("UNWIND [] AS x WITH collect(x) AS xs RETURN size(xs),head(xs),last(xs),size([y IN xs WHERE y>1])", "[[0,null,null,0]]");
+    try check("MATCH(n:Document) WITH n.rank%2 AS k,collect(n.title) AS xs RETURN k,size(xs),last(xs),size([y IN xs WHERE y STARTS WITH 'A']) ORDER BY k", "[[0,1,\"Beta\",0],[1,2,\"Gamma\",1]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN xs,size([y IN xs WHERE y>1])", "[[[1,2],1]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN CASE WHEN true THEN 7 ELSE size([y IN xs WHERE y/0>1]) END", "[[7]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN size([y IN xs WHERE y>1]),size([y IN xs WHERE y>0 | null])", "[[1,2]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN size([xs IN xs WHERE xs>1])", "[[1]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs,1 AS k RETURN head(xs),size([y IN xs WHERE y>k])", "[[1,1]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs ORDER BY size(xs) RETURN size(xs),last(xs)", "[[2,2]]");
+    try check("UNWIND [1,2] AS x RETURN CASE WHEN true THEN size([y IN collect(DISTINCT x) WHERE y>1]) ELSE 0 END,size([y IN collect(DISTINCT x) WHERE y>0])", "[[1,2]]");
+}
+
+test "collection summary consumers preserve deferred errors and argument precedence" {
+    const cases = .{
+        .{ "UNWIND [1,2] AS x WITH collect(x) AS xs RETURN size([y IN xs WHERE y/0>1])", error.CypherDivisionByZero },
+        .{ "UNWIND [1,2] AS x WITH collect(x) AS xs RETURN size([y IN xs WHERE true | 1/0])", error.CypherDivisionByZero },
+        .{ "UNWIND [1,2] AS x WITH collect(x) AS xs RETURN size([y IN xs WHERE y+true>0])", error.CypherTypeMismatch },
+        .{ "UNWIND [1,2] AS x WITH collect(x) AS xs RETURN size([y IN xs WHERE y>$missing])", error.MissingCypherParameter },
+        .{ "UNWIND [1,0] AS x WITH collect(1/x) AS xs RETURN size([y IN xs WHERE y+true>0])", error.CypherDivisionByZero },
+        .{ "UNWIND [1,2] AS x WITH collect(x) AS xs RETURN 1/0,size([y IN xs WHERE y+true>0])", error.CypherDivisionByZero },
+    };
+    inline for (cases) |case| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case[0], .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(case[1], runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "bounded ordered DISTINCT keeps stable complete keys and evaluates rejected inputs" {
+    try check("UNWIND [3,2,3,1,2,0,3] AS x RETURN DISTINCT x ORDER BY x SKIP 1 LIMIT 2", "[[1],[2]]");
+    try check("UNWIND [3,2,3,1,2,0,3] AS x RETURN DISTINCT x ORDER BY x DESC SKIP 1 LIMIT 2", "[[2],[1]]");
+    try check("UNWIND [null,2,null,1] AS x RETURN DISTINCT x ORDER BY x LIMIT 3", "[[1],[2],[null]]");
+    try check("UNWIND [3,2,3,1] AS x RETURN DISTINCT x,x%2 AS k ORDER BY k LIMIT 2", "[[2,0],[3,1]]");
+    try check("UNWIND [3,2,1] AS x WITH DISTINCT x ORDER BY x LIMIT 2 RETURN collect(x)", "[[[1,2]]]");
+    try check("UNWIND [3,2,1] AS x RETURN DISTINCT x%2 AS k,count(*) AS c ORDER BY k LIMIT 1", "[[0,1]]");
+    try check("UNWIND [] AS x RETURN DISTINCT x ORDER BY x LIMIT 1", "[]");
+    try check("UNWIND [3,2.0,2,1] AS x RETURN DISTINCT x ORDER BY x LIMIT 2", "[[1],[2]]");
+    try check("MATCH(a:Document {id:'a'})-[:CITES*1..5]->(b:Document) RETURN DISTINCT b.rank ORDER BY b.rank LIMIT 2", "[[1],[2]]");
+    var diagnostic: c.Diagnostic = .{};
+    var numeric = try c.compile(std.testing.allocator, "UNWIND [3,2.0,2,1] AS x RETURN DISTINCT x ORDER BY x LIMIT 2", .{}, &diagnostic);
+    defer numeric.deinit();
+    var numeric_fixture: Fixture = .{};
+    var numeric_result = try runtime.execute(std.testing.allocator, numeric_fixture.backend(), graph, &numeric, &.{}, .{});
+    defer numeric_result.deinit();
+    try std.testing.expect(numeric_result.rows[1][0] == .number);
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [3,2,0] AS x RETURN DISTINCT 1/x AS k ORDER BY k LIMIT 0", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+}
+
+test "collection summaries and ordered distinct windows release every failed allocation" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, text: []const u8) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    inline for (.{
+        "UNWIND [3,2,3,1,0] AS x RETURN DISTINCT x ORDER BY x LIMIT 2",
+        "UNWIND [1,2,3] AS x WITH collect(x) AS xs RETURN size(xs),head(xs),last(xs),size([y IN xs WHERE y>1 | null])",
+        "UNWIND [1,2] AS x WITH collect(DISTINCT x) AS xs RETURN size([y IN xs WHERE y>1]),CASE WHEN true THEN 7 ELSE size([y IN xs WHERE y/0>1]) END",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as([]const u8, text)});
+}

@@ -1889,6 +1889,12 @@ projection callbacks conservatively keep complete observed content. Labels and
 relationship physical attributes remain intact. Aggregate-only input payloads
 are released with their producer pages.
 
+Ordered DISTINCT with a proved key ordering uses a bounded group window and
+collision-checked membership for retained keys only. Evicted keys cannot improve
+against the monotone threshold; SKIP and stable ties use the same complete key
+and first-seen sequence rules. DISTINCT reductions and unproved ordering shapes
+retain their general executor.
+
 General grouped projection constructs its source/alias environment once. Proved finite
 SKIP/LIMIT windows use the existing stable TopK selector, with per-group scratch
 for projection and ordering and independent ownership for selected rows. Every
@@ -1915,8 +1921,15 @@ own only the demanded payload window, preserving first-seen order. Every input
 argument still evaluates,
 including after the prefix fills and for an empty prefix. NULL exclusion,
 first-seen DISTINCT order, weighted multiplicity and lazy branches retain their
-ordinary semantics. A full consumer, unknown/unbounded window, scope barrier or
-mixed cardinality/window alias demand conservatively retains the complete list.
+ordinary semantics. Combined cardinality and front/back demands use one private
+collection summary, including through transparent WITH aliases. SIZE of a
+row-local filtered comprehension consumes per-filter counters instead of retaining
+its input collection. Predicate and projection evaluation preserves NULL exclusion,
+counts NULL projections, and records each consumer's first scalar error for its
+original evaluation site; lazy branches and earlier aggregate argument failures
+retain their error precedence. Resource/cancellation failures propagate immediately.
+Full escapes, unknown/unbounded windows, scope barriers and
+correlated or effectful consumers conservatively retain the complete list.
 
 Compatible repeatable DISTINCT arguments also share a collision-checked value
 store across different reducers (for example COUNT and COLLECT). Ordinary row

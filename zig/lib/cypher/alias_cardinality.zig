@@ -23,8 +23,30 @@ const Bounds = @import("reduction.zig").Bounds;
 const A = std.mem.Allocator;
 pub const Rewrites = std.AutoHashMapUnmanaged(*const ast.Expr, ast.Expr);
 const Names = std.StringHashMapUnmanaged(usize);
-const Candidate = struct { expression: *const ast.Expr, valid: bool = true, window: ?Bounds = null, uses: std.ArrayList(*const ast.Expr) = .empty };
-const Cohort = struct { members: std.ArrayList(usize) = .empty, full: bool = false, window: ?Bounds = null };
+const FilterUse = struct { expression: *const ast.Expr, input: *const ast.Expr, filter: ast.CollectionFilter };
+const Candidate = struct { expression: *const ast.Expr, valid: bool = true, window: ?Bounds = null, uses: std.ArrayList(*const ast.Expr) = .empty, windows: std.ArrayList(*const ast.Expr) = .empty, filters: std.ArrayList(FilterUse) = .empty };
+const Cohort = struct { members: std.ArrayList(usize) = .empty, full: bool = false };
+fn hasCollection(value: anytype) bool {
+    const T = @TypeOf(value);
+    if (T == *const ast.Expr) {
+        if (value.value == .call and std.ascii.eqlIgnoreCase(value.value.call.name, "collect")) return true;
+        return hasCollection(value.value);
+    }
+    switch (@typeInfo(T)) {
+        .pointer => |p| if (p.size == .slice and p.child != u8) {
+            for (value) |child| if (hasCollection(child)) return true;
+        },
+        .@"struct" => |info| inline for (info.field_names) |name| {
+            if (hasCollection(@field(value, name))) return true;
+        },
+        .@"union" => switch (value) {
+            inline else => |child| return hasCollection(child),
+        },
+        .optional => if (value) |child| return hasCollection(child),
+        else => {},
+    }
+    return false;
+}
 const Flow = struct {
     a: A,
     source: []const u8,
@@ -48,6 +70,18 @@ const Flow = struct {
         if (slot == self.cohorts.items.len) try self.cohorts.append(self.a, .{});
         return slot;
     }
+    fn consumerInput(self: *@This(), input: *const ast.Expr, names: Names, locals: ?*const expressions.Local, index: ?*Index) !?usize {
+        if (input.value == .variable) return lookup(names, input.value.variable, locals);
+        if (index) |slots| if (input.value == .call and std.ascii.eqlIgnoreCase(input.value.call.name, "collect") and !input.value.call.star and input.value.call.args.len == 1) {
+            const slot = try self.cohort(slots, input);
+            const id = self.candidates.items.len;
+            try self.candidates.append(self.a, .{ .expression = input });
+            try self.cohorts.items[slot].members.append(self.a, id);
+            try self.scan(input.value.call.args, names, locals, index);
+            return id;
+        };
+        return null;
+    }
     fn scan(self: *@This(), value: anytype, names: Names, locals: ?*const expressions.Local, index: ?*Index) anyerror!void {
         const T = @TypeOf(value);
         if (T == *const ast.Expr) {
@@ -61,23 +95,39 @@ const Flow = struct {
                 };
             };
             if (@import("reduction.zig").collectionConsumer(value)) |prefix| {
-                if (prefix.input.value == .variable) {
-                    if (lookup(names, prefix.input.value.variable, locals)) |id| {
-                        self.candidates.items[id].window = (self.candidates.items[id].window orelse Bounds{}).merge(prefix.bounds);
-                        return;
-                    }
-                } else if (index != null and prefix.input.value == .call and std.ascii.eqlIgnoreCase(prefix.input.value.call.name, "collect")) {
-                    const slot = try self.cohort(index.?, prefix.input);
-                    self.cohorts.items[slot].window = (self.cohorts.items[slot].window orelse Bounds{}).merge(prefix.bounds);
-                    return self.scan(prefix.input.value.call.args, names, locals, index);
+                if (try self.consumerInput(prefix.input, names, locals, index)) |id| {
+                    self.candidates.items[id].window = (self.candidates.items[id].window orelse Bounds{}).merge(prefix.bounds);
+                    try self.candidates.items[id].windows.append(self.a, value);
+                    return;
                 }
             }
             switch (value.value) {
                 .variable => |name| self.full(names, name, locals),
                 .exists, .pattern_comprehension => self.barrier(names),
                 .call => |call| {
-                    if (std.ascii.eqlIgnoreCase(call.name, "size") and !call.star and !call.distinct and call.args.len == 1 and call.args[0].value == .variable) {
-                        if (lookup(names, call.args[0].value.variable, locals)) |id| {
+                    if (std.ascii.eqlIgnoreCase(call.name, "size") and !call.star and !call.distinct and call.args.len == 1 and call.args[0].value == .comprehension) {
+                        const c = call.args[0].value.comprehension;
+                        if (try self.consumerInput(c.input, names, locals, index)) |id| {
+                            const Context = struct {
+                                alias: []const u8,
+                                pub fn permits(context: @This(), name: []const u8) bool {
+                                    return std.mem.eql(u8, context.alias, name);
+                                }
+                            };
+                            const context: Context = .{ .alias = c.alias };
+                            // Correlated, effectful and nested aggregate consumers
+                            // stay materialized. Scalar failures are deferred by
+                            // the physical reducer until this exact SIZE is used.
+                            const safe_predicate = if (c.predicate) |e| !expressions.aggregates(e) and expressions.rowLocal(e, context) else true;
+                            const safe_projection = if (c.projection) |e| !expressions.aggregates(e) and expressions.rowLocal(e, context) else true;
+                            if (safe_predicate and safe_projection) {
+                                try self.candidates.items[id].filters.append(self.a, .{ .expression = value, .input = c.input, .filter = .{ .alias = c.alias, .predicate = c.predicate, .projection = c.projection } });
+                                return;
+                            }
+                        }
+                    }
+                    if (std.ascii.eqlIgnoreCase(call.name, "size") and !call.star and !call.distinct and call.args.len == 1) {
+                        if (try self.consumerInput(call.args[0], names, locals, index)) |id| {
                             try self.candidates.items[id].uses.append(self.a, value);
                             return;
                         }
@@ -125,13 +175,7 @@ const Flow = struct {
         }
     }
     fn analyze(self: *@This(), clauses: []const ast.Clause, rewrites: *Rewrites) !void {
-        var possible = false;
-        for (clauses) |clause| if (clause.operation == .project and !clause.operation.project.final) {
-            for (clause.operation.project.value.items) |item| if (item.alias != null and item.expression.value == .call and std.ascii.eqlIgnoreCase(item.expression.value.call.name, "collect")) {
-                possible = true;
-            };
-        };
-        if (!possible) return;
+        if (!hasCollection(clauses)) return;
         var names: Names = .empty;
         for (clauses) |clause| switch (clause.operation) {
             .project => |p| {
@@ -188,27 +232,70 @@ const Flow = struct {
         for (self.cohorts.items) |cohort_| {
             var allowed = !cohort_.full;
             var used = false;
-            var prefix = cohort_.window;
+            var prefix: ?Bounds = null;
             for (cohort_.members.items) |id| {
                 if (self.candidates.items[id].window) |limit| prefix = (prefix orelse Bounds{}).merge(limit);
                 allowed = allowed and self.candidates.items[id].valid;
                 used = used or self.candidates.items[id].uses.items.len != 0;
             }
-            // Mixing cardinality and window demands needs both count and
-            // payload state; keep the complete list until that demand exists.
-            if (!allowed or (used and prefix != null) or (!used and prefix == null)) continue;
+            var filters: std.ArrayList(ast.CollectionFilter) = .empty;
+            for (cohort_.members.items) |id| for (self.candidates.items[id].filters.items) |use| try filters.append(self.a, use.filter);
+            if (!allowed or (!used and prefix == null and filters.items.len == 0)) continue;
+            const summary = filters.items.len != 0 or (used and prefix != null);
+            var filter_slot: usize = 0;
             for (cohort_.members.items) |id| {
                 const original = self.candidates.items[id].expression;
                 var count = original.*;
-                if (prefix) |limit| {
+                if (summary) {
+                    count.value.call.collect_summary = true;
+                    count.value.call.collect_limit = if (prefix) |limit| limit.prefix else 0;
+                    count.value.call.collect_suffix = if (prefix) |limit| limit.suffix else 0;
+                    count.value.call.collect_filters = filters.items;
+                } else if (prefix) |limit| {
                     count.value.call.collect_limit = limit.prefix;
                     count.value.call.collect_suffix = limit.suffix;
                 } else count.value.call.name = "count";
                 try rewrites.put(self.a, original, count);
                 for (self.candidates.items[id].uses.items) |use| {
                     var scalar = use.*;
-                    scalar.value = .{ .variable = use.value.call.args[0].value.variable };
+                    if (summary) {
+                        scalar.value.call.collection_extract = .cardinality;
+                    } else if (use.value.call.args[0].value == .variable) {
+                        scalar.value = .{ .variable = use.value.call.args[0].value.variable };
+                    } else {
+                        scalar.value = .{ .call = count.value.call };
+                    }
                     try rewrites.put(self.a, use, scalar);
+                }
+                if (summary) {
+                    for (self.candidates.items[id].windows.items) |use| {
+                        var consumer = use.*;
+                        const input = @import("reduction.zig").collectionConsumer(use).?.input;
+                        const extracted = try self.a.create(ast.Expr);
+                        const args = try self.a.alloc(*const ast.Expr, 1);
+                        args[0] = input;
+                        extracted.* = .{ .span = input.span, .value = .{ .call = .{ .name = "head", .args = args, .collection_extract = .{ .window = 1 + filters.items.len * 2 } } } };
+                        switch (consumer.value) {
+                            .call => |*call| {
+                                const window_args = try self.a.dupe(*const ast.Expr, call.args);
+                                window_args[0] = extracted;
+                                call.args = window_args;
+                            },
+                            .index => |*index| index.base = extracted,
+                            .slice => |*slice| slice.base = extracted,
+                            else => unreachable,
+                        }
+                        try rewrites.put(self.a, use, consumer);
+                    }
+                    for (self.candidates.items[id].filters.items) |use| {
+                        var consumer = use.expression.*;
+                        const args = try self.a.alloc(*const ast.Expr, 1);
+                        args[0] = use.input;
+                        consumer.value.call.args = args;
+                        consumer.value.call.collection_extract = .{ .filtered = filter_slot };
+                        filter_slot += 1;
+                        try rewrites.put(self.a, use.expression, consumer);
+                    }
                 }
             }
         }

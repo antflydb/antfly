@@ -1383,6 +1383,51 @@ const Engine = struct {
         collected: std.ArrayList(v.Value) = .empty,
         tail: CollectionTail = .{},
         collection_seen: usize = 0,
+        filter_states: []FilterState = &.{},
+        collection_count: u64 = 0,
+        collection_overflow: bool = false,
+        const FilterState = struct { count: u64 = 0, failure: ?anyerror = null };
+        fn filterItem(engine: *Engine, filter: ast.CollectionFilter, value: v.Value) !bool {
+            const previous = engine.projection_locals;
+            const local: @import("expressions.zig").Local = .{ .name = filter.alias, .parent = previous };
+            engine.projection_locals = &local;
+            defer engine.projection_locals = previous;
+            const row = &.{v.Entry{ .name = filter.alias, .value = value }};
+            if (filter.predicate) |predicate| if ((try (try engine.eval(predicate, row, null)).truth()) != true) return false;
+            // SIZE still observes projection errors and counts NULL projections.
+            if (filter.projection) |projection| _ = try engine.eval(projection, row, null);
+            return true;
+        }
+        fn addSummary(self: *@This(), engine: *Engine, value: v.Value, weight: Count) !void {
+            if (!self.collection_overflow) self.collection_count = addPathCount(self.collection_count, weight.cap(std.math.maxInt(u64))) catch blk: {
+                self.collection_overflow = true;
+                break :blk 0;
+            };
+            if (self.function.collect_filters.len == 0) return;
+            if (self.filter_states.len == 0) {
+                self.filter_states = try self.arena.allocator().alloc(FilterState, self.function.collect_filters.len);
+                @memset(self.filter_states, .{});
+            }
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            for (self.function.collect_filters, self.filter_states) |filter, *state_value| {
+                if (state_value.failure != null) continue;
+                _ = scratch.reset(.free_all);
+                const scope = EvalScope.enter(engine, scratch.allocator());
+                defer scope.leave(engine);
+                const selected = filterItem(engine, filter, value) catch |err| switch (err) {
+                    error.CypherTypeMismatch, error.CypherNumericOverflow, error.CypherDivisionByZero, error.MissingCypherParameter, error.UnboundCypherVariable, error.CypherInvalidArgument, error.CypherInvalidRange, error.CypherInvalidSubstring, error.CypherInvalidRegex, error.CypherRegexUnavailable, error.CypherValueDepthExceeded => {
+                        state_value.failure = err;
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (selected) state_value.count = addPathCount(state_value.count, weight.cap(std.math.maxInt(u64))) catch |err| blk: {
+                    state_value.failure = err;
+                    break :blk 0;
+                };
+            }
+        }
         fn consumedOrdinal(self: *const @This(), ordinal: usize) bool {
             const word = ordinal / 64;
             return word < self.cohort.?.consumed.items.len and self.cohort.?.consumed.items[word] & (@as(u64, 1) << @intCast(ordinal % 64)) != 0;
@@ -1449,7 +1494,7 @@ const Engine = struct {
             if (value == .null) return;
             // Retention is bounded, evaluation is not: every argument above
             // still runs, even after this consumer has received its prefix.
-            if (self.function.collect_suffix == 0) if (self.function.collect_limit) |limit| if (self.collected.items.len >= limit) return;
+            if (!self.function.collect_summary and self.function.collect_suffix == 0) if (self.function.collect_limit) |limit| if (self.collected.items.len >= limit) return;
             // MIN/MAX are duplicate insensitive and need no distinct set.
             // Other DISTINCT reducers retain only unique arguments, using the
             // same equality and hashing as GROUP BY.
@@ -1465,7 +1510,7 @@ const Engine = struct {
                     distinct_owned = membership.values.items[ordinal];
                     // Equality canonicalizes numeric representations. A consumer
                     // activated later must keep its own first representation.
-                    if (std.ascii.eqlIgnoreCase(self.function.name, "collect") and self.function.collect_suffix == 0) {
+                    if (std.ascii.eqlIgnoreCase(self.function.name, "collect") and self.function.collect_suffix == 0 and !self.function.collect_summary) {
                         if (!membership.retain_payload) {
                             distinct_owned = try value.clone(self.arena.allocator());
                         } else {
@@ -1497,7 +1542,7 @@ const Engine = struct {
                         candidate = link.next;
                     }
                     const retained = self.distinct_arena.allocator();
-                    const owned = try v.cloneMembership(value, retained, engine.scratch_allocator, &self.distinct_bytes, std.ascii.eqlIgnoreCase(self.function.name, "collect") and self.function.collect_suffix == 0);
+                    const owned = try v.cloneMembership(value, retained, engine.scratch_allocator, &self.distinct_bytes, std.ascii.eqlIgnoreCase(self.function.name, "collect") and self.function.collect_suffix == 0 and !self.function.collect_summary);
                     try self.distinct_index.insert(retained, hash, self.distinct_values.items.len);
                     try self.distinct_values.append(retained, owned);
                 }
@@ -1510,11 +1555,12 @@ const Engine = struct {
                 return;
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) {
+                if (self.function.collect_summary) try self.addSummary(engine, value, weight);
                 const retained = self.arena.allocator();
                 const remaining = if (self.function.collect_limit) |limit| limit - self.collected.items.len else std.math.maxInt(usize);
                 const copies = if (self.function.collect_limit != null) std.math.cast(usize, weight.cap(remaining)).? else std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
                 if (copies != 0) {
-                    const owned = if (self.function.distinct and self.function.collect_suffix == 0) distinct_owned orelse self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
+                    const owned = if (self.function.distinct and self.function.collect_suffix == 0 and !self.function.collect_summary) distinct_owned orelse self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
                     try Engine.chargeWork(engine, copies);
                     try self.collected.ensureUnusedCapacity(retained, copies);
                     for (0..copies) |_| self.collected.appendAssumeCapacity(owned);
@@ -1636,6 +1682,22 @@ const Engine = struct {
             return self.addWeighted(engine, &.{}, weight);
         }
         fn finish(self: StreamingAggregate, engine: *Engine) !v.Value {
+            const window = try self.finishWindow(engine);
+            if (!self.function.collect_summary) return window;
+            // This private execution tuple cannot escape: demand planning rewrites
+            // every consumer, while full/correlated consumers prohibit summaries.
+            const header = 1 + self.function.collect_filters.len * 2;
+            const tuple = try engine.a.alloc(v.Value, header + window.list.len);
+            tuple[0] = .{ .integer = if (self.collection_overflow) -1 else @intCast(self.collection_count) };
+            @memcpy(tuple[header..], window.list);
+            for (self.function.collect_filters, 0..) |_, i| {
+                const state_value: FilterState = if (self.filter_states.len == 0) .{} else self.filter_states[i];
+                tuple[1 + i * 2] = .{ .integer = @intCast(state_value.count) };
+                tuple[2 + i * 2] = .{ .integer = if (state_value.failure) |err| @intFromError(err) else 0 };
+            }
+            return .{ .list = tuple };
+        }
+        fn finishWindow(self: StreamingAggregate, engine: *Engine) !v.Value {
             if (self.function.collect_suffix == 0) return self.result();
             const sum = std.math.add(usize, self.collected.items.len, self.tail.weight) catch return error.CypherStateBudgetExceeded;
             const length = @min(self.collection_seen, sum);
@@ -1760,7 +1822,10 @@ const Engine = struct {
         heap: std.ArrayList(usize) = .empty,
         sequence: usize = 0,
         fn init(engine: *Engine, projection: ast.Projection, scalar: bool) !?@This() {
-            if (!scalar or @as(u64, engine.limits.intermediate_states) > std.math.maxInt(i64) or projection.distinct or projection.predicate != null or projection.order.len == 0 or !engine.boundedGroupWindow(projection)) return null;
+            // DISTINCT with reducers may collapse different complete groups;
+            // only a pure DISTINCT key window licenses candidate-local membership.
+            if (projection.distinct) for (projection.items) |item| if (aggregates(item.expression) or !reduction_plan.repeatable(item.expression)) return null;
+            if (!scalar or @as(u64, engine.limits.intermediate_states) > std.math.maxInt(i64) or projection.predicate != null or projection.order.len == 0 or !engine.boundedGroupWindow(projection)) return null;
             var keys: std.ArrayList(*const ast.Expr) = .empty;
             for (projection.items) |item| {
                 if (aggregates(item.expression)) {
@@ -3108,7 +3173,7 @@ const Engine = struct {
             };
             break :blk true;
         };
-        var group_window = if (grouped) try GroupWindow.init(self, projection, scalar_groups) else null;
+        var group_window = if (grouped) try GroupWindow.init(self, projection, scalar_groups or (projection.distinct and calls.items.len == 0)) else null;
         defer if (group_window) |*window| {
             window.heap.deinit(self.scratch_allocator);
             group_index.deinit(self.scratch_allocator);
@@ -4069,7 +4134,7 @@ const Engine = struct {
                         for (bags.weights) |weight| if (!weight.isOne()) break :blk false;
                         break :blk true;
                     };
-                    var group_window = if (grouped) try GroupWindow.init(self, projection, scalar_groups) else null;
+                    var group_window = if (grouped) try GroupWindow.init(self, projection, scalar_groups or (projection.distinct and calls.items.len == 0)) else null;
                     defer if (group_window) |*window| {
                         window.heap.deinit(self.scratch_allocator);
                         group_index.deinit(self.scratch_allocator);
@@ -8194,7 +8259,9 @@ const Engine = struct {
                 }
                 break :blk .{ .map = try output.toOwnedSlice(self.a) };
             },
-            .call => |c| if (std.ascii.eqlIgnoreCase(c.name, "size") and c.args.len == 1 and c.args[0].value == .pattern_comprehension and weightedExpression(c.args[0]))
+            .call => |c| if (c.collection_extract) |extract|
+                try self.collectionExtract(extract, try self.eval(c.args[0], row, group))
+            else if (std.ascii.eqlIgnoreCase(c.name, "size") and c.args.len == 1 and c.args[0].value == .pattern_comprehension and weightedExpression(c.args[0]))
                 try self.comprehensionSize(c.args[0], row)
             else if (aggregateName(c.name)) try self.aggregate(c, group orelse return error.CypherAggregateScope, null) else try self.function(c.name, c.args, row, group),
             .case_when => |c| blk: {
@@ -8213,6 +8280,17 @@ const Engine = struct {
                 defer self.columns = columns;
                 const candidates = try self.existsRows(clauses, row);
                 break :blk .{ .boolean = candidates.len > 0 };
+            },
+        };
+    }
+    fn collectionExtract(_: *Engine, extract: ast.CollectionExtract, value: v.Value) !v.Value {
+        return switch (extract) {
+            .window => |header| .{ .list = value.list[header..] },
+            .cardinality => if (value.list[0].integer < 0) error.CypherNumericOverflow else value.list[0],
+            .filtered => |slot| blk: {
+                const code = value.list[2 + slot * 2].integer;
+                if (code != 0) return @errorFromInt(@as(@Int(.unsigned, @bitSizeOf(anyerror)), @intCast(code)));
+                break :blk value.list[1 + slot * 2];
             },
         };
     }
@@ -8525,14 +8603,14 @@ const Engine = struct {
     fn aggregate(self: *Engine, call_value: ast.Function, group: []const Row, prepared: ?[]const v.Value) !v.Value {
         if (call_value.args.len != (if (call_value.star) @as(usize, 0) else 1)) return error.CypherFunctionArity;
         if (call_value.collect_limit) |limit| {
-            if (prepared) |values| {
+            if (!call_value.collect_summary) if (prepared) |values| {
                 const prefix = @min(limit, values.len);
                 const tail_start = @max(prefix, values.len - @min(call_value.collect_suffix, values.len));
                 const output = try self.a.alloc(v.Value, prefix + values.len - tail_start);
                 @memcpy(output[0..prefix], values[0..prefix]);
                 @memcpy(output[prefix..], values[tail_start..]);
                 return .{ .list = output };
-            }
+            };
             const retained = self.a;
             var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
             defer scratch.deinit();
@@ -8542,7 +8620,17 @@ const Engine = struct {
             defer scope.leave(self);
             var reducer: StreamingAggregate = .{ .function = call_value, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
             defer reducer.deinit();
-            for (group) |row| try reducer.add(self, row);
+            if (prepared) |values| {
+                // DISTINCT membership has already selected first representations.
+                // Feed literal values without evaluating the original argument twice.
+                reducer.function.distinct = false;
+                for (values) |value| {
+                    const name = "_collection_input";
+                    const operand: ast.Expr = .{ .span = .{}, .value = .{ .variable = name } };
+                    reducer.function.args = &.{&operand};
+                    try reducer.add(self, &.{.{ .name = name, .value = value }});
+                }
+            } else for (group) |row| try reducer.add(self, row);
             // The temporary collection is an execution container. Its cells
             // can be valid at depth 64 even when HEAD removes the outer list.
             return .{ .list = try cloneValues(retained, (try reducer.finish(self)).list) };
@@ -8917,6 +9005,9 @@ const Engine = struct {
         var grouped = false;
         for (projection.items) |item| grouped = grouped or aggregates(item.expression);
         if (grouped and projection.wildcard) return error.CypherAggregateWildcard;
+        if (!grouped and projection.distinct and !projection.wildcard) {
+            if (try GroupWindow.init(self, projection, true)) |window| return self.projectBoundedCountGroups(rows, projection, final, window);
+        }
         if (grouped) bounded: {
             // Materialized reducers normally run group by group. COUNT(*) is
             // total, so switching it to row order cannot reorder argument errors.

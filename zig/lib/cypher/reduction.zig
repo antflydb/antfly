@@ -44,6 +44,9 @@ fn hashValue(hasher: *std.hash.Wyhash, value: anytype) void {
         hashValue(hasher, value.star);
         hashValue(hasher, value.collect_limit);
         hashValue(hasher, value.collect_suffix);
+        hashValue(hasher, value.collect_summary);
+        hashValue(hasher, value.collect_filters);
+        hashValue(hasher, value.collection_extract);
         return;
     }
     switch (@typeInfo(T)) {
@@ -423,7 +426,6 @@ test "prefix planning combines consumers preserves full escapes and leaves publi
     for ([_][]const u8{
         "UNWIND [1] AS x RETURN head(collect(x)),collect(x)",
         "UNWIND [1] AS x RETURN head(collect(x)),collect(x)[..-1]",
-        "UNWIND [1] AS x WITH collect(x) AS xs RETURN head(xs),size(xs)",
         "UNWIND [1] AS x WITH collect(x) AS xs RETURN head(xs),xs",
     }) |text| {
         var other = try compiler.compile(a, text, .{}, &diagnostic);
@@ -433,6 +435,11 @@ test "prefix planning combines consumers preserves full escapes and leaves publi
         const collection = if (first.value == .call and std.ascii.eqlIgnoreCase(first.value.call.name, "head")) first.value.call.args[0] else first;
         try std.testing.expect(collection.value.call.collect_limit == null);
     }
+    var mixed = try compiler.compile(a, "UNWIND [1] AS x WITH collect(x) AS xs RETURN head(xs),size(xs)", .{}, &diagnostic);
+    defer mixed.deinit();
+    const summary = (try lowerCardinality(a, mixed.query)).clauses[1].operation.project.value.items[0].expression.value.call;
+    try std.testing.expect(summary.collect_summary);
+    try std.testing.expectEqual(@as(?usize, 1), summary.collect_limit);
     var aliased = try compiler.compile(a, "UNWIND [1] AS x WITH collect(x) AS xs WITH xs AS ys RETURN ys[0..3]", .{}, &diagnostic);
     defer aliased.deinit();
     const planned = try lowerCardinality(a, aliased.query);

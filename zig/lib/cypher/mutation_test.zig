@@ -194,7 +194,13 @@ test "portable graph materialization retains owned node and edge postimages" {
     try std.testing.expectEqual(@as(usize, 2), cut.overlay.nodes.items.len);
     try std.testing.expectError(error.CypherMemoryBudgetExceeded, root.snapshot.Materialized.create(std.testing.allocator, fixture.backend(), graph, .{ .memory_bytes = 1 }));
     const Capture = struct {
-        fn run(a: A, source: *Fixture) !void {
+        fn run(backing: A, source: *Fixture) !void {
+            // Failure positions must not depend on adjacent arena allocations
+            // making an opportunistic resize/remap succeed on a later replay.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: A = .{ .ptr = backing.ptr, .vtable = &vtable };
             const retained = try root.snapshot.Materialized.create(a, source.backend(), graph, .{});
             defer retained.deinit();
         }

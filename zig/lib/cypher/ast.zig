@@ -57,7 +57,13 @@ pub const Function = struct {
     /// Physical retention demand; the parser never sets this field.
     collect_limit: ?usize = null,
     collect_suffix: usize = 0,
+    collect_summary: bool = false,
+    collect_filters: []const CollectionFilter = &.{},
+    collection_extract: ?CollectionExtract = null,
 };
+/// Private physical summary access; never emitted by the parser or exposed on wire.
+pub const CollectionExtract = union(enum) { cardinality, window: usize, filtered: usize };
+pub const CollectionFilter = struct { alias: []const u8, predicate: ?*const Expr, projection: ?*const Expr };
 pub const Procedure = struct { name: []const u8, args: []const *const Expr, yields: []const Yield, predicate: ?*const Expr = null };
 pub const Branch = struct { condition: *const Expr, value: *const Expr };
 pub const Node = struct { span: Span, alias: ?[]const u8, labels: []const []const u8, properties: []const Entry };
