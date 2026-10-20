@@ -64,7 +64,12 @@ coverage in the same traversal, retaining annotations only from successful
 branches. Schemas without coverage consumers allocate no coverage state;
 composition does not recursively revalidate subtrees to discover annotations.
 Unique items use semantic fingerprints with equality checks on collisions,
-avoiding pairwise comparisons of distinct items.
+avoiding pairwise comparisons of distinct items. Hashing and literal equality
+walk instance values iteratively, so nested model values do not consume the
+native call stack. Before ownership or provider serialization, the complete
+schema JSON graph (including `const`, `enum`, and annotations) is limited to
+128 levels and 65,536 values. Constrained schema keywords retain their tighter
+24-level and 4,096-schema-node limits.
 
 `auto` selects a forced, actual tool call, provider JSON-schema output, then
 native grammar output, subject to the selected model's admitted capabilities.

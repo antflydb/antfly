@@ -2771,7 +2771,7 @@ pub const Runtime = struct {
             alloc.free(items);
         }
         for (items, requests, result.values, result.failures) |*item, request, value, failure| {
-            item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = if (value) |output| .{ .value = try std.json.Stringify.valueAlloc(alloc, output, .{}) } else .{ .item_error = .{ .cause = failure orelse error.InvalidConstrainedOutput, .code = .generation_failed } } };
+            item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = if (value) |output| .{ .value = try @import("antfly-json").stringifyValueAlloc(alloc, output) } else .{ .item_error = .{ .cause = failure orelse error.InvalidConstrainedOutput, .code = .generation_failed } } };
             initialized += 1;
         }
         return .{ .items = items, .execution = constrainedExecution(result.execution, requests.len) };

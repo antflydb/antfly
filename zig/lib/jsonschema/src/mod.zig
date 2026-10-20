@@ -19,6 +19,8 @@ const schema_regex = @import("antfly_regex");
 const value_semantics = @import("value_semantics.zig");
 pub const parseValueLosslessLeaky = json.parseValueLosslessLeaky;
 pub const unsignedInteger = value_semantics.unsignedInteger;
+/// Exact decimal comparison shared with JSON consumers such as templates.
+pub const compareNumbers = value_semantics.numberOrder;
 
 const TableSchema = struct {
     version: u32 = 0,
@@ -407,6 +409,7 @@ pub const CompiledSchema = struct {
     property: *DocumentProperty,
 
     pub fn init(alloc: std.mem.Allocator, schema: json.Value) !CompiledSchema {
+        try validateSchemaComplexity(schema);
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -429,6 +432,25 @@ pub const CompiledSchema = struct {
         try validateDocumentFieldValueWithContext(&context, self.property.*, &value, false);
     }
 };
+
+/// Bound the entire JSON graph before recursive schema compilation, including
+/// const/enum literals and annotations. Schema-keyword depth alone does not
+/// protect ownership, literal comparison, or downstream provider serialization.
+/// Keep the walk allocation-free and reject before copying any schema data.
+pub fn validateSchemaComplexity(schema: json.Value) !void {
+    var remaining: usize = 65536;
+    try validateSchemaComplexityAt(schema, 0, &remaining);
+}
+
+fn validateSchemaComplexityAt(value: json.Value, depth: usize, remaining: *usize) anyerror!void {
+    if (depth > 128 or remaining.* == 0) return error.InvalidSchemaUpdateRequest;
+    remaining.* -= 1;
+    switch (value) {
+        .array => for (value.array.items) |child| try validateSchemaComplexityAt(child, depth + 1, remaining),
+        .object => for (value.object.values()) |child| try validateSchemaComplexityAt(child, depth + 1, remaining),
+        else => {},
+    }
+}
 
 // Clone into the compilation arena without serializing: reparsing would round
 // number_string literals through f64 and discard their exact decimal value.
@@ -4209,4 +4231,55 @@ test "document validation retains its explicit metadata field policy" {
 
 test {
     _ = @import("value_validation_test.zig");
+}
+
+test "compiled schema bounds literal depth before recursive ownership" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "const", "enum", "ignored_annotation" }) |keyword| {
+        var raw: std.ArrayList(u8) = .empty;
+        try raw.appendSlice(a, "{\"");
+        try raw.appendSlice(a, keyword);
+        try raw.appendSlice(a, "\":");
+        try raw.appendNTimes(a, '[', 100000);
+        try raw.append(a, '0');
+        try raw.appendNTimes(a, ']', 100000);
+        try raw.append(a, '}');
+        const parsed = try json.parseValueLosslessLeaky(a, raw.items);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, CompiledSchema.init(std.testing.allocator, parsed));
+    }
+}
+
+test "compiled schema bounds wide literal graphs and accepts bounded nested literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var literal = json.Array.init(a);
+    try literal.appendNTimes(.null, 65536);
+    var schema: json.Value = .{ .object = .empty };
+    try schema.object.put(a, "const", .{ .array = literal });
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, CompiledSchema.init(std.testing.allocator, schema));
+    const valid = try json.parseValueLosslessLeaky(a, "{\"const\":[{\"id\":9007199254740993.0}]}");
+    var compiled = try CompiledSchema.init(std.testing.allocator, valid);
+    defer compiled.deinit();
+    try compiled.validate(std.testing.allocator, valid.object.get("const").?);
+}
+
+test "uniqueItems validates deeply nested model values without recursive hashing or equality" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var raw: std.ArrayList(u8) = .empty;
+    try raw.appendNTimes(a, '[', 100000);
+    try raw.append(a, '0');
+    try raw.appendNTimes(a, ']', 100000);
+    const value = try json.parseValueLosslessLeaky(a, raw.items);
+    var items = json.Array.init(a);
+    try items.append(value);
+    var compiled = try CompiledSchema.init(std.testing.allocator, try json.parseValueLosslessLeaky(a, "{\"type\":\"array\",\"uniqueItems\":true}"));
+    defer compiled.deinit();
+    try compiled.validate(std.testing.allocator, .{ .array = items });
+    try items.append(value);
+    try std.testing.expectError(error.InvalidBatchRequest, compiled.validate(std.testing.allocator, .{ .array = items }));
 }
