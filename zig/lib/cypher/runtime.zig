@@ -469,7 +469,7 @@ pub const NodeCursor = struct {
         }
         engine.match_aliases = try aliases.toOwnedSlice(a);
         engine.values = .{ .a = a, .ptr = engine, .charge = Engine.chargeWork };
-        engine.strings = .{ .a = a, .ptr = engine, .charge = Engine.chargeWork };
+        engine.strings = engine.newStringWork(a);
         errdefer engine.regex.deinit();
         errdefer if (engine.invariants) |state_value| state_value.deinit();
         const columns = try a.alloc([]const u8, projection.items.len);
@@ -996,7 +996,7 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     errdefer arena.deinit();
     var engine: Engine = .{ .a = arena.allocator(), .planning_allocator = arena.allocator(), .scratch_allocator = budget.allocator(), .backend = backend, .graph = graph, .source = compiled.query.source, .parameters = parameters, .limits = limits, .regex = .{ .a = arena.allocator(), .scratch = std.heap.ArenaAllocator.init(budget.allocator()) } };
     engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
-    engine.strings = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
+    engine.strings = engine.newStringWork(engine.a);
     defer engine.regex.deinit();
     defer if (engine.invariants) |state_value| state_value.deinit();
     defer if (engine.expression_memo) |*memo| memo.deinit();
@@ -1354,7 +1354,7 @@ const Engine = struct {
             var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
             var owned = true;
             defer if (owned) arena.deinit();
-            const copied = try value.clone(arena.allocator());
+            const copied = try engine.cloneScoped(value, arena.allocator());
             // A run represents repeated identical values without expanding a
             // promoted path count. Retire payload arenas as soon as evicted.
             const keep = limit - copies;
@@ -1382,17 +1382,38 @@ const Engine = struct {
             self.weight += copies;
         }
     };
+    const LoopScope = struct {
+        constants: ?std.heap.ArenaAllocator = null,
+        owner: ?*Invariants = null,
+        fn deinit(self: *@This()) void {
+            if (self.owner) |owner| owner.deinit();
+            if (self.constants) |*arena| arena.deinit();
+        }
+        fn enter(self: *@This(), engine: *Engine) !?*Invariants {
+            const previous = engine.local_invariants;
+            if (!engine.read_only and self.owner == null) {
+                // Expressions cannot mutate. Closed computations can be shared
+                // within this invocation, but never across mutation stages.
+                self.constants = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                const allocator = self.constants.?.allocator();
+                const owner = try allocator.create(Invariants);
+                const parent = engine.scalarOwner();
+                owner.* = .{ .parent = parent, .work = .{ .a = allocator, .ptr = engine, .charge = chargeWork, .parent = if (parent) |outer| &outer.work else null } };
+                self.owner = owner;
+            }
+            if (self.owner) |owner| engine.local_invariants = owner;
+            return previous;
+        }
+    };
     const FoldState = struct {
         initialized: bool = false,
         accumulator: v.Value = .null,
         owned: ?std.heap.ArenaAllocator = null,
         metadata: ?value_work.Work = null,
-        constants: ?std.heap.ArenaAllocator = null,
-        local_invariants: ?*Invariants = null,
+        invariants: LoopScope = .{},
         fn deinit(self: *@This()) void {
             if (self.owned) |*arena| arena.deinit();
-            if (self.local_invariants) |owner| owner.deinit();
-            if (self.constants) |*arena| arena.deinit();
+            self.invariants.deinit();
         }
         fn own(self: *@This(), engine: *Engine, value: v.Value) !void {
             if (engine.immutableOwner(value)) |_| {
@@ -1424,21 +1445,8 @@ const Engine = struct {
             self.metadata.?.a = self.owned.?.allocator();
         }
         fn advance(self: *@This(), engine: *Engine, projection: *const ast.Expr, outer: Row, accumulator: []const u8, alias: []const u8, value: v.Value, weight: Count) !void {
-            const previous = engine.local_invariants;
+            const previous = try self.invariants.enter(engine);
             defer engine.local_invariants = previous;
-            if (!engine.read_only) {
-                // An expression cannot mutate the graph. Cache its closed
-                // computations for this fold, never across mutation stages.
-                if (self.local_invariants == null) {
-                    self.constants = std.heap.ArenaAllocator.init(engine.scratch_allocator);
-                    const allocator = self.constants.?.allocator();
-                    const owner = try allocator.create(Invariants);
-                    const parent = engine.scalarOwner();
-                    owner.* = .{ .parent = parent, .work = .{ .a = allocator, .ptr = engine, .charge = chargeWork, .parent = if (parent) |outer_owner| &outer_owner.work else null } };
-                    self.local_invariants = owner;
-                }
-                engine.local_invariants = self.local_invariants;
-            }
             const copies = std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
             for (0..copies) |_| {
                 try engine.state();
@@ -1828,7 +1836,7 @@ const Engine = struct {
             const remaining = if (self.function.collect_limit) |limit| limit - self.collected.items.len else std.math.maxInt(usize);
             const copies = if (self.function.collect_limit != null) std.math.cast(usize, weight.cap(remaining)).? else std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
             if (copies != 0) {
-                const owned = if (self.function.distinct and self.function.collect_suffix == 0 and !self.function.collect_summary) distinct_owned orelse self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
+                const owned = if (self.function.distinct and self.function.collect_suffix == 0 and !self.function.collect_summary) distinct_owned orelse self.distinct_values.items[self.distinct_values.items.len - 1] else try engine.cloneScoped(value, retained);
                 try Engine.chargeWork(engine, copies);
                 try self.collected.ensureUnusedCapacity(retained, copies);
                 for (0..copies) |_| self.collected.appendAssumeCapacity(owned);
@@ -8241,7 +8249,7 @@ const Engine = struct {
             if (!invariant) break :result try self.evalInner(expression, row, group);
             const owner = try self.invariantState();
             if (owner.scalars.get(expression.execution_invariant.?)) |cached| break :result cached;
-            if (owner.strings == null) owner.strings = .{ .a = owner.work.a, .ptr = self, .charge = chargeWork };
+            if (owner.strings == null) owner.strings = self.newStringWork(owner.work.a);
             self.scalar_strings = &owner.strings.?;
             // Closed expressions cannot borrow recycled row values. Allocate
             // their computations directly in statement storage: cloning a
@@ -8259,11 +8267,17 @@ const Engine = struct {
         } else _ = try self.values.info(result);
         return result;
     }
+    fn newStringWork(self: *Engine, allocator: A) @import("string_work.zig").Runtime {
+        return .{ .a = allocator, .scratch = self.scratch_allocator, .ptr = self, .charge = chargeWork, .prefix_budget = @min(256 << 10, self.limits.memory_bytes / 64) };
+    }
     fn stringWork(self: *Engine) *@import("string_work.zig").Runtime {
         return self.scalar_strings orelse &self.strings;
     }
     fn immutableOwner(self: *Engine, value: v.Value) ?*Invariants {
-        var owner = self.scalarOwner();
+        return immutableOwnerFrom(self.scalarOwner(), value);
+    }
+    fn immutableOwnerFrom(start: ?*Invariants, value: v.Value) ?*Invariants {
+        var owner = start;
         while (owner) |current| : (owner = current.parent) {
             if (current.work.hasMetadata(value)) return current;
         }
@@ -8271,7 +8285,7 @@ const Engine = struct {
     }
     fn stringInputWork(self: *Engine, input: v.Value) *@import("string_work.zig").Runtime {
         if (self.immutableOwner(input)) |owner| {
-            if (owner.strings == null) owner.strings = .{ .a = owner.work.a, .ptr = self, .charge = chargeWork };
+            if (owner.strings == null) owner.strings = self.newStringWork(owner.work.a);
             return &owner.strings.?;
         }
         return self.stringWork();
@@ -8334,6 +8348,102 @@ const Engine = struct {
         if (source) |id| try state_value.owned_lists.put(self.planning_allocator, id, built);
         try state_value.lists.put(self.planning_allocator, right.execution_invariant.?, built);
         return state_value.lists.getPtr(right.execution_invariant.?).?.contains(&self.values, left);
+    }
+    /// The source owns its values in the caller's evaluation scope. RANGE is
+    /// represented arithmetically; each consumer decides when to stop visiting.
+    /// General expressions are evaluated eagerly before the consumer starts, so
+    /// their errors cannot be hidden behind a predicate's short circuit.
+    const ListSource = struct {
+        values: union(enum) { list: []const v.Value, range: @import("range.zig").Range },
+        position: u128 = 0,
+        fn next(self: *@This()) ?v.Value {
+            const value = switch (self.values) {
+                .list => |items| if (self.position < items.len) items[@intCast(self.position)] else return null,
+                .range => |sequence| if (self.position < sequence.length) sequence.at(self.position) else return null,
+            };
+            self.position += 1;
+            return value;
+        }
+    };
+    fn listSource(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?ListSource {
+        if (isRange(expression)) {
+            const sequence = (try self.rangeInput(expression, row, group)) orelse return null;
+            return .{ .values = .{ .range = sequence } };
+        }
+        const value = try self.eval(expression, row, group);
+        if (value == .null) return null;
+        if (value != .list) return error.CypherTypeMismatch;
+        return .{ .values = .{ .list = value.list } };
+    }
+    fn cloneScoped(self: *Engine, value: v.Value, allocator: A) !v.Value {
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        var context: v.CloneContext = .{ .a = allocator, .scratch = scratch.allocator() };
+        return context.clone(value);
+    }
+    const ListDemand = union(enum) { all, count, window: reduction_plan.Bounds };
+    fn evalComprehension(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row, demand: ListDemand) anyerror!v.Value {
+        const c = expression.value.comprehension;
+        var input = (try self.listSource(c.input, row, group)) orelse return .null;
+        const destination = self.a;
+        const caller_owner = self.scalarOwner();
+        var invariants: LoopScope = .{};
+        defer invariants.deinit();
+        const previous_invariants = try invariants.enter(self);
+        defer self.local_invariants = previous_invariants;
+        var values: std.ArrayList(v.Value) = .empty;
+        var cardinality: usize = 0;
+        var embedding_failure = false;
+        const bounds = if (demand == .window) demand.window else reduction_plan.Bounds{};
+        var window: StreamingAggregate = .{
+            .function = .{ .name = "collect", .args = &.{}, .collect_limit = bounds.prefix, .collect_suffix = bounds.suffix },
+            .arena = std.heap.ArenaAllocator.init(self.scratch_allocator),
+            .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator),
+        };
+        defer window.deinit();
+        const previous = self.projection_locals;
+        defer self.projection_locals = previous;
+        const local: @import("expressions.zig").Local = .{ .name = c.alias, .parent = previous };
+        self.projection_locals = &local;
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        while (input.next()) |item| {
+            try self.state();
+            _ = scratch.reset(.retain_capacity);
+            const scope = EvalScope.enter(self, scratch.allocator());
+            defer scope.leave(self);
+            const inner = try self.replace(row, c.alias, item);
+            if (c.predicate) |predicate| if ((try (try self.eval(predicate, inner, null)).truth()) != true) continue;
+            const value = if (c.projection) |projection| try self.eval(projection, inner, null) else item;
+            cardinality += 1;
+            switch (demand) {
+                .all => {
+                    // The caller's own metadata proves a value predates this
+                    // element scope. Keep aliases shared; only new projections
+                    // need cloning before the element arena is recycled. A
+                    // write loop's new invariant owner cannot escape by borrow.
+                    const owned = if (c.projection == null or scope.values.hasMetadata(value) or immutableOwnerFrom(if (invariants.owner == null) self.scalarOwner() else caller_owner, value) != null) value else try self.cloneScoped(value, destination);
+                    try values.append(destination, owned);
+                },
+                .count, .window => {
+                    // The original list is validated after every projection has
+                    // run. Discarding an item cannot hide excessive embedding
+                    // depth; a later scalar failure still takes precedence.
+                    _ = self.values.info(.{ .list = &.{value} }) catch |err| blk: {
+                        if (err != error.CypherValueDepthExceeded) return err;
+                        embedding_failure = true;
+                        break :blk null;
+                    };
+                    if (demand == .window) try window.retainCollection(self, value, Count.one, null);
+                },
+            }
+        }
+        if (embedding_failure) return error.CypherValueDepthExceeded;
+        return switch (demand) {
+            .all => .{ .list = try values.toOwnedSlice(destination) },
+            .count => .{ .integer = std.math.cast(i64, cardinality) orelse return error.CypherNumericOverflow },
+            .window => try self.cloneScoped(try window.finishWindow(self), destination),
+        };
     }
     fn rangeInput(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?@import("range.zig").Range {
         const call_value = expression.value.call;
@@ -8416,6 +8526,25 @@ const Engine = struct {
         };
         try self.checkpoint();
         if (try self.rangeConsumer(expression, row, group)) |result| return result;
+        if (expression.value == .call) {
+            const call_value = expression.value.call;
+            if (!call_value.star and !call_value.distinct and call_value.args.len == 1 and std.ascii.eqlIgnoreCase(call_value.name, "size") and call_value.args[0].value == .comprehension)
+                return self.evalComprehension(call_value.args[0], row, group, .count);
+        }
+        if (reduction_plan.collectionConsumer(expression)) |demand| if (demand.input.value == .comprehension) {
+            const value = try self.evalComprehension(demand.input, row, group, .{ .window = demand.bounds });
+            // Bounds are evaluated after producing the list, even for NULL.
+            if (value != .null) return self.listWindowConsumer(expression, value, row, group);
+            switch (expression.value) {
+                .index => |index| _ = try self.eval(index.index, row, group),
+                .slice => |slice| {
+                    if (slice.start) |bound| _ = try self.eval(bound, row, group);
+                    if (slice.end) |bound| _ = try self.eval(bound, row, group);
+                },
+                else => {},
+            }
+            return .null;
+        };
         if (reduction_plan.collectionConsumer(expression)) |demand| if (demand.input.value == .pattern_comprehension) {
             if (try self.patternDemand(demand.input, row, demand.bounds)) |value| return self.listWindowConsumer(expression, value, row, group);
         };
@@ -8481,17 +8610,24 @@ const Engine = struct {
                 break :blk result;
             },
             .list_predicate => |c| blk: {
-                const input = try self.eval(c.input, row, group);
-                if (input == .null) break :blk .null;
-                if (input != .list) return error.CypherTypeMismatch;
+                var input = (try self.listSource(c.input, row, group)) orelse break :blk .null;
+                var invariants: LoopScope = .{};
+                defer invariants.deinit();
+                const previous_invariants = try invariants.enter(self);
+                defer self.local_invariants = previous_invariants;
                 var true_count: usize = 0;
                 var unknown = false;
                 const previous_locals = self.projection_locals;
                 defer self.projection_locals = previous_locals;
                 const local: @import("expressions.zig").Local = .{ .name = c.alias, .parent = previous_locals };
                 self.projection_locals = &local;
-                for (input.list) |item| {
+                var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+                defer scratch.deinit();
+                while (input.next()) |item| {
                     try self.state();
+                    _ = scratch.reset(.retain_capacity);
+                    const scope = EvalScope.enter(self, scratch.allocator());
+                    defer scope.leave(self);
                     const inner = try self.replace(row, c.alias, item);
                     const answer = try (try self.eval(c.predicate, inner, null)).truth();
                     if (answer == null) {
@@ -8511,9 +8647,7 @@ const Engine = struct {
             },
             .reduce => |c| blk: {
                 const accumulator = try self.eval(c.initial, row, group);
-                const input = try self.eval(c.input, row, group);
-                if (input == .null) break :blk .null;
-                if (input != .list) return error.CypherTypeMismatch;
+                var input = (try self.listSource(c.input, row, group)) orelse break :blk .null;
                 const previous_locals = self.projection_locals;
                 defer self.projection_locals = previous_locals;
                 const local: @import("expressions.zig").Local = .{ .name = c.alias, .parent = previous_locals };
@@ -8522,26 +8656,10 @@ const Engine = struct {
                 self.projection_locals = &accumulator_local;
                 var fold: FoldState = .{ .initialized = true, .accumulator = accumulator };
                 defer fold.deinit();
-                for (input.list) |item| try fold.advance(self, c.projection, row, c.accumulator, c.alias, item, Count.one);
-                break :blk if (input.list.len == 0) accumulator else try fold.escape(self);
+                while (input.next()) |item| try fold.advance(self, c.projection, row, c.accumulator, c.alias, item, Count.one);
+                break :blk if (input.position == 0) accumulator else try fold.escape(self);
             },
-            .comprehension => |c| blk: {
-                const input = try self.eval(c.input, row, group);
-                if (input == .null) break :blk .null;
-                if (input != .list) return error.CypherTypeMismatch;
-                var values: std.ArrayList(v.Value) = .empty;
-                const previous_locals = self.projection_locals;
-                defer self.projection_locals = previous_locals;
-                const local: @import("expressions.zig").Local = .{ .name = c.alias, .parent = previous_locals };
-                self.projection_locals = &local;
-                for (input.list) |item| {
-                    try self.state();
-                    const inner = try self.replace(row, c.alias, item);
-                    if (c.predicate) |predicate| if ((try (try self.eval(predicate, inner, null)).truth()) != true) continue;
-                    try values.append(self.a, if (c.projection) |projection| try self.eval(projection, inner, null) else item);
-                }
-                break :blk .{ .list = try values.toOwnedSlice(self.a) };
-            },
+            .comprehension => try self.evalComprehension(expression, row, group, .all),
             .pattern_comprehension => |c| blk: {
                 const pattern_scope = PatternScope.enter(self);
                 defer pattern_scope.leave(self);
@@ -9193,7 +9311,7 @@ const Engine = struct {
             const scope: EvalScope = .{ .a = engine.a, .values = engine.values, .strings = engine.strings, .regex = engine.regex, .reads = engine.read_nodes, .cache_reads = engine.cache_reads };
             engine.a = a;
             engine.values = .{ .a = a, .ptr = engine, .charge = chargeWork, .parent = if (engine.scalarOwner()) |state_value| &state_value.work else null };
-            engine.strings = .{ .a = a, .ptr = engine, .charge = chargeWork };
+            engine.strings = engine.newStringWork(a);
             engine.regex = .{ .a = a, .scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator) };
             engine.read_nodes = .empty;
             engine.cache_reads = false;
@@ -10170,7 +10288,7 @@ test "boolean collection summaries cap promoted multiplicities and ignore empty 
     var engine: Engine = .{ .a = arena.allocator(), .scratch_allocator = std.testing.allocator, .regex = .{ .a = arena.allocator(), .scratch = std.heap.ArenaAllocator.init(std.testing.allocator) }, .backend = .{ .ptr = &dummy, .vtable = &.{ .bind = undefined, .checkpoint = Noop.checkpoint, .scan = undefined, .get = undefined, .expand = undefined } }, .graph = undefined, .source = "", .parameters = &.{}, .limits = .{} };
     defer engine.regex.deinit();
     engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
-    engine.strings = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
+    engine.strings = engine.newStringWork(engine.a);
     const input: ast.Expr = .{ .span = .{}, .value = .{ .variable = "x" } };
     const predicate: ast.Expr = .{ .span = .{}, .value = .{ .variable = "y" } };
     const huge = try Count.parse(engine.a, "1180591620717411303424");
@@ -10194,7 +10312,7 @@ test "streaming windows cap promoted weights while sequential folds enforce tran
     var engine: Engine = .{ .a = arena.allocator(), .scratch_allocator = std.testing.allocator, .regex = .{ .a = arena.allocator(), .scratch = std.heap.ArenaAllocator.init(std.testing.allocator) }, .backend = .{ .ptr = &dummy, .vtable = &.{ .bind = undefined, .checkpoint = Noop.checkpoint, .scan = undefined, .get = undefined, .expand = undefined } }, .graph = undefined, .source = "", .parameters = &.{}, .limits = .{} };
     defer engine.regex.deinit();
     engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
-    engine.strings = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
+    engine.strings = engine.newStringWork(engine.a);
     const input: ast.Expr = .{ .span = .{}, .value = .{ .variable = "x" } };
     const item: ast.Expr = .{ .span = .{}, .value = .{ .variable = "y" } };
     const zero: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = 0 } } };

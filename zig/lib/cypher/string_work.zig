@@ -32,6 +32,11 @@ const Record = struct {
 };
 pub const Runtime = struct {
     a: A,
+    // Freeable, query-budgeted storage for uncached search tables.
+    scratch: A,
+    // Conservative retained cost, including each admitted key's metadata.
+    prefix_bytes: usize = 0,
+    prefix_budget: usize = 256 * 1024,
     ptr: *anyopaque,
     charge: *const fn (*anyopaque, usize) anyerror!void,
     cache: std.AutoHashMapUnmanaged(Key, Record) = .empty,
@@ -126,22 +131,37 @@ pub const Runtime = struct {
         try self.charge(self.ptr, 1);
         if (needle.len == 0) return true;
         if (needle.len > haystack.len) return false;
-        const slot = try self.record(needle);
-        if (slot.prefix == null) {
+        const key: Key = .{ .address = @intFromPtr(needle.ptr), .length = needle.len };
+        // Do not create memo entries for one-shot needles after exhausting the
+        // byte budget. Existing cached tables remain useful on repeated calls.
+        const cached = if (self.cache.get(key)) |record_value| record_value.prefix else null;
+        var temporary: ?[]usize = null;
+        defer if (temporary) |table| self.scratch.free(table);
+        const prefix = cached orelse table: {
             try self.reserve(needle.len, 2);
-            const prefix = try self.a.alloc(usize, needle.len);
-            prefix[0] = 0;
+            const bytes = std.math.mul(usize, needle.len, @sizeOf(usize)) catch return error.OutOfMemory;
+            // Include a conservative share of hash-table metadata, so many
+            // tiny needles cannot turn a byte bound into an unbounded key set.
+            const cost = bytes +| (4 * (@sizeOf(Key) + @sizeOf(Record) + @sizeOf(usize)));
+            const retain = cost <= self.prefix_budget -| self.prefix_bytes;
+            const allocator = if (retain) self.a else self.scratch;
+            const table = try allocator.alloc(usize, needle.len);
+            if (!retain) temporary = table;
+            table[0] = 0;
             var matched: usize = 0;
             for (needle[1..], 1..) |byte, index| {
                 if (index % (16 * 1024) == 0) try checkpoint(self);
-                while (matched > 0 and needle[matched] != byte) matched = prefix[matched - 1];
+                while (matched > 0 and needle[matched] != byte) matched = table[matched - 1];
                 if (needle[matched] == byte) matched += 1;
-                prefix[index] = matched;
+                table[index] = matched;
             }
-            slot.prefix = prefix;
-        }
+            if (retain) {
+                (try self.record(needle)).prefix = table;
+                self.prefix_bytes += cost;
+            }
+            break :table table;
+        };
         try self.reserve(haystack.len, 2);
-        const prefix = slot.prefix.?;
         var matched: usize = 0;
         for (haystack, 0..) |byte, index| {
             if (index % (16 * 1024) == 0) try checkpoint(self);
@@ -167,7 +187,7 @@ test "immutable Unicode analysis and transforms are cached while cache hits rema
     defer arena.deinit();
     const a = arena.allocator();
     var counter: Counter = .{};
-    var runtime: Runtime = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    var runtime: Runtime = .{ .a = a, .scratch = std.testing.allocator, .ptr = &counter, .charge = Counter.charge };
     const text = try a.alloc(u8, 400_000);
     @memset(text, 'x');
     for (0..1000) |_| {
@@ -213,7 +233,7 @@ test "uncached scans reserve work and checkpoint within long UTF-8 and repeated-
     const needle = try a.dupe(u8, text[0..128_000]);
     needle[0] = 'b';
     var counter: Counter = .{};
-    var runtime: Runtime = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    var runtime: Runtime = .{ .a = a, .scratch = std.testing.allocator, .ptr = &counter, .charge = Counter.charge };
     try std.testing.expect(!try runtime.contains(text, needle));
     try std.testing.expect(counter.units < 13_000);
     try std.testing.expect(counter.calls > 10);
@@ -229,4 +249,50 @@ test "uncached scans reserve work and checkpoint within long UTF-8 and repeated-
     try std.testing.expectError(error.Canceled, runtime.caseConvert(text, false));
     counter = .{ .limit = 1 };
     try std.testing.expectError(error.CypherStateBudgetExceeded, runtime.reverse(text));
+}
+
+test "search memo admission is byte bounded and saturated needles use freeable scratch" {
+    const Counter = struct {
+        units: usize = 0,
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.units += amount;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var counter: Counter = .{};
+    var runtime: Runtime = .{ .a = arena.allocator(), .scratch = std.testing.allocator, .ptr = &counter, .charge = Counter.charge, .prefix_budget = 4096 };
+    // Distinct, long-lived allocations exercise identity-key admission. Every
+    // fallback is freed independently of the statement arena (including errors).
+    const haystack: [2048]u8 = @splat('z');
+    for (0..100) |i| {
+        const needle = try arena.allocator().alloc(u8, 1024);
+        @memset(needle, 'a');
+        needle[1023] = @intCast(i);
+        try std.testing.expect(!try runtime.contains(&haystack, needle));
+    }
+    try std.testing.expect(runtime.prefix_bytes <= runtime.prefix_budget);
+    try std.testing.expectEqual(@as(usize, 0), runtime.cache.count());
+    try std.testing.expect(try runtime.contains("ababababac", "ababac"));
+    const before = counter.units;
+    try std.testing.expect(try runtime.contains("ababababac", "ababac"));
+    try std.testing.expect(counter.units - before < 5);
+    try std.testing.expectEqual(@as(usize, 1), runtime.cache.count());
+}
+
+test "cached and temporary search tables release every failed allocation" {
+    const Campaign = struct {
+        fn charge(_: *anyopaque, _: usize) !void {}
+        fn run(a: A, budget: usize) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var dummy: u8 = 0;
+            var runtime: Runtime = .{ .a = arena.allocator(), .scratch = a, .ptr = &dummy, .charge = charge, .prefix_budget = budget };
+            try std.testing.expect(try runtime.contains("ababababac", "ababac"));
+            try std.testing.expect(!try runtime.contains("ababababac", "ababaz"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as(usize, 0)});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as(usize, 4096)});
 }

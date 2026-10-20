@@ -1425,3 +1425,32 @@ test "write folds cache closed scalar work locally without crossing deleted enti
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }
+
+test "ordinary expression loops own write epoch constants and release them on failure" {
+    const Campaign = struct {
+        fn run(a: A) !void {
+            var fixture = Fixture.init();
+            defer fixture.arena.deinit();
+            var diagnostic: root.compiler.Diagnostic = .{};
+            var compiled = try root.compiler.compile(a, "CREATE(n:Person {id:'lists'}) RETURN head([i IN range(1,3)|toLower($word)]),[i IN range(1,3)|toLower($word)],any(i IN range(1,3) WHERE size(toLower($word))=3)", .{}, &diagnostic);
+            defer compiled.deinit();
+            var result = try root.runtime.execute(a, fixture.backend(), graph, &compiled, &.{.{ .name = "word", .value = .{ .string = "AbC" } }}, .{});
+            defer result.deinit();
+            try std.testing.expectEqualStrings("abc", result.rows[0][0].string);
+            for (result.rows[0][1].list) |item| try std.testing.expectEqualStrings("abc", item.string);
+            try std.testing.expect(result.rows[0][2].boolean);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var seed = try root.compiler.compile(std.testing.allocator, "CREATE(n:Person {id:'epoch'}) RETURN n", .{}, &diagnostic);
+    defer seed.deinit();
+    var created = try root.runtime.execute(std.testing.allocator, fixture.backend(), graph, &seed, &.{}, .{});
+    defer created.deinit();
+    var compiled = try root.compiler.compile(std.testing.allocator, "WITH $entity AS n,size([i IN range(1,3)|keys($entity)]) AS before DELETE n RETURN before,size([i IN range(1,3)|keys($entity)])", .{}, &diagnostic);
+    defer compiled.deinit();
+    try std.testing.expectError(error.CypherDeletedEntity, root.runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "entity", .value = .{ .node = fixture.nodes[0] } }}, .{}));
+    try std.testing.expectEqual(@as(usize, 1), fixture.nodes.len);
+}

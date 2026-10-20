@@ -4052,3 +4052,52 @@ test "immutable string aliases retain analysis and borrowed fold results escape 
     }
     try check("RETURN reduce(s=0,i IN range(1,3)|'done'),reduce(s=[],i IN [1,2]|[3,4])", "[[\"done\",[3,4]]]");
 }
+
+test "ordinary comprehension demands preserve order nulls shadowing and eager errors" {
+    try check("WITH reduce(s=[0],i IN range(1,30)|[s,s]) AS deep RETURN size(head([x IN [1]|deep]))", "[[2]]");
+    try check("RETURN [x IN range(5,-5,-3)|x+1],size([x IN range(5,-5,-3) WHERE x<3|null])", "[[[6,3,0,-3],3]]");
+    try check("WITH 9 AS x RETURN [x IN [1,2]|[x IN [x+1]|x]],x", "[[[[2],[3]],9]]");
+    try check("RETURN head([x IN [1,2,3]|null]),last([x IN [1,2,3]|x]),[x IN range(1,9) WHERE x%2=1|x][-3..-1],[x IN range(1,9)|x][2..4]", "[[null,3,[5,7],[3,4]]]");
+    try check("RETURN head([x IN null|x]),[x IN null|x][null],[x IN null|x][null..2],size([x IN null|x])", "[[null,null,null,null]]");
+    try check("RETURN any(x IN [null,false] WHERE x),all(x IN [null,true] WHERE x),none(x IN [] WHERE x),single(x IN [null,true] WHERE x)", "[[null,null,true,null]]");
+    try check("RETURN any(x IN range(-9223372036854775808,9223372036854775807) WHERE x=-9223372036854775808),all(x IN range(3,1) WHERE false),reduce(s=7,x IN range(3,1)|s+x)", "[[true,true,7]]");
+    const Case = struct { query: []const u8, err: anyerror };
+    for ([_]Case{
+        .{ .query = "RETURN head([x IN [1,0]|1/x])", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN size([x IN [1,0]|1/x])", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN [x IN [1,0]|1/x][0..0]", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN [x IN [1,0]|1/x][true]", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN [x IN null|x][1/0]", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN [x IN null|x][1/0..2]", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN any(x IN [y IN [0]|1/y] WHERE true)", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN any(x IN range(1,2,0) WHERE true)", .err = error.CypherInvalidRange },
+        .{ .query = "RETURN reduce(s=1/0,x IN range(1,2,0)|s+x)", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN size([x IN 1|x])", .err = error.CypherTypeMismatch },
+        .{ .query = "WITH reduce(s=0,i IN range(1,64)|[s]) AS deep RETURN head([x IN [1]|deep])", .err = error.CypherValueDepthExceeded },
+        .{ .query = "WITH reduce(s=0,i IN range(1,64)|[s]) AS deep RETURN size([x IN [1]|deep])", .err = error.CypherValueDepthExceeded },
+        .{ .query = "WITH reduce(s=0,i IN range(1,64)|[s]) AS deep RETURN head([x IN [1,0]|CASE WHEN x=1 THEN deep ELSE 1/x END])", .err = error.CypherDivisionByZero },
+    }) |case| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(case.err, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "ordinary comprehension scopes and list sources release failed allocations" {
+    const Campaign = struct {
+        fn run(a: std.mem.Allocator, text: []const u8) !void {
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    inline for (.{
+        "RETURN [x IN range(1,3)|{a:toString(x)}],head([x IN range(1,3)|{a:toString(x)}]),[x IN range(1,4)|toString(x)][-2..]",
+        "RETURN any(x IN range(1,3) WHERE toString(x)='3'),reduce(s='',x IN range(1,3)|s+toString(x)),size([x IN range(1,3) WHERE x>1|null])",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as([]const u8, text)});
+}

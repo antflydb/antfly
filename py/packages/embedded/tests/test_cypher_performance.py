@@ -4944,3 +4944,84 @@ def test_pattern_window_and_cardinality_sinks_do_not_retain_match_payloads(graph
             assert len(cell["value"][0]["value"]) == 4092
         else:
             assert len(cell["value"]) == 4092
+
+
+def test_ordinary_list_scopes_reclaim_discarded_temporary_strings(graph_db):
+    db = graph_db
+    word = "A" * 4096
+    predicate = "size(toLower($word+toString(x)))=0"
+    for expression, expected in (
+        (f"size([x IN range(1,2000) WHERE {predicate}|x])", "0"),
+        (f"any(x IN range(1,2000) WHERE {predicate})", False),
+    ):
+        response = db.cypher_json(
+            "g",
+            {
+                "query": "RETURN " + expression,
+                "parameters": {"word": word},
+                "limits": {"memory_bytes": 1 << 20},
+            },
+        )
+        assert response["rows"][0][0]["value"] == expected
+
+
+def test_ordinary_list_projection_preserves_shared_caller_values(graph_db):
+    response = graph_db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND [1] AS row WITH $word+toString(row) AS text RETURN any(x IN [i IN range(1,2000)|text] WHERE size(x)=4097)",
+            "parameters": {"word": "A" * 4096},
+            "limits": {"memory_bytes": 1 << 20},
+        },
+    )
+    assert response["rows"][0][0]["value"] is True
+
+
+def test_ordinary_list_windows_and_range_iterators_bound_retained_memory(graph_db):
+    db = graph_db
+    word = "A" * 4096
+    for expression, expected in (
+        ("head([x IN range(1,2000)|$word+toString(x)])", word + "1"),
+        ("last([x IN range(1,2000)|$word+toString(x)])", word + "2000"),
+        ("[x IN range(1,2000)|$word+toString(x)][$i]", word + "1999"),
+    ):
+        response = db.cypher_json(
+            "g",
+            {
+                "query": "RETURN " + expression,
+                "parameters": {"word": word, "i": -2},
+                "limits": {"memory_bytes": 1 << 20},
+            },
+        )
+        assert response["rows"][0][0]["value"] == expected
+    response = db.cypher_json(
+        "g",
+        {
+            "query": "RETURN any(x IN range(1,300000) WHERE x=1),reduce(s=0,x IN range(1,100000)|s+x)",
+            "limits": {"memory_bytes": 1 << 20, "intermediate_states": 900000},
+        },
+    )
+    assert [cell["value"] for cell in response["rows"][0]] == [True, "5000050000"]
+
+
+def test_contains_prefix_cache_is_bounded_for_many_distinct_needles(graph_db):
+    db = graph_db
+    needles = ["a" * 4088 + f"{i:08}" for i in range(200)]
+    response = db.cypher_json(
+        "g",
+        {
+            "query": "RETURN any(x IN $xs WHERE $hay CONTAINS x)",
+            "parameters": {"hay": "z" * 4096, "xs": needles},
+            "limits": {"memory_bytes": 1 << 20},
+        },
+    )
+    assert response["rows"][0][0]["value"] is False
+    response = db.cypher_json(
+        "g",
+        {
+            "query": "WITH [x IN range(1,4000)|$word+toString(x)] AS xs RETURN any(x IN xs WHERE $hay CONTAINS x)",
+            "parameters": {"hay": "z" * 1100, "word": "a" * 1024},
+            "limits": {"memory_bytes": 16 << 20},
+        },
+    )
+    assert response["rows"][0][0]["value"] is False
