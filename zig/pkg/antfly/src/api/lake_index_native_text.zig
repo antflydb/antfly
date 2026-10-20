@@ -426,10 +426,16 @@ pub fn loadFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkR
     return loadFileManifestBudget(a, store, ref, domain, cancellation, cache, null);
 }
 pub fn loadFileManifestBudget(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead, remaining: ?*u64) !FileGroup {
+    return loadFileManifestInner(a, store, ref, domain, cancellation, cache, remaining, false);
+}
+pub fn loadFileManifestPublication(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation) !FileGroup {
+    return loadFileManifestInner(a, store, ref, domain, cancellation, null, null, true);
+}
+fn loadFileManifestInner(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead, remaining: ?*u64, publication: bool) !FileGroup {
     if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
     if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
-    const bytes = try artifacts.readArtifact(a, store, ref, cancellation, cache);
+    const bytes = if (publication) try artifacts.readPublicationArtifact(a, store, ref, cancellation) else try artifacts.readArtifact(a, store, ref, cancellation, cache);
     defer a.free(bytes);
     var group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
     if (group.selected.len != 0) return error.InvalidNativeLakeTextCorpus;
@@ -440,7 +446,7 @@ pub fn loadFileManifestBudget(a: A, store: stores.ArtifactStore, ref: artifacts.
     }
     if (group.source_pages.len != 0) {
         if (group.sources.len != 0) return error.InvalidNativeLakeTextCorpus;
-        group.sources = try source_spans.load(a, store, group.source_pages, group.source_count, domain, cancellation, cache, remaining);
+        group.sources = if (publication) try source_spans.loadPublication(a, store, group.source_pages, group.source_count, domain, cancellation, remaining) else try source_spans.load(a, store, group.source_pages, group.source_count, domain, cancellation, cache, remaining);
     }
     try group.validate(domain);
     return group;
@@ -1124,33 +1130,39 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
         var totals: CollectionBuilder = .{ .a = a };
         defer totals.deinit();
-        var removed_refs: std.ArrayList(artifacts.ChunkRef) = .empty;
-        if (baseline) |old| {
-            totals.documents = old.collection.?.documents;
-            totals.segments = old.segment_count;
-            for (old.collection.?.fields) |field| try totals.field(field.name, field.total_length, false);
-            for (removed_files.items) |record| {
-                try removed_refs.append(ca, record.manifest);
+        const publication = directory_publication: {
+            var metadata_publisher: text_directory.Publisher = undefined;
+            try metadata_publisher.init(a, store, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
+            defer metadata_publisher.deinit();
+            if (baseline) |old| {
+                totals.documents = old.collection.?.documents;
+                totals.segments = old.segment_count;
+                for (old.collection.?.fields) |field| try totals.field(field.name, field.total_length, false);
+                for (removed_files.items) |record| {
+                    _ = file_arena.reset(.free_all);
+                    const group = try loadFileManifestPublication(file_arena.allocator(), store.*, record.manifest, old.domain, cancellation);
+                    try metadata_publisher.add(group, record.manifest, true);
+                    try totals.add(group, true);
+                    if (incremental_directory) for (group.summaries, group.segments) |summary, segment| {
+                        try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), -1, null, &directory_builder);
+                    };
+                }
+            }
+            for (added_files.items) |record| {
                 _ = file_arena.reset(.free_all);
-                const group = try loadFileManifest(file_arena.allocator(), store.*, record.manifest, old.domain, cancellation, null);
-                try totals.add(group, true);
-                if (incremental_directory) for (group.summaries, group.segments) |summary, segment| {
-                    try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), -1, null, &directory_builder);
-                };
+                const group = try loadFileManifestPublication(file_arena.allocator(), store.*, record.manifest, store.upload_scope.?.domain, cancellation);
+                try metadata_publisher.add(group, record.manifest, false);
+                for (group.summaries, group.segments) |summary, segment| {
+                    try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
+                }
+                try totals.add(group, false);
             }
-        }
-        var current_refs: std.ArrayList(artifacts.ChunkRef) = .empty;
-        for (added_files.items) |record| {
-            try current_refs.append(ca, record.manifest);
-            _ = file_arena.reset(.free_all);
-            const group = try loadFileManifest(file_arena.allocator(), store.*, record.manifest, store.upload_scope.?.domain, cancellation, null);
-            for (group.summaries, group.segments) |summary, segment| {
-                try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
-            }
-            try totals.add(group, false);
-        }
-        const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
-        const directories = try text_directory.publishManifests(a, store, current_refs.items, removed_refs.items, if (baseline) |old| old.directories else .{}, store.upload_scope.?.domain, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
+            const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
+            const directories = try metadata_publisher.finish(if (baseline) |old| old.directories else .{});
+            break :directory_publication .{ .terms = directory, .metadata = directories };
+        };
+        const directory = publication.terms;
+        const directories = publication.metadata;
         var root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.count()), .segment_count = totals.segments, .collection = try totals.finish(ca) };
         root.source_layout_version = 1;
         root.source_routes_version = 1;

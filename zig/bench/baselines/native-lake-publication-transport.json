@@ -28,6 +28,21 @@
       "text file, segment, routing, and checkpoint directories"
     ]
   },
+  "text_publication": {
+    "shared_manifest_consumers": ["collection statistics", "term directory", "file/segment/routing directories"],
+    "changed_manifests_in_test": 256,
+    "manifest_payload_reads_across_shared_consumers": 256,
+    "decode_arena_reset_after_each_manifest": true,
+    "paged_source_span_reads_use_publication_admission": true,
+    "directory_working_state_released_before_serving_compaction": true,
+    "data_pack_bytes": 1048576,
+    "data_packs_in_test": 13,
+    "maximum_packs_per_wave": 8,
+    "io_slots_in_test": 3,
+    "required_peak_pack_uploads": {"greater_than": 1, "at_most": 3},
+    "serial_and_parallel_directory_identities": "equal",
+    "partial_upload_failure": "drain children before returning; no directory published"
+  },
   "qualification_outstanding": [
     "Controlled identical-fixture base/head HN one-file and 1024-file latency and post-GC footprint",
     "Live object-provider publication throughput and durable retention qualification"

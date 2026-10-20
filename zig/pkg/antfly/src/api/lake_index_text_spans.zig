@@ -97,6 +97,12 @@ pub fn publish(a: std.mem.Allocator, store: *stores.ArtifactStore, spans: []cons
     return refs.toOwnedSlice(a);
 }
 pub fn load(a: std.mem.Allocator, store: stores.ArtifactStore, pages: []const artifacts.ChunkRef, count: u32, domain: [32]u8, token: @import("antfly_cancellation").CancellationToken, cached: ?artifacts.CachedRead, remaining: ?*u64) ![]const Span {
+    return loadInner(a, store, pages, count, domain, token, cached, remaining, false);
+}
+pub fn loadPublication(a: std.mem.Allocator, store: stores.ArtifactStore, pages: []const artifacts.ChunkRef, count: u32, domain: [32]u8, token: @import("antfly_cancellation").CancellationToken, remaining: ?*u64) ![]const Span {
+    return loadInner(a, store, pages, count, domain, token, null, remaining, true);
+}
+fn loadInner(a: std.mem.Allocator, store: stores.ArtifactStore, pages: []const artifacts.ChunkRef, count: u32, domain: [32]u8, token: @import("antfly_cancellation").CancellationToken, cached: ?artifacts.CachedRead, remaining: ?*u64, publication: bool) ![]const Span {
     if (count == 0 or count > max_spans or pages.len == 0 or pages.len > count) return error.InvalidNativeLakeTextCorpus;
     const result = try a.alloc(Span, count);
     var offset: usize = 0;
@@ -107,7 +113,7 @@ pub fn load(a: std.mem.Allocator, store: stores.ArtifactStore, pages: []const ar
         if (ref.byte_len > max_page_bytes) return error.InvalidNativeLakeTextCorpus;
         try stores.chargeReadBudget(&allowance, ref.byte_len);
         if (remaining) |budget| try stores.chargeReadBudget(budget, ref.byte_len);
-        const bytes = try artifacts.readArtifact(a, store, ref, token, cached);
+        const bytes = if (publication) try artifacts.readPublicationArtifact(a, store, ref, token) else try artifacts.readArtifact(a, store, ref, token, cached);
         defer a.free(bytes);
         const page = try std.json.parseFromSliceLeaky(Page, a, bytes, .{ .allocate = .alloc_always });
         if (page.version != 1 or page.spans.len == 0 or page.spans.len > page_spans or page.spans.len > count - offset) return error.InvalidNativeLakeTextCorpus;

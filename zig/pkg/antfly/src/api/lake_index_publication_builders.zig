@@ -1202,6 +1202,32 @@ test "external lake publication adapters batch reverse statistics and text direc
         original: stores.ArtifactStore,
         peak_slots: usize = 0,
         reads: usize = 0,
+        manifest_reads: usize = 0,
+        track_packs: bool = false,
+        fail_pack: bool = false,
+        read_failure: bool = false,
+        canceled: bool = false,
+        cancel_resume: bool = false,
+        active_puts: std.atomic.Value(usize) = .init(0),
+        peak_puts: std.atomic.Value(usize) = .init(0),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.canceled) return error.Canceled;
+        }
+        fn put(_: *anyopaque, alloc: A, scope: stores.UploadScope, bytes: []const u8, token: Token) !stores.ArtifactMetadata {
+            const self = active;
+            try std.testing.expect(!self.phase.execution.active);
+            const current = self.active_puts.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.active_puts.fetchSub(1, .acq_rel);
+            if (self.track_packs) {
+                _ = self.peak_puts.fetchMax(current, .acq_rel);
+                try std.testing.io.sleep(.fromMilliseconds(3), .awake);
+                if (self.fail_pack and bytes.len != 0 and bytes[0] == 3) return error.InjectedUploadFailure;
+            }
+            var backend = self.original;
+            backend.allocator = alloc;
+            return backend.putScoped(scope, bytes, token);
+        }
         fn begin(raw: *anyopaque, count: usize) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expect(self.phase.execution.active);
@@ -1210,6 +1236,7 @@ test "external lake publication adapters batch reverse statistics and text direc
         }
         fn finish(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cancel_resume) self.canceled = true;
             try PublicationIo.finish(&self.phase);
         }
         fn abort(raw: *anyopaque) void {
@@ -1227,9 +1254,15 @@ test "external lake publication adapters batch reverse statistics and text direc
             return self.original.getRangeAllocWithCancellationUsingAllocator(a, id, offset, length, token);
         }
         fn bounded(_: *anyopaque, a: A, id: []const u8, maximum: usize, token: Token) ![]u8 {
-            // Manifest reads use their complete-object port; the range probe
-            // above observes only the explicit publication page transport.
-            const bytes = try active.original.getAllocWithCancellationUsingAllocator(a, id, token);
+            const self = active;
+            try std.testing.expect(!self.phase.execution.active);
+            try std.testing.expectEqual(@as(usize, 1), self.phase.execution.scheduler.io_workers);
+            self.manifest_reads += 1;
+            var competing: local.sql_parallel_scheduler.Execution = .{ .scheduler = self.phase.execution.scheduler, .bytes = 32 };
+            try competing.enter(std.testing.io);
+            competing.pause();
+            if (self.read_failure) return error.InjectedReadFailure;
+            const bytes = try self.original.getAllocWithCancellationUsingAllocator(a, id, token);
             errdefer a.free(bytes);
             if (bytes.len > maximum) return error.ArtifactTooLarge;
             return bytes;
@@ -1248,9 +1281,11 @@ test "external lake publication adapters batch reverse statistics and text direc
     try execution.enter(std.testing.io);
     var probe: Probe = .{ .phase = .{ .execution = &execution, .io = std.testing.io }, .original = original };
     Probe.active = &probe;
+    execution.checkpoint = .{ .ptr = &probe, .check = Probe.check };
     const phase: stores.IoPhase = .{ .io = std.testing.io, .ptr = &probe, .max_parallel = 3, .begin = Probe.begin, .finish = Probe.finish, .abort = Probe.abort };
     var vtable = original.vtable.*;
     vtable.get_range_alloc_with_cancellation = Probe.read;
+    vtable.put_scoped = Probe.put;
     vtable.get_bounded_alloc_with_cancellation = Probe.bounded;
     var store = original;
     store.vtable = &vtable;
@@ -1310,6 +1345,47 @@ test "external lake publication adapters batch reverse statistics and text direc
         probe.peak_slots = 0;
         const roots = try directory.publish(a, &store, groups, refs, &.{}, &.{}, .{}, .none, std.testing.io);
         try std.testing.expect(probe.peak_slots > 1 and probe.peak_slots <= 3);
+        // Reuse the decode arena after every group. Both consumers observe
+        // exactly one manifest GET, and the directory retains no borrowed data.
+        var publisher: directory.Publisher = undefined;
+        try publisher.init(a, &store, .none, std.testing.io);
+        defer publisher.deinit();
+        var decoded_group = std.heap.ArenaAllocator.init(a);
+        defer decoded_group.deinit();
+        probe.manifest_reads = 0;
+        var consumed: usize = 0;
+        for (refs) |ref| {
+            _ = decoded_group.reset(.free_all);
+            const group = try corpus.loadFileManifestPublication(decoded_group.allocator(), store, ref, original.upload_scope.?.domain, .none);
+            consumed += group.file.id.len;
+            try publisher.add(group, ref, false);
+        }
+        _ = decoded_group.reset(.free_all);
+        const shared = try publisher.finish(.{});
+        try std.testing.expect(consumed > 0);
+        try std.testing.expectEqual(@as(usize, 256), probe.manifest_reads);
+        try std.testing.expect(roots.files.?.eql(shared.files.?));
+        // Paged source spans use the same explicit read admission, with CPU
+        // restored between each verified object and its JSON decode.
+        const spans = try out.alloc(corpus.source_spans.Span, 65);
+        for (spans, 0..) |*span, ordinal| span.* = .{ .file = groups[0].file, .physical = refs[0], .file_rows = 1, .file_lower = 0, .pack_lower = @intCast(ordinal), .count = 1 };
+        const span_pages = try corpus.source_spans.publish(out, &store, spans, .none);
+        const paged_manifest = try corpus.publishFileManifest(a, out, &store, .{ .file = groups[0].file, .segments = refs[0..1], .source_pages = span_pages, .source_count = 65 }, .none);
+        const before_spans = probe.manifest_reads;
+        const paged_group = try corpus.loadFileManifestPublication(out, store, paged_manifest, original.upload_scope.?.domain, .none);
+        try std.testing.expectEqual(@as(usize, 65), paged_group.sources.len);
+        try std.testing.expectEqual(before_spans + 1 + span_pages.len, probe.manifest_reads);
+        probe.read_failure = true;
+        try std.testing.expectError(error.InjectedReadFailure, corpus.loadFileManifestPublication(out, store, refs[0], original.upload_scope.?.domain, .none));
+        probe.read_failure = false;
+        try std.testing.expect(execution.active);
+        probe.cancel_resume = true;
+        try std.testing.expectError(error.Canceled, corpus.loadFileManifestPublication(out, store, refs[0], original.upload_scope.?.domain, .none));
+        probe.cancel_resume = false;
+        probe.canceled = false;
+        try std.testing.expect(!execution.active);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        try execution.enter(std.testing.io);
         probe.peak_slots = 0;
         const streamed = try directory.publishManifests(a, &store, refs, &.{}, .{}, original.upload_scope.?.domain, .none, std.testing.io);
         try std.testing.expect(roots.files.?.eql(streamed.files.?));
@@ -1322,6 +1398,35 @@ test "external lake publication adapters batch reverse statistics and text direc
         const updated = (try directory.publishFileRecords(a, &store, &.{}, records[0..1], checkpoints, .none, std.testing.io)).?;
         try std.testing.expectEqual(@as(u64, 255), updated.records);
         try std.testing.expect(probe.reads > 0);
+    }
+    {
+        const seekable = @import("lake_index_seekable_text.zig");
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const out = arena.allocator();
+        const bytes = try a.alloc(u8, 13 * 1024 * 1024 - 7);
+        defer a.free(bytes);
+        for (bytes, 0..) |*byte, ordinal| byte.* = @intCast(ordinal / (1024 * 1024));
+        probe.track_packs = true;
+        const parallel = try seekable.publish(a, out, &store, bytes, .none);
+        try std.testing.expect(probe.peak_puts.load(.acquire) > 1 and probe.peak_puts.load(.acquire) <= 3);
+        const serial = try seekable.publish(a, out, &original, bytes, .none);
+        try std.testing.expectEqualStrings(serial.artifact_id, parallel.artifact_id);
+        const data = try seekable.load(a, .{ .store = original, .cache = null, .context = .{}, .cancellation = .none }, parallel);
+        var source = data.native;
+        defer source.close();
+        var sample: [16]u8 = undefined;
+        for (1..13) |boundary| {
+            const offset = boundary * 1024 * 1024 - 8;
+            try source.readInto(offset, &sample);
+            try std.testing.expectEqualSlices(u8, bytes[offset..][0..sample.len], &sample);
+        }
+        probe.fail_pack = true;
+        try std.testing.expectError(error.InjectedUploadFailure, seekable.publish(a, out, &store, bytes, .none));
+        probe.fail_pack = false;
+        probe.track_packs = false;
+        try std.testing.expectEqual(@as(usize, 0), probe.active_puts.load(.acquire));
+        std.debug.print("packed text publication: packs=13 peak_uploads={} shared_manifest_reads=256\n", .{probe.peak_puts.load(.acquire)});
     }
     try std.testing.expect(execution.active);
     try std.testing.expect(probe.phase.pending == null);

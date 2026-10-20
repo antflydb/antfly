@@ -161,6 +161,13 @@ fn packedPiece(a: A, pack: Ref, offset: usize, pack_offset: usize, bytes: []cons
     const id = try scope.artifactId(checksum);
     return .{ .offset = offset, .ref = .{ .artifact_id = try a.dupe(u8, &id), .checksum = checksum, .byte_len = bytes.len }, .pack = pack, .pack_offset = pack_offset };
 }
+fn uploadWidth(a: A, store: *const stores.ArtifactStore) usize {
+    const phase = store.io_phase orelse return 1;
+    const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse local.sql_memory_budget.headroom(a) orelse return 1;
+    // Borrowed payloads need no capture buffer. Leave conservative headroom
+    // for bounded provider staging and returned identities during parallel I/O.
+    return @max(1, @min(stores.ArtifactStore.max_upload_batch, phase.max_parallel, available / (2 * pack_bytes)));
+}
 pub fn publish(a: A, out: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation) !Ref {
     return publishWithOpeningCollector(a, out, store, bytes, cancellation, null);
 }
@@ -197,22 +204,39 @@ pub fn publishWithOpeningCollector(a: A, out: A, store: *stores.ArtifactStore, b
     var position: usize = 0;
     var metadata_position: usize = 0;
     while (position < bytes.len) {
-        const pack_end = @min(position + pack_bytes, bytes.len);
-        const pack = try upload(ca, store, bytes[position..pack_end], cancellation);
-        var offset = position;
-        while (offset < pack_end) {
-            while (metadata_position < ranges.len and ranges[metadata_position].offset + ranges[metadata_position].len <= offset) metadata_position += 1;
-            if (metadata_position < ranges.len and ranges[metadata_position].offset <= offset) {
-                const end = @min(pack_end, ranges[metadata_position].offset + ranges[metadata_position].len);
-                if (compressed_bundle != null) try metadata.append(ca, try packedPiece(ca, pack, offset, offset - position, bytes[offset..end]));
-                offset = end;
-                continue;
-            }
-            const end = @min(@min(offset + block_bytes, pack_end), if (metadata_position < ranges.len) ranges[metadata_position].offset else bytes.len);
-            try blocks.append(ca, try packedPiece(ca, pack, offset, offset - position, bytes[offset..end]));
-            offset = end;
+        var contents: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
+        var uploaded: [stores.ArtifactStore.max_upload_batch]stores.ArtifactMetadata = undefined;
+        var count: usize = 0;
+        var next = position;
+        const width = uploadWidth(a, store);
+        while (count < width and next < bytes.len) : (count += 1) {
+            const end = @min(next + pack_bytes, bytes.len);
+            contents[count] = bytes[next..end];
+            next = end;
         }
-        position = pack_end;
+        // Payloads borrow the already-admitted immutable segment. Metadata
+        // stays on the synchronized store allocator until every child drains;
+        // only this serial owner mutates descriptor arenas after CPU resumes.
+        try store.putBatchWithCancellation(if (store.io_phase) |phase| phase.io else null, contents[0..count], uploaded[0..count], cancellation);
+        defer for (uploaded[0..count]) |*item| item.deinit(store.allocator);
+        for (contents[0..count], uploaded[0..count]) |payload, item| {
+            const pack: Ref = .{ .artifact_id = try ca.dupe(u8, item.artifact_id), .checksum = try ca.dupe(u8, item.checksum), .byte_len = item.byte_len };
+            const pack_end = position + payload.len;
+            var offset = position;
+            while (offset < pack_end) {
+                while (metadata_position < ranges.len and ranges[metadata_position].offset + ranges[metadata_position].len <= offset) metadata_position += 1;
+                if (metadata_position < ranges.len and ranges[metadata_position].offset <= offset) {
+                    const end = @min(pack_end, ranges[metadata_position].offset + ranges[metadata_position].len);
+                    if (compressed_bundle != null) try metadata.append(ca, try packedPiece(ca, pack, offset, offset - position, bytes[offset..end]));
+                    offset = end;
+                    continue;
+                }
+                const end = @min(@min(offset + block_bytes, pack_end), if (metadata_position < ranges.len) ranges[metadata_position].offset else bytes.len);
+                try blocks.append(ca, try packedPiece(ca, pack, offset, offset - position, bytes[offset..end]));
+                offset = end;
+            }
+            position = pack_end;
+        }
     }
     const directory: Directory = .{ .version = if (compressed_bundle != null) 5 else 4, .metadata_bundle = compressed_bundle, .metadata_decoded_bytes = decoded_bytes, .bytes = bytes.len, .metadata = metadata.items, .blocks = blocks.items, .terms = &.{} };
     try directory.validate();

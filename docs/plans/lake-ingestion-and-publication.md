@@ -3274,3 +3274,30 @@ coordinates, thousands of text terms, equivalent direct/manifest/checkpoint file
 directories, and incremental deletion with one CPU lane and three I/O slots.
 It checks batching, exact retained counts, CPU availability during page reads,
 and release of every I/O slot before the owner returns.
+
+Text publication streams each changed or removed file manifest through collection
+statistics, term-directory deltas, and file/segment/routing directory reducers in
+one decode pass. The operation-owned directory publisher copies records into its
+bounded sorts before the manifest arena is reset. It retains no archive-sized
+list of decoded groups. Its spill manager and sort buffers retire before serving
+compaction begins; any failure leaves only private objects and the old published
+root remains usable. Direct groups, streamed manifests, and checkpoint inventories
+share the same directory construction code and immutable page identities.
+
+Manifest and source-span transport explicitly borrow publication I/O admission.
+Verified bytes transfer only after CPU resumption; parsing and reducer work run
+with CPU admission restored. Failed reads restore CPU before error handling, and
+canceled resumption frees the fetched buffer. Serving and asynchronous paths keep
+their existing ownership. The regression reads 256 manifests exactly once across
+the shared consumers, resets the decode arena after each group, checks equivalent
+directory identities, and covers separately paged source spans and failed reads.
+
+Seekable text data packs also use the bounded ordered uploader. Each wave borrows
+up to eight existing 1 MiB segment slices, capped by the worker's I/O capability
+and known allocator headroom for provider staging. Unknown allocator chains and
+required inline execution keep width one. Descriptor construction stays serial
+after all children drain and CPU resumes; the directory/root is uploaded only
+after its referenced packs succeed. A 13-pack regression observes three uploads
+in flight with three I/O slots, preserves the serial directory identity, reads
+across every pack boundary, and drains an injected partial-wave failure. These
+are deterministic request/concurrency bounds, without a cloud latency claim.

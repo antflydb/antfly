@@ -301,13 +301,58 @@ pub const Mutations = struct {
         return .{ .key = record.key, .value = if (record.value[0] == 0) null else record.value[1..] };
     }
 };
+/// Address-stable, operation-owned streaming directory publication. Each decoded
+/// group is copied into bounded sorts before the caller reuses its read arena.
+/// Statistics and directory consumers can therefore share one manifest read.
+pub const Publisher = struct {
+    token: Cancellation,
+    reads: u64 = 0,
+    writes: u64 = 0,
+    pages: pages_mod.PageStore = undefined,
+    manager: local.sql_spill.Manager = undefined,
+    files: Mutations = undefined,
+    segments: Mutations = undefined,
+    routing: Mutations = undefined,
+    metadata: MetadataBuilder = undefined,
+    pub fn init(self: *Publisher, a: A, store: *stores.ArtifactStore, token: Cancellation, io: std.Io) !void {
+        const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
+        self.* = .{ .token = token };
+        self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
+        self.pages.admitPublication();
+        self.initReducers(a, self.pages.store(), io);
+    }
+    fn initReducers(self: *Publisher, a: A, storage: tree.Store, io: std.Io) void {
+        self.manager = .{ .alloc = a, .io = io, .context = self, .checkpoint = check };
+        self.files = Mutations.init(a, &self.manager, storage);
+        self.segments = Mutations.init(a, &self.manager, storage);
+        self.routing = Mutations.init(a, &self.manager, storage);
+        self.metadata = .{ .files = &self.files, .segments = &self.segments, .routing = &self.routing, .token = self.token, .group_arena = .init(a), .record_arena = .init(a) };
+    }
+    fn check(raw: *anyopaque) !void {
+        try @as(*Publisher, @ptrCast(@alignCast(raw))).token.check();
+    }
+    pub fn add(self: *Publisher, group: corpus.FileGroup, ref: Chunk, deleting: bool) !void {
+        try self.metadata.add(group, ref, deleting);
+    }
+    pub fn finish(self: *Publisher, old: Roots) !Roots {
+        return .{ .files = try self.files.finish(old.files), .segments = try self.segments.finish(old.segments), .routing = try self.routing.finish(old.routing) };
+    }
+    pub fn deinit(self: *Publisher) void {
+        self.metadata.deinit();
+        self.files.deinit();
+        self.segments.deinit();
+        self.routing.deinit();
+        self.manager.deinit();
+    }
+};
 pub fn publish(a: A, store: *stores.ArtifactStore, groups: []const corpus.FileGroup, refs: []const Chunk, removed: []const corpus.FileGroup, removed_refs: []const Chunk, old: Roots, token: Cancellation, io: std.Io) !Roots {
-    const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
-    var reads: u64 = 0;
-    var writes: u64 = 0;
-    var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
-    pages.admitPublication();
-    return update(a, pages.store(), groups, refs, removed, removed_refs, old, token, io);
+    var publisher: Publisher = undefined;
+    try publisher.init(a, store, token, io);
+    defer publisher.deinit();
+    for ([_]bool{ true, false }) |deleting| {
+        for (if (deleting) removed else groups, if (deleting) removed_refs else refs) |group, ref| try publisher.add(group, ref, deleting);
+    }
+    return publisher.finish(old);
 }
 /// Checkpoints need only compact file identities, never segment/routing trees.
 /// Changes are paged and applied to the previous immutable delta inventory.
@@ -338,27 +383,13 @@ pub fn publishFileRecords(a: A, store: *stores.ArtifactStore, records: []const F
     return mutations.finish(prior);
 }
 fn update(a: A, storage: tree.Store, groups: []const corpus.FileGroup, refs: []const Chunk, removed: []const corpus.FileGroup, removed_refs: []const Chunk, old: Roots, token: Cancellation, io: std.Io) !Roots {
-    var check = token;
-    const Check = struct {
-        fn call(raw: *anyopaque) !void {
-            const cancellation: *Cancellation = @ptrCast(@alignCast(raw));
-            try cancellation.check();
-        }
-    };
-    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = io, .context = &check, .checkpoint = Check.call };
-    defer manager.deinit();
-    var files = Mutations.init(a, &manager, storage);
-    defer files.deinit();
-    var segments = Mutations.init(a, &manager, storage);
-    defer segments.deinit();
-    var routing = Mutations.init(a, &manager, storage);
-    defer routing.deinit();
-    var builder: MetadataBuilder = .{ .files = &files, .segments = &segments, .routing = &routing, .token = token, .group_arena = .init(a), .record_arena = .init(a) };
-    defer builder.deinit();
+    var publisher: Publisher = .{ .token = token };
+    publisher.initReducers(a, storage, io);
+    defer publisher.deinit();
     for ([_]bool{ true, false }) |deleting| {
-        for (if (deleting) removed else groups, if (deleting) removed_refs else refs) |group, ref| try builder.add(group, ref, deleting);
+        for (if (deleting) removed else groups, if (deleting) removed_refs else refs) |group, ref| try publisher.add(group, ref, deleting);
     }
-    return .{ .files = try files.finish(old.files), .segments = try segments.finish(old.segments), .routing = try routing.finish(old.routing) };
+    return publisher.finish(old);
 }
 const MetadataBuilder = struct {
     files: *Mutations,
@@ -404,39 +435,22 @@ const MetadataBuilder = struct {
 /// Maintenance consumes one durable file manifest at a time. No decoded
 /// admissions or physical directories survive the next file.
 pub fn publishManifests(a: A, store: *stores.ArtifactStore, refs: []const Chunk, removed: []const Chunk, old: Roots, domain: Id, token: Cancellation, io: std.Io) !Roots {
-    const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
-    var reads: u64 = 0;
-    var writes: u64 = 0;
-    var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
-    pages.admitPublication();
-    var check = token;
-    const Check = struct {
-        fn call(raw: *anyopaque) !void {
-            try @as(*Cancellation, @ptrCast(@alignCast(raw))).check();
-        }
-    };
-    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = io, .context = &check, .checkpoint = Check.call };
-    defer manager.deinit();
-    var files = Mutations.init(a, &manager, pages.store());
-    defer files.deinit();
-    var segments = Mutations.init(a, &manager, pages.store());
-    defer segments.deinit();
-    var routing = Mutations.init(a, &manager, pages.store());
-    defer routing.deinit();
-    var builder: MetadataBuilder = .{ .files = &files, .segments = &segments, .routing = &routing, .token = token, .group_arena = .init(a), .record_arena = .init(a) };
-    defer builder.deinit();
+    var publisher: Publisher = undefined;
+    try publisher.init(a, store, token, io);
+    defer publisher.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     for ([_]bool{ true, false }) |deleting| {
         for (if (deleting) removed else refs) |ref| {
             try token.check();
             _ = arena.reset(.free_all);
-            const group = try corpus.loadFileManifest(arena.allocator(), store.*, ref, domain, token, null);
-            try builder.add(group, ref, deleting);
+            const group = try corpus.loadFileManifestPublication(arena.allocator(), store.*, ref, domain, token);
+            try publisher.add(group, ref, deleting);
         }
     }
-    return .{ .files = try files.finish(old.files), .segments = try segments.finish(old.segments), .routing = try routing.finish(old.routing) };
+    return publisher.finish(old);
 }
+
 fn get(a: A, storage: tree.Store, root: ?tree.Ref, id: Id) ![]const u8 {
     const start = key(id, 0);
     var upper = id;

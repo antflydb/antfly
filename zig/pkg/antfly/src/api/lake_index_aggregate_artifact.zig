@@ -45,6 +45,19 @@ pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellati
     if (cached) |cache| return cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
     return @TypeOf(loader).load(&loader, a);
 }
+/// Explicit synchronous publication read. Verified transport completes and CPU
+/// admission resumes before callers parse metadata or advance reducers.
+/// Serving and asynchronous readers never borrow this serial capability.
+pub fn readPublicationArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation) ![]u8 {
+    var phase = try store.beginIo(1);
+    defer phase.abort();
+    var backend = store;
+    backend.io_phase = null;
+    const bytes = readArtifact(a, backend, ref, cancellation, null) catch |err| return phase.failed(err);
+    errdefer a.free(bytes);
+    try phase.finish();
+    return bytes;
+}
 /// Borrow a verified bounded block until the caller has copied/decoded its
 /// requested range. Current authority is checked even when payloads are warm.
 pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
