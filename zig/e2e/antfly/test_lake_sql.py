@@ -6646,6 +6646,23 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
         for row in limited:
             k = int(row[0])
             assert row == [str(k), str(expected[k][0]), str(expected[k][1])]
+        # No ORDER BY authorizes an arbitrary prefix, including across a
+        # provider-frame boundary. Unsupported sorts must still see all groups.
+        one = call(
+            "POST", "/sql",
+            {"statement": "SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k LIMIT 1"},
+        )["rows"]
+        assert len(one) == 1
+        key = int(one[0][0])
+        assert one[0] == [str(key), str(expected[key][0]), str(expected[key][1])]
+        for order, key in [
+            ("k + 0 DESC", max(expected)),
+            ("SUM(amount) DESC, k DESC", max(expected, key=lambda k: (expected[k][1], k))),
+        ]:
+            assert call(
+                "POST", "/sql",
+                {"statement": f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k ORDER BY {order} LIMIT 1"},
+            )["rows"] == [[str(key), str(expected[key][0]), str(expected[key][1])]]
         failed = False
     finally:
         server.stop(test_failed=failed)

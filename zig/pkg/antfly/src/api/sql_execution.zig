@@ -1019,7 +1019,7 @@ pub const Adapter = struct {
             while (self.final_position == self.final_positions.len) {
                 _ = self.final_page.reset(.free_all);
                 const pa = self.final_page.allocator();
-                const rows = (try next(raw, pa, if (self.final_ordered and request.selection.maximum_groups == null) @intCast(@min(maximum, request.batch_rows)) else request.batch_rows)) orelse return null;
+                const rows = (try next(raw, pa, if ((self.final_ordered and request.selection.maximum_groups == null) or (request.selection.unordered_prefix and request.predicate == null and request.selection.maximum_groups != null)) @intCast(@min(maximum, request.batch_rows)) else request.batch_rows)) orelse return null;
                 try self.scan_quota.admit(rows.len, false);
                 const positions = try pa.alloc(usize, rows.len);
                 var accepted: usize = 0;

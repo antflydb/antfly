@@ -65,6 +65,7 @@ test {
     _ = @import("metadata/lake_index_lifecycle.zig");
     _ = @import("api/lake_index_aggregate_artifact.zig");
     _ = @import("api/lake_index_aggregate_keys.zig");
+    _ = @import("api/lake_index_aggregate_record.zig");
     _ = @import("api/lake_index_aggregate_composition.zig");
     _ = @import("api/lake_index_names.zig");
     _ = @import("api/lake_index_native_aggregates.zig");

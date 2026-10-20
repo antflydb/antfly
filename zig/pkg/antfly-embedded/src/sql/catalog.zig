@@ -770,7 +770,9 @@ pub const GroupSelection = struct {
     page_limit: usize = std.math.maxInt(usize),
     conditions: []const Condition = &.{},
     order: []const Scan.Order = &.{},
-    /// Proven upper bound on the consumed ordered prefix, including OFFSET.
+    /// The caller accepts any source prefix (SQL has no ORDER BY).
+    unordered_prefix: bool = false,
+    /// Proven upper bound on the consumed prefix, including OFFSET.
     /// Absent when SQL still needs residual filtering or an unbounded result.
     maximum_groups: ?usize = null,
     batch_rows: u32 = 4096,

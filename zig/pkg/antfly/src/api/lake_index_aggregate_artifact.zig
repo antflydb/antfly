@@ -24,6 +24,7 @@ const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const CachedRead = struct {
+    metrics: ?*@import("lake_query_metrics.zig").Metrics = null,
     cache: *local.serverless_query_lake_serving_cache.Cache,
     scope: [32]u8,
     context: local.serverless_query_lake_read_context.Context,
@@ -65,7 +66,10 @@ pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cance
 
 pub const metadata_version: u16 = 2;
 pub fn supportsMetadataVersion(version: u16) bool {
-    return version == 1 or version == metadata_version or version == 6 or version == 7 or isPartitioned(version);
+    return version == 1 or version == metadata_version or version == 6 or isTree(version) or isPartitioned(version);
+}
+pub fn isTree(version: u16) bool {
+    return version == 7 or version == 8;
 }
 pub fn isPartitioned(version: u16) bool {
     return version == 3 or version == 4 or version == 5;
@@ -311,6 +315,8 @@ pub fn publishCohortProven(a: A, result_alloc: A, store: *stores.ArtifactStore, 
 /// spilled inputs retain the established radix/block publisher.
 pub fn publishKeyed(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, group: *operators.Grouped, recipe: recipes.Recipe, manager: *spill.Manager, token: Cancellation) ![]Ref {
     if (!state_tree.eligible(recipe)) return publishPartitioned(a, out, store, names, group, recipe, manager, token);
+    const record_layout = try state_tree.record.Layout.init(a, recipe);
+    defer record_layout.deinit(a);
     var admitted = true;
     var ordinal: u64 = 0;
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
@@ -333,7 +339,7 @@ pub fn publishKeyed(a: A, out: A, store: *stores.ArtifactStore, names: []const [
             admitted = false;
             break :failed &fallback;
         };
-        const value = try state_tree.encode(sa, input, recipe);
+        const value = try state_tree.record.encodeWithLayout(sa, input, record_layout);
         if (key.len > state_tree.tree.max_key_bytes or key.len + value.len + 8 > state_tree.tree.max_record_bytes) admitted = false;
         try sort.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = key })}, .values = &.{local.sql_scalar.Datum.json(.{ .string = value })}, .ordinal = ordinal });
         ordinal += 1;
@@ -354,7 +360,7 @@ pub fn publishKeyed(a: A, out: A, store: *stores.ArtifactStore, names: []const [
         try builder.add(input.keys[0].value.string, input.values[0].value.string);
     }
     const page = try builder.finish();
-    return publishTree(a, out, store, names, recipe, .{ .domain = scope.domain, .page = page }, token);
+    return publishTree(a, out, store, names, recipe, .{ .domain = scope.domain, .layout = 2, .page = page }, token);
 }
 const TreeControl = struct {
     format: []const u8 = "native-sql-aggregate-v7",
@@ -367,11 +373,11 @@ const TreeControl = struct {
     }
 };
 fn loadTreeControl(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead) !TreeControl {
-    if (ref.kind != .algebraic_segment or ref.metadata_version != 7 or ref.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
+    if (ref.kind != .algebraic_segment or !isTree(ref.metadata_version) or ref.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
     const bytes = try readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
     defer a.free(bytes);
     const value = try std.json.parseFromSliceLeaky(TreeControl, a, bytes, .{ .allocate = .alloc_always });
-    if (!std.mem.eql(u8, value.format, "native-sql-aggregate-v7") or value.names.len == 0 or value.names.len > 256 or value.names.len != value.recipe.inputs.len) return error.InvalidNativeAggregateArtifact;
+    if (!std.mem.eql(u8, value.format, if (ref.metadata_version == 8) "native-sql-aggregate-v8" else "native-sql-aggregate-v7") or value.names.len == 0 or value.names.len > 256 or value.names.len != value.recipe.inputs.len) return error.InvalidNativeAggregateArtifact;
     for (value.names, 0..) |name, i| {
         if (name.len == 0) return error.InvalidNativeAggregateArtifact;
         for (value.names[0..i]) |previous| if (std.mem.eql(u8, name, previous)) return error.InvalidNativeAggregateArtifact;
@@ -382,8 +388,8 @@ fn loadTreeControl(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellat
     return value;
 }
 pub fn publishTree(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, recipe: recipes.Recipe, index: state_tree.Index, token: Cancellation) ![]Ref {
-    if (names.len != recipe.inputs.len or names.len == 0 or !state_tree.eligible(recipe)) return error.InvalidNativeAggregateArtifact;
-    const bytes = try std.json.Stringify.valueAlloc(a, TreeControl{ .recipe = recipe, .names = names, .index = index }, .{});
+    if (names.len != recipe.inputs.len or names.len == 0 or !state_tree.eligible(recipe) or (index.layout != 1 and index.layout != 2)) return error.InvalidNativeAggregateArtifact;
+    const bytes = try std.json.Stringify.valueAlloc(a, TreeControl{ .format = if (index.layout == 2) "native-sql-aggregate-v8" else "native-sql-aggregate-v7", .recipe = recipe, .names = names, .index = index }, .{});
     defer a.free(bytes);
     if (bytes.len > max_root_bytes) return error.NativeAggregateArtifactTooLarge;
     var saved = try store.putWithCancellation(bytes, token);
@@ -401,7 +407,7 @@ pub fn publishTree(a: A, out: A, store: *stores.ArtifactStore, names: []const []
         const id = try out.dupe(u8, saved.artifact_id);
         errdefer out.free(id);
         const checksum = try out.dupe(u8, saved.checksum);
-        ref.* = .{ .kind = .algebraic_segment, .metadata_version = 7, .name = name, .artifact_id = id, .checksum = checksum, .byte_len = saved.byte_len };
+        ref.* = .{ .kind = .algebraic_segment, .metadata_version = if (index.layout == 2) 8 else 7, .name = name, .artifact_id = id, .checksum = checksum, .byte_len = saved.byte_len };
         completed += 1;
     }
     return refs;
@@ -573,7 +579,7 @@ fn publishPartialStream(a: A, result_alloc: A, store: *stores.ArtifactStore, nam
 /// Cache only authenticated immutable directory metadata. The expected query
 /// recipe and the live reader lease are checked on every open, including hits.
 fn loadRoot(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation, cached: ?CachedRead) !Root {
-    if (artifact.metadata_version == 7) return (try loadTreeControl(a, store, artifact, cancellation, cached)).root(artifact.name);
+    if (isTree(artifact.metadata_version)) return (try loadTreeControl(a, store, artifact, cancellation, cached)).root(artifact.name);
     if (artifact.kind != .algebraic_segment or !supportsMetadataVersion(artifact.metadata_version) or artifact.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
     if (artifact.metadata_version == 6) return (try loadPacked(a, store, artifact, cancellation, cached)).root(artifact.name);
     const bytes = try readArtifact(a, store, .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, cancellation, cached);
@@ -589,7 +595,7 @@ fn allBounds(entries: anytype) ?group_keys.Bounds {
     return result;
 }
 fn validateRoot(artifact: Ref, root: Root) !void {
-    if (!std.mem.eql(u8, root.format, if (artifact.metadata_version == 1) "native-sql-aggregate-v1" else if (artifact.metadata_version == 7) "native-sql-aggregate-v7" else if (artifact.metadata_version == 3) "native-sql-aggregate-v3" else if (artifact.metadata_version == 5) "native-sql-aggregate-v5" else if (artifact.metadata_version == 4) "native-sql-aggregate-v4" else "native-sql-aggregate-v2") or !std.mem.eql(u8, root.name, artifact.name) or root.blocks.len > max_blocks) return error.InvalidNativeAggregateArtifact;
+    if (!std.mem.eql(u8, root.format, if (artifact.metadata_version == 1) "native-sql-aggregate-v1" else if (isTree(artifact.metadata_version)) (if (artifact.metadata_version == 8) "native-sql-aggregate-v8" else "native-sql-aggregate-v7") else if (artifact.metadata_version == 3) "native-sql-aggregate-v3" else if (artifact.metadata_version == 5) "native-sql-aggregate-v5" else if (artifact.metadata_version == 4) "native-sql-aggregate-v4" else "native-sql-aggregate-v2") or !std.mem.eql(u8, root.name, artifact.name) or root.blocks.len > max_blocks) return error.InvalidNativeAggregateArtifact;
     if (artifact.metadata_version == 1) {
         if (root.state_recipe != null or root.state_slot != null) return error.InvalidNativeAggregateArtifact;
     } else {
@@ -597,8 +603,9 @@ fn validateRoot(artifact: Ref, root: Root) !void {
         const slot = root.state_slot orelse return error.InvalidNativeAggregateArtifact;
         if (state_recipe.inputs.len > 256 or slot >= state_recipe.inputs.len or !root.recipe.eql(.{ .keys = state_recipe.keys, .inputs = state_recipe.inputs[slot .. slot + 1] })) return error.InvalidNativeAggregateArtifact;
     }
-    if (artifact.metadata_version == 7) {
+    if (isTree(artifact.metadata_version)) {
         const index = root.state_tree orelse return error.InvalidNativeAggregateArtifact;
+        if (index.layout != (if (artifact.metadata_version == 8) @as(u8, 2) else 1)) return error.InvalidNativeAggregateArtifact;
         if (root.blocks.len != 0 or root.partitions.len != 0 or root.key_index != null or root.bounds != null or root.cohort != null or !state_tree.eligible(root.state_recipe.?) or index.count() != root.groups) return error.InvalidNativeAggregateArtifact;
         const scope = (try stores.uploadScopeFromArtifactId(artifact.artifact_id)) orelse return error.InvalidNativeAggregateArtifact;
         if (!std.mem.eql(u8, &index.domain, &scope.domain)) return error.InvalidNativeAggregateArtifact;
@@ -853,6 +860,7 @@ pub const Reader = struct {
     selection_spill: ?*spill.Manager = null,
     selection_memory: usize = 8 * 1024 * 1024,
     selection_started: bool = false,
+    tree_record_layout: ?*const state_tree.record.Layout = null,
     tree_cursor: ?state_tree.tree.Cursor = null,
     tree_access: ?*@import("lake_index_native_directory.zig").Access = null,
     tree_maximum: ?usize = null,
@@ -933,7 +941,7 @@ pub const Reader = struct {
         const pack_metadata = if (artifact.metadata_version == 6 and cached != null) try @import("lake_index_decoded_metadata.zig").acquire(Packed, cached.?, store, pack_ref, cancellation, loadPacked) else null;
         errdefer if (pack_metadata) |owned| owned.release();
         const pack_data = if (pack_metadata) |owned| owned.value.* else if (artifact.metadata_version == 6) try loadPacked(ca, store, artifact, cancellation, cached) else null;
-        const tree_metadata = if (artifact.metadata_version == 7 and cached != null) try @import("lake_index_decoded_metadata.zig").acquire(TreeControl, cached.?, store, pack_ref, cancellation, loadTreeControl) else null;
+        const tree_metadata = if (isTree(artifact.metadata_version) and cached != null) try @import("lake_index_decoded_metadata.zig").acquire(TreeControl, cached.?, store, pack_ref, cancellation, loadTreeControl) else null;
         errdefer if (tree_metadata) |owned| owned.release();
         const metadata = if (cached != null and pack_data == null and tree_metadata == null) metadata: {
             const cache = cached.?;
@@ -1094,6 +1102,10 @@ pub const Reader = struct {
                 self.key_range.?.upper = value;
             };
         }
+        if (self.root.state_tree != null and request.unordered_prefix and request.order.len == 0) {
+            self.tree_maximum = request.maximum_groups;
+            return false;
+        }
         if (request.memory_bytes < 64 * 1024 or request.order.len == 0 or request.order.len > self.root.recipe.keys.len or (self.root.bounds == null and self.root.state_tree == null)) return false;
         const reverse = request.order[0].descending;
         for (request.order, self.root.recipe.keys[0..request.order.len]) |order, key| {
@@ -1250,6 +1262,11 @@ pub const Reader = struct {
     fn nextTree(self: *Reader, a: A, maximum: u32) !?[]const operators.GroupResult {
         if (self.tree_maximum) |goal| if (self.emitted >= goal) return null;
         const index = self.root.state_tree.?;
+        if (index.layout == 2 and self.tree_record_layout == null) {
+            const compiled = try self.control.allocator().create(state_tree.record.Layout);
+            compiled.* = try state_tree.record.Layout.init(self.control.allocator(), self.root.state_recipe.?);
+            self.tree_record_layout = compiled;
+        }
         if (self.tree_cursor == null) {
             const ca = self.control.allocator();
             const access = try ca.create(@import("lake_index_native_directory.zig").Access);
@@ -1280,7 +1297,7 @@ pub const Reader = struct {
         // Physical row descriptors also consume memory. Wide recipes must
         // shrink their decode batch even when their encoded payloads are tiny.
         const width = native_partial.physicalWidth(self.root.state_recipe.?.inputs) + self.root.recipe.keys.len;
-        const descriptors = width *| @sizeOf(std.meta.Elem(@FieldType(spill.ColumnarBlock, "values"))) *| 2 +| @sizeOf(operators.GroupResult);
+        const descriptors = if (index.layout == 2) self.root.recipe.keys.len *| @sizeOf(local.sql_scalar.Datum) *| 2 +| @sizeOf(state_tree.View) +| @sizeOf(operators.GroupResult) else width *| @sizeOf(std.meta.Elem(@FieldType(spill.ColumnarBlock, "values"))) *| 2 +| @sizeOf(operators.GroupResult);
         var count: usize = 0;
         var decoded_bytes: usize = 0;
         while (count < wanted) {
@@ -1299,7 +1316,7 @@ pub const Reader = struct {
             if (self.selection_rows_left == 0) return error.SqlProgramLimitExceeded;
             self.selection_rows_left -= 1;
             const bytes = try a.dupe(u8, record.value);
-            const value = try state_tree.block(a, bytes, self.root.state_recipe.?);
+            const value = try state_tree.view(a, bytes, self.root.state_recipe.?, index.layout, self.tree_record_layout);
             self.blocks_decoded += 1;
             const input = try state_tree.row(a, value, self.root.state_recipe.?, slots, self.output_slots, self.emitted);
             if (!group_keys.compatible(self.root.state_recipe.?, input.keys)) return error.InvalidNativeAggregateArtifact;
@@ -2706,7 +2723,7 @@ test "external lake aggregate ordered persistent group state prunes long prefixe
             try grouped.add(&.{local.sql_scalar.Datum.json(.{ .string = &label })}, &.{ value, value, value, value });
         }
         const refs = try publishKeyed(a, out, &store, names, grouped, recipe, &manager, .none);
-        try std.testing.expectEqual(@as(u16, 7), refs[0].metadata_version);
+        try std.testing.expectEqual(@as(u16, 8), refs[0].metadata_version);
         const reader = try Reader.open(a, store, refs[0], .{ .keys = recipe.keys, .inputs = inputs[0..1] }, .none);
         defer reader.cursor().close(reader);
         index.* = reader.root.state_tree.?;
@@ -2718,6 +2735,21 @@ test "external lake aggregate ordered persistent group state prunes long prefixe
     var unknown = refs[0];
     unknown.name = "missing.slot";
     try std.testing.expectError(error.InvalidNativeAggregateArtifact, Reader.open(a, store, unknown, .{ .keys = recipe.keys, .inputs = inputs[0..1] }, .none));
+    // ORDER BY absence is explicit; an unsupported requested sort cannot
+    // accidentally turn its LIMIT into an arbitrary source prefix.
+    for ([_]bool{ true, false }) |unordered| {
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        const limited = try Reader.openWithCache(a, store, refs[0], .{ .keys = recipe.keys, .inputs = inputs[0..1] }, .none, .{ .cache = &cache, .scope = @splat(8), .context = .{ .io = std.testing.io } });
+        defer limited.cursor().close(limited);
+        try std.testing.expect(!try limited.cursor().select_keys.?(limited, .{ .maximum_groups = 1, .unordered_prefix = unordered }));
+        const result = (try limited.cursor().next(limited, out, 4096)).?;
+        try std.testing.expectEqual(@as(usize, if (unordered) 1 else 256), result.len);
+        if (unordered) {
+            try std.testing.expectEqual(@as(usize, 0), limited.tree_prefetches);
+            try std.testing.expect((try limited.cursor().next(limited, out, 4096)) == null);
+        }
+    }
     for ([_]bool{ false, true }) |reverse| {
         const reader = try Reader.open(a, store, refs[0], .{ .keys = recipe.keys, .inputs = inputs[0..1] }, .none);
         defer reader.cursor().close(reader);
@@ -2830,7 +2862,7 @@ test "external lake aggregate persistent state admits spilled groups and preserv
     try grouped.add(&.{.{}}, &.{local.sql_scalar.Datum.json(.{ .integer = 1 })});
     try std.testing.expect(grouped.external != null);
     const refs = try publishKeyed(a, out, &store, &.{"stats.count"}, grouped, recipe, &manager, .none);
-    try std.testing.expectEqual(@as(u16, 7), refs[0].metadata_version);
+    try std.testing.expectEqual(@as(u16, 8), refs[0].metadata_version);
     {
         const reader = try Reader.open(a, store, refs[0], recipe, .none);
         defer reader.cursor().close(reader);
@@ -2857,10 +2889,60 @@ test "external lake aggregate persistent state admits spilled groups and preserv
     try wide.add(&.{local.sql_scalar.Datum.json(.{ .string = label })}, &.{local.sql_scalar.Datum.json(.{ .integer = 1 })});
     const wide_recipe: recipes.Recipe = .{ .keys = &.{.{ .path = "k", .type = .string, .nullable = false }}, .inputs = recipe.inputs };
     const fallback = try publishKeyed(a, out, &store, &.{"stats.count"}, wide, wide_recipe, &manager, .none);
-    try std.testing.expect(fallback[0].metadata_version != 7);
+    try std.testing.expect(fallback[0].metadata_version != 8);
     const reader = try Reader.open(a, store, fallback[0], wide_recipe, .none);
     defer reader.cursor().close(reader);
     const result = (try reader.cursor().next(reader, out, 2)).?;
     try std.testing.expectEqualStrings(label, result[0].keys[0].value.string);
     try std.testing.expectEqual(@as(i64, 1), (try native_partial.finish(out, out, result[0], 0, spec)).value.integer);
+}
+
+test "external lake aggregate compact trees read historical columnar records and upgrade mixed merges" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("aggregate-record-upgrade");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @import("lake_index_publication.zig").uploadDomain(4, @splat(9)), .attempt = @splat(1) };
+    const recipe: recipes.Recipe = .{ .keys = &.{.{ .path = "k", .type = .integer, .nullable = false }}, .inputs = &.{.{ .spec = .{ .kind = .count }, .column = null }} };
+    const keys = &.{local.sql_scalar.Datum.json(.{ .integer = 7 })};
+    const legacy = try spill.encodeColumnarBlockAlloc(out, &.{.{ .keys = keys, .values = &.{local.sql_scalar.Datum.json(.{ .integer = 3 })}, .ordinal = 0 }}, max_block_bytes);
+    var access: @import("lake_index_native_directory.zig").Access = undefined;
+    access.init(store, store.upload_scope.?.domain, .none, null);
+    var builder: state_tree.tree.SortedBuilder = .{ .alloc = a, .store = access.backing() };
+    defer builder.deinit();
+    try builder.add(try group_keys.encode(out, keys), legacy);
+    const old_index: state_tree.Index = .{ .domain = store.upload_scope.?.domain, .page = try builder.finish() };
+    const old_refs = try publishTree(a, out, &store, &.{"count"}, recipe, old_index, .none);
+    try std.testing.expectEqual(@as(u16, 7), old_refs[0].metadata_version);
+    const old_reader = try Reader.open(a, store, old_refs[0], recipe, .none);
+    defer old_reader.cursor().close(old_reader);
+    const before = (try old_reader.cursor().next(old_reader, out, 8)).?;
+    try std.testing.expectEqual(@as(i64, 3), (try native_partial.finish(out, out, before[0], 0, recipe.inputs[0].spec)).value.integer);
+    const group = try operators.Grouped.create(a, &.{recipe.inputs[0].spec}, .{});
+    defer group.deinit();
+    try group.add(keys, &.{local.sql_scalar.Datum.json(.{ .integer = 1 })});
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    const fresh = try publishKeyed(a, out, &store, &.{"count"}, group, recipe, &manager, .none);
+    const new_reader = try Reader.open(a, store, fresh[0], recipe, .none);
+    defer new_reader.cursor().close(new_reader);
+    const mixed = try state_tree.merge(a, &store, recipe, old_index, new_reader.root.state_tree.?, null, .none, null);
+    try std.testing.expectEqual(@as(u8, 2), mixed.layout);
+    const refs = try publishTree(a, out, &store, &.{"count"}, recipe, mixed, .none);
+    const reader = try Reader.open(a, store, refs[0], recipe, .none);
+    defer reader.cursor().close(reader);
+    const after = (try reader.cursor().next(reader, out, 8)).?;
+    try std.testing.expectEqual(@as(i64, 4), (try native_partial.finish(out, out, after[0], 0, recipe.inputs[0].spec)).value.integer);
+    var collector: @import("lake_index_gc.zig").Collector = .{ .a = out, .table = 4, .authority = undefined, .store = store, .identity = @splat(9), .context = .{}, .token = @splat(7), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 32 * 1024 * 1024 };
+    try collector.markArtifact(out, old_refs[0]);
+    try collector.markArtifact(out, refs[0]);
+    try std.testing.expect(collector.marked.count() >= 4);
 }

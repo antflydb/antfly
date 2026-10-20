@@ -409,6 +409,8 @@ fn decodeRootDirectory(a: A, ref: Ref, bytes: []const u8) !Root {
 /// Directory-only metadata has a distinct cache type from expanded roots.
 pub const Directory = struct { root: Root };
 pub fn loadDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Directory {
+    const started = @import("antfly_platform").time.monotonicNs();
+    defer if (cache) |cached| if (cached.metrics) |metrics| metrics.record(.text_directory, started);
     return .{ .root = try servingRoot(a, store, try loadRootDirectory(a, store, ref, cancellation, cache), cancellation, cache) };
 }
 pub fn servingRoot(a: A, store: stores.ArtifactStore, outer: Root, token: Cancellation, cache: ?artifacts.CachedRead) !Root {

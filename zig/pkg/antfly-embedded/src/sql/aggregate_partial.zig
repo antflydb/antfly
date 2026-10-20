@@ -83,7 +83,8 @@ pub fn finishPhysical(a: A, block: @import("spill.zig").ColumnarBlock, row: usiz
     // established exact semantics and immutable cache ownership.
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    return finishBorrowed(a, try readPhysical(scratch.allocator(), block, row, column, spec));
+    const state = try readPhysical(scratch.allocator(), block, row, column, spec);
+    return operators.cloneDatum(a, try state.finish());
 }
 
 /// Native aggregate block layout. Fixed counters and transition bits are
@@ -143,6 +144,10 @@ pub fn readPhysical(a: A, block: @import("spill.zig").ColumnarBlock, row: usize,
     @memset(cells[0..6], Datum.json(.{ .integer = 0 }));
     cells[6] = Datum.json(.{ .bool = false });
     for (lanes, 0..) |lane, offset| cells[lane] = try block.cell(row, column + offset);
+    return readPhysicalCells(a, cells, spec);
+}
+pub fn readPhysicalCells(a: A, cells: [physical_width]Datum, spec: operators.AggregateSpec) !operators.Aggregate {
+    if (!physicalEligible(spec)) return error.InvalidSqlSpill;
     for (cells[0..6]) |lane| if (lane.sql_null or lane.value != .integer or lane.numeric != null) return error.InvalidSqlSpill;
     if (cells[0].value.integer < 0 or cells[6].sql_null or cells[6].value != .bool) return error.InvalidSqlSpill;
     var state = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
@@ -185,6 +190,31 @@ pub fn readPhysical(a: A, block: @import("spill.zig").ColumnarBlock, row: usize,
     } else if ((spec.kind == .min or spec.kind == .max) and state.count != 0) return error.InvalidSqlSpill;
     return state;
 }
+/// Finalize selected schema-bound transitions without constructing a block.
+pub fn finishPhysicalCells(a: A, cells: [physical_width]Datum, spec: operators.AggregateSpec) !Datum {
+    const counter = cells[0];
+    if (!physicalEligible(spec) or counter.sql_null or counter.numeric != null or counter.value != .integer or counter.value.integer < 0) return error.InvalidSqlSpill;
+    const count = counter.value.integer;
+    if (spec.kind == .count) return counter;
+    if (spec.kind == .sum and spec.input_type == .integer) {
+        for (cells[1..3]) |lane| if (lane.sql_null or lane.value != .integer or lane.numeric != null) return error.InvalidSqlSpill;
+        const low: u64 = @bitCast(cells[1].value.integer);
+        const high: u64 = @bitCast(cells[2].value.integer);
+        const sum: i128 = @bitCast(@as(u128, high) << 64 | low);
+        return if (count == 0) .{} else Datum.json(.{ .integer = std.math.cast(i64, sum) orelse return error.SqlNumericOutOfRange });
+    }
+    if (spec.kind == .bool_and or spec.kind == .bool_or) {
+        if (cells[6].sql_null or cells[6].value != .bool) return error.InvalidSqlSpill;
+        return if (count == 0) .{} else cells[6];
+    }
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    // This reducer is privately decoded in scratch, so finalization can memoize
+    // in place. Borrowed cached reducers still use finishBorrowed above.
+    const state = try readPhysicalCells(scratch.allocator(), cells, spec);
+    return operators.cloneDatum(a, try state.finish());
+}
+
 /// Clone only the selected row's state across a page-owner boundary.
 pub fn cloneBorrowed(a: A, source: operators.Aggregate) !operators.Aggregate {
     if (source.distinct or source.patterns != null) {

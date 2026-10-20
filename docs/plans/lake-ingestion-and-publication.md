@@ -3026,3 +3026,62 @@ overhead. Cancellation and early close join that task before releasing request
 authority. All batch allocations retain the request's memory accounting.
 Explicit proven prefixes also allow the SQL adapter to consume provider batches
 without repeatedly verifying one group per output fragment.
+
+
+### Native state and cold-search qualification follow-up (protocol 65)
+
+Grouped serving now uses version 8 recipe-bound records in the same persistent
+ordered tree. The shared control recipe supplies fixed transition offsets once;
+only variable fields have a record directory. Readers finalize selected native
+slots directly, without decoding other cohort slots into column descriptors.
+Version 7 columnar records still read correctly, and a mixed-version reduction
+upgrades once through the bounded streaming merge. Oversized records retain the
+existing spill/radix fallback and SQL limits.
+
+Incremental group differences zip routing intervals across fence changes and
+height changes. Shared child identities skip even when a new minimum or a split
+changes parent boundaries. The 12,000-key regression requires fewer than twelve
+page reads for a single value change, new minimum, first-key deletion or append
+(with the production 512 KiB page cache). SQL also carries explicit authorization
+for arbitrary unordered prefixes; LIMIT/OFFSET caps their gathers and prefetch,
+while unsupported sort expressions and residual/HAVING work remain complete.
+
+The native HN comparison is reproducible with two independently built binaries:
+
+```sh
+python examples/hackernews/native_search_comparison.py \
+  --base-binary /path/to/main/antfly --base-revision MAIN_SHA \
+  --head-binary /path/to/pr/antfly --head-revision PR_SHA \
+  --parquet /path/to/hackernews.parquet --output /path/to/new-report \
+  --layouts 1 1024 --cycles 2 --repeats 20 \
+  --process-memory-budget-mb 4096
+```
+
+Use the lake-extra Python environment for PyArrow. The runner prepares both
+layouts once, hashes every source and binary, alternates binary order by cycle,
+and runs plain BM25, highlighted search, union and overlay through the existing
+correctness harness. Each case owns a fresh state directory. Empty-cache cases
+clear only that directory's serving cache after publication and disable optional
+navigation warming; readiness cases retain construction caches and issue their
+first archive query without metric-refresh sleeps. OS file caches remain retained
+and must be reported. `--cpu-cores` pins Linux runs; native macOS runs report
+unpinned CPU execution. Stop simultaneous build/benchmark work before publishing
+controlled latency comparisons. A small fixture can smoke-test the matrix with
+`--layouts 1 16 --cycles 1 --repeats 3 --modes plain`.
+
+The added text phase counters distinguish directory/term planning, inventory
+admission, immutable reader opening and validation, frontier navigation,
+posting/decode/ranking windows, final page construction, retained snapshot/cursor
+publication and final result delivery. They include failed
+work and overlap under prefetch. Process counter deltas attribute only a serial
+request interval; immediate-first-query measurements intentionally omit the
+pre-query scrape delay. The comparison preserves the underlying full reports,
+readiness/publication times, peak RSS, warm samples, and physical post-run object
+counts/bytes. Physical footprint is explicitly not live retained state: live and
+orphan bytes require a completed bounded engine-GC observation, and are left
+unknown when that qualification has not run.
+
+The RC1/DuckDB measurements in PR #1196 are diagnostic baselines, not measurements
+of this head. Neither the aggregate layout nor the new timings establish cold
+BM25 parity. Real-provider retention qualification remains deferred; the local
+runner performs no cloud writes or retention policy changes.

@@ -5229,6 +5229,7 @@ test "SQL finalized aggregate runtime stops unordered limits after filtering and
         .{ .sql = "SELECT id, COUNT(*) FROM docs GROUP BY id LIMIT 3 OFFSET 2", .first = 2, .rows = 3, .emitted = 5 },
         .{ .sql = "SELECT id, COUNT(*) FROM docs WHERE id >= 9950 GROUP BY id LIMIT 1", .first = 9950, .rows = 1, .emitted = 1 },
         .{ .sql = "SELECT id, COUNT(*) FROM docs GROUP BY id HAVING id >= 50 LIMIT 2 OFFSET 1", .first = 51, .rows = 2, .emitted = 56 },
+        .{ .sql = "SELECT id, COUNT(*) FROM docs GROUP BY id ORDER BY id + 0 DESC LIMIT 1", .first = 9999, .rows = 1, .emitted = 10000 },
         .{ .sql = "SELECT id, COUNT(*) FROM docs WHERE id < 0 GROUP BY id LIMIT 1", .first = 0, .rows = 0, .emitted = 0 },
     }) |case| {
         var driver: Driver = .{};

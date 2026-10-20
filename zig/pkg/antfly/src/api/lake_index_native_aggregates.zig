@@ -621,10 +621,10 @@ const Reduction = struct {
     }
     const Prior = struct { parent: Leaf, left: ?Leaf, right: ?Leaf };
     fn treeIndex(self: *@This(), refs: []const local.serverless_manifest_artifact_ref.ArtifactRef) !?artifacts.state_tree.Index {
-        if (refs.len != self.recipe.inputs.len or refs[0].metadata_version != 7) return null;
+        if (refs.len != self.recipe.inputs.len or !artifacts.isTree(refs[0].metadata_version)) return null;
         var result: ?artifacts.state_tree.Index = null;
         for (refs, 0..) |ref, slot| {
-            if (ref.metadata_version != 7) return null;
+            if (!artifacts.isTree(ref.metadata_version)) return null;
             const one: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
             const reader = try artifacts.Reader.openWithCache(self.a, self.store.*, ref, one, self.cancellation, self.cached);
             defer reader.cursor().close(reader);
@@ -1518,7 +1518,7 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
             const recipe = try artifacts.loadRecipe(output.allocator(), store, declaration.artifact, .none);
             const reader = try artifacts.Reader.open(a, store, declaration.artifact, recipe, .none);
             defer reader.cursor().close(reader);
-            try std.testing.expectEqual(@as(u16, 7), declaration.artifact.metadata_version);
+            try std.testing.expectEqual(@as(u16, 8), declaration.artifact.metadata_version);
             try std.testing.expectEqual(@as(u64, 300), reader.root.state_tree.?.count());
             if (phase == 1) {
                 const before = try artifacts.Reader.open(a, store, previous.declarations[slot].artifact, recipe, .none);

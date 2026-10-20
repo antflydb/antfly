@@ -1423,11 +1423,14 @@ without retaining obsolete files in the new serving generation. The native
 manifest's bounded full run-set serialization remains local work.
 
 
-### Persistent ordered group state (protocol 64)
+### Persistent ordered group state (protocol 65)
 
-Native grouped file reductions can publish version 7 serving roots over one
+Native grouped file reductions publish version 8 serving roots over one
 ordered copy-on-write page tree. Complete normalized grouping keys route directly
-to native physical transition rows. Forward/reverse LIMIT and typed key ranges
+to recipe-bound native transition records. Historical version 7 one-row columnar
+records remain readable, and mixed reductions upgrade through a full streaming
+merge once. The index binds the record layout and the publication requires
+reader protocol 65. Forward/reverse LIMIT and typed key ranges
 seek that tree; long common prefixes do not require opening every hash leaf.
 The same tree serves COUNT, integer SUM, exact NUMERIC, and typed extrema.
 Logical slots share one authenticated control object, binding names, the entire
@@ -1442,8 +1445,8 @@ This preserves exact arithmetic and recomputes MIN/MAX winners after removal,
 without inverse transitions or chains of old serving generations.
 Value updates retain unrelated underfull tail pages. Occupancy repair runs for
 splits, membership changes, or newly shrunken pages, and merges toward the normal
-page target rather than growing small tails into objects near the hard cap. Shape changes
-use a bounded streaming comparison; large edit sets fall back to a full streaming
+page target rather than growing small tails into objects near the hard cap. Routing intervals are zipped across changed fences, splits, merges and tree
+height changes, so retained child references still skip without payload reads; large edit sets fall back to a full streaming
 merge before publishing any new root. File-contribution ownership remains the
 existing counted graph, while ordinary and resumable GC trace state-tree pages.
 
@@ -1462,3 +1465,28 @@ overhead. Cancellation and early close join that task before releasing request
 authority. All batch allocations retain the request's memory accounting.
 Explicit proven prefixes also allow the SQL adapter to consume provider batches
 without repeatedly verifying one group per output fragment.
+
+
+Fixed state offsets are compiled once per reader/reduction from the authenticated
+recipe. COUNT, integer SUM, primitive extrema, boolean and floating transitions
+occupy native fixed fields. Only key presentation, variable extrema and exact
+NUMERIC coefficient buffers need an offset directory. Scalar/NUMERIC payloads
+reuse the existing native scalar codec; this adds no public columnar interchange
+format. Selecting one counter allocates no column descriptors or reducers for
+other slots. The decoder admits a bounded batch by actual record/key bytes and
+key descriptor cost, while legacy records retain their wider descriptor bound.
+
+An unordered source prefix is explicitly authorized by SQL when ORDER BY is
+absent. Proven LIMIT/OFFSET consumption bounds cap record gathering, decoding and
+prefetch even without ordering. Unsupported sort expressions, residual predicates
+and HAVING do not acquire this authority. Logical scan quotas remain independent
+of physical batch fragmentation.
+
+Cold text diagnostics expose directory admission, inventory admission, immutable
+reader opening/validation, term planning, frontier navigation, posting/ranking
+windows and final result cursor work as bounded Prometheus phase counters. These
+scopes are inclusive and can overlap under prefetch; do not add them together.
+The HN native comparison runner uses identical source checksums and separate
+empty-cache/readiness cases rather than attributing aggregate improvements to
+BM25. See `examples/hackernews/native_search_comparison.py` and the qualification
+instructions in the ingestion/publication plan.

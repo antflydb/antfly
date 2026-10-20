@@ -293,7 +293,7 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner
                     return self.bound.input.matchesWithLimits(a, cells, self.context.parameters, self.context.backend.decision_provider, @import("decision_eval.zig").limitsFor(self.context.backend));
                 }
             };
-            var request: catalog.FinalGroupRequest = .{ .page_limit = context.limits.scan_pages, .row_limit = context.limits.scan_rows, .batch_rows = context.limits.executionRows(), .selection = .{ .maximum_groups = if (bound.input.predicate == null and bound.having == null) maximum_groups else null, .conditions = conditions, .order = try materializedOrder(context.arena, bound, recipe, ordering), .spill = context.spill, .memory_bytes = context.limits.retained_bytes / 4 } };
+            var request: catalog.FinalGroupRequest = .{ .page_limit = context.limits.scan_pages, .row_limit = context.limits.scan_rows, .batch_rows = context.limits.executionRows(), .selection = .{ .unordered_prefix = ordering.len == 0, .maximum_groups = if (bound.input.predicate == null and bound.having == null) maximum_groups else null, .conditions = conditions, .order = try materializedOrder(context.arena, bound, recipe, ordering), .spill = context.spill, .memory_bytes = context.limits.retained_bytes / 4 } };
             if (bound.input.predicate != null) {
                 const predicate = try context.arena.create(Predicate);
                 predicate.* = .{ .context = context, .bound = bound, .columns = reuse.key_columns };

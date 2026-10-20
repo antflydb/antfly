@@ -1077,6 +1077,25 @@ pub const ColumnarBlock = struct {
         return self.keys[column].cell(row);
     }
 };
+/// Existing native scalar codec for schema-bound persistent records. Owners
+/// supply an arena; no column descriptors or row envelopes are constructed.
+pub fn encodeDatumsAlloc(a: Allocator, values: []const Datum, max_bytes: usize) ![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(a);
+    var encoder: Encoder = .{ .a = a, .bytes = &bytes, .limit = max_bytes };
+    try encoder.cells(values);
+    return bytes.toOwnedSlice(a);
+}
+pub fn decodeDatumsInArena(a: Allocator, bytes: []const u8, max_bytes: usize) ![]const Datum {
+    if (bytes.len > max_bytes) return error.InvalidSqlSpill;
+    var scratch: JsonScratch = .{ .a = @import("memory_budget.zig").reclaimingAllocator(a) };
+    defer scratch.deinit();
+    var decoder: Decoder = .{ .a = a, .bytes = bytes, .json_scratch = &scratch, .borrow_compact = true };
+    const result = try decoder.cells();
+    if (decoder.position != bytes.len) return error.InvalidSqlSpill;
+    return result;
+}
+
 const columnar_v1_magic = "NCB\x01";
 pub const ColumnarVersion = enum { v1, v2 };
 const columnar_v2_magic = "NCB\x02";
