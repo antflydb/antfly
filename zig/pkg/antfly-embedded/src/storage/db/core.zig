@@ -2450,6 +2450,18 @@ pub const DBCore = struct {
         return result;
     }
 
+    /// Capture the exact producer inputs and their durable catalog/physical
+    /// identity under the caller's apply fence. Keep the catalog generation and
+    /// route leases alive while producing; the seal rechecks the current digest.
+    /// This owner is not a funded prepare vote or a validated replay request.
+    pub fn capturePreparedTransactionInputs(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId, mode: @import("prepared_transaction_effects.zig").Mode, control: ?@import("../../common/read_admission.zig").Port) !transactions_mod.PreparedIntentSnapshot {
+        try self.requirePreparedTransactionProtocol(control);
+        const catalog = try self.preparedEffectsCatalogDigest(control);
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return manager.capturePreparedIntents(alloc, txn_id, catalog, mode, control);
+    }
+
     /// Caller holds apply ownership and retained non-yielding controls. The
     /// frame becomes the durable catalog lease in the same publication batch.
     pub fn sealPreparedTransactionEffects(self: *DBCore, txn_id: transactions_mod.TxnId, frame: []const u8, mode: @import("prepared_transaction_effects.zig").Mode, control: ?@import("../../common/read_admission.zig").Port) !void {

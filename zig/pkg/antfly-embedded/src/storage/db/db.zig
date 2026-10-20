@@ -144920,3 +144920,45 @@ test "db prepared replay plan bounds actual thin and materialized request builde
     defer a.free(notified);
     try std.testing.expect(notified.len <= bound);
 }
+
+test "db prepared transaction effects required captures producer bytes with the current catalog witness" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("prepared-input-owner");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const id: types.TxnId = @splat(0xf3);
+    try std.testing.expectError(error.PreparedTransactionProtocolDisabled, db.core.capturePreparedTransactionInputs(a, id, .deferred, null));
+    try db.enablePreparedTransactionProtocol();
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        _ = try db.core.beginTransactionRequiringPreparedEffects(id, 1, 1, &.{}, true, true, .{ .mode = .deferred }, .{}, null);
+    }
+    try db.writeTransaction(id, .{ .writes = &.{.{ .key = "row", .value = "{}" }} });
+    var captured = blk: {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        break :blk try db.core.capturePreparedTransactionInputs(a, id, .deferred, null);
+    };
+    defer captured.deinit();
+    try std.testing.expectEqual(@as(usize, 1), captured.batch.writes.len);
+    try std.testing.expectEqualStrings("row", captured.batch.writes[0].key);
+    try std.testing.expectEqualDeep(try db.core.preparedEffectsCatalogDigest(null), captured.contract.catalog_digest);
+    const stale = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = captured.contract, .effects = .{} }, null);
+    defer a.free(stale);
+    try db.addIndex(.{ .name = "new-generation", .kind = .full_text, .config_json = "{}" });
+    {
+        db.core.lockApply();
+        defer db.core.unlockApply();
+        try std.testing.expectError(error.PreparedEffectsMismatch, db.core.sealPreparedTransactionEffects(id, stale, .deferred, null));
+        var current = try db.core.capturePreparedTransactionInputs(a, id, .deferred, null);
+        defer current.deinit();
+        try std.testing.expectEqualDeep(captured.contract.intent_digest, current.contract.intent_digest);
+        try std.testing.expect(!std.mem.eql(u8, &captured.contract.catalog_digest, &current.contract.catalog_digest));
+        const frame = try @import("prepared_transaction_effects.zig").encode(a, .{ .contract = current.contract, .effects = .{} }, null);
+        defer a.free(frame);
+        try db.core.sealPreparedTransactionEffects(id, frame, .deferred, null);
+    }
+    try db.resolveTransactionIntents(id, .aborted, 2);
+}

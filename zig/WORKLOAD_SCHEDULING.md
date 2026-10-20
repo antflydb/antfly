@@ -767,3 +767,39 @@ context-aware MCP/A2A/extension/NDJSON, internal, embedded, serverless, and admi
 records actual process resource costs against fixed startup and authenticated-cursor manifests. These
 changes do not qualify a total-process heap cap or automatic scheduling defaults;
 independent backend/model owners and uncooperative legacy callbacks remain explicit release work.
+
+
+### Owned prepared-input snapshots
+
+`TxnManager.capturePreparedIntents` now returns an allocator-owned snapshot
+containing both the exact intent bytes and the contract hashed from those bytes.
+Writes, deletes and prepared-row envelopes borrow the retained owned entries;
+the capture does not clone their payloads a second time. The existing contract
+API uses this same capture implementation internally and releases its snapshot.
+Its digest framing and persisted formats are unchanged.
+
+The producer-facing capture rejects terminal decisions, conflicts with the
+required mode recorded at BEGIN, and existing immutable seals. The seal check
+uses an admitted keys-only seek and rejects opaque/corrupt frames without reading
+their effect payloads. Recovery retains its separate existing contract path for
+a durable COMMIT whose intents still await application. Original admission
+rejections unwind snapshot ownership, including failures during hashing.
+
+`DBCore.capturePreparedTransactionInputs` checks durable protocol eligibility and
+binds the owned input snapshot to the current catalog and physical identity under
+the caller's apply fence. The caller must retain catalog/route leases during
+production and revalidate at the final seal. This does not certify an arbitrary
+caller-supplied DerivedBatch, include later auxiliary/group replay mutations,
+reserve a derived-log quota or fund the minimum executable RAM/CPU/I/O/dependency
+bundle. Normal PREPARE drivers and strong provider activation remain off; the
+full scheduling objective remains incomplete. No native ABI, reader version or
+durable format changes are required by this internal owner addition.
+
+`prepared-input-snapshot-v3.json` and its raw log record 74 executed tests across
+the prepared-effect, required-DB, replay-plan and durable replay-credit targets:
+88/88 build steps, zero skips, failures or leaks. New cases retain producer bytes
+across a later prepare, reject stale intent/catalog seals, enumerate caller-owned
+allocation failures and original checkpoints, and refuse terminal/mode conflicts
+before allocating an input snapshot. Opaque seals are also rejected. Full Linux
+qualification remains waived; this run does not requalify public source packaging
+or the full storage archive.

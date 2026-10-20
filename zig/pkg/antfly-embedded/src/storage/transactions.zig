@@ -474,6 +474,20 @@ pub const IntentBatch = struct {
     }
 };
 
+/// The producer consumes these owned intent bytes, rather than collecting a
+/// second batch after capturing a digest. Retain the DB's catalog/route leases
+/// separately and revalidate under apply ownership before publishing any seal.
+pub const PreparedIntentSnapshot = struct {
+    allocator: Allocator,
+    contract: prepared_effects.Contract,
+    batch: IntentBatch,
+
+    pub fn deinit(self: *@This()) void {
+        self.batch.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
 const TxnRecord = struct {
     status: TxnStatus,
     begin_timestamp: u64,
@@ -1563,10 +1577,52 @@ pub const TxnManager = struct {
     }
 
     fn preparedEffectsContractInner(self: *TxnManager, txn_id: TxnId, catalog_digest: [32]u8, mode: prepared_effects.Mode, control: ?read_control.Port) !prepared_effects.Contract {
+        var snapshot = try self.capturePreparedIntentsInner(self.alloc, txn_id, catalog_digest, mode, control);
+        defer snapshot.deinit();
+        return snapshot.contract;
+    }
+
+    /// The returned batch and contract describe one captured revision, including
+    /// exact stored prepared-row envelopes. This does not certify a subsequently
+    /// supplied DerivedBatch or reserve the executable completion bundle. Only
+    /// pending transactions may capture producer inputs; recovery loads already
+    /// accepted effects through its separate contract validation path.
+    pub fn capturePreparedIntents(self: *TxnManager, alloc: Allocator, txn_id: TxnId, catalog_digest: [32]u8, mode: prepared_effects.Mode, original: ?read_control.Port) !PreparedIntentSnapshot {
+        var trace: MutationAdmissionTrace = .{};
+        var snapshot = self.captureProducerInputsInner(alloc, txn_id, catalog_digest, mode, trace.bind(original)) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| {
+            snapshot.deinit();
+            return cause;
+        }
+        return snapshot;
+    }
+
+    fn captureProducerInputsInner(self: *TxnManager, alloc: Allocator, txn_id: TxnId, catalog_digest: [32]u8, mode: prepared_effects.Mode, control: ?read_control.Port) !PreparedIntentSnapshot {
+        if (control) |owner| try owner.checkpoint();
+        const decision = try self.getPreparationDecision(txn_id, control);
+        if (decision.status != .pending) return error.DecisionConflict;
+        if (decision.requirement) |required| if (required.mode != mode) return error.PreparationContractConflict;
+        {
+            // A retry consumes the accepted frame. Key-only lookup must reject
+            // even corrupt/opaque seals without loading their effect payloads.
+            const key = makePreparedEffectsKey(txn_id);
+            var scan = if (control) |owner| try self.store.beginCurrentScanWithAdmission(owner) else try self.store.beginCurrentScan();
+            defer scan.abort();
+            var cursor = try scan.openCursor();
+            defer cursor.close();
+            cursor.setKeysOnly();
+            if (try cursor.seekAtOrAfter(&key)) |entry|
+                if (std.mem.eql(u8, entry.key, &key)) return error.PreparedEffectsSealed;
+        }
+        return self.capturePreparedIntentsInner(alloc, txn_id, catalog_digest, mode, control);
+    }
+
+    fn capturePreparedIntentsInner(self: *TxnManager, alloc: Allocator, txn_id: TxnId, catalog_digest: [32]u8, mode: prepared_effects.Mode, control: ?read_control.Port) !PreparedIntentSnapshot {
+        if (control) |owner| try owner.checkpoint();
         const record = try self.loadTransactionRecordWithAdmission(txn_id, control);
         if (!record.prepared or record.intent_revision == 0 or record.status == .aborted) return error.PreparedEffectsRequired;
-        var batch = try self.collectIntentBatchWithAdmission(self.alloc, txn_id, control);
-        defer batch.deinit(self.alloc);
+        var batch = try self.collectIntentBatchWithAdmission(alloc, txn_id, control);
+        errdefer batch.deinit(alloc);
         if (batch.revision != record.intent_revision) return error.IntentSnapshotChanged;
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("antfly-prepared-intents-v1");
@@ -1590,14 +1646,14 @@ pub const TxnManager = struct {
             !after.prepared) return error.IntentSnapshotChanged;
         var digest: [32]u8 = undefined;
         hash.final(&digest);
-        return .{
+        return .{ .allocator = alloc, .batch = batch, .contract = .{
             .txn_id = txn_id,
             .intent_revision = batch.revision,
             .intent_digest = digest,
             .catalog_digest = catalog_digest,
             .schema_version = if (batch.schema_binding) |binding| binding.version else null,
             .mode = mode,
-        };
+        } };
     }
 
     /// Final predecision seal. The external apply fence must span validation
@@ -7442,4 +7498,126 @@ test "prepared transaction effects bound receipt preserves every original reject
             try std.testing.expectError(cause, manager.getBoundPreparedSealReceipt(id, binding, .init(&payload)));
         }
     }
+}
+
+test "prepared transaction effects snapshot retains exactly the hashed producer inputs" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(151);
+    const catalog: [32]u8 = @splat(39);
+    try manager.initTransaction(id, 17);
+    try manager.writeIntentsExtraBatch(id, &.{
+        .{ .key = "z-row", .value = "original", .prepared_row = "typed-row" },
+        .{ .key = "a-delete", .value = null },
+    }, &.{}, .{ .schema_binding = .{ .version = 23 } });
+    var snapshot = try manager.capturePreparedIntents(a, id, catalog, .deferred, null);
+    defer snapshot.deinit();
+    try std.testing.expectEqualDeep(try manager.preparedEffectsContract(id, catalog, .deferred, null), snapshot.contract);
+    try std.testing.expectEqual(snapshot.batch.revision, snapshot.contract.intent_revision);
+    try std.testing.expectEqual(@as(?u32, 23), snapshot.contract.schema_version);
+    try std.testing.expectEqualStrings("z-row", snapshot.batch.writes[0].key);
+    try std.testing.expectEqualStrings("original", snapshot.batch.writes[0].value);
+    try std.testing.expectEqualStrings("typed-row", snapshot.batch.prepared_rows[0].?);
+    try std.testing.expectEqualStrings("a-delete", snapshot.batch.deletes[0]);
+    const entry = snapshot.batch.owned_entries.?[1];
+    const decoded = try IntentValue.decode(entry.value);
+    try std.testing.expectEqual(decoded.value.?.ptr, snapshot.batch.writes[0].value.ptr);
+    try std.testing.expectEqual(decoded.prepared_row.?.ptr, snapshot.batch.prepared_rows[0].?.ptr);
+    // A later prepare cannot mutate the bytes used by an in-flight producer.
+    try manager.writeIntentsExtraBatch(id, &.{.{ .key = "z-row", .value = "replacement", .prepared_row = "new-row" }}, &.{}, .{ .schema_binding = .{ .version = 23 } });
+    try std.testing.expectEqualStrings("original", snapshot.batch.writes[0].value);
+    try std.testing.expectEqualStrings("typed-row", snapshot.batch.prepared_rows[0].?);
+    const stale = try prepared_effects.encode(a, .{ .contract = snapshot.contract, .effects = .{} }, null);
+    defer a.free(stale);
+    try std.testing.expectError(error.PreparedEffectsMismatch, manager.sealPreparedEffects(id, stale, catalog, .deferred, null));
+    try std.testing.expect(!try manager.hasPreparedEffects(id));
+    var current = try manager.capturePreparedIntents(a, id, catalog, .deferred, null);
+    defer current.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &snapshot.contract.intent_digest, &current.contract.intent_digest));
+    const frame = try prepared_effects.encode(a, .{ .contract = current.contract, .effects = .{} }, null);
+    defer a.free(frame);
+    try manager.sealPreparedEffects(id, frame, catalog, .deferred, null);
+    try std.testing.expectError(error.PreparedEffectsSealed, manager.capturePreparedIntents(a, id, catalog, .deferred, null));
+    // Opaque/corrupt frame bytes are still accepted-work metadata, never an
+    // invitation to run the producer again. No frame decode is needed here.
+    const sealed_key = makePreparedEffectsKey(id);
+    try manager.applyBatch(&.{.{ .key = &sealed_key, .value = "opaque" }}, &.{}, null);
+    try std.testing.expectError(error.PreparedEffectsSealed, manager.capturePreparedIntents(a, id, catalog, .deferred, null));
+}
+
+test "prepared transaction effects snapshot owns allocation refusal and every original checkpoint" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(152);
+    try manager.initTransaction(id, 18);
+    const value = try a.alloc(u8, 13000);
+    defer a.free(value);
+    @memset(value, 'v');
+    try manager.writeIntents(id, &.{.{ .key = "row", .value = value }}, &.{});
+    const Checks = struct {
+        count: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.count += 1;
+            if (self.count >= self.stop) return error.DeadlineExceeded;
+        }
+        fn capture(alloc: Allocator, mgr: *TxnManager, txn_id: TxnId) !void {
+            var owned = try mgr.capturePreparedIntents(alloc, txn_id, @splat(1), .deferred, null);
+            defer owned.deinit();
+            try std.testing.expectEqual(@as(usize, 13000), owned.batch.writes[0].value.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Checks.capture, .{ &manager, id });
+    var checks: Checks = .{};
+    var payload: read_control.Payload = .{ .ptr = &checks, .vtable = &.{ .checkpoint = Checks.check } };
+    var complete = try manager.capturePreparedIntents(a, id, @splat(1), .deferred, read_control.Port.init(&payload));
+    const expected = complete.contract;
+    complete.deinit();
+    const checkpoints = checks.count;
+    try std.testing.expect(checkpoints > 8);
+    for (1..checkpoints + 1) |stop| {
+        checks = .{ .stop = stop };
+        try std.testing.expectError(error.DeadlineExceeded, manager.capturePreparedIntents(a, id, @splat(1), .deferred, read_control.Port.init(&payload)));
+        try std.testing.expectEqual(stop, checks.count);
+        try std.testing.expect(!try manager.hasPreparedEffects(id));
+    }
+    var retried = try manager.capturePreparedIntents(a, id, @splat(1), .deferred, null);
+    defer retried.deinit();
+    try std.testing.expectEqualDeep(expected, retried.contract);
+}
+
+test "prepared transaction effects snapshot refuses terminal decisions and conflicting required modes" {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{});
+    defer runtime.deinit();
+    var manager = try TxnManager.init(a, &runtime);
+    defer manager.deinit();
+    const id: TxnId = @splat(153);
+    try manager.initTransactionRequiringPreparedEffects(id, 1, 1, &.{}, false, false, .{ .mode = .synchronous }, .{}, null);
+    try manager.writeIntents(id, &.{.{ .key = "row", .value = "{}" }}, &.{});
+    var no_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.PreparationContractConflict, manager.capturePreparedIntents(no_allocations.allocator(), id, @splat(2), .deferred, null));
+    var record = try manager.loadTransactionRecord(id);
+    record.status = .committed;
+    record.commit_version = 2;
+    try manager.saveTransactionRecord(makeRecordKey(id), record);
+    try std.testing.expectError(error.DecisionConflict, manager.capturePreparedIntents(no_allocations.allocator(), id, @splat(2), .synchronous, null));
+    // A durable COMMIT awaiting apply still needs its existing recovery digest.
+    _ = try manager.preparedEffectsContract(id, @splat(2), .synchronous, null);
+    record.status = .aborted;
+    try manager.saveTransactionRecord(makeRecordKey(id), record);
+    try std.testing.expectError(error.DecisionConflict, manager.capturePreparedIntents(no_allocations.allocator(), id, @splat(2), .synchronous, null));
 }
