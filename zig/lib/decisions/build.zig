@@ -13,24 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const std = @import("std");
-
-/// Share a single source identity across SQL and inference consumers. This
-/// std-only module inherits the consumer's target and optimization settings.
-pub fn create(b: *std.Build, root: std.Build.LazyPath) *std.Build.Module {
-    if (b.modules.get("antfly_decisions")) |existing| return existing;
-    return b.addModule("antfly_decisions", .{ .root_source_file = root });
-}
-
-const WireBinding = struct { generator: *std.Build.Module, module: *std.Build.Module };
-var wire_bindings: std.ArrayList(WireBinding) = .empty;
-
-/// Wire types embed GeneratorConfig. Reuse their source identity within one
-/// dependency graph, without mixing native and WASM generator modules.
-pub fn createOpenApi(b: *std.Build, root: std.Build.LazyPath, generator: *std.Build.Module) *std.Build.Module {
-    for (wire_bindings.items) |binding| if (binding.generator == generator) return binding.module;
-    const module = b.createModule(.{ .root_source_file = root });
-    module.addImport("antfly_generating_openapi", generator);
-    wire_bindings.append(b.allocator, .{ .generator = generator, .module = module }) catch @panic("OOM");
-    return module;
-}
+// Keep one constructor identity for composed builds and the standalone
+// inference package, whose build module cannot import outside its own root.
+const support = @import("../../pkg/inference/build/decision_modules.zig");
+pub const create = support.create;
+pub const createOpenApi = support.createOpenApi;

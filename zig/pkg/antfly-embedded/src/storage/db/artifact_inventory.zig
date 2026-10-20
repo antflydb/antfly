@@ -290,22 +290,52 @@ const TestTxn = struct {
         return .{ .values = std.StringHashMap([]u8).init(std.testing.allocator) };
     }
     pub fn deinit(self: *TestTxn) void {
-        var it = self.values.valueIterator();
-        while (it.next()) |value| std.testing.allocator.free(value.*);
+        var it = self.values.iterator();
+        while (it.next()) |entry| {
+            std.testing.allocator.free(entry.key_ptr.*);
+            std.testing.allocator.free(entry.value_ptr.*);
+        }
         self.values.deinit();
     }
-    fn get(self: *TestTxn, key: []const u8) anyerror![]const u8 {
+    pub fn get(self: *TestTxn, key: []const u8) anyerror![]const u8 {
         return self.values.get(key) orelse error.NotFound;
     }
-    fn put(self: *TestTxn, key: []const u8, value: []const u8) !void {
+    pub fn put(self: *TestTxn, key: []const u8, value: []const u8) !void {
         const copy = try std.testing.allocator.dupe(u8, value);
         errdefer std.testing.allocator.free(copy);
-        if (try self.values.fetchPut(key, copy)) |old| std.testing.allocator.free(old.value);
+        if (self.values.getPtr(key)) |old| {
+            std.testing.allocator.free(old.*);
+            old.* = copy;
+        } else {
+            const owned_key = try std.testing.allocator.dupe(u8, key);
+            errdefer std.testing.allocator.free(owned_key);
+            try self.values.put(owned_key, copy);
+        }
     }
-    fn delete(self: *TestTxn, key: []const u8) anyerror!void {
+    pub fn delete(self: *TestTxn, key: []const u8) anyerror!void {
         const old = self.values.fetchRemove(key) orelse return error.NotFound;
+        std.testing.allocator.free(old.key);
         std.testing.allocator.free(old.value);
     }
+    pub fn openPhysicalCursorAdapter(self: *TestTxn) !Cursor {
+        return .{ .txn = self };
+    }
+    const Cursor = struct {
+        txn: *TestTxn,
+        const Item = struct { key: []const u8, value: []const u8 };
+        pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !?Item {
+            var found: ?Item = null;
+            var it = self.txn.values.iterator();
+            while (it.next()) |entry| {
+                const candidate = entry.key_ptr.*;
+                if (std.mem.order(u8, candidate, key) == .lt) continue;
+                if (found) |previous| if (std.mem.order(u8, candidate, previous.key) != .lt) continue;
+                found = .{ .key = candidate, .value = entry.value_ptr.* };
+            }
+            return found;
+        }
+        pub fn close(_: *Cursor) void {}
+    };
 };
 
 test "ordered artifact inventory semantic compatibility ignores history order and owner generations" {

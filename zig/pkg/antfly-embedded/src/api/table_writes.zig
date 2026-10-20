@@ -1041,7 +1041,7 @@ pub const BoundTableWriteSource = struct {
     pub fn resolverOperationGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, table_name: []const u8, body: []const u8) !?[]u8 {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
-        return (try self.activeDb()).resolverReviewsJsonAlloc(alloc, body);
+        return try (try self.activeDb()).resolverReviewsJsonAlloc(alloc, body);
     }
 
     pub fn graphMetricMaintenanceGroupLocal(

@@ -1046,12 +1046,24 @@ def test_resolver_entity_state_requires_source_scopes_on_api_keys(auth_api: Auth
         assert "private source text" not in denied.text
         auth_api.s.headers["Authorization"] = f"Bearer {keys[1]}"
         allowed = auth_api.get(prefix + suffix)
-        assert allowed["complete"] and len(allowed["results"]) == 2, allowed
+        # Independent legacy sources fold into one exact-template namespace.
+        assert allowed["complete"] and len(allowed["results"]) == 1, allowed
         for row in allowed["results"]:
             assert row["curation"]["suppress"]["keys"] == ["concept/noise"]
             assert row["curation"]["suppress"]["texts"] == []
         assert "private source text" not in str(allowed)
         assert "concept/private" not in str(allowed)
+
+    # Explicit adoption moves authority to the destination. Reading its
+    # namespace no longer borrows private source policy or needs source scopes.
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    auth_api.post(f"/tables/{destination}/entities/concept%2Fnoise:suppress", {})
+    auth_api.s.headers["Authorization"] = f"Bearer {keys[0]}"
+    for prefix in ("", "/databases/default/namespaces/public"):
+        owned = auth_api.get(prefix + suffix)
+        assert owned["complete"] and len(owned["results"]) == 1, owned
+        assert owned["results"][0]["curation"]["suppress"]["keys"] == ["concept/noise"]
+        assert "private source text" not in str(owned)
 
 
 @pytest.mark.parametrize("candidate_search", ["exact_key", "prefix"])

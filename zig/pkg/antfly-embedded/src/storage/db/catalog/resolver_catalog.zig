@@ -1054,7 +1054,8 @@ test "resolver adjudication catalogs fence old readers and redact public credent
 
 test "ordered artifact inventory resolver catalog serialization preserves explicit envelope" {
     const a = std.testing.allocator;
-    for ([_]u32{ 1, 2, 3, 4 }) |version| {
+    for (1..supported_reader_version + 1) |reader_version| {
+        const version: u32 = @intCast(reader_version);
         const encoded = try serializeCatalogWithMinimumVersion(a, &.{}, version);
         defer a.free(encoded);
         try std.testing.expectEqual(version, try catalogReaderVersion(a, encoded));
@@ -1066,7 +1067,7 @@ test "ordered artifact inventory resolver catalog serialization preserves explic
         try std.testing.expectEqualStrings(encoded, roundtrip);
     }
     try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 0));
-    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, 5));
+    try std.testing.expectError(error.UnsupportedResolverCatalogVersion, serializeCatalogWithMinimumVersion(a, &.{}, supported_reader_version + 1));
 }
 
 test "resolver public inspection redacts nested generated provider credentials without mutating execution" {
