@@ -197,6 +197,16 @@ pub fn planWithControl(a: A, config: Config, texts: []const []const u8, control:
     return .{ .windows = try windows.toOwnedSlice(a), .inputs = try inputs.toOwnedSlice(a) };
 }
 
+// JSON Schema integer is a mathematical type, not a dynamic Value storage tag.
+// Keep the same checked conversion before acceptance and during materialization.
+fn relationEndpoint(a: A, relation: V, name: []const u8) !usize {
+    if (relation != .object) return error.InvalidConstrainedOutput;
+    const raw = relation.object.get(name) orelse return error.InvalidConstrainedOutput;
+    return @intCast(@import("antfly_jsonschema").unsignedInteger(a, raw, 255) catch |err| {
+        return if (err == error.OutOfMemory) err else error.InvalidConstrainedOutput;
+    });
+}
+
 /// Validate semantic indices and decoder evidence before accepting a window.
 /// The common engine then repairs only this item, preserving valid siblings.
 pub const Validation = struct {
@@ -208,8 +218,8 @@ pub const Validation = struct {
             _ = try entityConfidence(a, self.config, proof, id, i, entity);
         };
         for (value.object.get("relations").?.array.items, 0..) |relation, i| if (relation.object.get("present").?.bool) {
-            const source = std.math.cast(usize, relation.object.get("source").?.integer) orelse return error.InvalidConstrainedOutput;
-            const target = std.math.cast(usize, relation.object.get("target").?.integer) orelse return error.InvalidConstrainedOutput;
+            const source = try relationEndpoint(a, relation, "source");
+            const target = try relationEndpoint(a, relation, "target");
             if (source >= entities.len or target >= entities.len) return error.InvalidConstrainedOutput;
             if (!entities[source].object.get("present").?.bool or !entities[target].object.get("present").?.bool) return error.InvalidConstrainedOutput;
             for (self.config.schema.object.get("relations").?.array.items) |definition| if (std.mem.eql(u8, try relationLabel(definition), relation.object.get("type").?.string)) {
@@ -333,8 +343,8 @@ pub fn materializeWithControl(a: A, config: Config, texts: []const []const u8, p
         }
         for (raw.object.get("relations").?.array.items, 0..) |relation, relation_index| {
             if (!relation.object.get("present").?.bool) continue;
-            const source = std.math.cast(usize, relation.object.get("source").?.integer) orelse return error.InvalidConstrainedOutput;
-            const target = std.math.cast(usize, relation.object.get("target").?.integer) orelse return error.InvalidConstrainedOutput;
+            const source = try relationEndpoint(a, relation, "source");
+            const target = try relationEndpoint(a, relation, "target");
             if (source >= mentions.len or target >= mentions.len) return error.InvalidConstrainedOutput;
             const label = relation.object.get("type").?.string;
             const confidence = try relationConfidence(a, config, generated.token_evidence[window_index], window_index, relation_index, relation);
@@ -526,4 +536,37 @@ test "generated extraction attributes typed window failures and preserves succes
     try std.testing.expectError(error.GenerationCapacityUnavailable, timed_out_outcomes[0].get());
     try std.testing.expectError(error.Timeout, timed_out_outcomes[1].get());
     try std.testing.expectError(error.Timeout, timed_out_outcomes[2].get());
+}
+
+test "generated extraction accepts mathematical integer endpoints through materialization" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try parse(a,
+        \\{"method":"generated","generator":{"provider":"antfly","model":"test"},"schema":{"entities":["person"],"relations":[{"type":"knows"}]},"probabilities":"verdict_only"}
+    );
+    defer config.deinit();
+    const constrained = @import("antfly_jsonschema");
+    const schema = try outputSchema(a, config.value);
+    for ([_][]const u8{ "0", "0.0", "-0e10" }, [_][]const u8{ "1", "1e0", "1.00" }) |source, target| {
+        const raw = try std.fmt.allocPrint(a, "{{\"entities\":[{{\"label\":\"person\",\"text\":\"Alice\",\"present\":true}},{{\"label\":\"person\",\"text\":\"Bob\",\"present\":true}}],\"relations\":[{{\"type\":\"knows\",\"source\":{s},\"target\":{s},\"present\":true}}]}}", .{ source, target });
+        const value = try std.json.parseFromSliceLeaky(V, a, raw, .{});
+        try constrained.validateJsonSchemaValue(a, schema, value);
+        var validation = Validation{ .config = config.value };
+        try Validation.validate(&validation, a, 0, value, null);
+        const text = "Alice knows Bob";
+        const result = try materialize(a, config.value, &.{text}, .{
+            .windows = try a.dupe(Window, &.{.{ .document = 0, .start = 0, .end = text.len }}),
+            .inputs = try a.dupe([]const u8, &.{text}),
+        }, .{ .values = try a.dupe(?V, &.{value}), .token_evidence = try a.dupe(?c.TokenEvidence, &.{null}) });
+        const relations = (try result[0].get()).object.get("relations").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), relations.len);
+        try std.testing.expectEqual(@as(i64, 0), relations[0].object.get("source").?.object.get("entity_index").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), relations[0].object.get("target").?.object.get("entity_index").?.integer);
+    }
+    for ([_]V{ .{ .integer = -1 }, .{ .float = 0.5 }, .{ .integer = 256 }, .{ .float = std.math.inf(f64) }, .{ .number_string = "1e100000" }, .{ .string = "1" } }) |bad| {
+        var relation = c.object();
+        try c.put(a, &relation, "source", bad);
+        try std.testing.expectError(error.InvalidConstrainedOutput, relationEndpoint(a, relation, "source"));
+    }
 }

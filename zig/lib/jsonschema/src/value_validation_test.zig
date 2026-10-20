@@ -163,3 +163,96 @@ test "compiled JSON schema retains exact native numeric literals" {
     try compiled.validate(a, .{ .number_string = "1.00000000000000010" });
     try std.testing.expectError(error.InvalidBatchRequest, compiled.validate(a, .{ .integer = 1 }));
 }
+
+test "JSON composition validates deeply nested instances without coverage allocation or repeated work" {
+    const Instance = struct { schema: []const u8, value: []const u8, closure: []const u8 };
+    for ([_]Instance{
+        .{ .schema = "{\"properties\":{\"x\":{\"type\":\"integer\"}}}", .value = "{\"x\":1}", .closure = "unevaluatedProperties" },
+        .{ .schema = "{\"items\":{\"type\":\"integer\"}}", .value = "[1]", .closure = "unevaluatedItems" },
+    }) |instance| {
+        for ([_][]const u8{ "allOf", "anyOf", "oneOf" }) |keyword| for ([_]usize{ 0, 4, 8, 12, 20 }) |depth| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var raw = instance.schema;
+            for (0..depth) |_| raw = try std.fmt.allocPrint(scratch, "{{\"{s}\":[{s}]}}", .{ keyword, raw });
+            var parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, raw, .{});
+            const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, instance.value, .{});
+            var compiled = try schema.CompiledSchema.init(a, parsed);
+            defer compiled.deinit();
+            var no_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            try compiled.validate(no_allocations.allocator(), value);
+            try std.testing.expectEqual(@as(usize, 0), no_allocations.alloc_index);
+            try parsed.object.put(scratch, instance.closure, .{ .bool = false });
+            var closed = try schema.CompiledSchema.init(a, parsed);
+            defer closed.deinit();
+            var bounded = std.testing.FailingAllocator.init(a, .{ .fail_index = depth + 2 });
+            try closed.validate(bounded.allocator(), value);
+            try std.testing.expect(bounded.alloc_index <= depth + 1);
+        };
+    }
+}
+
+test "JSON coverage belongs to successful branches and its current instance" {
+    const Case = struct { []const u8, []const u8, bool };
+    const cases = [_]Case{
+        .{ "{\"anyOf\":[{\"properties\":{\"a\":{}}},{\"properties\":{\"b\":{}}}],\"unevaluatedProperties\":false}", "{\"a\":1,\"b\":2}", true },
+        .{ "{\"anyOf\":[{\"properties\":{\"a\":{}}},{\"properties\":{\"b\":{}}}],\"unevaluatedProperties\":false}", "{\"a\":1,\"b\":2,\"x\":3}", false },
+        .{ "{\"anyOf\":[{\"properties\":{\"a\":{}},\"additionalProperties\":false},{\"properties\":{\"b\":{}}}],\"unevaluatedProperties\":false}", "{\"a\":1,\"b\":2}", false },
+        .{ "{\"allOf\":[{\"properties\":{\"a\":{}}},{\"properties\":{\"b\":{}}}],\"unevaluatedProperties\":false}", "{\"a\":1,\"b\":2}", true },
+        .{ "{\"oneOf\":[{\"properties\":{\"a\":{}},\"required\":[\"a\"]},{\"properties\":{\"b\":{}},\"required\":[\"b\"]}],\"unevaluatedProperties\":false}", "{\"a\":1}", true },
+        .{ "{\"oneOf\":[{\"properties\":{\"a\":{}},\"required\":[\"a\"]},{\"properties\":{\"b\":{}},\"required\":[\"b\"]}],\"unevaluatedProperties\":false}", "{\"a\":1,\"b\":2}", false },
+        .{ "{\"if\":{\"properties\":{\"a\":{}},\"required\":[\"a\"]},\"then\":{\"properties\":{\"b\":{}}},\"else\":{\"properties\":{\"c\":{}}},\"unevaluatedProperties\":false}", "{\"a\":1,\"b\":2}", true },
+        .{ "{\"if\":{\"properties\":{\"a\":{}},\"required\":[\"a\"]},\"then\":{\"properties\":{\"b\":{}}},\"else\":{\"properties\":{\"c\":{}}},\"unevaluatedProperties\":false}", "{\"c\":1}", true },
+        .{ "{\"not\":{\"properties\":{\"a\":{}},\"required\":[\"missing\"]},\"unevaluatedProperties\":false}", "{\"a\":1}", false },
+        .{ "{\"properties\":{\"a\":{}},\"dependentSchemas\":{\"a\":{\"properties\":{\"b\":{}}}},\"unevaluatedProperties\":false}", "{\"a\":1,\"b\":2}", true },
+        .{ "{\"properties\":{\"a\":{}},\"patternProperties\":{\"^a$\":{\"type\":\"integer\"}}}", "{\"a\":false}", false },
+        .{ "{\"allOf\":[{\"prefixItems\":[{}]},{\"contains\":{\"type\":\"string\"}}],\"unevaluatedItems\":false}", "[1,\"a\"]", true },
+        .{ "{\"allOf\":[{\"prefixItems\":[{}]},{\"contains\":{\"type\":\"string\"}}],\"unevaluatedItems\":false}", "[1,\"a\",2]", false },
+        .{ "{\"anyOf\":[{\"prefixItems\":[{\"type\":\"integer\"}],\"maxItems\":1},{\"contains\":{\"type\":\"string\"}}],\"unevaluatedItems\":false}", "[1,\"a\"]", false },
+        .{ "{\"allOf\":[{\"properties\":{\"a\":{\"properties\":{\"x\":{}}}}}],\"unevaluatedProperties\":false}", "{\"a\":{\"x\":1}}", true },
+        .{ "{\"allOf\":[{\"properties\":{\"a\":{\"properties\":{\"x\":{}}}}}],\"unevaluatedProperties\":false}", "{\"a\":{\"x\":1},\"x\":2}", false },
+        .{ "{\"allOf\":[{\"properties\":{\"a\":{}},\"unevaluatedProperties\":false},{\"properties\":{\"b\":{}}}]}", "{\"a\":1,\"b\":2}", false },
+    };
+    for (cases, 0..) |case, index| check(case[0], case[1], case[2]) catch |err| {
+        std.debug.print("coverage case {d}: {s}\n", .{ index, case[0] });
+        return err;
+    };
+}
+
+fn coverageAllocationSweep(allocator: std.mem.Allocator) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"anyOf":[{"properties":{"a":{}},"additionalProperties":false},{"properties":{"b":{}}}],"unevaluatedProperties":false}
+    , .{});
+    defer parsed.deinit();
+    var compiled = try schema.CompiledSchema.init(allocator, parsed.value);
+    defer compiled.deinit();
+    var value = try std.json.parseFromSlice(std.json.Value, allocator, "{\"b\":1}", .{});
+    defer value.deinit();
+    try compiled.validate(allocator, value.value);
+}
+
+test "single pass coverage propagates every allocation failure without leaking branch state" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, coverageAllocationSweep, .{});
+}
+
+test "bounded JSON integer conversion respects exact value and consumer range" {
+    for ([_][]const u8{ "0", "-0.0", "0e100000", "1.0", "1e0", "25500e-2" }, [_]u64{ 0, 0, 0, 1, 1, 255 }) |raw, expected|
+        try std.testing.expectEqual(expected, try schema.unsignedInteger(a, .{ .number_string = raw }, 255));
+    for ([_][]const u8{ "-1", "1.1", "256", "1e100000", "1e-100000", "1.0000000000000001", "null", "\"1\"", " 1", "1 ", "\t1" }) |raw|
+        try std.testing.expectError(error.InvalidBatchRequest, schema.unsignedInteger(a, .{ .number_string = raw }, 255));
+    try std.testing.expectEqual(std.math.maxInt(u64), try schema.unsignedInteger(a, .{ .number_string = "18446744073709551615" }, std.math.maxInt(u64)));
+    try std.testing.expectError(error.InvalidBatchRequest, schema.unsignedInteger(a, .{ .number_string = "18446744073709551616" }, std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(u64, 1), try schema.unsignedInteger(a, .{ .float = 1.0 }, 255));
+    try std.testing.expectError(error.InvalidBatchRequest, schema.unsignedInteger(a, .{ .float = std.math.inf(f64) }, 255));
+    try std.testing.expectError(error.InvalidBatchRequest, schema.unsignedInteger(a, .{ .float = std.math.nan(f64) }, 255));
+    try std.testing.expectError(error.InvalidBatchRequest, schema.unsignedInteger(a, .{ .string = "1" }, 255));
+}
+
+fn integerAllocationSweep(allocator: std.mem.Allocator) !void {
+    try std.testing.expectEqual(@as(u64, 255), try schema.unsignedInteger(allocator, .{ .number_string = "25500e-2" }, 255));
+}
+
+test "checked JSON integer conversion propagates allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, integerAllocationSweep, .{});
+}

@@ -75,7 +75,10 @@ pub const Index = struct {
         const rows = root.fields.get("items") orelse return error.InvalidConstrainedProbabilities;
         for (rows.items.items) |row| {
             const id_span = row.fields.get("item") orelse continue;
-            const id = std.fmt.parseInt(usize, self.text[id_span.start..id_span.end], 10) catch continue;
+            const id: usize = @intCast(@import("antfly_jsonschema").unsignedInteger(a, .{ .number_string = self.text[id_span.start..id_span.end] }, std.math.maxInt(usize)) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            });
             if (self.items.contains(id)) try self.items.put(a, id, null) else try self.items.put(a, id, row.fields.get("value"));
         }
         var tokens: std.ArrayList(Token) = .empty;
@@ -237,4 +240,23 @@ test "gemma native pretty JSON evidence retains whitespace positions" {
     const index = try Index.init(a, reply.object.get("text").?.string, reply.object.get("logprobs").?);
     const p = try distribution(a, index.evidence(), 0, &.{"relation"}, &.{ .{ .string = "1" }, .{ .string = "2" } });
     try std.testing.expect(p[0] > 0.9);
+}
+
+test "constrained token evidence canonicalizes mathematical integer item identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "0", "-0.0", "0e0" }) |id| {
+        const raw = try std.fmt.allocPrint(a, "{{\"items\":[{{\"item\":{s},\"value\":{{\"label\":\"yes\"}}}}]}}", .{id});
+        var proof = try std.json.parseFromSliceLeaky(V, a, "{\"content\":[{\"token\":\"\"}]}", .{});
+        try proof.object.getPtr("content").?.array.items[0].object.put(a, "token", .{ .string = raw });
+        const index = try Index.init(a, raw, proof);
+        try std.testing.expect(index.items.get(0).?.?.fields.contains("label"));
+    }
+    const duplicate = "{\"items\":[{\"item\":0,\"value\":{}},{\"item\":0.0,\"value\":{}}]}";
+    var proof = try std.json.parseFromSliceLeaky(V, a, "{\"content\":[{\"token\":\"\"}]}", .{});
+    try proof.object.getPtr("content").?.array.items[0].object.put(a, "token", .{ .string = duplicate });
+    const index = try Index.init(a, duplicate, proof);
+    try std.testing.expect(index.items.contains(0));
+    try std.testing.expect(index.items.get(0).? == null);
 }

@@ -271,12 +271,12 @@ pub fn execute(a: Allocator, executor: Executor, mode: Output, value_schema: Jso
                 const seen = try a.alloc(bool, end - begin);
                 @memset(seen, false);
                 for (entries.array.items) |entry| {
-                    const id = itemId(entry, begin, end) orelse continue;
+                    const id = (try itemId(a, entry, begin, end)) orelse continue;
                     if (seen[id - begin]) duplicates[id - begin] = true;
                     seen[id - begin] = true;
                 }
                 for (entries.array.items) |entry| {
-                    const id = itemId(entry, begin, end) orelse continue;
+                    const id = (try itemId(a, entry, begin, end)) orelse continue;
                     if (duplicates[id - begin] or result.values[id] != null) continue;
                     const value = entry.object.get("value") orelse continue;
                     validator.validate(a, value) catch |err| {
@@ -304,12 +304,11 @@ pub fn execute(a: Allocator, executor: Executor, mode: Output, value_schema: Jso
     }
     return result;
 }
-fn itemId(entry: Json, begin: usize, end: usize) ?usize {
-    if (entry != .object) return null;
+fn itemId(a: Allocator, entry: Json, begin: usize, end: usize) !?usize {
+    if (entry != .object or end == 0) return null;
     const id = entry.object.get("item") orelse return null;
-    if (id != .integer or id.integer < 0) return null;
-    const index = std.math.cast(usize, id.integer) orelse return null;
-    return if (index >= begin and index < end) index else null;
+    const index = schema_validator.unsignedInteger(a, id, end - 1) catch |err| return if (err == error.OutOfMemory) err else null;
+    return if (index >= begin) @intCast(index) else null;
 }
 
 /// Only trusted complete distributions can become probabilities. Missing
@@ -604,4 +603,48 @@ test "constrained JSON repair applies sibling assertions and preserves semantic 
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expect(result.failures[0] == null and result.failures[1] == null);
     try std.testing.expect(result.values[0].? == .object and result.values[1].? == .object);
+}
+
+test "constrained extraction repairs fractional endpoints and accepts numeric batch identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try extraction.parse(a,
+        \\{"method":"generated","generator":{"provider":"antfly","model":"test"},"schema":{"entities":["person"],"relations":[{"type":"knows"}]},"probabilities":"verdict_only"}
+    );
+    defer config.deinit();
+    const Fake = struct {
+        calls: usize = 0,
+        fn invoke(ptr: *anyopaque, alloc: Allocator, request: Invocation) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 2) {
+                try std.testing.expectEqual(@as(usize, 1), request.items.len);
+                try std.testing.expectEqual(@as(usize, 0), request.items[0].id);
+                try std.testing.expect(request.validation_error != null);
+            }
+            const raw = if (self.calls == 1)
+                \\{"items":[{"item":0.0,"value":{"entities":[{"label":"person","text":"Alice","present":true}],"relations":[{"type":"knows","source":0.5,"target":0e0,"present":true}]}},{"item":1e0,"value":{"entities":[],"relations":[]}}]}
+            else
+                \\{"items":[{"item":0e0,"value":{"entities":[{"label":"person","text":"Alice","present":true}],"relations":[{"type":"knows","source":0.0,"target":0e0,"present":true}]}}]}
+            ;
+            return .{ .value = try std.json.parseFromSliceLeaky(Json, alloc, raw, .{}) };
+        }
+    };
+    const Context = struct {
+        fake: Fake = .{},
+        validation: extraction.Validation,
+        fn invoke(ptr: *anyopaque, alloc: Allocator, request: Invocation) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return Fake.invoke(&self.fake, alloc, request);
+        }
+        fn validate(ptr: *anyopaque, alloc: Allocator, id: usize, value: Json, proof: ?TokenEvidence) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try extraction.Validation.validate(&self.validation, alloc, id, value, proof);
+        }
+    };
+    var context = Context{ .validation = .{ .config = config.value } };
+    const result = try execute(a, .{ .ptr = &context, .invoke = Context.invoke, .validate_item = Context.validate }, .json_schema, try extraction.outputSchema(a, config.value), "", .{}, &.{ "Alice", "empty" });
+    try std.testing.expectEqual(@as(usize, 2), context.fake.calls);
+    try std.testing.expect(result.failures[0] == null and result.failures[1] == null);
 }

@@ -36,7 +36,7 @@ const Decimal = struct {
         var scanner = std.json.Scanner.initCompleteInput(a, raw);
         defer scanner.deinit();
         const token = try scanner.next();
-        if (token != .number or try scanner.next() != .end_of_document) return error.InvalidBatchRequest;
+        if (token != .number or !std.mem.eql(u8, token.number, raw) or try scanner.next() != .end_of_document) return error.InvalidBatchRequest;
         const exponent_start = std.mem.indexOfAny(u8, raw, "eE") orelse raw.len;
         const negative = raw[0] == '-';
         const mantissa = raw[@intFromBool(negative)..exponent_start];
@@ -103,6 +103,29 @@ pub fn integral(a: A, value: V) !bool {
     defer decimal.deinit(a);
     return decimal.digits.len == 0 or decimal.order.toConst().orderAgainstScalar(decimal.digits.len) != .lt;
 }
+/// Convert a mathematical JSON integer without truncation, float rounding, or
+/// expanding an arbitrary exponent. The bound belongs to the typed consumer.
+pub fn unsignedInteger(a: A, value: V, maximum: u64) !u64 {
+    if (value == .integer) {
+        const result = std.math.cast(u64, value.integer) orelse return error.InvalidBatchRequest;
+        return if (result <= maximum) result else error.InvalidBatchRequest;
+    }
+    if (!isNumber(value)) return error.InvalidBatchRequest;
+    var decimal = Decimal.init(a, value) catch |err| return if (err == error.OutOfMemory) err else error.InvalidBatchRequest;
+    defer decimal.deinit(a);
+    if (decimal.digits.len == 0) return 0;
+    if (decimal.negative or decimal.order.toConst().orderAgainstScalar(decimal.digits.len) == .lt) return error.InvalidBatchRequest;
+    const places = decimal.order.toConst().toInt(u8) catch return error.InvalidBatchRequest;
+    if (places > 20) return error.InvalidBatchRequest;
+    var result: u64 = 0;
+    for (0..places) |index| {
+        const digit = if (index < decimal.digits.len) decimal.digits[index] - '0' else 0;
+        result = std.math.mul(u64, result, 10) catch return error.InvalidBatchRequest;
+        result = std.math.add(u64, result, digit) catch return error.InvalidBatchRequest;
+    }
+    return if (result <= maximum) result else error.InvalidBatchRequest;
+}
+
 pub fn equal(a: A, left: V, right: V) anyerror!bool {
     if (isNumber(left) and isNumber(right)) return try numberOrder(a, left, right) == .eq;
     if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;

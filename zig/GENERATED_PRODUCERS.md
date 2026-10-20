@@ -54,8 +54,12 @@ Enums, constants, and unique items use JSON value equality: object member order
 is irrelevant and mathematically equal numbers compare equally. Integer and
 numeric-literal comparisons retain decimal precision instead of rounding through
 floating point. The owned constraint tree compiles once per batch and serves all
-items and repair attempts. Unique items use semantic fingerprints with equality
-checks on collisions, avoiding pairwise comparisons of distinct items.
+items and repair attempts. Validation collects evaluated-field and evaluated-item
+coverage in the same traversal, retaining annotations only from successful
+branches. Schemas without coverage consumers allocate no coverage state;
+composition does not recursively revalidate subtrees to discover annotations.
+Unique items use semantic fingerprints with equality checks on collisions,
+avoiding pairwise comparisons of distinct items.
 
 `auto` selects a forced, actual tool call, provider JSON-schema output, then
 native grammar output, subject to the selected model's admitted capabilities.
@@ -145,7 +149,11 @@ provider invocation.
 Use as an extractor producer configuration, or add `inputs` for `/extract`.
 Generated extraction currently admits entity labels and relation type labels;
 advanced trained-extractor schema tasks are rejected. Relations refer to
-positions in the generated entity list. Alignment expands repeated source
+positions in the generated entity list. Relation endpoints and internal batch
+identities use checked mathematical integer conversion, so equivalent JSON
+spellings such as `0`, `0.0`, and `0e0` retain the same identity. Fractions,
+negative values, and out-of-range indices fail validation and use the ordinary
+repair policy. Alignment expands repeated source
 mentions, maps relation endpoints to the resulting `entity_index` values, and
 deduplicates overlap by source span and label. Unicode matching and window
 geometry are shared with GLiNER, preserving original source coordinates.
