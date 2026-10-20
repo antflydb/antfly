@@ -67492,6 +67492,70 @@ int termite_metal_buffer_copy(
     }
 }
 
+// A bounded gather owns every staging buffer until its single completion
+// fence. Host memory is copied once, directly into Shared upload storage.
+typedef struct {
+    void *device;
+    const void *host;
+    size_t source_offset;
+    size_t destination_offset;
+    size_t length;
+} termite_metal_buffer_gather_source;
+int termite_metal_buffer_gather(termite_metal_decode_runtime *runtime, void *destination,
+    const termite_metal_buffer_gather_source *sources, size_t count) {
+    if (!runtime || !runtime->device || !runtime->queue || !destination || !sources || !count || count > 8) return -1;
+    // Gathering is a complete phase, before prepared vision starts its frames.
+    if (runtime->active_frame_cb || runtime->submitted_frame_cb) return -2;
+    @autoreleasepool {
+        id<MTLBuffer> dst = (__bridge id<MTLBuffer>)destination;
+        if (dst.device != runtime->device) return -3;
+        id<MTLBuffer> inputs[8];
+        NSMutableArray * __attribute__((objc_precise_lifetime)) owners = [NSMutableArray new];
+        size_t offsets[8];
+        size_t host_bytes = 0;
+        // Validate the whole request before allocating or encoding anything.
+        for (size_t i = 0; i < count; ++i) {
+            const termite_metal_buffer_gather_source *source = sources + i;
+            if (!source->length || source->destination_offset > dst.length || source->length > dst.length - source->destination_offset) return -3;
+            if ((source->device != NULL) == (source->host != NULL)) return -4;
+            if (source->device) {
+                inputs[i] = (__bridge id<MTLBuffer>)source->device;
+                if (inputs[i].device != runtime->device || source->source_offset > inputs[i].length || source->length > inputs[i].length - source->source_offset) return -5;
+                offsets[i] = source->source_offset;
+                [owners addObject:inputs[i]];
+            } else {
+                if (source->source_offset != 0 || source->length > SIZE_MAX - host_bytes) return -6;
+                host_bytes += source->length;
+            }
+        }
+        if (host_bytes) {
+            id<MTLBuffer> staging = antfly_observe_metal_buffer([runtime->device newBufferWithLength:host_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+            if (!staging || !staging.contents) return -7;
+            [owners addObject:staging];
+            size_t cursor = 0;
+            for (size_t i = 0; i < count; ++i) if (sources[i].host) {
+                memcpy((uint8_t *)staging.contents + cursor, sources[i].host, sources[i].length);
+                inputs[i] = staging; offsets[i] = cursor; cursor += sources[i].length;
+            }
+        }
+        id<MTLCommandBuffer> command = termite_metal_new_command_buffer(runtime->queue, __func__);
+        if (!command) return -8;
+        id<MTLBlitCommandEncoder> encoder = termite_metal_tracked_blit_command_encoder(command);
+        if (!encoder) return -9;
+        for (size_t i = 0; i < count; ++i) {
+            [encoder copyFromBuffer:inputs[i] sourceOffset:offsets[i] toBuffer:dst destinationOffset:sources[i].destination_offset size:sources[i].length];
+        }
+        [encoder endEncoding];
+        if (termite_metal_commit_and_wait(command, __func__, -10) != 0) return -10;
+        for (size_t i = 0; i < count; ++i) {
+            const bool host = sources[i].host != NULL;
+            termite_metal_telemetry_copy(host ? TERMITE_METAL_UPLOAD_BYTES : TERMITE_METAL_COPY_BYTES,
+                host ? TERMITE_METAL_UPLOAD_CALLS : TERMITE_METAL_COPY_CALLS, sources[i].length);
+        }
+        return 0;
+    }
+}
+
 int termite_metal_buffer_copy_pair(
     termite_metal_decode_runtime *runtime,
     void *src_a_handle,

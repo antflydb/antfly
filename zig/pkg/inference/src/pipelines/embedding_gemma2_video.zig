@@ -1541,7 +1541,6 @@ pub const Prefetch = struct {
             cancelCohort(producers);
         }
         defer if (initial_stage) |stage| stage.cleanup();
-        if (initial_stage) |stage| try stage.pause();
         var offsets: [5]usize = @splat(0);
         var ids: [128]usize = undefined;
         var keys: [128]CacheKey = undefined;
@@ -1549,10 +1548,17 @@ pub const Prefetch = struct {
         for (producers, 0..) |producer, row| {
             if (producer.cache != producers[0].cache) return error.InvalidVideoCacheSession;
             var header: [1]Job = undefined;
-            _ = producer.header_queue.getUncancelable(io, &header, 1) catch {
+            const available = producer.header_queue.getUncancelable(io, &header, 0) catch {
                 producer.join();
                 return producer.failure orelse error.InvalidTensorShape;
             };
+            if (available == 0) {
+                if (initial_stage) |stage| try stage.pause();
+                _ = producer.header_queue.getUncancelable(io, &header, 1) catch {
+                    producer.join();
+                    return producer.failure orelse error.InvalidTensorShape;
+                };
+            }
             const selected = switch (header[0]) {
                 .header => |value| value,
                 else => return error.InvalidTensorShape,
@@ -1598,7 +1604,7 @@ pub const Prefetch = struct {
         defer for (jobs[0..count], owners[0..count], owned[0..count]) |*job, owner, live| if (live) owner.discard(job);
         while (remaining != 0 or count != 0) {
             try producers[0].control.check();
-            if (cb.embedding_stage) |stage| try stage.pause();
+            if (cb.embedding_stage) |stage| try stage.yieldReady();
             wake.reset();
             var active: [4]bool = @splat(false);
             for (closed[0..producers.len], 0..) |done, row| active[row] = !done;
@@ -1651,6 +1657,13 @@ pub const Prefetch = struct {
                 else => true,
             };
             const first = std.mem.indexOfScalar(bool, ready_mask[0..count], true) orelse {
+                // Never wait to fill a CPU batch: execute admitted ready work
+                // and emit its rows before a slower producer can publish more.
+                if (try capture.flushNativeBeforeWait()) {
+                    try emitter.emit();
+                    continue;
+                }
+                if (cb.embedding_stage) |stage| try stage.pause();
                 if (remaining != 0 or count != 0) wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
                     error.Timeout => {},
                     else => return err,
@@ -2354,6 +2367,11 @@ const Capture = struct {
             self.frame_tokens[duplicate] = tokens;
         };
     }
+    fn flushNativeBeforeWait(self: *Capture) !bool {
+        if (self.native_count == 0) return false;
+        try self.flushNativePending();
+        return true;
+    }
     fn flushNativePending(self: *Capture) !void {
         const count = self.native_count;
         if (count == 0) return;
@@ -2552,37 +2570,29 @@ const Capture = struct {
                 ceiling = admitted;
             };
             const started = batch_clock.monotonicNs();
-            const input = (try self.cb.allocUninitF32Shape(&.{ @intCast(take * rows), 768 })) orelse return error.UnsupportedPrimitiveOp;
-            defer self.cb.free(input);
+            var inputs: [8]@import("../ops/metal_compute.zig").VideoGatherInput = undefined;
             var destinations: [8]NativeProjectionJob = undefined;
             for (jobs[first..][0..take], 0..) |job, index| {
-                const part = switch (job) {
-                    .native => |value| blk: {
-                        if (value.patches.len != rows * 768) return error.InvalidTensorShape;
-                        break :blk try self.cb.fromFloat32Shape(value.patches, &.{ @intCast(rows), 768 });
-                    },
-                    .metal => |value| if (comptime build_options.enable_metal) blk: {
-                        if (value.prepared.geometry.values() != rows * 768) return error.InvalidTensorShape;
-                        break :blk try MetalCompute.importVideoBufferSpan(self.cb, try value.prepared.buffer(), value.prepared.output_byte_offset, rows * 768);
-                    } else return error.UnsupportedVideoBackend,
+                inputs[index] = switch (job) {
+                    .native => |value| .{ .host = value.patches },
+                    .metal => |value| .{ .device = .{ .buffer = try value.prepared.buffer(), .offset = value.prepared.output_byte_offset, .values = value.prepared.geometry.values() } },
                     else => unreachable,
                 };
-                defer self.cb.free(part);
-                if (!try self.cb.copyRows2D(self.a, input, index * rows, part, 0, rows, 768)) return error.UnsupportedPrimitiveOp;
                 destinations[index] = .{ .slot = switch (job) {
                     .native => |v| v.slot,
                     .metal => |v| v.slot,
                     else => unreachable,
                 }, .patches = &.{}, .options = options };
             }
+            const input = try MetalCompute.gatherVideoInputs(self.cb, inputs[0..take], rows, 768);
+            defer self.cb.free(input);
             const encoded = try self.encodeGpuAdmitted(input, options, take, true);
             defer self.cb.free(encoded.tensor);
             try self.saveResidentBatch(encoded, destinations[0..take]);
             if (!required or self.last_prepared) batch_policy.completedForPlan(true, options.width, options.height, take, batch_clock.monotonicNs() -| started, self.last_prepared);
             first += take;
             if (first < jobs.len) if (self.cb.embedding_stage) |stage| {
-                try stage.pause();
-                try stage.acquire();
+                try stage.yieldReady();
             };
         }
     }
@@ -2612,8 +2622,7 @@ const Capture = struct {
             consumed = stop;
             if (stop - first == 1) try self.projectGpuNowAdmitted(jobs[first].slot, jobs[first].prepared, options, true) else try self.projectGpuCohort(jobs[first..stop]);
             if (stop < jobs.len) if (self.cb.embedding_stage) |stage| {
-                try stage.pause();
-                try stage.acquire();
+                try stage.yieldReady();
             };
         }
     }
@@ -2636,20 +2645,12 @@ const Capture = struct {
                 buffers[i] = try job.prepared.buffer();
                 offsets[i] = job.prepared.output_byte_offset;
             }
-            var inputs: [8]CT = undefined;
-            var imported: usize = 0;
-            defer for (inputs[0..imported]) |part| self.cb.free(part);
             const input = if (contiguousPreparationSpans(buffers[0..jobs.len], offsets[0..jobs.len], span))
                 try MetalCompute.importVideoBufferSpan(self.cb, buffers[0], offsets[0], rows * jobs.len * 768)
             else blk: {
-                const stacked = (try self.cb.allocUninitF32Shape(&.{ @intCast(rows * jobs.len), 768 })) orelse return error.UnsupportedPrimitiveOp;
-                errdefer self.cb.free(stacked);
-                for (jobs, 0..) |job, i| {
-                    inputs[i] = try MetalCompute.importVideoBufferSpan(self.cb, buffers[i], offsets[i], job.prepared.geometry.values());
-                    imported += 1;
-                    if (!try self.cb.copyRows2D(self.a, stacked, i * rows, inputs[i], 0, rows, 768)) return error.UnsupportedPrimitiveOp;
-                }
-                break :blk stacked;
+                var inputs: [8]@import("../ops/metal_compute.zig").VideoGatherInput = undefined;
+                for (jobs, 0..) |job, i| inputs[i] = .{ .device = .{ .buffer = buffers[i], .offset = offsets[i], .values = job.prepared.geometry.values() } };
+                break :blk try MetalCompute.gatherVideoInputs(self.cb, inputs[0..jobs.len], rows, 768);
             };
             defer self.cb.free(input);
             for (jobs, 0..) |*job, i| {
@@ -2701,10 +2702,9 @@ const Capture = struct {
             };
             const started = batch_clock.monotonicNs();
             const patches = jobs[first].patches.len;
-            const combined = try self.a.alloc(f32, patches * count);
-            defer self.a.free(combined);
-            for (jobs[first..][0..count], 0..) |job, index| @memcpy(combined[index * patches ..][0..patches], job.patches);
-            const input = try self.cb.fromFloat32Shape(combined, &.{ @intCast(combined.len / 768), 768 });
+            var inputs: [8]@import("../ops/metal_compute.zig").VideoGatherInput = undefined;
+            for (jobs[first..][0..count], 0..) |job, index| inputs[index] = .{ .host = job.patches };
+            const input = try MetalCompute.gatherVideoInputs(self.cb, inputs[0..count], patches / 768, 768);
             defer self.cb.free(input);
             const encoded = try self.encodeGpuAdmitted(input, options, count, true);
             defer self.cb.free(encoded.tensor);
@@ -2712,8 +2712,7 @@ const Capture = struct {
             if (!required or self.last_prepared) batch_policy.completedForPlan(true, options.width, options.height, count, batch_clock.monotonicNs() -| started, self.last_prepared);
             first += count;
             if (first < jobs.len) if (self.cb.embedding_stage) |stage| {
-                try stage.pause();
-                try stage.acquire();
+                try stage.yieldReady();
             };
         }
     }
@@ -5251,4 +5250,26 @@ test "embeddinggemma2 video decoder dependency uses continuation identity and wa
     waiter.aborted.store(false, .release);
     predecessor.finished.set(std.testing.io);
     try waiter.waitForDecoder();
+}
+
+test "embeddinggemma2 video idle CPU batch executes without waiting for another producer" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        fn upload(_: *anyopaque, _: []const f32, _: []const i32) !CT {
+            return error.ReadyCpuProjectionExecuted;
+        }
+    };
+    var vtable: ComputeBackend.VTable = undefined;
+    vtable.fromFloat32Shape = Fake.upload;
+    var marker: u8 = 0;
+    const cb = ComputeBackend{ .ptr = &marker, .vtable = &vtable };
+    var counts = [_]usize{ 0, 0 };
+    var capture = Capture{ .a = a, .cb = &cb, .track = undefined, .control = .{}, .output = &.{}, .frame_tokens = &counts, .selected = &.{ 0, 1 }, .native_batching = true, .native_limit = 2 };
+    try std.testing.expect(!try capture.flushNativeBeforeWait());
+    capture.native_pending[0] = .{ .slot = 0, .patches = try a.alloc(f32, 48 * 48 * 3), .options = .{ .width = 48, .height = 48, .matrix = .bt601 } };
+    capture.native_count = 1;
+    // Frame 1's producer has published nothing. Projection must start now,
+    // before any queue wait, despite the desired paired width of two.
+    try std.testing.expectError(error.ReadyCpuProjectionExecuted, capture.flushNativeBeforeWait());
+    try std.testing.expectEqual(@as(usize, 0), capture.native_count);
 }

@@ -1652,6 +1652,13 @@ pub const EmbeddingStageControl = struct {
     /// restores the composition envelope; zero retains only idle resources.
     workspace_fn: ?*const fn (*anyopaque, ?usize) anyerror!void = null,
     copy_fn: ?*const fn (*anyopaque, usize, u64) void = null,
+    /// A fenced ready-work boundary may keep its provider when uncontended.
+    yield_ready_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    pub fn yieldReady(self: *const @This()) !void {
+        if (self.yield_ready_fn) |run| return run(self.ptr);
+        try self.pause();
+        try self.acquire();
+    }
     pub fn workspace(self: *const @This(), bytes: ?usize) !void {
         if (self.workspace_fn) |run| try run(self.ptr, bytes);
     }

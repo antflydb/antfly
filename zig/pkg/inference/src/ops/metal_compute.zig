@@ -13,6 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Borrowed inputs remain owned by the caller until gathering completes.
+pub const VideoGatherInput = union(enum) {
+    host: []const f32,
+    device: struct { buffer: *anyopaque, offset: usize, values: usize },
+};
+
 const std = @import("std");
 const builtin = @import("builtin");
 const ml = @import("ml");
@@ -1860,6 +1866,38 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (cb.kind() != .metal) return error.UnsupportedVideoBackend;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         return metal_runtime.termite_metal_decode_runtime_device(self.provider_impl.raw_decode_runtime) orelse error.MetalRuntimeUnavailable;
+    }
+
+    /// One bounded GPU submission gathers exact host patches and/or ready
+    /// device spans. Native staging owners survive its completion fence.
+    pub fn gatherVideoInputs(cb: *const ops.ComputeBackend, sources: []const VideoGatherInput, rows: usize, cols: usize) !CT {
+        if (cb.kind() != .metal or sources.len == 0 or sources.len > 8 or rows == 0 or cols == 0) return error.InvalidTensorShape;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.decoderWorkspaceBusy()) return error.EmbeddingStageBusy;
+        const values = try std.math.mul(usize, rows, cols);
+        const bytes = try std.math.mul(usize, values, @sizeOf(f32));
+        var spans: [8]metal_runtime_mod.BufferGatherSource = undefined;
+        for (sources, 0..) |source, index| {
+            spans[index] = .{ .destination_offset = try std.math.mul(usize, index, bytes), .length = bytes };
+            switch (source) {
+                .host => |data| {
+                    if (data.len != values) return error.InvalidTensorShape;
+                    spans[index].host = data.ptr;
+                },
+                .device => |input| {
+                    if (input.values != values) return error.InvalidTensorShape;
+                    spans[index].device = input.buffer;
+                    spans[index].source_offset = input.offset;
+                },
+            }
+        }
+        const output_rows = std.math.cast(i32, try std.math.mul(usize, sources.len, rows)) orelse return error.InvalidTensorShape;
+        const output_cols = std.math.cast(i32, cols) orelse return error.InvalidTensorShape;
+        const output = (try cb.allocUninitF32Shape(&.{ output_rows, output_cols })) orelse return error.UnsupportedPrimitiveOp;
+        errdefer cb.free(output);
+        const target = toBuf(output).metal_tensor.?;
+        if (metal_runtime_mod.termite_metal_buffer_gather(self.provider_impl.raw_decode_runtime, target.deviceHandle().?, &spans, sources.len) != 0) return error.MetalBufferCopyFailed;
+        return output;
     }
 
     /// Retire request-local bindings before releasing the shared provider.
@@ -36096,6 +36134,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn videoDevice(_: *const ops.ComputeBackend) !*anyopaque {
         return error.UnsupportedVideoBackend;
     }
+    pub fn gatherVideoInputs(_: *const ops.ComputeBackend, _: []const VideoGatherInput, _: usize, _: usize) !CT {
+        return error.UnsupportedVideoBackend;
+    }
     pub fn embeddingStageLease(_: *const ops.ComputeBackend, _: bool) !void {}
     pub fn escapeEmbeddingStage(_: *const ops.ComputeBackend, _: CT) !CT {
         return error.UnsupportedEmbeddingStage;
@@ -47781,4 +47822,61 @@ test "embeddinggemma2 video Metal projection writes persistent output across fra
     const values = try cb.toFloat32(view, a);
     defer a.free(values);
     try std.testing.expectEqualSlices(f32, &.{ 18, 13 }, values);
+}
+
+test "embeddinggemma2 video Metal gather fences host device and mixed spans once" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.MetalUnavailable;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.initWithIo(a, &store, null, std.testing.io);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const telemetry = @import("../backends/metal_telemetry.zig");
+    const initial = telemetry.snapshot(true)[6];
+    const source = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 3, 2 }));
+    defer cb.free(source);
+    // Drain the source upload's asynchronous diagnostics before measuring.
+    var polls: usize = 0;
+    while (telemetry.snapshot(true)[6] == initial and polls < 2000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    var retained = (try MetalCompute.retainDenseDeviceTensor(source)).?;
+    defer retained.deinit();
+    const first = VideoGatherInput{ .device = .{ .buffer = retained.deviceHandle().?, .offset = retained.deviceByteOffset() + 2 * 4, .values = 2 } };
+    const second = VideoGatherInput{ .device = .{ .buffer = retained.deviceHandle().?, .offset = retained.deviceByteOffset(), .values = 2 } };
+    const host = VideoGatherInput{ .host = &.{ 91, -17 } };
+    const cases = [_][2]VideoGatherInput{ .{ host, host }, .{ first, second }, .{ host, first } };
+    const expected = [_][4]f32{ .{ 91, -17, 91, -17 }, .{ 3, 4, 1, 2 }, .{ 91, -17, 3, 4 } };
+    for (cases, expected) |inputs, wanted| {
+        const before = telemetry.snapshot(true);
+        const gathered = try MetalCompute.gatherVideoInputs(&cb, &inputs, 1, 2);
+        defer cb.free(gathered);
+        polls = 0;
+        while (telemetry.snapshot(true)[6] == before[6] and polls < 2000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        const after = telemetry.snapshot(true);
+        try std.testing.expectEqual(before[6] + 1, after[6]);
+        var hosts: u64 = 0;
+        for (inputs) |input| hosts += @intFromBool(input == .host);
+        try std.testing.expectEqual(before[0] + hosts * 8, after[0]);
+        try std.testing.expectEqual(before[4] + (2 - hosts) * 8, after[4]);
+        const values = try cb.toFloat32(gathered, a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &wanted, values);
+        // Drain readback completion so the next gather has an isolated count.
+        polls = 0;
+        while (telemetry.snapshot(true)[6] < after[6] + 1 and polls < 2000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectError(error.InvalidTensorShape, MetalCompute.gatherVideoInputs(&cb, &.{host}, 2, 2));
+    const before_invalid = telemetry.snapshot(true)[6];
+    var invalid = first;
+    invalid.device.offset = std.math.maxInt(usize);
+    try std.testing.expectError(error.MetalBufferCopyFailed, MetalCompute.gatherVideoInputs(&cb, &.{invalid}, 1, 2));
+    try std.testing.expectEqual(before_invalid, telemetry.snapshot(true)[6]);
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    errdefer cb.decoderRuntimeCancelFrame() catch {};
+    try std.testing.expectError(error.EmbeddingStageBusy, MetalCompute.gatherVideoInputs(&cb, &.{host}, 1, 2));
+    try cb.decoderRuntimeSubmitAndWaitFrame();
 }

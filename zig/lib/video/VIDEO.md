@@ -1069,6 +1069,19 @@ spans keep the direct import path. When no pending job is ready, producer public
 and native GPU completion wake the same event immediately; a bounded timeout only
 checks cancellation while the model gate is released. Preparation destruction
 unregisters completion notification and fences any callback using that event.
+Ready Metal waves retain request-local bindings while their execution FIFO has no
+queued peer. Every completed wave checks contention; a peer receives the next
+handoff. Empty ready sets still retire the provider before waiting, and memory
+reclamation retains its explicit retirement boundary. Already-published headers
+do not force a retirement. Composition uses the same contention-aware boundary.
+Host-only, mixed and noncontiguous device batches gather directly into their
+admitted private input in one GPU command/fence. Native Shared staging owns each
+host span until completion, avoiding a concatenated CPU patch table and per-frame
+upload/copy waits. The existing vision transient envelope covers patch staging;
+all source preparations remain owned until the gather completes. Contiguous
+all-device spans retain their direct import. Native CPU batching consumes all
+currently ready compatible work and flushes a partial batch before waiting for
+another producer, so a completed row can compose without a batch-fill delay.
 No end-to-end speedup is implied without paired completed-time measurements.
 
 Live validation optionally accepts a model preparation policy with a versioned

@@ -55,8 +55,15 @@ const StageLane = struct {
     hook: @import("../ops/ops.zig").EmbeddingStageControl = undefined,
     fn attach(self: *StageLane) void {
         if (self.cb.kind() != .metal or self.gate == null or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_STAGE_SCHEDULING")) return;
-        self.hook = .{ .ptr = self, .pause_fn = pause, .resume_fn = acquire, .cleanup_fn = cleanup, .workspace_fn = if (self.video_phases) workspace else null, .copy_fn = if (self.timings != null) copied else null };
+        self.hook = .{ .ptr = self, .pause_fn = pause, .resume_fn = acquire, .yield_ready_fn = yieldReady, .cleanup_fn = cleanup, .workspace_fn = if (self.video_phases) workspace else null, .copy_fn = if (self.timings != null) copied else null };
         self.cb.embedding_stage = &self.hook;
+    }
+    fn yieldReady(raw: *anyopaque) !void {
+        const self: *StageLane = @ptrCast(@alignCast(raw));
+        try self.control.check();
+        if (!self.active or !Scheduler.hasPeer(self.waiter)) return;
+        try pause(raw);
+        try acquire(raw);
     }
     fn pause(raw: *anyopaque) !void {
         const self: *StageLane = @ptrCast(@alignCast(raw));
@@ -1250,8 +1257,7 @@ pub fn embedVideos(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
             };
             if (encoded == null) if (item.ahead) |ahead| ahead.release();
             if (self.cb.embedding_stage) |stage| {
-                try stage.pause();
-                try stage.acquire();
+                try stage.yieldReady();
             }
         }
     };
@@ -5817,4 +5823,63 @@ test "embeddinggemma2 persistent composition packs completion order without copy
     const tests = @import("../ops/media_residency_test.zig");
     try tests.onNative(tests.noWeights, Fixture.check);
     try tests.onMetal(tests.noWeights, Fixture.check);
+}
+
+test "embeddinggemma2 video ready stage stays warm alone and hands off to a queued peer" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var scheduler = Scheduler{};
+    var gate: std.atomic.Mutex = .unlocked;
+    var marker: u8 = 0;
+    const session = Session{ .ptr = &marker, .vtable = &PhaseTestSession.vtable, .execution_gate = &gate, .cohort_scheduler = &scheduler };
+    const Fake = struct {
+        fn kind(_: *anyopaque) @import("../ops/ops.zig").BackendKind {
+            return .native;
+        }
+    };
+    var vtable: ComputeBackend.VTable = undefined;
+    vtable.backendKind = Fake.kind;
+    var cb = ComputeBackend{ .ptr = &marker, .vtable = &vtable };
+    var permit = RunPermit{ .session = session, .lease = null, .request = .{ .batch = 1, .sequence = 1, .workspace_bytes = 0, .output_bytes = 0 } };
+    var waiter = Scheduler.Waiter{};
+    try scheduler.enter(&waiter, &gate, .{});
+    var timings = MediaTimings{};
+    var lane = StageLane{ .session = session, .gate = &gate, .waiter = &waiter, .cb = &cb, .control = .{ .io = std.testing.io }, .permit = &permit, .idle_backend = 0, .timings = &timings };
+    try StageLane.yieldReady(&lane);
+    try StageLane.yieldReady(&lane);
+    try std.testing.expectEqual(@as(usize, 0), timings.stage_yields);
+    try std.testing.expectEqual(@as(usize, 0), timings.stage_acquisitions);
+    try std.testing.expect(waiter.acquired);
+    const Peer = struct {
+        session: Session,
+        gate: *std.atomic.Mutex,
+        canceled: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        fn cancel(raw: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.canceled.load(.acquire);
+        }
+        fn run(self: *@This()) void {
+            var next = Scheduler.Waiter{};
+            self.session.enterExecutionCohort(self.gate, .{ .io = std.testing.io, .cancellation = .{ .ptr = self, .is_cancelled_fn = cancel } }, &next) catch return;
+            defer Scheduler.leave(&next);
+            self.done.store(true, .release);
+        }
+    };
+    var peer = Peer{ .session = session, .gate = &gate };
+    const thread = try std.Thread.spawn(.{}, Peer.run, .{&peer});
+    defer {
+        peer.canceled.store(true, .release);
+        Scheduler.leave(&waiter);
+        thread.join();
+    }
+    var polls: usize = 0;
+    while (!Scheduler.hasPeer(&waiter) and polls < 2000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    try std.testing.expect(Scheduler.hasPeer(&waiter));
+    try StageLane.yieldReady(&lane);
+    try std.testing.expect(peer.done.load(.acquire));
+    try std.testing.expect(waiter.acquired);
+    try std.testing.expectEqual(@as(usize, 1), timings.stage_yields);
+    try std.testing.expectEqual(@as(usize, 1), timings.stage_acquisitions);
+    try StageLane.yieldReady(&lane);
+    try std.testing.expectEqual(@as(usize, 1), timings.stage_yields);
 }
