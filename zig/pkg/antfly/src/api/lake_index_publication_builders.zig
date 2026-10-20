@@ -1189,3 +1189,141 @@ test "external lake publication checkpoints park CPU and unwind failed durable s
     scheduler.max_io_workers = 0;
     try std.testing.expect(phase.capability() == null);
 }
+
+test "external lake publication adapters batch reverse statistics and text directories" {
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    const ordered = @import("lake_index_ordered_rows.zig");
+    const corpus = @import("lake_index_native_text.zig");
+    const directory = @import("lake_index_text_directory.zig");
+    const statistics = @import("lake_index_text_statistics.zig");
+    const Probe = struct {
+        var active: *@This() = undefined;
+        phase: PublicationIo,
+        original: stores.ArtifactStore,
+        peak_slots: usize = 0,
+        reads: usize = 0,
+        fn begin(raw: *anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.phase.execution.active);
+            self.peak_slots = @max(self.peak_slots, count);
+            try PublicationIo.begin(&self.phase, count);
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try PublicationIo.finish(&self.phase);
+        }
+        fn abort(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            PublicationIo.abort(&self.phase);
+        }
+        fn read(_: *anyopaque, a: A, id: []const u8, offset: u64, length: usize, token: Token) ![]u8 {
+            const self = active;
+            try std.testing.expect(!self.phase.execution.active);
+            try std.testing.expectEqual(@as(usize, 1), self.phase.execution.scheduler.io_workers);
+            self.reads += 1;
+            var competing: local.sql_parallel_scheduler.Execution = .{ .scheduler = self.phase.execution.scheduler, .bytes = 32 };
+            try competing.enter(std.testing.io);
+            competing.pause();
+            return self.original.getRangeAllocWithCancellationUsingAllocator(a, id, offset, length, token);
+        }
+        fn bounded(_: *anyopaque, a: A, id: []const u8, maximum: usize, token: Token) ![]u8 {
+            // Manifest reads use their complete-object port; the range probe
+            // above observes only the explicit publication page transport.
+            const bytes = try active.original.getAllocWithCancellationUsingAllocator(a, id, token);
+            errdefer a.free(bytes);
+            if (bytes.len > maximum) return error.ArtifactTooLarge;
+            return bytes;
+        }
+    };
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("publication-transport-adapters");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var original = fs.artifactStore();
+    original.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = 3, .max_bytes = 128 };
+    var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 32 };
+    defer execution.pause();
+    try execution.enter(std.testing.io);
+    var probe: Probe = .{ .phase = .{ .execution = &execution, .io = std.testing.io }, .original = original };
+    Probe.active = &probe;
+    const phase: stores.IoPhase = .{ .io = std.testing.io, .ptr = &probe, .max_parallel = 3, .begin = Probe.begin, .finish = Probe.finish, .abort = Probe.abort };
+    var vtable = original.vtable.*;
+    vtable.get_range_alloc_with_cancellation = Probe.read;
+    vtable.get_bounded_alloc_with_cancellation = Probe.bounded;
+    var store = original;
+    store.vtable = &vtable;
+    store.io_phase = &phase;
+    {
+        const reverse = try ordered.ReverseBuilder.create(a, &store, .none);
+        defer reverse.deinit();
+        for (0..6000) |ordinal| {
+            var key: [24]u8 = @splat(0);
+            std.mem.writeInt(u64, key[0..8], 6000 - ordinal, .big);
+            std.mem.writeInt(u64, key[16..24], ordinal, .big);
+            try reverse.add(&key);
+        }
+        const root = (try reverse.finish()).?;
+        try std.testing.expectEqual(@as(u64, 6000), root.records);
+        try std.testing.expect(probe.peak_slots > 1 and probe.peak_slots <= 3);
+        var cursor = try tree.Cursor.init(a, reverse.pages.store(), root, "", null);
+        defer cursor.deinit();
+        var ordinal: u64 = 0;
+        while (try cursor.next()) |record| : (ordinal += 1) try std.testing.expectEqual(ordinal, std.mem.readInt(u64, record.key[8..16], .big));
+        try std.testing.expectEqual(@as(u64, 6000), ordinal);
+        try std.testing.expect(probe.reads > 0);
+    }
+    {
+        probe.peak_slots = 0;
+        var writer = local.segment.SegmentWriter.init(a);
+        defer writer.deinit();
+        var text = local.section_inverted.InvertedIndexBuilder.init(a, .{});
+        defer text.deinit();
+        try writer.addStoredDoc("one", "{}");
+        for (0..4096) |ordinal| {
+            var buffer: [128]u8 = undefined;
+            const term = try std.fmt.bufPrint(&buffer, "term-{d:0>4}-long-enough-to-span-multiple-statistics-pages", .{ordinal});
+            try text.addDocumentSingle(0, term, 1, 4096);
+        }
+        const inverted = try text.build();
+        defer a.free(inverted);
+        try writer.addSection(try writer.addField("body"), .inverted_text, inverted);
+        const bytes = try writer.build();
+        defer a.free(bytes);
+        const summary = (try statistics.publishSegment(a, &store, bytes, .none)).?;
+        try std.testing.expectEqual(@as(u64, 4096), summary.records);
+        try std.testing.expect(probe.peak_slots > 1 and probe.peak_slots <= 3);
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const out = arena.allocator();
+        const groups = try out.alloc(corpus.FileGroup, 256);
+        const refs = try out.alloc(@import("lake_index_aggregate_artifact.zig").ChunkRef, groups.len);
+        const records = try out.alloc(directory.FileRecord, groups.len);
+        for (groups, refs, records, 0..) |*group, *ref, *record, ordinal| {
+            group.* = .{ .file = .{ .id = try std.fmt.allocPrint(out, "file-{d}", .{ordinal}), .digest = @splat(1) }, .segments = &.{} };
+            ref.* = try corpus.publishFileManifest(a, out, &store, group.*, .none);
+            record.* = .{ .file = group.file, .manifest = ref.* };
+        }
+        probe.peak_slots = 0;
+        const roots = try directory.publish(a, &store, groups, refs, &.{}, &.{}, .{}, .none, std.testing.io);
+        try std.testing.expect(probe.peak_slots > 1 and probe.peak_slots <= 3);
+        probe.peak_slots = 0;
+        const streamed = try directory.publishManifests(a, &store, refs, &.{}, .{}, original.upload_scope.?.domain, .none, std.testing.io);
+        try std.testing.expect(roots.files.?.eql(streamed.files.?));
+        try std.testing.expect(probe.peak_slots > 1 and probe.peak_slots <= 3);
+        probe.peak_slots = 0;
+        const checkpoints = (try directory.publishFileRecords(a, &store, records, &.{}, null, .none, std.testing.io)).?;
+        try std.testing.expect(roots.files.?.eql(checkpoints));
+        try std.testing.expect(probe.peak_slots > 1 and probe.peak_slots <= 3);
+        probe.reads = 0;
+        const updated = (try directory.publishFileRecords(a, &store, &.{}, records[0..1], checkpoints, .none, std.testing.io)).?;
+        try std.testing.expectEqual(@as(u64, 255), updated.records);
+        try std.testing.expect(probe.reads > 0);
+    }
+    try std.testing.expect(execution.active);
+    try std.testing.expect(probe.phase.pending == null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+}

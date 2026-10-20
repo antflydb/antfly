@@ -3257,3 +3257,20 @@ physical-file publishers, ordered payload identities, exhausted upload budgets
 on unchanged refresh, required inline execution, and injected partial upload
 failure. Page-store checks cover batch forwarding through the cache, failed and
 canceled resumption, and a competing CPU operator running during a page read.
+
+Physical capture recognizes the build working-set allocator through synchronized
+worker wrappers, as well as SQL budgets. Its width follows current headroom:
+the production-allocator regression admits three chunks with 8 MiB available,
+then two with only 1 MiB available, and measures physical-file upload overlap
+independently from byte-backed publication. Unknown allocator chains and required
+inline execution retain the single-chunk fallback.
+
+The initial ordered reverse tree, per-segment text summaries, durable document
+frequency and term-directory deltas, and text file/segment/routing directories
+also opt into publication transport. Their synchronous page reads park the
+owning execution; sorted page writes use bounded batches. Serving readers keep
+their independent scheduling. An adapter integration test exercises reverse
+coordinates, thousands of text terms, equivalent direct/manifest/checkpoint file
+directories, and incremental deletion with one CPU lane and three I/O slots.
+It checks batching, exact retained counts, CPU availability during page reads,
+and release of every I/O slot before the owner returns.

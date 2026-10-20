@@ -306,6 +306,7 @@ pub fn publish(a: A, store: *stores.ArtifactStore, groups: []const corpus.FileGr
     var reads: u64 = 0;
     var writes: u64 = 0;
     var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    pages.admitPublication();
     return update(a, pages.store(), groups, refs, removed, removed_refs, old, token, io);
 }
 /// Checkpoints need only compact file identities, never segment/routing trees.
@@ -315,6 +316,7 @@ pub fn publishFileRecords(a: A, store: *stores.ArtifactStore, records: []const F
     var reads: u64 = 0;
     var writes: u64 = 0;
     var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    pages.admitPublication();
     var check = token;
     const Check = struct {
         fn call(raw: *anyopaque) !void {
@@ -406,6 +408,7 @@ pub fn publishManifests(a: A, store: *stores.ArtifactStore, refs: []const Chunk,
     var reads: u64 = 0;
     var writes: u64 = 0;
     var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    pages.admitPublication();
     var check = token;
     const Check = struct {
         fn call(raw: *anyopaque) !void {

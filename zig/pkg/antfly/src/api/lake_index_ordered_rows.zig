@@ -190,6 +190,7 @@ pub const ReverseBuilder = struct {
         const self = try a.create(ReverseBuilder);
         self.* = .{ .a = a, .pages = undefined, .builder = undefined };
         self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
+        self.pages.admitPublication();
         var storage = self.pages.store();
         storage.reduce = @import("lake_index_predicate_ranges.zig").reduce;
         self.builder = .{ .alloc = a, .store = storage };

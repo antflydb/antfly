@@ -221,6 +221,7 @@ pub fn publishSegmentWithIo(a: A, store: *stores.ArtifactStore, bytes: []const u
     var reads: u64 = 0;
     var writes: u64 = 128 * 1024 * 1024;
     var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .io = io };
+    pages.admitPublication();
     return tree.buildSortedWithOptions(a, pages.store(), &source, .{ .target_bytes = tree.bulk_target_page_bytes });
 }
 

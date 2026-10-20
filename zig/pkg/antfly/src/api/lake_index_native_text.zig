@@ -921,6 +921,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var df_writes: u64 = 0;
         const df_scope = store.upload_scope.?;
         var df_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = df_scope.domain, .attempt = df_scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &df_reads, .remaining_write_bytes = &df_writes, .streaming = true };
+        df_pages.admitPublication();
         var df = statistics.Builder.init(a, &df_manager);
         defer df.deinit();
         df.enableDurable(df_pages.store());
@@ -1096,6 +1097,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var stats_writes: u64 = 512 * 1024 * 1024;
         const scope = store.upload_scope.?;
         var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes, .streaming = true };
+        stats_pages.admitPublication();
         directory_builder.enableDurable(stats_pages.store());
         // A disabled optional directory has no complete base to update. Paged
         // seeds hold only changed maintenance groups, so stream unchanged
