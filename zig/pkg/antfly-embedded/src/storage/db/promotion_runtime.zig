@@ -46,6 +46,7 @@ const types = @import("types.zig");
 const runtime_callbacks = @import("runtime_callbacks.zig");
 const IndexManager = @import("catalog/index_manager.zig").IndexManager;
 const ResolverConfig = @import("catalog/index_manager.zig").ResolverConfig;
+const alias_curation = @import("entity_alias_curation.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -120,6 +121,10 @@ const PromotedRef = struct {
     label: []const u8,
     canonical_name: []const u8,
     alias: []const u8,
+    rendered_key: []const u8 = "",
+    suppressed: bool = false,
+    generation: u64 = 0,
+    scope: []const u8 = "",
 };
 
 /// An admitted promotion retains its exact immutable batch until the remote
@@ -140,7 +145,7 @@ fn promotedAlias(e: resolver_lib.ResolvedEntity) []const u8 {
 }
 
 fn promotedRefMatches(previous: PromotedRef, e: resolver_lib.ResolvedEntity) bool {
-    return std.mem.eql(u8, previous.table, e.doc_ref.table) and
+    return !previous.suppressed and std.mem.eql(u8, previous.table, e.doc_ref.table) and
         std.mem.eql(u8, previous.key, e.doc_ref.key) and
         (if (previous.storage_table) |physical|
             if (e.doc_ref.storage_table) |current| std.mem.eql(u8, physical, current) else false
@@ -148,7 +153,8 @@ fn promotedRefMatches(previous: PromotedRef, e: resolver_lib.ResolvedEntity) boo
             e.doc_ref.storage_table == null) and
         std.mem.eql(u8, previous.label, e.label) and
         std.mem.eql(u8, previous.canonical_name, e.canonical_name) and
-        std.mem.eql(u8, previous.alias, promotedAlias(e));
+        std.mem.eql(u8, previous.alias, promotedAlias(e)) and
+        std.mem.eql(u8, previous.rendered_key, e.rendered_key);
 }
 
 fn parsePromotedKeysState(a: Allocator, raw: []const u8) !std.StringArrayHashMapUnmanaged(PromotedRef) {
@@ -159,12 +165,12 @@ fn parsePromotedKeysState(a: Allocator, raw: []const u8) !std.StringArrayHashMap
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .array) return error.InvalidPromotionReceipt;
         const fields = entry.value_ptr.array.items;
-        if (fields.len != 6) return error.InvalidPromotionReceipt;
+        if (fields.len != 6 and fields.len != 7 and fields.len != 9 and fields.len != 10) return error.InvalidPromotionReceipt;
         var all_strings = true;
         for (fields[0..2]) |field| {
             if (field != .string) all_strings = false;
         }
-        for (fields[3..]) |field| {
+        for (fields[3..@min(fields.len, 7)]) |field| {
             if (field != .string) all_strings = false;
         }
         if (!all_strings or (fields[2] != .string and fields[2] != .null)) return error.InvalidPromotionReceipt;
@@ -175,12 +181,16 @@ fn parsePromotedKeysState(a: Allocator, raw: []const u8) !std.StringArrayHashMap
             .label = fields[3].string,
             .canonical_name = fields[4].string,
             .alias = fields[5].string,
+            .rendered_key = if (fields.len >= 7) fields[6].string else "",
+            .suppressed = if (fields.len >= 9) if (fields[7] == .bool) fields[7].bool else return error.InvalidPromotionReceipt else false,
+            .generation = if (fields.len >= 9) if (fields[8] == .integer and fields[8].integer >= 0) @intCast(fields[8].integer) else return error.InvalidPromotionReceipt else 0,
+            .scope = if (fields.len == 10) if (fields[9] == .string) fields[9].string else return error.InvalidPromotionReceipt else "",
         });
     }
     return map;
 }
 
-fn stringifyPromotedKeysState(a: Allocator, entities: []const resolver_lib.ResolvedEntity, prior: *const std.StringArrayHashMapUnmanaged(PromotedRef)) ![]u8 {
+fn stringifyPromotedKeysState(a: Allocator, entities: []const resolver_lib.ResolvedEntity, prior: *const std.StringArrayHashMapUnmanaged(PromotedRef), generation: u64, scope: ?[]const u8) ![]u8 {
     var state: std.json.ObjectMap = .empty;
     for (entities) |e| {
         // Review is a temporary decision, not proof that an earlier remote
@@ -188,14 +198,20 @@ fn stringifyPromotedKeysState(a: Allocator, entities: []const resolver_lib.Resol
         // exists, so a later accepted re-key still retires its old document.
         // Truly removed mentions drop out, keeping state bounded by the
         // current artifact rather than an ever-growing identity history.
-        const ref: PromotedRef = if (isPromotableDecision(e.decision) and e.canonical_name.len > 0) .{
+        var ref: PromotedRef = if (isPromotableDecision(e.decision) and e.canonical_name.len > 0) .{
             .table = e.doc_ref.table,
             .key = e.doc_ref.key,
             .storage_table = e.doc_ref.storage_table,
             .label = e.label,
             .canonical_name = e.canonical_name,
             .alias = promotedAlias(e),
+            .rendered_key = e.rendered_key,
         } else prior.get(e.local_id) orelse continue;
+        if (e.decision == .suppressed or isPromotableDecision(e.decision)) {
+            ref.suppressed = e.decision == .suppressed;
+            if (scope != null or e.rendered_key.len > 0 or ref.rendered_key.len > 0) ref.generation = generation;
+            if (scope) |value| ref.scope = value;
+        }
         var fields = std.json.Array.init(a);
         try fields.append(.{ .string = ref.table });
         try fields.append(.{ .string = ref.key });
@@ -203,6 +219,12 @@ fn stringifyPromotedKeysState(a: Allocator, entities: []const resolver_lib.Resol
         try fields.append(.{ .string = ref.label });
         try fields.append(.{ .string = ref.canonical_name });
         try fields.append(.{ .string = ref.alias });
+        if (ref.rendered_key.len > 0 or ref.suppressed or ref.scope.len > 0) {
+            try fields.append(.{ .string = ref.rendered_key });
+            try fields.append(.{ .bool = ref.suppressed });
+            try fields.append(.{ .integer = @intCast(ref.generation) });
+            if (ref.scope.len > 0) try fields.append(.{ .string = ref.scope });
+        }
         try state.put(a, e.local_id, .{ .array = fields });
     }
     return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = state }, .{});
@@ -217,10 +239,47 @@ fn buildMergedTombstoneDocAlloc(alloc: Allocator, previous_table: []const u8, e:
     }, .{});
 }
 
+pub const source_identity_key = "\x00\x00__metadata__:resolver_source_identity_v1";
+
+fn curationScope(a: Allocator, store: resolver_lib.ArtifactStore, name: []const u8) ![]const u8 {
+    const namespace = try store.get(a, &internal_keys.identity_namespace_key);
+    const source = if (namespace != null and namespace.?.len >= 8 and std.mem.readInt(u64, namespace.?[0..8], .big) != 0)
+        namespace.?[0..8]
+    else
+        (try store.get(a, source_identity_key)) orelse identity: {
+            var random: [16]u8 = undefined;
+            try std.Options.debug_io.randomSecure(&random);
+            try store.put(source_identity_key, &random);
+            break :identity try a.dupe(u8, &random);
+        };
+    return hexFingerprint(a, .{ source, name });
+}
+
+fn hexFingerprint(a: Allocator, value: anytype) ![]const u8 {
+    const digest = try resolver_lib.fingerprint(a, value);
+    return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+}
+
+fn controlled(a: Allocator, raw: []const u8, scope: []const u8, origin: []const u8, alias: []const u8, generation: u64, curation_revision: u64, action: @FieldType(alias_curation.Control, "action"), restore: bool, suppressed: ?bool) ![]const u8 {
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+    const instruction: alias_curation.Control = .{
+        .scope = scope,
+        .owner = try hexFingerprint(a, .{ scope, origin, alias }),
+        .alias = alias,
+        .revision = generation,
+        .curation_revision = curation_revision,
+        .action = action,
+        .restore = restore,
+        .suppressed = suppressed,
+    };
+    try value.object.put(a, alias_curation.control_field, try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, instruction, .{}), .{}));
+    return std.json.Stringify.valueAlloc(a, value, .{});
+}
+
 fn isPromotableDecision(decision: resolver_lib.Decision) bool {
     return switch (decision) {
         .new, .match => true,
-        .review => false,
+        .review, .suppressed => false,
     };
 }
 
@@ -274,6 +333,7 @@ fn processResolutionArtifactWithCatalog(
     var parsed = try resolver_lib.parseResolution(gpa, raw);
     defer parsed.deinit();
 
+    var curation_config: ?ResolverConfig = null;
     if (resolver_configs) |resolvers| {
         // DB catalog mutation holds this runtime's catch-up fence. Keep the
         // generation check and the sink call in that same critical section so
@@ -292,6 +352,7 @@ fn processResolutionArtifactWithCatalog(
                 // Activation advances the revision and durably backfills them,
                 // so consuming their journal records here cannot lose work.
                 if (!cfg.promote or cfg.replacement_index.len > 0) return 0;
+                if (cfg.suppress_json.len > 0 or cfg.curation_json.len > 0) curation_config = cfg;
                 current = true;
                 break;
             }
@@ -304,10 +365,53 @@ fn processResolutionArtifactWithCatalog(
     // transaction when it supports one).
     var prior = if (prior_raw) |state_raw| try parsePromotedKeysState(a, state_raw) else std.StringArrayHashMapUnmanaged(PromotedRef).empty;
     defer prior.deinit(a);
+    // Old receipts predate rendered-key provenance. Recover it from the
+    // recorded spelling where possible, so text suppression can retire a
+    // formerly minted document without marking a shared alias survivor.
+    if (curation_config) |cfg| {
+        var renderer = try resolver_lib.Resolver.initFromParts(a, cfg.table, cfg.key_template, .{}, cfg.type_must_match, "");
+        defer renderer.deinit();
+        for (prior.values()) |*ref| if (ref.rendered_key.len == 0) {
+            ref.rendered_key = renderer.renderKeyAlloc(a, .{ .text = ref.alias, .label = ref.label, .local_id = "" }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => "",
+            };
+        };
+    }
+    const scope: ?[]const u8 = if (curation_config) |cfg| enabled: {
+        if (!try sink.supportsCuration()) return error.EntityCurationUnavailable;
+        break :enabled try curationScope(a, store, cfg.name);
+    } else null;
 
     var entries = std.ArrayListUnmanaged(EntityUpsert).empty;
     var promotable_count: usize = 0;
     for (parsed.entities) |e| {
+        // A rejected mention removes its source graph contribution, not the
+        // canonical entity/alias shared by other mentions. Global key/text
+        // suppression below owns destination cleanup and scoped retirement.
+        if (e.decision == .suppressed and e.suppression_reason == .curator) continue;
+        if (scope) |owner_scope| if (e.decision == .suppressed) {
+            const previous = prior.get(e.local_id);
+            if (previous) |ref| {
+                if (ref.suppressed and ref.generation == parsed.config_generation and std.mem.eql(u8, ref.scope, owner_scope)) continue;
+                try entries.append(a, .{
+                    .table = ref.table,
+                    .storage_table = ref.storage_table,
+                    .key = ref.key,
+                    .doc_json = try controlled(a, "{}", if (ref.scope.len > 0) ref.scope else owner_scope, ref.rendered_key, ref.alias, parsed.config_generation, curation_config.?.curation_revision, .remove, false, if (ref.scope.len > 0 and !std.mem.eql(u8, ref.scope, owner_scope)) false else if (std.mem.eql(u8, ref.key, ref.rendered_key)) true else null),
+                    .skip_if_missing = true,
+                });
+            }
+            const origin = if (e.rendered_key.len > 0) e.rendered_key else if (previous) |ref| ref.rendered_key else "";
+            if (origin.len > 0 and (previous == null or !std.mem.eql(u8, previous.?.key, origin) or !std.mem.eql(u8, previous.?.scope, owner_scope))) try entries.append(a, .{
+                .table = e.doc_ref.table,
+                .storage_table = e.doc_ref.storage_table,
+                .key = origin,
+                .doc_json = try controlled(a, "{}", owner_scope, origin, e.surface_form, parsed.config_generation, curation_config.?.curation_revision, .remove, false, true),
+                .skip_if_missing = true,
+            });
+            continue;
+        };
         if (!isPromotableDecision(e.decision)) continue;
         // Need at least a canonical name to mint/merge a meaningful entity.
         if (e.canonical_name.len == 0) continue;
@@ -319,6 +423,9 @@ fn processResolutionArtifactWithCatalog(
             else
                 e.doc_ref.storage_table == null;
             if (same_logical_key and same_storage_table) {
+                if (scope) |owner_scope| if (previous.scope.len > 0 and !std.mem.eql(u8, previous.scope, owner_scope)) {
+                    try entries.append(a, .{ .table = previous.table, .storage_table = previous.storage_table, .key = previous.key, .doc_json = try controlled(a, "{}", previous.scope, previous.rendered_key, previous.alias, parsed.config_generation, curation_config.?.curation_revision, .remove, false, false), .skip_if_missing = true });
+                };
                 // The same key with the same canonical document is a
                 // byte-stable replay (a retried resolution window
                 // re-emits its artifact when the handoff marker did not
@@ -326,7 +433,7 @@ fn processResolutionArtifactWithCatalog(
                 // committed, so re-upserting adds nothing. Avoid a remote
                 // write even though the sink's live transform is safe to
                 // replay across a curator redirect.
-                if (promotedRefMatches(previous, e)) continue;
+                if (promotedRefMatches(previous, e) and (scope == null or previous.generation == parsed.config_generation and std.mem.eql(u8, previous.scope, scope.?))) continue;
             } else if (same_logical_key and previous.storage_table != null and e.doc_ref.storage_table != null) {
                 // A physical table move with the same logical key cannot use
                 // a redirect: that would point back to the old document.
@@ -338,29 +445,49 @@ fn processResolutionArtifactWithCatalog(
                     .delete = true,
                 });
             } else if (!same_logical_key) {
-                // A mention that previously promoted a DIFFERENT key in
-                // the same table has re-keyed (compositional identity
-                // following a merge): tombstone the old document with a
-                // merged_into redirect so it never lingers as a dead
-                // node, in the same atomic batch as the survivor's
-                // upsert.
-                try entries.append(a, .{
-                    .table = previous.table,
-                    .storage_table = previous.storage_table,
-                    .key = previous.key,
-                    .doc_json = try buildMergedTombstoneDocAlloc(a, previous.table, e),
-                });
+                const already_redirected = if (previous.rendered_key.len > 0)
+                    !std.mem.eql(u8, previous.key, previous.rendered_key)
+                else if (e.rendered_key.len > 0)
+                    !std.mem.eql(u8, previous.key, e.rendered_key)
+                else
+                    false;
+                if (scope != null and (already_redirected or e.identity_restored)) {
+                    try entries.append(a, .{
+                        .table = previous.table,
+                        .storage_table = previous.storage_table,
+                        .key = previous.key,
+                        .doc_json = try controlled(a, "{}", if (previous.scope.len > 0) previous.scope else scope.?, previous.rendered_key, previous.alias, parsed.config_generation, curation_config.?.curation_revision, .remove, false, null),
+                        .skip_if_missing = true,
+                    });
+                } else {
+                    // A mention that previously promoted a DIFFERENT key in
+                    // the same table has re-keyed (compositional identity
+                    // following a merge): tombstone the old document with a
+                    // merged_into redirect so it never lingers as a dead
+                    // node, in the same atomic batch as the survivor's
+                    // upsert.
+                    try entries.append(a, .{
+                        .table = previous.table,
+                        .storage_table = previous.storage_table,
+                        .key = previous.key,
+                        .doc_json = if (scope) |owner_scope| try controlled(a, try buildMergedTombstoneDocAlloc(a, previous.table, e), owner_scope, previous.rendered_key, previous.alias, parsed.config_generation, curation_config.?.curation_revision, .redirect, false, false) else try buildMergedTombstoneDocAlloc(a, previous.table, e),
+                    });
+                }
             }
         }
+        if (scope) |owner_scope| if (e.rendered_key.len > 0 and !std.mem.eql(u8, e.rendered_key, e.doc_ref.key)) {
+            const patch = if (e.redirected_from != null) try buildMergedTombstoneDocAlloc(a, e.doc_ref.table, e) else "{}";
+            try entries.append(a, .{ .table = e.doc_ref.table, .storage_table = e.doc_ref.storage_table, .key = e.rendered_key, .doc_json = try controlled(a, patch, owner_scope, e.rendered_key, e.surface_form, parsed.config_generation, curation_config.?.curation_revision, .redirect, false, false), .skip_if_missing = true });
+        };
         try entries.append(a, .{
             .table = e.doc_ref.table,
             .storage_table = e.doc_ref.storage_table,
             .key = e.doc_ref.key,
-            .doc_json = try buildEntityDocAlloc(a, e),
+            .doc_json = if (scope) |owner_scope| try controlled(a, try buildEntityDocAlloc(a, e), owner_scope, e.rendered_key, promotedAlias(e), parsed.config_generation, curation_config.?.curation_revision, .add, e.identity_restored, false) else try buildEntityDocAlloc(a, e),
         });
     }
     if (entries.items.len == 0 and promotable_count == prior.count()) return 0;
-    const state_value = try stringifyPromotedKeysState(a, parsed.entities, &prior);
+    const state_value = try stringifyPromotedKeysState(a, parsed.entities, &prior, parsed.config_generation, scope);
     if (entries.items.len == 0) {
         // Every remaining mention was a byte-stable replay, but the artifact
         // itself may have shrunk. Remove vanished mentions while retaining

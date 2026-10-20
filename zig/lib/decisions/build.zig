@@ -21,3 +21,16 @@ pub fn create(b: *std.Build, root: std.Build.LazyPath) *std.Build.Module {
     if (b.modules.get("antfly_decisions")) |existing| return existing;
     return b.addModule("antfly_decisions", .{ .root_source_file = root });
 }
+
+const WireBinding = struct { generator: *std.Build.Module, module: *std.Build.Module };
+var wire_bindings: std.ArrayList(WireBinding) = .empty;
+
+/// Wire types embed GeneratorConfig. Reuse their source identity within one
+/// dependency graph, without mixing native and WASM generator modules.
+pub fn createOpenApi(b: *std.Build, root: std.Build.LazyPath, generator: *std.Build.Module) *std.Build.Module {
+    for (wire_bindings.items) |binding| if (binding.generator == generator) return binding.module;
+    const module = b.createModule(.{ .root_source_file = root });
+    module.addImport("antfly_generating_openapi", generator);
+    wire_bindings.append(b.allocator, .{ .generator = generator, .module = module }) catch @panic("OOM");
+    return module;
+}

@@ -24,6 +24,11 @@ pub const identity_namespace: u8 = 0x03;
 pub const replay_all_kind: u8 = 0xfe;
 
 pub const primary_kind: u8 = 0x10;
+const group_identity = @import("db/group_source_identity.zig");
+pub const group_source_primary_kind = group_identity.primary_kind;
+pub const group_source_reverse_kind = group_identity.reverse_kind;
+pub const group_source_outbox_kind = group_identity.outbox_kind;
+pub const group_source_metadata_kind = group_identity.metadata_kind;
 pub const ttl_kind: u8 = 0x11;
 pub const relational_row_kind: u8 = 0x12;
 /// One reverse ownership record per document/physical relational index.
@@ -433,7 +438,7 @@ pub fn documentKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     var key = try alloc.alloc(u8, 1 + encodedComponentLen(doc_key) + 1);
     key[0] = user_namespace;
     const pos = 1 + encodeComponent(key[1..], doc_key);
-    key[pos] = primary_kind;
+    key[pos] = if (group_identity.isAnchor(doc_key)) group_source_primary_kind else primary_kind;
     return key;
 }
 
@@ -1740,6 +1745,23 @@ pub fn isRelationalRowKey(key: []const u8) bool {
 
 pub fn isStoredDocumentRowKey(key: []const u8) bool {
     return isPrimaryDocumentKey(key) or isRelationalRowKey(key);
+}
+
+/// Private unit sources participate in artifact authority and range ownership,
+/// while public row scans, identity counters and match_all keep using the
+/// primary/relational-only predicate above.
+pub fn isGroupSourceRowKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    return term + 3 == key.len and key[term + 2] == group_source_primary_kind;
+}
+pub fn isStoredSourceRowKey(key: []const u8) bool {
+    return isStoredDocumentRowKey(key) or isGroupSourceRowKey(key);
+}
+pub fn decodeStoredSourceRowKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isStoredSourceRowKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    return try decodeBodyAlloc(alloc, key[1..term]);
 }
 
 pub fn isRelationalIndexReverseKey(key: []const u8) bool {

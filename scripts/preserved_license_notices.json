@@ -814,5 +814,11 @@
   },
   "zig/pkg/inference/src/ops/cuda/video_headers/dynlink_nvcuvid.h": {
     "file": "LICENSES/third-party/NV-Codec-NVIDIA-MIT.txt"
+  },
+  "zig/lib/extracting/src/unicode_tables.zig": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
+  },
+  "zig/lib/extracting/src/case_data.zig": {
+    "file": "LICENSES/third-party/Unicode-V3.txt"
   }
 }

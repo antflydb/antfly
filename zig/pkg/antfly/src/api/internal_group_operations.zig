@@ -201,7 +201,7 @@ fn validateHandoffReceiptLookup(input: LookupInput, request: operation.RequestCo
         input.key.len != 0 or input.consistency != .read_index or
         input.options.generation_handoff_install_read_index_certified or
         input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
-        input.options.relational_integrity_jobs_json.len != 0 or input.options.relational_index_status_json.len != 0 or
+        input.options.relational_integrity_jobs_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or
         input.options.relational_activation_json.len != 0 or input.options.fields.len != 0)
         return error.InvalidArgument;
 }
@@ -1078,7 +1078,7 @@ pub const Operations = struct {
             if (probe.value.transition_id != null) {
                 if (input.key.len != 0 or input.consistency != .read_index or input.options.restore_staging_scope != null or
                     input.options.include_primary_digest or input.options.relational_integrity_catalog or input.options.relational_integrity_action or
-                    input.options.relational_integrity_jobs_json.len != 0 or input.options.relational_index_status_json.len != 0 or input.options.relational_activation_json.len != 0 or input.options.fields.len != 0) return error.InvalidArgument;
+                    input.options.relational_integrity_jobs_json.len != 0 or input.options.group_source_query_json.len != 0 or input.options.relational_index_status_json.len != 0 or input.options.relational_activation_json.len != 0 or input.options.fields.len != 0) return error.InvalidArgument;
                 var scoped = std.json.parseFromSlice(@import("../raft/shard_ops.zig").TopologyReadRequest, alloc, input.options.relational_topology_json, .{}) catch return error.InvalidArgument;
                 defer scoped.deinit();
                 const ops = self.shard_ops orelse return error.NotFound;

@@ -604,6 +604,10 @@ fn waitForResolvedTransactionSyncWithCancellation(self: *DB, sync_level: types.S
     return .{ .value = self.waitForResolvedTransactionSyncWithCancellation(sync_level, sequence, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn waitForResolvedTransactionSyncTargetWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: *u64, phase: *u8, cancellation: types.CancellationToken) engine.Outcome(void) {
+    return .{ .value = self.waitForResolvedTransactionSyncTargetWithCancellation(sync_level, sequence, phase, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn captureRelationalStatementSnapshot(self: *DB) engine.Outcome(DB.RelationalStatementSnapshot) {
     return .{ .value = self.captureRelationalStatementSnapshot() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -1453,6 +1457,26 @@ fn listResolvers(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]@import("
     return .{ .value = self.listResolvers(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn curateResolverJsonAlloc(self: *DB, alloc: std.mem.Allocator, name: []const u8, request_json: []const u8) engine.Outcome([]u8) {
+    return .{ .value = self.curateResolverJsonAlloc(alloc, name, request_json) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn resolverCurationJsonAlloc(self: *DB, alloc: std.mem.Allocator, name: []const u8) engine.Outcome([]u8) {
+    return .{ .value = self.resolverCurationJsonAlloc(alloc, name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn resolverReviewsJsonAlloc(self: *DB, alloc: std.mem.Allocator, request_json: []const u8) engine.Outcome([]u8) {
+    return .{ .value = self.resolverReviewsJsonAlloc(alloc, request_json) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn listResolverIdentities(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig) {
+    return .{ .value = self.listResolverIdentities(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn consumeResolverMetadataDrop(self: *DB, alloc: std.mem.Allocator, identity: @import("db/resolver_curation.zig").MetadataIdentity) engine.Outcome(void) {
+    return .{ .value = self.consumeResolverMetadataDrop(alloc, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn pendingWorkStats(self: *DB) engine.Outcome(@import("db/core.zig").PendingWorkStats) {
     return .{ .value = self.pendingWorkStats() };
 }
@@ -1793,6 +1817,10 @@ fn writeResolveWritesForSchemaValidation(alloc: std.mem.Allocator, database: *@i
     return .{ .value = @import("write.zig").resolveWritesForSchemaValidation(alloc, database, base_writes, deletes, transforms) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn writeValidateGroupedSourceBatch(alloc: Allocator, database: *DB, writes: []const types.BatchWrite, deletes: []const []const u8, transforms: []const types.DocumentTransform) engine.Outcome(void) {
+    return .{ .value = @import("write.zig").validateGroupedSourceBatch(alloc, database, writes, deletes, transforms) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn writeValidateTableBatchAgainstLocalSchema(alloc: std.mem.Allocator, database: *@import("db/mod.zig").DB, writes: []const @import("db/mod.zig").types.BatchWrite, deletes: []const []const u8, transforms: []const @import("db/mod.zig").types.DocumentTransform) engine.Outcome(void) {
     return .{ .value = @import("write.zig").validateTableBatchAgainstLocalSchema(alloc, database, writes, deletes, transforms) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -2076,12 +2104,12 @@ comptime {
                 return @ptrCast(&@field(Exports, name));
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v24", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v28", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v24", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v28", .visibility = .hidden });
 }

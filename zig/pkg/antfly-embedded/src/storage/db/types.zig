@@ -336,6 +336,8 @@ pub const TransactionMutation = union(enum) {
 };
 
 pub const BatchRequest = struct {
+    /// Private ordered curator decision; never accepted from public batch JSON.
+    resolver_review: ?@import("resolver_review.zig").Command = null,
     /// Trusted ingress attaches a signed write principal and the admission
     /// instant after authenticating the live request. Replicas verify against
     /// that committed instant so delayed Raft replay is deterministic.
@@ -357,6 +359,8 @@ pub const BatchRequest = struct {
     online_source: ?@import("online_source_contract.zig").Command = null,
     /// Ordered complete artifact catalog; accepted only by private Raft ingress.
     artifact_catalog: ?@import("artifact_inventory.zig").Command = null,
+    /// Private grouped-source control; public batch JSON cannot populate it.
+    group_source: ?@import("group_source_contract.zig").Command = null,
     /// Exact producer result; only authenticated owner-leader Raft ingress.
     artifact_publication: ?@import("artifact_publication.zig").Command = null,
     /// Bounded authenticated upload stages for a large ordered publication.
@@ -602,6 +606,7 @@ pub const EnrichmentKind = enum {
     chunk,
     asset,
     embedding,
+    group,
 };
 
 pub const ArtifactKind = enum {
@@ -671,6 +676,8 @@ pub const ArtifactRef = struct {
 pub const EnrichmentConfig = struct {
     name: []const u8,
     kind: EnrichmentKind,
+    source: ?@import("group_sources.zig").Config = null,
+    prior_context: ?@import("group_sources.zig").PriorContext = null,
     field: []const u8 = "",
     template: []const u8 = "",
     source_artifact_name: []const u8 = "",
@@ -687,27 +694,25 @@ pub const EnrichmentConfig = struct {
     execution: ?EnrichmentExecutionConfig = null,
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
-        return .{
-            .name = try alloc.dupe(u8, cfg.name),
-            .kind = cfg.kind,
-            .field = if (cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
-            .template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
-            .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
-            .embedding_input = cfg.embedding_input,
-            .expected_dims = cfg.expected_dims,
-            .vector_space = if (cfg.vector_space.len > 0) try alloc.dupe(u8, cfg.vector_space) else "",
-            .chunk_size = cfg.chunk_size,
-            .chunk_overlap = cfg.chunk_overlap,
-            .chunker_json = if (cfg.chunker_json.len > 0) try alloc.dupe(u8, cfg.chunker_json) else "",
-            .full_text_index = cfg.full_text_index,
-            .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
-            .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
-            .neighbor_context = if (cfg.neighbor_context) |context| try EnrichmentNeighborContextConfig.clone(alloc, context) else null,
-            .execution = cfg.execution,
-        };
+        var out = cfg;
+        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json" }) |field| @field(out, field) = "";
+        out.source = null;
+        out.prior_context = null;
+        out.neighbor_context = null;
+        errdefer out.deinit(alloc);
+        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json" }) |field| {
+            const value = @field(cfg, field);
+            if (value.len > 0) @field(out, field) = try alloc.dupe(u8, value);
+        }
+        if (cfg.source) |source| out.source = try source.clone(alloc);
+        if (cfg.prior_context) |context| out.prior_context = try context.clone(alloc);
+        if (cfg.neighbor_context) |context| out.neighbor_context = try EnrichmentNeighborContextConfig.clone(alloc, context);
+        return out;
     }
 
     pub fn deinit(self: *EnrichmentConfig, alloc: Allocator) void {
+        if (self.source) |*source| source.deinit(alloc);
+        if (self.prior_context) |*context| context.deinit(alloc);
         alloc.free(self.name);
         if (self.field.len > 0) alloc.free(self.field);
         if (self.template.len > 0) alloc.free(self.template);
@@ -770,6 +775,14 @@ pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
     var hasher = std.hash.Wyhash.init(0x41454a4346470001);
     hashLengthPrefixedBytes(&hasher, cfg.name);
     hashLengthPrefixedBytes(&hasher, @tagName(cfg.kind));
+    if (cfg.source) |source| hasher.update(&source.semanticDigest());
+    if (cfg.prior_context) |context| {
+        hashLengthPrefixedBytes(&hasher, context.artifact);
+        hashLengthPrefixedBytes(&hasher, context.render);
+        hashU32(&hasher, context.max_items);
+        hashU32(&hasher, context.max_bytes);
+        hashU32(&hasher, context.horizon_segments);
+    }
     hashLengthPrefixedBytes(&hasher, cfg.field);
     hashLengthPrefixedBytes(&hasher, cfg.template);
     hashLengthPrefixedBytes(&hasher, cfg.source_artifact_name);
@@ -1425,6 +1438,8 @@ pub const LookupOptions = struct {
     relational_integrity_jobs_json: []const u8 = "",
     relational_activation_json: []const u8 = "",
     relational_index_status_json: []const u8 = "",
+    /// Authenticated private grouped-source control read.
+    group_source_query_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
     /// Local FK source-control capability. Never parsed from HTTP or encoded
     /// on the lookup wire; only the authenticated owner receiver sets it.
@@ -3488,12 +3503,16 @@ pub const ReplayStageStats = struct {
 
 pub const ResolverReplayDiagnostic = struct {
     name: []const u8 = "",
+    config_generation: u64 = 0,
+    effective_generation: u64 = 0,
+    curation_revision: u64 = 0,
     table: []const u8 = "",
     source_artifact: []const u8 = "",
     resolution_artifact: []const u8 = "",
 };
 
 pub const ResolverReplayDiagnostics = struct {
+    reresolve_pending: bool = false,
     resolver_count: u64 = 0,
     resolution_runtime_present: bool = false,
     resolution_worker_started: bool = false,

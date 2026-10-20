@@ -55,6 +55,8 @@ servers:
   - url: /db/v1
     description: Main API server
 tags:
+  - name: resolver_curation
+    description: Durable resolver identity correction, suppression, review and replay.
   - name: getting_started
     x-displayName: Getting Started
     description: |
@@ -18452,3 +18454,1840 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
+
+  /tables/{tableName}/resolvers:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: listResolvers
+      tags: [resolver_curation]
+      summary: list resolvers
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/resolvers/{resolverName}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: getResolver
+      tags: [resolver_curation]
+      summary: get resolver
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+    delete:
+      operationId: dropResolverIdentity
+      tags: [resolver_curation]
+      summary: drop resolver identity
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/resolvers/{resolverName}:render:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: renderResolverKey
+      tags: [resolver_curation]
+      summary: render resolver key
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverRenderRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverRenderResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/resolvers/{resolverName}:resolve:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: resolveResolverQuery
+      tags: [resolver_curation]
+      summary: resolve resolver query
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverResolveRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverResolveResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/resolvers/{resolverName}:namespace:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: setResolverNamespace
+      tags: [resolver_curation]
+      summary: set resolver namespace
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverNamespaceRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/resolvers/{resolverName}/redirects:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: listResolverRedirects
+      tags: [resolver_curation]
+      summary: list resolver redirects
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverRedirectList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+    post:
+      operationId: mergeResolverKeys
+      tags: [resolver_curation]
+      summary: merge resolver keys
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverMergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/resolvers/{resolverName}/redirects/{key}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+      - name: pin_distinct
+        in: query
+        schema: {type: boolean, default: false}
+    delete:
+      operationId: unmergeResolverKey
+      tags: [resolver_curation]
+      summary: unmerge resolver key
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/resolvers/{resolverName}/suppressions:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: listResolverSuppressions
+      tags: [resolver_curation]
+      summary: list resolver suppressions
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverSuppressionList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+    post:
+      operationId: suppressResolverKeys
+      tags: [resolver_curation]
+      summary: suppress resolver keys
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverSuppressionRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/resolvers/{resolverName}/suppressions/{key}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    delete:
+      operationId: unsuppressResolverKey
+      tags: [resolver_curation]
+      summary: unsuppress resolver key
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/resolvers/{resolverName}/reviews:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: cursor
+        in: query
+        schema: {type: string}
+      - name: limit
+        in: query
+        schema: {type: integer, minimum: 1, maximum: 256, default: 64}
+    get:
+      operationId: listResolverReviews
+      tags: [resolver_curation]
+      summary: list resolver reviews
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverReviewPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: reviewId
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: reviewResolverMention
+      tags: [resolver_curation]
+      summary: review resolver mention
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverReviewDecision"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/entities/{key}/redirects:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: listEntityResolverState
+      tags: [resolver_curation]
+      summary: list entity resolver state
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/entities/{key}:merge:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: mergeEntity
+      tags: [resolver_curation]
+      summary: merge entity
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/EntityMergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "207":
+          description: Per-source-table fan-out includes partial outcomes
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/entities/{key}:unmerge:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: unmergeEntity
+      tags: [resolver_curation]
+      summary: unmerge entity
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "207":
+          description: Per-source-table fan-out includes partial outcomes
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/entities/{key}:suppress:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: suppressEntity
+      tags: [resolver_curation]
+      summary: suppress entity
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "207":
+          description: Per-source-table fan-out includes partial outcomes
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /tables/{tableName}/entities/{key}:unsuppress:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: unsuppressEntity
+      tags: [resolver_curation]
+      summary: unsuppress entity
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "207":
+          description: Per-source-table fan-out includes partial outcomes
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: namespaceListResolvers
+      tags: [resolver_curation]
+      summary: list resolvers
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: namespaceGetResolver
+      tags: [resolver_curation]
+      summary: get resolver
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+    delete:
+      operationId: namespaceDropResolverIdentity
+      tags: [resolver_curation]
+      summary: drop resolver identity
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:render:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceRenderResolverKey
+      tags: [resolver_curation]
+      summary: render resolver key
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverRenderRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverRenderResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:resolve:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceResolveResolverQuery
+      tags: [resolver_curation]
+      summary: resolve resolver query
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverResolveRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverResolveResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:namespace:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceSetResolverNamespace
+      tags: [resolver_curation]
+      summary: set resolver namespace
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverNamespaceRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: namespaceListResolverRedirects
+      tags: [resolver_curation]
+      summary: list resolver redirects
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverRedirectList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+    post:
+      operationId: namespaceMergeResolverKeys
+      tags: [resolver_curation]
+      summary: merge resolver keys
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverMergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects/{key}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+      - name: pin_distinct
+        in: query
+        schema: {type: boolean, default: false}
+    delete:
+      operationId: namespaceUnmergeResolverKey
+      tags: [resolver_curation]
+      summary: unmerge resolver key
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: namespaceListResolverSuppressions
+      tags: [resolver_curation]
+      summary: list resolver suppressions
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverSuppressionList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+    post:
+      operationId: namespaceSuppressResolverKeys
+      tags: [resolver_curation]
+      summary: suppress resolver keys
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverSuppressionRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    delete:
+      operationId: namespaceUnsuppressResolverKey
+      tags: [resolver_curation]
+      summary: unsuppress resolver key
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: cursor
+        in: query
+        schema: {type: string}
+      - name: limit
+        in: query
+        schema: {type: integer, minimum: 1, maximum: 256, default: 64}
+    get:
+      operationId: namespaceListResolverReviews
+      tags: [resolver_curation]
+      summary: list resolver reviews
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverReviewPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: resolverName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: reviewId
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceReviewResolverMention
+      tags: [resolver_curation]
+      summary: review resolver mention
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverReviewDecision"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/ResolverMutationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: namespaceListEntityResolverState
+      tags: [resolver_curation]
+      summary: list entity resolver state
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceMergeEntity
+      tags: [resolver_curation]
+      summary: merge entity
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/EntityMergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "207":
+          description: Per-source-table fan-out includes partial outcomes
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unmerge:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceUnmergeEntity
+      tags: [resolver_curation]
+      summary: unmerge entity
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "207":
+          description: Per-source-table fan-out includes partial outcomes
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceSuppressEntity
+      tags: [resolver_curation]
+      summary: suppress entity
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "207":
+          description: Per-source-table fan-out includes partial outcomes
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unsuppress:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: key
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: namespaceUnsuppressEntity
+      tags: [resolver_curation]
+      summary: unsuppress entity
+      description: >-
+        Runtime curation is owned by the source table and resolver identity,
+        independent of graph index versions. Accepted changes replay through
+        bounded resolution and promotion journals. Repeating a request is safe.
+        Entity operations report each affected resolver; atomicity is per source
+        table, and partial outcomes must be retried. Render and resolve are reads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "resolvers.yaml#/components/schemas/ResolverUnmergeRequest"
+      responses:
+        "200":
+          description: Completed result
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "202":
+          description: Durably accepted; replay remains pending
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "207":
+          description: Per-source-table fan-out includes partial outcomes
+          content:
+            application/json:
+              schema:
+                $ref: "resolvers.yaml#/components/schemas/EntityCurationResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Curation revision, topology, or namespace conflict; inspect state before retrying
+        "429":
+          description: Resolver owner is busy; retry with backoff
+        "503":
+          description: Metadata or storage owner is unavailable; retry is safe
