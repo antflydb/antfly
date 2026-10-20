@@ -25,6 +25,12 @@ cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
 
+Source `488b54d1a194399c5a04490069be51547de92552` shares the durable reader
+epoch between local admission and capability negotiation. Stale readiness claims
+now fail before BEGIN; restart checks preserve rejection without a transaction
+or apply receipt. The focused coordinator/durable suites and immutable package
+consumer pass. Actual required mutation providers remain unwired.
+
 Source `090dc709dce3b77143bc5444f9013c7e1fd13625` adds independently funded
 current online status-owner preparation with bounded scheduling metadata,
 original expiry, adaptive admitted workspace and fresh metadata/quorum

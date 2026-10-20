@@ -4,6 +4,42 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Shared durable preparation readiness epochs (2026-10-20)
+
+Source `488b54d1a194399c5a04490069be51547de92552` fixes the readiness audit's
+post-merge mismatch: local required BEGIN needed reader epoch 10, while peer
+capability validation still accepted epoch 7. Catalog admission and negotiation
+now share an implementation-independent reader-epoch module. Each claimed
+minimum reader, permanent reader and catalog envelope must meet epoch 10.
+Main's generated-producer, grouped-source and namespace epochs remain 7, 8 and 9.
+No wire layout or native ABI changes, file rewrites or activation accompany this
+validation change. A shared threshold is not evidence that a provider is ready.
+
+Coordinator runtime checks reject all 60 stale claims across the three fields
+and both preparation modes before any BEGIN, producer, seal, decision or abort.
+Existing current-epoch negotiation and compatible higher-epoch checks pass.
+Durable protocol fixtures now use the merged required Raft gates 26, 27 and 28,
+a current valid catalog for witness invalidation, and the actual unsupported
+protocol bound. A separate persistent test rewrites an older catalog, reopens
+and rejects a new required BEGIN without creating its transaction or advancing
+an apply receipt. Accepted replay, bound-seal drift and restart behavior remain
+covered. The earlier two failed fixture assumptions are retained diagnostically;
+the final source passes all selected cases.
+
+`native-preparation-epoch-verified.json` binds 71/71 build steps, 110 coordinator
+cases, 46 companion cases and six durable protocol cases to 5258 source/schema
+hashes. Its immutable public package contains 4542 exact sources and passes all
+25 ReleaseSafe consumer steps. Generated errors and the storage control catalog
+match. Full Linux qualification remains waived, and the full linked storage-owner
+archive and actual cold-open controller remain unqualified.
+
+The whole goal is incomplete. Actual required capability/BEGIN/PREPARE/seal
+providers and independently funded original producers remain unwired. Providers
+must report observed durable readiness and migration evidence rather than fill
+claims from the shared constants. Fresh route authority, authenticated hidden
+owner preparation, coordinated activation, large frames, completion resource
+bundles and broader scheduler/fault scope also remain open.
+
 ## Storage controls repaired and current main merged (2026-10-20)
 
 Fixture repair `0f1653e4e120029ba8c3d9aa89c97ca677f5d931` and merge
