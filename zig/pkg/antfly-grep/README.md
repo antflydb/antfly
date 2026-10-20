@@ -3839,8 +3839,10 @@ ripgrep/PCRE2 compatibility or local-search throughput claim.
 Named-autocomplete semantics now participate in the physical generation's durable
 text-projection witness. Existing nonempty prefix-only generations are quarantined
 with `TextProjectionProvenanceMismatch` until explicitly rebuilt; reopening cannot
-silently relabel their postings. Unaffected analyzers keep their existing witness.
-The native upgrade regression creates real legacy terms, checks refusal, then
+silently relabel their postings. This also applies to unversioned named-analyzer
+generations already built with complete words: the old witness cannot prove
+which implementation produced their postings. Unaffected analyzers keep their
+existing witness. The native upgrade regression creates real legacy terms, checks refusal, then
 builds and reopens a private replacement containing complete short and long words.
 
 Retained membership expiry uses an indexed min-heap within the same 16 MiB budget.
@@ -3866,8 +3868,11 @@ force deterministic growth so Linux remapping differences cannot change their
 failure enumeration.
 
 `zig/lib/json/bench_value_strings.zig` isolates the two string paths with nine
-alternating standard/native samples and checked results. Its gains describe
-scanner throughput; complete-query timings must also include storage reads,
+alternating standard/native samples and checked results. On the shared Apple
+host, with this task's compilers paused, median standard/native ratios were
+14.83× for selected plain 4 KiB strings, 3.88× for skipped strings with 16 escapes,
+and 5.68× for skipped 128 KiB escaped strings. These ratios describe scanner
+throughput; complete-query timings must also include storage reads,
 matching, authorization and response work. The shared
 [design](../../../docs/design/logical-field-queries.md) documents the migration and
 dataflow contracts, including requirements for a future versioned stored-field
