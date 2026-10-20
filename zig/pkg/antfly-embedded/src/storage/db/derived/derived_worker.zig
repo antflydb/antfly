@@ -1770,7 +1770,7 @@ test "catchUpIndex subchunks one oversized full text record before advancing its
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 2048 };
-    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var capture = TestApplyCapture{ .alloc = alloc };
     defer capture.deinit();
@@ -1784,8 +1784,8 @@ test "catchUpIndex subchunks one oversized full text record before advancing its
         .{ .max_items_per_window = 2, .max_chunk_bytes = 512, .resource_manager = &manager },
     );
 
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
-    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 2048);
+    try resource_manager_mod.metadata_fixture.expectUsage(0, &manager, &.{&manager});
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 2048 + manager.identity_metadata_bytes);
     try std.testing.expectEqual(@as(usize, 1), stats.scanned_entries);
     try std.testing.expectEqual(@as(usize, 1), stats.applied_entries);
     try std.testing.expectEqual(@as(usize, 3), capture.call_count);
@@ -2100,7 +2100,7 @@ test "replay batch budget denial rolls back key ownership" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1 };
-    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     {
         var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 0);
@@ -2108,7 +2108,7 @@ test "replay batch budget denial rolls back key ownership" {
         try std.testing.expectError(error.ResourceBudgetExceeded, builder.appendRecord(.{ .changed_doc_keys = &.{"a"} }));
         try std.testing.expectEqual(@as(usize, 0), builder.changed_doc_keys.items.len);
     }
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try resource_manager_mod.metadata_fixture.expectUsage(0, &manager, &.{&manager});
 }
 
 test "catchUpIndex accounts shared decoding scratch and releases it after apply failure" {
@@ -2116,7 +2116,7 @@ test "catchUpIndex accounts shared decoding scratch and releases it after apply 
     var log = try change_journal_mod.Journal.open("budgeted-replay-scratch", testInMemoryJournalOpenOptions());
     defer log.close();
     try appendChangeJournalRecord(&log, alloc, .{ .sequence = 1, .changed_doc_keys = &.{"a"}, .target_hints = &.{.full_text} });
-    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var manager = try resource_manager_mod.metadata_fixture.init(.{});
     defer manager.deinit(alloc);
     const Consumer = struct {
         fn apply(ctx: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef) !bool {
@@ -2127,7 +2127,7 @@ test "catchUpIndex accounts shared decoding scratch and releases it after apply 
     };
     @import("antfly_test_error_logs").expectErrorLogs(2);
     try std.testing.expectError(error.InjectedApplyFailure, catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&log), .{ .name = "text", .kind = .full_text }, 0, &manager, Consumer.apply, .{ .resource_manager = &manager }));
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try resource_manager_mod.metadata_fixture.expectUsage(0, &manager, &.{&manager});
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }
 
@@ -2137,7 +2137,7 @@ test "catchUpIndex admits document descriptors during collection and progresses 
         for ([_]bool{ false, true }) |aggregate_limited| {
             var budgets = resource_manager_mod.Options.defaultBudgets();
             budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 1000, .hard_limit_bytes = if (aggregate_limited) 0 else 1000 };
-            var manager = resource_manager_mod.ResourceManager.init(.{
+            var manager = try resource_manager_mod.metadata_fixture.init(.{
                 .budgets = budgets,
                 .memory_budget = .{ .hard_limit_bytes = if (aggregate_limited) 1000 else 0 },
             });
@@ -2153,8 +2153,8 @@ test "catchUpIndex admits document descriptors during collection and progresses 
             try std.testing.expectEqual(@as(u64, 10), stats.last_applied_sequence);
             try std.testing.expect(capture.call_count > 1);
             const snapshot = manager.snapshot();
-            try std.testing.expect(snapshot.memory.peak_bytes <= 1000);
-            try std.testing.expectEqual(@as(u64, 0), snapshot.memory.used_bytes);
+            try std.testing.expect(snapshot.memory.peak_bytes <= 1000 + manager.identity_metadata_bytes);
+            try resource_manager_mod.metadata_fixture.expectUsage(0, &manager, &.{&manager});
             try std.testing.expectEqual(@as(u64, 0), snapshot.memory.accounting_errors);
         }
     }
@@ -2173,7 +2173,7 @@ test "catchUpIndex yields collected window on lookahead admission and preserves 
         try appendChangeJournalRecord(&log, alloc, .{ .sequence = 2, .changed_doc_keys = &keys, .target_hints = &.{.full_text} });
         var budgets = resource_manager_mod.Options.defaultBudgets();
         budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 2000, .hard_limit_bytes = 2000 };
-        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        var manager = try resource_manager_mod.metadata_fixture.init(.{ .budgets = budgets });
         defer manager.deinit(alloc);
         var capture = TestApplyCapture{ .alloc = alloc };
         defer capture.deinit();
@@ -2184,14 +2184,14 @@ test "catchUpIndex yields collected window on lookahead admission and preserves 
         try std.testing.expectEqual(@as(u64, 1), first.last_applied_sequence);
         try std.testing.expectEqual(@as(usize, 1), capture.applied_documents);
         const snapshot = manager.snapshot();
-        try std.testing.expectEqual(@as(u64, 0), snapshot.memory.used_bytes);
+        try resource_manager_mod.metadata_fixture.expectUsage(0, &manager, &.{&manager});
         try std.testing.expectEqual(@as(u64, 0), snapshot.memory.accounting_errors);
         if (max_items != 0) try std.testing.expectEqual(@as(u64, 0), snapshot.slices[@backingInt(resource_manager_mod.Slice.derived_replay_window)].hard_limit_rejections);
         // A record that cannot fit even in an empty window remains a hard
         // admission error, without bypassing the limit or consuming its cursor.
         try std.testing.expectError(error.ResourceBudgetExceeded, catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{ .resource_manager = &manager }));
         try std.testing.expectEqual(@as(usize, 1), capture.applied_documents);
-        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        try resource_manager_mod.metadata_fixture.expectUsage(0, &manager, &.{&manager});
         // With enough space, the same cursor must replay the deferred record
         // exactly once. Its sequence cannot be consumed by failed lookahead.
         const second = try catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{});
@@ -2206,7 +2206,7 @@ test "replay batch descriptor admission is deduplicated and finish needs no new 
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 1000 };
-    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 1000);
     defer builder.deinit();
@@ -2234,7 +2234,7 @@ test "catchUpIndex reclaims changing record shapes under a tight hard budget" {
     try appendChangeJournalRecord(&log, alloc, .{ .sequence = 2, .changed_doc_keys = &.{ "u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7" }, .target_hints = &.{.full_text} });
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 2000 };
-    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var capture = TestApplyCapture{ .alloc = alloc };
     defer capture.deinit();
@@ -2243,12 +2243,12 @@ test "catchUpIndex reclaims changing record shapes under a tight hard budget" {
     const index: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
     const retry = try catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{ .resource_manager = &manager, .max_records_per_window = 1 });
     try std.testing.expectEqual(@as(usize, 20), capture.applied_deleted_keys);
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try resource_manager_mod.metadata_fixture.expectUsage(0, &manager, &.{&manager});
     try std.testing.expectEqual(@as(usize, 2), retry.scanned_entries);
     // ArrayList growth may require one bounded fresh-scratch retry between
     // these record shapes. Both records must still fit the hard memory limit.
     try std.testing.expect(retry.replay_scan_batches >= 2 and retry.replay_scan_batches <= 3);
-    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 2000);
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 2000 + manager.identity_metadata_bytes);
     try std.testing.expectEqual(@as(u64, 2), retry.last_applied_sequence);
     try std.testing.expectEqual(@as(usize, 8), capture.applied_documents);
 }
@@ -2257,18 +2257,18 @@ test "replay key blocks admit their header and spare capacity and roll back fail
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 64 };
-    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 0);
     defer builder.deinit();
     const first = try builder.copyKey("abcd");
     const second = try builder.copyKey("efgh");
     try std.testing.expectEqual(@as(u64, 2 * (@sizeOf(ReplayChunkBuilder.KeyBlock) + 4)), builder.tracked_bytes);
-    try std.testing.expectEqual(builder.tracked_bytes, manager.snapshot().memory.used_bytes);
+    try resource_manager_mod.metadata_fixture.expectUsage(builder.tracked_bytes, &manager, &.{&manager});
     try std.testing.expectError(error.ResourceBudgetExceeded, builder.copyKey("ijkl"));
     try std.testing.expectEqualStrings("abcd", first);
     try std.testing.expectEqualStrings("efgh", second);
-    try std.testing.expectEqual(builder.tracked_bytes, manager.snapshot().memory.used_bytes);
+    try resource_manager_mod.metadata_fixture.expectUsage(builder.tracked_bytes, &manager, &.{&manager});
     // A backing allocator failure releases the reservation taken before allocation.
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     var failed = ReplayChunkBuilder.init(failing.allocator(), .{ .name = "text", .kind = .full_text }, &manager, 0);
@@ -2278,7 +2278,7 @@ test "replay key blocks admit their header and spare capacity and roll back fail
     builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 0);
     try std.testing.expectError(error.OutOfMemory, failed.copyKey("abcd"));
     try std.testing.expectEqual(@as(u64, 0), failed.tracked_bytes);
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try resource_manager_mod.metadata_fixture.expectUsage(0, &manager, &.{&manager});
 }
 
 test "catchUpIndex drops key block slack before rejecting an otherwise fitting record" {
@@ -2290,15 +2290,15 @@ test "catchUpIndex drops key block slack before rejecting an otherwise fitting r
     // A one-key scratch list, output list, dedup map, descriptor and exact key
     // block fit. The preferred block's unused bytes do not fit.
     budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 580 };
-    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var capture = TestApplyCapture{ .alloc = alloc };
     defer capture.deinit();
     const stats = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), .{ .name = "text", .kind = .full_text }, 0, &capture, testApplyCapture, .{ .resource_manager = &manager });
     try std.testing.expectEqual(@as(u64, 1), stats.last_applied_sequence);
     try std.testing.expectEqual(@as(usize, 1), capture.applied_documents);
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
-    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 580);
+    try resource_manager_mod.metadata_fixture.expectUsage(0, &manager, &.{&manager});
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 580 + manager.identity_metadata_bytes);
 }
 
 test "catchUpIndex no-op records do not disable compact key admission" {
@@ -2310,7 +2310,7 @@ test "catchUpIndex no-op records do not disable compact key admission" {
     try appendChangeJournalRecord(&journal, alloc, .{ .sequence = 3, .target_hints = &.{.full_text} });
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 580 };
-    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var capture = TestApplyCapture{ .alloc = alloc };
     defer capture.deinit();
@@ -2332,7 +2332,7 @@ test "catchUpIndex compact fallback shares one key block per record" {
     try appendChangeJournalRecord(&journal, alloc, record);
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 750 };
-    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var capture = TestApplyCapture{ .alloc = alloc };
     defer capture.deinit();
@@ -2340,15 +2340,15 @@ test "catchUpIndex compact fallback shares one key block per record" {
     const stats = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), index, 0, &capture, testApplyCapture, .{ .resource_manager = &manager });
     try std.testing.expectEqual(@as(u64, 1), stats.last_applied_sequence);
     try std.testing.expectEqual(@as(usize, 2), capture.applied_documents);
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
-    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 750);
+    try resource_manager_mod.metadata_fixture.expectUsage(0, &manager, &.{&manager});
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 750 + manager.identity_metadata_bytes);
 }
 
 test "replay metadata hint cannot reject a duplicate-heavy record under a hard budget" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 600 };
-    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 0);
     defer builder.deinit();
@@ -2356,7 +2356,7 @@ test "replay metadata hint cannot reject a duplicate-heavy record under a hard b
     try builder.appendRecord(.{ .changed_doc_keys = &repeated });
     const batch = try builder.finishBorrowed(1);
     try std.testing.expectEqual(@as(usize, 1), batch.documents.len);
-    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 600);
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 600 + manager.identity_metadata_bytes);
 }
 
 fn replayMetadataAllocationFailure(alloc: Allocator) !void {
@@ -2376,7 +2376,7 @@ test "replay metadata initial reservation releases every allocation failure" {
 test "replay publication releases temporary metadata storage and admission before apply" {
     const Counter = @import("../../../allocation_bench_support.zig").Counter;
     var counter: Counter = .{};
-    var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 750 } });
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .memory_budget = .{ .hard_limit_bytes = 750 } });
     defer manager.deinit(std.testing.allocator);
     var builder = ReplayChunkBuilder.init(counter.allocator(), .{ .name = "text", .kind = .full_text }, &manager, 0);
     defer builder.deinit();
@@ -2524,4 +2524,37 @@ test "vector replay coalescing cancels and revives artifact tombstones without g
             try std.testing.expectEqual(@as(usize, 1), batch.changed_artifact_keys.len);
         }
     }
+}
+
+test "replay windows retire payload while retained identity metadata remains bounded" {
+    const a = std.testing.allocator;
+    var metadata = std.testing.FailingAllocator.init(a, .{});
+    var manager = try resource_manager_mod.metadata_fixture.init(.{
+        .identity_allocator = metadata.allocator(),
+        .memory_budget = .{ .hard_limit_bytes = 2048 },
+    });
+    var live = true;
+    defer if (live) manager.deinit(a);
+    const table_bytes = manager.identity_metadata_bytes;
+    const table_allocations = metadata.allocations;
+    try std.testing.expect(table_bytes > 0);
+    for (0..128) |_| {
+        {
+            var builder = ReplayChunkBuilder.init(a, .{ .name = "text", .kind = .full_text }, &manager, 2048);
+            defer builder.deinit();
+            builder.minimal_key_blocks = true;
+            try builder.appendRecord(.{ .changed_doc_keys = &.{ "first", "second" } });
+            const batch = try builder.finishBorrowed(1);
+            try std.testing.expectEqual(@as(usize, 2), batch.documents.len);
+            try resource_manager_mod.metadata_fixture.expectUsage(builder.tracked_bytes, &manager, &.{&manager});
+        }
+        try resource_manager_mod.metadata_fixture.expectUsage(0, &manager, &.{&manager});
+        try std.testing.expectEqual(table_bytes, manager.identity_metadata_bytes);
+        try std.testing.expectEqual(table_allocations, metadata.allocations);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().slices[@backingInt(resource_manager_mod.Slice.derived_replay_window)].used_bytes);
+        try std.testing.expect(manager.snapshot().memory.peak_bytes <= manager.memory.budget.hard_limit_bytes);
+    }
+    manager.deinit(a);
+    live = false;
+    try std.testing.expectEqual(metadata.allocated_bytes, metadata.freed_bytes);
 }
