@@ -14,7 +14,8 @@
 // limitations.
 
 //! One projected, delete-aware scan feeds independent bounded native builders.
-//! Replay retains at most one file. Whole-source consumers stream ordinarily;
+//! Each replay retains at most one file. The publication producer may pair two
+//! independently bounded buffers for read-ahead. Whole-source consumers stream ordinarily;
 //! per-file consumers share a bounded replay without an archive-wide spool.
 const std = @import("std");
 const local = @import("antfly_local_sources");
@@ -27,6 +28,9 @@ const A = std.mem.Allocator;
 /// Plan the shared projection once. Unsupported expression dependencies remain
 /// safe through Provider's ordinary-scan fallback when a column is not covered.
 pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableRecord, provider: *Provider, base: local.serverless_manifest_base_source.BaseSourceDescriptor) ![]const []const u8 {
+    return columnsForFamilies(a, out, table, provider, base, .{ true, true, true, true, true });
+}
+pub fn columnsForFamilies(a: A, out: A, table: local.common_topology_records.TableRecord, provider: *Provider, base: local.serverless_manifest_base_source.BaseSourceDescriptor, enabled: [5]bool) ![]const []const u8 {
     const rebuild = @import("../serverless/build/lake_rebuild.zig");
     var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(a, base, provider.source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
     defer desired.deinit(a);
@@ -41,20 +45,32 @@ pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableR
     const ca = arena.allocator();
     var names: std.StringHashMapUnmanaged(void) = .empty;
     defer names.deinit(a);
+    const configs = try std.json.parseFromSliceLeaky(std.json.Value, ca, table.indexes_json, .{});
     var consumers: usize = 0;
     for (desired.artifacts) |artifact| {
+        const family: usize = switch (artifact.kind) {
+            .algebraic_segment => 0,
+            .text_segment => 2,
+            .sparse_segment => 3,
+            .vector_segment => 4,
+            else => continue,
+        };
+        if (!enabled[family]) continue;
         consumers += 1;
         if (artifact.kind == .text_segment) {
             const config = try std.json.parseFromSliceLeaky(std.json.Value, ca, artifact.build_spec.?.text.config_json, .{});
             const field = config.object.get("field");
-            if (field == null or field.? != .string) {
+            if (field == null or field.? != .string or try @import("lake_index_native_text.zig").storesSource(config)) {
                 for (schema.relational_columns) |column| try names.put(a, column.name, {});
                 continue;
             }
         }
+        if (artifact.kind == .vector_segment or artifact.kind == .sparse_segment) if (configs.object.get(artifact.name)) |config| {
+            if (@import("lake_enrichment_units.zig").configured(config, "template") != null) for (schema.relational_columns) |column| try names.put(a, column.name, {});
+        };
         for (artifact.binding.column_bindings) |column| try names.put(a, column, {});
     }
-    if (try parsed.relationalIndexDefinitions(ca)) |indexes| for (indexes) |index| {
+    if (enabled[1]) if (try parsed.relationalIndexDefinitions(ca)) |indexes| for (indexes) |index| {
         consumers += 1;
         var tuple = try local.storage_db_relational_index_keys.TuplePlan.init(a, schema, &layout, index.keys);
         defer tuple.deinit();
@@ -68,7 +84,7 @@ pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableR
     };
     // Contract binds nullable/missing columns across heterogeneous Parquet files.
     const contract = try out.alloc(local.serverless_query_lake_schema.Column, schema.relational_columns.len);
-    for (contract, schema.relational_columns) |*column, definition| column.* = .{ .name = try out.dupe(u8, definition.path), .kind = @tagName(definition.column_type), .required = definition.required and !definition.allows_null };
+    for (contract, schema.relational_columns) |*column, definition| column.* = .{ .name = try out.dupe(u8, definition.path), .kind = if (definition.sql_element_type == .numeric) "numeric" else @tagName(definition.column_type), .required = definition.required and !definition.allows_null };
     provider.schema_contract = contract;
     provider.replay_recommended = consumers >= 2;
     if (consumers == 0 or names.count() == 0) return &.{};
@@ -82,25 +98,48 @@ pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableR
     }.less);
     return columns;
 }
+/// Sparse union owned by the publication planner. No archive-sized replay mask.
+pub const Needed = struct {
+    files: local.encoding_roaring.RoaringBitmap,
+    pub fn deinit(self: *Needed) void {
+        self.files.deinit();
+    }
+    pub fn contains(self: *const Needed, ordinal: usize) bool {
+        return self.files.contains(std.math.cast(u32, ordinal) orelse return false);
+    }
+    pub fn fromMask(a: A, mask: []const bool) !Needed {
+        var self: Needed = .{ .files = .init(a) };
+        errdefer self.deinit();
+        for (mask, 0..) |needed, ordinal| if (needed) try self.add(ordinal);
+        return self;
+    }
+    fn add(self: *Needed, ordinal: usize) !void {
+        try self.files.add(std.math.cast(u32, ordinal) orelse return error.InvalidNativeLakeFileState);
+    }
+    fn addPlan(self: *Needed, plan: *const @import("lake_index_native_state.zig").Plan) !void {
+        var it = plan.iterator(true);
+        while (try it.next()) |item| try self.add(item.ordinal);
+    }
+};
+fn deltaMatches(provider: *Provider, source: []const u8, schema: []const u8, snapshot: []const u8) bool {
+    const delta = provider.native_delta orelse return false;
+    return delta.count() == provider.source.inventory.files.len and delta.prior_snapshot != null and std.mem.eql(u8, delta.prior_snapshot.?, snapshot) and
+        std.mem.eql(u8, delta.source, source) and std.mem.eql(u8, delta.schema, schema);
+}
 /// Union changed native files so delta builders share only the necessary input.
 /// Unknown/legacy producer formats conservatively request a complete replay.
-pub fn changedFiles(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation) !?[]const bool {
+pub fn changedFiles(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation) !?Needed {
     return changedFilesIndexed(a, out, provider, store, declarations, contributions, cancellation, null);
 }
-pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation, index: ?*@import("lake_index_contributions.zig").Index) !?[]const bool {
+pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation, index: ?*@import("lake_index_contributions.zig").Index) !?Needed {
     const state = @import("lake_index_native_state.zig");
-    const needed = try out.alloc(bool, provider.source.inventory.files.len);
-    @memset(needed, false);
+    var needed: Needed = .{ .files = .init(out) };
+    var returned = false;
+    defer if (!returned) needed.deinit();
     const aggregate = @import("lake_index_native_aggregates.zig");
     var old: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer old.deinit(a);
     for (contributions) |contribution| try old.put(a, aggregate.contributionKey(contribution.file, contribution.recipe, contribution.name), {});
-    const needs_contribution_keys = for (declarations) |declaration| {
-        if (declaration.artifact.kind == .algebraic_segment) break true;
-    } else false;
-    const file_keys = try a.alloc([32]u8, if (needs_contribution_keys) provider.source.inventory.files.len else 0);
-    defer a.free(file_keys);
-    for (provider.source.inventory.files[0..file_keys.len], file_keys) |file, *key| key.* = aggregate.fileIdentity(provider.source, file);
     for (declarations) |declaration| {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -110,15 +149,23 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
             const recipe = try @import("lake_index_aggregate_artifact.zig").loadRecipe(ca, store, declaration.artifact, cancellation);
             if (!aggregate.incrementalRecipe(recipe) or provider.source.inventory.deleted_row_groups.len != 0 or (if (provider.source.scanner.iceberg_delete_plan) |plan| plan.files.len != 0 else false)) return null;
             const fingerprint = recipe.fingerprint();
-            for (file_keys, needed) |key, *required| {
+            if (provider.native_delta) |delta| if (index) |lookup| if (lookup.acceptsDelta(delta) and try lookup.reductionRoot(ca, fingerprint, declaration.name, delta.prior_count) != null) {
+                var plan = try state.Plan.fromDelta(a, ca, delta);
+                defer plan.deinit();
+                try needed.addPlan(&plan);
+                continue;
+            };
+            for (provider.source.inventory.files, 0..) |file, ordinal| {
+                const key = aggregate.fileIdentity(provider.source, file);
                 const lookup_key = aggregate.contributionKey(key, fingerprint, declaration.name);
-                if (!required.* and !old.contains(lookup_key)) {
-                    required.* = if (index) |lookup| missing: {
+                if (!needed.contains(ordinal) and !old.contains(lookup_key)) {
+                    const missing = if (index) |lookup| missing: {
                         if (lookup.has_file_coverage) break :missing !lookup.covered_files.contains(key);
                         var scratch = std.heap.ArenaAllocator.init(a);
                         defer scratch.deinit();
                         break :missing (try lookup.lookup(scratch.allocator(), lookup_key)) == null;
                     } else true;
+                    if (missing) try needed.add(ordinal);
                 }
             }
             continue;
@@ -128,6 +175,12 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
                 const native = @import("lake_index_native_text.zig");
                 if (declaration.artifact.metadata_version != native.metadata_version) return null;
                 const directory = try native.loadRootDirectory(ca, store, declaration.artifact, cancellation, null);
+                if (directory.inventory_version == 3 and directory.checkpoint_base == null and directory.checkpoint_files == null and directory.inventory_delta_version != 0 and deltaMatches(provider, directory.binding.source_id, directory.binding.schema_fingerprint, directory.binding.snapshot_id) and directory.file_count == provider.native_delta.?.prior_count) {
+                    var plan = try state.Plan.fromDelta(a, ca, provider.native_delta.?);
+                    defer plan.deinit();
+                    try needed.addPlan(&plan);
+                    continue;
+                }
                 if (directory.inventory_version == 3) {
                     const records = try native.text_directory.fileRecords(ca, directory, store, null, cancellation);
                     const files = try ca.alloc(state.File, records.len);
@@ -144,7 +197,9 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
                 if (!native.supportsMetadata(declaration.artifact.metadata_version)) return null;
                 const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
                 if (root.file_directory != null and state.canUseDelta(provider, root.binding.snapshot_id)) {
-                    for (needed, 0..) |*file, ordinal| file.* = file.* or provider.native_delta.?.isChanged(ordinal);
+                    var plan = try state.Plan.fromDelta(a, ca, provider.native_delta.?);
+                    defer plan.deinit();
+                    try needed.addPlan(&plan);
                     continue;
                 }
                 break :sparse if (root.file_directory) |directory| try state.directoryFiles(ca, store, directory, root.generation.domain, cancellation) else root.file_states;
@@ -154,7 +209,9 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
                 if (!native.supportsMetadata(declaration.artifact.metadata_version)) return null;
                 const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
                 if (root.file_directory != null and state.canUseDelta(provider, root.binding.snapshot_id)) {
-                    for (needed, 0..) |*file, ordinal| file.* = file.* or provider.native_delta.?.isChanged(ordinal);
+                    var plan = try state.Plan.fromDelta(a, ca, provider.native_delta.?);
+                    defer plan.deinit();
+                    try needed.addPlan(&plan);
                     continue;
                 }
                 break :dense if (root.file_directory) |directory| try state.directoryFiles(ca, store, directory, root.generation.domain, cancellation) else root.file_states;
@@ -162,6 +219,13 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
             .ordered_row_index => ordered: {
                 const native = @import("lake_index_ordered_rows.zig");
                 if (!native.supportsBuildMetadata(declaration.artifact.metadata_version)) return null;
+                const lazy = try native.loadRootLazy(ca, store, declaration.artifact, cancellation, null);
+                if (!lazy.building and deltaMatches(provider, lazy.source, declaration.binding.schema_fingerprint, lazy.snapshot)) {
+                    var plan = try state.Plan.fromDelta(a, ca, provider.native_delta.?);
+                    defer plan.deinit();
+                    try needed.addPlan(&plan);
+                    continue;
+                }
                 const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
                 if (root.file_fingerprints.len != root.files.len) return null;
                 const files = try ca.alloc(state.File, root.files.len);
@@ -172,8 +236,9 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
         };
         var plan = try state.Plan.init(a, ca, provider, previous);
         defer plan.deinit();
-        for (needed, 0..) |*file, ordinal| file.* = file.* or plan.isChanged(ordinal);
+        try needed.addPlan(&plan);
     }
+    returned = true;
     return needed;
 }
 pub const Replay = struct {
@@ -186,26 +251,88 @@ pub const Replay = struct {
     kinds: []rows.ColumnKind = &.{},
     range: Range = .{ .begin = .{ .row = 0, .byte = 0 }, .end = 0 },
     ready: bool = false,
+    live: ?rows.Source = null,
+    live_allocator: A = undefined,
+    captures: usize = 0,
+    read_ahead_hits: usize = 0,
+    publication_sessions: usize = 0,
+    streamed_batches: usize = 0,
+    retained_batches: usize = 0,
+    pipeline: ?*@import("lake_index_build_pipeline.zig") = null,
+    /// A bounded cold-build window owns each sibling independently.
+    sibling: ?*Replay = null,
+    /// A speculative lane pins only the first borrowed source batch. Joining
+    /// transfers its cursor and this batch together; no replay spool is built.
+    primed: ?rows.ColumnBatch = null,
+    primed_ready: bool = false,
     captured_file: ?usize = null,
     readers: usize = 0,
     mutex: std.Io.Mutex = .init,
     max_spill_bytes: u64 = 1024 * 1024 * 1024,
-    only_files: ?[]const bool = null,
+    only_files: ?Needed = null,
     const Range = struct { begin: spill.Sequential.Position, end: u64 };
     pub fn init(a: A, provider: *Provider, columns: []const []const u8) Replay {
         return .{ .provider = provider, .columns = columns, .arena = .init(a), .budget = .{ .backing = a, .limit = 256 * 1024 * 1024 } };
     }
     pub fn deinit(self: *Replay) void {
+        self.reset() catch unreachable;
+        if (self.only_files) |*needed| needed.deinit();
+        self.arena.deinit();
+        std.debug.assert(self.budget.live == 0);
+    }
+    /// Discard an unleased optimization buffer before changing its admission.
+    pub fn reset(self: *Replay) !void {
+        if (self.readers != 0) return error.LakeReplayBusy;
+        if (self.live) |source| source.deinit(self.live_allocator);
+        self.live = null;
+        self.primed = null;
+        self.primed_ready = false;
         if (self.run) |*run| {
             run.close();
             self.manager.deinit();
+            self.run = null;
         }
-        self.arena.deinit();
-        std.debug.assert(self.budget.live == 0);
+        _ = self.arena.reset(.free_all);
+        self.ready = false;
+        self.captured_file = null;
     }
     fn check(raw: *anyopaque) !void {
         const self: *Replay = @ptrCast(@alignCast(raw));
         try self.provider.context.ensureActive();
+        if (self.pipeline) |pipeline| try pipeline.check();
+    }
+    fn captureCheckpoint(raw: *anyopaque) !void {
+        const self: *Replay = @ptrCast(@alignCast(raw));
+        if (self.provider.context.additional_checkpoint) |hook| try hook.check(hook.ptr);
+        if (self.pipeline) |pipeline| try pipeline.check();
+    }
+    pub fn beginStream(self: *Replay, a: A, binding: Binding, file: usize, token: Cancellation) !void {
+        try self.reset();
+        var input = self.provider.*;
+        input.replay = null;
+        input.replay_consumer = null;
+        input.only_file = file;
+        input.only_files = null;
+        input.only_plan = null;
+        input.context.additional_checkpoint = .{ .ptr = self, .check = captureCheckpoint };
+        self.live = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, token);
+        self.live_allocator = a;
+        self.ready = true;
+        self.captured_file = file;
+        self.captures += 1;
+    }
+    pub fn primeStream(self: *Replay, a: A, binding: Binding, file: usize, token: Cancellation) anyerror!bool {
+        try self.beginStream(a, binding, file, token);
+        self.primed = try self.live.?.next(a);
+        self.primed_ready = true;
+        return true;
+    }
+    pub fn nextLive(self: *Replay) !?rows.ColumnBatch {
+        if (self.primed_ready) {
+            self.primed_ready = false;
+            return self.primed;
+        }
+        return self.live.?.next(self.live_allocator);
     }
     fn capture(self: *Replay, a: A, original: Binding, file_index: usize, cancellation: Cancellation) !void {
         if (self.ready and self.captured_file == file_index) return;
@@ -217,6 +344,7 @@ pub const Replay = struct {
         }
         _ = self.arena.reset(.free_all);
         self.ready = false;
+        self.budget.exhausted = false;
         self.captured_file = file_index;
         const io = self.provider.context.io orelse return error.UnsupportedSqlExecution;
         if (self.run != null) return error.InvalidSqlSpill;
@@ -232,6 +360,8 @@ pub const Replay = struct {
         if (file_index >= self.provider.source.inventory.files.len) return error.SidecarSourceBindingMismatch;
         var input = self.provider.*;
         input.replay = null;
+        input.replay_consumer = null;
+        if (self.pipeline != null) input.context.additional_checkpoint = .{ .ptr = self, .check = captureCheckpoint };
         input.only_file = file_index;
         input.only_files = null;
         input.only_plan = null;
@@ -260,7 +390,10 @@ pub const Replay = struct {
             // Bind borrowed source vectors once; the spill codec gathers one
             // bounded column at a time and chooses its physical dictionary.
             var capture_batch: CaptureBatch = .{ .vectors = vectors };
-            const values: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &capture_batch, .read = CaptureBatch.cell, .read_identity = CaptureBatch.identity, .count = batch.rowCount(), .width = self.columns.len } };
+            const borrowed: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &capture_batch, .read = CaptureBatch.cell, .read_physical = CaptureBatch.physical, .read_identity = CaptureBatch.identity, .count = batch.rowCount(), .width = self.columns.len } };
+            var physical_arena = std.heap.ArenaAllocator.init(self.budget.allocator());
+            defer physical_arena.deinit();
+            const values = try borrowed.preparePhysical(physical_arena.allocator());
             var begin: usize = 0;
             while (begin < batch.rowCount()) {
                 const external = switch (batch.rowRef(begin)) {
@@ -305,9 +438,25 @@ pub const Replay = struct {
         self.range.end = self.run.?.size;
         try self.run.?.seal();
         self.ready = true;
+        self.captures += 1;
     }
     const CaptureBatch = struct {
         vectors: []const rows.ColumnVector,
+        fn physical(raw: *anyopaque, _: A, ordinal: usize) !?local.sql_execution_batch.PhysicalColumn {
+            const self: *CaptureBatch = @ptrCast(@alignCast(raw));
+            const column = self.vectors[ordinal];
+            const kind: local.sql_ast.ColumnType = switch (column.values) {
+                .i64, .dictionary_i64 => .integer,
+                .f64, .dictionary_f64 => .number,
+                .bool => .boolean,
+                .bytes, .dictionary_bytes, .json => .string,
+                else => return null,
+            };
+            var vector = column;
+            // JSON source columns are serialized bytes in the replay contract.
+            if (vector.values == .json) vector.values = .{ .bytes = vector.values.json };
+            return .{ .vector = vector, .range = .{ .count = column.rowCount() }, .kind = kind, .element = if (kind == .number) .float64 else null };
+        }
         fn identity(raw: *anyopaque, row: usize, ordinal: usize) !?u64 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const column = self.vectors[ordinal];
@@ -336,26 +485,17 @@ pub const Replay = struct {
             } };
         }
     };
-    pub fn open(self: *Replay, a: A, binding: Binding, only_file: ?usize, cancellation: Cancellation) !?rows.Source {
-        for (binding.column_bindings) |name| {
-            const present = for (self.columns) |column| {
-                if (std.mem.eql(u8, name, column)) break true;
-            } else false;
-            if (!present) return null;
-        }
-        const file_index = only_file orelse return null;
-        const io = self.provider.context.io orelse return null;
+    pub fn prepare(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation) !bool {
+        const io = self.provider.context.io orelse return false;
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
-        if (self.readers != 0 and self.captured_file != file_index) return null;
-        if (self.only_files) |needed| {
-            if (needed.len != self.provider.source.inventory.files.len or file_index >= needed.len) return error.SidecarSourceBindingMismatch;
-            if (!needed[file_index]) return null;
-        }
+        return self.captureAdmitted(a, binding, file_index, cancellation);
+    }
+    fn captureAdmitted(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation) !bool {
         // Oversized individual files retain the ordinary streaming path. The
         // replay optimization must never make an otherwise valid scan fail.
-        self.capture(a, binding, file_index, cancellation) catch |err| switch (err) {
-            error.SqlProgramLimitExceeded => {
+        self.capture(a, binding, file_index, cancellation) catch |err| {
+            if (err == error.SqlProgramLimitExceeded or err == error.UnsupportedExternalLakeIndex or (err == error.OutOfMemory and self.budget.isLocallyExhausted())) {
                 if (self.run) |*run| {
                     run.close();
                     self.manager.deinit();
@@ -363,36 +503,86 @@ pub const Replay = struct {
                 }
                 _ = self.arena.reset(.free_all);
                 self.ready = false;
-                return null;
-            },
-            else => return err,
+                return false;
+            }
+            return err;
         };
-        const range: Range = if (only_file) |file| blk: {
-            if (file != self.captured_file) return error.SidecarSourceBindingMismatch;
-            break :blk self.range;
-        } else .{ .begin = .{ .row = 0, .byte = 0 }, .end = self.run.?.size };
+        return true;
+    }
+    pub fn open(self: *Replay, a: A, binding: Binding, only_file: ?usize, cancellation: Cancellation) !?rows.Source {
+        return self.openFor(a, binding, only_file, cancellation, null);
+    }
+    pub fn openFor(self: *Replay, a: A, binding: Binding, only_file: ?usize, cancellation: Cancellation, consumer: ?usize) !?rows.Source {
+        for (binding.column_bindings) |name| {
+            const present = for (self.columns) |column| {
+                if (std.mem.eql(u8, name, column)) break true;
+            } else false;
+            if (!present) return null;
+        }
+        const file_index = only_file orelse return null;
+        if (file_index >= self.provider.source.inventory.files.len) return error.SidecarSourceBindingMismatch;
+        if (consumer == null and self.captured_file != file_index) {
+            var sibling = self.sibling;
+            while (sibling) |candidate| : (sibling = candidate.sibling) {
+                if (candidate.ready and candidate.captured_file == file_index) return candidate.openFor(a, binding, only_file, cancellation, null);
+            }
+        }
+        if (consumer) |slot| if (self.pipeline) |pipeline| {
+            const chosen = (try pipeline.request(slot, file_index, cancellation)) orelse return null;
+            return try chosen.openPrepared(a, binding, file_index, cancellation, slot);
+        };
+        const io = self.provider.context.io orelse return null;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        if (self.readers != 0 and self.captured_file != file_index) return null;
+        if (consumer == null) if (self.only_files) |needed| {
+            if (file_index >= self.provider.source.inventory.files.len) return error.SidecarSourceBindingMismatch;
+            if (!needed.contains(file_index)) return null;
+        };
+        if (!try self.captureAdmitted(a, binding, file_index, cancellation)) return null;
+        return try self.openCursor(a, binding, cancellation);
+    }
+    /// Producer has already captured and granted this file. Never re-enter the
+    /// rendezvous or apply the serial planner's advisory changed-file mask.
+    fn openPrepared(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation, slot: usize) !rows.Source {
+        const io = self.provider.context.io.?;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        if (!self.ready or self.captured_file != file_index) return error.SidecarSourceBindingMismatch;
+        return try self.openCursorFor(a, binding, cancellation, slot);
+    }
+    fn openCursor(self: *Replay, a: A, binding: Binding, cancellation: Cancellation) !rows.Source {
+        return self.openCursorFor(a, binding, cancellation, null);
+    }
+    fn openCursorFor(self: *Replay, a: A, binding: Binding, cancellation: Cancellation, slot: ?usize) !rows.Source {
+        const range = self.range;
+        const columns = try a.dupe([]const u8, binding.column_bindings);
+        errdefer a.free(columns);
         const cursor = try a.create(Cursor);
         errdefer a.destroy(cursor);
-        cursor.* = .{ .owner = self, .reader = try self.run.?.readerSealed(a, range.begin, range.end), .arena = .init(a), .columns = binding.column_bindings, .cancellation = cancellation };
+        cursor.* = .{ .owner = self, .slot = slot, .reader = if (self.live != null) null else try self.run.?.readerSealed(a, range.begin, range.end), .arena = .init(a), .columns = columns, .cancellation = cancellation };
         self.readers += 1;
         return .{ .kind = binding.source_kind, .ctx = cursor, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
     }
     const Cursor = struct {
         block: ?*spill.Sequential.OwnedBlock = null,
         owner: *Replay,
-        reader: spill.Sequential.Reader,
+        reader: ?spill.Sequential.Reader,
+        slot: ?usize = null,
+        generation: u64 = 0,
         arena: std.heap.ArenaAllocator,
         columns: []const []const u8,
         cancellation: Cancellation,
         fn deinit(raw: *anyopaque, a: A) void {
             const self: *Cursor = @ptrCast(@alignCast(raw));
             if (self.block) |block| block.release();
-            self.reader.deinit();
+            if (self.reader) |*reader| reader.deinit() else self.owner.pipeline.?.leaveStream(self.slot.?);
             const io = self.owner.provider.context.io.?;
             self.owner.mutex.lockUncancelable(io);
             self.owner.readers -= 1;
             self.owner.mutex.unlock(io);
             self.arena.deinit();
+            a.free(self.columns);
             a.destroy(self);
         }
         fn next(raw: *anyopaque, _: A) !?rows.ColumnBatch {
@@ -403,7 +593,15 @@ pub const Replay = struct {
             self.block = null;
             _ = self.arena.reset(.retain_capacity);
             const a = self.arena.allocator();
-            const block = try self.reader.nextOwned() orelse return null;
+            if (self.reader == null) {
+                const input = try self.owner.pipeline.?.readStream(self.slot.?, &self.generation, self.cancellation) orelse return null;
+                const columns = try a.alloc(rows.ColumnVector, self.columns.len);
+                for (columns, self.columns) |*column, name| column.* = input.findColumn(name) orelse return error.RowSourceColumnKindMismatch;
+                var result = input;
+                result.columns = columns;
+                return result;
+            }
+            const block = try self.reader.?.nextOwned() orelse return null;
             self.block = block;
             const refs = try a.alloc(rows.RowRef, block.count());
             const inventory = self.owner.provider.source.inventory;
@@ -486,4 +684,99 @@ test "external lake bounded replay releases files and falls back for oversized s
     try std.testing.expect((try replay.open(a, binding, 0, .none)) == null);
     try std.testing.expect(replay.run == null);
     try std.testing.expectEqual(@as(usize, 0), replay.readers);
+    replay.max_spill_bytes = 160 * 1024;
+    replay.budget.limit = 1;
+    try std.testing.expect((try replay.open(a, binding, 0, .none)) == null);
+    try std.testing.expectEqual(@as(usize, 0), replay.budget.live);
+    try std.testing.expectEqual(@as(usize, 0), replay.manager.files);
+    replay.budget.limit = 2 * 1024 * 1024;
+    const recovered = (try replay.open(a, binding, 0, .none)).?;
+    recovered.deinit(a);
+    try replay.reset();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var failed = Replay.init(failing.allocator(), &provider, &.{"body"});
+    defer failed.deinit();
+    try std.testing.expectError(error.OutOfMemory, failed.open(a, binding, 0, .none));
+    try std.testing.expect(!failed.budget.isLocallyExhausted());
+}
+
+test "external lake replay sparse union borrows authenticated deltas without opening file catalogs" {
+    const state = @import("lake_index_native_state.zig");
+    const text = @import("lake_index_native_text.zig");
+    const ordered = @import("lake_index_ordered_rows.zig");
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("sparse-replay-union");
+    defer directory.cleanup();
+    var memory = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer memory.deinit();
+    var store = memory.artifactStore();
+    store.upload_scope = .{ .domain = @splat(1), .attempt = @splat(2) };
+    // Valid references deliberately have no payload in the store. Planning
+    // compatible generations must authenticate only the small root records.
+    const missing: tree.Ref = .{ .digest = @splat(3), .bytes = 128, .height = 0, .records = 3 };
+    const binding: Binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "s", .snapshot_id = "before", .schema_fingerprint = "schema", .column_bindings = &.{"body"}, .index_config_hash = "config" };
+    const text_root: text.Root = .{ .domain = @splat(1), .binding = binding, .config_json = "{}", .inventory_version = 3, .inventory_delta_version = 2, .file_count = 3, .directories = .{ .files = missing } };
+    var first = try store.putWithCancellation(try std.json.Stringify.valueAlloc(out, text_root, .{}), .none);
+    defer first.deinit(a);
+    const ordered_root: ordered.Root = .{ .fingerprint = @splat(4), .domain = @splat(1), .page = null, .source = "s", .snapshot = "before", .file_dictionary = .{ .count = 3, .slots = missing, .names = missing, .public = missing } };
+    var second = try store.putWithCancellation(try std.json.Stringify.valueAlloc(out, ordered_root, .{}), .none);
+    defer second.deinit(a);
+    var files = [_]state.File{ .{ .id = "a", .digest = @splat(1) }, .{ .id = "b", .digest = @splat(2) }, .{ .id = "c", .digest = @splat(3) } };
+    var flags = [_]bool{ false, true, false };
+    var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    source.inventory = .{ .format = .parquet, .source_id = @constCast("s"), .source_uri = @constCast("s3://bucket/source"), .snapshot_id = @constCast("after"), .schema_fingerprint = @constCast("schema"), .files = &.{} };
+    source.inventory.files = try out.alloc(local.serverless_external_source_types.FileEntry, files.len);
+    for (source.inventory.files, files) |*file, prior| file.* = .{ .file_id = @constCast(prior.id), .object_uri = @constCast("s3://bucket/source/file"), .byte_len = 1, .row_count = 0, .row_groups = &.{} };
+    var provider: Provider = .{ .source = &source, .context = .{ .io = std.testing.io }, .native_delta = .{ .source = "s", .schema = "schema", .prior_snapshot = "before", .prior_count = 3, .files = &files, .changed = &flags, .prior_changed = &.{}, .by_id = .empty } };
+    var ordered_binding = binding;
+    ordered_binding.sidecar_kind = .ordered_rows;
+    const declarations = [_]local.serverless_segment_sidecar_manifest.DeclaredArtifact{
+        .{ .name = "text", .binding = binding, .artifact = .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = first.artifact_id, .checksum = first.checksum, .byte_len = first.byte_len } },
+        .{ .name = "ordered", .binding = ordered_binding, .artifact = .{ .kind = .ordered_row_index, .metadata_version = ordered.metadata_version, .artifact_id = second.artifact_id, .checksum = second.checksum, .byte_len = second.byte_len } },
+    };
+    var needed = (try changedFiles(a, a, &provider, store, &declarations, &.{}, .none)).?;
+    defer needed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), needed.files.cardinality());
+    try std.testing.expect(needed.files.contains(1));
+    // Snapshot mismatch cannot turn a partial predecessor into a delta proof.
+    try std.testing.expect(!deltaMatches(&provider, "s", "schema", "older"));
+    try std.testing.expect(!deltaMatches(&provider, "other", "schema", "before"));
+}
+
+test "external lake replay capture keeps IEEE values and null dictionary identities through disk" {
+    const a = std.testing.allocator;
+    const floating = [_]f64{ std.math.nan(f64), 0, -0.0, std.math.inf(f64), -std.math.inf(f64) };
+    const dictionary = [_]f64{ -0.0, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) };
+    const vectors = [_]rows.ColumnVector{
+        .{ .name = "f", .values = .{ .f64 = &floating }, .nulls = .{ .bytes = &.{ 0, 1, 0, 0, 0 } } },
+        .{ .name = "f", .values = .{ .dictionary_f64 = .{ .values = &dictionary, .indices = &.{ 3, 999999, 0, 1, 2 } } }, .nulls = .{ .bytes = &.{ 0, 1, 0, 0, 0 } } },
+    };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for (vectors) |vector| {
+        var capture: Replay.CaptureBatch = .{ .vectors = &.{vector} };
+        const input: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &capture, .read = Replay.CaptureBatch.cell, .read_identity = Replay.CaptureBatch.identity, .count = 5, .width = 1 } };
+        var marker: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.check, .async_writes = false };
+        defer manager.deinit();
+        var file = try spill.Sequential.init(&manager, 256);
+        defer file.close();
+        const keys: [5][]const local.sql_scalar.Datum = @splat(&.{});
+        try file.appendBatch(input, .{ .rows = &keys }, &.{ 0, 1, 2, 3, 4 });
+        var offset: u64 = 0;
+        while (offset < 5) {
+            const batch = try file.readBatchBorrowed(offset, 2);
+            for (batch.rows) |row| {
+                const index: usize = @intCast(row.ordinal);
+                try std.testing.expectEqual(index == 1, row.values[0].sql_null);
+                if (index != 1) try std.testing.expectEqual(@as(u64, @bitCast(floating[index])), @as(u64, @bitCast(row.values[0].value.float)));
+            }
+            offset = batch.following;
+        }
+    }
 }

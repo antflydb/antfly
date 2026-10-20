@@ -2225,6 +2225,7 @@ pub const Backend = struct {
         manifest_bytes: []u8,
         run_ids: []u64,
         run_paths: [][]u8,
+        run_sizes: []u64,
 
         /// Persist the retained generation using immutable file links. Unlike
         /// process-local run refs, this tree survives owner restart and GC.
@@ -2260,6 +2261,7 @@ pub const Backend = struct {
             }
             self.allocator.free(self.run_paths);
             self.allocator.free(self.run_ids);
+            self.allocator.free(self.run_sizes);
             self.allocator.free(self.manifest_bytes);
             self.* = undefined;
         }
@@ -2335,6 +2337,8 @@ pub const Backend = struct {
         errdefer self.allocator.free(manifest_bytes);
         const run_ids = try self.allocator.alloc(u64, self.runs.count());
         errdefer self.allocator.free(run_ids);
+        const run_sizes = try self.allocator.alloc(u64, self.runs.count());
+        errdefer self.allocator.free(run_sizes);
         const run_paths = try self.allocator.alloc([]u8, self.runs.count());
         var initialized: usize = 0;
         errdefer {
@@ -2350,6 +2354,7 @@ pub const Backend = struct {
             errdefer self.allocator.free(owned);
             try run_snapshot_refs.retain(owned);
             run_ids[index] = run.id;
+            run_sizes[index] = run.size_bytes;
             run_paths[index] = owned;
             initialized += 1;
         }
@@ -2359,6 +2364,7 @@ pub const Backend = struct {
             .manifest_bytes = manifest_bytes,
             .run_ids = run_ids,
             .run_paths = run_paths,
+            .run_sizes = run_sizes,
         };
     }
 

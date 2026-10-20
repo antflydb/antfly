@@ -87,7 +87,8 @@ pub const Join = struct {
     scalar_residual_rows: usize = 0,
     probe: ?operators.HashJoin.Probe = null,
     left: ?[]const Datum = null,
-    matched: bool = false,
+    probe_matches: [256]bool = @splat(false),
+    unmatched_probe: usize = 0,
     unmatched: usize = 0,
     rows: [2]usize = @splat(0),
     next_ordinals: [2]usize = @splat(0),
@@ -459,7 +460,11 @@ pub const Join = struct {
     pub fn accept(self: *Join, index: usize) !void {
         if (self.active_join) |child| return child.accept(index);
         if (self.skew) |skew| return skew.accept(index);
-        self.matched = true;
+        return self.acceptProbe(index, self.probe_input_index - 1);
+    }
+    fn acceptProbe(self: *Join, index: usize, probe_row: usize) !void {
+        if (self.probe_input == null or probe_row >= self.probe_input.?.view().count()) return error.InvalidSqlBackendResponse;
+        self.probe_matches[probe_row] = true;
         if (self.outer_right) try self.hash.?.markMatched(index);
     }
     fn partitionFile(self: *Join) !spill.Sequential {
@@ -921,7 +926,7 @@ pub const Join = struct {
                     }
                     lane += 1;
                     if (!accepted) continue;
-                    if (self.skew) |skew| try skew.acceptAt(index, pair.left.?.index) else try self.accept(index);
+                    if (self.skew) |skew| try skew.acceptAt(index, pair.left.?.index) else try self.acceptProbe(index, pair.left.?.index);
                 }
                 rows.append(a, pair) catch |err| {
                     upstream = err;
@@ -977,39 +982,43 @@ pub const Join = struct {
             }
             if (self.probe) |*probe| {
                 if (try probe.next()) |match| return .{ .left = self.nativeProbe(), .right = NativeRow.build(match), .match = match.index };
-                if (!may_advance) return null;
                 self.probe = null;
-                if (!self.matched and self.outer_left) return .{ .left = self.nativeProbe(), .right = null };
             }
+            // Complete residual decisions before emitting unmatched probe rows
+            // or releasing their block. A cohort may span every probe in this
+            // pinned block, including one-to-one hash matches.
+            if (self.probe_input) |*input| if (self.probe_input_index == input.view().count()) {
+                if (!may_advance and self.unmatched_probe == 0) return null;
+                if (self.outer_left) while (self.unmatched_probe < input.view().count()) {
+                    const row = self.unmatched_probe;
+                    self.unmatched_probe += 1;
+                    if (!self.probe_matches[row]) return .{ .left = .{ .source = .{ .probe = input.view() }, .index = row, .width = input.view().width() }, .right = null };
+                };
+                if (!may_advance) return null;
+                input.deinit();
+                self.probe_input = null;
+            };
             if (self.active.?.probes) |*file| {
                 if (self.probe_offset < file.size) {
-                    // Keep the physical probe block until every match for its
-                    // rows has drained. Expand only the current row at the
-                    // join boundary, rather than boxing an entire typed block.
-                    if (self.probe_input) |*input| if (self.probe_input_index == input.view().count()) {
-                        if (!may_advance) return null;
-                        input.deinit();
-                        self.probe_input = null;
-                    };
                     if (self.probe_input == null) {
+                        if (!may_advance) return null;
                         self.probe_input = try file.readInputBlockBorrowed(self.probe_offset);
                         self.probe_input_index = 0;
+                        self.unmatched_probe = 0;
+                        @memset(&self.probe_matches, false);
                     }
                     const block = self.probe_input.?.view();
+                    if (block.count() > self.probe_matches.len) return error.InvalidSqlSpill;
                     const width = block.keyWidth();
                     if (self.probe_cells.len < width) self.probe_cells = try self.a.realloc(self.probe_cells, width);
                     const keys = self.probe_cells[0..width];
                     for (keys, 0..) |*key, column| key.* = try block.keyCell(self.probe_input_index, column);
                     self.probe_input_index += 1;
                     self.probe_offset += 1;
-                    self.matched = false;
                     self.probe = try self.hash.?.probe(keys);
                     continue;
                 }
                 if (!may_advance) return null;
-                if (self.probe_input) |*input| input.deinit();
-                self.probe_input = null;
-                self.probe_input_index = 0;
                 file.close();
                 self.active.?.probes = null;
             }
@@ -1922,4 +1931,60 @@ test "SQL partitioned vector residual batches preserve skew outer matches" {
     try std.testing.expect(join.skew_blocks_read > 0);
     try std.testing.expect(join.vector_residual_batches > 0);
     try std.testing.expect(join.scalar_residual_rows < 1200 * 40 / 2);
+}
+
+test "SQL partitioned join batches one-to-one probes and defers outer residual decisions" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var compiled = try @import("compiler.zig").compileScalar(a, "l < 500", .{});
+    defer compiled.deinit();
+    var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "l", .type = .integer }, .{ .name = "r", .type = .integer } }, &.{}, .{});
+    defer condition.deinit();
+    const join = try Join.create(a, &manager, 256 * 1024, 10000, 200000, true, true);
+    defer join.close();
+    join.evaluation = .{ .condition = &condition, .left_width = 1, .right_width = 1 };
+    var cells: [1000]Datum = undefined;
+    var rows: [1000][]const Datum = undefined;
+    for (&cells, &rows, 0..) |*cell, *row, i| {
+        cell.* = Datum.json(.{ .integer = @intCast(i) });
+        row.* = cells[i..][0..1];
+    }
+    try join.addBatch(true, .{ .rows = &rows }, &rows, 0);
+    try join.addBatch(false, .{ .rows = &rows }, &rows, 0);
+    var matched: usize = 0;
+    var left: usize = 0;
+    var right: usize = 0;
+    while (true) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var failure: ?anyerror = null;
+        const batch = try join.nextBatch(arena.allocator(), 64, &failure);
+        if (failure) |err| return err;
+        if (batch.len() == 0) break;
+        for (0..batch.len()) |row| {
+            const l = try batch.cell(arena.allocator(), row, 0);
+            const r = try batch.cell(arena.allocator(), row, 1);
+            if (l.sql_null) {
+                right += 1;
+                try std.testing.expect(r.value.integer >= 500);
+            } else if (r.sql_null) {
+                left += 1;
+                try std.testing.expect(l.value.integer >= 500);
+            } else {
+                matched += 1;
+                try std.testing.expect(l.value.integer < 500);
+                try std.testing.expectEqual(l.value.integer, r.value.integer);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 500), matched);
+    try std.testing.expectEqual(@as(usize, 500), left);
+    try std.testing.expectEqual(@as(usize, 500), right);
+    try std.testing.expect(join.vector_residual_batches > 0);
+    try std.testing.expect(join.scalar_residual_rows < 100);
 }

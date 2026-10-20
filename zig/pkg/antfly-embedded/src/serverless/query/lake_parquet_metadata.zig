@@ -689,9 +689,9 @@ fn parseSchemaColumnsAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     try reader.admitAllocation(SchemaColumn, list.len);
     try reader.admitAllocation([]const u8, list.len);
     const elements = try alloc.alloc(SchemaElement, list.len);
-    errdefer alloc.free(elements);
+    defer alloc.free(elements);
     var initialized: usize = 0;
-    errdefer {
+    defer {
         for (elements[0..initialized]) |*element| element.deinit(alloc);
     }
     for (elements) |*element| {
@@ -711,8 +711,6 @@ fn parseSchemaColumnsAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     try collectSchemaColumnsAlloc(alloc, reader, elements, &cursor, elements[0].child_count, false, &path, &columns, 0);
     if (cursor != elements.len) return error.InvalidParquetMetadata;
 
-    for (elements) |*element| element.deinit(alloc);
-    alloc.free(elements);
     return try columns.toOwnedSlice(alloc);
 }
 
@@ -1299,7 +1297,7 @@ fn parseFirstEncodingAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     for (0..list.len) |_| {
         const value = try reader.readI32();
         // This is a set, not a page order. RLE may describe definition levels.
-        if (value == 2 or value == 8) data_encoding = value else if (value == 0 and data_encoding == null) data_encoding = value;
+        if (value == 2 or value == 8) data_encoding = value else if ((value == 5 or value == 6 or value == 7 or value == 9) and data_encoding != 2 and data_encoding != 8) data_encoding = value else if (value == 0 and data_encoding == null) data_encoding = value;
     }
     return try alloc.dupe(u8, encodingName(data_encoding orelse -1));
 }

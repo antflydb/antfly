@@ -23,6 +23,7 @@ const types = @import("../../storage/rowsource/types.zig");
 const Chunk = @import("../external_source/types.zig").ColumnChunk;
 const A = std.mem.Allocator;
 const Self = @This();
+const encoded_page = @import("lake_parquet_encoded.zig");
 const absent = std.math.maxInt(u32);
 a: A,
 budget: @import("../../sql/memory_budget.zig"),
@@ -36,10 +37,15 @@ data: []const u8 = &.{},
 dictionary: ?page.Dictionary = null,
 width: usize = 0,
 count: usize,
+delta: ?encoded_page.Delta = null,
+strings: ?encoded_page.Strings = null,
+split: bool = false,
+present: usize = 0,
 converted: usize = 0,
 
 pub fn create(a: A, chunk: Chunk, header: page.Header, encoded: []const u8, dictionary: ?page.Dictionary, limit: usize) !?*Self {
-    if (header.encoding != .plain and header.encoding != .plain_dictionary and header.encoding != .rle_dictionary) return null;
+    const dictionary_encoded = header.encoding == .plain_dictionary or header.encoding == .rle_dictionary;
+    if (header.encoding != .plain and !dictionary_encoded and !extended(header.encoding)) return null;
     if (header.repetition_level_bytes != 0) return null;
     const kind: @FieldType(Self, "kind") = if (std.mem.eql(u8, chunk.physical_type, "int64") or std.mem.eql(u8, chunk.physical_type, "int32")) .integer else if (std.mem.eql(u8, chunk.physical_type, "float") or std.mem.eql(u8, chunk.physical_type, "double")) .number else if (std.mem.eql(u8, chunk.physical_type, "boolean")) .boolean else if (std.mem.eql(u8, chunk.physical_type, "byte_array") or std.mem.eql(u8, chunk.physical_type, "fixed_len_byte_array")) .bytes else return null;
     // Keep unsupported logical interpretations on the established decoder.
@@ -56,8 +62,8 @@ pub fn create(a: A, chunk: Chunk, header: page.Header, encoded: []const u8, dict
     if (logical.len != 0 and !std.mem.eql(u8, logical, "string") and !std.mem.eql(u8, logical, "decimal") and !std.mem.startsWith(u8, logical, "int") and !std.mem.startsWith(u8, logical, "timestamp_")) return null;
     if (std.mem.eql(u8, logical, "decimal") and (chunk.decimal_precision < 1 or chunk.decimal_precision > 38 or chunk.decimal_scale < 0 or chunk.decimal_scale > chunk.decimal_precision)) return null;
     if (kind == .bytes and std.mem.eql(u8, chunk.physical_type, "fixed_len_byte_array") and !std.mem.eql(u8, logical, "decimal")) return null;
-    if (header.encoding != .plain and (dictionary == null or kind == .boolean)) return null;
-    if (header.encoding != .plain) {
+    if (dictionary_encoded and (dictionary == null or kind == .boolean)) return null;
+    if (dictionary_encoded) {
         const valid = switch (kind) {
             .integer => dictionary.? == .i64,
             .number => dictionary.? == .f64,
@@ -67,7 +73,7 @@ pub fn create(a: A, chunk: Chunk, header: page.Header, encoded: []const u8, dict
         if (!valid) return error.InvalidParquetPage;
     }
     const self = try a.create(Self);
-    self.* = .{ .a = a, .budget = .{ .backing = a, .limit = limit }, .chunk = chunk, .kind = kind, .dictionary = if (header.encoding == .plain) null else dictionary, .count = header.value_count };
+    self.* = .{ .a = a, .budget = .{ .backing = a, .limit = limit }, .chunk = chunk, .kind = kind, .dictionary = if (dictionary_encoded) dictionary else null, .count = header.value_count };
     self.arena = .init(self.budget.allocator());
     errdefer self.destroy();
     const alloc = self.arena.allocator();
@@ -84,7 +90,28 @@ pub fn create(a: A, chunk: Chunk, header: page.Header, encoded: []const u8, dict
         present = self.count;
     }
     self.data = data;
-    if (header.encoding != .plain) {
+    self.present = present;
+    if (extended(header.encoding)) {
+        self.width = if (std.mem.eql(u8, chunk.physical_type, "int32") or std.mem.eql(u8, chunk.physical_type, "float")) 4 else if (kind == .integer or kind == .number) 8 else std.math.cast(usize, chunk.type_length) orelse return error.InvalidParquetPage;
+        switch (header.encoding) {
+            .delta_binary_packed => {
+                if (kind != .integer) return error.UnsupportedParquetPage;
+                self.delta = try encoded_page.Delta.init(alloc, data, present, @intCast(self.width * 8));
+                if (self.delta.?.consumed != data.len) return error.InvalidParquetPage;
+            },
+            .delta_length_byte_array, .delta_byte_array => {
+                if (!std.mem.eql(u8, chunk.physical_type, "byte_array")) return error.UnsupportedParquetPage;
+                self.strings = try encoded_page.Strings.init(alloc, data, present, header.encoding == .delta_byte_array);
+            },
+            .byte_stream_split => {
+                if (kind == .boolean or self.width == 0 or self.width > 16 or data.len != std.math.mul(usize, present, self.width) catch return error.InvalidParquetPage) return error.InvalidParquetPage;
+                self.split = true;
+            },
+            else => unreachable,
+        }
+        return self;
+    }
+    if (dictionary_encoded) {
         if (present == 0) return self;
         if (data.len == 0 or data[0] > 32) return error.InvalidParquetPage;
 
@@ -132,7 +159,20 @@ pub fn destroy(self: *Self) void {
 fn lanePosition(self: *const Self, row: usize) u32 {
     return if (self.definitions) |index| index.position(row) orelse absent else @intCast(row);
 }
+pub fn extended(encoding: page.Encoding) bool {
+    return encoding == .delta_binary_packed or encoding == .delta_length_byte_array or encoding == .delta_byte_array or encoding == .byte_stream_split;
+}
+fn splitValue(self: *Self, position: usize, buffer: *[16]u8) []const u8 {
+    for (0..self.width) |byte| buffer[byte] = self.data[byte * self.present + position];
+    return buffer[0..self.width];
+}
 fn integer(self: *Self, position: usize) !i64 {
+    if (self.delta) |*delta| return delta.at(position);
+    if (self.split) {
+        var buffer: [16]u8 = undefined;
+        const value = self.splitValue(position, &buffer);
+        return if (self.width == 4) std.mem.readInt(i32, value[0..4], .little) else std.mem.readInt(i64, value[0..8], .little);
+    }
     if (self.dictionary) |dictionary| return switch (dictionary) {
         .i64 => |values| values[self.indices.?.at(position)],
         else => error.InvalidParquetPage,
@@ -141,6 +181,11 @@ fn integer(self: *Self, position: usize) !i64 {
     return if (self.width == 4) std.mem.readInt(i32, self.data[offset..][0..4], .little) else std.mem.readInt(i64, self.data[offset..][0..8], .little);
 }
 fn number(self: *Self, position: usize) !f64 {
+    if (self.split) {
+        var buffer: [16]u8 = undefined;
+        const value = self.splitValue(position, &buffer);
+        return if (self.width == 4) @as(f32, @bitCast(std.mem.readInt(u32, value[0..4], .little))) else @as(f64, @bitCast(std.mem.readInt(u64, value[0..8], .little)));
+    }
     if (self.dictionary) |dictionary| return switch (dictionary) {
         .f64 => |values| values[self.indices.?.at(position)],
         else => error.InvalidParquetPage,
@@ -149,6 +194,11 @@ fn number(self: *Self, position: usize) !f64 {
     return if (self.width == 4) @as(f32, @bitCast(std.mem.readInt(u32, self.data[offset..][0..4], .little))) else @as(f64, @bitCast(std.mem.readInt(u64, self.data[offset..][0..8], .little)));
 }
 fn bytes(self: *Self, position: usize) ![]const u8 {
+    if (self.strings) |*strings| return strings.at(position);
+    if (self.split) {
+        var buffer: [16]u8 = undefined;
+        return self.arena.allocator().dupe(u8, self.splitValue(position, &buffer));
+    }
     if (self.dictionary) |dictionary| return switch (dictionary) {
         .bytes => |values| values[self.indices.?.at(position)],
         else => error.InvalidParquetPage,
@@ -164,7 +214,10 @@ fn predicateValue(self: *Self, comptime T: type, position: usize, domain: types.
         return std.math.mul(i64, try self.integer(position), factor) catch error.InvalidParquetPage;
     }
     if (T == f64) return @import("../../common/float_domain.zig").normalize(try self.number(position), domain);
-    if (T == []const u8) return self.bytes(position);
+    if (T == []const u8) {
+        if (self.strings) |*strings| return strings.borrow(position);
+        return self.bytes(position);
+    }
     if (T == bool) return self.data[position / 8] & (@as(u8, 1) << @as(u3, @intCast(position % 8))) != 0;
     unreachable;
 }
@@ -201,6 +254,15 @@ fn predicateMaskOp(self: *Self, comptime T: type, comptime op: types.EncodedOp, 
         if (T == i64 or T == f64) {
             const timestamp = std.mem.startsWith(u8, self.chunk.logical_type, "timestamp_") and !std.mem.eql(u8, self.chunk.logical_type, "timestamp_nanos");
             const position = self.lanePosition(begin + lane);
+            if (T == i64) if (!timestamp and position != absent) if (self.delta) |*delta| {
+                var count: usize = 0;
+                while (count < @min(32, keep.len - lane) and keep[lane + count] and self.lanePosition(begin + lane + count) == position + count) : (count += 1) {}
+                if (count >= 4) {
+                    try delta.mask(position, keep[lane..][0..count], literal, op);
+                    lane += count;
+                    continue;
+                }
+            };
             const dense = !timestamp and self.dictionary == null and lane + 4 <= keep.len and position != absent and for (keep[lane..][0..4], 0..) |active, offset| {
                 if (!active or self.lanePosition(begin + lane + offset) != position + offset) break false;
                 if (T == f64) if (!std.math.isFinite(try self.number(position + offset)) or !std.math.isFinite(literal)) break false;
@@ -517,4 +579,25 @@ test "lake SQL nullable repeated pages retain native masks within a tiny decode 
         for (mask, 0..) |active, lane| try std.testing.expectEqual(lane != 1000 and (!mixed or lane >= 768), active);
         try std.testing.expectEqual(@as(usize, 0), selected.converted);
     }
+}
+
+test "lake SQL compact prefix predicates keep only stable projected strings" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const prefixes = try encoded_page.testDelta(work, &.{ 0, 3, 4, 0 });
+    const lengths = try encoded_page.testDelta(work, &.{ 6, 1, 2, 3 });
+    const payload = try std.mem.concat(work, u8, &.{ prefixes, lengths, "abcdefX12new" });
+    const header: page.Header = .{ .page_type = .data_page, .compressed_page_size = @intCast(payload.len), .uncompressed_page_size = @intCast(payload.len), .value_count = 4, .encoding = .delta_byte_array };
+    const chunk: Chunk = .{ .column_id = @constCast("s"), .file_offset = 0, .compressed_len = @intCast(payload.len), .physical_type = @constCast("byte_array"), .logical_type = @constCast("string") };
+    const selected = (try create(a, chunk, header, payload, null, 65536)).?;
+    defer selected.destroy();
+    var keep: [4]bool = @splat(true);
+    try std.testing.expect(try encodedMask(selected, 0, &keep, .{ .string = "abcX12" }, .eq));
+    try std.testing.expectEqualSlices(bool, &.{ false, false, true, false }, &keep);
+    try std.testing.expectEqual(@as(usize, 0), selected.strings.?.materialized.count());
+    const vector = try selected.project(work, 0, &keep);
+    try std.testing.expectEqualStrings("abcX12", vector.values.bytes[2]);
+    try std.testing.expectEqual(@as(usize, 1), selected.strings.?.materialized.count());
 }

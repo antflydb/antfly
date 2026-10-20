@@ -1092,6 +1092,25 @@ pub const ColumnarBlock = struct {
         return self.keys[column].cell(row);
     }
 };
+/// Existing native scalar codec for schema-bound persistent records. Owners
+/// supply an arena; no column descriptors or row envelopes are constructed.
+pub fn encodeDatumsAlloc(a: Allocator, values: []const Datum, max_bytes: usize) ![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(a);
+    var encoder: Encoder = .{ .a = a, .bytes = &bytes, .limit = max_bytes };
+    try encoder.cells(values);
+    return bytes.toOwnedSlice(a);
+}
+pub fn decodeDatumsInArena(a: Allocator, bytes: []const u8, max_bytes: usize) ![]const Datum {
+    if (bytes.len > max_bytes) return error.InvalidSqlSpill;
+    var scratch: JsonScratch = .{ .a = @import("memory_budget.zig").reclaimingAllocator(a) };
+    defer scratch.deinit();
+    var decoder: Decoder = .{ .a = a, .bytes = bytes, .json_scratch = &scratch, .borrow_compact = true };
+    const result = try decoder.cells();
+    if (decoder.position != bytes.len) return error.InvalidSqlSpill;
+    return result;
+}
+
 const columnar_v1_magic = "NCB\x01";
 
 test "SQL temporal spill decoder rejects malformed flags kinds frames and truncations" {
@@ -3506,6 +3525,40 @@ pub const Sequential = struct {
 /// Immutable runs write directly into reusable 64 KiB extents in one anonymous
 /// file. The map scales with disk quota, not rows; unrelated runs read/write
 /// disjoint extents concurrently. Only extent allocation and release serialize.
+/// Bounded radix streams backed by reusable extents in one anonymous file.
+/// Child partitions borrow the same store and close before their parent owner.
+pub const Partitions = struct {
+    store: *RunStore,
+    owner: bool,
+    streams: [64]?Sequential = @splat(null),
+    pub fn init(manager: *Manager) !Partitions {
+        const store = try manager.allocator().create(RunStore);
+        errdefer manager.allocator().destroy(store);
+        store.* = .{ .file = try manager.create() };
+        return .{ .store = store, .owner = true };
+    }
+    pub fn child(self: *Partitions) Partitions {
+        return .{ .store = self.store, .owner = false };
+    }
+    pub fn deinit(self: *Partitions) void {
+        for (0..self.streams.len) |index| self.close(index);
+        if (self.owner) self.store.deinit();
+    }
+    pub fn close(self: *Partitions, index: usize) void {
+        if (self.streams[index]) |*stream| stream.close();
+        self.streams[index] = null;
+    }
+    pub fn appendBatch(self: *Partitions, index: usize, values: @import("execution_batch.zig").Batch, keys: @import("execution_batch.zig").Batch, ordinals: []const u64) !void {
+        if (index >= self.streams.len or values.len() != keys.len() or values.len() != ordinals.len) return error.InvalidSqlSpill;
+        if (values.len() == 0) return;
+        if (self.streams[index] == null) self.streams[index] = self.store.run(64 * 1024);
+        try self.streams[index].?.appendBatch(values, keys, ordinals);
+    }
+    pub fn seal(self: *Partitions) !void {
+        for (&self.streams) |*stream| if (stream.*) |*file| try file.seal();
+    }
+};
+
 const RunStore = struct {
     const block_bytes: u64 = 64 * 1024;
     file: File,
@@ -9032,4 +9085,68 @@ test "SQL native spill decimal views retain selected coefficients display scales
     try std.testing.expectEqualSlices(i128, &.{ -45, 0, 12300, -45 }, view.physical.vector.values.decimal128.values);
     try std.testing.expectEqualSlices(u16, &.{ 1, 0, 4, 1 }, view.scales);
     try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, view.physical.vector.nulls.bytes);
+}
+
+test "SQL shared radix partitions bound descriptors and reclaim canceled extents" {
+    const Check = struct {
+        canceled: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.canceled) return error.Canceled;
+        }
+    };
+    var check: Check = .{};
+    var manager: Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &check, .checkpoint = Check.check, .async_writes = false };
+    defer manager.deinit();
+    {
+        var partitions = try Partitions.init(&manager);
+        defer partitions.deinit();
+        for (0..64) |index| try partitions.appendBatch(index, .{ .rows = &.{&.{Datum.json(.{ .integer = @intCast(index) })}} }, .{ .rows = &.{&.{}} }, &.{index});
+        try partitions.seal();
+        try std.testing.expectEqual(@as(usize, 1), manager.peak_files);
+        var child = partitions.child();
+        defer child.deinit();
+        for (0..64) |index| {
+            const row = (try partitions.streams[index].?.readBatchBorrowed(0, 256)).rows[0];
+            try std.testing.expectEqual(@as(i64, @intCast(index)), row.values[0].value.integer);
+            if (index == 0) try child.appendBatch(0, .{ .rows = &.{row.values} }, .{ .rows = &.{row.keys} }, &.{row.ordinal});
+            partitions.close(index);
+        }
+        try child.seal();
+        try std.testing.expectEqual(@as(i64, 0), (try child.streams[0].?.readBatchBorrowed(0, 1)).rows[0].values[0].value.integer);
+        check.canceled = true;
+        try std.testing.expectError(error.Canceled, child.appendBatch(1, .{ .rows = &.{&.{Datum.json(.{ .integer = 1 })}} }, .{ .rows = &.{&.{}} }, &.{1}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+    try std.testing.expectEqual(@as(usize, 1), manager.peak_files);
+}
+
+test "SQL shared radix partitions unwind allocation faults and disk admission" {
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+        fn run(a: Allocator) !void {
+            var dummy: u8 = 0;
+            var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check, .async_writes = false };
+            defer manager.deinit();
+            var parent = try Partitions.init(&manager);
+            defer parent.deinit();
+            try parent.appendBatch(0, .{ .rows = &.{&.{Datum.json(.{ .string = "checkpoint" })}} }, .{ .rows = &.{&.{}} }, &.{0});
+            var child = parent.child();
+            defer child.deinit();
+            try child.appendBatch(3, .{ .rows = &.{&.{Datum.json(.{ .integer = 2 })}} }, .{ .rows = &.{&.{}} }, &.{1});
+            try child.seal();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check, .max_bytes = 64 * 1024, .async_writes = false };
+    defer manager.deinit();
+    {
+        var partitions = try Partitions.init(&manager);
+        defer partitions.deinit();
+        try partitions.appendBatch(0, .{ .rows = &.{&.{Datum.json(.{ .integer = 1 })}} }, .{ .rows = &.{&.{}} }, &.{0});
+        try std.testing.expectError(error.SqlProgramLimitExceeded, partitions.appendBatch(1, .{ .rows = &.{&.{Datum.json(.{ .integer = 2 })}} }, .{ .rows = &.{&.{}} }, &.{1}));
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
 }

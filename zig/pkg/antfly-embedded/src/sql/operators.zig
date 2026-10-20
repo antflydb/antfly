@@ -1091,6 +1091,7 @@ pub const GroupResult = struct {
         ptr: *const anyopaque,
         count: usize,
         read: *const fn (*const anyopaque, Allocator, usize) anyerror!Aggregate,
+        finish: ?*const fn (*const anyopaque, Allocator, usize, AggregateSpec) anyerror!Datum = null,
     };
     /// In-process partials borrow typed reducers from the page arena. Durable
     /// and backend interchange continues to use versioned aggregate cells.
@@ -1805,6 +1806,17 @@ pub const HashJoin = struct {
 pub const Grouped = struct {
     pub const Limits = struct { groups: usize = 10000, bytes: usize = 8 * 1024 * 1024, spill: ?*@import("spill.zig").Manager = null };
     pub const Reducers = struct { ptr: *anyopaque, groups: []const *Grouped, release: *const fn (*anyopaque) void };
+    /// Already unique, fully reduced keys. Pulls own only a bounded output
+    /// page; no hash table or second grouping/spill pass is required.
+    pub const Finalized = struct {
+        ptr: *anyopaque,
+        count: usize,
+        exact_count: bool = true,
+        ordered: bool = false,
+        batch_rows: usize = 4096,
+        next: *const fn (*anyopaque, Allocator, usize, bool) anyerror!?GroupBatch,
+        close: *const fn (*anyopaque) void,
+    };
     const Group = struct { next: ?usize, ordinal: u64 };
     backing: Allocator,
     budget: MemoryBudget,
@@ -1823,6 +1835,8 @@ pub const Grouped = struct {
     finished: bool = false,
     key_count: ?usize = null,
 
+    finalized: ?Finalized = null,
+    finalized_quota: @import("native_scan_quota.zig").Quota = .{ .capacity = 1, .row_limit = 0, .page_limit = 0 },
     external: ?*@import("spill_grouped.zig").Grouped = null,
     result_cursor: usize = 0,
     reducers: ?Reducers = null,
@@ -1833,6 +1847,25 @@ pub const Grouped = struct {
         self.reducers = reducers;
         self.rows_seen = rows;
         self.finished = true; // Sealed grouping; only result pulls remain valid.
+    }
+    pub fn adoptFinalized(self: *Grouped, source: Finalized, page_limit: usize) !void {
+        if (self.failed or self.finished or self.finalized != null or self.external != null or self.reducers != null or self.rows_seen != 0 or self.groups.items.len > 1 or (self.groups.items.len == 1 and self.key_count != 0)) return error.InvalidSqlBackendResponse;
+        if (source.batch_rows == 0) return error.InvalidSqlBackendResponse;
+        self.clearGroups(); // Retire the initial empty global group, if present.
+        self.finalized = source;
+        self.finalized_quota = .{ .capacity = source.batch_rows, .row_limit = self.limits.groups, .page_limit = page_limit };
+        self.finished = true;
+    }
+    fn nextFinalized(self: *Grouped, a: Allocator, maximum: usize, exact: bool) !?GroupBatch {
+        const source = self.finalized.?;
+        const result = try source.next(source.ptr, a, maximum, exact);
+        if (result) |batch| {
+            if (batch.ordinals.len == 0 or batch.ordinals.len > maximum or batch.keys.len() != batch.ordinals.len or batch.aggregates.len() != batch.ordinals.len or batch.aggregates.width() != self.specs.len) return error.InvalidSqlBackendResponse;
+            try self.finalized_quota.admit(batch.ordinals.len, false);
+            if (batch.ordinals.len > source.count -| self.output_count) return error.SqlProgramLimitExceeded;
+            self.output_count += batch.ordinals.len;
+        } else if (source.exact_count and self.output_count != source.count) return error.InvalidSqlBackendResponse;
+        return result;
     }
     fn clearGroups(self: *Grouped) void {
         const alloc = self.budget.allocator();
@@ -1868,6 +1901,7 @@ pub const Grouped = struct {
     pub fn nextResultBatch(self: *Grouped, a: Allocator, maximum: usize, exact: bool) !?GroupBatch {
         if (maximum == 0) return error.InvalidSqlLimit;
         if (self.failed) return error.InvalidSqlBackendResponse;
+        if (self.finalized != null) return self.nextFinalized(a, maximum, exact);
         if (self.reducers) |reducers| {
             while (self.reducer_cursor < reducers.groups.len) {
                 const result = try reducers.groups[self.reducer_cursor].nextResultBatch(a, maximum, exact);
@@ -1915,6 +1949,10 @@ pub const Grouped = struct {
         };
     }
     pub fn nextResult(self: *Grouped, alloc: Allocator) !?GroupResult {
+        if (self.finalized != null) {
+            const batch = (try self.nextFinalized(alloc, 1, false)) orelse return null;
+            return .{ .keys = try batch.keys.row(alloc, 0), .aggregates = try batch.aggregates.row(alloc, 0), .ordinal = batch.ordinals[0] };
+        }
         if (self.reducers) |reducers| {
             while (self.reducer_cursor < reducers.groups.len) {
                 if (try reducers.groups[self.reducer_cursor].nextResult(alloc)) |result| {
@@ -1939,6 +1977,7 @@ pub const Grouped = struct {
         return result;
     }
     pub fn nextTypedPartialResult(self: *Grouped, a: Allocator) !?GroupResult {
+        if (self.finalized != null) return self.nextPartialResult(a);
         if (self.external) |external| {
             // Decode once at the spill boundary, before any compact join pair.
             const result = try external.nextPartial(a) orelse return null;
@@ -1954,6 +1993,10 @@ pub const Grouped = struct {
         return .{ .keys = try self.key_columns.row(a, index), .aggregates = &.{}, .typed_states = states, .ordinal = self.groups.items[index].ordinal };
     }
     pub fn nextPartialResult(self: *Grouped, a: Allocator) !?GroupResult {
+        if (self.finalized != null) {
+            const batch = (try self.nextFinalized(a, 1, true)) orelse return null;
+            return .{ .keys = try batch.keys.row(a, 0), .aggregates = try batch.aggregates.row(a, 0), .ordinal = batch.ordinals[0] };
+        }
         if (self.external) |external| return external.nextPartial(a);
         if (self.result_cursor == self.groups.items.len) return null;
         const index = self.result_cursor;
@@ -1976,6 +2019,7 @@ pub const Grouped = struct {
     }
 
     pub fn deinit(self: *Grouped) void {
+        if (self.finalized) |source| source.close(source.ptr);
         if (self.reducers) |reducers| reducers.release(reducers.ptr);
         if (self.external) |external| {
             external.deinit();
@@ -2819,6 +2863,25 @@ pub const Grouped = struct {
         }
         return self.importTypedPartialMappedAdmitted(keys, states, slots, ordinal, require_fit);
     }
+    /// Import an entire provider page without reboxing typed reducer payloads.
+    pub fn importPartialBatch(self: *Grouped, rows: []const GroupResult) !void {
+        for (rows) |row| {
+            const count = try @import("aggregate_partial.zig").partialCount(row);
+            if (row.typed_states) |states| {
+                try self.importTypedPartialMapped(row.keys, states, row.aggregate_slots, row.ordinal);
+            } else if (row.state_reader != null) {
+                var arena = std.heap.ArenaAllocator.init(self.backing);
+                defer arena.deinit();
+                const states = try arena.allocator().alloc(Aggregate, count);
+                for (states, 0..) |*state, index| {
+                    const slot = if (row.aggregate_slots) |slots| slots[index] else index;
+                    if (slot >= self.specs.len) return error.InvalidSqlBackendResponse;
+                    state.* = try @import("aggregate_partial.zig").read(arena.allocator(), row, index, self.specs[slot]);
+                }
+                try self.importTypedPartialMapped(row.keys, states, row.aggregate_slots, row.ordinal);
+            } else try self.importPartialMapped(row.keys, row.aggregates, row.aggregate_slots, row.ordinal);
+        }
+    }
     pub fn importTypedPartialMapped(self: *Grouped, keys: []const Datum, states: []const Aggregate, slots: ?[]const u16, ordinal: u64) !void {
         return self.importTypedPartialMappedAdmitted(keys, states, slots, ordinal, false);
     }
@@ -3034,6 +3097,7 @@ pub const Grouped = struct {
     }
 
     pub fn groupCount(self: *const Grouped) usize {
+        if (self.finalized) |source| return source.count;
         if (self.reducers) |reducers| {
             var count: usize = 0;
             for (reducers.groups) |group| count +|= group.groupCount();
@@ -3110,6 +3174,12 @@ pub const Grouped = struct {
     /// operator. Use a caller arena or individually free each aggregates slice.
     pub fn finish(self: *Grouped, alloc: Allocator) ![]GroupResult {
         if (self.failed) return error.InvalidSqlBackendResponse;
+        if (self.finalized != null) {
+            var rows: std.ArrayList(GroupResult) = .empty;
+            errdefer rows.deinit(alloc);
+            while (try self.nextResult(alloc)) |row| try rows.append(alloc, row);
+            return rows.toOwnedSlice(alloc);
+        }
         self.finished = true;
         const result = try alloc.alloc(GroupResult, self.groups.items.len);
         var initialized: usize = 0;
@@ -5834,4 +5904,68 @@ test "SQL native hash join shares producer body preparation across physical page
         seen += 1;
     }
     try std.testing.expectEqual(@as(usize, 64), seen);
+}
+
+test "SQL finalized aggregate streams bypass hash retention and fence ownership and quotas" {
+    const a = std.testing.allocator;
+    const Source = struct {
+        count: usize,
+        position: usize = 0,
+        closes: usize = 0,
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+        fn next(raw: *anyopaque, out: Allocator, maximum: usize, _: bool) !?GroupBatch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.position == self.count) return null;
+            const count = @min(maximum, self.count - self.position);
+            const keys = try out.alloc([]const Datum, count);
+            const values = try out.alloc([]const Datum, count);
+            const ordinals = try out.alloc(u64, count);
+            for (keys, values, ordinals, self.position..) |*key, *value, *ordinal, row| {
+                key.* = try out.dupe(Datum, &.{Datum.json(.{ .integer = @intCast(row) })});
+                value.* = try out.dupe(Datum, &.{Datum.json(.{ .integer = @intCast(row + 1) })});
+                ordinal.* = row;
+            }
+            self.position += count;
+            return .{ .keys = .{ .rows = keys }, .aggregates = .{ .rows = values }, .ordinals = ordinals };
+        }
+    };
+    var source: Source = .{ .count = 10000 };
+    {
+        const group = try Grouped.create(a, &.{.{ .kind = .count }}, .{ .groups = 10000, .bytes = 16 * 1024 });
+        defer group.deinit();
+        try group.adoptFinalized(.{ .ptr = &source, .count = source.count, .next = Source.next, .close = Source.close }, 1000);
+        try std.testing.expectEqual(@as(usize, 10000), group.groupCount());
+        var count: usize = 0;
+        while (true) {
+            var page = std.heap.ArenaAllocator.init(a);
+            defer page.deinit();
+            const batch = (try group.nextResultBatch(page.allocator(), 17, false)) orelse break;
+            for (batch.ordinals, count..) |ordinal, row| {
+                try std.testing.expectEqual(row, ordinal);
+                try std.testing.expectEqual(@as(i64, @intCast(row + 1)), (try batch.aggregates.cell(page.allocator(), row - count, 0)).value.integer);
+            }
+            count += batch.ordinals.len;
+        }
+        try std.testing.expectEqual(source.count, count);
+        try std.testing.expectEqual(@as(usize, 0), group.groups.items.len);
+        try std.testing.expectEqual(@as(usize, 0), group.heads.count());
+        try std.testing.expectEqual(@as(u64, 0), group.hash_probes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), source.closes);
+    source = .{ .count = 10 };
+    {
+        const group = try Grouped.create(a, &.{.{ .kind = .count }}, .{ .groups = 10, .bytes = 16 * 1024 });
+        defer group.deinit();
+        try group.ensureGlobalGroup();
+        try std.testing.expectEqual(@as(usize, 0), source.closes);
+        try group.adoptFinalized(.{ .ptr = &source, .count = 50_000_000, .exact_count = false, .batch_rows = 2, .next = Source.next, .close = Source.close }, 1);
+        var page = std.heap.ArenaAllocator.init(a);
+        defer page.deinit();
+        _ = try group.nextResultBatch(page.allocator(), 2, false);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, group.nextResultBatch(page.allocator(), 2, false));
+    }
+    try std.testing.expectEqual(@as(usize, 1), source.closes);
 }
