@@ -3247,15 +3247,17 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         terminal_failed_count == 0 and
         coverageAllSourcesTerminal(table_doc_count, produced_count, skipped_count, terminal_failed_count) and
         embeddingsArtifactPublishComplete(item, sparse, produced_count);
+    const artifact_publication_complete = embeddingsArtifactPublishComplete(item, sparse, produced_count);
     // External indexes are query-ready once their published artifacts and
     // replay are current. Their coverage remains independently observable and
     // may be incomplete because callers are not required to supply a vector
     // for every source document.
     const readiness_complete = if (coverage_policy == .external)
-        !coverage_incomplete and replay_current
+        !coverage_incomplete and replay_current and (sparse or artifact_publication_complete)
     else
         materialization_complete;
     const all_sources_settled = !coverage_incomplete and replay_current and
+        (coverage_policy != .external or sparse or artifact_publication_complete) and
         coverageAllSourcesTerminal(table_doc_count, produced_count, skipped_count, terminal_failed_count);
     const vector_projection_pending = @hasField(@TypeOf(item), "dense_vector_projection_pending") and
         item.dense_vector_projection_pending;
@@ -3307,8 +3309,8 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     const replay_ready = view.replay_target_sequence > 0 and
         view.replay_target_sequence <= view.replay_applied_sequence and
         !(if (enrichment) |stats| stats.retrying or stats.worker_failed else false);
-    const artifact_visible = observation_current and embeddingsArtifactPublishComplete(item, sparse, produced_count);
-    if (replay_ready and !artifact_visible and view.replay_target_sequence > 0) {
+    const artifact_visible = observation_current and artifact_publication_complete;
+    if ((replay_ready or (coverage_policy == .external and !sparse)) and !artifact_visible) {
         view.backfill_active = true;
         view.backfill_progress = 0.0;
         return view;
@@ -7196,6 +7198,31 @@ fn consumerTests() type {
             );
         }
 
+        test "external dense readiness requires complete artifact publication (#1210)" {
+            var item: db_mod.types.DBIndexStats = .{
+                .name = "vec",
+                .kind = .dense_vector,
+                .doc_count = 0,
+                .coverage_produced_count = 0,
+                .publication_target_count = 50,
+                .publication_target_ready = true,
+                .coverage_generation = 7,
+                .coverage_config_hash = 41,
+                .coverage_identity_ready = true,
+                .backfill_active = false,
+                .backfill_progress = 1.0,
+                .replay_applied_sequence = 9,
+                .replay_target_sequence = 9,
+            };
+            const pending = embeddingsRuntimeView(item, 200, .external, false, 7, 41, null, true);
+            try std.testing.expect(pending.backfill_active);
+            item.doc_count = 50;
+            item.node_count = 1;
+            const ready = embeddingsRuntimeView(item, 200, .external, false, 7, 41, null, true);
+            try std.testing.expect(!ready.backfill_active);
+            try std.testing.expectEqual(@as(f64, 1.0), ready.backfill_progress);
+        }
+
         test "native dense vector projection remains public readiness debt after external coverage converges" {
             const item: db_mod.types.DBIndexStats = .{
                 .name = "vec",
@@ -9863,6 +9890,8 @@ fn consumerTests() type {
                 .name = try std.testing.allocator.dupe(u8, "vec"),
                 .kind = .dense_vector,
                 .doc_count = 50_000,
+                .publication_target_ready = true,
+                .publication_target_count = 50_000,
                 .node_count = 24,
                 .coverage_produced_count = 50_000,
                 .coverage_generation = 42,

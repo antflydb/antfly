@@ -322,6 +322,9 @@ pub const IndexBackendOptions = struct {
     /// This is deliberately separate from dense_lsm_storage: native HBC may
     /// retire its compatibility LSM while vector blocks still need files.
     vector_block_storage: ?lsm_backend_mod.Storage = null,
+    /// Durable generation manifests and active-root pointers for external roots.
+    /// Null retains host filesystem metadata for ordinary directory-backed DBs.
+    generation_storage: ?lsm_backend_mod.Storage = null,
     sparse_lsm_storage: ?lsm_backend_mod.Storage = null,
     graph_lsm_storage: ?lsm_backend_mod.Storage = null,
     lsm_cache: ?*lsm_backend_mod.Cache = null,
@@ -525,6 +528,7 @@ pub fn indexBackendOptionsForPrimary(
         .text_lsm_storage = overrides.text_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .dense_lsm_storage = overrides.dense_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .vector_block_storage = overrides.vector_block_storage orelse if (kind == .lsm) primary_lsm_storage else null,
+        .generation_storage = overrides.generation_storage,
         .sparse_lsm_storage = overrides.sparse_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .graph_lsm_storage = overrides.graph_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .lsm_cache = overrides.lsm_cache orelse lsm_cache,
