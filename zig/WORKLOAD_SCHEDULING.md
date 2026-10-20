@@ -18,12 +18,23 @@ implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `d227ec2811235d618b8e50d86ab4b1472b207cc4`
 (merge commit `b81563cddd6bd86941e40ebcdf2b1bf805113605`).
 
-Native ABI 44, storage-owner ABI 105, engine descriptor 29, required preparation
+Native ABI 44, storage-owner ABI 106, engine descriptor 29, required preparation
 file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
+
+Source `53099a8ffc4f296b90240aa57ec5c42030d3a9df` carries original execution and
+cancellation through ordinary native commit/abort and atomic participant
+acknowledgement. Contended completion returns to the same durable retry owner; the
+later indexed commit pipeline also bounds admission with retained CPU. Original
+visibility lending resumes only after service holders retire. Actual full-text
+commit and retry, pre-holder lending/canceled reentry, restart and original error
+identity checks pass alongside the coordinator and packaged-source checks.
+Storage-owner ABI 106 and runtime-failure ABI 65 preserve the new
+completion-pending identity. Controlled hidden completion and required preparation
+remain closed pending their authenticated native Plan, provider and producer work.
 
 Source `e1c19bf0a44c40bd220cfffd4c4cffffbc68257a` carries original admission through a typed native
 transaction BEGIN. Validation workspace is admitted before backing allocation;

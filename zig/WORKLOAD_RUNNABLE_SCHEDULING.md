@@ -19,6 +19,66 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Ordinary native completion preserves admission and bounds retry (2026-10-20)
+
+Source `53099a8ffc4f296b90240aa57ec5c42030d3a9df` registers native execution-aware
+and cancellation-aware ordinary transaction completion. A typed synchronous owner
+operation carries these calls into storage. The original deadline, cancellation,
+runnable, supplied route controls and checked CPU reentry remain borrowed through
+native resolution. Callback-originated errors retain their exact cause across the
+C boundary, including missing-shaped errors and original backpressure.
+Participant-locator scratch is funded before backing allocation, and physical
+freeing precedes credit retirement. No new completion owner, thread, deadline,
+JSON response or post-success caller checkpoint is created.
+
+Resolution and local participant acknowledgement retain their existing atomic
+physical batch. Retained coordinators still defer committed self-acknowledgement
+until the response registry records success. Native apply contention returns to
+the same durable retry owner, rather than waiting with CPU/mutation ownership
+retained. The later indexed commit pipeline also uses bounded pressure, snapshot
+and apply admission. Its original visibility-wait boundary is restored only after
+the existing retirement checks prove service holders are gone. Native backpressure
+becomes `CommitCompletionPending`; a traced original callback rejection takes
+precedence. A visibility failure never authorizes changing an already durable
+commit into an abort.
+
+Storage-owner ABI is now 106 and shared runtime-failure ABI is 65. The new
+completion-pending identity is appended at `0x1000D` in the unpublished pooling
+range; released main statuses retain their numbers. Native ABI 44, API ABI 54,
+engine descriptor 29, required reader floor 10, data-Raft protocol 28 and metadata
+protocol 36 remain unchanged. Required preparation is not activated.
+
+`native-controlled-completion-verified.json` binds 5259 native/schema input hashes
+to 94/94 passing build steps. Runtime coverage includes 110 coordinator cases, 46
+companion cases, 12 native protocol/owner cases, the actual DB
+late-contention/full-text regression, the exact error-registry check and four
+persistent transaction WAL cases. The late-contention test pauses after the
+initial decision lookup: refusal leaves the transaction pending with neither
+primary mutation nor acknowledgement; retrying the same ID commits and produces a
+full-text search hit. No CPU loan is allowed during the refused attempt. Every
+visibility loan on retry observes this invocation’s apply and snapshot leases
+retired and has a balanced resume. Independent producers may own the same global
+locks while the caller waits. Separate capture-barrier tests verify lending before
+mutation ownership; canceled reentry leaves the transaction pending and
+unacknowledged. Original failure injection, acknowledgement deferral, terminal
+conflicts, restart durability and quota-before-backing checks pass. The
+intermediate fixtures rejected legitimate post-retirement lending or probed global
+lock availability. The final test observes the invocation’s actual retirement
+while preserving every retained-holder prohibition.
+
+Both startup profiles and the actual source controller pass semantic analysis; the
+full linked storage-owner archive and source cold-open runtime remain unqualified.
+The immutable public package contains 4543 matching sources and passes all 25
+ReleaseSafe consumer steps. Generated errors and the storage control catalog
+match. Full Linux qualification remains waived.
+
+The full design remains incomplete. Context-aware native PREPARE, required
+capability/BEGIN/PREPARE/seal providers and independently funded original
+producers remain unwired. Controlled hidden completion stays closed until its
+authenticated Plan is enforced under native apply ownership. Fresh route
+authority, migration/activation, large frames, completion resource bundles and
+broader scheduler/fault scope remain open.
+
 ## Original admission through native transaction BEGIN (2026-10-20)
 
 Source `e1c19bf0a44c40bd220cfffd4c4cffffbc68257a` replaces the context-aware source's uncontrolled JSON BEGIN
