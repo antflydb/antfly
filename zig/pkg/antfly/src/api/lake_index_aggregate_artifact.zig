@@ -884,12 +884,13 @@ pub const Reader = struct {
         const a = frame.arena.allocator();
         var records: std.ArrayList(state_tree.tree.Cursor.Record) = .empty;
         var bytes: usize = 0;
+        const byte_limit = @min(@as(usize, 4 * 1024 * 1024), @max(@as(usize, 64 * 1024), self.selection_memory / 4));
         while (records.items.len < 256) {
             if (self.tree_maximum) |goal| if (self.tree_loaded >= goal) break;
             const record = if (self.tree_pending) |record| record else (try self.tree_cursor.?.next()) orelse break;
             self.tree_pending = null;
             const size = record.key.len + record.value.len;
-            if (records.items.len != 0 and size > 4 * 1024 * 1024 -| bytes) {
+            if (records.items.len != 0 and size > byte_limit -| bytes) {
                 self.tree_pending = record;
                 break;
             }
@@ -1275,7 +1276,20 @@ pub const Reader = struct {
             };
         }
         const remaining = self.tree_frame.?.records.len - self.tree_frame_position;
-        const count = @min(remaining, @min(@min(maximum, 256), if (self.tree_maximum) |goal| goal - @as(usize, @intCast(self.emitted)) else std.math.maxInt(usize)));
+        const wanted = @min(remaining, @min(@min(maximum, 256), if (self.tree_maximum) |goal| goal - @as(usize, @intCast(self.emitted)) else std.math.maxInt(usize)));
+        // Physical row descriptors also consume memory. Wide recipes must
+        // shrink their decode batch even when their encoded payloads are tiny.
+        const width = native_partial.physicalWidth(self.root.state_recipe.?.inputs) + self.root.recipe.keys.len;
+        const descriptors = width *| @sizeOf(std.meta.Elem(@FieldType(spill.ColumnarBlock, "values"))) *| 2 +| @sizeOf(operators.GroupResult);
+        var count: usize = 0;
+        var decoded_bytes: usize = 0;
+        while (count < wanted) {
+            const record = self.tree_frame.?.records[self.tree_frame_position + count];
+            const cost = record.value.len +| record.key.len *| 2 +| descriptors;
+            if (count != 0 and cost > self.selection_memory -| decoded_bytes) break;
+            decoded_bytes +|= cost;
+            count += 1;
+        }
         const result = try a.alloc(operators.GroupResult, count);
         const slots = self.state_slots orelse try a.dupe(u16, &.{self.root.state_slot.?});
         var n: usize = 0;
@@ -2755,6 +2769,7 @@ test "external lake aggregate ordered persistent group state prunes long prefixe
     var current = try state_tree.merge(a, &store, recipe, indexes[0], right, .{ .parent = parent, .left = indexes[0], .right = indexes[1] }, .none, &metrics);
     try std.testing.expectEqual(@as(usize, 1), metrics.changed_groups);
     try std.testing.expect(metrics.written_bytes < cold_metrics.written_bytes / 4);
+    const one_group_writes = metrics.written_bytes;
     for (0..3) |phase| {
         if (phase == 1) {
             const before = right;
@@ -2788,7 +2803,7 @@ test "external lake aggregate ordered persistent group state prunes long prefixe
         try collector.markArtifact(out, fresh[0]);
         try std.testing.expect(collector.marked.count() > 1);
     }
-    std.debug.print("group state: cold_writes={d} one_group_writes={d}\n", .{ cold_metrics.written_bytes, metrics.written_bytes });
+    std.debug.print("group state: cold_writes={d} one_group_update={d} one_group_delete={d}\n", .{ cold_metrics.written_bytes, one_group_writes, metrics.written_bytes });
 }
 
 test "external lake aggregate persistent state admits spilled groups and preserves oversized record fallback" {
