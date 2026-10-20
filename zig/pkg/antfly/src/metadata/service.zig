@@ -13258,6 +13258,40 @@ test "metadata table topology protocol fences namespace writers and restored dec
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } }));
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"indexes_json\":\"{\\\"_resolver_namespaces\\\":{}}\"}" }));
+    // The predecessor advertises v35 but cannot parse the provenance fields
+    // emitted even by an otherwise empty new curation state. Every table
+    // writer, including reserved-only retired/proposal metadata, must fence it.
+    try std.testing.expect(version > 35);
+    for ([_][]const u8{
+        "{\"_curation_proposals\":{\"proposals\":[]}}",
+        "{\"_resolver_curation\":{\"identities\":[]}}",
+        "{\"_resolver_namespaces\":{\"namespaces\":[]}}",
+    }) |indexes| {
+        var replacement = table;
+        replacement.indexes_json = indexes;
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = replacement }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = table, .replacement = replacement } }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle = .{ .upsert_tables = &.{replacement} } }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{replacement} } }));
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .indexes_json = indexes }, .{});
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = encoded }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = encoded }));
+    }
+    const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    var predecessor = MetadataStatus{
+        .metadata_group_id = 42,
+        .metadata_incarnation = incarnation,
+        .metadata_raft_local_node_id = 7,
+        .table_topology_protocol_version = 35,
+        .metrics = .{},
+    };
+    for ([_]u16{ 35, 36 }) |old_version| {
+        predecessor.table_topology_protocol_version = old_version;
+        try std.testing.expect(!tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
+    }
+    predecessor.table_topology_protocol_version = version;
+    try std.testing.expect(tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
 }
 
 test "metadata table topology protocol checks the command's required version and exact replica" {

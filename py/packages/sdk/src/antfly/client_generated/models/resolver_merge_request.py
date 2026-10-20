@@ -20,6 +20,8 @@ class ResolverMergeRequest:
     Attributes:
         from_ (str):
         to (str):
+        actor (str | Unset):
+        reason (str | Unset):
         replace (bool | Unset):  Default: False.
         pin_distinct (bool | Unset): Pin the replaced former target distinct. Requires an existing different redirect
             and replace=true. Default: False.
@@ -31,6 +33,8 @@ class ResolverMergeRequest:
 
     from_: str
     to: str
+    actor: str | Unset = UNSET
+    reason: str | Unset = UNSET
     replace: bool | Unset = False
     pin_distinct: bool | Unset = False
     expected_revision: int | Unset = UNSET
@@ -40,6 +44,10 @@ class ResolverMergeRequest:
         from_ = self.from_
 
         to = self.to
+
+        actor = self.actor
+
+        reason = self.reason
 
         replace = self.replace
 
@@ -59,6 +67,10 @@ class ResolverMergeRequest:
                 "to": to,
             }
         )
+        if actor is not UNSET:
+            field_dict["actor"] = actor
+        if reason is not UNSET:
+            field_dict["reason"] = reason
         if replace is not UNSET:
             field_dict["replace"] = replace
         if pin_distinct is not UNSET:
@@ -79,6 +91,10 @@ class ResolverMergeRequest:
 
         to = d.pop("to")
 
+        actor = d.pop("actor", UNSET)
+
+        reason = d.pop("reason", UNSET)
+
         replace = d.pop("replace", UNSET)
 
         pin_distinct = d.pop("pin_distinct", UNSET)
@@ -95,6 +111,8 @@ class ResolverMergeRequest:
         resolver_merge_request = cls(
             from_=from_,
             to=to,
+            actor=actor,
+            reason=reason,
             replace=replace,
             pin_distinct=pin_distinct,
             expected_revision=expected_revision,

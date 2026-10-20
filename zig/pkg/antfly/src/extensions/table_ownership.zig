@@ -14,6 +14,7 @@
 // limitations.
 
 const std = @import("std");
+const index_metadata = @import("antfly_local_sources").api_index_metadata;
 const extension_domain = @import("mod.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -74,7 +75,7 @@ fn collectEnrichmentByName(root: std.json.Value, name: []const u8, found: *?std.
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 try collectEnrichmentByName(entry.value_ptr.*, name, found);
             }
         },
@@ -199,4 +200,15 @@ test "relation mutation ownership streams semantic index checks and preserves sh
     var invalid = Fixture.after;
     invalid.indexes_json = "[]";
     try std.testing.expectError(error.InvalidTableIndexMetadata, DefinitionMutationGuard.init(std.testing.allocator, Fixture.before, invalid));
+}
+
+test "relation mutation ownership ignores opaque evidence enrichments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"_curation_proposals":{"enrichments":"invalid evidence"},"_resolver_curation":{"enrichments":[{"name":"live","field":"fake"}]},"_resolver_namespaces":{"enrichments":false},"index":{"enrichments":[{"name":"live","field":"body"}]}}
+    , .{});
+    const live = (try enrichmentByName(root, "live")).?;
+    try std.testing.expectEqualStrings("body", live.object.get("field").?.string);
 }

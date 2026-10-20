@@ -19,6 +19,9 @@ class EntityMergeRequest:
     """
     Attributes:
         into (str):
+        expected_revision (int | Unset):
+        actor (str | Unset):
+        reason (str | Unset):
         replace (bool | Unset):  Default: False.
         pin_distinct (bool | Unset):  Default: False.
         wait (ResolverWait | Unset): Wait for observed replay completion up to this timeout. A timeout returns accepted
@@ -26,12 +29,21 @@ class EntityMergeRequest:
     """
 
     into: str
+    expected_revision: int | Unset = UNSET
+    actor: str | Unset = UNSET
+    reason: str | Unset = UNSET
     replace: bool | Unset = False
     pin_distinct: bool | Unset = False
     wait: ResolverWait | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         into = self.into
+
+        expected_revision = self.expected_revision
+
+        actor = self.actor
+
+        reason = self.reason
 
         replace = self.replace
 
@@ -48,6 +60,12 @@ class EntityMergeRequest:
                 "into": into,
             }
         )
+        if expected_revision is not UNSET:
+            field_dict["expected_revision"] = expected_revision
+        if actor is not UNSET:
+            field_dict["actor"] = actor
+        if reason is not UNSET:
+            field_dict["reason"] = reason
         if replace is not UNSET:
             field_dict["replace"] = replace
         if pin_distinct is not UNSET:
@@ -64,6 +82,12 @@ class EntityMergeRequest:
         d = dict(src_dict)
         into = d.pop("into")
 
+        expected_revision = d.pop("expected_revision", UNSET)
+
+        actor = d.pop("actor", UNSET)
+
+        reason = d.pop("reason", UNSET)
+
         replace = d.pop("replace", UNSET)
 
         pin_distinct = d.pop("pin_distinct", UNSET)
@@ -77,6 +101,9 @@ class EntityMergeRequest:
 
         entity_merge_request = cls(
             into=into,
+            expected_revision=expected_revision,
+            actor=actor,
+            reason=reason,
             replace=replace,
             pin_distinct=pin_distinct,
             wait=wait,

@@ -20,6 +20,7 @@
 /// Each handler method extracts wire parameters from the httpx Context, calls
 /// a typed operation, and adapts its owned result to an httpx.Response.
 const std = @import("std");
+const index_metadata = @import("antfly_local_sources").api_index_metadata;
 const ant_json = @import("antfly-json");
 const sql_execution = @import("sql_execution.zig");
 const sql_compiler = @import("antfly_local_sources").sql_compiler;
@@ -521,7 +522,7 @@ fn graphResolverDestinationsAllowedInConfig(
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 if (!(try graphResolverDestinationsAllowedInConfig(identity, entry.value_ptr.*))) return false;
             }
         },
@@ -9235,6 +9236,66 @@ pub const AntflyApiHandler = struct {
         return self.reviewResolverMention(ctx, table_name, resolver_name, review_id);
     }
 
+    pub fn proposeCuration(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal_create, table_name, "", "");
+    }
+
+    pub fn namespaceProposeCuration(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.proposeCuration(ctx, table_name);
+    }
+
+    pub fn listCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposals, table_name, "", "");
+    }
+
+    pub fn namespaceListCurationProposals(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.listCurationProposals(ctx, table_name);
+    }
+
+    pub fn getCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal, table_name, "", proposal_id);
+    }
+
+    pub fn namespaceGetCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.getCurationProposal(ctx, table_name, proposal_id);
+    }
+
+    pub fn acceptCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal_accept, table_name, "", proposal_id);
+    }
+
+    pub fn namespaceAcceptCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.acceptCurationProposal(ctx, table_name, proposal_id);
+    }
+
+    pub fn rejectCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .proposal_reject, table_name, "", proposal_id);
+    }
+
+    pub fn namespaceRejectCurationProposal(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.rejectCurationProposal(ctx, table_name, proposal_id);
+    }
+
+    pub fn pinEntitiesDistinct(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
+        return self.resolverRequest(ctx, .entity_distinct, table_name, "", key);
+    }
+
+    pub fn namespacePinEntitiesDistinct(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.pinEntitiesDistinct(ctx, table_name, key);
+    }
+
     pub fn listEntityResolverState(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response {
         return self.resolverRequest(ctx, .entity_redirects, table_name, "", key);
     }
@@ -17767,4 +17828,16 @@ test "public graph metric borrowed wire owned HTTP responses keep buffers throug
     try std.testing.expectEqual(@as(usize, 0), owner.freed_bytes);
     response.releaseBody();
     try std.testing.expectEqual(owner.allocated_bytes, owner.freed_bytes);
+}
+
+test "resolver curation HTTP destination checks ignore opaque control metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const payload = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"_curation_proposals":{"resolvers":"invalid evidence"},"_resolver_curation":{"resolvers":[{"table":"protected"}]},"_resolver_namespaces":{"resolvers":false}}
+    , .{});
+    try std.testing.expect(try graphResolverDestinationsAllowedInConfig(null, payload));
+    const actual = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"graph\":{\"resolvers\":false}}", .{});
+    try std.testing.expectError(error.InvalidCreateTableRequest, graphResolverDestinationsAllowedInConfig(null, actual));
 }
