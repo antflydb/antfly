@@ -557,6 +557,30 @@ pub const Gemma4LayerSpecCache = struct {
 };
 
 pub const DecodeContext = struct {
+    pub const SelectionQueryCapture = struct {
+        pub const Metrics = struct {
+            calls: usize = 0,
+            bytes: usize = 0,
+            host_wait_ns: u64 = 0,
+            /// Collector callback only, after the query download has completed.
+            callback_ns: u64 = 0,
+        };
+        /// Diagnostic wall time includes waiting for earlier GPU work; it is
+        /// not an estimate of removable transfer overhead.
+        metrics: ?*Metrics = null,
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        horizon: usize,
+        captureFn: *const fn (
+            ctx: *anyopaque,
+            donor_layer: usize,
+            consumer_layer: usize,
+            first_position: usize,
+            num_heads: usize,
+            head_dim: usize,
+            values: []const f32,
+        ) anyerror!void,
+    };
     pub const AttentionMode = enum {
         full_recompute,
         paged_prefill,
@@ -604,6 +628,9 @@ pub const DecodeContext = struct {
     moe_runtime: ?*runtime.moe.runtime.MoeRuntime = null,
     qwen35_linear_cache: ?*Qwen35LinearCache = null,
     gemma4_layer_spec_cache: ?*Gemma4LayerSpecCache = null,
+    /// Qualification/selection-only capture of actual post-RoPE queries.
+    /// Implementations retain at most `horizon` rows per donor consumer.
+    selection_query_capture: ?SelectionQueryCapture = null,
     input_ids: ?[]const i64 = null,
     /// Qwen3-VL query positions in axis-major temporal/height/width order.
     /// The slice covers exactly the current query tokens, not the resident KV
@@ -6428,6 +6455,8 @@ fn decoderBlockImpl(
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "q_attn", layer, Q_for_attn, num_heads * head_dim);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "k_attn", layer, K_attn, num_kv_heads * head_dim);
     try maybeCaptureActivationTrace(trace_sink, cb, allocator, "v_attn", layer, V_normed, num_kv_heads * head_dim);
+    if (qk_already_roped and !config.layerUsesSlidingAttention(layer))
+        try captureSelectionQueries(cb, decode_context, Q_for_attn, kv_layer_index, layer, num_heads, head_dim);
     debug_timing_stats.attention_qkv_nanos += @intCast(monotonicNowNs() - attn_qkv_started_at);
 
     if (!disableDecoderRuntimeActivationDebug() and attn_out_proj_linear_slot != null and ffn_norm_slot != null) {
@@ -8500,6 +8529,41 @@ fn attentionQueryRopeScale(global_head_dim: u32, head_dim: u32) ?f32 {
     return @sqrt(@as(f32, @floatFromInt(head_dim)));
 }
 
+fn captureSelectionQueries(
+    cb: *const ComputeBackend,
+    decode_context: ?*const DecodeContext,
+    q_rope: CT,
+    donor_layer: usize,
+    consumer_layer: usize,
+    num_heads: usize,
+    head_dim: usize,
+) !void {
+    const dc = decode_context orelse return;
+    const capture = dc.selection_query_capture orelse return;
+    if (capture.horizon == 0 or dc.query_sequence_len == 0) return;
+    const capture_started = if (capture.metrics != null) monotonicNowNs() else 0;
+    defer if (capture.metrics) |metrics| {
+        metrics.calls += 1;
+        metrics.host_wait_ns += @intCast(monotonicNowNs() - capture_started);
+    };
+    const rows = @min(capture.horizon, dc.query_sequence_len);
+    const start_row = dc.query_sequence_len - rows;
+    const width = try std.math.mul(usize, num_heads, head_dim);
+    const allocator = capture.allocator;
+    const tail = try cb.sliceRows2D(allocator, q_rope, start_row, rows, width);
+    defer cb.free(tail);
+    const values = try cb.toFloat32(tail, allocator);
+    defer allocator.free(values);
+    if (values.len != rows * width) return error.UnexpectedOutputShape;
+    if (capture.metrics) |metrics| metrics.bytes += values.len * @sizeOf(f32);
+    const first_position = dc.total_sequence_len - dc.query_sequence_len + start_row;
+    const callback_started = if (capture.metrics != null) monotonicNowNs() else 0;
+    defer if (capture.metrics) |metrics| {
+        metrics.callback_ns += @intCast(monotonicNowNs() - callback_started);
+    };
+    try capture.captureFn(capture.ctx, donor_layer, consumer_layer, first_position, num_heads, head_dim, values);
+}
+
 fn runPreparedAttentionWithSinkMetadata(
     cb: *const ComputeBackend,
     Q: CT,
@@ -8731,6 +8795,8 @@ fn applyAttentionWithSink(
         try maybeDebugLayerTensorLastRow(cb, std.heap.page_allocator, layer, "k_rope", K_rope, num_kv_heads * head_dim);
         try maybeDebugLayerTensor(cb, std.heap.page_allocator, layer, "q_rope", Q_rope);
         try maybeDebugLayerTensor(cb, std.heap.page_allocator, layer, "k_rope", K_rope);
+        if (!config.layerUsesSlidingAttention(layer))
+            try captureSelectionQueries(cb, decode_context, Q_rope, kv_layer_index, layer, num_heads, head_dim);
         if (!sink_metadata.hasMetadata() and attention.mode == .dense_causal and attention.sliding_window == 0 and attention.attn_or_mask == null) {
             const gqa_started_at = monotonicNowNs();
             const result = try cb.gqaCausalAttention(Q_rope, K_rope, V, null, batch, attention.query_sequence_len, num_heads, num_kv_heads, head_dim);
@@ -8979,6 +9045,8 @@ pub fn applyAttentionResidual(
         debug_timing_stats.attention_rope_nanos += @intCast(monotonicNowNs() - rope_started_at);
         try maybeDumpGatedLayerStageStats(cb, std.heap.page_allocator, layer, "q-rope", Q_rope, num_heads * head_dim);
         try maybeDumpGatedLayerStageStats(cb, std.heap.page_allocator, layer, "k-rope", K_rope, num_kv_heads * head_dim);
+        if (!config.layerUsesSlidingAttention(layer))
+            try captureSelectionQueries(cb, decode_context, Q_rope, kv_layer_index, layer, num_heads, head_dim);
         return cb.runAttentionResidual(&.{
             .q = Q_rope,
             .k = K_rope,

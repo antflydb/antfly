@@ -787,6 +787,20 @@ from .inference_config import InferenceConfig
 from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
+from .inference_context_checkpoint import InferenceContextCheckpoint
+from .inference_context_checkpoint_version import InferenceContextCheckpointVersion
+from .inference_context_diagnostics import InferenceContextDiagnostics
+from .inference_context_diagnostics_kv_cache_mode import InferenceContextDiagnosticsKvCacheMode
+from .inference_context_diagnostics_kv_cache_version import InferenceContextDiagnosticsKvCacheVersion
+from .inference_context_diagnostics_policy import InferenceContextDiagnosticsPolicy
+from .inference_context_management import InferenceContextManagement
+from .inference_context_management_mode import InferenceContextManagementMode
+from .inference_context_prepare_request import InferenceContextPrepareRequest
+from .inference_context_prepare_request_mode import InferenceContextPrepareRequestMode
+from .inference_context_prepare_response import InferenceContextPrepareResponse
+from .inference_context_structured_memory import InferenceContextStructuredMemory
+from .inference_context_tool_evidence import InferenceContextToolEvidence
+from .inference_context_unresolved_tool_call import InferenceContextUnresolvedToolCall
 from .inference_credentials import InferenceCredentials
 from .inference_decide_long_document import InferenceDecideLongDocument
 from .inference_decide_long_document_mode import InferenceDecideLongDocumentMode
@@ -854,6 +868,9 @@ from .inference_generate_usage import InferenceGenerateUsage
 from .inference_image_url import InferenceImageURL
 from .inference_image_url_content_part import InferenceImageURLContentPart
 from .inference_image_url_content_part_type import InferenceImageURLContentPartType
+from .inference_kv_cache_policy import InferenceKvCachePolicy
+from .inference_kv_cache_policy_mode import InferenceKvCachePolicyMode
+from .inference_kv_cache_policy_version import InferenceKvCachePolicyVersion
 from .inference_level import InferenceLevel
 from .inference_media_content_part import InferenceMediaContentPart
 from .inference_media_content_part_type import InferenceMediaContentPartType
@@ -2292,6 +2309,20 @@ __all__ = (
     "InferenceConnection",
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
+    "InferenceContextCheckpoint",
+    "InferenceContextCheckpointVersion",
+    "InferenceContextDiagnostics",
+    "InferenceContextDiagnosticsKvCacheMode",
+    "InferenceContextDiagnosticsKvCacheVersion",
+    "InferenceContextDiagnosticsPolicy",
+    "InferenceContextManagement",
+    "InferenceContextManagementMode",
+    "InferenceContextPrepareRequest",
+    "InferenceContextPrepareRequestMode",
+    "InferenceContextPrepareResponse",
+    "InferenceContextStructuredMemory",
+    "InferenceContextToolEvidence",
+    "InferenceContextUnresolvedToolCall",
     "InferenceCredentials",
     "InferenceDecideLongDocument",
     "InferenceDecideLongDocumentMode",
@@ -2359,6 +2390,9 @@ __all__ = (
     "InferenceImageURL",
     "InferenceImageURLContentPart",
     "InferenceImageURLContentPartType",
+    "InferenceKvCachePolicy",
+    "InferenceKvCachePolicyMode",
+    "InferenceKvCachePolicyVersion",
     "InferenceLevel",
     "InferenceMediaContentPart",
     "InferenceMediaContentPartType",

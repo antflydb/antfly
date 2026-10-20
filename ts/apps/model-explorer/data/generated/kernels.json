@@ -4354,6 +4354,22 @@
    }
   },
   {
+   "name": "termite_selection_score_norm",
+   "family": "norm_rope",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_selection_score_reduce",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_slice_last_dim_f32_2d",
    "family": "data_movement",
    "generated": false,

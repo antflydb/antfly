@@ -140,6 +140,9 @@ pub const ServerConfig = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     max_body_size: usize = 10 * 1024 * 1024,
+    /// Optional ceiling for explicitly bounded raw-streaming routes. It does
+    /// not enlarge ordinary bodies or the process-wide buffering budget.
+    max_streamed_body_size: ?usize = null,
     max_headers: usize = 100,
     max_file_size: usize = types.default_max_body_size,
     /// Absolute wall-clock limit for receiving one request's header block.
@@ -1725,6 +1728,17 @@ pub const Server = struct {
         try self.router.addStreamingRaw(method, path, handler);
     }
 
+    /// Explicitly bounded raw streaming. The separate configured stream
+    /// ceiling permits large uploads without changing buffered-body limits.
+    pub fn routeStreamingRawWithBodyLimit(self: *Self, method: types.Method, path: []const u8, max_body_size: usize, handler: anytype) !void {
+        try self.router.addStreamingRawWithBodyLimit(method, path, handler, max_body_size);
+    }
+
+    /// Bounded raw streaming without losing route-owned context.
+    pub fn routeStreamingRawWithDataAndBodyLimit(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque, max_body_size: usize) !void {
+        try self.router.addStreamingRawWithDataAndBodyLimit(method, path, handler, data, max_body_size);
+    }
+
     /// Registers a route with borrowed opaque data copied into Context.
     pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
         try self.router.addWithData(method, path, handler, data);
@@ -2375,7 +2389,7 @@ pub const Server = struct {
                 if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
                     // Reject before telling client to send, if Content-Length exceeds limit.
                     if (parser.content_length) |cl| {
-                        if (cl > self.config.max_body_size) {
+                        if (cl > parser.message_body_size_limit) {
                             try sock.sendAll("HTTP/1.1 413 Content Too Large\r\n\r\n");
                             return;
                         }
@@ -2587,7 +2601,11 @@ pub const Server = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const path = if (mem.indexOfScalar(u8, request_target, '?')) |query| request_target[0..query] else request_target;
         const route_limit = self.router.bodySizeLimit(method, path) orelse return null;
-        return @min(route_limit, self.config.max_body_size);
+        const ceiling = if (self.router.requestBodyStreaming(method, path) == .raw)
+            self.config.max_streamed_body_size orelse self.config.max_body_size
+        else
+            self.config.max_body_size;
+        return @min(route_limit, ceiling);
     }
 
     fn resolveRequestBodyStreaming(ptr: *anyopaque, method: types.Method, request_target: []const u8, content_type_value: ?[]const u8) bool {
@@ -6611,4 +6629,181 @@ test "removeCookie rejects CR/LF in name" {
 
     const result = ctx.removeCookie("bad\nname", .{});
     try std.testing.expectError(error.HeaderContainsCrLf, result);
+}
+test "large raw stream limits require both explicit route and separate ceiling" {
+    const handler = struct {
+        fn h(ctx: *Context) !Response {
+            return ctx.text("ok");
+        }
+    }.h;
+    for ([_]?usize{ null, 4096 }) |stream_limit| {
+        var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+            .max_body_size = 64,
+            .max_streamed_body_size = stream_limit,
+            .request_body_buffer_budget_bytes = 128,
+        });
+        defer server.deinit();
+        try server.routeStreamingRawWithBodyLimit(.POST, "/checkpoint/:id", 2048, handler);
+        try server.routeStreamingRawWithBodyLimit(.POST, "/capped", 8192, handler);
+        try server.postWithBodyLimit("/buffered", 8192, handler);
+        try server.postStreamingRaw("/unbounded-raw", handler);
+        try server.postStreaming("/attachments", handler);
+        try std.testing.expectEqual(@as(?usize, if (stream_limit != null) 2048 else 64), Server.resolveRequestBodyLimit(&server, .POST, "/checkpoint/7?ignored=1"));
+        try std.testing.expectEqual(@as(?usize, stream_limit orelse 64), Server.resolveRequestBodyLimit(&server, .POST, "/capped"));
+        try std.testing.expectEqual(@as(?usize, 64), Server.resolveRequestBodyLimit(&server, .POST, "/buffered"));
+        try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/unbounded-raw"));
+        try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/attachments"));
+        try std.testing.expectEqual(@as(usize, 128), server.config.request_body_buffer_budget_bytes);
+
+        var parser = Parser.init(std.testing.allocator);
+        defer parser.deinit();
+        parser.max_body_size = server.config.max_body_size;
+        parser.body_budget = &server.body_budget;
+        parser.request_body_limit_context = &server;
+        parser.request_body_limit_resolver = Server.resolveRequestBodyLimit;
+        parser.request_body_streaming_context = &server;
+        parser.request_body_streaming_resolver = Server.resolveRequestBodyStreaming;
+        _ = try parser.feed("POST /checkpoint/7 HTTP/1.1\r\nContent-Length: 2048\r\n\r\n");
+        try std.testing.expectEqual(stream_limit == null, parser.isError());
+        if (stream_limit != null) {
+            try std.testing.expect(parser.isComplete() and parser.headers_only);
+            try std.testing.expectEqual(@as(usize, 2048), parser.message_body_size_limit);
+        }
+        try std.testing.expectEqual(@as(usize, 0), parser.body_buffer.capacity);
+        try std.testing.expectEqual(@as(usize, 0), parser.body_budget_reserved);
+        parser.reset();
+        _ = try parser.feed("POST /checkpoint/7 HTTP/1.1\r\nContent-Length: 2049\r\n\r\n");
+        try std.testing.expect(parser.isError());
+        parser.reset();
+        _ = try parser.feed("POST /buffered HTTP/1.1\r\nContent-Length: 65\r\n\r\n");
+        try std.testing.expect(parser.isError());
+        parser.reset();
+        _ = try parser.feed("POST /unbounded-raw HTTP/1.1\r\nContent-Length: 65\r\n\r\n");
+        try std.testing.expect(parser.isError());
+    }
+}
+
+test "H1 explicit large stream receives fixed body without enlarging buffering budget" {
+    const State = struct {
+        expected_bytes: usize,
+        fn handler(ctx: *Context) anyerror!Response {
+            const state: *const @This() = @ptrCast(@alignCast(ctx.route_data orelse return error.MissingRouteData));
+            var reader = ctx.requestBodyReader();
+            var buf: [64]u8 = undefined;
+            var total: usize = 0;
+            while (true) {
+                const n = try reader.read(&buf);
+                if (n == 0) break;
+                for (buf[0..n]) |byte| if (byte != 'x') return error.InvalidTestPayload;
+                total += n;
+            }
+            if (total != state.expected_bytes) return error.InvalidTestPayload;
+            return ctx.text("streamed-large");
+        }
+    };
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_body_size = 64,
+        .max_streamed_body_size = 4096,
+        .request_body_buffer_budget_bytes = 128,
+        .body_read_timeout_ms = 5_000,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    var state = State{ .expected_bytes = 2048 };
+    try server.routeStreamingRawWithDataAndBodyLimit(.POST, "/checkpoint", State.handler, &state, 2048);
+    try server.bind();
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("large stream listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    var client = try Socket.connect(server.boundAddress().?, std.Io.Threaded.global_single_threaded.io());
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll("POST /checkpoint HTTP/1.1\r\nHost: test\r\nContent-Type: application/octet-stream\r\nContent-Length: 2048\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n");
+    var response: [1024]u8 = undefined;
+    var count = try client.recv(&response);
+    try std.testing.expect(mem.indexOf(u8, response[0..count], "100 Continue") != null);
+    try client.sendAll(&@as([2048]u8, @splat('x')));
+    count = 0;
+    while (count < response.len and mem.indexOf(u8, response[0..count], "streamed-large") == null) {
+        const n = try client.recv(response[count..]);
+        if (n == 0) break;
+        count += n;
+    }
+    try std.testing.expect(mem.indexOf(u8, response[0..count], "200 OK") != null);
+    try std.testing.expect(mem.indexOf(u8, response[0..count], "streamed-large") != null);
+    try std.testing.expectEqual(@as(usize, 128), server.config.request_body_buffer_budget_bytes);
+}
+test "HTTP2 explicit large stream ceiling applies before data and bounds cumulative bytes" {
+    const allocator = std.testing.allocator;
+    const handler = struct {
+        fn h(ctx: *Context) !Response {
+            return ctx.text("ok");
+        }
+    }.h;
+    for ([_]bool{ false, true }) |oversized_header| {
+        var server = Server.initWithConfig(allocator, std.testing.io, .{
+            .max_body_size = 64,
+            .max_streamed_body_size = 512,
+            .request_body_buffer_budget_bytes = 128,
+        });
+        defer server.deinit();
+        try server.routeStreamingRawWithBodyLimit(.POST, "/checkpoint", 256, handler);
+        var h2 = H2Connection.initServer(allocator, std.testing.io);
+        defer h2.deinit();
+        h2.max_stream_data_size = 64;
+        h2.recv_data_budget = &server.body_budget;
+        const stream = try h2.stream_manager.getOrCreateStream(1);
+        try stream.open();
+        stream.got_headers = true;
+        const headers = try allocator.alloc(hpack.DecodedHeader, 2);
+        headers[0] = .{ .name = @constCast(":method"), .value = @constCast("POST"), .name_owned = false, .value_owned = false };
+        headers[1] = .{ .name = @constCast(":path"), .value = @constCast("/checkpoint"), .name_owned = false, .value_owned = false };
+        stream.request_headers = headers;
+        stream.content_length = if (oversized_header) 257 else null;
+        var output = std.ArrayListUnmanaged(u8).empty;
+        defer output.deinit(allocator);
+        const Writer = struct {
+            bytes: *std.ArrayListUnmanaged(u8),
+            allocator: Allocator,
+            pub fn writeAll(self: *@This(), bytes: []const u8) !void {
+                try self.bytes.appendSlice(self.allocator, bytes);
+            }
+        };
+        var writer: Writer = .{ .bytes = &output, .allocator = allocator };
+        var event = Io.Event.unset;
+        const accepted = server.claimH2StreamForHandler(&h2, &writer, 1, &event);
+        try std.testing.expectEqual(!oversized_header, accepted);
+        if (oversized_header) {
+            try std.testing.expect(h2.stream_manager.getStream(1) == null);
+            try std.testing.expect(output.items.len > 0);
+            continue;
+        }
+        try std.testing.expectEqual(@as(?usize, 256), stream.max_data_size);
+        const payload = @as([192]u8, @splat('a'));
+        var data: @import("../protocol/h2_connection.zig").Frame = .{
+            .header = .{ .length = 65, .frame_type = .data, .flags = 0, .stream_id = 1 },
+            .payload = @constCast(payload[0..65]),
+        };
+        try h2.deliverToMailbox(&data);
+        try std.testing.expect(stream.stream_error == null);
+        try std.testing.expectEqual(@as(usize, 65), stream.data_buf.items.len);
+        try std.testing.expect(stream.data_budget_reserved <= 128);
+        data.header.length = 192;
+        data.payload = @constCast(&payload);
+        try h2.deliverToMailbox(&data);
+        try std.testing.expectEqual(error.StreamDataOverflow, stream.stream_error.?);
+        try std.testing.expectEqual(@as(usize, 65), stream.data_buf.items.len);
+    }
 }

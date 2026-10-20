@@ -55,6 +55,7 @@ pub const Outbound = struct {
         return .{
             .context = self,
             .read_all = readAllBody,
+            .read = readBodyChunk,
             .streaming = @intFromBool(self.context.hasStreamingRequestBody()),
         };
     }
@@ -71,6 +72,17 @@ pub const Outbound = struct {
     fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
         const context: *const httpx.Context = @ptrCast(@alignCast(raw orelse return 0));
         return @intFromBool(context.isCancellationRequested());
+    }
+
+    fn readBodyChunk(raw: ?*anyopaque, dest: [*]u8, capacity: usize, count: *usize) callconv(.c) abi.CallbackStatus {
+        count.* = 0;
+        const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
+        if (self.context.isCancellationRequested()) return .canceled;
+        var reader = self.context.requestBodyReader();
+        const n = reader.read(dest[0..capacity]) catch |err| return callbackStatusAfterIo(self.context, err);
+        if (n > capacity) return .failed;
+        count.* = n;
+        return .ok;
     }
 
     fn readAllBody(raw: ?*anyopaque, out: *abi.OptionalBytes) callconv(.c) abi.CallbackStatus {
@@ -128,10 +140,11 @@ pub fn installInbound(
             .is_cancelled = inboundIsCancelled,
         };
     }
-    if (body_source.read_all != null) {
+    if (body_source.read_all != null or body_source.read != null) {
         context.body_delegate = .{
             .ptr = @constCast(body_source),
             .read_all = inboundReadAllBody,
+            .read = if (body_source.read != null) inboundReadBodyChunk else null,
             .streaming = body_source.streaming != 0,
         };
     }
@@ -145,10 +158,27 @@ pub fn installInbound(
     }
 }
 
+fn inboundReadBodyChunk(raw: ?*anyopaque, dest: []u8) !usize {
+    const source: *const abi.RequestBodySource = @ptrCast(@alignCast(raw orelse return error.BodySourceUnavailable));
+    var count: usize = 0;
+    switch (source.read.?(source.context, dest.ptr, dest.len, &count)) {
+        .ok => {},
+        .failed => return error.BodyReadFailed,
+        .canceled => return error.Canceled,
+        .timeout => return error.Timeout,
+        .body_too_large => return error.BodyTooLarge,
+        .body_capacity_exceeded => return error.BodyCapacityExceeded,
+        .end_of_stream => return error.EndOfStream,
+    }
+    if (count > dest.len) return error.InvalidBodyReadCount;
+    return count;
+}
+
 fn inboundReadAllBody(raw: ?*anyopaque) !?[]const u8 {
     const body_source: *const abi.RequestBodySource = @ptrCast(@alignCast(raw orelse return error.BodySourceUnavailable));
     var bytes: abi.OptionalBytes = .{};
-    switch (body_source.read_all.?(body_source.context, &bytes)) {
+    const read = body_source.read_all orelse return error.BodySourceUnavailable;
+    switch (read(body_source.context, &bytes)) {
         .ok => {},
         .failed => return error.BodyReadFailed,
         .canceled => return error.Canceled,
@@ -504,4 +534,111 @@ test "outbound callbacks prefer cancellation that arrives during transport IO" {
 
     cancellation.store(false, .release);
     try std.testing.expectEqual(.canceled, stream_sink.close.?(stream_sink.context));
+}
+
+test "linked incremental body reads cross both adapters without materializing the upload" {
+    const std = @import("std");
+    const State = struct {
+        remaining: usize = 1024 * 1024,
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        canceled: bool = false,
+        fn readAll(_: ?*anyopaque) !?[]const u8 {
+            return error.UnexpectedWholeBodyRead;
+        }
+        fn read(raw: ?*anyopaque, bytes: []u8) !usize {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.failure) |err| return err;
+            const n = @min(self.remaining, @min(bytes.len, 137));
+            @memset(bytes[0..n], 'k');
+            self.remaining -= n;
+            return n;
+        }
+        fn isCanceled(raw: ?*const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return self.canceled;
+        }
+    };
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/checkpoint");
+    defer request.deinit();
+    var outer = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer outer.deinit();
+    var state: State = .{};
+    outer.body_delegate = .{ .ptr = &state, .read_all = State.readAll, .read = State.read, .streaming = true };
+    outer.cancellation_probe = .{ .ptr = &state, .is_cancelled = State.isCanceled };
+    var outbound = Outbound{ .context = &outer };
+    const source = outbound.bodySource();
+    const cancellation = outbound.cancellation();
+    var inner = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer inner.deinit();
+    installInbound(&inner, &cancellation, &source, &.{});
+    try std.testing.expect(inner.hasStreamingRequestBody());
+    try std.testing.expectEqual(@as(usize, 0), state.calls);
+    var reader = inner.requestBodyReader();
+    var buffer: [512]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try reader.read(&buffer);
+        if (n == 0) break;
+        for (buffer[0..n]) |byte| try std.testing.expectEqual(@as(u8, 'k'), byte);
+        total += n;
+    }
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), total);
+    try std.testing.expect(request.body == null);
+    for ([_]anyerror{ error.Timeout, error.BodyTooLarge, error.BodyCapacityExceeded, error.EndOfStream, error.Canceled }) |err| {
+        state.failure = err;
+        try std.testing.expectError(err, reader.read(&buffer));
+    }
+    state.canceled = true;
+    const calls = state.calls;
+    try std.testing.expectError(error.Canceled, reader.read(&buffer));
+    try std.testing.expectEqual(calls, state.calls);
+}
+
+test "linked incremental body callback rejects an oversized count" {
+    const std = @import("std");
+    const Broken = struct {
+        fn read(_: ?*anyopaque, _: [*]u8, capacity: usize, count: *usize) callconv(.c) abi.CallbackStatus {
+            count.* = capacity + 1;
+            return .ok;
+        }
+    };
+    var source: abi.RequestBodySource = .{ .read = Broken.read };
+    var buffer: [8]u8 = undefined;
+    try std.testing.expectError(error.InvalidBodyReadCount, inboundReadBodyChunk(&source, &buffer));
+}
+
+test "linked incremental-only source is installed without a whole-body fallback" {
+    const std = @import("std");
+    const Source = struct {
+        remaining: usize = 13,
+        fn read(raw: ?*anyopaque, destination: [*]u8, capacity: usize, count: *usize) callconv(.c) abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            count.* = @min(self.remaining, capacity, 3);
+            @memset(destination[0..count.*], 'x');
+            self.remaining -= count.*;
+            return .ok;
+        }
+    };
+    var source: Source = .{};
+    const body: abi.RequestBodySource = .{ .context = &source, .read = Source.read, .streaming = 1 };
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/chat/context/resume");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    installInbound(&context, &.{}, &body, &.{});
+    try std.testing.expect(context.hasStreamingRequestBody());
+    var reader = context.requestBodyReader();
+    var buffer: [5]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const n = try reader.read(&buffer);
+        if (n == 0) break;
+        for (buffer[0..n]) |b| try std.testing.expectEqual(@as(u8, 'x'), b);
+        total += n;
+    }
+    try std.testing.expectEqual(@as(usize, 13), total);
+    try std.testing.expect(request.body == null);
+    try std.testing.expectError(error.BodySourceUnavailable, context.body());
 }

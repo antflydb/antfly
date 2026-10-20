@@ -42,6 +42,12 @@ const operator_plan = @import("../../graph/operator_plan.zig");
 const kv_storage_runtime = @import("../../runtime/kv/storage_runtime.zig");
 const kv_pool_mod = @import("../../runtime/kv/pool.zig");
 const kv_block_mod = @import("../../runtime/kv/block.zig");
+const attention_match_storage = @import("attention_match_storage.zig");
+const attention_match_checkpoint = @import("../../runtime/kv/attention_match_checkpoint.zig");
+const attention_match_snapshot = @import("../../runtime/kv/attention_match_snapshot.zig");
+const attention_match_half = @import("half_exact.zig");
+const attention_match_decode = @import("attention_match_decode.zig");
+const AttentionMatchControl = @import("../../runtime/kv/attention_match.zig").Control;
 const prefetch_mod = @import("../../runtime/tier/prefetch.zig");
 const gpt_arch = @import("../../architectures/gpt.zig");
 const gemma4_runtime = @import("../../architectures/gemma4_runtime.zig");
@@ -2596,6 +2602,68 @@ pub const CudaCompute = struct {
         self.ctx.deinit();
     }
 
+    pub const AttentionMatchProfile = struct {
+        attention_us: u64 = 0,
+        other_gpu_us: u64 = 0,
+        downloads: usize = 0,
+        download_bytes: usize = 0,
+        allocations: usize = 0,
+        events: usize = 0,
+    };
+
+    pub fn attentionMatchProfile(self: *CudaCompute) AttentionMatchProfile {
+        drainCudaProfile(self);
+        var result = AttentionMatchProfile{
+            .attention_us = self.stats.prefill_profile_attention_us,
+            .downloads = self.stats.download_syncs,
+            .download_bytes = self.stats.d2h_bytes,
+            .allocations = self.stats.device_alloc_calls,
+            .events = self.stats.prefill_profile_events,
+        };
+        inline for (.{ "q4_linear", "q4_qkv", "q4_pair", "q4_gated_down", "bf16_linear", "f16_linear", "bf16_qkv", "bf16_pair", "ple_dense", "staging", "norm", "rope", "kv_write", "elementwise", "embedding" }) |name| {
+            result.other_gpu_us += @field(self.stats, "prefill_profile_" ++ name ++ "_us");
+        }
+        return result;
+    }
+
+    pub const AttentionMatchRepeatScope = struct {
+        compute: *CudaCompute,
+        previous: @FieldType(kernels_mod.KernelModule, "gqa_prefill_profile"),
+        pub fn deinit(scope: *AttentionMatchRepeatScope) void {
+            scope.compute.kernels.gqa_prefill_profile = scope.previous;
+            scope.compute.kernels.attention_match_repeat = false;
+            scope.compute.kernels.attention_match_repeat_split = false;
+            scope.compute.kernels.attention_match_repeat_check_ctx = null;
+            scope.compute.kernels.attention_match_repeat_check_fn = null;
+            // cuMemFree fences this allocation; failed frees remain charged.
+            scope.compute.kernels.attention_match_repeat_scratch.free(&scope.compute.ctx);
+        }
+    };
+
+    /// Caller holds the session execution lock for the entire scope.
+    pub fn beginAttentionMatchRepeat(self: *CudaCompute, split: bool, max_queries: usize) !AttentionMatchRepeatScope {
+        if (self.ctx.info.compute_major != 8 or self.ctx.info.compute_minor != 9 or
+            self.ctx.debug_graph_capture_active or self.debug_cuda_graph_capture_active or
+            self.kernels.attention_match_repeat or self.kernels.gqa_repeat_hd256 == null or
+            self.kernels.gqa_repeat_hd512 == null) return error.UnsupportedCompactionQueryRoute;
+        var scratch = buffer_mod.DeviceBuffer{};
+        if (split) {
+            if (self.kernels.gqa_repeat_split_scores == null or self.kernels.gqa_repeat_split_coefficients == null or
+                self.kernels.gqa_repeat_split_values == null) return error.UnsupportedCompactionQueryRoute;
+            scratch = try buffer_mod.DeviceBuffer.alloc(&self.ctx, try kernels_mod.attentionMatchSplitScratchBytes(max_queries));
+        }
+        const scope = AttentionMatchRepeatScope{ .compute = self, .previous = self.kernels.gqa_prefill_profile };
+        self.kernels.gqa_prefill_profile = .tiled_f16_exact;
+        self.kernels.attention_match_repeat = true;
+        self.kernels.attention_match_repeat_launches = 0;
+        self.kernels.attention_match_repeat_split_launches = 0;
+        self.kernels.attention_match_repeat_split = split;
+        self.kernels.attention_match_repeat_scratch = scratch;
+        self.kernels.attention_match_repeat_check_ctx = null;
+        self.kernels.attention_match_repeat_check_fn = null;
+        return scope;
+    }
+
     pub fn computeBackend(self: *CudaCompute) ops.ComputeBackend {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -3993,11 +4061,235 @@ fn traceCudaDeviceKvGatherFailure(
     }
 }
 
+const AttentionMatchBinding = struct {
+    diagnostic_only: bool = false,
+    sequence: kv_storage_runtime.SequenceId,
+    device: attention_match_storage.DeviceState,
+    runner: attention_match_decode.Runner,
+    control: AttentionMatchControl,
+    invalid: bool = false,
+    attention_calls: usize = 0,
+    donor_appends: usize = 0,
+    rollback_tokens: usize = 0,
+
+    fn deinit(self: *@This()) void {
+        std.log.info("{s} source_tokens={d} logical_tokens={d} attention_calls={d} donor_appends={d} allocated_device_bytes={d} invalid={d} rollback_tokens={d}", .{ if (self.diagnostic_only) @as([]const u8, "attention_match_shadow_serving") else "attention_match_serving", self.device.initial_logical_length, self.device.logical_length, self.attention_calls, self.donor_appends, self.device.allocated_bytes, @intFromBool(self.invalid), self.rollback_tokens });
+        self.runner.deinit();
+        self.device.deinit();
+    }
+};
+
+fn attentionMatchStorage(self: *CudaCompute, storage: *kv_storage_runtime.KvStorageRuntime) !*CudaKvDeviceStorage {
+    const hook = storage.device_write_hook orelse return error.UnsupportedAttentionMatchRoute;
+    if (hook.vtable != &CudaKvDeviceStorage.hook_vtable) return error.UnsupportedAttentionMatchRoute;
+    const device: *CudaKvDeviceStorage = @ptrCast(@alignCast(hook.ctx));
+    if (device.compute != self) return error.InvalidCudaState;
+    return device;
+}
+
+pub fn attentionMatchRevision(self: *CudaCompute, storage: *kv_storage_runtime.KvStorageRuntime) !u64 {
+    return (try attentionMatchStorage(self, storage)).revision;
+}
+
+pub const AttentionMatchActivity = struct { attention_calls: usize, donor_appends: usize, invalid: bool };
+pub fn installedAttentionMatchActivity(self: *CudaCompute, storage: *kv_storage_runtime.KvStorageRuntime, sequence: kv_storage_runtime.SequenceId) !?AttentionMatchActivity {
+    const owner = try attentionMatchStorage(self, storage);
+    const binding = owner.match_binding orelse return null;
+    if (binding.sequence != sequence) return error.StaleKvCompaction;
+    return .{ .attention_calls = binding.attention_calls, .donor_appends = binding.donor_appends, .invalid = binding.invalid };
+}
+
+/// Clone a fitted owner for isolated reference-query forwards. The dense
+/// clone contract remains exact-only; callers explicitly select this adapter.
+pub fn cloneInstalledAttentionMatch(self: *CudaCompute, destination_storage: *kv_storage_runtime.KvStorageRuntime, source_storage: *kv_storage_runtime.KvStorageRuntime, request: kv_storage_runtime.device_clone.Request) !?kv_storage_runtime.device_clone.Result {
+    try request.check();
+    const source = try attentionMatchStorage(self, source_storage);
+    const binding = source.match_binding orelse return null;
+    const destination = try attentionMatchStorage(self, destination_storage);
+    if (source == destination or binding.invalid or binding.sequence != request.source_sequence or
+        binding.device.logical_length != request.tokens or source.dtype != destination.dtype or
+        source.layers.count() != 0 or destination.layers.count() != 0 or destination.match_binding != null or
+        source.revision == std.math.maxInt(u64) or destination.revision == std.math.maxInt(u64)) return error.InvalidDeviceKvClone;
+    _ = try request.allocationBytes(if (source.dtype == .f16) 2 else 4);
+    if (self.debug_cuda_graph_capture_active or try self.ctx.streamCaptureActive()) return error.CompactionDuringGraphCapture;
+    const extra = request.capacity - request.tokens;
+    if (extra > 8192) return error.DeviceKvCloneBudgetExceeded;
+    var bound: usize = 64 * 1024 * 1024; // Maximum private decode scratch.
+    var count: usize = 0;
+    for (request.donors) |donor| {
+        const heads = try binding.device.layer(donor.layer);
+        if (heads.len != donor.heads) return error.InvalidDeviceKvClone;
+        count = try checkedAdd(count, heads.len);
+        for (heads) |head| {
+            if (head.dim != donor.dim) return error.InvalidDeviceKvClone;
+            const width = try checkedAdd(20, try checkedMul(head.dim, if (source.dtype == .f16) 4 else 8));
+            // Admission includes every growth-copy overlap, even when a local
+            // ring can reuse capacity. Actual allocations stay in the ledger.
+            bound = try checkedAdd(bound, try checkedMul(try checkedMul(try checkedAdd(head.rows, extra), 4), width));
+        }
+    }
+    if (count != binding.device.heads.len or bound > request.max_bytes) return error.DeviceKvCloneBudgetExceeded;
+    const source_revision = source.revision;
+    const destination_revision = destination.revision;
+    const max_device_bytes = @min(self.ctx.device_allocations.snapshot().limit, try checkedAdd(self.ctx.device_allocations.snapshot().live, bound));
+    const control: AttentionMatchControl = .{ .context = request.check_ctx, .check_fn = request.check_fn };
+    var device = try binding.device.clone(destination.allocator, max_device_bytes, control);
+    errdefer device.deinit();
+    device.initial_logical_length = device.logical_length;
+    const staged = try destination.allocator.create(AttentionMatchBinding);
+    errdefer destination.allocator.destroy(staged);
+    var runner = try attention_match_decode.Runner.init(&self.ctx, max_device_bytes);
+    errdefer runner.deinit();
+    try request.check();
+    if (source.revision != source_revision or source.match_binding != binding or binding.invalid or destination.revision != destination_revision or
+        destination.match_binding != null or destination.layers.count() != 0) return error.StaleKvCompaction;
+    staged.* = .{ .sequence = request.destination_sequence, .device = device, .runner = runner, .control = control, .diagnostic_only = true };
+    destination.match_binding = staged;
+    destination.revision += 1;
+    return .{ .allocation_bound_bytes = bound, .copied_bytes = device.allocated_bytes, .donors = request.donors.len };
+}
+
+/// Read the currently installed ragged cache at a completed forward boundary.
+/// Returns null for an exact owner, allowing the dense snapshot path to run.
+/// Identity and resume metadata come from the caller's trusted model/request.
+pub fn snapshotInstalledAttentionMatch(self: *CudaCompute, storage: *kv_storage_runtime.KvStorageRuntime, allocator: std.mem.Allocator, request: attention_match_snapshot.Request) !?attention_match_checkpoint.Owned {
+    try request.control.check();
+    const owner = try attentionMatchStorage(self, storage);
+    const binding = owner.match_binding orelse return null;
+    if (self.debug_cuda_graph_capture_active or try self.ctx.streamCaptureActive()) return error.CompactionDuringGraphCapture;
+    if (binding.invalid or binding.sequence != request.sequence or binding.device.logical_length != request.tokens.len or owner.layers.count() != 0)
+        return error.StaleKvCompaction;
+    if (request.donors.len == 0 or request.donors.len > 256) return error.InvalidKvCheckpoint;
+    var donors: [256]attention_match_checkpoint.Donor = undefined;
+    const empty_heads: [64]attention_match_checkpoint.Head = @splat(.{});
+    for (request.donors, donors[0..request.donors.len]) |geometry, *donor| {
+        if (geometry.heads == 0 or geometry.heads > empty_heads.len) return error.InvalidKvCheckpoint;
+        const heads = try binding.device.layer(geometry.layer);
+        if (heads.len != geometry.heads) return error.InvalidKvCheckpoint;
+        for (heads) |head| if (head.dim != geometry.dim or head.window != geometry.window) return error.InvalidKvCheckpoint;
+        donor.* = .{ .layer = geometry.layer, .window = geometry.window, .heads = empty_heads[0..geometry.heads] };
+    }
+    const revision = owner.revision;
+    var result = try binding.device.download(allocator, .{ .identity = request.identity, .logical_length = request.tokens.len, .tokens = request.tokens, .logits = request.logits, .layer_donors = request.layer_donors, .donors = donors[0..request.donors.len] }, request.limits, request.max_host_bytes, request.control);
+    errdefer result.deinit();
+    if (owner.revision != revision or owner.match_binding != binding or binding.invalid) return error.StaleKvCompaction;
+    return result;
+}
+
+/// Private qualification installation. The pipeline holds its execution lock,
+/// validates the host candidate against the original checkpoint and supplies the
+/// revision captured before fitting. Ownership transfers only at publication.
+/// Restore a validated portable checkpoint into a fresh, exclusively owned
+/// runtime. The caller holds the execution lock and validates the loaded-model
+/// identity, geometry and complete token prefix before uploading the candidate.
+/// Unlike live replacement, no previous device cache exists to retire.
+pub fn restoreAttentionMatch(self: *CudaCompute, storage: *kv_storage_runtime.KvStorageRuntime, sequence: kv_storage_runtime.SequenceId, candidate: *?attention_match_storage.DeviceState, expected_length: usize, expected_revision: u64, max_device_bytes: usize, control: AttentionMatchControl, options: AttentionMatchInstallOptions) !void {
+    try control.check();
+    const owner = try attentionMatchStorage(self, storage);
+    try validateFreshAttentionMatchOwner(owner, storage, sequence, expected_length, expected_revision);
+    const next = if (candidate.*) |*value| value else return error.InvalidKvCheckpoint;
+    if (next.context != &self.ctx or next.logical_length != expected_length or next.initial_logical_length != expected_length or next.heads.len == 0 or
+        (owner.dtype != .f16 and owner.dtype != .f32) or (owner.dtype == .f16) != (next.precision == .f16)) return error.UnsupportedAttentionMatchRoute;
+    for (next.heads) |head| if (head.logical_length != expected_length) return error.InvalidKvCheckpoint;
+    if (self.debug_cuda_graph_capture_active or try self.ctx.streamCaptureActive()) return error.CompactionDuringGraphCapture;
+    if (self.ctx.device_allocations.snapshot().live > max_device_bytes) return error.CudaMemoryLimitExceeded;
+    const binding = try owner.allocator.create(AttentionMatchBinding);
+    errdefer owner.allocator.destroy(binding);
+    var runner = try attention_match_decode.Runner.init(&self.ctx, max_device_bytes);
+    errdefer runner.deinit();
+    try next.synchronize();
+    try control.check();
+    // Cancellation callbacks can expose a stale owner or sequence. Revalidate
+    // after the final fence, before the ownership transfer becomes visible.
+    if (try attentionMatchStorage(self, storage) != owner) return error.StaleKvCompaction;
+    try validateFreshAttentionMatchOwner(owner, storage, sequence, expected_length, expected_revision);
+    if (self.debug_cuda_graph_capture_active or try self.ctx.streamCaptureActive()) return error.CompactionDuringGraphCapture;
+    if (self.ctx.device_allocations.snapshot().live > max_device_bytes) return error.CudaMemoryLimitExceeded;
+    binding.* = .{ .sequence = sequence, .device = next.*, .runner = runner, .control = control, .diagnostic_only = options.diagnostic_only };
+    owner.match_binding = binding;
+    candidate.* = null;
+    owner.revision += 1;
+}
+
+fn validateFreshAttentionMatchOwner(owner: *CudaKvDeviceStorage, storage: *const kv_storage_runtime.KvStorageRuntime, sequence: kv_storage_runtime.SequenceId, expected_length: usize, expected_revision: u64) !void {
+    if (expected_length == 0 or expected_revision == std.math.maxInt(u64) or owner.revision != expected_revision or
+        owner.match_binding != null or owner.layers.count() != 0 or storage.sequences.items.len != 1) return error.StaleKvCompaction;
+    const current = &storage.sequences.items[0];
+    if (!current.active or current.compacted or current.id != sequence or
+        (storage.tokenCount(sequence) orelse return error.StaleKvCompaction) != expected_length) return error.StaleKvCompaction;
+}
+
+pub fn installAttentionMatch(self: *CudaCompute, storage: *kv_storage_runtime.KvStorageRuntime, sequence: kv_storage_runtime.SequenceId, candidate: *?attention_match_storage.DeviceState, expected_length: usize, expected_revision: u64, max_device_bytes: usize, control: AttentionMatchControl) !void {
+    return installAttentionMatchWithOptions(self, storage, sequence, candidate, expected_length, expected_revision, max_device_bytes, control, .{});
+}
+
+pub const AttentionMatchInstallOptions = struct { diagnostic_only: bool = false };
+
+pub fn installAttentionMatchWithOptions(self: *CudaCompute, storage: *kv_storage_runtime.KvStorageRuntime, sequence: kv_storage_runtime.SequenceId, candidate: *?attention_match_storage.DeviceState, expected_length: usize, expected_revision: u64, max_device_bytes: usize, control: AttentionMatchControl, options: AttentionMatchInstallOptions) !void {
+    try control.check();
+    const owner = try attentionMatchStorage(self, storage);
+    if (owner.revision != expected_revision or expected_revision == std.math.maxInt(u64)) return error.StaleKvCompaction;
+    const previous = owner.match_binding;
+    const next = if (candidate.*) |*value| value else return error.InvalidKvCheckpoint;
+    if (next.context != &self.ctx or next.logical_length != expected_length or next.initial_logical_length != expected_length or next.heads.len == 0 or
+        (owner.dtype != .f16 and owner.dtype != .f32) or (owner.dtype == .f16) != (next.precision == .f16)) return error.UnsupportedAttentionMatchRoute;
+    if (self.debug_cuda_graph_capture_active or try self.ctx.streamCaptureActive()) return error.CompactionDuringGraphCapture;
+    if (previous) |old| {
+        if (old.invalid or old.sequence != sequence or old.device.logical_length != expected_length or
+            old.device.precision != next.precision or old.device.heads.len != next.heads.len or owner.layers.count() != 0)
+            return error.StaleKvCompaction;
+        for (old.device.heads, next.heads) |before, after| {
+            if (before.layer != after.layer or before.head != after.head or before.window != after.window or before.dim != after.dim or
+                before.logical_length != expected_length or after.logical_length != expected_length or
+                after.compacted_until < before.compacted_until or after.rows > before.rows)
+                return error.StaleKvCompaction;
+        }
+    } else {
+        var donors: usize = 0;
+        for (next.heads) |head| {
+            if (head.logical_length != expected_length) return error.InvalidKvCheckpoint;
+            if (head.head != 0) continue;
+            donors += 1;
+            const heads = try next.layer(head.layer);
+            const source = owner.layers.get(try owner.layerKey(sequence, head.layer)) orelse return error.StaleKvCompaction;
+            if (source.position_offset != 0 or source.token_count != expected_length or source.row_width != heads.len * head.dim)
+                return error.StaleKvCompaction;
+        }
+        // An exact hook shared with unrelated sequence storage cannot be retired.
+        if (donors != owner.layers.count()) return error.UnsupportedAttentionMatchRoute;
+    }
+    if (self.ctx.device_allocations.snapshot().live > max_device_bytes) return error.CudaMemoryLimitExceeded;
+    const binding = try owner.allocator.create(AttentionMatchBinding);
+    errdefer owner.allocator.destroy(binding);
+    var runner = try attention_match_decode.Runner.init(&self.ctx, max_device_bytes);
+    errdefer runner.deinit();
+    try next.synchronize();
+    try control.check();
+    if (owner.revision != expected_revision or owner.match_binding != previous) return error.StaleKvCompaction;
+    if (previous) |old| if (old.invalid) return error.StaleKvCompaction;
+    if (self.ctx.device_allocations.snapshot().live > max_device_bytes) return error.CudaMemoryLimitExceeded;
+    binding.* = .{ .sequence = sequence, .device = next.*, .runner = runner, .control = control, .diagnostic_only = options.diagnostic_only };
+    owner.match_binding = binding;
+    candidate.* = null;
+    owner.revision += 1;
+    // No fallible work follows publication. Prior stream work is fenced and
+    // all future dispatch for this hook goes through the installed binding.
+    var it = owner.layers.iterator();
+    while (it.next()) |entry| entry.value_ptr.deinit(self);
+    owner.layers.clearRetainingCapacity();
+    if (previous) |old| {
+        old.deinit();
+        owner.allocator.destroy(old);
+    }
+}
+
 const CudaKvDeviceStorage = struct {
     allocator: std.mem.Allocator,
     compute: *CudaCompute,
     dtype: kv_pool_mod.KvDType,
     layers: std.AutoHashMapUnmanaged(u64, CudaKvLayer) = .{},
+    revision: u64 = 0,
+    match_binding: ?*AttentionMatchBinding = null,
 
     fn create(allocator: std.mem.Allocator, compute: *CudaCompute, dtype: kv_pool_mod.KvDType) !*CudaKvDeviceStorage {
         const self = try allocator.create(CudaKvDeviceStorage);
@@ -4010,6 +4302,11 @@ const CudaKvDeviceStorage = struct {
     }
 
     pub fn deinit(self: *CudaKvDeviceStorage) void {
+        if (self.match_binding) |binding| {
+            binding.deinit();
+            self.allocator.destroy(binding);
+            self.match_binding = null;
+        }
         var it = self.layers.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.deinit(self.compute);
@@ -4227,6 +4524,8 @@ const CudaKvDeviceStorage = struct {
         v_ref: kv_storage_runtime.DeviceKvRef,
     ) anyerror!void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        if (self.match_binding != null) return error.UnsupportedAttentionMatchRoute;
+        self.revision = std.math.add(u64, self.revision, 1) catch return error.StaleKvCompaction;
         if (write.suffix_token_count == 0) return;
         if (write.suffix_token_count > write.total_token_count) return error.InvalidKvShape;
         const row_width = try checkedMul(@as(usize, write.num_kv_heads), @as(usize, write.head_dim));
@@ -4372,6 +4671,11 @@ const CudaKvDeviceStorage = struct {
 
     fn releaseSequence(ctx: *anyopaque, sequence_id: kv_storage_runtime.SequenceId) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        if (self.match_binding) |binding| if (binding.sequence == sequence_id) {
+            binding.deinit();
+            self.allocator.destroy(binding);
+            self.match_binding = null;
+        };
         var doomed: std.ArrayList(u64) = .empty;
         defer doomed.deinit(self.allocator);
         var it = self.layers.iterator();
@@ -4394,6 +4698,19 @@ const CudaKvDeviceStorage = struct {
         retained_token_count: usize,
     ) void {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        self.revision = std.math.add(u64, self.revision, 1) catch std.math.maxInt(u64);
+        // A completed lookahead forward may be rolled back within its exact
+        // tail. Never revive a failed forward or cross evicted/fitted history.
+        if (self.match_binding) |binding| if (binding.sequence == sequence_id) {
+            if (binding.invalid) return;
+            const previous = binding.device.logical_length;
+            binding.device.truncate(retained_token_count, .{}) catch {
+                binding.invalid = true;
+                return;
+            };
+            binding.rollback_tokens += @intCast(previous - retained_token_count);
+            return;
+        };
         var it = self.layers.iterator();
         while (it.next()) |entry| {
             if (@as(u32, @intCast(entry.key_ptr.* >> 32)) != sequence_id) continue;
@@ -4407,7 +4724,140 @@ const CudaKvDeviceStorage = struct {
         allocator.destroy(self);
     }
 
+    fn cloneExactPrefix(
+        ctx: *anyopaque,
+        source_hook: kv_storage_runtime.DeviceWriteHook,
+        request: kv_storage_runtime.device_clone.Request,
+    ) !kv_storage_runtime.device_clone.Result {
+        const destination: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        if (source_hook.vtable != &hook_vtable or source_hook.ctx == ctx) return error.InvalidDeviceKvClone;
+        const match_source: *CudaKvDeviceStorage = @ptrCast(@alignCast(source_hook.ctx));
+        if (destination.match_binding != null or match_source.match_binding != null) return error.UnsupportedAttentionMatchRoute;
+        const source: *const CudaKvDeviceStorage = @ptrCast(@alignCast(source_hook.ctx));
+        if (source.compute != destination.compute or source.dtype != destination.dtype or
+            (source.dtype != .f16 and source.dtype != .f32) or destination.layers.count() != 0 or
+            source.layers.count() != request.donors.len or destination.compute.ctx.debug_graph_capture_active or
+            destination.compute.debug_cuda_graph_capture_active) return error.DeviceKvCloneUnsupported;
+        const element_bytes: usize = if (source.dtype == .f16) 2 else 4;
+        const allocation_bound = try request.allocationBytes(element_bytes);
+        const pages = try neededBlockCount(request.tokens, request.page_size);
+        // Validate every donor before allocating or submitting a single copy.
+        for (request.donors) |donor| {
+            const layer = source.layers.get(try source.layerKey(request.source_sequence, donor.layer)) orelse return error.InvalidDeviceKvClone;
+            const row_width = try checkedMul(donor.heads, donor.dim);
+            const row_bytes = try checkedMul(row_width, element_bytes);
+            if (layer.token_count != request.tokens or layer.position_offset != 0 or layer.capacity_tokens < request.tokens or
+                layer.row_width != row_width or layer.key_row_bytes != row_bytes or layer.base_key_row_bytes != row_bytes or
+                layer.value_row_bytes != row_bytes or layer.compressed_format != cudaPagedKvFormat(source.dtype) or
+                layer.value_format != (if (source.dtype == .f16) cuda_kv_value_format_f16 else cuda_kv_value_format_f32) or
+                layer.k.len < try checkedMul(request.tokens, row_bytes) or layer.v.len < try checkedMul(request.tokens, row_bytes))
+                return error.UnsupportedDeviceKvCloneLayout;
+            if (source.dtype == .f16 and (!layer.block_table_valid or !layer.block_table_identity or
+                layer.page_size_tokens != request.page_size or layer.block_table_len < pages or layer.block_table_len > request.source_blocks.len or
+                layer.block_table_signature != blockTableSignature(request.source_blocks, layer.block_table_len, request.page_size)))
+                return error.UnsupportedDeviceKvCloneLayout;
+        }
+
+        var staged = CudaKvDeviceStorage{ .allocator = destination.allocator, .compute = destination.compute, .dtype = destination.dtype };
+        defer staged.deinit();
+        // A failed copy or cancellation must finish queued reads before staged
+        // allocations are freed. The source binding is never modified.
+        errdefer destination.compute.ctx.synchronize() catch {};
+        var copied_bytes: usize = 0;
+        for (request.donors) |donor| {
+            try request.check();
+            const original = source.layers.get(try source.layerKey(request.source_sequence, donor.layer)).?;
+            const layer_key = try staged.layerKey(request.destination_sequence, donor.layer);
+            const entry = try staged.layers.getOrPut(staged.allocator, layer_key);
+            std.debug.assert(!entry.found_existing);
+            const layer = entry.value_ptr;
+            layer.* = .{
+                .capacity_tokens = request.capacity,
+                .token_count = request.tokens,
+                .row_width = original.row_width,
+                .key_row_bytes = original.key_row_bytes,
+                .base_key_row_bytes = original.base_key_row_bytes,
+                .value_row_bytes = original.value_row_bytes,
+                .compressed_format = original.compressed_format,
+                .value_format = original.value_format,
+                .page_size_tokens = request.page_size,
+            };
+            const k_bytes = try checkedMul(request.capacity, layer.key_row_bytes);
+            const v_bytes = try checkedMul(request.capacity, layer.value_row_bytes);
+            layer.k = try buffer_mod.DeviceBuffer.alloc(&staged.compute.ctx, k_bytes);
+            layer.v = try buffer_mod.DeviceBuffer.alloc(&staged.compute.ctx, v_bytes);
+            staged.compute.noteDeviceBytes(try checkedAdd(k_bytes, v_bytes));
+            const copy_k = try checkedMul(request.tokens, layer.key_row_bytes);
+            const copy_v = try checkedMul(request.tokens, layer.value_row_bytes);
+            try layer.k.copyFromDevice(&staged.compute.ctx, original.k, copy_k);
+            try layer.v.copyFromDevice(&staged.compute.ctx, original.v, copy_v);
+            copied_bytes = try checkedAdd(copied_bytes, try checkedAdd(copy_k, copy_v));
+            if (layer.compressed_format != null) {
+                // Reserve the full repeat-pass table too. Growing a table
+                // allocates its replacement before freeing the old one, which
+                // would exceed the single-table admission bound transiently.
+                const table_capacity = request.capacity / request.page_size;
+                const table_bytes = try checkedMul(table_capacity, @sizeOf(kv_block_mod.KvBlockId));
+                layer.block_table = try buffer_mod.DeviceBuffer.alloc(&staged.compute.ctx, table_bytes);
+                layer.block_table_capacity = table_capacity;
+                staged.compute.noteDeviceBytes(table_bytes);
+                try staged.ensureLayerBlockTable(layer, request.destination_blocks, request.tokens, request.page_size);
+            }
+        }
+        try destination.compute.ctx.synchronize();
+        try request.check();
+        std.mem.swap(@TypeOf(destination.layers), &destination.layers, &staged.layers);
+        return .{ .allocation_bound_bytes = allocation_bound, .copied_bytes = copied_bytes, .donors = request.donors.len };
+    }
+
+    fn readExactAttentionMatchKv(
+        ctx: *anyopaque,
+        range: kv_storage_runtime.attention_match_snapshot.Range,
+        keys: []f32,
+        values: []f32,
+    ) !void {
+        const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        if (self.match_binding != null) return error.UnsupportedAttentionMatchRoute;
+        if ((self.dtype != .f16 and self.dtype != .f32) or self.compute.ctx.debug_graph_capture_active or
+            self.compute.debug_cuda_graph_capture_active) return error.UnsupportedKvSnapshotLayout;
+        if (range.count == 0 or range.start > range.logical_length or range.count > range.logical_length - range.start or
+            range.heads == 0 or range.dim == 0) return error.InvalidKvCheckpoint;
+        const width = try checkedMul(range.heads, range.dim);
+        const elements = try checkedMul(range.count, width);
+        if (keys.len != elements or values.len != elements or elements > kv_storage_runtime.attention_match_snapshot.chunk_elements) return error.InvalidKvCheckpoint;
+        const layer = self.layers.get(try self.layerKey(range.sequence, range.layer)) orelse return error.DeviceReadUnsupported;
+        const element_bytes: usize = if (self.dtype == .f16) 2 else 4;
+        const row_bytes = try checkedMul(width, element_bytes);
+        if (layer.token_count != range.logical_length or layer.position_offset != 0 or layer.capacity_tokens < range.logical_length or
+            layer.row_width != width or layer.key_row_bytes != row_bytes or layer.base_key_row_bytes != row_bytes or
+            layer.value_row_bytes != row_bytes or layer.compressed_format != cudaPagedKvFormat(self.dtype) or
+            layer.value_format != (if (self.dtype == .f16) cuda_kv_value_format_f16 else cuda_kv_value_format_f32))
+            return error.UnsupportedKvSnapshotLayout;
+        if (self.dtype == .f16 and (!layer.block_table_valid or !layer.block_table_identity or layer.page_size_tokens == 0 or
+            layer.block_table_len < try neededBlockCount(range.logical_length, layer.page_size_tokens)))
+            return error.UnsupportedKvSnapshotLayout;
+        const offset = try checkedMul(range.start, row_bytes);
+        const bytes = try checkedMul(elements, element_bytes);
+        if (offset > layer.k.len or bytes > layer.k.len - offset or offset > layer.v.len or bytes > layer.v.len - offset)
+            return error.InvalidKvCheckpoint;
+        // Host output remains owned by the caller through this final fence,
+        // including copy failures. Half values occupy its first 2*N bytes and
+        // expand backwards after both independent K/V transfers complete.
+        errdefer self.compute.ctx.synchronize() catch {};
+        const buffers = [_]buffer_mod.DeviceBuffer{ layer.k, layer.v };
+        const outputs = [_][]f32{ keys, values };
+        for (buffers, outputs) |buffer, output| {
+            const source: buffer_mod.DeviceBuffer = .{ .ptr = buffer.ptr + offset, .len = bytes };
+            try source.copyToHost(&self.compute.ctx, std.mem.sliceAsBytes(output)[0..bytes]);
+        }
+        try self.compute.ctx.synchronize();
+        if (self.dtype == .f16) for (outputs) |output| attention_match_half.expandReadback(output);
+        self.compute.stats.device_kv_reads += 1;
+    }
+
     const hook_vtable = kv_storage_runtime.DeviceWriteHook.VTable{
+        .readExactAttentionMatchKv = readExactAttentionMatchKv,
+        .cloneExactPrefix = cloneExactPrefix,
         .writeLayerKvSuffix = writeLayerKvSuffix,
         .gatherLayerKvDevice = gatherLayerKvDevice,
         .pagedLayerKvDevice = pagedLayerKvDevice,
@@ -4415,6 +4865,13 @@ const CudaKvDeviceStorage = struct {
         .releaseSequence = releaseSequence,
         .deinit = hookDeinit,
     };
+
+    test "CUDA KV device hook remains fail closed for selected global rows" {
+        try std.testing.expect(hook_vtable.reserveLayerKvDevice == null);
+        try std.testing.expect(hook_vtable.repackSelectedGlobalKv == null);
+        try std.testing.expect(hook_vtable.scoreSelectedAttention == null);
+        try std.testing.expect(hook_vtable.supportsSelectedGlobalKv == null);
+    }
 
     fn hook(self: *CudaKvDeviceStorage) kv_storage_runtime.DeviceWriteHook {
         return .{ .ctx = self, .vtable = &hook_vtable };
@@ -16570,7 +17027,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     var device_b_owned = false;
     errdefer if (!device_b_owned) device_b.free(&self.ctx);
 
-    var prefill_profile_scope = beginPrefillProfile(self, if (use_bf16) .bf16_pair else null, rows);
+    var prefill_profile_scope = beginPrefillProfile(self, if (use_bf16) .bf16_pair else if (use_q4_0) .q4_pair else null, rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
 
     if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, use_hybrid_bf16) and
@@ -16787,6 +17244,9 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
                         shape_a_owned = true;
                         self.allocator.free(shape_b);
                         shape_b_owned = true;
+                        // The child projections own their profiling intervals.
+                        if (prefill_profile_scope) |*scope| scope.end();
+                        prefill_profile_scope = null;
                         const first = try linearNoBias(ctx, input, weight_a, rows, in_dim, out_dim);
                         errdefer freeTensor(ctx, first);
                         const second = try linearNoBias(ctx, input, weight_b, rows, in_dim, out_dim);
@@ -19311,7 +19771,7 @@ fn gqaDenseAttention(
             .prefill_tiled => "termite_gqa_attention_prefill_tiled_f32",
             .prefill_mma => "termite_gqa_attention_prefill_mma_f32",
             .prefill_mma_m32 => "termite_gqa_attention_prefill_mma_m32_f32",
-            .prefill_tiled_f16_exact => "termite_gqa_attention_prefill_tiled_f16_exact_f32",
+            .prefill_tiled_f16_exact => if (self.kernels.attention_match_repeat) (if (head_dim == 256) "antfly_gqa_repeat_prefill_exact_hd256_f32" else "antfly_gqa_repeat_prefill_exact_hd512_f32") else "termite_gqa_attention_prefill_tiled_f16_exact_f32",
             .prefill_tiled_f16_warp => "termite_gqa_attention_prefill_tiled_f16_warp_f32",
             .prefill_flash_f16_sm89 => if (head_dim == 256)
                 quant_kernel_compiler.first_prefill_flash_cuda_hd256_kernel_id
@@ -19809,6 +20269,13 @@ fn gqaPagedAttentionWithDeviceKv(
     num_kv_heads: usize,
     head_dim: usize,
 ) anyerror!CT {
+    if (attention.kv_storage) |storage| if (storage.device_write_hook) |hook| {
+        if (hook.vtable == &CudaKvDeviceStorage.hook_vtable) {
+            const owner: *CudaKvDeviceStorage = @ptrCast(@alignCast(hook.ctx));
+            if (owner.match_binding) |binding|
+                return gqaAttentionMatch(self, owner, binding, q_ct, k_ct, v_ct, attn_bias_ct, attention, batch, num_heads, num_kv_heads, head_dim);
+        }
+    };
     if (attention.kv_batch) |kv_batch| {
         return gqaPagedAttentionBatchWithDeviceKv(
             self,
@@ -20001,6 +20468,53 @@ fn gqaPagedAttentionWithDeviceKv(
     );
     self.stats.device_kv_successes += 1;
     return result;
+}
+
+fn gqaAttentionMatch(self: *CudaCompute, owner: *CudaKvDeviceStorage, binding: *AttentionMatchBinding, q_ct: CT, k_ct: CT, v_ct: CT, attn_bias_ct: ?CT, attention: ops.AttentionContext, batch: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) !CT {
+    if (binding.invalid) return error.InvalidAttentionMatchCache;
+    // Any failed forward pass must be discarded, including partial donor writes.
+    // No dense/host fallback may consume an installed fitted cache.
+    errdefer binding.invalid = true;
+    const kv = attention.kv_cache orelse return error.UnsupportedAttentionMatchRoute;
+    if (owner.compute != self or batch != 1 or attention.kv_batch != null or kv.sequence_id != binding.sequence or
+        attn_bias_ct != null or attention.attn_or_mask != null or attention.attention_sink.hasMetadata() or
+        attention.total_sequence_len < attention.query_sequence_len or attention.query_sequence_len == 0 or
+        attention.query_sequence_len > 512 or attention.layer_index > std.math.maxInt(u32) or num_heads == 0 or num_kv_heads == 0 or
+        num_heads % num_kv_heads != 0) return error.UnsupportedAttentionMatchRoute;
+    const layer: u32 = @intCast(attention.layer_index);
+    const heads = try binding.device.layer(layer);
+    if (heads.len != num_kv_heads or heads[0].dim != head_dim or heads[0].window != attention.sliding_window) return error.InvalidAttentionShape;
+    const first_position = attention.total_sequence_len - attention.query_sequence_len;
+    const q = tensorFromCt(q_ct);
+    try ensureF32(q);
+    const q_count = try checkedMul(try checkedMul(attention.query_sequence_len, num_heads), head_dim);
+    try ensureCount(q, q_count);
+    const shape = try dupeShape(self.allocator, q.shape);
+    errdefer self.allocator.free(shape);
+    var output = try allocDeviceBuffer(self, try checkedMul(q_count, 4));
+    errdefer output.free(&self.ctx);
+    if (!attention.skip_kv_write) {
+        if (owner.revision == std.math.maxInt(u64)) return error.StaleKvCompaction;
+        const k = tensorFromCt(k_ct);
+        const v = tensorFromCt(v_ct);
+        try ensureF32(k);
+        try ensureF32(v);
+        const count = try checkedMul(try checkedMul(attention.query_sequence_len, num_kv_heads), head_dim);
+        try ensureCount(k, count);
+        try ensureCount(v, count);
+        // Trim the preceding completed step, never the current chunk: shared
+        // consumers later in this forward pass still need its early queries.
+        try binding.device.retainLocalWindow(layer);
+        try binding.runner.append(&binding.device, layer, k.buffer, v.buffer, attention.query_sequence_len, first_position, binding.control);
+        owner.revision += 1;
+        binding.donor_appends += 1;
+    }
+    for (heads) |head| if (head.logical_length != attention.total_sequence_len) return error.InvalidAttentionMatchCache;
+    try binding.runner.attend(.{ .heads = heads, .precision = binding.device.precision, .queries = q.buffer, .output = output, .query_rows = attention.query_sequence_len, .query_heads = num_heads, .first_query_position = first_position, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))) }, binding.control);
+    self.stats.device_kv_successes += 1;
+    self.stats.launch_attention += 1;
+    binding.attention_calls += 1;
+    return createTensor(self, output, shape, q_count);
 }
 
 /// Correctness-first CUDA batch path. Quantized projections and the rest of
@@ -24195,3 +24709,728 @@ const primDotGeneralOpImpl = primDotGeneralOp;
 const binaryElementwiseImpl = binaryElementwise;
 
 const trainingAdamWManyF32Impl = trainingAdamWManyF32Op;
+
+test "attention match repeat scope restores profile on error" {
+    var compute: CudaCompute = undefined;
+    compute.ctx.info.compute_major = 8;
+    compute.ctx.info.compute_minor = 9;
+    compute.ctx.debug_graph_capture_active = false;
+    compute.debug_cuda_graph_capture_active = false;
+    compute.kernels.attention_match_repeat = false;
+    compute.kernels.gqa_prefill_profile = .required_fast;
+    compute.kernels.gqa_repeat_hd256 = @ptrFromInt(1);
+    compute.kernels.gqa_repeat_hd512 = @ptrFromInt(2);
+    const Runner = struct {
+        fn run(c: *CudaCompute) !void {
+            var scope = try c.beginAttentionMatchRepeat(false, 256);
+            defer scope.deinit();
+            try std.testing.expect(c.kernels.attention_match_repeat);
+            try std.testing.expectEqual(@FieldType(kernels_mod.KernelModule, "gqa_prefill_profile").tiled_f16_exact, c.kernels.gqa_prefill_profile);
+            try std.testing.expectError(error.UnsupportedCompactionQueryRoute, c.beginAttentionMatchRepeat(false, 256));
+            return error.CompactionCancelled;
+        }
+    };
+    try std.testing.expectError(error.CompactionCancelled, Runner.run(&compute));
+    try std.testing.expect(!compute.kernels.attention_match_repeat);
+    try std.testing.expectEqual(@FieldType(kernels_mod.KernelModule, "gqa_prefill_profile").required_fast, compute.kernels.gqa_prefill_profile);
+    compute.kernels.gqa_repeat_split_scores = null;
+    compute.kernels.gqa_repeat_split_coefficients = null;
+    compute.kernels.gqa_repeat_split_values = null;
+    try std.testing.expectError(error.UnsupportedCompactionQueryRoute, compute.beginAttentionMatchRepeat(true, 256));
+    try std.testing.expectEqual(@as(usize, 0), compute.kernels.attention_match_repeat_scratch.len);
+    compute.kernels.gqa_repeat_hd512 = null;
+    try std.testing.expectError(error.UnsupportedCompactionQueryRoute, compute.beginAttentionMatchRepeat(false, 256));
+    try std.testing.expectEqual(@FieldType(kernels_mod.KernelModule, "gqa_prefill_profile").required_fast, compute.kernels.gqa_prefill_profile);
+}
+
+test "attention match CUDA split admission failure and queued cancellation release scratch" {
+    if (!platform.env.getenvBool("ANTFLY_TEST_CUDA_REPEAT")) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    if (compute.ctx.info.compute_major != 8 or compute.ctx.info.compute_minor != 9) return error.SkipZigTest;
+    compute.kernels.gqa_prefill_profile = .required_fast;
+    const initial = compute.ctx.device_allocations.snapshot();
+    try compute.ctx.device_allocations.setLimit(initial.live + (try kernels_mod.attentionMatchSplitScratchBytes(2)) - 1);
+    try std.testing.expectError(error.CudaMemoryLimitExceeded, compute.beginAttentionMatchRepeat(true, 2));
+    try std.testing.expectEqual(initial.live, compute.ctx.device_allocations.snapshot().live);
+    try std.testing.expect(!compute.kernels.attention_match_repeat);
+    try compute.ctx.device_allocations.setLimit(initial.limit);
+    var q = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 2 * 8 * 512 * 4);
+    defer q.free(&compute.ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, q.len);
+    defer output.free(&compute.ctx);
+    var k = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 4112 * 2048);
+    defer k.free(&compute.ctx);
+    var v = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, k.len);
+    defer v.free(&compute.ctx);
+    try compute.kernels.launchFillF32(&compute.ctx, q, q.len / 4, 0.1);
+    try compute.kernels.launchFillF32(&compute.ctx, k, k.len / 4, 1.25);
+    try compute.kernels.launchFillF32(&compute.ctx, v, v.len / 4, 1.5);
+    const host = try std.testing.allocator.alloc(u8, k.len + v.len);
+    defer std.testing.allocator.free(host);
+    try k.copyToHost(&compute.ctx, host[0..k.len]);
+    try v.copyToHost(&compute.ctx, host[k.len..]);
+    try compute.ctx.synchronize();
+    var before: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(host, &before, .{});
+    const allocated = compute.ctx.device_allocations.snapshot().live;
+    const Cancellation = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.CompactionCancelled;
+        }
+    };
+    for (0..20) |_| {
+        var cancellation = Cancellation{};
+        {
+            var scope = try compute.beginAttentionMatchRepeat(true, 2);
+            defer scope.deinit();
+            compute.kernels.attention_match_repeat_check_ctx = &cancellation;
+            compute.kernels.attention_match_repeat_check_fn = Cancellation.check;
+            try std.testing.expectError(error.CompactionCancelled, compute.kernels.launchGqaAttentionDecodeTurboquantF32(
+                &compute.ctx,
+                output,
+                q,
+                k,
+                v,
+                .{},
+                .{},
+                .{},
+                1,
+                2,
+                4097,
+                8,
+                2,
+                512,
+                4095,
+                0,
+                0,
+                4097,
+                0,
+                0,
+                2048,
+                2048,
+                2048,
+                0,
+                16,
+                2,
+                2,
+                4112,
+                .{},
+            ));
+            try std.testing.expectEqual(@as(usize, 3), compute.kernels.attention_match_repeat_split_launches);
+            try std.testing.expectEqual(@as(usize, 2), cancellation.calls);
+        }
+        try std.testing.expectEqual(allocated, compute.ctx.device_allocations.snapshot().live);
+        try std.testing.expect(!compute.kernels.attention_match_repeat);
+        try std.testing.expectEqual(@FieldType(kernels_mod.KernelModule, "gqa_prefill_profile").required_fast, compute.kernels.gqa_prefill_profile);
+    }
+    try k.copyToHost(&compute.ctx, host[0..k.len]);
+    try v.copyToHost(&compute.ctx, host[k.len..]);
+    try compute.ctx.synchronize();
+    var after: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(host, &after, .{});
+    try std.testing.expectEqualSlices(u8, &before, &after);
+    {
+        var scope = try compute.beginAttentionMatchRepeat(true, 2);
+        defer scope.deinit();
+        _ = try compute.kernels.launchGqaAttentionDecodeTurboquantF32(
+            &compute.ctx,
+            output,
+            q,
+            k,
+            v,
+            .{},
+            .{},
+            .{},
+            1,
+            2,
+            4097,
+            8,
+            2,
+            512,
+            4095,
+            0,
+            0,
+            4097,
+            0,
+            0,
+            2048,
+            2048,
+            2048,
+            0,
+            16,
+            2,
+            2,
+            4112,
+            .{},
+        );
+        try compute.ctx.synchronize();
+        try std.testing.expectEqual(@as(usize, 6), compute.kernels.attention_match_repeat_split_launches);
+    }
+    try std.testing.expectEqual(allocated, compute.ctx.device_allocations.snapshot().live);
+}
+
+test "attention match CUDA authoritative snapshot reads f16 and f32 and rejects stale or remapped storage" {
+    if (!platform.env.getenvBool("ANTFLY_TEST_CUDA_REPEAT")) return error.SkipZigTest;
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    for ([_]kv_pool_mod.KvDType{ .f16, .f32 }) |dtype| {
+        var storage: CudaKvDeviceStorage = .{ .allocator = std.testing.allocator, .compute = &compute, .dtype = dtype };
+        defer storage.deinit();
+        const entry = try storage.layers.getOrPut(std.testing.allocator, try storage.layerKey(7, 0));
+        const layer = entry.value_ptr;
+        const row_bytes: usize = if (dtype == .f16) 8 else 16;
+        layer.* = .{ .capacity_tokens = 16, .token_count = 4, .row_width = 4, .key_row_bytes = row_bytes, .base_key_row_bytes = row_bytes, .value_row_bytes = row_bytes, .compressed_format = cudaPagedKvFormat(dtype), .value_format = if (dtype == .f16) cuda_kv_value_format_f16 else cuda_kv_value_format_f32, .page_size_tokens = 16 };
+        layer.k = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 16 * row_bytes);
+        layer.v = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 16 * row_bytes);
+        var k32: [64]f32 = undefined;
+        var v32: [64]f32 = undefined;
+        var k16: [64]f16 = undefined;
+        var v16: [64]f16 = undefined;
+        for (0..64) |i| {
+            k32[i] = @floatFromInt(i);
+            v32[i] = @floatFromInt(100 + i);
+            k16[i] = @floatCast(k32[i]);
+            v16[i] = @floatCast(v32[i]);
+        }
+        try layer.k.copyFromHost(&compute.ctx, if (dtype == .f16) std.mem.sliceAsBytes(&k16) else std.mem.sliceAsBytes(&k32));
+        try layer.v.copyFromHost(&compute.ctx, if (dtype == .f16) std.mem.sliceAsBytes(&v16) else std.mem.sliceAsBytes(&v32));
+        if (dtype == .f16) try storage.ensureLayerBlockTable(layer, &.{0}, 4, 16);
+        try compute.ctx.synchronize();
+        const baseline_live = compute.ctx.device_allocations.snapshot().live;
+        const reader = try storage.hook().attentionMatchReader();
+        var keys: [8]f32 = @splat(-1);
+        var values: [8]f32 = @splat(-1);
+        var range: kv_storage_runtime.attention_match_snapshot.Range = .{ .sequence = 7, .layer = 0, .logical_length = 4, .start = 1, .count = 2, .heads = 2, .dim = 2 };
+        try reader.read_fn(reader.context, range, &keys, &values);
+        try std.testing.expectEqualSlices(f32, k32[4..12], &keys);
+        try std.testing.expectEqualSlices(f32, v32[4..12], &values);
+        // The device snapshot adapter has no host pool to fall back to.
+        var captured = try kv_storage_runtime.attention_match_snapshot.capture(std.testing.allocator, .{
+            .identity = .{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) },
+            .sequence = 7,
+            .tokens = &.{ 0, 1, 0, 1 },
+            .logits = &.{ 0.1, 0.2 },
+            .layer_donors = &.{0},
+            .donors = &.{.{ .layer = 0, .window = 0, .heads = 2, .dim = 2 }},
+            .max_host_bytes = 1024 * 1024,
+        }, reader);
+        defer captured.deinit();
+        try std.testing.expectEqualSlices(f32, &.{ 2, 3, 6, 7, 10, 11, 14, 15 }, captured.state.donors[0].heads[1].keys);
+        range.logical_length = 5;
+        try std.testing.expectError(error.UnsupportedKvSnapshotLayout, reader.read_fn(reader.context, range, &keys, &values));
+        range.logical_length = 4;
+        range.start = 3;
+        try std.testing.expectError(error.InvalidKvCheckpoint, reader.read_fn(reader.context, range, &keys, &values));
+        range.start = 1;
+        layer.position_offset = 1;
+        try std.testing.expectError(error.UnsupportedKvSnapshotLayout, reader.read_fn(reader.context, range, &keys, &values));
+        layer.position_offset = 0;
+        if (dtype == .f16) {
+            layer.block_table_identity = false;
+            try std.testing.expectError(error.UnsupportedKvSnapshotLayout, reader.read_fn(reader.context, range, &keys, &values));
+            layer.block_table_identity = true;
+        }
+        try reader.read_fn(reader.context, range, &keys, &values);
+        try std.testing.expectEqualSlices(f32, v32[4..12], &values);
+        try std.testing.expectEqual(baseline_live, compute.ctx.device_allocations.snapshot().live);
+    }
+}
+
+test "attention match CUDA staging fits exports and swaps owned device state with failure recovery" {
+    if (!platform.env.getenvBool("ANTFLY_TEST_CUDA_REPEAT")) return error.SkipZigTest;
+    const staging = @import("attention_match_storage.zig");
+    const checkpoint = @import("../../runtime/kv/attention_match_checkpoint.zig");
+    const engine = @import("../../runtime/kv/attention_match_engine.zig");
+    const transaction = @import("../../runtime/kv/attention_match_transaction.zig");
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const initial_live = compute.ctx.device_allocations.snapshot().live;
+    const head: checkpoint.Head = .{ .dim = 2, .positions = &.{ 0, 1, 2, 3 }, .coverage_ends = &.{ 1, 2, 3, 4 }, .keys = &.{ 0, 0, 0, 0, 0, 0, 0, 0 }, .values = &.{ 3, 3, 3, 3, 3, 3, 3, 3 }, .bias = &.{ 0, 0, 0, 0 } };
+    const fixture: checkpoint.State = .{ .identity = .{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) }, .logical_length = 4, .tokens = &.{ 0, 1, 0, 1 }, .logits = &.{ 0.1, 0.2 }, .layer_donors = &.{0}, .donors = &.{.{ .layer = 0, .heads = &.{ head, head } }} };
+    const batches = [_]engine.ReferenceBatch{
+        .{ .consumer_layer = 0, .query_head = 0, .train = &.{ 0, 0 }, .heldout = &.{ 1, 1 }, .train_positions = &.{4}, .heldout_positions = &.{5} },
+        .{ .consumer_layer = 0, .query_head = 1, .train = &.{ 0, 0 }, .heldout = &.{ 1, 1 }, .train_positions = &.{4}, .heldout_positions = &.{5} },
+    };
+    const layout: engine.Layout = .{ .query_heads_by_layer = &.{2}, .scales_by_donor = &.{1}, .softcaps_by_donor = &.{0} };
+    for ([_]staging.Precision{ .f16, .f32 }) |precision| {
+        const backend: staging.Backend = .{ .allocator = a, .context = &compute.ctx, .precision = precision };
+        const encoded = try checkpoint.encode(a, fixture, .{});
+        defer a.free(encoded);
+        var owned = try checkpoint.decode(a, encoded, fixture.identity, .{});
+        const original_device = backend.upload(owned.state, std.math.maxInt(usize), .{}) catch |err| {
+            owned.deinit();
+            return err;
+        };
+        var cache: transaction.Cache(staging.DeviceState) = .{ .current = .{ .host = owned, .device = original_device } };
+        defer cache.deinit();
+        const live = compute.ctx.device_allocations.snapshot().live;
+        const original_ptr = cache.current.device.heads[0].values.ptr;
+        const options: engine.Options = .{ .recent_rows = 0, .storage_precision = if (precision == .f16) .f16 else .f32 };
+        var host = try engine.prepare(a, fixture, &batches, layout, options);
+        defer host.deinit();
+        const needed = try backend.allocationBytes(host.state);
+        if (precision == .f16) {
+            const values = @constCast(host.state.donors[0].heads[0].values);
+            const saved = values[0];
+            values[0] = 3.0001;
+            try std.testing.expectError(error.KvStoragePrecisionMismatch, backend.upload(host.state, std.math.maxInt(usize), .{}));
+            values[0] = saved;
+            try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+        }
+        try std.testing.expectError(error.CudaMemoryLimitExceeded, backend.upload(host.state, live + needed - 1, .{}));
+        try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+        // Force an allocation-ledger failure after staging has started; this is
+        // distinct from the preflight budget check, not a physical cuMemAlloc OOM.
+        const saved_limit = compute.ctx.device_allocations.snapshot().limit;
+        try compute.ctx.device_allocations.setLimit(live + needed - 1);
+        const failed = backend.upload(host.state, std.math.maxInt(usize), .{});
+        try compute.ctx.device_allocations.setLimit(saved_limit);
+        try std.testing.expectError(error.CudaMemoryLimitExceeded, failed);
+        try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+        const Cancel = struct {
+            checks: usize = 0,
+            fn check(raw: ?*anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.checks += 1;
+                if (self.checks == 5) return error.CompactionCancelled;
+            }
+        };
+        var cancel: Cancel = .{};
+        // F16 conversion adds per-chunk checks; f32 only checks donor heads and
+        // completion, so cancel at the commit fence separately for both routes.
+        if (precision == .f16) {
+            try std.testing.expectError(error.CompactionCancelled, backend.upload(host.state, std.math.maxInt(usize), .{ .context = &cancel, .check_fn = Cancel.check }));
+            try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+        }
+        var pending = try cache.prepare(a, &batches, layout, options, backend, live + needed);
+        defer pending.deinit();
+        try std.testing.expectEqual(live + needed, compute.ctx.device_allocations.snapshot().live);
+        var bias: [1]f32 = undefined;
+        var coverage: [1]u64 = undefined;
+        try pending.entry.?.device.heads[0].bias.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&bias));
+        try pending.entry.?.device.heads[0].coverage_ends.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&coverage));
+        try compute.ctx.synchronize();
+        try std.testing.expectApproxEqAbs(@log(@as(f32, 4)), bias[0], 1e-6);
+        try std.testing.expectEqual(@as(u64, 4), coverage[0]);
+        const Sink = struct {
+            bytes: [4096]u8 = undefined,
+            used: usize = 0,
+            pub fn writeAll(self: *@This(), data: []const u8) !void {
+                if (data.len > self.bytes.len - self.used) return error.NoSpaceLeft;
+                @memcpy(self.bytes[self.used..][0..data.len], data);
+                self.used += data.len;
+            }
+        };
+        var sink: Sink = .{};
+        try pending.exportTo(.{}, &sink, .{});
+        var imported = try checkpoint.decode(a, sink.bytes[0..sink.used], fixture.identity, .{});
+        defer imported.deinit();
+        try std.testing.expectEqual(@as(u64, 4), imported.state.logical_length);
+        try std.testing.expectEqualSlices(f32, fixture.logits, imported.state.logits);
+        cancel.checks = 3; // commit checks before and after the successful fence
+        try std.testing.expectError(error.CompactionCancelled, cache.commit(&pending, .{}, .{ .context = &cancel, .check_fn = Cancel.check }));
+        try std.testing.expectEqual(original_ptr, cache.current.device.heads[0].values.ptr);
+        try std.testing.expectEqual(live + needed, compute.ctx.device_allocations.snapshot().live);
+        var retired = try cache.commit(&pending, .{}, .{});
+        try std.testing.expectEqual(original_ptr, retired.device.heads[0].values.ptr);
+        try std.testing.expectEqual(@as(usize, 1), cache.current.device.heads[0].rows);
+        try std.testing.expectEqual(@as(u64, 1), cache.generation);
+        // The old device rows are still readable after publication.
+        var old_values: [8]f32 = undefined;
+        var old_half: [8]f16 = undefined;
+        try retired.device.heads[0].values.copyToHost(&compute.ctx, if (precision == .f16) std.mem.sliceAsBytes(&old_half) else std.mem.sliceAsBytes(&old_values));
+        try compute.ctx.synchronize();
+        if (precision == .f16) for (&old_values, old_half) |*out, value| {
+            out.* = value;
+        };
+        try std.testing.expectEqualSlices(f32, head.values, &old_values);
+        retired.deinit();
+        try std.testing.expectEqual(initial_live + needed, compute.ctx.device_allocations.snapshot().live);
+    }
+    try std.testing.expectEqual(initial_live, compute.ctx.device_allocations.snapshot().live);
+}
+
+test "attention match CUDA staging preserves HD256 and HD512 multi-chunk tails and metadata" {
+    if (!platform.env.getenvBool("ANTFLY_TEST_CUDA_REPEAT")) return error.SkipZigTest;
+    const staging = @import("attention_match_storage.zig");
+    const checkpoint = @import("../../runtime/kv/attention_match_checkpoint.zig");
+    var compute = try CudaCompute.init(std.testing.allocator);
+    defer compute.deinit();
+    const initial_live = compute.ctx.device_allocations.snapshot().live;
+    const tokens: [17]u32 = @splat(0);
+    var positions: [17]u64 = undefined;
+    var ends: [17]u64 = undefined;
+    for (&positions, &ends, 0..) |*pos, *end, i| {
+        pos.* = i;
+        end.* = i + 1;
+    }
+    const bias: [17]f32 = @splat(0);
+    var values: [17 * 512]f32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 64)) * 0.125;
+    var readback: [17 * 512]f32 = undefined;
+    var half_readback: [17 * 512]f16 = undefined;
+    for ([_]staging.Precision{ .f16, .f32 }) |precision| for ([_]u32{ 256, 512 }) |dim| {
+        const head: checkpoint.Head = .{ .dim = dim, .positions = &positions, .coverage_ends = &ends, .keys = values[0 .. 17 * dim], .values = values[0 .. 17 * dim], .bias = &bias };
+        const source: checkpoint.State = .{
+            .identity = .{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) },
+            .logical_length = tokens.len,
+            .tokens = &tokens,
+            .logits = &.{0.1},
+            .layer_donors = &.{0},
+            .donors = &.{.{ .layer = 0, .heads = &.{ head, head } }},
+        };
+        const backend: staging.Backend = .{ .allocator = std.testing.allocator, .context = &compute.ctx, .precision = precision };
+        var device = try backend.upload(source, std.math.maxInt(usize), .{});
+        defer device.deinit();
+        try device.heads[1].values.copyToHost(&compute.ctx, if (precision == .f16) std.mem.sliceAsBytes(half_readback[0 .. 17 * dim]) else std.mem.sliceAsBytes(readback[0 .. 17 * dim]));
+        var device_ends: [17]u64 = undefined;
+        try device.heads[1].coverage_ends.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&device_ends));
+        try compute.ctx.synchronize();
+        if (precision == .f16) for (readback[0 .. 17 * dim], half_readback[0 .. 17 * dim]) |*out, value| {
+            out.* = value;
+        };
+        try std.testing.expectEqualSlices(f32, source.donors[0].heads[1].values, readback[0 .. 17 * dim]);
+        try std.testing.expectEqualSlices(u64, &ends, &device_ends);
+        try std.testing.expectEqual(initial_live + device.allocated_bytes, compute.ctx.device_allocations.snapshot().live);
+    };
+    try std.testing.expectEqual(initial_live, compute.ctx.device_allocations.snapshot().live);
+}
+test "attention match CUDA live install preserves ownership on failure and retires exact storage on success" {
+    if (!platform.env.getenvBool("ANTFLY_TEST_CUDA_REPEAT")) return error.SkipZigTest;
+    const checkpoint = @import("../../runtime/kv/attention_match_checkpoint.zig");
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const initial_live = compute.ctx.device_allocations.snapshot().live;
+    const head: checkpoint.Head = .{ .dim = 1, .compacted_until = 4, .positions = &.{ 0, 2 }, .coverage_ends = &.{ 2, 4 }, .keys = &.{ 0, 0 }, .values = &.{ 2, 4 }, .bias = &.{ @log(@as(f32, 2)), @log(@as(f32, 2)) } };
+    const fixture: checkpoint.State = .{ .identity = .{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) }, .logical_length = 4, .tokens = &.{ 0, 0, 0, 0 }, .logits = &.{0}, .layer_donors = &.{0}, .donors = &.{.{ .layer = 0, .heads = &.{head} }} };
+    for ([_]attention_match_storage.Precision{ .f16, .f32 }) |precision| {
+        for (0..20) |cycle| {
+            const dtype: kv_pool_mod.KvDType = if (precision == .f16) .f16 else .f32;
+            var runtime = try kv_storage_runtime.KvStorageRuntime.init(a, .{ .backend = .native, .dtype = dtype, .page_size_tokens = 16, .num_kv_heads = 1, .head_dim = 1 });
+            defer runtime.deinit();
+            const owner = try CudaKvDeviceStorage.create(a, &compute, dtype);
+            runtime.setDeviceWriteHook(owner.hook());
+            const key = try owner.layerKey(7, 0);
+            const entry = try owner.layers.getOrPut(a, key);
+            const layer = entry.value_ptr;
+            layer.* = .{ .capacity_tokens = 4, .token_count = 4, .row_width = 1 };
+            layer.k = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 16);
+            layer.v = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, 16);
+            const source: [4]f32 = .{ 1, 2, 3, 4 };
+            try layer.k.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&source));
+            try layer.v.copyFromHost(&compute.ctx, std.mem.sliceAsBytes(&source));
+            try compute.ctx.synchronize();
+            const source_ptr = layer.k.ptr;
+            const backend: attention_match_storage.Backend = .{ .allocator = a, .context = &compute.ctx, .precision = precision };
+            var candidate: ?attention_match_storage.DeviceState = try backend.upload(fixture, std.math.maxInt(usize), .{});
+            defer if (candidate) |*value| value.deinit();
+            const candidate_ptr = candidate.?.heads[0].keys.ptr;
+            const live = compute.ctx.device_allocations.snapshot().live;
+            const revision = try attentionMatchRevision(&compute, &runtime);
+            try std.testing.expectError(error.CudaMemoryLimitExceeded, installAttentionMatch(&compute, &runtime, 7, &candidate, 4, revision, live - 1, .{}));
+            try std.testing.expectError(error.StaleKvCompaction, installAttentionMatch(&compute, &runtime, 7, &candidate, 4, revision + 1, std.math.maxInt(usize), .{}));
+            try std.testing.expectError(error.UnsupportedAttentionMatchRoute, installAttentionMatch(&compute, &runtime, 7, &candidate, 5, revision, std.math.maxInt(usize), .{}));
+            layer.position_offset = 1;
+            try std.testing.expectError(error.StaleKvCompaction, installAttentionMatch(&compute, &runtime, 7, &candidate, 4, revision, std.math.maxInt(usize), .{}));
+            layer.position_offset = 0;
+            compute.debug_cuda_graph_capture_active = true;
+            try std.testing.expectError(error.CompactionDuringGraphCapture, installAttentionMatch(&compute, &runtime, 7, &candidate, 4, revision, std.math.maxInt(usize), .{}));
+            compute.debug_cuda_graph_capture_active = false;
+            const Cancellation = struct {
+                calls: usize = 0,
+                at: usize = 2,
+                owner: ?*CudaKvDeviceStorage = null,
+                invalidate: bool = false,
+                fn check(raw: ?*anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    self.calls += 1;
+                    if (self.calls == self.at) {
+                        if (self.owner) |value| {
+                            if (self.invalidate) value.match_binding.?.invalid = true else value.revision += 1;
+                        } else return error.CompactionCancelled;
+                    }
+                }
+            };
+            var cancel: Cancellation = .{};
+            try std.testing.expectError(error.CompactionCancelled, installAttentionMatch(&compute, &runtime, 7, &candidate, 4, revision, std.math.maxInt(usize), .{ .context = &cancel, .check_fn = Cancellation.check }));
+            try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+            var stale: Cancellation = .{ .owner = owner };
+            try std.testing.expectError(error.StaleKvCompaction, installAttentionMatch(&compute, &runtime, 7, &candidate, 4, revision, std.math.maxInt(usize), .{ .context = &stale, .check_fn = Cancellation.check }));
+            try std.testing.expectEqual(@as(usize, 2), stale.calls);
+            try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+            try std.testing.expect(owner.match_binding == null);
+            try std.testing.expectEqual(source_ptr, owner.layers.get(key).?.k.ptr);
+            try std.testing.expectEqual(candidate_ptr, candidate.?.heads[0].keys.ptr);
+            var readback: [4]f32 = undefined;
+            try layer.k.copyToHost(&compute.ctx, std.mem.sliceAsBytes(&readback));
+            try compute.ctx.synchronize();
+            try std.testing.expectEqualSlices(f32, &source, &readback);
+            const current_revision = owner.revision;
+            {
+                var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                owner.allocator = failing.allocator();
+                defer owner.allocator = a;
+                try std.testing.expectError(error.OutOfMemory, installAttentionMatch(&compute, &runtime, 7, &candidate, 4, current_revision, std.math.maxInt(usize), .{}));
+                try std.testing.expect(owner.match_binding == null);
+                try std.testing.expect(candidate != null);
+                try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+            }
+            try installAttentionMatch(&compute, &runtime, 7, &candidate, 4, current_revision, std.math.maxInt(usize), .{});
+            try std.testing.expect(candidate == null);
+            try std.testing.expectEqual(@as(u32, 0), owner.layers.count());
+            try std.testing.expectEqual(current_revision + 1, owner.revision);
+            try std.testing.expectEqual(candidate_ptr, owner.match_binding.?.device.heads[0].keys.ptr);
+            try std.testing.expectEqual(live - 32, compute.ctx.device_allocations.snapshot().live);
+            if (cycle == 0) {
+                for (0..20) |_| {
+                    const old_pointer = owner.match_binding.?.device.heads[0].keys.ptr;
+                    const installed_live = compute.ctx.device_allocations.snapshot().live;
+                    candidate = try backend.upload(fixture, std.math.maxInt(usize), .{});
+                    const staged_pointer = candidate.?.heads[0].keys.ptr;
+                    const staged_live = compute.ctx.device_allocations.snapshot().live;
+                    const replace_revision = owner.revision;
+                    try std.testing.expectError(error.StaleKvCompaction, installAttentionMatch(&compute, &runtime, 8, &candidate, 4, replace_revision, std.math.maxInt(usize), .{}));
+                    try std.testing.expectError(error.CudaMemoryLimitExceeded, installAttentionMatch(&compute, &runtime, 7, &candidate, 4, replace_revision, staged_live - 1, .{}));
+                    var replacement_cancel: Cancellation = .{};
+                    try std.testing.expectError(error.CompactionCancelled, installAttentionMatch(&compute, &runtime, 7, &candidate, 4, replace_revision, std.math.maxInt(usize), .{ .context = &replacement_cancel, .check_fn = Cancellation.check }));
+                    try std.testing.expectEqual(old_pointer, owner.match_binding.?.device.heads[0].keys.ptr);
+                    try std.testing.expectEqual(staged_pointer, candidate.?.heads[0].keys.ptr);
+                    try std.testing.expectEqual(staged_live, compute.ctx.device_allocations.snapshot().live);
+                    var replacement_invalid: Cancellation = .{ .owner = owner, .invalidate = true };
+                    try std.testing.expectError(error.StaleKvCompaction, installAttentionMatch(&compute, &runtime, 7, &candidate, 4, replace_revision, std.math.maxInt(usize), .{ .context = &replacement_invalid, .check_fn = Cancellation.check }));
+                    try std.testing.expectEqual(old_pointer, owner.match_binding.?.device.heads[0].keys.ptr);
+                    owner.match_binding.?.invalid = false;
+                    try installAttentionMatch(&compute, &runtime, 7, &candidate, 4, replace_revision, std.math.maxInt(usize), .{});
+                    try std.testing.expect(candidate == null);
+                    try std.testing.expectEqual(staged_pointer, owner.match_binding.?.device.heads[0].keys.ptr);
+                    try std.testing.expectEqual(replace_revision + 1, owner.revision);
+                    try std.testing.expectEqual(installed_live, compute.ctx.device_allocations.snapshot().live);
+                }
+                var snapshot_stale: Cancellation = .{ .owner = owner };
+                try std.testing.expectError(error.StaleKvCompaction, snapshotInstalledAttentionMatch(&compute, &runtime, a, .{ .identity = fixture.identity, .sequence = 7, .tokens = fixture.tokens, .logits = fixture.logits, .layer_donors = fixture.layer_donors, .donors = &.{.{ .layer = 0, .window = 0, .heads = 1, .dim = 1 }}, .max_host_bytes = 1024 * 1024, .control = .{ .context = &snapshot_stale, .check_fn = Cancellation.check } }));
+                var downloaded = (try snapshotInstalledAttentionMatch(&compute, &runtime, a, .{ .identity = fixture.identity, .sequence = 7, .tokens = fixture.tokens, .logits = fixture.logits, .layer_donors = fixture.layer_donors, .donors = &.{.{ .layer = 0, .window = 0, .heads = 1, .dim = 1 }}, .max_host_bytes = 1024 * 1024 })).?;
+                defer downloaded.deinit();
+                try std.testing.expectEqualSlices(f32, head.keys, downloaded.state.donors[0].heads[0].keys);
+                try std.testing.expectEqualSlices(f32, head.values, downloaded.state.donors[0].heads[0].values);
+                try std.testing.expectEqualSlices(f32, head.bias, downloaded.state.donors[0].heads[0].bias);
+                {
+                    var shadow_runtime = try kv_storage_runtime.KvStorageRuntime.init(a, .{ .backend = .native, .dtype = dtype, .page_size_tokens = 16, .num_kv_heads = 1, .head_dim = 1 });
+                    defer shadow_runtime.deinit();
+                    const shadow_owner = try CudaKvDeviceStorage.create(a, &compute, dtype);
+                    shadow_runtime.setDeviceWriteHook(shadow_owner.hook());
+                    const clone_request: kv_storage_runtime.device_clone.Request = .{ .source_sequence = 7, .destination_sequence = 9, .tokens = 4, .capacity = 16, .page_size = 16, .source_blocks = &.{0}, .destination_blocks = &.{0}, .donors = &.{.{ .layer = 0, .heads = 1, .dim = 1 }}, .max_bytes = 128 * 1024 * 1024 };
+                    const original_pointer = owner.match_binding.?.device.heads[0].keys.ptr;
+                    const live_before_clone = compute.ctx.device_allocations.snapshot().live;
+                    var failed_clone = clone_request;
+                    var clone_cancel: Cancellation = .{ .at = 5 };
+                    failed_clone.check_ctx = &clone_cancel;
+                    failed_clone.check_fn = Cancellation.check;
+                    try std.testing.expectError(error.CompactionCancelled, cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, failed_clone));
+                    try std.testing.expectEqual(@as(usize, 5), clone_cancel.calls);
+                    try std.testing.expect(shadow_owner.match_binding == null);
+                    try std.testing.expectEqual(live_before_clone, compute.ctx.device_allocations.snapshot().live);
+                    var clone_stale: Cancellation = .{ .owner = owner };
+                    failed_clone.check_ctx = &clone_stale;
+                    try std.testing.expectError(error.StaleKvCompaction, cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, failed_clone));
+                    try std.testing.expect(shadow_owner.match_binding == null);
+                    try std.testing.expectEqual(live_before_clone, compute.ctx.device_allocations.snapshot().live);
+                    {
+                        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+                        shadow_owner.allocator = failing.allocator();
+                        defer shadow_owner.allocator = a;
+                        try std.testing.expectError(error.OutOfMemory, cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, clone_request));
+                        try std.testing.expect(shadow_owner.match_binding == null);
+                        try std.testing.expectEqual(live_before_clone, compute.ctx.device_allocations.snapshot().live);
+                    }
+                    const original_revision = owner.revision;
+                    const cloned = (try cloneInstalledAttentionMatch(&compute, &shadow_runtime, &runtime, clone_request)).?;
+                    try std.testing.expect(cloned.copied_bytes > 0 and cloned.allocation_bound_bytes <= clone_request.max_bytes);
+                    try std.testing.expectEqual(original_pointer, owner.match_binding.?.device.heads[0].keys.ptr);
+                    try std.testing.expectEqual(original_revision, owner.revision);
+                    try std.testing.expect(shadow_owner.match_binding.?.device.heads[0].keys.ptr != original_pointer);
+                    try std.testing.expectEqual(@as(u32, 9), shadow_owner.match_binding.?.sequence);
+                    var shadow_download = (try snapshotInstalledAttentionMatch(&compute, &shadow_runtime, a, .{ .identity = fixture.identity, .sequence = 9, .tokens = fixture.tokens, .logits = fixture.logits, .layer_donors = fixture.layer_donors, .donors = &.{.{ .layer = 0, .window = 0, .heads = 1, .dim = 1 }}, .max_host_bytes = 1024 * 1024 })).?;
+                    defer shadow_download.deinit();
+                    try std.testing.expectEqualSlices(f32, head.values, shadow_download.state.donors[0].heads[0].values);
+                    try std.testing.expectEqualSlices(f32, head.bias, shadow_download.state.donors[0].heads[0].bias);
+                }
+            }
+            CudaKvDeviceStorage.truncateSequence(owner, 7, 3);
+            try std.testing.expect(owner.match_binding.?.invalid);
+            CudaKvDeviceStorage.releaseSequence(owner, 7);
+            try std.testing.expect(owner.match_binding == null);
+            try std.testing.expectEqual(initial_live, compute.ctx.device_allocations.snapshot().live);
+        }
+    }
+}
+
+test "attention match CUDA fresh restore validates sequence and preserves candidate on failure" {
+    if (!platform.env.getenvBool("ANTFLY_TEST_CUDA_REPEAT")) return error.SkipZigTest;
+    const checkpoint = @import("../../runtime/kv/attention_match_checkpoint.zig");
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const initial_live = compute.ctx.device_allocations.snapshot().live;
+    const head: checkpoint.Head = .{ .dim = 1, .compacted_until = 4, .positions = &.{ 0, 2 }, .coverage_ends = &.{ 2, 4 }, .keys = &.{ 0, 0 }, .values = &.{ 2, 4 }, .bias = &.{ @log(@as(f32, 2)), @log(@as(f32, 2)) } };
+    const fixture: checkpoint.State = .{ .identity = .{ .weights = @splat(1), .tokenizer = @splat(2), .template = @splat(3), .layout = @splat(4) }, .logical_length = 4, .tokens = &.{ 0, 0, 0, 0 }, .logits = &.{0}, .layer_donors = &.{0}, .donors = &.{.{ .layer = 0, .heads = &.{head} }} };
+    for ([_]attention_match_storage.Precision{ .f16, .f32 }) |precision| {
+        const dtype: kv_pool_mod.KvDType = if (precision == .f16) .f16 else .f32;
+        var runtime = try kv_storage_runtime.KvStorageRuntime.init(a, .{ .backend = .native, .dtype = dtype, .page_size_tokens = 16, .num_kv_heads = 1, .head_dim = 1 });
+        defer runtime.deinit();
+        const owner = try CudaKvDeviceStorage.create(a, &compute, dtype);
+        runtime.setDeviceWriteHook(owner.hook());
+        const sequence = try runtime.attachSequence(runtime.storage.pool_id);
+        try runtime.appendTokens(sequence, 4);
+        const backend: attention_match_storage.Backend = .{ .allocator = a, .context = &compute.ctx, .precision = precision };
+        var candidate: ?attention_match_storage.DeviceState = try backend.upload(fixture, std.math.maxInt(usize), .{});
+        defer if (candidate) |*value| value.deinit();
+        const candidate_ptr = candidate.?.heads[0].keys.ptr;
+        const live = compute.ctx.device_allocations.snapshot().live;
+        const revision = owner.revision;
+        try std.testing.expectError(error.StaleKvCompaction, restoreAttentionMatch(&compute, &runtime, sequence + 1, &candidate, 4, revision, std.math.maxInt(usize), .{}, .{}));
+        try std.testing.expectError(error.StaleKvCompaction, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 5, revision, std.math.maxInt(usize), .{}, .{}));
+        try std.testing.expectError(error.StaleKvCompaction, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, revision + 1, std.math.maxInt(usize), .{}, .{}));
+        try std.testing.expectError(error.CudaMemoryLimitExceeded, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, revision, live - 1, .{}, .{}));
+        try std.testing.expectError(error.StaleKvCompaction, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, std.math.maxInt(u64), std.math.maxInt(usize), .{}, .{}));
+        owner.dtype = if (dtype == .f16) .f32 else .f16;
+        try std.testing.expectError(error.UnsupportedAttentionMatchRoute, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, revision, std.math.maxInt(usize), .{}, .{}));
+        owner.dtype = dtype;
+        candidate.?.initial_logical_length = 3;
+        try std.testing.expectError(error.UnsupportedAttentionMatchRoute, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, revision, std.math.maxInt(usize), .{}, .{}));
+        candidate.?.initial_logical_length = 4;
+        try owner.layers.put(a, try owner.layerKey(sequence, 0), .{});
+        try std.testing.expectError(error.StaleKvCompaction, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, revision, std.math.maxInt(usize), .{}, .{}));
+        owner.layers.clearRetainingCapacity();
+        try runtime.sequences.append(a, .{ .id = sequence + 1 });
+        try std.testing.expectError(error.StaleKvCompaction, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, revision, std.math.maxInt(usize), .{}, .{}));
+        runtime.sequences.items.len -= 1; // The synthetic sequence owns no blocks.
+        compute.debug_cuda_graph_capture_active = true;
+        try std.testing.expectError(error.CompactionDuringGraphCapture, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, revision, std.math.maxInt(usize), .{}, .{}));
+        compute.debug_cuda_graph_capture_active = false;
+        const Mutation = struct {
+            calls: usize = 0,
+            kind: enum { cancel, revision, length, active, compacted, graph },
+            owner: *CudaKvDeviceStorage,
+            runtime: *kv_storage_runtime.KvStorageRuntime,
+            fn check(raw: ?*anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.calls += 1;
+                if (self.calls != 2) return;
+                switch (self.kind) {
+                    .cancel => return error.CompactionCancelled,
+                    .revision => self.owner.revision += 1,
+                    .length => self.runtime.sequences.items[0].block_table.tail_tokens += 1,
+                    .active => self.runtime.sequences.items[0].active = false,
+                    .compacted => self.runtime.sequences.items[0].compacted = true,
+                    .graph => self.owner.compute.debug_cuda_graph_capture_active = true,
+                }
+            }
+        };
+        for ([_]@FieldType(Mutation, "kind"){ .cancel, .revision, .length, .active, .compacted, .graph }) |kind| {
+            var mutation: Mutation = .{ .kind = kind, .owner = owner, .runtime = &runtime };
+            const expected_error = switch (kind) {
+                .cancel => error.CompactionCancelled,
+                .graph => error.CompactionDuringGraphCapture,
+                else => error.StaleKvCompaction,
+            };
+            try std.testing.expectError(expected_error, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, revision, std.math.maxInt(usize), .{ .context = &mutation, .check_fn = Mutation.check }, .{}));
+            try std.testing.expectEqual(@as(usize, 2), mutation.calls);
+            try std.testing.expect(owner.match_binding == null);
+            try std.testing.expectEqual(candidate_ptr, candidate.?.heads[0].keys.ptr);
+            try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+            owner.revision = revision;
+            runtime.sequences.items[0].block_table.tail_tokens = 4;
+            runtime.sequences.items[0].active = true;
+            runtime.sequences.items[0].compacted = false;
+            compute.debug_cuda_graph_capture_active = false;
+        }
+        {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            owner.allocator = failing.allocator();
+            defer owner.allocator = a;
+            try std.testing.expectError(error.OutOfMemory, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, revision, std.math.maxInt(usize), .{}, .{}));
+            try std.testing.expect(owner.match_binding == null);
+            try std.testing.expectEqual(candidate_ptr, candidate.?.heads[0].keys.ptr);
+            try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+        }
+        try restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, revision, std.math.maxInt(usize), .{}, .{ .diagnostic_only = true });
+        try std.testing.expect(candidate == null);
+        try std.testing.expectEqual(revision + 1, owner.revision);
+        try std.testing.expectEqual(candidate_ptr, owner.match_binding.?.device.heads[0].keys.ptr);
+        try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+        var downloaded = (try snapshotInstalledAttentionMatch(&compute, &runtime, a, .{ .identity = fixture.identity, .sequence = sequence, .tokens = fixture.tokens, .logits = fixture.logits, .layer_donors = fixture.layer_donors, .donors = &.{.{ .layer = 0, .window = 0, .heads = 1, .dim = 1 }}, .max_host_bytes = 1024 * 1024 })).?;
+        defer downloaded.deinit();
+        try std.testing.expectEqualSlices(f32, head.values, downloaded.state.donors[0].heads[0].values);
+        try std.testing.expectEqualSlices(f32, head.bias, downloaded.state.donors[0].heads[0].bias);
+        candidate = try backend.upload(fixture, std.math.maxInt(usize), .{});
+        try std.testing.expectError(error.StaleKvCompaction, restoreAttentionMatch(&compute, &runtime, sequence, &candidate, 4, owner.revision, std.math.maxInt(usize), .{}, .{}));
+        try installAttentionMatch(&compute, &runtime, sequence, &candidate, 4, owner.revision, std.math.maxInt(usize), .{});
+        try std.testing.expect(candidate == null);
+        try std.testing.expectEqual(live, compute.ctx.device_allocations.snapshot().live);
+        try runtime.releaseSequence(sequence);
+        try std.testing.expect(owner.match_binding == null);
+        try std.testing.expectEqual(initial_live, compute.ctx.device_allocations.snapshot().live);
+    }
+}
+
+test "attention match CUDA authoritative snapshot batches large half and float reads" {
+    if (!platform.env.getenvBool("ANTFLY_TEST_CUDA_REPEAT")) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.init(a);
+    defer compute.deinit();
+    const width = 16;
+    const capacity = 4112;
+    const logical = 4097;
+    const count = capacity * width;
+    const k32 = try a.alloc(f32, count);
+    defer a.free(k32);
+    const v32 = try a.alloc(f32, count);
+    defer a.free(v32);
+    const k16 = try a.alloc(f16, count);
+    defer a.free(k16);
+    const v16 = try a.alloc(f16, count);
+    defer a.free(v16);
+    for (0..count) |i| {
+        k16[i] = @bitCast(@as(u16, @intCast((i % 31744) | (if (i % 2 == 0) @as(usize, 32768) else 0))));
+        v16[i] = @bitCast(@as(u16, @intCast(((i + 13) % 31744) | (if (i % 3 == 0) @as(usize, 32768) else 0))));
+        k32[i] = attention_match_half.decode(k16[i]);
+        v32[i] = attention_match_half.decode(v16[i]);
+    }
+    const keys = try a.alloc(f32, 65536);
+    defer a.free(keys);
+    const values = try a.alloc(f32, 65536);
+    defer a.free(values);
+    for ([_]kv_pool_mod.KvDType{ .f16, .f32 }) |dtype| {
+        var storage: CudaKvDeviceStorage = .{ .allocator = a, .compute = &compute, .dtype = dtype };
+        defer storage.deinit();
+        const entry = try storage.layers.getOrPut(a, try storage.layerKey(7, 0));
+        const layer = entry.value_ptr;
+        const row_bytes: usize = width * (if (dtype == .f16) @as(usize, 2) else 4);
+        layer.* = .{ .capacity_tokens = capacity, .token_count = logical, .row_width = width, .key_row_bytes = row_bytes, .base_key_row_bytes = row_bytes, .value_row_bytes = row_bytes, .compressed_format = cudaPagedKvFormat(dtype), .value_format = if (dtype == .f16) cuda_kv_value_format_f16 else cuda_kv_value_format_f32, .page_size_tokens = 16 };
+        layer.k = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, capacity * row_bytes);
+        layer.v = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, capacity * row_bytes);
+        try layer.k.copyFromHost(&compute.ctx, if (dtype == .f16) std.mem.sliceAsBytes(k16) else std.mem.sliceAsBytes(k32));
+        try layer.v.copyFromHost(&compute.ctx, if (dtype == .f16) std.mem.sliceAsBytes(v16) else std.mem.sliceAsBytes(v32));
+        if (dtype == .f16) {
+            var blocks: [257]u32 = undefined;
+            for (&blocks, 0..) |*block, i| block.* = @intCast(i);
+            try storage.ensureLayerBlockTable(layer, &blocks, logical, 16);
+        }
+        try compute.ctx.synchronize();
+        const baseline = compute.ctx.device_allocations.snapshot().live;
+        const reader = try storage.hook().attentionMatchReader();
+        for ([_]usize{ 1, 257, 4096 }) |rows| {
+            const elements = rows * width;
+            try reader.read_fn(reader.context, .{ .sequence = 7, .layer = 0, .logical_length = logical, .start = 1, .count = rows, .heads = 2, .dim = 8 }, keys[0..elements], values[0..elements]);
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(k32[width..][0..elements]), std.mem.sliceAsBytes(keys[0..elements]));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(v32[width..][0..elements]), std.mem.sliceAsBytes(values[0..elements]));
+        }
+        try std.testing.expectEqual(baseline, compute.ctx.device_allocations.snapshot().live);
+    }
+}

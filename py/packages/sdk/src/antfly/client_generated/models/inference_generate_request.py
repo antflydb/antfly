@@ -17,9 +17,11 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.inference_chat_message import InferenceChatMessage
+    from ..models.inference_context_management import InferenceContextManagement
     from ..models.inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
     from ..models.inference_generate_response_format import InferenceGenerateResponseFormat
     from ..models.inference_generate_stream_options import InferenceGenerateStreamOptions
+    from ..models.inference_kv_cache_policy import InferenceKvCachePolicy
     from ..models.inference_tool import InferenceTool
     from ..models.inference_tool_choice_type_1 import InferenceToolChoiceType1
 
@@ -32,7 +34,9 @@ class InferenceGenerateRequest:
     """
     Attributes:
         model (str): Name of the generator model from models_dir/generators/ Example: google/gemma-3-1b-it.
-        messages (list[InferenceChatMessage]): Conversation messages (OpenAI-compatible format)
+        messages (list[InferenceChatMessage]): Conversation messages (OpenAI-compatible format). When
+            `context_management.checkpoint` is supplied, this array is the active suffix;
+            the archived prefix represented by the checkpoint is not resent.
         max_tokens (int | Unset): Maximum tokens to generate Default: 256. Example: 256.
         temperature (float | Unset): Sampling temperature (0.0 = deterministic, higher = more random) Default: 0.0.
             Example: 0.7.
@@ -82,6 +86,8 @@ class InferenceGenerateRequest:
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
             The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
             device-backed compaction is not yet supported.
+        context_management (InferenceContextManagement | Unset):
+        kv_cache (InferenceKvCachePolicy | Unset):
         prompt_cache_key (str | Unset): inference-native prompt prefix cache namespace key. Requests with the same key
             can
             reuse matching prompt-prefix KV on the same node. Required to enable prompt caching;
@@ -136,6 +142,8 @@ class InferenceGenerateRequest:
     speculation_calibration: InferenceGenerateRequestSpeculationCalibration | Unset = UNSET
     cache_dtype: InferenceGenerateRequestCacheDtype | Unset = UNSET
     cache_compaction_ratio: float | Unset = UNSET
+    context_management: InferenceContextManagement | Unset = UNSET
+    kv_cache: InferenceKvCachePolicy | Unset = UNSET
     prompt_cache_key: str | Unset = UNSET
     prompt_cache: bool | Unset = UNSET
     backend: InferenceModelBackend | Unset = UNSET
@@ -211,6 +219,14 @@ class InferenceGenerateRequest:
 
         cache_compaction_ratio = self.cache_compaction_ratio
 
+        context_management: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.context_management, Unset):
+            context_management = self.context_management.to_dict()
+
+        kv_cache: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.kv_cache, Unset):
+            kv_cache = self.kv_cache.to_dict()
+
         prompt_cache_key = self.prompt_cache_key
 
         prompt_cache = self.prompt_cache
@@ -285,6 +301,10 @@ class InferenceGenerateRequest:
             field_dict["cache_dtype"] = cache_dtype
         if cache_compaction_ratio is not UNSET:
             field_dict["cache_compaction_ratio"] = cache_compaction_ratio
+        if context_management is not UNSET:
+            field_dict["context_management"] = context_management
+        if kv_cache is not UNSET:
+            field_dict["kv_cache"] = kv_cache
         if prompt_cache_key is not UNSET:
             field_dict["prompt_cache_key"] = prompt_cache_key
         if prompt_cache is not UNSET:
@@ -303,9 +323,11 @@ class InferenceGenerateRequest:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.inference_chat_message import InferenceChatMessage
+        from ..models.inference_context_management import InferenceContextManagement
         from ..models.inference_generate_chat_template_kwargs import InferenceGenerateChatTemplateKwargs
         from ..models.inference_generate_response_format import InferenceGenerateResponseFormat
         from ..models.inference_generate_stream_options import InferenceGenerateStreamOptions
+        from ..models.inference_kv_cache_policy import InferenceKvCachePolicy
         from ..models.inference_tool import InferenceTool
         from ..models.inference_tool_choice_type_1 import InferenceToolChoiceType1
 
@@ -398,6 +420,20 @@ class InferenceGenerateRequest:
 
         cache_compaction_ratio = d.pop("cache_compaction_ratio", UNSET)
 
+        _context_management = d.pop("context_management", UNSET)
+        context_management: InferenceContextManagement | Unset
+        if isinstance(_context_management, Unset):
+            context_management = UNSET
+        else:
+            context_management = InferenceContextManagement.from_dict(_context_management)
+
+        _kv_cache = d.pop("kv_cache", UNSET)
+        kv_cache: InferenceKvCachePolicy | Unset
+        if isinstance(_kv_cache, Unset):
+            kv_cache = UNSET
+        else:
+            kv_cache = InferenceKvCachePolicy.from_dict(_kv_cache)
+
         prompt_cache_key = d.pop("prompt_cache_key", UNSET)
 
         prompt_cache = d.pop("prompt_cache", UNSET)
@@ -466,6 +502,8 @@ class InferenceGenerateRequest:
             speculation_calibration=speculation_calibration,
             cache_dtype=cache_dtype,
             cache_compaction_ratio=cache_compaction_ratio,
+            context_management=context_management,
+            kv_cache=kv_cache,
             prompt_cache_key=prompt_cache_key,
             prompt_cache=prompt_cache,
             backend=backend,

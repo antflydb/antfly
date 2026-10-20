@@ -38,28 +38,40 @@ pub const TokenByteTable = struct {
     token_lengths: []u16,
     /// Concatenated decoded bytes for all tokens.
     byte_data: []u8,
+    initial_token_offsets: ?[]u32 = null,
+    initial_token_lengths: ?[]u16 = null,
 
     pub fn init(allocator: std.mem.Allocator, tok: tokenizer_mod.Tokenizer, vocab_size: usize) !TokenByteTable {
-        var offsets = try allocator.alloc(u32, vocab_size);
+        const offsets = try allocator.alloc(u32, vocab_size);
         errdefer allocator.free(offsets);
-        var lengths = try allocator.alloc(u16, vocab_size);
+        const lengths = try allocator.alloc(u16, vocab_size);
         errdefer allocator.free(lengths);
 
-        // Single pass: decode all tokens, accumulate bytes into a growable list.
+        const initial_offsets = try allocator.alloc(u32, vocab_size);
+        errdefer allocator.free(initial_offsets);
+        const initial_lengths = try allocator.alloc(u16, vocab_size);
+        errdefer allocator.free(initial_lengths);
         var byte_list = std.ArrayListUnmanaged(u8).empty;
         errdefer byte_list.deinit(allocator);
         for (0..vocab_size) |token_id| {
-            const ids = [1]i32{@intCast(token_id)};
-            const token_bytes = tok.decode(allocator, &ids) catch {
-                offsets[token_id] = std.math.cast(u32, byte_list.items.len) orelse return error.VocabTooLarge;
-                lengths[token_id] = 0;
-                continue;
-            };
-            defer allocator.free(token_bytes);
-            const capped_len: u16 = @intCast(@min(token_bytes.len, std.math.maxInt(u16)));
-            offsets[token_id] = std.math.cast(u32, byte_list.items.len) orelse return error.VocabTooLarge;
-            lengths[token_id] = capped_len;
-            try byte_list.appendSlice(allocator, token_bytes[0..capped_len]);
+            for ([_]bool{ false, true }) |at_start| {
+                const target_offsets = if (at_start) initial_offsets else offsets;
+                const target_lengths = if (at_start) initial_lengths else lengths;
+                target_offsets[token_id] = std.math.cast(u32, byte_list.items.len) orelse return error.VocabTooLarge;
+                target_lengths[token_id] = 0;
+                const token_bytes = tok.decodeToken(allocator, @intCast(token_id), at_start) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    continue;
+                };
+                defer allocator.free(token_bytes);
+                const len = std.math.cast(u16, token_bytes.len) orelse return error.TokenTooLarge;
+                if (at_start and std.mem.eql(u8, token_bytes, byte_list.items[offsets[token_id]..][0..lengths[token_id]])) {
+                    target_offsets[token_id] = offsets[token_id];
+                } else {
+                    try byte_list.appendSlice(allocator, token_bytes);
+                }
+                target_lengths[token_id] = len;
+            }
         }
         const byte_data = try byte_list.toOwnedSlice(allocator);
 
@@ -67,6 +79,8 @@ pub const TokenByteTable = struct {
             .token_offsets = offsets,
             .token_lengths = lengths,
             .byte_data = byte_data,
+            .initial_token_offsets = initial_offsets,
+            .initial_token_lengths = initial_lengths,
         };
     }
 
@@ -78,10 +92,22 @@ pub const TokenByteTable = struct {
         return self.byte_data[off..][0..len];
     }
 
+    pub fn getTokenBytesAtPosition(self: *const TokenByteTable, token_id: usize, at_start: bool) []const u8 {
+        if (at_start) {
+            if (self.initial_token_lengths) |lengths| {
+                if (token_id >= lengths.len) return &.{};
+                return self.byte_data[self.initial_token_offsets.?[token_id]..][0..lengths[token_id]];
+            }
+        }
+        return self.getTokenBytes(token_id);
+    }
+
     pub fn deinit(self: *TokenByteTable, allocator: std.mem.Allocator) void {
         allocator.free(self.token_offsets);
         allocator.free(self.token_lengths);
         allocator.free(self.byte_data);
+        if (self.initial_token_offsets) |offsets| allocator.free(offsets);
+        if (self.initial_token_lengths) |lengths| allocator.free(lengths);
         self.* = undefined;
     }
 };
@@ -132,6 +158,7 @@ const max_depth = 64;
 /// `allowedTokenMask` to build a boolean mask over the vocabulary, and `isComplete` to
 /// check whether valid JSON has been produced.
 pub const JsonGrammar = struct {
+    at_start: bool = true,
     state: State,
     /// Nesting stack for objects and arrays.
     stack: [max_depth]StackEntry,
@@ -184,14 +211,17 @@ pub const JsonGrammar = struct {
         vocab_size: usize,
     ) ![]bool {
         const mask = try allocator.alloc(bool, vocab_size);
+        errdefer allocator.free(mask);
         @memset(mask, false);
 
         var any_allowed = false;
 
         // For each token in the vocabulary, simulate advancing a copy of the FSM.
         for (0..vocab_size) |token_id| {
-            const ids = [1]i32{@intCast(token_id)};
-            const token_bytes = tok.decode(allocator, &ids) catch continue;
+            const token_bytes = tok.decodeToken(allocator, @intCast(token_id), self.at_start) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            };
             defer allocator.free(token_bytes);
 
             if (token_bytes.len == 0) continue;
@@ -212,11 +242,7 @@ pub const JsonGrammar = struct {
             }
         }
 
-        // Safety: if nothing is allowed (shouldn't happen for well-formed grammars),
-        // allow everything to avoid completely blocking generation.
-        if (!any_allowed) {
-            @memset(mask, true);
-        }
+        if (!any_allowed and !self.isComplete()) return error.GrammarNoValidToken;
 
         return mask;
     }
@@ -230,12 +256,13 @@ pub const JsonGrammar = struct {
         vocab_size: usize,
     ) ![]bool {
         const mask = try allocator.alloc(bool, vocab_size);
+        errdefer allocator.free(mask);
         @memset(mask, false);
 
         var any_allowed = false;
 
         for (0..vocab_size) |token_id| {
-            const token_bytes = token_table.getTokenBytes(token_id);
+            const token_bytes = token_table.getTokenBytesAtPosition(token_id, self.at_start);
             if (token_bytes.len == 0) continue;
 
             var sim = self.*;
@@ -253,9 +280,7 @@ pub const JsonGrammar = struct {
             }
         }
 
-        if (!any_allowed) {
-            @memset(mask, true);
-        }
+        if (!any_allowed and !self.isComplete()) return error.GrammarNoValidToken;
 
         return mask;
     }
@@ -273,6 +298,7 @@ pub const JsonGrammar = struct {
     // --- Internal FSM logic ---
 
     fn advanceByte(self: *JsonGrammar, b: u8) void {
+        self.at_start = false;
         switch (self.state) {
             .start => self.handleTopLevelValueStart(b),
             .object_open => self.handleObjectOpen(b),
@@ -686,6 +712,9 @@ const ArenaAllocation = struct {
 /// GBNF grammar engine. Maintains a set of active parse positions and
 /// advances them byte-by-byte as tokens are generated.
 pub const GbnfGrammar = struct {
+    const MatchError = error{ OutOfMemory, GrammarResourceLimit };
+
+    at_start: bool = true,
     allocator: std.mem.Allocator,
     rules: std.StringArrayHashMapUnmanaged(GbnfRule),
     positions: std.ArrayListUnmanaged(ParsePosition),
@@ -710,6 +739,7 @@ pub const GbnfGrammar = struct {
         if (grammar.mask_cache) |cache| cache.* = .{};
         errdefer grammar.deinit();
 
+        if (source.len > 64 * 1024) return error.GrammarResourceLimit;
         try parseGbnfSource(&grammar, source);
 
         // Initialize with a single position at the start of the "root" rule.
@@ -738,6 +768,7 @@ pub const GbnfGrammar = struct {
             return error.NoRootRule;
         }
 
+        try dedupPositions(&grammar.positions);
         return grammar;
     }
 
@@ -757,35 +788,35 @@ pub const GbnfGrammar = struct {
     }
 
     /// Feed a sequence of bytes and advance all parse positions.
-    pub fn advance(self: *GbnfGrammar, bytes: []const u8) void {
+    pub fn advance(self: *GbnfGrammar, bytes: []const u8) MatchError!void {
         for (bytes) |b| {
-            self.advanceByte(b);
+            try self.advanceByte(b);
         }
     }
 
     /// Advance all active positions by one byte. Positions that can't consume
     /// the byte are dropped. Positions at the end of a quantified element may
     /// fork (one continues the repetition, one advances past it).
-    pub fn advanceByte(self: *GbnfGrammar, byte: u8) void {
+    pub fn advanceByte(self: *GbnfGrammar, byte: u8) MatchError!void {
+        self.at_start = false;
         var next = std.ArrayListUnmanaged(ParsePosition).empty;
+        errdefer next.deinit(self.allocator);
 
         for (self.positions.items) |*pos| {
-            self.advancePosition(pos, byte, &next);
+            try self.advancePosition(pos, byte, &next);
         }
 
+        try dedupPositions(&next);
         self.positions.deinit(self.allocator);
         self.positions = next;
-
-        // Deduplicate positions to prevent exponential blowup.
-        dedupPositions(&self.positions);
     }
 
     /// Check whether any active position has completed the root rule.
-    pub fn isComplete(self: *const GbnfGrammar) bool {
+    pub fn isComplete(self: *const GbnfGrammar) MatchError!bool {
         for (self.positions.items) |*pos| {
             var expanded = std.ArrayListUnmanaged(ParsePosition).empty;
             defer expanded.deinit(self.allocator);
-            self.expandPosition(pos, &expanded);
+            try self.expandPosition(pos, &expanded);
 
             if (expanded.items.len == 0 and self.positionAtEnd(pos)) return true;
             for (expanded.items) |*epos| {
@@ -804,31 +835,36 @@ pub const GbnfGrammar = struct {
         vocab_size: usize,
     ) ![]bool {
         const mask = try allocator.alloc(bool, vocab_size);
+        errdefer allocator.free(mask);
         @memset(mask, false);
 
         var any_allowed = false;
 
         for (0..vocab_size) |token_id| {
-            const ids = [1]i32{@intCast(token_id)};
-            const token_bytes = tok.decode(allocator, &ids) catch continue;
+            const token_bytes = tok.decodeToken(allocator, @intCast(token_id), self.at_start) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            };
             defer allocator.free(token_bytes);
 
             if (token_bytes.len == 0) continue;
 
             // Simulate: clone positions, advance with token bytes, check survival.
             var sim_positions = std.ArrayListUnmanaged(ParsePosition).empty;
-            defer sim_positions.deinit(allocator);
-            sim_positions.appendSlice(allocator, self.positions.items) catch continue;
+            defer sim_positions.deinit(self.allocator);
+            try sim_positions.appendSlice(self.allocator, self.positions.items);
 
             var valid = true;
             for (token_bytes) |b| {
                 var next = std.ArrayListUnmanaged(ParsePosition).empty;
+                errdefer next.deinit(self.allocator);
                 for (sim_positions.items) |*pos| {
-                    self.advancePosition(pos, b, &next);
+                    try self.advancePosition(pos, b, &next);
                 }
-                sim_positions.deinit(allocator);
+                sim_positions.deinit(self.allocator);
                 sim_positions = next;
-                dedupPositions(&sim_positions);
+                next = .empty;
+                try dedupPositions(&sim_positions);
 
                 if (sim_positions.items.len == 0) {
                     valid = false;
@@ -842,9 +878,7 @@ pub const GbnfGrammar = struct {
             }
         }
 
-        if (!any_allowed) {
-            @memset(mask, true);
-        }
+        if (!any_allowed and !try self.isComplete()) return error.GrammarNoValidToken;
 
         return mask;
     }
@@ -857,7 +891,10 @@ pub const GbnfGrammar = struct {
         vocab_size: usize,
     ) ![]bool {
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("gbnf-token-mask-v1");
+        hash.update("gbnf-token-mask-v2");
+        hash.update(std.mem.asBytes(&self.at_start));
+        if (token_table.initial_token_offsets) |offsets| hash.update(std.mem.sliceAsBytes(offsets));
+        if (token_table.initial_token_lengths) |lengths| hash.update(std.mem.sliceAsBytes(lengths));
         inline for (.{ token_table.token_offsets.len, token_table.token_lengths.len, token_table.byte_data.len, self.positions.items.len }) |length| hash.update(std.mem.asBytes(&length));
         hash.update(std.mem.sliceAsBytes(token_table.token_offsets));
         hash.update(std.mem.sliceAsBytes(token_table.token_lengths));
@@ -880,27 +917,36 @@ pub const GbnfGrammar = struct {
             }
         }
         const mask = try allocator.alloc(bool, vocab_size);
+        errdefer allocator.free(mask);
         @memset(mask, false);
 
         var any_allowed = false;
 
+        // Vocabulary-wide simulation must not allocate for every token byte.
+        // These buffers belong to the grammar allocator, which also owns the
+        // positions appended by expansion and consumption.
+        var sim_positions = std.ArrayListUnmanaged(ParsePosition).empty;
+        defer sim_positions.deinit(self.allocator);
+        var next = std.ArrayListUnmanaged(ParsePosition).empty;
+        defer next.deinit(self.allocator);
+        var expanded = std.ArrayListUnmanaged(ParsePosition).empty;
+        defer expanded.deinit(self.allocator);
+
         for (0..vocab_size) |token_id| {
-            const token_bytes = token_table.getTokenBytes(token_id);
+            const token_bytes = token_table.getTokenBytesAtPosition(token_id, self.at_start);
             if (token_bytes.len == 0) continue;
 
-            var sim_positions = std.ArrayListUnmanaged(ParsePosition).empty;
-            defer sim_positions.deinit(allocator);
-            sim_positions.appendSlice(allocator, self.positions.items) catch continue;
+            sim_positions.clearRetainingCapacity();
+            try sim_positions.appendSlice(self.allocator, self.positions.items);
 
             var valid = true;
             for (token_bytes) |b| {
-                var next = std.ArrayListUnmanaged(ParsePosition).empty;
+                next.clearRetainingCapacity();
                 for (sim_positions.items) |*pos| {
-                    self.advancePosition(pos, b, &next);
+                    try self.advancePositionWithScratch(pos, b, &next, &expanded);
                 }
-                sim_positions.deinit(allocator);
-                sim_positions = next;
-                dedupPositions(&sim_positions);
+                std.mem.swap(std.ArrayListUnmanaged(ParsePosition), &sim_positions, &next);
+                try dedupPositions(&sim_positions);
 
                 if (sim_positions.items.len == 0) {
                     valid = false;
@@ -914,9 +960,7 @@ pub const GbnfGrammar = struct {
             }
         }
 
-        if (!any_allowed) {
-            @memset(mask, true);
-        }
+        if (!any_allowed and !try self.isComplete()) return error.GrammarNoValidToken;
 
         // Cache admission is optional. An allocation failure must not discard
         // an otherwise valid mask or reuse an earlier continuation's result.
@@ -944,21 +988,43 @@ pub const GbnfGrammar = struct {
 
     // --- Internal position advancement ---
 
+    fn appendPosition(self: *const GbnfGrammar, positions: *std.ArrayListUnmanaged(ParsePosition), position: ParsePosition) MatchError!void {
+        if (positions.items.len >= max_positions) {
+            try dedupPositions(positions);
+            for (positions.items) |*existing| {
+                if (positionsEqual(existing, &position)) return;
+            }
+            if (positions.items.len >= max_positions) return error.GrammarResourceLimit;
+        }
+        try positions.append(self.allocator, position);
+    }
+
     fn advancePosition(
         self: *const GbnfGrammar,
         pos: *const ParsePosition,
         byte: u8,
         next: *std.ArrayListUnmanaged(ParsePosition),
-    ) void {
+    ) MatchError!void {
+        var expanded = std.ArrayListUnmanaged(ParsePosition).empty;
+        defer expanded.deinit(self.allocator);
+        try self.advancePositionWithScratch(pos, byte, next, &expanded);
+    }
+
+    fn advancePositionWithScratch(
+        self: *const GbnfGrammar,
+        pos: *const ParsePosition,
+        byte: u8,
+        next: *std.ArrayListUnmanaged(ParsePosition),
+        expanded: *std.ArrayListUnmanaged(ParsePosition),
+    ) MatchError!void {
         // First, expand the position: if we're at the start of a rule_ref or
         // group, or past the end of an alternative, adjust the position.
-        var expanded = std.ArrayListUnmanaged(ParsePosition).empty;
-        self.expandPosition(pos, &expanded);
+        expanded.clearRetainingCapacity();
+        try self.expandPosition(pos, expanded);
 
         for (expanded.items) |*epos| {
-            self.tryConsumeByte(epos, byte, next);
+            try self.tryConsumeByte(epos, byte, next);
         }
-        expanded.deinit(self.allocator);
     }
 
     /// Expand a position by resolving rule references and handling end-of-alternative.
@@ -967,7 +1033,7 @@ pub const GbnfGrammar = struct {
         self: *const GbnfGrammar,
         pos: *const ParsePosition,
         out: *std.ArrayListUnmanaged(ParsePosition),
-    ) void {
+    ) MatchError!void {
         if (pos.frame_count == 0) return;
 
         const frame = pos.topFrame().?;
@@ -1001,9 +1067,9 @@ pub const GbnfGrammar = struct {
                     },
                 }
                 // Recursively expand the popped position.
-                self.expandPosition(&popped, out);
+                try self.expandPosition(&popped, out);
             } else {
-                out.append(self.allocator, popped) catch return;
+                try self.appendPosition(out, popped);
             }
             return;
         }
@@ -1020,7 +1086,7 @@ pub const GbnfGrammar = struct {
                 sf.elem_idx += 1;
                 sf.literal_offset = 0;
                 sf.rep_count = 0;
-                self.expandPosition(&skip, out);
+                try self.expandPosition(&skip, out);
             },
             .optional => {
                 if (frame.rep_count == 0) {
@@ -1030,7 +1096,7 @@ pub const GbnfGrammar = struct {
                     sf.elem_idx += 1;
                     sf.literal_offset = 0;
                     sf.rep_count = 0;
-                    self.expandPosition(&skip, out);
+                    try self.expandPosition(&skip, out);
                 }
             },
             .one_or_more => {
@@ -1041,7 +1107,7 @@ pub const GbnfGrammar = struct {
                     sf.elem_idx += 1;
                     sf.literal_offset = 0;
                     sf.rep_count = 0;
-                    self.expandPosition(&skip, out);
+                    try self.expandPosition(&skip, out);
                 }
             },
             .once => {},
@@ -1052,13 +1118,13 @@ pub const GbnfGrammar = struct {
             .rule_ref => |ref_name| {
                 if (frame.literal_offset > 0) {
                     // Already started matching this ref, don't re-enter.
-                    out.append(self.allocator, pos.clone()) catch return;
+                    try self.appendPosition(out, pos.clone());
                     return;
                 }
                 const ref_rule = self.rules.get(ref_name) orelse return;
                 // Push a new frame for the referenced rule, fork for each alternative.
                 for (0..ref_rule.alternatives.len) |alt_i| {
-                    if (pos.frame_count >= max_gbnf_depth) continue;
+                    if (pos.frame_count >= max_gbnf_depth) return error.GrammarResourceLimit;
                     var new_pos = pos.clone();
                     // Mark that we've entered the ref (use literal_offset as a flag).
                     new_pos.topFrameMut().?.literal_offset = 1;
@@ -1070,12 +1136,12 @@ pub const GbnfGrammar = struct {
                         .rep_count = 0,
                     };
                     new_pos.frame_count += 1;
-                    self.expandPosition(&new_pos, out);
+                    try self.expandPosition(&new_pos, out);
                 }
             },
             .group => |alts| {
                 if (frame.literal_offset > 0) {
-                    out.append(self.allocator, pos.clone()) catch return;
+                    try self.appendPosition(out, pos.clone());
                     return;
                 }
                 // Groups are inlined: create a synthetic rule name and treat like a ref.
@@ -1088,12 +1154,12 @@ pub const GbnfGrammar = struct {
                     // the rule_name points to a synthetic entry.
                     _ = alt_i;
                     // Actually, let's just handle groups by direct expansion.
-                    out.append(self.allocator, pos.clone()) catch return;
+                    try self.appendPosition(out, pos.clone());
                 }
             },
             .literal, .char_class => {
                 // These are terminal — add position as-is for byte consumption.
-                out.append(self.allocator, pos.clone()) catch return;
+                try self.appendPosition(out, pos.clone());
             },
         }
     }
@@ -1104,7 +1170,7 @@ pub const GbnfGrammar = struct {
         pos: *const ParsePosition,
         byte: u8,
         next: *std.ArrayListUnmanaged(ParsePosition),
-    ) void {
+    ) MatchError!void {
         if (pos.frame_count == 0) return;
 
         const frame = pos.topFrame().?;
@@ -1142,7 +1208,7 @@ pub const GbnfGrammar = struct {
                 } else {
                     nf.literal_offset += 1;
                 }
-                next.append(self.allocator, new_pos) catch return;
+                try self.appendPosition(next, new_pos);
             },
             .char_class => |cc| {
                 if (!cc.matches(byte)) return;
@@ -1159,7 +1225,7 @@ pub const GbnfGrammar = struct {
                         nf.rep_count = 1;
                     },
                 }
-                next.append(self.allocator, new_pos) catch return;
+                try self.appendPosition(next, new_pos);
             },
             .rule_ref, .group => {
                 // These should have been expanded away by expandPosition.
@@ -1193,7 +1259,7 @@ pub const GbnfGrammar = struct {
     }
 
     /// Remove duplicate positions to prevent exponential blowup.
-    fn dedupPositions(positions: *std.ArrayListUnmanaged(ParsePosition)) void {
+    fn dedupPositions(positions: *std.ArrayListUnmanaged(ParsePosition)) MatchError!void {
         if (positions.items.len <= 1) return;
 
         var keep: usize = 0;
@@ -1212,10 +1278,7 @@ pub const GbnfGrammar = struct {
         }
         positions.items.len = keep;
 
-        // Also cap at max_positions to prevent runaway state.
-        if (positions.items.len > max_positions) {
-            positions.items.len = max_positions;
-        }
+        if (positions.items.len > max_positions) return error.GrammarResourceLimit;
     }
 
     fn positionsEqual(a: *const ParsePosition, b: *const ParsePosition) bool {
@@ -1506,8 +1569,19 @@ fn skipWsAndComments(source: []const u8, start: usize) usize {
 }
 
 pub fn buildJsonSchemaGrammar(allocator: std.mem.Allocator, schema: std.json.Value) ![]u8 {
+    return buildJsonSchemaGrammarWithOptions(allocator, schema, .{});
+}
+
+pub const JsonSchemaGrammarOptions = struct {
+    /// Internal summaries must not spend their output budget on indentation.
+    /// This bounds formatting whitespace only; string content is unaffected.
+    bounded_whitespace: bool = false,
+};
+
+pub fn buildJsonSchemaGrammarWithOptions(allocator: std.mem.Allocator, schema: std.json.Value, options: JsonSchemaGrammarOptions) ![]u8 {
     var builder = JsonSchemaGrammarBuilder{
         .allocator = allocator,
+        .options = options,
     };
     errdefer builder.deinit();
     const result = try builder.build(schema);
@@ -1517,6 +1591,7 @@ pub fn buildJsonSchemaGrammar(allocator: std.mem.Allocator, schema: std.json.Val
 
 const JsonSchemaGrammarBuilder = struct {
     allocator: std.mem.Allocator,
+    options: JsonSchemaGrammarOptions,
     out: std.ArrayListUnmanaged(u8) = .empty,
     rule_names: std.ArrayListUnmanaged([]const u8) = .empty,
     next_rule_id: usize = 0,
@@ -1565,11 +1640,15 @@ const JsonSchemaGrammarBuilder = struct {
     }
 
     fn emitSharedRules(self: *JsonSchemaGrammarBuilder) !void {
-        try self.out.appendSlice(self.allocator,
-            \\ws ::= [ \t\n\r]*
-            \\hex ::= [0-9a-fA-F]
-            \\json_escape ::= ["\\/bfnrt] | "u" hex hex hex hex
-            \\json_char ::= [^"\\] | "\\" json_escape
+        try self.out.appendSlice(self.allocator, if (self.options.bounded_whitespace)
+            "ws ::= [ \\t\\n\\r]?\n"
+        else
+            "ws ::= [ \\t\\n\\r]*\n");
+        try self.out.appendSlice(self.allocator, "hex ::= [0-9a-fA-F]\n" ++
+            "json_escape ::= [\"\\\\/bfnrt] | \"u\" hex hex hex hex\n" ++
+            // The byte-oriented GBNF parser accepts a literal control-byte
+            // range. JSON strings require these bytes to be escaped.
+            "json_char ::= [^\"\\\\\x00-\x1f] | \"\\\\\" json_escape\n" ++
             \\json_string ::= "\"" json_char* "\""
             \\json_digit ::= [0-9]
             \\json_digits ::= json_digit+
@@ -1993,8 +2072,8 @@ test "json schema grammar: required object property" {
 
     var grammar = try GbnfGrammar.parse(allocator, source);
     defer grammar.deinit();
-    grammar.advance("{\"answer\":\"ok\"}");
-    try std.testing.expect(grammar.isComplete());
+    try grammar.advance("{\"answer\":\"ok\"}");
+    try std.testing.expect(try grammar.isComplete());
 }
 
 test "json schema grammar: optional property arbitrary order" {
@@ -2017,8 +2096,8 @@ test "json schema grammar: optional property arbitrary order" {
 
     var grammar = try GbnfGrammar.parse(allocator, source);
     defer grammar.deinit();
-    grammar.advance("{\"count\":2,\"answer\":\"ok\"}");
-    try std.testing.expect(grammar.isComplete());
+    try grammar.advance("{\"count\":2,\"answer\":\"ok\"}");
+    try std.testing.expect(try grammar.isComplete());
 }
 
 test "json schema grammar: bounded array and integer range" {
@@ -2038,8 +2117,71 @@ test "json schema grammar: bounded array and integer range" {
 
     var grammar = try GbnfGrammar.parse(allocator, source);
     defer grammar.deinit();
-    grammar.advance("[1,2]");
-    try std.testing.expect(grammar.isComplete());
+    try grammar.advance("[1,2]");
+    try std.testing.expect(try grammar.isComplete());
+}
+
+test "json schema grammar: bounded formatting forces progress without changing strings" {
+    const a = std.testing.allocator;
+    const schema = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"type":"object","properties":{"conversation":{"type":"string"},"tool_evidence":{"type":"array","maxItems":0,"items":{"type":"string"}}},"required":["conversation","tool_evidence"],"additionalProperties":false}
+    , .{});
+    defer schema.deinit();
+    const source = try buildJsonSchemaGrammarWithOptions(a, schema.value, .{ .bounded_whitespace = true });
+    defer a.free(source);
+    var grammar = try GbnfGrammar.parse(a, source);
+    defer grammar.deinit();
+    // A repeated-whitespace token must be rejected before sampling it, while
+    // spaces inside a completed string remain ordinary content.
+    try grammar.advance("{\"conversation\":\"a  b\"");
+    var offsets = [_]u32{ 0, 1, 0, 2 };
+    var lengths = [_]u16{ 1, 1, 2, 1 };
+    const table = TokenByteTable{ .token_offsets = &offsets, .token_lengths = &lengths, .byte_data = @constCast(" \n,") };
+    const before = try grammar.allowedTokenMaskFast(a, &table, offsets.len);
+    defer a.free(before);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, false, true }, before);
+    try grammar.advance(" ");
+    const after = try grammar.allowedTokenMaskFast(a, &table, offsets.len);
+    defer a.free(after);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false, true }, after);
+    try grammar.advance(", \"tool_evidence\": []}");
+    try std.testing.expect(try grammar.isComplete());
+
+    const default_source = try buildJsonSchemaGrammar(a, schema.value);
+    defer a.free(default_source);
+    var default_grammar = try GbnfGrammar.parse(a, default_source);
+    defer default_grammar.deinit();
+    try default_grammar.advance("{\n  \"conversation\":\"a  b\",\n  \"tool_evidence\": []}");
+    try std.testing.expect(try default_grammar.isComplete());
+}
+
+test "json schema grammar: string masks reject every raw control byte and permit escapes" {
+    const a = std.testing.allocator;
+    const schema = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"string\"}", .{});
+    defer schema.deinit();
+    const source = try buildJsonSchemaGrammar(a, schema.value);
+    defer a.free(source);
+    var grammar = try GbnfGrammar.parse(a, source);
+    defer grammar.deinit();
+    try grammar.advance("\"");
+    var bytes: [35]u8 = undefined;
+    var offsets: [34]u32 = undefined;
+    var lengths: [34]u16 = @splat(1);
+    for (0..32) |i| {
+        bytes[i] = @intCast(i);
+        offsets[i] = @intCast(i);
+    }
+    @memcpy(bytes[32..], "a\\n");
+    offsets[32] = 32;
+    offsets[33] = 33;
+    lengths[33] = 2;
+    const table = TokenByteTable{ .token_offsets = &offsets, .token_lengths = &lengths, .byte_data = &bytes };
+    const mask = try grammar.allowedTokenMaskFast(a, &table, offsets.len);
+    defer a.free(mask);
+    for (mask[0..32]) |allowed| try std.testing.expect(!allowed);
+    try std.testing.expect(mask[32] and mask[33]);
+    try grammar.advance("a\\n\\u0000\"");
+    try std.testing.expect(try grammar.isComplete());
 }
 
 // ============================================================================
@@ -2154,8 +2296,8 @@ test "gbnf: simple literal" {
     var g = try GbnfGrammar.parse(allocator, "root ::= \"hello\"");
     defer g.deinit();
 
-    g.advance("hello");
-    try std.testing.expect(g.isComplete());
+    try g.advance("hello");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: literal rejects wrong input" {
@@ -2163,9 +2305,9 @@ test "gbnf: literal rejects wrong input" {
     var g = try GbnfGrammar.parse(allocator, "root ::= \"hello\"");
     defer g.deinit();
 
-    g.advance("hell");
-    try std.testing.expect(!g.isComplete());
-    g.advance("x"); // wrong byte
+    try g.advance("hell");
+    try std.testing.expect(!try g.isComplete());
+    try g.advance("x"); // wrong byte
     try std.testing.expectEqual(@as(usize, 0), g.positions.items.len);
 }
 
@@ -2174,8 +2316,8 @@ test "gbnf: character class" {
     var g = try GbnfGrammar.parse(allocator, "root ::= [abc]");
     defer g.deinit();
 
-    g.advance("a");
-    try std.testing.expect(g.isComplete());
+    try g.advance("a");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: character range" {
@@ -2183,8 +2325,8 @@ test "gbnf: character range" {
     var g = try GbnfGrammar.parse(allocator, "root ::= [a-z]");
     defer g.deinit();
 
-    g.advance("m");
-    try std.testing.expect(g.isComplete());
+    try g.advance("m");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: negated character class" {
@@ -2192,8 +2334,8 @@ test "gbnf: negated character class" {
     var g = try GbnfGrammar.parse(allocator, "root ::= [^0-9]");
     defer g.deinit();
 
-    g.advance("a");
-    try std.testing.expect(g.isComplete());
+    try g.advance("a");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: negated class rejects matching char" {
@@ -2201,7 +2343,7 @@ test "gbnf: negated class rejects matching char" {
     var g = try GbnfGrammar.parse(allocator, "root ::= [^0-9]");
     defer g.deinit();
 
-    g.advance("5");
+    try g.advance("5");
     try std.testing.expectEqual(@as(usize, 0), g.positions.items.len);
 }
 
@@ -2211,10 +2353,10 @@ test "gbnf: zero or more repetition" {
     defer g.deinit();
 
     // Zero repetitions should be complete.
-    try std.testing.expect(g.isComplete());
+    try std.testing.expect(try g.isComplete());
 
-    g.advance("abc");
-    try std.testing.expect(g.isComplete());
+    try g.advance("abc");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: one or more repetition" {
@@ -2223,13 +2365,13 @@ test "gbnf: one or more repetition" {
     defer g.deinit();
 
     // Zero repetitions: not complete.
-    try std.testing.expect(!g.isComplete());
+    try std.testing.expect(!try g.isComplete());
 
-    g.advance("1");
-    try std.testing.expect(g.isComplete());
+    try g.advance("1");
+    try std.testing.expect(try g.isComplete());
 
-    g.advance("23");
-    try std.testing.expect(g.isComplete());
+    try g.advance("23");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: optional element" {
@@ -2239,9 +2381,9 @@ test "gbnf: optional element" {
     );
     defer g.deinit();
 
-    g.advance("a");
+    try g.advance("a");
     // "b" is optional, so "a" alone is complete.
-    try std.testing.expect(g.isComplete());
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: optional element with match" {
@@ -2251,8 +2393,8 @@ test "gbnf: optional element with match" {
     );
     defer g.deinit();
 
-    g.advance("ab");
-    try std.testing.expect(g.isComplete());
+    try g.advance("ab");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: alternatives" {
@@ -2260,8 +2402,8 @@ test "gbnf: alternatives" {
     var g = try GbnfGrammar.parse(allocator, "root ::= \"yes\" | \"no\"");
     defer g.deinit();
 
-    g.advance("no");
-    try std.testing.expect(g.isComplete());
+    try g.advance("no");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: rule reference" {
@@ -2272,8 +2414,8 @@ test "gbnf: rule reference" {
     );
     defer g.deinit();
 
-    g.advance("hi");
-    try std.testing.expect(g.isComplete());
+    try g.advance("hi");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: sequence of elements" {
@@ -2281,8 +2423,8 @@ test "gbnf: sequence of elements" {
     var g = try GbnfGrammar.parse(allocator, "root ::= \"a\" \"b\" \"c\"");
     defer g.deinit();
 
-    g.advance("abc");
-    try std.testing.expect(g.isComplete());
+    try g.advance("abc");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: no root rule" {
@@ -2299,8 +2441,8 @@ test "gbnf: comment and whitespace" {
     );
     defer g.deinit();
 
-    g.advance("ok");
-    try std.testing.expect(g.isComplete());
+    try g.advance("ok");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: literal with escape" {
@@ -2308,8 +2450,8 @@ test "gbnf: literal with escape" {
     var g = try GbnfGrammar.parse(allocator, "root ::= \"a\\nb\"");
     defer g.deinit();
 
-    g.advance("a\nb");
-    try std.testing.expect(g.isComplete());
+    try g.advance("a\nb");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: digits grammar" {
@@ -2320,8 +2462,8 @@ test "gbnf: digits grammar" {
     );
     defer g.deinit();
 
-    g.advance("42");
-    try std.testing.expect(g.isComplete());
+    try g.advance("42");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: simple word grammar" {
@@ -2332,8 +2474,8 @@ test "gbnf: simple word grammar" {
     );
     defer g.deinit();
 
-    g.advance("Hello");
-    try std.testing.expect(g.isComplete());
+    try g.advance("Hello");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: incremental byte advance" {
@@ -2341,15 +2483,15 @@ test "gbnf: incremental byte advance" {
     var g = try GbnfGrammar.parse(allocator, "root ::= \"abc\"");
     defer g.deinit();
 
-    g.advanceByte('a');
-    try std.testing.expect(!g.isComplete());
+    try g.advanceByte('a');
+    try std.testing.expect(!try g.isComplete());
     try std.testing.expect(g.positions.items.len > 0);
 
-    g.advanceByte('b');
-    try std.testing.expect(!g.isComplete());
+    try g.advanceByte('b');
+    try std.testing.expect(!try g.isComplete());
 
-    g.advanceByte('c');
-    try std.testing.expect(g.isComplete());
+    try g.advanceByte('c');
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf: repeated rule reference" {
@@ -2360,8 +2502,8 @@ test "gbnf: repeated rule reference" {
     );
     defer g.deinit();
 
-    g.advance("abc");
-    try std.testing.expect(g.isComplete());
+    try g.advance("abc");
+    try std.testing.expect(try g.isComplete());
 }
 
 test "gbnf token masks bound ambiguous repetition and preserve rejection" {
@@ -2388,12 +2530,12 @@ test "gbnf token masks bound ambiguous repetition and preserve rejection" {
     try std.testing.expectEqualSlices(bool, &.{ true, true, false, false }, changed);
     try std.testing.expectEqualSlices(bool, &.{ true, false, false, false }, first);
     bytes[300] = 'c';
-    grammar.advance(bytes[0..300]);
+    try grammar.advance(bytes[0..300]);
     try std.testing.expect(grammar.positions.items.len < 8);
     const after = try grammar.allowedTokenMaskFast(a, &table, 4);
     defer a.free(after);
     try std.testing.expectEqualSlices(bool, &.{ true, false, true, false }, after);
-    grammar.advance("a");
+    try grammar.advance("a");
     const continued = try grammar.allowedTokenMaskFast(a, &table, 4);
     defer a.free(continued);
     try std.testing.expectEqualSlices(bool, after, continued);
@@ -2405,6 +2547,139 @@ test "gbnf token masks bound ambiguous repetition and preserve rejection" {
         defer a.free(uncached);
         try std.testing.expectEqualSlices(bool, continued, uncached);
     }
-    grammar.advance("b");
-    try std.testing.expect(grammar.isComplete());
+    try grammar.advance("b");
+    try std.testing.expect(try grammar.isComplete());
+}
+
+test "gbnf vocabulary masking bounds scratch allocations and isolates token candidates" {
+    const a = std.testing.allocator;
+    var counted = std.testing.FailingAllocator.init(a, .{});
+    var grammar = try GbnfGrammar.parse(counted.allocator(), "root ::= item+ \"b\"\nitem ::= \"a\" | \"a\"");
+    defer grammar.deinit();
+    const vocab_size = 4096;
+    const offsets = try a.alloc(u32, vocab_size);
+    defer a.free(offsets);
+    const lengths = try a.alloc(u16, vocab_size);
+    defer a.free(lengths);
+    const token_offsets = [_]u32{ 0, 4, 5, 6, 0 };
+    const token_lengths = [_]u16{ 4, 1, 1, 1, 0 };
+    for (offsets, lengths, 0..) |*offset, *length, i| {
+        offset.* = token_offsets[i % token_offsets.len];
+        length.* = token_lengths[i % token_lengths.len];
+    }
+    const table = TokenByteTable{
+        .token_offsets = offsets,
+        .token_lengths = lengths,
+        .byte_data = @constCast("aaababc"),
+    };
+    for (0..2) |step| {
+        const before = counted.allocations;
+        // Returning the mask through a different allocator must not change
+        // ownership of the grammar's scratch buffers.
+        const mask = try grammar.allowedTokenMaskFast(a, &table, vocab_size);
+        defer a.free(mask);
+        try std.testing.expect(counted.allocations - before <= 32);
+        for (mask, 0..) |allowed, i| {
+            const kind = i % token_offsets.len;
+            const expected = kind == 0 or kind == 1 or (step == 1 and kind == 2);
+            try std.testing.expectEqual(expected, allowed);
+        }
+        try grammar.advance("a");
+    }
+}
+
+test "grammar empty language fails closed but completion leaves EOS to the pipeline" {
+    const a = std.testing.allocator;
+    var grammar = try GbnfGrammar.parse(a, "root ::= \"a\"");
+    defer grammar.deinit();
+    var offsets = [_]u32{0};
+    var lengths = [_]u16{1};
+    var bytes = [_]u8{'b'};
+    const table: TokenByteTable = .{ .token_offsets = &offsets, .token_lengths = &lengths, .byte_data = &bytes };
+    try std.testing.expectError(error.GrammarNoValidToken, grammar.allowedTokenMaskFast(a, &table, 1));
+    try grammar.advance("a");
+    const completed = try grammar.allowedTokenMaskFast(a, &table, 1);
+    defer a.free(completed);
+    try std.testing.expectEqualSlices(bool, &.{false}, completed);
+}
+
+test "grammar recursive expansion returns an explicit resource limit" {
+    const a = std.testing.allocator;
+    var grammar = try GbnfGrammar.parse(a, "root ::= root | \"a\"");
+    defer grammar.deinit();
+    try std.testing.expectError(error.GrammarResourceLimit, grammar.advanceByte('a'));
+}
+
+test "grammar failed byte allocation preserves parser state" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var grammar = try GbnfGrammar.parse(failing.allocator(), "root ::= \"ab\"");
+    defer grammar.deinit();
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, grammar.advanceByte('a'));
+    failing.fail_index = std.math.maxInt(usize);
+    try grammar.advance("ab");
+    try std.testing.expect(try grammar.isComplete());
+}
+
+test "grammar masks preserve metaspace continuation bytes in schema keys" {
+    const allocator = std.testing.allocator;
+    const HfTokenizer = @import("inference_hf_tokenizer").HfTokenizer;
+    var hf = try HfTokenizer.loadFromBytes(allocator,
+        \\{"model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0],["▁{",-1],["\"",-1],["▁tool_evidence",-1],["tool_evidence",-1],["\":[]}",-1]]},"pre_tokenizer":{"type":"Metaspace","replacement":"▁","prepend_scheme":"always"}}
+    );
+    defer hf.deinitSelf();
+    const tok = hf.tokenizer();
+    var table = try TokenByteTable.init(allocator, tok, 6);
+    defer table.deinit(allocator);
+    try std.testing.expectEqualStrings("{", table.getTokenBytesAtPosition(1, true));
+    try std.testing.expectEqualStrings(" {", table.getTokenBytesAtPosition(1, false));
+    try std.testing.expectEqualStrings(" tool_evidence", table.getTokenBytesAtPosition(3, false));
+    var grammar = try GbnfGrammar.parse(allocator,
+        \\root ::= "{\"tool_evidence\":[]}"
+    );
+    defer grammar.deinit();
+    const initial_mask = try grammar.allowedTokenMaskFast(allocator, &table, 6);
+    defer allocator.free(initial_mask);
+    try std.testing.expect(initial_mask[1]);
+    try grammar.advance(table.getTokenBytesAtPosition(1, grammar.at_start));
+    try grammar.advance(table.getTokenBytesAtPosition(2, grammar.at_start));
+    const fast = try grammar.allowedTokenMaskFast(allocator, &table, 6);
+    defer allocator.free(fast);
+    const slow = try grammar.allowedTokenMask(allocator, tok, 6);
+    defer allocator.free(slow);
+    try std.testing.expectEqualSlices(bool, slow, fast);
+    try std.testing.expect(!fast[3]);
+    try std.testing.expect(fast[4]);
+    try grammar.advance(table.getTokenBytesAtPosition(4, grammar.at_start));
+    try grammar.advance(table.getTokenBytesAtPosition(5, grammar.at_start));
+    try std.testing.expect(try grammar.isComplete());
+    const decoded = try tok.decode(allocator, &.{ 1, 2, 4, 5 });
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("{\"tool_evidence\":[]}", decoded);
+}
+
+test "grammar token byte table agrees with whole WordPiece and byte-level decoding" {
+    const allocator = std.testing.allocator;
+    const HfTokenizer = @import("inference_hf_tokenizer").HfTokenizer;
+    const fixtures = [_][]const u8{
+        \\{"model":{"type":"WordPiece","unk_token":"[UNK]","continuing_subword_prefix":"##","vocab":{"[UNK]":0,"test":1,"##ing":2,"again":3}}}
+        ,
+        \\{"model":{"type":"BPE","vocab":{"x":0,"Ġtest":1,"ing":2,"Ġagain":3},"merges":[]},"pre_tokenizer":{"type":"ByteLevel"}}
+        ,
+    };
+    for (fixtures) |fixture| {
+        var hf = try HfTokenizer.loadFromBytes(allocator, fixture);
+        defer hf.deinitSelf();
+        const tok = hf.tokenizer();
+        var table = try TokenByteTable.init(allocator, tok, 4);
+        defer table.deinit(allocator);
+        var joined = std.ArrayListUnmanaged(u8).empty;
+        defer joined.deinit(allocator);
+        for ([_]usize{ 1, 2, 3 }, 0..) |id, index| {
+            try joined.appendSlice(allocator, table.getTokenBytesAtPosition(id, index == 0));
+        }
+        const decoded = try tok.decode(allocator, &.{ 1, 2, 3 });
+        defer allocator.free(decoded);
+        try std.testing.expectEqualStrings(decoded, joined.items);
+    }
 }

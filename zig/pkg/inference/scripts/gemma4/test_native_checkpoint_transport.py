@@ -1,0 +1,72 @@
+import hashlib
+import io
+import json
+import struct
+import tempfile
+import unittest
+from pathlib import Path
+from native_checkpoint_transport import MIME, MAX_CHECKPOINT, envelope_prefix, receive_checkpoint
+
+
+def fixture():
+    payload = b'payload for a transport-only fixture'
+    header = struct.pack('<8sIIQ', b'ANTFLYKV', 2, 0, len(payload)) + bytes(range(128))
+    checkpoint = header + payload + hashlib.sha256(header + payload).digest()
+    metadata = {'version': 'attention_match_v1', 'wire_version': 2,
+                'outcome': 'compacted', 'checkpoint_bytes': len(checkpoint)}
+    return envelope_prefix(metadata, len(checkpoint)) + checkpoint, checkpoint
+
+
+class TransportTests(unittest.TestCase):
+    def test_valid_bounded_transfer_and_independent_digest(self):
+        frame, checkpoint = fixture()
+        class ShortReader(io.BytesIO):
+            def read(self, n=-1):
+                self.assert_bound(n)
+                return super().read(min(n, 7))
+            @staticmethod
+            def assert_bound(n):
+                if not 0 < n <= 65536:
+                    raise AssertionError(n)
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'checkpoint'
+            result = receive_checkpoint(ShortReader(frame), destination)
+            self.assertEqual(checkpoint, destination.read_bytes())
+            self.assertEqual(hashlib.sha256(checkpoint).hexdigest(), result['file_sha256'])
+            self.assertEqual(bytes(range(32)).hex(), result['identity']['weights'])
+
+    def test_every_truncation_preserves_previous_file(self):
+        frame, _ = fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'checkpoint'
+            destination.write_bytes(b'previous-valid-file')
+            for length in range(len(frame)):
+                with self.subTest(length=length), self.assertRaises((ValueError, json.JSONDecodeError)):
+                    receive_checkpoint(io.BytesIO(frame[:length]), destination)
+                self.assertEqual(b'previous-valid-file', destination.read_bytes())
+                self.assertFalse(destination.with_name('checkpoint.part').exists())
+
+    def test_bad_integrity_header_mime_and_trailing_data(self):
+        frame, _ = fixture()
+        variants = [frame + b'x']
+        for offset in (0, 16, 20, 24, 28, frame.index(MIME), len(frame) - 33, len(frame) - 1):
+            bad = bytearray(frame); bad[offset] ^= 1; variants.append(bytes(bad))
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'checkpoint'
+            for bad in variants:
+                with self.assertRaises(ValueError): receive_checkpoint(io.BytesIO(bad), destination)
+                self.assertFalse(destination.exists())
+                self.assertFalse(destination.with_name('checkpoint.part').exists())
+
+    def test_limits_and_existing_staging_are_not_overwritten(self):
+        with self.assertRaises(ValueError): envelope_prefix({}, MAX_CHECKPOINT + 1)
+        frame, _ = fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'checkpoint'
+            partial = destination.with_name('checkpoint.part')
+            partial.write_bytes(b'other-transfer')
+            with self.assertRaises(FileExistsError): receive_checkpoint(io.BytesIO(frame), destination)
+            self.assertEqual(b'other-transfer', partial.read_bytes())
+
+
+if __name__ == '__main__': unittest.main()

@@ -40,9 +40,9 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
 
     const bench_server = b.addExecutable(.{
         .name = "antfly-inference-bench-server",
-        // Match the macOS Metal inference-test allowance; other accelerators
-        // reserve 8 GiB for the production Decide prepared-pipeline benchmark.
-        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else if (ctx.hasAccelerator()) 8 else 6) * 1024 * 1024 * 1024,
+        // Match the macOS Metal inference-test allowance. Optimized CUDA
+        // compilation measured a 9.21 GB peak; reserve 10 GiB for that path.
+        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else if (ctx.backend.enable_cuda) 10 else if (ctx.hasAccelerator()) 8 else 6) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/benchmark_server.zig"),
             .target = ctx.target,

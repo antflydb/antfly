@@ -12,6 +12,16 @@ pub fn parseChatCompletionsBody(allocator: std.mem.Allocator, body: []const u8) 
     return std.json.parseFromSlice(types.GenerateRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for prepareNativeKvCheckpoint.
+pub fn parsePrepareNativeKvCheckpointBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GenerateRequest) {
+    return std.json.parseFromSlice(types.GenerateRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for prepareChatContext.
+pub fn parsePrepareChatContextBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ContextPrepareRequest) {
+    return std.json.parseFromSlice(types.ContextPrepareRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for chunkText.
 pub fn parseChunkTextBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ChunkRequest) {
     return std.json.parseFromSlice(types.ChunkRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -134,6 +144,9 @@ pub const Route = struct {
 
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/chat/completions", .operation_id = "chatCompletions", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/chat/context/checkpoint", .operation_id = "prepareNativeKvCheckpoint", .request_body = .buffered, .streaming_response = true },
+    .{ .method = "POST", .path = "/chat/context/prepare", .operation_id = "prepareChatContext", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/chat/context/resume", .operation_id = "resumeNativeKvCheckpoint", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/decisions", .operation_id = "decide", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/dictate", .operation_id = "dictate", .request_body = .buffered, .streaming_response = true },
@@ -154,7 +167,7 @@ pub const routes = [_]Route{
     .{ .method = "DELETE", .path = "/transcription/sessions/{session_id}", .operation_id = "deleteTranscriptionSession", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transcription/sessions/{session_id}/audio", .operation_id = "appendTranscriptionAudio", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/transcription/sessions/{session_id}/events", .operation_id = "streamTranscriptionSessionEvents", .request_body = .none, .streaming_response = true },
-    .{ .method = "POST", .path = "/transcription/sessions/{session_id}/stream", .operation_id = "streamTranscriptionAudio", .request_body = .none, .streaming_response = true },
+    .{ .method = "POST", .path = "/transcription/sessions/{session_id}/stream", .operation_id = "streamTranscriptionAudio", .request_body = .buffered, .streaming_response = true },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -169,6 +182,9 @@ pub const routes = [_]Route{
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
         if (!@hasDecl(Impl, "chatCompletions")) @compileError("ServerRouter: Impl missing required method 'chatCompletions'");
+        if (!@hasDecl(Impl, "prepareNativeKvCheckpoint")) @compileError("ServerRouter: Impl missing required method 'prepareNativeKvCheckpoint'");
+        if (!@hasDecl(Impl, "prepareChatContext")) @compileError("ServerRouter: Impl missing required method 'prepareChatContext'");
+        if (!@hasDecl(Impl, "resumeNativeKvCheckpoint")) @compileError("ServerRouter: Impl missing required method 'resumeNativeKvCheckpoint'");
         if (!@hasDecl(Impl, "chunkText")) @compileError("ServerRouter: Impl missing required method 'chunkText'");
         if (!@hasDecl(Impl, "decide")) @compileError("ServerRouter: Impl missing required method 'decide'");
         if (!@hasDecl(Impl, "dictate")) @compileError("ServerRouter: Impl missing required method 'dictate'");
@@ -202,6 +218,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// Register all routes on the server with explicit instance context.
         pub fn register(self: *const @This(), server: anytype) !void {
             try server.post("/chat/completions", httpx.Handler.bind(self.impl, chatCompletions));
+            try server.post("/chat/context/checkpoint", httpx.Handler.bind(self.impl, prepareNativeKvCheckpoint));
+            try server.post("/chat/context/prepare", httpx.Handler.bind(self.impl, prepareChatContext));
+            try server.post("/chat/context/resume", httpx.Handler.bind(self.impl, resumeNativeKvCheckpoint));
             try server.post("/chunk", httpx.Handler.bind(self.impl, chunkText));
             try server.post("/decisions", httpx.Handler.bind(self.impl, decide));
             try server.post("/dictate", httpx.Handler.bind(self.impl, dictate));
@@ -229,6 +248,24 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /chat/completions
         fn chatCompletions(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.chatCompletions(ctx);
+        }
+
+        /// Prepare a portable native KV checkpoint
+        /// POST /chat/context/checkpoint
+        fn prepareNativeKvCheckpoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.prepareNativeKvCheckpoint(ctx);
+        }
+
+        /// Inspect or prepare bounded chat context
+        /// POST /chat/context/prepare
+        fn prepareChatContext(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.prepareChatContext(ctx);
+        }
+
+        /// Generate from a portable native KV checkpoint
+        /// POST /chat/context/resume
+        fn resumeNativeKvCheckpoint(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.resumeNativeKvCheckpoint(ctx);
         }
 
         /// Chunk text into smaller segments
@@ -372,6 +409,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 // Handler interface. Implement these methods on your Impl struct:
 //
 //   fn chatCompletions(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn prepareNativeKvCheckpoint(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn prepareChatContext(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn resumeNativeKvCheckpoint(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn chunkText(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn decide(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn dictate(self: *Impl, ctx: *httpx.Context) !httpx.Response

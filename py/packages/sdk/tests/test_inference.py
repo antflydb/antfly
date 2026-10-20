@@ -10,7 +10,11 @@ from antfly.client_generated.models import (
     InferenceChatMessage,
     InferenceGenerateChatTemplateKwargs,
     InferenceGenerateRequest,
+    InferenceContextPrepareRequest,
+    InferenceContextManagement,
+    InferenceContextManagementMode,
     InferenceRole,
+    InferenceToolChoiceType0,
 )
 
 
@@ -40,6 +44,61 @@ def test_generate_request_preserves_explicit_thinking_false() -> None:
     request = generation_request()
     request.chat_template_kwargs = InferenceGenerateChatTemplateKwargs(enable_thinking=False)
     assert request.to_dict()["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_context_and_generation_requests_preserve_developer_role() -> None:
+    wire = {
+        "model": "gemma",
+        "messages": [
+            {"role": "developer", "content": "Preserve these instructions."},
+            {"role": "user", "content": "hello"},
+        ],
+    }
+    for request_type in (InferenceContextPrepareRequest, InferenceGenerateRequest):
+        request = request_type.from_dict(wire)
+        assert request.messages[0].role == InferenceRole.DEVELOPER
+        assert request.to_dict()["messages"] == wire["messages"]
+
+
+def test_prepare_chat_context_forwards_typed_request_and_parses_diagnostics() -> None:
+    captured: list[dict[str, object]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.read()))
+        return httpx.Response(
+            200,
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "context": {
+                    "policy": "inspect",
+                    "applied": False,
+                    "original_input_tokens": 4,
+                    "effective_input_tokens": 4,
+                    "target_input_tokens": 128,
+                    "reserved_output_tokens": 16,
+                    "dropped_messages": 0,
+                    "retained_messages": 1,
+                    "retained_from_message": 0,
+                    "checkpoint_applied": False,
+                    "windowed": False,
+                    "compacted": False,
+                },
+                "usage": {"prompt_tokens": 4, "completion_tokens": 0, "total_tokens": 4},
+            },
+        )
+
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(handle))
+    request = InferenceContextPrepareRequest(
+        model="gemma",
+        messages=generation_request().messages,
+        max_tokens=16,
+        tool_choice=InferenceToolChoiceType0.NONE,
+        chat_template_kwargs=InferenceGenerateChatTemplateKwargs(enable_thinking=False),
+    )
+    response = client.prepare_chat_context(request)
+    assert response.context.effective_input_tokens == 4
+    assert captured == [request.to_dict()]
 
 
 def install_transport(client: AntflyClient, handler: httpx.MockTransport) -> None:
@@ -92,6 +151,77 @@ def test_generate_and_stream_reuse_auth_and_parse_framed_sse() -> None:
         {**generation_request().to_dict(), "stream": False},
         {**generation_request().to_dict(), "stream": True},
     ]
+
+
+def test_managed_generation_requires_and_preserves_context_attestation() -> None:
+    request = generation_request()
+    request.context_management = InferenceContextManagement(
+        mode=InferenceContextManagementMode.REJECT
+    )
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "id": "missing",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gemma",
+                    "choices": [],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "id": "wrong-policy",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gemma",
+                    "choices": [],
+                    "context": {
+                        "policy": "window",
+                        "applied": False,
+                        "original_input_tokens": 1,
+                        "effective_input_tokens": 1,
+                        "target_input_tokens": 8,
+                        "reserved_output_tokens": 1,
+                        "dropped_messages": 0,
+                        "retained_messages": 1,
+                        "retained_from_message": 0,
+                        "checkpoint_applied": False,
+                        "windowed": False,
+                        "compacted": False,
+                    },
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1},
+                },
+            ),
+            httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=(
+                    b'data: {"id":"managed","object":"chat.completion.chunk","created":1,'
+                    b'"model":"gemma","choices":[],"context":{"policy":"reject",'
+                    b'"applied":false,"original_input_tokens":1,"effective_input_tokens":1,'
+                    b'"target_input_tokens":8,"reserved_output_tokens":1,"dropped_messages":0,'
+                    b'"retained_messages":1,"retained_from_message":0,"checkpoint_applied":false,'
+                    b'"windowed":false,"compacted":false}}\n\ndata: [DONE]\n\n'
+                ),
+            ),
+        ]
+    )
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(lambda _: next(responses)))
+
+    with pytest.raises(AntflyException, match="did not attest"):
+        client.generate(request)
+    with pytest.raises(AntflyException, match="different context policy"):
+        client.generate(request)
+    with client.generate_stream(request) as chunks:
+        chunk = next(chunks)
+        assert chunk.context.policy.value == "reject"
+        with pytest.raises(StopIteration):
+            next(chunks)
 
 
 def test_generate_stream_returns_typed_507_and_requires_done() -> None:

@@ -12347,7 +12347,7 @@ test "quant kernel compiler pins the paged-attention params layout drift guard" 
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_rt_external_helper_paged_attention_params, 1, metal_renderer.paged_attention_params_field_body));
     try std.testing.expect(std.mem.containsAtLeast(u8, metal_renderer.helper_paged_attention_1x_params.msl, 1, metal_renderer.paged_attention_params_field_body));
     // Every field the dispatch fills is present in the shared body.
-    inline for (.{ "uint q_len;", "uint kv_tokens;", "uint num_heads;", "uint num_kv_heads;", "uint head_dim;", "uint key_row_bytes;", "uint base_key_row_bytes;", "uint query_position_offset;", "uint kv_position_offset;", "uint sliding_window;", "uint v_row_stride;", "uint page_size;", "uint block_count;", "uint contiguous_base_token;", "uint contiguous_blocks;", "uint format;", "uint v_element_bytes;", "uint has_sinks;", "float softcap;", "uint swa_scan_clamp;" }) |field| {
+    inline for (.{ "uint q_len;", "uint kv_tokens;", "uint num_heads;", "uint num_kv_heads;", "uint head_dim;", "uint key_row_bytes;", "uint base_key_row_bytes;", "uint query_position_offset;", "uint kv_position_offset;", "uint sliding_window;", "uint v_row_stride;", "uint page_size;", "uint block_count;", "uint contiguous_base_token;", "uint contiguous_blocks;", "uint format;", "uint v_element_bytes;", "uint has_sinks;", "float softcap;", "uint swa_scan_clamp;", "uint has_explicit_positions;" }) |field| {
         try std.testing.expect(std.mem.containsAtLeast(u8, metal_renderer.paged_attention_params_field_body, 1, field));
     }
 
@@ -12362,6 +12362,8 @@ test "quant kernel compiler pins the paged-attention params layout drift guard" 
     defer std.testing.allocator.free(expected_size_assert);
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, expected_size_assert));
     try std.testing.expectEqual(field_count, std.mem.count(u8, host_source, "_Static_assert(offsetof(termite_metal_paged_attention_params"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "device const uint *key_positions [[buffer(7)]]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 2, "p.has_explicit_positions != 0u ? key_positions[ki] : p.kv_position_offset + ki"));
 
     const decode_threads = try std.fmt.allocPrint(std.testing.allocator, "#define TERMITE_METAL_GENERATED_DECODE_THREADS {d}u", .{first_decode_attention_1x_metal_schedule.threads_per_threadgroup});
     defer std.testing.allocator.free(decode_threads);

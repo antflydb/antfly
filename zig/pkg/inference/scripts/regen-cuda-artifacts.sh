@@ -308,6 +308,11 @@ required_symbols=(
   antfly_gqa_attention_decode_turboquant_score_prework_tiled64_hd512_f32_v1
   antfly_gqa_attention_prefill_flash_sm89_hd256_swa512_f32_v1
   antfly_gqa_attention_prefill_flash_sm89_hd512_global_f32_v1
+  antfly_gqa_repeat_prefill_exact_hd256_f32
+  antfly_gqa_repeat_prefill_exact_hd512_f32
+  antfly_gqa_repeat_split_scores_f32
+  antfly_gqa_repeat_split_coefficients_f32
+  antfly_gqa_repeat_split_values_f32
   antfly_gqa_attention_decode_splitk_online_sm89_hd256_swa512_f16_f32_v1
   antfly_gqa_attention_decode_splitk_online_sm89_hd512_global_f16_f32_v1
   termite_kv_write_suffix_decode_scalars_f32
@@ -362,6 +367,7 @@ required_symbols=(
   termite_linear_q4_0_bias_gelu_f32_tc_hmma
   termite_linear_q4_0_bias_add_f32_tc_hmma
   termite_linear_q4_0_f32_tc_hmma_bf16
+  antfly_linear_q4_0_bf16_staged
   termite_linear_q4_0_bias_f32_tc_hmma_bf16
   termite_linear_q4_0_bias_gelu_f32_tc_hmma_bf16
   termite_linear_q4_0_bias_add_f32_tc_hmma_bf16

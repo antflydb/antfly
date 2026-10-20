@@ -16,6 +16,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include "../../../graph/templates/cuda_q4_0_bf16_staged.cuh"
 
 using namespace nvcuda;
 
@@ -25044,3 +25045,6 @@ extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attent
         __syncthreads();
     }
 }
+
+// Native Attention Matching repeat-only kernels; host dispatch is opt-in.
+#include "../../../graph/templates/cuda_gqa_repeat_split_f16.cuh"

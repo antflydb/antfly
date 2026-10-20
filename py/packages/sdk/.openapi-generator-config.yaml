@@ -2,5 +2,7 @@ project_name_override: antfly
 package_name_override: client_generated
 package_version_override: 0.0.1
 content_type_overrides:
+  # Treat the envelope as bytes while retaining its declared wire Content-Type.
+  application/vnd.antfly.attachments.v1: application/octet-stream
   application/x-ndjson: application/octet-stream
 post_hooks: []

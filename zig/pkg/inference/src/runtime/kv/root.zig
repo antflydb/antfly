@@ -21,6 +21,15 @@ pub const manager = @import("manager.zig");
 pub const storage_runtime = @import("storage_runtime.zig");
 pub const linalg = @import("linalg.zig");
 pub const compaction = @import("compaction.zig");
+pub const attention_match = @import("attention_match.zig");
+pub const attention_match_checkpoint = @import("attention_match_checkpoint.zig");
+pub const attention_match_resume = @import("attention_match_resume.zig");
+pub const attention_match_engine = @import("attention_match_engine.zig");
+pub const attention_match_queries = @import("attention_match_queries.zig");
+pub const attention_match_transaction = @import("attention_match_transaction.zig");
+pub const attention_match_snapshot = @import("attention_match_snapshot.zig");
+pub const device_clone = @import("device_clone.zig");
+pub const selection = @import("selection.zig");
 pub const turboquant = @import("turboquant.zig");
 pub const prompt_cache = @import("prompt_cache.zig");
 
@@ -33,6 +42,15 @@ test {
     _ = storage_runtime;
     _ = linalg;
     _ = compaction;
+    _ = attention_match;
+    _ = attention_match_checkpoint;
+    _ = attention_match_resume;
+    _ = attention_match_engine;
+    _ = attention_match_queries;
+    _ = attention_match_transaction;
+    _ = attention_match_snapshot;
+    _ = device_clone;
+    _ = selection;
     _ = turboquant;
     _ = prompt_cache;
 }

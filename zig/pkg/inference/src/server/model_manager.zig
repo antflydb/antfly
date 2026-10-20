@@ -2427,8 +2427,46 @@ pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, ma
     return resolutionModelRevision(a, io, manifest);
 }
 
+const native_kv_identity = @import("../runtime/kv/attention_match_identity.zig");
+
+/// Include optional tokenizer sidecars in the generation marker even if absent.
+/// Their appearance during/after loading must not authenticate different bytes.
+const NativeKvFiles = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: [8]native_kv_identity.FileArtifact,
+
+    fn init(a: std.mem.Allocator, directory: []const u8, manifest: manifest_mod.ModelManifest) !NativeKvFiles {
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        if (!manifest.usesGgufWeights()) return error.UnsupportedKvIdentity;
+        const weights = manifest.gguf_path orelse return error.UnsupportedKvIdentity;
+        const entries = [8]native_kv_identity.FileArtifact{
+            .{ .role = "added_tokens", .path = try std.fs.path.join(alloc, &.{ directory, "added_tokens.json" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "config", .path = manifest.config_path orelse try std.fs.path.join(alloc, &.{ directory, "config.json" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "special_tokens_map", .path = manifest.special_tokens_map_path orelse try std.fs.path.join(alloc, &.{ directory, "special_tokens_map.json" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "tokenizer_config", .path = manifest.tokenizer_config_path orelse try std.fs.path.join(alloc, &.{ directory, "tokenizer_config.json" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "tokenizer_json", .path = manifest.tokenizer_json_path orelse try std.fs.path.join(alloc, &.{ directory, "tokenizer.json" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "tokenizer_model", .path = try std.fs.path.join(alloc, &.{ directory, "tokenizer.model" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "vocab", .path = manifest.vocab_txt_path orelse try std.fs.path.join(alloc, &.{ directory, "vocab.txt" }), .optional = true, .max_bytes = 64 * 1024 * 1024 },
+            .{ .role = "weights", .path = weights, .max_bytes = 16 * 1024 * 1024 * 1024 },
+        };
+        return .{ .arena = arena, .entries = entries };
+    }
+    fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const LoadedModel = struct {
     resolution_revision: ?[32]u8 = null,
+    /// Portable checkpoint identity is bound to this loaded asset generation.
+    /// Unsupported bundles keep this optional capability disabled.
+    native_kv_asset_generation: ?[32]u8 = null,
+    native_kv_artifact_digest: ?[32]u8 = null,
+    native_kv_tokenizer_contract: ?native_kv_identity.TokenizerContract = null,
+    native_kv_identity_mutex: std.atomic.Mutex = .unlocked,
     embedding_identity: ?[64]u8 = null,
     embedding_asset_signature: ?[32]u8 = null,
     manifest: manifest_mod.ModelManifest,
@@ -2513,6 +2551,53 @@ pub const LoadedModel = struct {
     /// fault. Existing handles may finish unwinding; the last one destroys the
     /// retired model while new requests load a fresh session.
     retired: bool = false,
+
+    /// Caller owns a loaded-model handle for this entire operation. Identity is
+    /// cached only in this loaded generation, never in a user-writable memo.
+    /// The pre-load generation marker ties the content hash to admitted weights
+    /// and tokenizer state; edited assets cannot retroactively label old state.
+    pub fn nativeKvIdentity(self: *LoadedModel, dtype: runtime.kv.pool.KvDType, control: ?InferenceExecutionControl) !runtime.kv.attention_match_checkpoint.Identity {
+        if ((dtype != .f16 and dtype != .f32) or self.chat_template_failed or !self.manifest.usesGgufWeights()) return error.UnsupportedKvIdentity;
+        const config = session_factory.getGptConfig(self.session) orelse return error.UnsupportedKvIdentity;
+        if (config.family != .gemma or !config.usesGemma4Channels() or config.gemma4_mtp_assistant) return error.UnsupportedKvIdentity;
+        const expected_generation = self.native_kv_asset_generation orelse return error.UnsupportedKvIdentity;
+        const tokenizer_contract = self.native_kv_tokenizer_contract orelse return error.UnsupportedKvIdentity;
+        if (control) |active| try active.lock(&self.native_kv_identity_mutex) else platform.sync.lockYielding(&self.native_kv_identity_mutex);
+        defer self.native_kv_identity_mutex.unlock();
+        if (control) |active| try active.check();
+        const identity_started = std.Io.Timestamp.now(self.executor_io orelse std.Options.debug_io, .awake);
+        const identity_cache_hit = self.native_kv_artifact_digest != null;
+        if (self.native_kv_artifact_digest == null) {
+            var files = try NativeKvFiles.init(self.allocator, self.model_dir, self.manifest);
+            defer files.deinit();
+            const Callback = struct {
+                active: ?InferenceExecutionControl,
+                fn check(raw: ?*anyopaque) !void {
+                    const self_callback: *@This() = @ptrCast(@alignCast(raw.?));
+                    if (self_callback.active) |active| try active.check();
+                }
+            };
+            var callback: Callback = .{ .active = control };
+            const digest = try native_kv_identity.hashFiles(std.Io.Dir.cwd(), self.executor_io orelse std.Options.debug_io, &files.entries, expected_generation, "antfly.gemma4.loaded-bundle-v1", .{ .context = &callback, .check_fn = Callback.check });
+            if (control) |active| try active.check();
+            self.native_kv_artifact_digest = digest;
+        }
+        const artifacts_digest = self.native_kv_artifact_digest.?;
+        const identity: runtime.kv.attention_match_checkpoint.Identity = .{
+            // Conservative full-bundle content binding includes weight and
+            // tokenizer sidecars; filenames and inode metadata are excluded.
+            .weights = artifacts_digest,
+            .tokenizer = native_kv_identity.tokenizer(artifacts_digest, tokenizer_contract.route, tokenizer_contract.preserve_inline_specials),
+            .template = native_kv_identity.template(if (self.chat_tmpl != null) self.manifest.chat_template orelse return error.UnsupportedKvIdentity else "", self.manifest.bos_token, self.manifest.eos_token, self.manifest.unk_token, self.manifest.pad_token),
+            .layout = try native_kv_identity.layout(config, @tagName(dtype)),
+        };
+        std.log.info("native_kv_identity cache_hit={d} elapsed_ns={d} weights_sha256={s} tokenizer_sha256={s} template_sha256={s} layout_sha256={s}", .{
+            @intFromBool(identity_cache_hit),              identity_started.untilNow(self.executor_io orelse std.Options.debug_io, .awake).nanoseconds,
+            std.fmt.bytesToHex(identity.weights, .lower),  std.fmt.bytesToHex(identity.tokenizer, .lower),
+            std.fmt.bytesToHex(identity.template, .lower), std.fmt.bytesToHex(identity.layout, .lower),
+        });
+        return identity;
+    }
 
     pub fn verifyEmbeddingIdentity(self: *const LoadedModel) !void {
         const expected = self.embedding_asset_signature orelse return;
@@ -7566,6 +7651,14 @@ pub const ModelManager = struct {
             sm.preferred_backends = eg2_backends[0..count];
         }
 
+        // Record before tokenizer and weight loading. Errors disable only the
+        // optional portable-KV route; ordinary inference remains available.
+        const native_kv_asset_generation: ?[32]u8 = native_generation: {
+            if (!man.usesGgufWeights()) break :native_generation null;
+            var files = NativeKvFiles.init(self.allocator, model_dir, man) catch break :native_generation null;
+            defer files.deinit();
+            break :native_generation native_kv_identity.fileGeneration(std.Io.Dir.cwd(), sm.io orelse std.Options.debug_io, &files.entries) catch null;
+        };
         const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
         const resolution_revision = try modelIdentity(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man);
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
@@ -7803,6 +7896,14 @@ pub const ModelManager = struct {
         if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
         model.* = .{
             .resolution_revision = resolution_revision,
+            .native_kv_asset_generation = native_kv_asset_generation,
+            .native_kv_tokenizer_contract = if (native_kv_asset_generation != null) .{
+                .route = switch (tokenizer_type) {
+                    .huggingface => .huggingface,
+                    .sentencepiece => .sentencepiece,
+                },
+                .preserve_inline_specials = if (sp_tok) |sp| sp.preserve_inline_specials_after_literal_bos else false,
+            } else null,
             .embedding_identity = if (embedding_snapshot) |snapshot| snapshot.digest else null,
             .embedding_asset_signature = if (embedding_snapshot) |snapshot| snapshot.signature else null,
             .manifest = man,

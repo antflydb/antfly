@@ -20,10 +20,11 @@
 
 const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
+const http = @import("antfly_runtime_abi").http_abi;
 
 pub fn main() !void {
     const table = bridge.antfly_standalone_inference_get_function_table();
-    if (!bridge.validFunctionTable(table, bridge.Capability.provider))
+    if (!bridge.validFunctionTable(table, bridge.Capability.provider | bridge.Capability.route_manifest))
         return error.InvalidLinkedInferenceFunctionTable;
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -44,6 +45,7 @@ pub fn main() !void {
     const create_status = table.create(&create_context);
     if (!create_status.isOk()) return bridge.errorFromStatus(create_status);
     defer table.destroy(handle.?);
+    try checkNativeCheckpointRoutes(table, handle.?);
 
     const image_bytes = [_]u8{0};
     const payloads = [_]bridge.ProviderBinaryPayload{.{
@@ -151,3 +153,62 @@ fn createContext(io: *const std.Io, out_handle: *?*anyopaque) bridge.CreateConte
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+fn checkNativeCheckpointRoutes(table: *const bridge.FunctionTable, handle: *anyopaque) !void {
+    var entries: ?[*]const bridge.RouteManifestEntry = null;
+    var count: usize = 0;
+    const status = table.route_manifest(&.{ .abi_version = bridge.abi_version, .handle = handle, .out_entries = &entries, .out_len = &count });
+    if (!status.isOk()) return bridge.errorFromStatus(status);
+    const manifest = (entries orelse return error.MissingInferenceRoutes)[0..count];
+    inline for (.{ bridge.ai_api_prefix, bridge.public_api_prefix }) |prefix| {
+        var resume_route: ?bridge.RouteManifestEntry = null;
+        var prepare_seen = false;
+        for (manifest) |entry| {
+            if (entry.method != .post) continue;
+            if (std.mem.eql(u8, entry.path.slice(), prefix ++ "/chat/context/checkpoint")) {
+                if (entry.request_body != .buffered or entry.streaming_response == 0) return error.InvalidCheckpointRouteCapabilities;
+                prepare_seen = true;
+            }
+            if (std.mem.eql(u8, entry.path.slice(), prefix ++ "/chat/context/resume")) {
+                if (entry.request_body != .buffered or entry.streaming_response == 0) return error.InvalidCheckpointRouteCapabilities;
+                resume_route = entry;
+            }
+        }
+        if (!prepare_seen or resume_route == null) return error.MissingCheckpointRoute;
+        const Source = struct {
+            bytes: [40]u8 = @splat(0),
+            offset: usize = 0,
+            calls: usize = 0,
+            fn read(raw: ?*anyopaque, destination: [*]u8, capacity: usize, out: *usize) callconv(.c) http.CallbackStatus {
+                const self: *@This() = @ptrCast(@alignCast(raw orelse return .failed));
+                self.calls += 1;
+                out.* = @min(capacity, self.bytes.len - self.offset, 3);
+                @memcpy(destination[0..out.*], self.bytes[self.offset..][0..out.*]);
+                self.offset += out.*;
+                return .ok;
+            }
+        };
+        for ([_]u16{ 400, 413, 400 }) |expected| {
+            var source: Source = .{};
+            if (expected == 413) {
+                @memcpy(source.bytes[0..8], "AFATT001");
+                std.mem.writeInt(u64, source.bytes[8..16], 2 * 1024 * 1024 + 1, .little);
+                std.mem.writeInt(u32, source.bytes[16..20], 1, .little);
+                std.mem.writeInt(u32, source.bytes[24..28], "application/vnd.antfly.kv-checkpoint".len, .little);
+                std.mem.writeInt(u64, source.bytes[32..40], 192, .little);
+            }
+            const headers = [_]http.HeaderView{.{ .name = .init("Content-Type"), .value = .init("application/vnd.antfly.attachments.v1") }};
+            const request: http.HttpRequestView = .{ .method = .post, .path = .init(prefix ++ "/chat/context/resume"), .headers_ptr = &headers, .headers_len = headers.len };
+            var response_handle: ?*anyopaque = null;
+            var response: http.HttpResponseView = .{ .body = .init("") };
+            defer if (response_handle) |owned| table.destroy_http_response(owned);
+            const result = table.handle_http(&.{ .abi_version = bridge.abi_version, .route_handle = resume_route.?.route_handle, .request = &request, .body_source = .{ .context = &source, .read = Source.read, .streaming = 1 }, .out_response_handle = &response_handle, .out_response = &response });
+            if (!result.isOk()) return bridge.errorFromStatus(result);
+            if (response.status != expected or source.offset != 40 or source.calls <= 1)
+                return error.InvalidCheckpointIncrementalAbi;
+        }
+    }
+    var admission: bridge.RequestAdmissionStats = undefined;
+    table.request_admission_stats(handle, &admission);
+    if (admission.in_flight != 0) return error.LeakedCheckpointAdmission;
+}

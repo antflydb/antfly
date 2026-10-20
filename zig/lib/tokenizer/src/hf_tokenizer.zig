@@ -801,6 +801,7 @@ pub const HfTokenizer = struct {
         .encodeForModelUnpadded = @ptrCast(&encodeForModelUnpadded),
         .encodeGeneration = @ptrCast(&encodeGeneration),
         .decode = @ptrCast(&decode),
+        .decodeToken = @ptrCast(&decodeToken),
         .specialTokens = @ptrCast(&getSpecialTokens),
         .allSpecialTokenIds = @ptrCast(&getAllSpecialTokenIds),
         .vocabSize = @ptrCast(&getVocabSize),
@@ -7640,7 +7641,16 @@ pub const HfTokenizer = struct {
     // =====================================================================
 
     fn decode(self: *HfTokenizer, allocator: std.mem.Allocator, token_ids: []const i32) ![]u8 {
+        return self.decodeAtPosition(allocator, token_ids, true);
+    }
+
+    fn decodeToken(self: *HfTokenizer, allocator: std.mem.Allocator, id: i32, at_start: bool) ![]u8 {
+        return self.decodeAtPosition(allocator, &.{id}, at_start);
+    }
+
+    fn decodeAtPosition(self: *HfTokenizer, allocator: std.mem.Allocator, token_ids: []const i32, at_start: bool) ![]u8 {
         var result = std.ArrayListUnmanaged(u8).empty;
+        errdefer result.deinit(allocator);
 
         for (token_ids) |id| {
             if (self.id_to_token.get(id)) |token| {
@@ -7652,7 +7662,7 @@ pub const HfTokenizer = struct {
                         if (std.mem.startsWith(u8, token, self.continuing_prefix)) {
                             try result.appendSlice(allocator, token[self.continuing_prefix.len..]);
                         } else {
-                            if (result.items.len > 0) try result.append(allocator, ' ');
+                            if (!at_start or result.items.len > 0) try result.append(allocator, ' ');
                             try result.appendSlice(allocator, token);
                         }
                     },
@@ -7685,7 +7695,7 @@ pub const HfTokenizer = struct {
             (self.model_type == .bpe and self.pre_tokenizer_type == .metaspace) or
             (self.model_type == .bpe and self.replace_space_with != null))
         {
-            const cleaned = try replaceMetaspace(allocator, result.items, self.metaspace_replacement);
+            const cleaned = try replaceMetaspace(allocator, result.items, self.metaspace_replacement, at_start);
             result.deinit(allocator);
             return cleaned;
         }
@@ -9091,10 +9101,11 @@ fn appendByteDecoded(result: *std.ArrayListUnmanaged(u8), allocator: std.mem.All
     }
 }
 
-fn replaceMetaspace(allocator: std.mem.Allocator, text: []const u8, replacement: []const u8) ![]u8 {
+fn replaceMetaspace(allocator: std.mem.Allocator, text: []const u8, replacement: []const u8, strip_initial_space: bool) ![]u8 {
     var result = std.ArrayListUnmanaged(u8).empty;
+    errdefer result.deinit(allocator);
     var i: usize = 0;
-    var at_start = true;
+    var at_start = strip_initial_space;
     while (i < text.len) {
         if (i + replacement.len <= text.len and std.mem.eql(u8, text[i .. i + replacement.len], replacement)) {
             if (!at_start) {
