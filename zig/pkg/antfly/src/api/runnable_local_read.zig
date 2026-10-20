@@ -44,6 +44,7 @@ pub const Read = struct {
             .current_class = currentClass,
             .cpu_borrow = cpuBorrow,
             .request_resources = requestResources,
+            .enter_resources = enterResources,
         };
     }
     pub fn validateCurrent(self: *Read) !void {
@@ -74,6 +75,21 @@ pub const Read = struct {
             self.execution.disableCpuBorrow() catch |err| return runtime.error_abi.statusFromError(err);
             self.validateCurrent() catch |err| return runtime.error_abi.statusFromError(err);
         }
+        return .ok;
+    }
+    fn enterResources(raw: *anyopaque, resources: *const abi.ResourceBundle, restriction: ?*const abi.Reentry) callconv(.c) runtime.error_abi.Status {
+        const participant = @import("runnable_resource_bridge.zig").receive(resources) catch |err| return runtime.error_abi.statusFromError(err);
+        if (restriction) |check| check.validate() catch |err| return runtime.error_abi.statusFromError(err);
+        const self = from(raw);
+        self.precheck() catch |err| return runtime.error_abi.statusFromError(err);
+        @import("runnable_reentry.zig").enterWithResources(self.execution, participant, restriction) catch |err| return runtime.error_abi.statusFromError(err);
+        const generation = self.execution.resume_generation;
+        const validation_needed = if (self.validation) |hook| !hook.active and hook.last_generation != generation else false;
+        self.validateCurrent() catch |err| return runtime.error_abi.statusFromError(err);
+        if (restriction) |check| if (validation_needed or generation != self.execution.resume_generation) check.checkpoint() catch |err| {
+            if (self.validation) |*hook| hook.reject(self.execution, err);
+            return runtime.error_abi.statusFromError(err);
+        };
         return .ok;
     }
     fn requestResources(raw: *anyopaque, resources: *const abi.ResourceBundle) callconv(.c) runtime.error_abi.Status {

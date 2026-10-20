@@ -27,7 +27,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .check_lifetime = checkLifetime, .current_class = currentClass, .cpu_borrow = cpuBorrow, .request_resources = requestResources };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .check_lifetime = checkLifetime, .current_class = currentClass, .cpu_borrow = cpuBorrow, .request_resources = requestResources, .enter_resources = enterResources };
     }
 };
 
@@ -120,6 +120,11 @@ fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
 fn requestResources(raw: *anyopaque, resources: *const abi.ResourceBundle) callconv(.c) runtime.error_abi.Status {
     const participant = @import("runnable_resource_bridge.zig").receive(resources) catch |err| return runtime.error_abi.statusFromError(err);
     capsule(raw).execution.requestResources(participant) catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+fn enterResources(raw: *anyopaque, resources: *const abi.ResourceBundle, restriction: ?*const abi.Reentry) callconv(.c) runtime.error_abi.Status {
+    const participant = @import("runnable_resource_bridge.zig").receive(resources) catch |err| return runtime.error_abi.statusFromError(err);
+    @import("runnable_reentry.zig").enterWithResources(&capsule(raw).execution, participant, restriction) catch |err| return runtime.error_abi.statusFromError(err);
     return .ok;
 }
 fn cpuBorrow(raw: *anyopaque, options: *const abi.CpuBorrow) callconv(.c) runtime.error_abi.Status {

@@ -21,7 +21,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 15;
+pub const abi_version: u32 = 16;
 /// Synchronous, non-yielding restriction on the original CPU-return wait.
 /// Borrowed only until enterChecked returns; never retained by the owner.
 /// Rejection stops that execution and does not retire physical ownership.
@@ -205,6 +205,10 @@ pub const Owner = extern struct {
     enter_checked: ?*const fn (*anyopaque, c_int, *const Reentry) callconv(.c) errors.Status = null,
     cpu_borrow: ?*const fn (*anyopaque, *const CpuBorrow) callconv(.c) errors.Status = null,
     request_resources: ?*const fn (*anyopaque, *const ResourceBundle) callconv(.c) errors.Status = null,
+    /// Synchronous stage: copies resource metadata, releases CPU, acquires the
+    /// complete bundle with CPU, and detaches the participant on every return.
+    /// The caller retains granted physical resources through their actual joins.
+    enter_resources: ?*const fn (*anyopaque, *const ResourceBundle, ?*const Reentry) callconv(.c) errors.Status = null,
 
     /// Resource-capable owners advertise both initial and parked grants through
     /// request_resources. Require that capability before invoking start, so an
@@ -215,6 +219,15 @@ pub const Owner = extern struct {
         if (options.resources == null) return error.InvalidArgument;
         if (self.request_resources == null) return error.UnsupportedOperation;
         const status = self.start(self.context, options);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn enterWithResources(self: Owner, handle: *anyopaque, resources: *const ResourceBundle, restriction: ?*const Reentry) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        const value = try ResourceBundle.read(resources);
+        if (restriction) |check| try check.validate();
+        const callback = self.enter_resources orelse return error.ExecutionWaitUnsupported;
+        const status = callback(handle, &value, restriction);
         if (!status.isOk()) return errors.errorFromStatus(status);
     }
 
@@ -372,6 +385,19 @@ pub const Borrowed = extern struct {
     enter_checked: ?*const fn (*anyopaque, c_int, *const Reentry) callconv(.c) errors.Status = null,
     cpu_borrow: ?*const fn (*anyopaque, *const CpuBorrow) callconv(.c) errors.Status = null,
     request_resources: ?*const fn (*anyopaque, *const ResourceBundle) callconv(.c) errors.Status = null,
+    /// Synchronous stage: copies resource metadata, releases CPU, acquires the
+    /// complete bundle with CPU, and detaches the participant on every return.
+    /// The caller retains granted physical resources through their actual joins.
+    enter_resources: ?*const fn (*anyopaque, *const ResourceBundle, ?*const Reentry) callconv(.c) errors.Status = null,
+
+    pub fn enterWithResources(self: Borrowed, resources: *const ResourceBundle, restriction: ?*const Reentry) !void {
+        try self.validate();
+        const value = try ResourceBundle.read(resources);
+        if (restriction) |check| try check.validate();
+        const callback = self.enter_resources orelse return error.ExecutionWaitUnsupported;
+        const status = callback(self.context, &value, restriction);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
 
     pub fn requestResources(self: Borrowed, resources: *const ResourceBundle) !void {
         try self.validate();
@@ -519,6 +545,7 @@ pub const Borrowed = extern struct {
             .enter_checked = owner.enter_checked,
             .cpu_borrow = owner.cpu_borrow,
             .request_resources = owner.request_resources,
+            .enter_resources = owner.enter_resources,
         };
         try borrow.validate();
         return borrow;

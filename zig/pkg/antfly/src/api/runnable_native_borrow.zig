@@ -26,6 +26,7 @@ pub const Bridge = struct {
     borrow: abi.Borrowed,
     allocator: std.mem.Allocator,
     owned_child: ?*ChildReceiver = null,
+    resource_rejection: ?anyerror = null,
 
     pub fn init(raw: *const abi.Borrowed, allocator: std.mem.Allocator) !Bridge {
         const borrow = try abi.Borrowed.read(raw);
@@ -43,6 +44,7 @@ pub const Bridge = struct {
             .current_class = currentClass,
             .cpu_borrow = if (self.borrow.cpu_borrow != null) cpuBorrow else null,
             .request_resources = if (self.borrow.request_resources != null) requestResources else null,
+            .enter_resources = if (self.borrow.enter_resources != null) enterResources else null,
             .checkpoint = checkpoint,
             .check_lifetime = lifetime,
             .park = park,
@@ -54,6 +56,33 @@ pub const Bridge = struct {
         });
     }
 
+    fn enterResources(raw: *anyopaque, resources: native.GrantResources, restriction: ?native.AdmissionCheck) !void {
+        const self = from(raw);
+        if (self.resource_rejection) |cause| return cause;
+        const participant = @import("runnable_resource_bridge.zig").send(resources);
+        const Forward = struct {
+            restriction: native.AdmissionCheck,
+            rejection: ?anyerror = null,
+            fn check(context: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const value: *@This() = @ptrCast(@alignCast(context));
+                if (value.rejection != null) return runtime.error_abi.statusFromError(error.Canceled);
+                value.restriction.checkpoint() catch |err| {
+                    value.rejection = err;
+                    return runtime.error_abi.statusFromError(error.Canceled);
+                };
+                return .ok;
+            }
+        };
+        var forwarded: ?Forward = if (restriction) |value| .{ .restriction = value } else null;
+        var reentry: ?abi.Reentry = if (forwarded) |*value| .{ .context = value, .check = Forward.check } else null;
+        self.borrow.enterWithResources(&participant, if (reentry) |*value| value else null) catch |err| {
+            if (forwarded) |value| if (value.rejection) |cause| {
+                self.resource_rejection = cause;
+                return cause;
+            };
+            return err;
+        };
+    }
     fn requestResources(raw: *anyopaque, resources: native.GrantResources) !void {
         const self = from(raw);
         const participant = @import("runnable_resource_bridge.zig").send(resources);
@@ -68,10 +97,13 @@ pub const Bridge = struct {
     }
     fn checkpoint(raw: *anyopaque) !void {
         const self = from(raw);
+        if (self.resource_rejection) |cause| return cause;
         try checked(self.borrow.checkpoint(self.borrow.context));
     }
     fn lifetime(raw: *anyopaque) !void {
-        try from(raw).borrow.checkLifetime();
+        const self = from(raw);
+        if (self.resource_rejection) |cause| return cause;
+        try self.borrow.checkLifetime();
     }
     fn currentClass(raw: *anyopaque) !native.Class {
         return classFromAbi(@backingInt(try from(raw).borrow.currentClass()));

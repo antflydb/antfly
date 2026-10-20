@@ -1917,6 +1917,7 @@ pub const Execution = struct {
         current_class: ?*const fn (*anyopaque) anyerror!Class = null,
         cpu_borrow: ?*const fn (*anyopaque, ?CpuBorrowBudget) anyerror!void = null,
         request_resources: ?*const fn (*anyopaque, GrantResources) anyerror!void = null,
+        enter_resources: ?*const fn (*anyopaque, GrantResources, ?AdmissionCheck) anyerror!void = null,
         checkpoint: *const fn (*anyopaque) anyerror!void,
         check_lifetime: *const fn (*anyopaque) anyerror!void,
         park: *const fn (*anyopaque, State) anyerror!void,
@@ -1973,13 +1974,22 @@ pub const Execution = struct {
     /// owners require an explicit detachable capability and are rejected before
     /// parking; ordinary requestResources retains its longer-lived contract.
     pub fn enterWithResources(self: *Execution, resources: GrantResources, restriction: ?AdmissionCheck) !void {
-        if (self.borrowed != null) return error.ExecutionWaitUnsupported;
+        if (self.child_pending) return error.InvalidRunnableTransition;
+        if (self.borrowed) |borrow| {
+            const callback = borrow.enter_resources orelse return error.ExecutionWaitUnsupported;
+            try callback(borrow.ptr, resources, restriction);
+            self.resume_generation +%= 1;
+            return;
+        }
         const e = if (self.entry) |*value| value else return error.InvalidRunnableTransition;
         const owner = try schedulerFor(e, false);
         const class = try self.retainedClass();
         if (class == .control or e.retainedPhase() or e.pending_resources != null) return error.InvalidRunnableTransition;
         try self.park(.resource_blocked);
-        try self.requestResources(resources);
+        self.requestResources(resources) catch |err| {
+            owner.failWait(e, err, true);
+            return err;
+        };
         defer owner.detachResources(e, resources);
         try self.enterWithCheck(class, restriction);
     }
