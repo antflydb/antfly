@@ -1023,7 +1023,8 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
         engine.stats.scanned_anchors = initial.scanned_anchors;
         engine.stats.explored_edges = initial.explored_edges;
     };
-    const query = if (writes) compiled.query else try @import("length_constraints.zig").normalize(engine.a, try @import("path_summaries.zig").lower(engine.a, compiled.query), parameters);
+    const reductions = try reduction_plan.lowerCardinality(engine.a, compiled.query);
+    const query = if (writes) reductions else try @import("length_constraints.zig").normalize(engine.a, try @import("path_summaries.zig").lower(engine.a, reductions), parameters);
     const rows = try engine.run(query.clauses, &.{&.{}}, compiled.query.explain, false);
     var combined: std.ArrayList(Row) = .empty;
     try combined.appendSlice(engine.a, rows);
@@ -1074,6 +1075,19 @@ fn serializationCheckpoint(ptr: *anyopaque) !void {
     try backend.vtable.checkpoint(backend.ptr);
 }
 
+// Rows and ordering-key arrays are execution containers, not Cypher values.
+// Clone each cell at its own depth so retaining a valid depth-64 value does
+// not introduce an extra user-visible nesting level.
+fn cloneValues(a: A, values: []const v.Value) ![]const v.Value {
+    const result = try a.alloc(v.Value, values.len);
+    for (values, result) |value, *out| out.* = try value.clone(a);
+    return result;
+}
+fn cloneRow(a: A, row: Row) !Row {
+    const result = try a.alloc(v.Entry, row.len);
+    for (row, result) |entry, *out| out.* = .{ .name = try a.dupe(u8, entry.name), .value = try entry.value.clone(a) };
+    return result;
+}
 fn lookup(row: Row, name: []const u8) ?v.Value {
     for (row) |entry| if (std.mem.eql(u8, entry.name, name)) return entry.value;
     return null;
@@ -1799,11 +1813,12 @@ const Engine = struct {
         for (groups, 0..) |group, index| {
             const sequence = if (group.window) |window_| window_.sequence else index;
             _ = scratch.reset(.free_all);
-            const evaluation = if (window != null) scratch.allocator() else retained;
-            const eval_scope: ?EvalScope = if (window != null) EvalScope.enter(self, evaluation) else null;
-            defer if (eval_scope) |scope_| scope_.leave(self);
+            // Aggregate arenas stay alive through projection. Borrow their
+            // results in scratch and own only values that escape this group.
+            const eval_scope = EvalScope.enter(self, scratch.allocator());
+            defer eval_scope.leave(self);
             const overrides = try self.a.alloc(v.Value, calls.items.len);
-            for (overrides, group.states) |*override, state_value| override.* = if (window != null) state_value.result() else try state_value.result().clone(retained);
+            for (overrides, group.states) |*override, state_value| override.* = state_value.result();
             self.aggregate_overrides = .{ .index = &calls.index.pointers, .values = overrides };
             self.group_overrides = .{ .index = &retention.uses, .values = group.key };
             const row = try self.a.alloc(v.Entry, projection.items.len);
@@ -1811,7 +1826,10 @@ const Engine = struct {
             self.group_overrides.?.aliases = row;
             const scope = if (projection.order.len != 0) try self.projectionScope(group.source, row) else group.source;
             if (projection.predicate) |predicate| if ((try (try self.eval(predicate, row, null)).truth()) != true) continue;
-            if (projection.distinct and !try unique_rows.accept(self, retained, row)) continue;
+            const distinct_row: ?Row = if (projection.distinct) distinct: {
+                if (!try unique_rows.accept(self, retained, row)) continue;
+                break :distinct unique_rows.rows.items[unique_rows.rows.items.len - 1];
+            } else null;
             const keys = try self.a.alloc(v.Value, projection.order.len);
             for (projection.order, keys) |order, *key| key.* = try self.orderValue(order.expression, projection, row, scope, &.{});
             const candidate: Projected = .{ .row = row, .source = group.source, .group = null, .keys = keys, .sequence = sequence };
@@ -1819,7 +1837,13 @@ const Engine = struct {
                 // Projection errors are still evaluated for every group,
                 // including losing candidates and LIMIT 0.
                 try top.acceptProjected(candidate);
-            } else try projected.append(retained, candidate);
+            } else try projected.append(retained, .{
+                .row = distinct_row orelse try cloneRow(retained, row),
+                .source = &.{},
+                .group = null,
+                .keys = try cloneValues(retained, keys),
+                .sequence = sequence,
+            });
         }
         self.aggregate_overrides = previous;
         if (window) |*top| return top.finish(true);
@@ -1853,7 +1877,7 @@ const Engine = struct {
         fn accept(self: *@This(), engine: *Engine, retained: A, row: Row) !bool {
             if (try self.contains(engine, row)) return false;
             const hash = try engine.rowHash(row);
-            const owned = (try (v.Value{ .map = row }).clone(retained)).map;
+            const owned = try cloneRow(retained, row);
             try self.index.insert(retained, hash, self.rows.items.len);
             try self.rows.append(retained, owned);
             return true;
@@ -8521,8 +8545,8 @@ const Engine = struct {
         var arena = std.heap.ArenaAllocator.init(self.scratch_allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        const row = (try (v.Value{ .map = candidate.row }).clone(a)).map;
-        const keys = (try (v.Value{ .list = candidate.keys }).clone(a)).list;
+        const row = try cloneRow(a, candidate.row);
+        const keys = try cloneValues(a, candidate.keys);
         return .{ .arena = arena, .value = .{ .row = row, .source = &.{}, .group = null, .keys = keys, .sequence = candidate.sequence, .weight = candidate.weight, .multiplicity = if (candidate.multiplicity) |weight| try weight.clone(a) else null } };
     }
     const TopK = struct {
@@ -8609,7 +8633,7 @@ const Engine = struct {
         fn finish(self: *TopK, final: bool) ![]const Row {
             const engine = self.engine;
             const projected = try engine.a.alloc(Projected, self.picks.items.len);
-            for (self.picks.items, projected) |pick, *item| item.* = .{ .row = (try (v.Value{ .map = pick.value.row }).clone(engine.a)).map, .source = &.{}, .group = null, .keys = (try (v.Value{ .list = pick.value.keys }).clone(engine.a)).list, .sequence = pick.value.sequence, .weight = pick.value.weight, .multiplicity = if (pick.value.multiplicity) |weight| try weight.clone(engine.a) else null };
+            for (self.picks.items, projected) |pick, *item| item.* = .{ .row = try cloneRow(engine.a, pick.value.row), .source = &.{}, .group = null, .keys = try cloneValues(engine.a, pick.value.keys), .sequence = pick.value.sequence, .weight = pick.value.weight, .multiplicity = if (pick.value.multiplicity) |weight| try weight.clone(engine.a) else null };
             // Sort only the retained window, using input sequence for stable ties.
             if (self.projection.order.len == 0 and self.projection.limit != null) std.mem.sort(Projected, projected, {}, struct {
                 fn less(_: void, left: Projected, right: Projected) bool {

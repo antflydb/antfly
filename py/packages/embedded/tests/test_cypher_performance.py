@@ -4317,12 +4317,12 @@ def _populate_payload_graph(db, count, payload_bytes):
 def test_repeated_pure_aggregates_share_one_physical_state(graph_db):
     db = graph_db
     _populate_payload_graph(db, 1500, 4096)
-    columns = ",".join(f"size({'COLLECT' if k % 2 else 'collect'}(n.payload)) AS c{k}" for k in range(8))
+    columns = ",".join(f"size(head({'COLLECT' if k % 2 else 'collect'}(n.payload))) AS c{k}" for k in range(8))
     result = db.cypher_json(
         "payloads",
         {"query": "MATCH (n:W) RETURN " + columns, "limits": {"memory_bytes": 32 << 20}},
     )
-    assert [int(cell["value"]) for cell in result["rows"][0]] == [1500] * 8
+    assert [int(cell["value"]) for cell in result["rows"][0]] == [4096] * 8
     populate(db, 10000)
     columns = ",".join(f"count(*) AS c{k}" for k in range(32))
     result = db.cypher_json(
@@ -4371,11 +4371,11 @@ def test_distinct_reducers_share_wide_membership_values(graph_db):
     result = db.cypher_json(
         "payloads",
         {
-            "query": "MATCH(n:W) RETURN count(DISTINCT n.payload),size(collect(DISTINCT n.payload))",
+            "query": "MATCH(n:W) RETURN count(DISTINCT n.payload),size(head(collect(DISTINCT n.payload)))",
             "limits": {"memory_bytes": 48 << 20, "intermediate_states": 600000},
         },
     )
-    assert [int(cell["value"]) for cell in result["rows"][0]] == [count, count]
+    assert [int(cell["value"]) for cell in result["rows"][0]] == [count, 4092]
 
 
 def test_group_key_window_retains_only_selected_count_groups(graph_db):
@@ -4413,3 +4413,52 @@ def test_group_key_window_retains_only_selected_count_groups(graph_db):
         exact = db.cypher_json("g", {"query": query})["rows"]
         bounded = db.cypher_json("g", {"query": query + " SKIP 2 LIMIT 7"})["rows"]
         assert bounded == exact[2:9]
+
+
+def test_collection_cardinality_does_not_retain_payloads(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092)
+    for tail in ("", " LIMIT 1"):
+        result = db.cypher_json(
+            "payloads",
+            {
+                "query": "MATCH(n:W) RETURN size(collect(n.payload))" + tail,
+                "limits": {"memory_bytes": 8 << 20, "intermediate_states": 300000},
+            },
+        )
+        assert int(result["rows"][0][0]["value"]) == 3000
+
+
+def test_aggregate_projection_borrows_collections_until_values_escape(graph_db):
+    db = graph_db
+    count = 3000
+    db.sql("CREATE TABLE payloads (score BIGINT,payload TEXT)")
+    payload = "x" * 4080
+    for start in range(0, count, 50):
+        db.sql(
+            "INSERT INTO payloads (_id,score,payload) VALUES "
+            + ",".join(f"('n{i}',{i},'{i:012d}{payload}')" for i in range(start, min(start + 50, count)))
+        )
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "payloads",
+            "definition": {"labels": [{"name": "W", "table": "payloads"}], "relationships": []},
+        }
+    )
+    # A real list consumer checks borrowed finalization independently of the
+    # cardinality rewrite. DISTINCT cardinality also needs the cheaper count
+    # work plan, even though its membership values still require storage.
+    for expression, expected, work in (
+        ("size(head(collect(DISTINCT n.payload)))", 4092, 600000),
+        ("size(collect(DISTINCT n.payload))", count, 300000),
+    ):
+        for tail in ("", " LIMIT 1"):
+            result = db.cypher_json(
+                "payloads",
+                {
+                    "query": "MATCH(n:W) RETURN " + expression + tail,
+                    "limits": {"memory_bytes": 24 << 20, "intermediate_states": work},
+                },
+            )
+            assert int(result["rows"][0][0]["value"]) == expected

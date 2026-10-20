@@ -3162,7 +3162,13 @@ test "directional, quadratic and support reductions agree with materialized path
 
 test "quadratic path statistics release every allocation failure" {
     const Campaign = struct {
-        fn run(a: std.mem.Allocator) !void {
+        fn run(backing: std.mem.Allocator) !void {
+            // Arena resize/remap success depends on adjacent allocations and
+            // otherwise changes the number of injected failure positions.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             var diagnostic: c.Diagnostic = .{};
             var compiled = try c.compile(a, "MATCH REPEATABLE ELEMENTS p=(a:Document {id:'a'})-[xs:CITES*0..1]->()-[ys:CITES*0..1]->(b) RETURN avg(length(p)*length(p)),min(2*size(xs)-size(ys)),count(DISTINCT length(p))", .{}, &diagnostic);
             defer compiled.deinit();
@@ -3343,4 +3349,64 @@ test "DISTINCT cohorts and evicting group windows release every allocation failu
         }
     };
     inline for (.{ false, true }) |bounded| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{bounded});
+}
+
+test "collection cardinality preserves nulls scopes lazy branches and escaped collections" {
+    try check("UNWIND [null,1,1.0,2] AS x RETURN size(collect(x)),size(collect(DISTINCT x))", "[[3,2]]");
+    try check("UNWIND [] AS x RETURN size(collect(x)),size(collect(DISTINCT x))", "[[0,0]]");
+    try check("UNWIND [null,[1],[1],[2]] AS x RETURN size(collect(DISTINCT x))", "[[2]]");
+    try check("UNWIND [1,2,1] AS x RETURN x%2 AS k,size(collect(x)) AS c ORDER BY k", "[[0,1],[1,2]]");
+    try check("MATCH(n:Document) RETURN size(collect(n.title)),size(collect(DISTINCT n.rank))", "[[3,3]]");
+    try check("UNWIND [1,2] AS x RETURN CASE WHEN true THEN size(collect(x)) ELSE size(collect(1/0)) END", "[[2]]");
+    try check("UNWIND [1,2] AS x RETURN size(collect(x)),collect(x)", "[[2,[1,2]]]");
+    try check("UNWIND [1,2] AS x CALL { WITH x UNWIND [x,x] AS y RETURN size(collect(y)) AS n } RETURN collect(n)", "[[[2,2]]]");
+    try check("UNWIND [1] AS x RETURN size(collect(x)) UNION ALL UNWIND [1,2] AS x RETURN size(collect(x))", "[[1],[2]]");
+    for ([_][]const u8{
+        "UNWIND [0,1] AS x RETURN size(collect(1/(1-x)))",
+        "UNWIND [0,1] AS x RETURN size(collect(DISTINCT 1/(1-x))) LIMIT 0",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "borrowed group reductions own escaped nested values and order keys" {
+    try check("MATCH(n:Document) RETURN n.rank%2 AS k,collect({title:n.title,rank:n.rank}) AS xs ORDER BY head(xs).rank DESC", "[[0,[{\"title\":\"Beta\",\"rank\":2}]],[1,[{\"title\":\"Alpha\",\"rank\":1},{\"title\":\"Gamma\",\"rank\":3}]]]");
+    try check("MATCH(n:Document) WITH n.rank%2 AS k,collect(n.title)[0..1] AS xs ORDER BY k RETURN k,head(xs)", "[[0,\"Beta\"],[1,\"Alpha\"]]");
+    try check("MATCH(n:Document) RETURN DISTINCT head(collect(n.title)) AS title ORDER BY title", "[[\"Alpha\"]]");
+    try check("MATCH(n:Document) RETURN n.rank%2 AS k,min([n.title]) AS title ORDER BY title", "[[1,[\"Alpha\"]],[0,[\"Beta\"]]]");
+}
+
+test "borrowed aggregate projection and cardinality lowering release every failed allocation" {
+    const Campaign = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "MATCH(n:Document) RETURN n.rank%2 AS k,head(collect(n.title)) AS title,size(collect(n.rank)) AS c ORDER BY title", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "aggregate retention keeps execution containers outside the value depth limit" {
+    for ([_][]const u8{ "", " LIMIT 1" }) |tail| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "MATCH(n:Document) RETURN min(reduce(xs=0,x IN range(1,64)|[xs])) AS xs ORDER BY xs{s}", .{tail});
+        defer std.testing.allocator.free(text);
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        var value = result.rows[0][0];
+        for (0..64) |_| value = value.list[0];
+        try std.testing.expectEqual(@as(i64, 0), value.integer);
+    }
 }

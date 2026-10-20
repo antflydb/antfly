@@ -124,6 +124,104 @@ pub const Calls = struct {
         }
     }
 };
+/// A scalar cardinality consumer does not require a collection buffer. Keep
+/// the original source span (including its public column name), argument and
+/// DISTINCT flag. This rewrite stays at the original evaluation site: it does
+/// not hoist lazy CASE branches or cross correlated aggregate scopes.
+fn cardinality(expression: *const ast.Expr) ?*const ast.Expr {
+    if (expression.value != .call) return null;
+    const call = expression.value.call;
+    if (!std.ascii.eqlIgnoreCase(call.name, "size") or call.distinct or call.star or call.args.len != 1) return null;
+    const input = call.args[0];
+    if (input.value != .call) return null;
+    const aggregate = input.value.call;
+    if (!std.ascii.eqlIgnoreCase(aggregate.name, "collect") or aggregate.star or aggregate.args.len != 1) return null;
+    return input;
+}
+const Cardinality = struct {
+    a: A,
+    /// A full consumer in the same projection still needs the physical collect
+    /// slot. Leave matching size consumers on that shared slot rather than
+    /// adding another argument evaluation and reducer.
+    fn fullCollections(self: *@This(), value: anytype, full: *Index) anyerror!void {
+        const T = @TypeOf(value);
+        if (T == *const ast.Expr) {
+            if (cardinality(value) != null) return;
+            if (value.value == .call and std.ascii.eqlIgnoreCase(value.value.call.name, "collect")) {
+                _ = try full.intern(self.a, value, full.entries.items.len);
+                return;
+            }
+            switch (value.value) {
+                .exists, .pattern_comprehension => return,
+                inline else => |payload| try self.fullCollections(payload, full),
+            }
+            return;
+        }
+        switch (@typeInfo(T)) {
+            .pointer => |p| if (p.size == .slice and p.child != u8) {
+                for (value) |child| try self.fullCollections(child, full);
+            },
+            .@"struct" => |info| inline for (info.field_names) |name| try self.fullCollections(@field(value, name), full),
+            .@"union" => switch (value) {
+                inline else => |payload| try self.fullCollections(payload, full),
+            },
+            .optional => if (value) |child| try self.fullCollections(child, full),
+            else => {},
+        }
+    }
+    fn lower(self: *@This(), value: anytype, full: ?*const Index) anyerror!@TypeOf(value) {
+        const T = @TypeOf(value);
+        if (T == *const ast.Expr) {
+            var expression = value.*;
+            if (cardinality(value)) |input| {
+                if (full == null or full.?.find(input) == null) {
+                    expression.value = .{ .call = input.value.call };
+                    expression.value.call.name = "count";
+                }
+            }
+            const nested = expression.value == .exists or expression.value == .pattern_comprehension;
+            expression.value = try self.lower(expression.value, if (nested) null else full);
+            if (std.meta.eql(expression, value.*)) return value;
+            const result = try self.a.create(ast.Expr);
+            result.* = expression;
+            return result;
+        }
+        switch (@typeInfo(T)) {
+            .pointer => |p| {
+                if (p.size == .slice and p.child != u8) {
+                    var result: ?[]p.child = null;
+                    for (value, 0..) |child, i| {
+                        const next = try self.lower(child, full);
+                        if (result == null and !std.meta.eql(child, next)) result = try self.a.dupe(p.child, value);
+                        if (result) |items| items[i] = next;
+                    }
+                    return result orelse value;
+                }
+                return value;
+            },
+            .@"struct" => |info| {
+                var collections: Index = .{};
+                const scope = if (T == ast.Projection) scope: {
+                    try self.fullCollections(value, &collections);
+                    break :scope &collections;
+                } else full;
+                var result = value;
+                inline for (info.field_names) |name| @field(result, name) = try self.lower(@field(value, name), scope);
+                return result;
+            },
+            .@"union" => return switch (value) {
+                inline else => |payload, tag| @unionInit(T, @tagName(tag), try self.lower(payload, full)),
+            },
+            .optional => return if (value) |child| try self.lower(child, full) else null,
+            else => return value,
+        }
+    }
+};
+pub fn lowerCardinality(a: A, query: ast.Query) !ast.Query {
+    var lower: Cardinality = .{ .a = a };
+    return lower.lower(query, null);
+}
+
 /// Compile pointer lookups once, instead of structurally comparing every key
 /// on every projected row. Nested graph scopes own independent reductions.
 pub fn keyUses(a: A, keys: *const Index, value: anytype, uses: *std.AutoHashMapUnmanaged(*const ast.Expr, usize)) anyerror!void {
@@ -180,4 +278,24 @@ fn slotScenario(backing: A) !void {
 }
 test "scope-local slots share repeatable calls and preserve distinct and effect boundaries" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, slotScenario, .{});
+}
+
+test "cardinality planning retains source names shared full consumers and unchanged trees" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const compiler = @import("compiler.zig");
+    var diagnostic: compiler.Diagnostic = .{};
+    var compiled = try compiler.compile(a, "UNWIND [1] AS x RETURN size(collect(x)),size(COLLECT(DISTINCT x)),collect(DISTINCT x)", .{}, &diagnostic);
+    defer compiled.deinit();
+    const lowered = try lowerCardinality(a, compiled.query);
+    const original = compiled.query.clauses[1].operation.project.value.items;
+    const items = lowered.clauses[1].operation.project.value.items;
+    try std.testing.expectEqualStrings("count", items[0].expression.value.call.name);
+    try std.testing.expectEqual(original[0].expression.span, items[0].expression.span);
+    try std.testing.expectEqual(original[1].expression, items[1].expression);
+    try std.testing.expectEqual(original[2].expression, items[2].expression);
+    try std.testing.expectEqual(compiled.query.clauses[0].operation.unwind.expression, lowered.clauses[0].operation.unwind.expression);
+    // Lowering never mutates the compiled public schema or cached AST.
+    try std.testing.expectEqualStrings("size", original[0].expression.value.call.name);
 }
