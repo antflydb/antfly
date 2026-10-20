@@ -699,11 +699,17 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
 fn awaitActivation(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, physical: []const u8, receipt: *catalog.DdlReceipt) !void {
     const reader = server.table_reads orelse return error.ConstraintActivationPending;
     var bounded = context;
-    const now = if (context.deadline_io) |borrow| blk: {
-        var receiver = try borrow.receive();
-        break :blk @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds)));
-    } else @import("antfly_platform").time.monotonicNs();
-    bounded.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), now +| (2 * std.time.ns_per_s));
+    // SQL DDL is synchronous within the admitted statement budget. A shorter
+    // observation deadline also reaches owner admission and can abort a cold
+    // open after the declaration commits. Preserve the caller's absolute
+    // deadline/clock and use the normal SQL budget only for unbounded callers.
+    if (bounded.deadline_ns == null) {
+        const now = if (context.deadline_io) |borrow| blk: {
+            var receiver = try borrow.receive();
+            break :blk @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds)));
+        } else @import("antfly_platform").time.monotonicNs();
+        bounded.deadline_ns = now +| (@as(u64, (@import("../pgwire/protocol.zig").Limits{}).statement_timeout_ms) * std.time.ns_per_ms);
+    }
     while (true) {
         try bounded.ensureActive();
         const bytes = @import("relational_constraint_status.zig").collect(alloc, server.source, reader, physical, bounded) catch |err| switch (err) {
@@ -756,7 +762,69 @@ fn awaitActivation(server: *server_mod.ApiHttpServer, context: operation.Request
     }
 }
 
-test "SQL DDL readiness retries transient observations without replaying the declaration" {
+test "SQL catalog DDL readiness preserves the statement deadline through owner admission" {
+    const metadata_api = @import("../metadata/api.zig");
+    const types = @import("antfly_local_sources").storage_db_types;
+    const Fixture = struct {
+        expected_deadline: ?u64,
+        expected_io: ?@import("antfly_runtime_abi").io_abi.Borrow,
+        calls: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(&[_]@import("../metadata/table_manager.zig").TableRecord{.{
+                    .table_id = 7,
+                    .name = "new_table",
+                    .schema_json =
+                    \\{"version":0,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+                    ,
+                }}),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn lookup(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, opts: types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(opts.relational_integrity_catalog);
+            try std.testing.expectEqualDeep(self.expected_io, opts.execution_io);
+            if (self.expected_deadline) |expected| {
+                try std.testing.expectEqual(expected, opts.execution_deadline_ns.?);
+            } else {
+                const remaining = opts.execution_deadline_ns.? -| @import("antfly_platform").time.monotonicNs();
+                try std.testing.expect(remaining > 29 * std.time.ns_per_s);
+                try std.testing.expect(remaining <= 30 * std.time.ns_per_s);
+            }
+            return error.UnexpectedCall;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]?u64{ 1, 10, null }) |seconds| {
+        const deadline = if (seconds) |value| @import("antfly_platform").time.monotonicNs() + value * std.time.ns_per_s else null;
+        var fixture: Fixture = .{ .expected_deadline = deadline, .expected_io = null };
+        var server = server_mod.ApiHttpServer.init(alloc, .{}, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .admin_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.free } }, null, null);
+        defer server.deinit();
+        server.table_reads = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } };
+        var receipt: catalog.DdlReceipt = .{ .database = "default", .namespace = "public", .table = "new_table", .table_id = "7", .schema_version = 0, .state = .pending };
+        try std.testing.expectError(error.UnexpectedCall, awaitActivation(&server, .{ .deadline_ns = deadline }, alloc, "new_table", &receipt));
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        if (seconds != null) {
+            fixture.expected_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io);
+            fixture.expected_deadline = @intCast(std.Io.Clock.now(.awake, std.testing.io).nanoseconds + 10 * std.time.ns_per_s);
+            try std.testing.expectError(error.UnexpectedCall, awaitActivation(&server, .{ .deadline_ns = fixture.expected_deadline, .deadline_io = fixture.expected_io }, alloc, "new_table", &receipt));
+        }
+        try std.testing.expectEqual(.pending, receipt.state);
+    }
+}
+
+test "SQL catalog DDL readiness retries transient observations without replaying the declaration" {
     const metadata_api = @import("../metadata/api.zig");
     const Fixture = struct {
         failure: anyerror,

@@ -1233,9 +1233,7 @@ pub fn runFromIterator(
             .runnable_owner = if (storage_runnable_port) |*port| port else null,
         });
         storage_kernel_context = context;
-        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
-        defer alloc.free(security_json);
-        try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
+        try storage_kernel_context.?.configureRemoteContent(remote_content);
         try storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
     }
 

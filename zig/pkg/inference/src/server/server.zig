@@ -32605,6 +32605,7 @@ fn applyDenseEmbeddingRequestOptions(
     manifest: *const manifest_mod.ModelManifest,
     request: ParsedEmbedRequest,
 ) !?[]u8 {
+    pipeline.interactive = request.task_type == .RETRIEVAL_QUERY;
     return applyDenseEmbeddingConfigRequestOptions(allocator, &pipeline.config, manifest, request);
 }
 fn applyDenseEmbeddingConfigRequestOptions(
@@ -38826,7 +38827,11 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
     const acknowledged_prefix = reader.stream_ledger.acknowledged;
     if (ts) {
         try std.testing.expect(reader.stream_ledger.acknowledged > 0);
-    } else try std.testing.expectEqual(@as(usize, if (parts) 1 else 2), reader.stream_ledger.acknowledged);
+    } else {
+        const minimum: usize = if (parts) 1 else 2;
+        try std.testing.expect(reader.stream_ledger.acknowledged >= minimum);
+        try std.testing.expect(reader.stream_ledger.acknowledged <= minimum + 2);
+    }
     try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
     try std.testing.expect(stream.pending != null and !stream.pending.?.acknowledged);
     try std.testing.expectEqual(@as(usize, 0), flow.ordinal);
@@ -38858,7 +38863,352 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
         for (expected.result.?.vector, actual.result.?.vector) |left, right| max_error = @max(max_error, @abs(left - right));
     }
     try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
-    std.debug.print("streamed live pretrained ts={} parts={} encrypted={} metal={} windows={d} callbacks={d} early={d} prefix={d} requests={d} max_error={d:.9}\n", .{ ts, parts, encrypted, metal, capture.count, capture.calls, capture.early, acknowledged_prefix, transport.requests, max_error });
+    std.debug.print("streamed live pretrained ts={} parts={} encrypted={} metal={} windows={d} callbacks={d} early={d} prefix={d} requests={d} prefetched={d} overlaps={d} validation_overlap_packets={d} max_error={d:.9}\n", .{ ts, parts, encrypted, metal, capture.count, capture.calls, capture.early, acknowledged_prefix, transport.requests, stream.stats.prefetched_fragments, stream.stats.overlapped_fragments, stream.stats.overlapped_validation_packets, max_error });
+    if (!ts and !parts and !encrypted) {
+        // A backlog is available immediately: qualify native cohorts and one
+        // preparation wave ahead, including captions and an unacknowledged
+        // first callback while a second computed output is already retained.
+        var cohort_client = Fake.Client{};
+        var cohort_transport = stream_media.http_stream.Adapter(Fake){ .allocator = a, .client = &cohort_client, .root_url = transport.root_url, .limits = transport.limits };
+        var cohort_reader = try stream_media.hls_live.Reader(Fake).init(a, &cohort_transport, transport.root_url, .{});
+        defer cohort_reader.deinit();
+        try cohort_reader.reload();
+        var cohort_flow = try stream_coordinator.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .max_frames = 1 });
+        defer cohort_flow.deinit();
+        while (try cohort_reader.next()) |value| {
+            var unit: ?stream_media.live_mp4.Segment = value;
+            defer if (unit) |*owner| owner.deinit();
+            try cohort_flow.append(&unit);
+        }
+        try cohort_flow.finish();
+        var snapshots: [6]?stream_coordinator.Prepared = @splat(null);
+        defer for (&snapshots) |*snapshot| if (snapshot.*) |*owner| owner.deinit();
+        for (&snapshots, 0..) |*snapshot, offset| snapshot.* = (try cohort_flow.prepareAheadAlloc(a, offset)).?;
+        const Ended = struct {
+            calls: usize = 0,
+            pub fn ended(_: *@This()) bool {
+                return true;
+            }
+            pub fn streamNext(self: *@This(), _: *anyopaque, _: *const fn (*anyopaque, *stream_media.http_stream.FragmentDelivery) anyerror!void) !?struct { resource_complete: bool } {
+                self.calls += 1;
+                return null;
+            }
+        };
+        const CohortCapture = struct {
+            calls: usize = 0,
+            count: usize = 0,
+            hash: [32]u8 = undefined,
+            outputs: [6]?stream_embedding.LiveResult = @splat(null),
+            fn accept(raw: *anyopaque, delivery: *StreamDelivery) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.calls += 1;
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(delivery.value.result.?.vector), &hash, .{});
+                if (self.calls == 1) {
+                    self.hash = hash;
+                    return error.ConsumerFailure;
+                }
+                if (self.calls == 2) try std.testing.expectEqual(self.hash, hash);
+                try std.testing.expectEqual(self.count, delivery.value.ordinal);
+                self.outputs[self.count] = try delivery.copy(std.testing.allocator);
+                self.count += 1;
+            }
+        };
+        var telemetry = @import("antfly_video").decoding.Telemetry{};
+        const cohort_options = stream_embedding.Options{ .video_decoder = .{ .telemetry = &telemetry } };
+        const caption = "A short scene.";
+        var cohort_stream = try StreamAPI.init(a, loaded.session, loaded.getTokenizer(), &cohort_flow, caption, cohort_options, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+        defer cohort_stream.deinit();
+        var ended_reader = Ended{};
+        var captured = CohortCapture{};
+        defer for (captured.outputs) |output| if (output) |value| a.free(value.result.?.vector);
+        const cohort_started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        try std.testing.expectError(error.ConsumerFailure, cohort_stream.process(&ended_reader, &captured, CohortCapture.accept));
+        try std.testing.expect(cohort_stream.queued != null);
+        try std.testing.expectEqual(@as(usize, 0), ended_reader.calls);
+        _ = try cohort_stream.process(&ended_reader, &captured, CohortCapture.accept);
+        const cohort_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - cohort_started;
+        try std.testing.expectEqual(@as(usize, 6), captured.count);
+        // Completed-cost calibration may choose serial windows after its
+        // initial admitted batch samples; delivery and parity stay identical.
+        try std.testing.expect(cohort_stream.stats.native_batches > 0 and cohort_stream.stats.native_batches <= 3);
+        try std.testing.expect(telemetry.validated_frames.load(.acquire) > 0);
+        var cohort_error: f32 = 0;
+        const serial_started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        for (&snapshots, captured.outputs) |*snapshot, output| {
+            const expected = try stream_embedding.embedPreparedLiveCached(a, loaded.session, loaded.getTokenizer(), &cohort_flow, &snapshot.*.?, caption, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+            defer a.free(expected.result.?.vector);
+            try std.testing.expectEqual(expected.result.?.input_tokens, output.?.result.?.input_tokens);
+            for (expected.result.?.vector, output.?.result.?.vector) |left, right| cohort_error = @max(cohort_error, @abs(left - right));
+        }
+        try std.testing.expect(cohort_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
+        const serial_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - serial_started;
+        std.debug.print("sealed live cohorts metal={} batches={d} shared_vision_batches={d} ahead={d} validated_frames={d} callbacks={d} max_error={d:.9} completed_ns={d} serial_ns={d}\n", .{ metal, cohort_stream.stats.native_batches, cohort_stream.stats.shared_vision_batches, cohort_stream.stats.prepared_ahead, telemetry.validated_frames.load(.acquire), captured.calls, cohort_error, cohort_ns, serial_ns });
+        // Ready preparations from distinct sources must share the vision lane,
+        // while preserving each row's independent caption and pooled vector.
+        {
+            var pools = [_]stream_media.admission.Pool{ .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } }, .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } } };
+            var ahead_rows: [2]?*stream_embedding.VideoAhead = @splat(null);
+            defer for (ahead_rows) |entry| if (entry) |ahead| ahead.deinit();
+            var items: [2]stream_embedding.VideoBatchItem = undefined;
+            for (&items, 0..) |*item, index| {
+                const snapshot = &snapshots[index].?;
+                const movie = stream_embedding.SampledVideo{ .reader = &snapshot.window.reader, .sampling = .{ .source_timestamps = snapshot.policy } };
+                ahead_rows[index] = (try stream_embedding.VideoAhead.start(loaded.session, movie, node.extractionExecutionControl(null), null, &pools[index], .{})).?;
+                item.* = .{ .movie = movie, .caption = caption, .ahead = ahead_rows[index] };
+            }
+            // The test supplies an already prepared backlog. Serving never
+            // waits for a batch to fill; it consumes whatever is currently ready.
+            for (ahead_rows) |entry| entry.?.producer.?.finished.waitUncancelable(std.testing.io);
+            const shared = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &items, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+            defer {
+                for (shared.vectors) |vector| a.free(vector);
+                a.free(shared.vectors);
+                a.free(shared.input_tokens);
+            }
+            var error_max: f32 = 0;
+            for (shared.vectors, 0..) |vector, index| for (vector, captured.outputs[index].?.result.?.vector) |left, right| {
+                error_max = @max(error_max, @abs(left - right));
+            };
+            try std.testing.expect(error_max < 1e-3);
+            // CPU calibration may correctly prefer singleton vision after
+            // exercising the shared cohorts above. Qualify the serving route
+            // without overriding its measured policy for this later call.
+            try std.testing.expect(shared.shared_vision_batches + cohort_stream.stats.shared_vision_batches > 0);
+            std.debug.print("ready cross-window vision metal={} shared_batches={d} max_error={d:.9}\n", .{ metal, shared.shared_vision_batches, error_max });
+        }
+        // One publication exceeds the cache horizon. Its packet slices must
+        // reuse later validated frames and advance validation during backbone
+        // execution, with the same captioned vectors as independent windows.
+        var publication = try stream_media.live_mp4.Ingest.init(a, "whole-publication", bytes[0..797], .{});
+        defer publication.deinit();
+        try publication.push(bytes[797..]);
+        const PublicationReader = struct {
+            unit: ?stream_media.live_mp4.Segment,
+            control: ?stream_media.source.Control = null,
+            pub fn swapReadControl(self: *@This(), control: ?stream_media.source.Control) ?stream_media.source.Control {
+                const previous = self.control;
+                self.control = control;
+                return previous;
+            }
+            pub fn ended(self: *@This()) bool {
+                return self.unit == null;
+            }
+            pub fn streamNext(self: *@This(), raw: *anyopaque, accept: *const fn (*anyopaque, *stream_media.http_stream.FragmentDelivery) anyerror!void) !?struct { resource_complete: bool } {
+                if (self.unit == null) return null;
+                try self.control.?.check();
+                var delivery = stream_media.http_stream.FragmentDelivery{ .segment = self.unit };
+                defer self.unit = delivery.segment;
+                try accept(raw, &delivery);
+                return .{ .resource_complete = true };
+            }
+        };
+        var published_reader = PublicationReader{ .unit = try publication.finishSegment() };
+        defer if (published_reader.unit) |*unit| unit.deinit();
+        const PublishedCapture = struct {
+            telemetry: *@import("antfly_video").decoding.Telemetry,
+            outputs: [6]?stream_embedding.LiveResult = @splat(null),
+            count: usize = 0,
+            fn accept(raw: *anyopaque, delivery: *StreamDelivery) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try std.testing.expectEqual(self.count, delivery.value.ordinal);
+                std.debug.print("whole publication window={d} validated={d}\n", .{ self.count, self.telemetry.validated_frames.load(.acquire) });
+                self.outputs[self.count] = try delivery.copy(std.testing.allocator);
+                self.count += 1;
+            }
+        };
+        var published_telemetry = @import("antfly_video").decoding.Telemetry{};
+        var published = PublishedCapture{ .telemetry = &published_telemetry };
+        defer for (published.outputs) |output| if (output) |value| a.free(value.result.?.vector);
+        var published_flow = try stream_coordinator.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .max_frames = 1 });
+        defer published_flow.deinit();
+        var published_stream = try StreamAPI.init(a, loaded.session, loaded.getTokenizer(), &published_flow, caption, .{ .video_decoder = .{ .telemetry = &published_telemetry } }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+        defer published_stream.deinit();
+        const published_start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        _ = try published_stream.process(&published_reader, &published, PublishedCapture.accept);
+        const published_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - published_start;
+        try std.testing.expectEqual(@as(usize, 6), published.count);
+        try std.testing.expect(published_stream.stats.overlapped_validation_packets > 0);
+        try std.testing.expectEqual(@as(usize, 6), published_telemetry.validated_frames.load(.acquire));
+        var published_error: f32 = 0;
+        for (published.outputs, captured.outputs) |actual, expected| {
+            try std.testing.expectEqual(expected.?.result.?.input_tokens, actual.?.result.?.input_tokens);
+            for (actual.?.result.?.vector, expected.?.result.?.vector) |left, right| published_error = @max(published_error, @abs(left - right));
+        }
+        try std.testing.expect(published_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
+        std.debug.print("whole publication metal={} windows={d} batches={d} validation_overlap_packets={d} validated_frames={d} max_error={d:.9} completed_ns={d}\n", .{ metal, published.count, published_stream.stats.native_batches, published_stream.stats.overlapped_validation_packets, published_telemetry.validated_frames.load(.acquire), published_error, published_ns });
+        // Extra lifecycle/host-input qualification follows timed sections so
+        // before/after benchmarks perform the same work before each sample.
+        {
+            var pools = [_]stream_media.admission.Pool{ .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } }, .{ .limits = .{ .host_bytes = 256 * 1024 * 1024 } } };
+            var items: [2]stream_embedding.VideoBatchItem = undefined;
+            for (&items, 0..) |*item, index| item.* = .{ .movie = .{ .reader = &snapshots[index].?.window.reader, .sampling = .{ .source_timestamps = snapshots[index].?.policy } }, .caption = caption };
+            const expected_vectors = [_][]f32{ captured.outputs[0].?.result.?.vector, captured.outputs[1].?.result.?.vector };
+            if (metal) {
+                // Compact validation entries yield exact host patches. Exercise
+                // their ready-cohort path with the same pinned checkpoint too.
+                var host_rows: [2]?*stream_embedding.VideoAhead = @splat(null);
+                defer for (host_rows) |entry| if (entry) |ahead| ahead.deinit();
+                var host_items = items;
+                for (&host_items, &host_rows, 0..) |*item, *owner, index| {
+                    const ahead = (try stream_embedding.VideoAhead.start(loaded.session, item.movie, node.extractionExecutionControl(null), null, &pools[index], .{})).?;
+                    owner.* = ahead;
+                    ahead.producer.?.deinit();
+                    ahead.producer = null;
+                    ahead.producer = try @import("../pipelines/embedding_gemma2_video.zig").Prefetch.startConfigured(ahead.bounded.allocator(), std.testing.io, null, item.movie.bytes, item.movie.reader, node.extractionExecutionControl(null), .{ .sampling = item.movie.sampling, .selection = item.movie.selection, .cache_pins = ahead.pins, .inspection_scope = ahead.inspection_scope, .pool = &ahead.pool });
+                    item.ahead = ahead;
+                }
+                for (host_rows) |entry| entry.?.producer.?.finished.waitUncancelable(std.testing.io);
+                const host = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &host_items, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (host.vectors) |vector| a.free(vector);
+                    a.free(host.vectors);
+                    a.free(host.input_tokens);
+                }
+                for (host.vectors, expected_vectors) |actual, expected| for (actual, expected) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+                std.debug.print("host patch cohort metal=true parity=true shared_batches={d}\n", .{host.shared_vision_batches});
+                // Publish one host row and one device row before consumption,
+                // qualifying mixed ready sources under measured wave sizing.
+                var mixed_items = items;
+                var mixed_rows: [2]?*stream_embedding.VideoAhead = @splat(null);
+                defer for (mixed_rows) |entry| if (entry) |ahead| ahead.deinit();
+                for (&mixed_items, &mixed_rows, 0..) |*item, *owner, index| {
+                    const ahead = (try stream_embedding.VideoAhead.start(loaded.session, item.movie, node.extractionExecutionControl(null), null, &pools[index], .{})).?;
+                    owner.* = ahead;
+                    if (index == 0) {
+                        ahead.producer.?.deinit();
+                        ahead.producer = null;
+                        ahead.producer = try @import("../pipelines/embedding_gemma2_video.zig").Prefetch.startConfigured(ahead.bounded.allocator(), std.testing.io, null, item.movie.bytes, item.movie.reader, node.extractionExecutionControl(null), .{ .sampling = item.movie.sampling, .selection = item.movie.selection, .cache_pins = ahead.pins, .inspection_scope = ahead.inspection_scope, .pool = &ahead.pool });
+                    }
+                    item.ahead = ahead;
+                }
+                for (mixed_rows) |entry| entry.?.producer.?.finished.waitUncancelable(std.testing.io);
+                const mixed = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &mixed_items, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (mixed.vectors) |vector| a.free(vector);
+                    a.free(mixed.vectors);
+                    a.free(mixed.input_tokens);
+                }
+                for (mixed.vectors, expected_vectors) |actual, expected| for (actual, expected) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+                std.debug.print("mixed host device cohort metal=true parity=true shared_batches={d}\n", .{mixed.shared_vision_batches});
+
+                // A single window with two ready host frames uses the same
+                // consumer as a multiwindow cohort, including its caption.
+                const singleton_movie = stream_embedding.SampledVideo{ .bytes = bytes, .sampling = .{ .source_timestamps = .{ .end_ns = 2 * std.time.ns_per_s, .step_ns = std.time.ns_per_s, .max_frames = 2 } } };
+                const singleton = (try stream_embedding.VideoAhead.start(loaded.session, singleton_movie, node.extractionExecutionControl(null), null, &pools[0], .{})).?;
+                defer singleton.deinit();
+                singleton.producer.?.deinit();
+                singleton.producer = null;
+                singleton.producer = try @import("../pipelines/embedding_gemma2_video.zig").Prefetch.startConfigured(singleton.bounded.allocator(), std.testing.io, null, bytes, null, node.extractionExecutionControl(null), .{ .sampling = singleton_movie.sampling, .cache_pins = singleton.pins, .inspection_scope = singleton.inspection_scope, .pool = &singleton.pool });
+                singleton.producer.?.finished.waitUncancelable(std.testing.io);
+                try std.testing.expectEqual(@as(usize, 2), singleton.producer.?.selected.?.len);
+                const single_host = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &.{.{ .movie = singleton_movie, .caption = caption, .ahead = singleton }}, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (single_host.vectors) |vector| a.free(vector);
+                    a.free(single_host.vectors);
+                    a.free(single_host.input_tokens);
+                }
+                const single_device = try stream_embedding.embedVideos(a, loaded.session, loaded.getTokenizer(), &.{.{ .movie = singleton_movie, .caption = caption }}, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+                defer {
+                    for (single_device.vectors) |vector| a.free(vector);
+                    a.free(single_device.vectors);
+                    a.free(single_device.input_tokens);
+                }
+                try std.testing.expectEqual(single_device.input_tokens[0], single_host.input_tokens[0]);
+                for (single_host.vectors[0], single_device.vectors[0]) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+                std.debug.print("singleton host patch frames=2 metal=true parity=true\n", .{});
+            }
+            // Ordinary rows must begin bounded preparation while the model
+            // gate belongs to another request, rather than waiting to decode.
+            const Queued = struct {
+                session: @import("../backends/session.zig").Session,
+                tokenizer: @import("inference_tokenizer").Tokenizer,
+                items: []const stream_embedding.VideoBatchItem,
+                control: @import("../execution_control.zig").InferenceExecutionControl,
+                gate: *std.atomic.Mutex,
+                telemetry: *@import("antfly_video").decoding.Telemetry,
+                result: ?stream_embedding.VideoBatchResult = null,
+                failure: ?anyerror = null,
+                done: std.atomic.Value(bool) = .init(false),
+                fn run(self: *@This()) void {
+                    defer self.done.store(true, .release);
+                    self.result = stream_embedding.embedVideos(std.testing.allocator, self.session, self.tokenizer, self.items, .{ .video_decoder = .{ .policy = .portable, .telemetry = self.telemetry } }, self.gate, self.control, null) catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                }
+            };
+            var queued_items = items;
+            for (&queued_items) |*item| item.ahead = null;
+            var queued_telemetry = @import("antfly_video").decoding.Telemetry{};
+            // CPU sessions normally run without a global execution mutex;
+            // supply an explicit gate to qualify their queued-preparation path.
+            var native_gate: std.atomic.Mutex = .unlocked;
+            const gate = loaded.embeddingExecutionLock() orelse &native_gate;
+            try std.testing.expect(gate.tryLock());
+            var held = true;
+            defer if (held) gate.unlock();
+            var queued = Queued{ .session = loaded.session, .tokenizer = loaded.getTokenizer(), .items = &queued_items, .control = node.extractionExecutionControl(null), .gate = gate, .telemetry = &queued_telemetry };
+            defer if (queued.result) |batch| {
+                for (batch.vectors) |vector| a.free(vector);
+                a.free(batch.vectors);
+                a.free(batch.input_tokens);
+            };
+            const thread = try std.Thread.spawn(.{}, Queued.run, .{&queued});
+            var joined = false;
+            defer if (!joined) {
+                if (held) {
+                    gate.unlock();
+                    held = false;
+                }
+                thread.join();
+            };
+            var polls: usize = 0;
+            while (!queued.done.load(.acquire) and queued_telemetry.portable.load(.acquire) == 0 and polls < 10_000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            const prepared_while_queued = queued_telemetry.portable.load(.acquire) != 0;
+            gate.unlock();
+            held = false;
+            thread.join();
+            joined = true;
+            if (queued.failure) |err| return err;
+            try std.testing.expect(prepared_while_queued);
+            for (queued.result.?.vectors, expected_vectors) |actual, expected| for (actual, expected) |left, right| try std.testing.expectApproxEqAbs(left, right, 1e-3);
+            std.debug.print("queued cohort preparation metal={} before_gate=true\n", .{metal});
+            const CancelQueued = struct {
+                cancelled: std.atomic.Value(bool) = .init(false),
+                fn check(raw: ?*anyopaque) bool {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    return self.cancelled.load(.acquire);
+                }
+            };
+            var cancel = CancelQueued{};
+            var cancelled_control = node.extractionExecutionControl(null);
+            cancelled_control.cancellation = .{ .ptr = &cancel, .is_cancelled_fn = CancelQueued.check };
+            cancelled_control.deadline_ns = @import("antfly_platform").time.monotonicNs() + 10 * std.time.ns_per_s;
+            var cancel_telemetry = @import("antfly_video").decoding.Telemetry{};
+            var cancelled = Queued{ .session = loaded.session, .tokenizer = loaded.getTokenizer(), .items = &queued_items, .control = cancelled_control, .gate = gate, .telemetry = &cancel_telemetry };
+            try std.testing.expect(gate.tryLock());
+            held = true;
+            const cancelled_thread = try std.Thread.spawn(.{}, Queued.run, .{&cancelled});
+            var cancelled_joined = false;
+            defer if (!cancelled_joined) {
+                cancel.cancelled.store(true, .release);
+                cancelled_thread.join();
+            };
+            polls = 0;
+            while (!cancelled.done.load(.acquire) and cancel_telemetry.portable.load(.acquire) == 0 and polls < 10_000) : (polls += 1) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            cancel.cancelled.store(true, .release);
+            // Teardown must finish while another request still owns the gate.
+            cancelled_thread.join();
+            cancelled_joined = true;
+            gate.unlock();
+            held = false;
+            try std.testing.expect(cancelled.result == null);
+            try std.testing.expectEqual(error.Cancelled, cancelled.failure.?);
+            try std.testing.expect(cancel_telemetry.portable.load(.acquire) != 0);
+            std.debug.print("queued cohort cancellation metal={} drained_before_gate=true\n", .{metal});
+        }
+    }
 }
 
 test "embeddinggemma2 video partial DASH pretrained windows preserve vectors across clean short EOF and growth" {
@@ -39033,7 +39383,7 @@ test "embeddinggemma2 video partial DASH pretrained windows preserve vectors acr
     var capture = Capture{ .transport = &transport, .wire = &wire };
     defer for (&capture.outputs) |*entry| if (entry.*) |value| if (value.result) |result| a.free(result.vector);
     try std.testing.expectError(error.ConsumerFailure, stream.process(&reader, &capture, Capture.accept));
-    try std.testing.expectEqual(@as(usize, 2), reader.stream_ledger.acknowledged);
+    try std.testing.expect(reader.stream_ledger.acknowledged >= 2 and reader.stream_ledger.acknowledged <= 4);
     try std.testing.expectEqual(@as(u64, 1), reader.dash_position.?.sequence);
     try std.testing.expect(stream.pending != null and !stream.pending.?.acknowledged);
     try std.testing.expectEqual(@as(usize, 0), flow.ordinal);

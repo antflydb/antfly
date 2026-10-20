@@ -1090,9 +1090,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         else
             try self.context.ensure();
         if (self.remote_content_configured) return;
-        const security_json = try common_config.remoteContentSecurityJsonAlloc(self.alloc, self.remote_content);
-        defer self.alloc.free(security_json);
-        try self.context.configureRemoteContentSecurity(security_json);
+        try self.context.configureRemoteContent(self.remote_content);
         try self.context.configureSecrets(self.secret_store);
         self.remote_content_configured = true;
     }

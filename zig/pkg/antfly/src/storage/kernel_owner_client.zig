@@ -97,6 +97,31 @@ pub const Context = struct {
         try statusToError(abi.antfly_storage_context_configure_native_queries(self.handle, .fromSlice(setup)));
     }
 
+    /// Keep the remote-content publisher live across the compiled owner boundary.
+    pub fn configureRemoteContent(self: *Context, config: ?*const @import("antfly_scraping").RemoteContentConfig) !void {
+        const remote = config orelse return self.configureRemoteContentSecurity("");
+        const Adapter = struct {
+            fn acquire(raw: *anyopaque, out: *abi.OwnedBytes) callconv(.c) abi.Status {
+                const facade: *const @import("antfly_scraping").RemoteContentConfig = @ptrCast(@alignCast(raw));
+                const bytes = @import("antfly_local_sources").common_config.remoteContentSecurityJsonAlloc(std.heap.smp_allocator, facade) catch |err| return switch (err) {
+                    error.OutOfMemory => .out_of_memory,
+                    error.Timeout => .timeout,
+                    error.Canceled => .cancelled,
+                    else => .resource_temporarily_unavailable,
+                };
+                out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+                return .ok;
+            }
+            fn release(_: *anyopaque, bytes: abi.OwnedBytes) callconv(.c) void {
+                std.heap.smp_allocator.free(bytes.slice());
+            }
+        };
+        const services = @import("kernel_runtime_services.zig");
+        const source = services.RemoteContentSource{ .context = @ptrCast(@constCast(remote)), .acquire = Adapter.acquire, .release = Adapter.release };
+        try self.ensure();
+        try statusToError(services.antfly_storage_context_configure_remote_content_source(self.handle, &source));
+    }
+
     pub fn configureRemoteContentSecurity(self: *Context, security_json: []const u8) !void {
         try self.ensure();
         try statusToError(abi.antfly_storage_context_configure_remote_content_security(

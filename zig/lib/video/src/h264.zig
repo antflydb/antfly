@@ -123,6 +123,14 @@ pub const PictureObserver = struct {
     accept: *const fn (*anyopaque, Picture) anyerror!void,
     /// Allocation-free notification before reconstruction owners are released.
     pending: ?*const fn (*anyopaque, PendingPicture) void = null,
+    frames: ?FrameObserver = null,
+};
+/// Synchronous borrowed pixels, emitted only after complete reconstruction and
+/// deblocking. A consumer must copy before returning; failure is not validation.
+pub const FrameObserver = struct {
+    context: *anyopaque,
+    wants: *const fn (*anyopaque, Picture) bool,
+    accept: *const fn (*anyopaque, Picture, *const Frame) void,
 };
 pub const Frame = struct {
     allocator: std.mem.Allocator,
@@ -1359,14 +1367,113 @@ pub const Incremental = struct {
     pub fn decodeSelectedWithConfigurations(self: *Incremental, reader: *media.mp4.Reader, indexes: []const usize, callback_context: *anyopaque, callback: SelectionCallback, configurations: ?@import("h264_dynamic.zig").Context) !Statistics {
         if (!self.valid) return error.UnsupportedIncrementalConfiguration;
         if (indexes.len == 0) return error.InvalidPacketIndex;
+        if (indexes.len > self.options.max_dependency_packets) return error.ResourceLimitExceeded;
+        // Independent colour planes publish only after all three prediction
+        // lanes complete. Preserve their combined span/slot envelope.
+        if (self.cfg.?.separate_planes) {
+            var last: usize = 0;
+            for (indexes) |index| last = @max(last, index);
+            return self.decodeRun(reader, indexes, last, callback_context, callback, configurations);
+        }
+        const a = self.budget.allocator();
+        var order_storage: [64]usize = undefined;
+        const order = if (indexes.len <= order_storage.len) order_storage[0..indexes.len] else try a.alloc(usize, indexes.len);
+        defer if (indexes.len > order_storage.len) a.free(order);
+        for (order, 0..) |*slot, i| slot.* = i;
+        std.mem.sort(usize, order, indexes, struct {
+            fn less(values: []const usize, left: usize, right: usize) bool {
+                return values[left] < values[right];
+            }
+        }.less);
+        var selected_storage: [64]usize = undefined;
+        const selected = if (indexes.len <= selected_storage.len) selected_storage[0..indexes.len] else try a.alloc(usize, indexes.len);
+        defer if (indexes.len > selected_storage.len) a.free(selected);
+        for (order, selected) |slot, *index| {
+            index.* = indexes[slot];
+            if (index.* >= reader.packets.len or index.* < self.cursor()) return error.InvalidPacketIndex;
+        }
+        var delivered_storage: [64]bool = undefined;
+        const delivered = if (indexes.len <= delivered_storage.len) delivered_storage[0..indexes.len] else try a.alloc(bool, indexes.len);
+        defer if (indexes.len > delivered_storage.len) a.free(delivered);
+        @memset(delivered, false);
+        const Forward = struct {
+            slots: []const usize,
+            delivered: []bool,
+            context: *anyopaque,
+            callback: SelectionCallback,
+            fn accept(raw: *anyopaque, slot: usize, frame: *const Frame) !void {
+                const forward: *@This() = @ptrCast(@alignCast(raw));
+                try forward.callback(forward.context, forward.slots[slot], frame);
+                forward.delivered[slot] = true;
+            }
+        };
+        var stats = Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 };
+        const limit = self.options.max_dependency_packets;
+        defer self.options.max_dependency_packets = limit;
+        errdefer self.valid = false;
+        var begin: usize = 0;
+        while (begin < selected.len) {
+            if (delivered[begin]) {
+                begin += 1;
+                continue;
+            }
+            try reader.input.control.check();
+            var end = begin + 1;
+            // Keep nearby requests in one warm run. A large hole or a full
+            // dependency envelope needs its own verified restart, not decoding
+            // all intervening pictures. Pending field/partition assembly is
+            // retained and checked by decodeRun before any reset.
+            while (end < selected.len and selected[end] - selected[end - 1] <= 32 and selected[end] - selected[begin] < @max(1, limit / 2)) : (end += 1) {}
+            if (stats.decoded_packets >= limit) return error.ResourceLimitExceeded;
+            self.options.max_dependency_packets = limit - stats.decoded_packets;
+            // Assembly may extend beyond this run (for example a PAFF mate
+            // after unrelated pictures). Keep every remaining selection visible
+            // so those pictures are delivered once during the same traversal.
+            var forward = Forward{ .slots = order[begin..], .delivered = delivered[begin..], .context = callback_context, .callback = callback };
+            const part = try self.decodeRun(reader, selected[begin..], selected[end - 1], &forward, Forward.accept, configurations);
+            stats.decoded_packets = try std.math.add(usize, stats.decoded_packets, part.decoded_packets);
+            stats.payload_bytes = try std.math.add(u64, stats.payload_bytes, part.payload_bytes);
+            stats.decode_high_water = @max(stats.decode_high_water, part.decode_high_water);
+            begin = end;
+        }
+        return stats;
+    }
+    fn decodeRun(self: *Incremental, reader: *media.mp4.Reader, indexes: []const usize, run_last: usize, callback_context: *anyopaque, callback: SelectionCallback, configurations: ?@import("h264_dynamic.zig").Context) !Statistics {
+        if (!self.valid) return error.UnsupportedIncrementalConfiguration;
+        if (indexes.len == 0) return error.InvalidPacketIndex;
         var first = reader.packets.len;
-        var last: usize = 0;
+        const last = run_last;
         for (indexes) |index| {
             if (index >= reader.packets.len or index < self.cursor()) return error.InvalidPacketIndex;
             first = @min(first, index);
-            last = @max(last, index);
         }
         errdefer self.valid = false;
+        // A warm DPB is useful only while it is cheaper than an independently
+        // verified restart. Never discard an unfinished field/partition pair.
+        if (!self.hasPending() and (first > self.cursor() +| 32 or last - self.cursor() >= self.options.max_dependency_packets)) {
+            var restart = first;
+            var probes: usize = 0;
+            while (restart > self.cursor() and probes < self.options.max_dependency_packets) : (restart -= 1) {
+                probes += 1;
+                if (!reader.packets[restart].sync and configurations == null) continue;
+                var lease = try reader.readPacket(restart);
+                defer lease.deinit();
+                if (lease.bytes.len > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
+                const probe_cfg = if (configurations) |epoch_context| try epoch_context.session.configAt(epoch_context.base + restart) else self.cfg.?;
+                if (!try isDependencyReset(self.budget.allocator(), probe_cfg, lease.bytes, reader.track.nal_length_bytes, reader.input)) continue;
+                // Apply a hysteresis of 32 packets to avoid resetting for tiny
+                // savings. Dependency-limit recovery takes priority over it.
+                if (restart - self.cursor() > 32 or last - self.cursor() >= self.options.max_dependency_packets) {
+                    switch (self.lanes) {
+                        inline else => |*lanes| for (lanes) |*lane| {
+                            lane.deinit(self.budget.allocator());
+                            lane.* = .{};
+                        },
+                    }
+                }
+                break;
+            }
+        }
         switch (self.lanes) {
             inline else => |*lanes| for (lanes[0..if (self.cfg.?.separate_planes) @as(usize, 3) else 1]) |*lane| for (&lane.workspaces) |*slot| if (slot.*) |*workspace| {
                 workspace.selected = try self.budget.allocator().realloc(workspace.selected, indexes.len);
@@ -1491,6 +1598,7 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
     var temporary = Continuation(Sample){};
     const live = retained orelse &temporary;
     const metadata_only = retained != null and indexes.len == 0;
+    var frame_observer = if (options.picture_observer) |observer| observer.frames else null;
     const allocator = budget.allocator();
     var output_packet = reader.packets[index];
     if (cfg.width != reader.track.width or cfg.height != reader.track.height) return error.UnsupportedDynamicGeometry;
@@ -1506,7 +1614,8 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
         if (reader.packets[start].sync or configurations != null) {
             var probe = try reader.readPacket(start);
             defer probe.deinit();
-            if (try isDependencyReset(allocator, cfg, probe.bytes, reader.track.nal_length_bytes, reader.input)) break;
+            const probe_cfg = if (configurations) |epoch_context| try epoch_context.session.configAt(epoch_context.base + start) else cfg;
+            if (try isDependencyReset(allocator, probe_cfg, probe.bytes, reader.track.nal_length_bytes, reader.input)) break;
         }
         if (start == 0) return error.MissingVideoReference;
         start -= 1;
@@ -1571,7 +1680,7 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
     if (workspaces[0] == null) workspaces[0] = try Workspace.init(allocator, coded_pixels, if (cfg.chroma_format == 0) 0 else sub_x * sub_y, group_size, indexes.len);
     if (!live.initialized) live.references.chroma_format = cfg.chroma_format;
     const references = &live.references;
-    const output = try allocator.alloc(u8, output_size);
+    var output = try allocator.alloc(u8, output_size);
     errdefer allocator.free(output);
     var decoded_packets: usize = 0;
     var field_macroblocks: usize = 0;
@@ -1756,17 +1865,30 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
             }
             for (workspace.metadata) |m| field_macroblocks += @intFromBool(m.field);
             const selected = workspace.wanted();
-            if (options.picture_observer) |observer| {
-                const pts = workspace.pts.?;
-                const duration = std.math.cast(u32, std.math.sub(i64, workspace.end, pts) catch return error.TimestampOverflow) orelse return error.TimestampOverflow;
-                try observer.accept(observer.context, .{ .first_packet = workspace.first_packet + (if (configurations) |epoch_context| epoch_context.base else 0), .last_packet = partition_span.last + (if (configurations) |epoch_context| epoch_context.base else 0), .pts = pts, .duration = duration, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .bit_depth = cfg.bit_depth, .chroma_format = cfg.chroma_format, .independent_plane = if (cfg.separate_planes) cfg.selected_plane else null });
+            const picture = Picture{ .first_packet = workspace.first_packet + (if (configurations) |epoch_context| epoch_context.base else 0), .last_packet = partition_span.last + (if (configurations) |epoch_context| epoch_context.base else 0), .pts = workspace.pts.?, .duration = std.math.cast(u32, std.math.sub(i64, workspace.end, workspace.pts.?) catch return error.TimestampOverflow) orelse return error.TimestampOverflow, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .bit_depth = cfg.bit_depth, .chroma_format = cfg.chroma_format, .independent_plane = if (cfg.separate_planes) cfg.selected_plane else null };
+            if (options.picture_observer) |observer| try observer.accept(observer.context, picture);
+            var capture_frame = if (frame_observer) |observer| observer.wants(observer.context, picture) else false;
+            if (capture_frame and metadata_only) capture: {
+                const bytes = (cfg.width * cfg.height + (if (cfg.chroma_format == 0) @as(usize, 0) else 2 * (cfg.width / sub_x) * (cfg.height / sub_y))) * @sizeOf(Sample);
+                if (output.len >= bytes) break :capture;
+                reservation.resize(.{ .host_bytes = bytes }) catch {
+                    capture_frame = false;
+                    frame_observer = null;
+                    break :capture;
+                };
+                output = allocator.realloc(output, bytes) catch {
+                    reservation.resize(.{ .host_bytes = output.len }) catch {};
+                    capture_frame = false;
+                    frame_observer = null;
+                    break :capture;
+                };
             }
-            if (selected) {
-                output_packet.pts = workspace.pts.?;
-                output_packet.duration = std.math.cast(u32, std.math.sub(i64, workspace.end, output_packet.pts) catch return error.TimestampOverflow) orelse return error.TimestampOverflow;
+            if (selected or capture_frame) {
+                output_packet.pts = picture.pts;
+                output_packet.duration = picture.duration;
             }
             const planes = [3][]Sample{ workspace.planar[0..coded_pixels], workspace.planar[coded_pixels..][0..chroma_pixels], workspace.planar[coded_pixels + chroma_pixels ..] };
-            if (selected) {
+            if (selected or capture_frame) {
                 for (0..cfg.height) |y| {
                     try reader.input.control.check();
                     const source_start = (y + cfg.top) * cfg.coded_width + cfg.left;
@@ -1780,12 +1902,16 @@ fn decodeConfiguredState(comptime Sample: type, initial_cfg: Config, config_rese
                     const target_start = (cfg.width * cfg.height + y * width * 2) * @sizeOf(Sample);
                     @import("h264_pixels.zig").interleave(Sample, output[target_start..][0 .. width * 2 * @sizeOf(Sample)], planes[1][source_start..][0..width], planes[2][source_start..][0..width]);
                 }
-                if (callback) |publish| {
+                {
                     const picture_bytes = (cfg.width * cfg.height + (if (cfg.chroma_format == 0) @as(usize, 0) else 2 * (cfg.width / sub_x) * (cfg.height / sub_y))) * @sizeOf(Sample);
                     const metadata_frame = Frame{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .allocator = budget.backing, .nv12 = output[0..picture_bytes], .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .color = cfg.color, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
-                    for (workspace.selected, 0..) |wanted, request_slot| if (wanted) {
+                    if (callback) |publish| for (workspace.selected, 0..) |wanted, request_slot| if (wanted) {
                         try publish(callback_context.?, request_slot, &metadata_frame);
                     };
+                    if (capture_frame) {
+                        const observer = frame_observer.?;
+                        observer.accept(observer.context, picture, &metadata_frame);
+                    }
                 }
             }
             workspace.active = false;

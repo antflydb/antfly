@@ -6270,7 +6270,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => null,
                 }
             else
@@ -6919,7 +6919,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => null,
                 }
             else
@@ -8317,7 +8317,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !?[]u8 {
             if (request.source_template.len > 0) {
                 const rendered = renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => return null,
                 };
                 errdefer alloc.free(rendered);
@@ -8839,7 +8839,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const source_text = if (request.source_template.len > 0)
                 renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-                    error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                    error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                     else => null,
                 }
             else
@@ -11481,7 +11481,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !?[]template_mod.ContentPart {
             if (request.source_template.len == 0) return null;
             const parts = renderSourceTemplateParts(alloc, db, request.source_template, doc_value, max_media_parts) catch |err| switch (err) {
-                error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                 else => return null,
             };
             if (parts.len == 0) {
@@ -12403,7 +12403,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
                 if (entry.source_template.len > 0) {
                     const rendered = renderSourceTemplateText(S.ownerField(db, "alloc").*, db, entry.source_template, doc_value) catch |err| switch (err) {
-                        error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                        error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                         else => continue,
                     };
                     defer S.ownerField(db, "alloc").*.free(rendered);
@@ -12433,7 +12433,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
                 if (request.source_template.len > 0) {
                     const rendered = renderSourceTemplateText(alloc, db, request.source_template, (try document.logicalJson()).?) catch |err| switch (err) {
-                        error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+                        error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                         else => continue,
                     };
                     defer alloc.free(rendered);

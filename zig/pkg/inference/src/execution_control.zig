@@ -605,12 +605,14 @@ test "execution control checkpoint replacement preserves carrier and resets fore
     try std.testing.expectEqual(original.cancellation_grace_ns, rebound.cancellation_grace_ns);
 }
 
-/// FIFO admission to one model's transient working set. Waiting requests own
-/// no workspace reservation. Stack-owned waiters are removed on cancellation,
+/// Fair admission to one model's transient working set. Interactive work may
+/// bypass bulk work, with a bounded burst so indexing continues under load.
+/// Waiting requests own no workspace reservation. Stack-owned waiters are removed on cancellation,
 /// so a timed-out request cannot leave a ticket hole or block later work.
 pub const ExecutionLane = struct {
     const Waiter = struct {
         next: ?*Waiter = null,
+        interactive: bool = false,
         ready: std.Io.Event = .unset,
         io: ?std.Io = null,
     };
@@ -618,6 +620,7 @@ pub const ExecutionLane = struct {
     head: ?*Waiter = null,
     tail: ?*Waiter = null,
     owned: bool = false,
+    interactive_burst: usize = 0,
 
     pub const Lease = struct {
         lane: *ExecutionLane,
@@ -634,8 +637,21 @@ pub const ExecutionLane = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
+    fn selected(self: *ExecutionLane) ?*Waiter {
+        var interactive: ?*Waiter = null;
+        var background: ?*Waiter = null;
+        var current = self.head;
+        while (current) |waiter| : (current = waiter.next) {
+            if (waiter.interactive) {
+                if (interactive == null) interactive = waiter;
+            } else if (background == null) background = waiter;
+        }
+        if (self.interactive_burst >= 8 and background != null) return background;
+        return interactive orelse background;
+    }
+
     fn wakeHead(self: *ExecutionLane) void {
-        if (!self.owned) if (self.head) |head| if (head.io) |io| head.ready.set(io);
+        if (!self.owned) if (self.selected()) |head| if (head.io) |io| head.ready.set(io);
     }
 
     fn remove(self: *ExecutionLane, waiter: *Waiter) void {
@@ -653,8 +669,12 @@ pub const ExecutionLane = struct {
     }
 
     pub fn acquire(self: *ExecutionLane, control: InferenceExecutionControl) !Lease {
+        return self.acquireWithPriority(control, false);
+    }
+
+    pub fn acquireWithPriority(self: *ExecutionLane, control: InferenceExecutionControl, interactive: bool) !Lease {
         try control.check();
-        var waiter = Waiter{ .io = control.io };
+        var waiter = Waiter{ .io = control.io, .interactive = interactive };
         self.lock();
         if (self.tail) |tail| tail.next = &waiter else self.head = &waiter;
         self.tail = &waiter;
@@ -668,12 +688,16 @@ pub const ExecutionLane = struct {
         while (true) {
             try control.check();
             self.lock();
-            if (!self.owned and self.head == &waiter) {
+            if (!self.owned and self.selected() == &waiter) {
                 self.remove(&waiter);
                 self.owned = true;
+                self.interactive_burst = if (interactive) self.interactive_burst +| 1 else 0;
                 self.mutex.unlock();
                 return .{ .lane = self };
             }
+            // A newly queued query can supersede a signaled bulk waiter. Reset
+            // under the lane lock so that waiter sleeps without losing a wake.
+            waiter.ready.reset();
             self.mutex.unlock();
             if (control.io) |io| {
                 // Release signals the next waiter immediately. The bounded
@@ -749,4 +773,60 @@ test "execution lane gives queued batches FIFO ownership" {
     released = true;
     try std.testing.expectEqual(@as(usize, 0), try first.await(std.testing.io));
     try std.testing.expectEqual(@as(usize, 1), try second.await(std.testing.io));
+}
+
+test "execution lane prioritizes queries with bounded background fairness" {
+    var lane = ExecutionLane{};
+    var bulk: ExecutionLane.Waiter = .{};
+    var first: ExecutionLane.Waiter = .{ .interactive = true };
+    var second: ExecutionLane.Waiter = .{ .interactive = true };
+    lane.head = &bulk;
+    lane.tail = &second;
+    bulk.next = &first;
+    first.next = &second;
+    try std.testing.expectEqual(&first, lane.selected().?);
+    lane.remove(&first);
+    try std.testing.expectEqual(&second, lane.selected().?);
+    lane.interactive_burst = 8;
+    try std.testing.expectEqual(&bulk, lane.selected().?);
+    lane.remove(&bulk);
+    try std.testing.expectEqual(&second, lane.selected().?);
+}
+
+test "execution lane wakes a query ahead of queued enrichment" {
+    const Worker = struct {
+        fn run(lane: *ExecutionLane, order: *std.atomic.Value(usize), interactive: bool) !usize {
+            const lease = try lane.acquireWithPriority(.{ .io = std.testing.io }, interactive);
+            defer lease.release();
+            return order.fetchAdd(1, .seq_cst);
+        }
+        fn queued(lane: *ExecutionLane, count: usize) !void {
+            const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (true) {
+                lane.lock();
+                var length: usize = 0;
+                var current = lane.head;
+                while (current) |item| : (current = item.next) length += 1;
+                lane.mutex.unlock();
+                if (length == count) return;
+                if (platform_time.monotonicNs() >= deadline) return error.Timeout;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    var lane = ExecutionLane{};
+    var order = std.atomic.Value(usize).init(0);
+    const held = try lane.acquire(.{});
+    var released = false;
+    defer if (!released) held.release();
+    var bulk = try std.testing.io.concurrent(Worker.run, .{ &lane, &order, false });
+    defer _ = bulk.cancel(std.testing.io) catch 0;
+    try Worker.queued(&lane, 1);
+    var query = try std.testing.io.concurrent(Worker.run, .{ &lane, &order, true });
+    defer _ = query.cancel(std.testing.io) catch 0;
+    try Worker.queued(&lane, 2);
+    held.release();
+    released = true;
+    try std.testing.expectEqual(@as(usize, 0), try query.await(std.testing.io));
+    try std.testing.expectEqual(@as(usize, 1), try bulk.await(std.testing.io));
 }

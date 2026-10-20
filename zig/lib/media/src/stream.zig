@@ -33,6 +33,10 @@ pub const Options = struct {
 };
 pub const Snapshot = struct {
     input: source.Source,
+    references: std.atomic.Value(usize) = .init(1),
+    /// Segment ownership may move its identity here before releasing its ref.
+    owned_identity: ?[]u8 = null,
+    identity_reservation: admission.Token = .{},
     bytes: []u8,
     reservation: admission.Token,
     /// Spools retain capacity so finalization never copies the complete input.
@@ -65,11 +69,19 @@ pub const Snapshot = struct {
         self.* = .{ .bytes = bytes, .reservation = reservation, .input = .{ .allocator = allocator, .identity = identity, .storage = .{ .borrowed = bytes }, .limits = options.source_limits, .control = options.control, .admission_pool = options.admission_pool } };
         return self;
     }
-    /// All readers and leases must be released before the backing snapshot.
+    /// Published bytes are immutable. Each independent consumer retains one owner.
+    pub fn retain(self: *Snapshot) void {
+        const previous = self.references.fetchAdd(1, .monotonic);
+        std.debug.assert(previous != 0 and previous != std.math.maxInt(usize));
+    }
+    /// Each consumer releases its leases before releasing its snapshot reference.
     pub fn deinit(self: *Snapshot) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
         std.debug.assert(self.input.retained_bytes == 0);
         const allocator = self.input.allocator;
         allocator.free(self.backing orelse self.bytes);
+        if (self.owned_identity) |identity| allocator.free(identity);
+        self.identity_reservation.deinit();
         self.reservation.deinit();
         allocator.destroy(self);
     }

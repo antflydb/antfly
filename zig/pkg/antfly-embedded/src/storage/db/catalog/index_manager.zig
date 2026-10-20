@@ -3906,7 +3906,8 @@ pub const IndexManager = struct {
     }
 
     fn denseVectorArtifactScopeHashAt(entry: *const DenseIndex, index: usize) u64 {
-        return internal_keys.embeddingArtifactScopeHashForName(denseVectorArtifactNameAt(entry, index));
+        const scope: vector_block_store_mod.ArtifactScope = .{ .name_hash = internal_keys.embeddingArtifactScopeHashForName(denseVectorArtifactNameAt(entry, index)), .dimensions = entry.dims };
+        return scope.coverageHash();
     }
 
     /// Resolve HBC member metadata to the authoritative exact-vector artifact
@@ -3998,6 +3999,26 @@ pub const IndexManager = struct {
         return try self.alloc.realloc(hashes, unique_count);
     }
 
+    fn vectorBlockArtifactScopesAlloc(self: *const IndexManager) ![]vector_block_store_mod.ArtifactScope {
+        var scopes = std.ArrayListUnmanaged(vector_block_store_mod.ArtifactScope).empty;
+        errdefer scopes.deinit(self.alloc);
+        for (self.dense_indexes.items) |*entry| {
+            for (0..denseVectorArtifactNameCount(entry)) |index| try scopes.append(self.alloc, .{
+                .name_hash = internal_keys.embeddingArtifactScopeHashForName(denseVectorArtifactNameAt(entry, index)),
+                .dimensions = entry.dims,
+            });
+        }
+        std.mem.sortUnstable(vector_block_store_mod.ArtifactScope, scopes.items, {}, vector_block_store_mod.ArtifactScope.lessThan);
+        var unique: usize = 0;
+        for (scopes.items) |scope| {
+            if (unique != 0 and scopes.items[unique - 1].coverageHash() == scope.coverageHash()) continue;
+            scopes.items[unique] = scope;
+            unique += 1;
+        }
+        scopes.items.len = unique;
+        return scopes.toOwnedSlice(self.alloc);
+    }
+
     /// Establishes the exact-vector transaction base for a fresh unpublished
     /// dense index. The common first-index path publishes only CURRENT and an
     /// empty WAL. When a table-wide generation already exists, this performs a
@@ -4065,9 +4086,11 @@ pub const IndexManager = struct {
         var writer = try vector_block_store_mod.Store.open(self.alloc, storage, root);
         defer writer.deinit();
         if (writer.manifest == null) {
+            const artifact_scopes = try self.vectorBlockArtifactScopesAlloc();
+            defer self.alloc.free(artifact_scopes);
             try writer.publishEmptyBase(1, snapshot_sequence, .{
                 .encoding = self.vectorBlockStorageEncoding(),
-                .artifact_scope_hashes = scope_hashes,
+                .artifact_scopes = artifact_scopes,
             });
         } else {
             if (writer.covered_source_sequence != snapshot_sequence) return false;
@@ -5018,11 +5041,11 @@ pub const IndexManager = struct {
             "shared vector-block primary snapshot build started index={s} generation={} sequence={} vectors={}",
             .{ entry.config.name, generation, applied_sequence, entry.index.stats().active_count },
         );
-        const artifact_scope_hashes = try self.vectorBlockArtifactScopeHashesAlloc();
-        defer self.alloc.free(artifact_scope_hashes);
+        const artifact_scopes = try self.vectorBlockArtifactScopesAlloc();
+        defer self.alloc.free(artifact_scopes);
         var build = store.stageBaseFromArtifactsTxn(primary, &source_txn, generation, applied_sequence, .{
             .encoding = self.vectorBlockStorageEncoding(),
-            .artifact_scope_hashes = artifact_scope_hashes,
+            .artifact_scopes = artifact_scopes,
         }) catch |err| {
             if (err == error.OutOfMemory and budgeted_alloc != null and budgeted_alloc.?.denied())
                 return error.ResourceBudgetExceeded;

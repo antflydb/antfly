@@ -24,7 +24,8 @@ const Device = if (enabled) @import("../backends/metal_tensor.zig").MetalTensor 
 pub const Key = struct { clip: [32]u8, picture: usize };
 pub const Stats = struct { hits: usize = 0, stored: usize = 0, evicted: usize = 0, denied: usize = 0, unsupported: usize = 0 };
 const Value = union(enum) { cpu: []f32, device: Device };
-const Entry = struct { value: Value, tokens: usize, bytes: usize, permit: Permit };
+const Entry = struct { value: Value, tokens: usize, bytes: usize, permit: ?Permit = null, allocation: ?usize = null };
+const Allocation = struct { handle: ?*anyopaque = null, references: usize = 0, bytes: usize = 0, permit: ?Permit = null };
 const Slot = struct { key: Key = undefined, age: u64 = 0, entry: ?Entry = null, borrowed: bool = false };
 /// A ticket moves ownership without touching Metal's confined buffer refcount.
 /// Producers may borrow entries; only the model consumer imports device tensors.
@@ -79,6 +80,9 @@ pub const Cache = struct {
     limit: usize = 64 * 1024 * 1024,
     bytes: usize = 0,
     slots: [128]Slot = @splat(.{}),
+    // Shared frame views charge their physical owner exactly once. Borrowed
+    // tickets keep their reference until restored and eventually evicted.
+    allocations: [128]Allocation = @splat(.{}),
     clock: u64 = 0,
     mutex: std.atomic.Mutex = .unlocked,
     stats: Stats = .{},
@@ -115,8 +119,19 @@ pub const Cache = struct {
             .cpu => |values| self.allocator.free(values),
             .device => |*value| if (comptime enabled) value.deinit(),
         }
-        entry.permit.deinit();
+        if (entry.permit) |*permit| permit.deinit();
+        if (entry.allocation) |index| self.releaseAllocation(index);
         self.bytes -= entry.bytes;
+    }
+    fn releaseAllocation(self: *Cache, index: usize) void {
+        const allocation = &self.allocations[index];
+        std.debug.assert(allocation.references != 0);
+        allocation.references -= 1;
+        if (allocation.references == 0) {
+            allocation.permit.?.deinit();
+            self.bytes -= allocation.bytes;
+            allocation.* = .{};
+        }
     }
     pub fn deinit(self: *Cache) void {
         defer {
@@ -192,18 +207,39 @@ pub const Cache = struct {
             self.stats.unsupported += 1;
             return;
         }
-        const bytes = retained.retainedAllocationBytes();
+        const handle = retained.deviceHandle() orelse {
+            retained.deinit();
+            self.stats.unsupported += 1;
+            return;
+        };
+        var shared: ?usize = null;
+        for (self.allocations, 0..) |allocation, index| if (allocation.references != 0 and allocation.handle == handle and allocation.bytes == retained.retainedAllocationBytes()) {
+            shared = index;
+            break;
+        };
+        // Protect a shared owner while reserve may evict its last other view.
+        if (shared) |index| self.allocations[index].references += 1;
+        const bytes = if (shared == null) retained.retainedAllocationBytes() else 0;
         const slot = self.reserve(key, bytes) orelse {
+            if (shared) |index| self.releaseAllocation(index);
             retained.deinit();
             return;
         };
-        const permit = self.session.admitRetainedMedia(0, bytes) catch {
-            retained.deinit();
-            self.stats.denied += 1;
-            return;
-        };
-        self.slots[slot] = .{ .key = key, .entry = .{ .value = .{ .device = retained }, .tokens = tokens, .bytes = bytes, .permit = permit } };
-        self.bytes += bytes;
+        if (shared == null) {
+            const permit = self.session.admitRetainedMedia(0, bytes) catch {
+                retained.deinit();
+                self.stats.denied += 1;
+                return;
+            };
+            for (&self.allocations, 0..) |*allocation, index| if (allocation.references == 0) {
+                allocation.* = .{ .handle = handle, .references = 1, .bytes = bytes, .permit = permit };
+                shared = index;
+                break;
+            };
+            std.debug.assert(shared != null);
+            self.bytes += bytes;
+        }
+        self.slots[slot] = .{ .key = key, .entry = .{ .value = .{ .device = retained }, .tokens = tokens, .bytes = 0, .allocation = shared } };
         self.touch(slot);
         self.stats.stored += 1;
     }
@@ -330,7 +366,7 @@ test "embeddinggemma2 Metal video cache survives compute wrappers without interm
         if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
         const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&values, &.{ 2, 512 }));
         defer cb.free(input);
-        const view = try cb.primSlice(input, &.{ 1, 0 }, &.{ 2, 512 }, &.{ 1, 1 }, &.{ 2, 512 });
+        const view = try cb.sliceRows2D(a, input, 1, 1, 512);
         defer cb.free(view);
         const before = cb.debugTimingSnapshot().provider.metal_tensor_host_mirror_download_bytes;
         cache.storeDevice(key, view, 1);
@@ -340,6 +376,22 @@ test "embeddinggemma2 Metal video cache survives compute wrappers without interm
         var owned = retained;
         defer owned.deinit();
         try std.testing.expectEqual(owned.retainedAllocationBytes(), controller.snapshot().backend_scratch_bytes);
+        const sibling = try cb.sliceRows2D(a, input, 0, 1, 512);
+        defer cb.free(sibling);
+        cache.storeDevice(.{ .clip = key.clip, .picture = 2 }, sibling, 1);
+        try std.testing.expectEqual(@as(usize, 2), cache.stats.stored);
+        try std.testing.expectEqual(owned.retainedAllocationBytes(), cache.bytes);
+        try std.testing.expectEqual(owned.retainedAllocationBytes(), controller.snapshot().backend_scratch_bytes);
+        const pinned = cache.take(key).?;
+        // One pinned frame keeps the entire allocation admitted even after
+        // all unborrowed siblings are evicted under a zero-byte cache limit.
+        cache.limit = 0;
+        cache.storeDevice(.{ .clip = key.clip, .picture = 3 }, sibling, 1);
+        try std.testing.expectEqual(@as(usize, 1), cache.stats.evicted);
+        try std.testing.expect(cache.take(.{ .clip = key.clip, .picture = 2 }) == null);
+        try std.testing.expectEqual(owned.retainedAllocationBytes(), controller.snapshot().backend_scratch_bytes);
+        cache.restore(pinned);
+        cache.limit = 64 * 1024 * 1024;
     }
     try std.testing.expect(controller.snapshot().backend_scratch_bytes > 0);
     try std.testing.expectEqual(@as(usize, 1), probe.arms);

@@ -361,6 +361,7 @@ pub const EmbeddingPipeline = struct {
     execution_gate_held: bool = false,
     execution_lane: ?*@import("../execution_control.zig").ExecutionLane = null,
     execution_lane_held: bool = false,
+    interactive: bool = false,
     trace: ?*embedding_trace.Trace = null,
     /// Request lifetime propagated from ingress through model execution.
     execution_control: ?InferenceExecutionControl = null,
@@ -408,6 +409,35 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of texts, returning [batch_size][hidden_dim] embeddings.
     /// Caller owns the returned slices and must free them with the allocator.
     pub fn embed(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
+        // Release the model lane between bounded cohorts. A backlog must not
+        // own the entire model working set for one arbitrarily large call.
+        if (self.execution_lane != null and !self.execution_lane_held and texts.len > 4) {
+            if (self.execution_control) |control| try control.check();
+            // Earlier cohorts retain their results while later cohorts run.
+            // Keep that output storage admitted for the complete request.
+            const row_bytes = try std.math.add(usize, @sizeOf([]f32), try std.math.mul(usize, self.config.embedding_gemma2_dimensions, @sizeOf(f32)));
+            var retained = try self.session.admitHostPreprocess(try std.math.mul(usize, texts.len, row_bytes));
+            defer retained.deinit();
+            const output = try self.allocator.alloc([]f32, texts.len);
+            errdefer self.allocator.free(output);
+            var completed: usize = 0;
+            var tokens: usize = 0;
+            errdefer for (output[0..completed]) |row| self.allocator.free(row);
+            while (completed < texts.len) {
+                const count = @min(@as(usize, 4), texts.len - completed);
+                const rows = try self.embedCohort(texts[completed..][0..count]);
+                @memcpy(output[completed..][0..count], rows);
+                self.allocator.free(rows);
+                tokens +|= self.last_input_tokens;
+                completed += count;
+            }
+            self.last_input_tokens = tokens;
+            return output;
+        }
+        return self.embedCohort(texts);
+    }
+
+    fn embedCohort(self: *EmbeddingPipeline, texts: []const []const u8) ![][]f32 {
         const lane = try self.enterExecutionLane();
         defer self.leaveExecutionLane(lane);
         self.last_input_tokens = 0;
@@ -552,10 +582,10 @@ pub const EmbeddingPipeline = struct {
                 text_only = false;
             };
         }
-        const lane = try self.enterExecutionLane();
-        defer self.leaveExecutionLane(lane);
-        self.last_input_tokens = 0;
-        if (inputs.len == 0) return self.allocator.alloc([]f32, 0);
+        if (inputs.len == 0) {
+            self.last_input_tokens = 0;
+            return self.allocator.alloc([]f32, 0);
+        }
         if (text_only) {
             const texts = try self.allocator.alloc([]const u8, inputs.len);
             defer self.allocator.free(texts);
@@ -570,6 +600,9 @@ pub const EmbeddingPipeline = struct {
             }
             return self.embed(texts);
         }
+        const lane = try self.enterExecutionLane();
+        defer self.leaveExecutionLane(lane);
+        self.last_input_tokens = 0;
         const embeddings = try self.allocator.alloc([]f32, inputs.len);
         errdefer self.allocator.free(embeddings);
         var filled: usize = 0;
@@ -2428,7 +2461,7 @@ pub const EmbeddingPipeline = struct {
     fn enterExecutionLane(self: *EmbeddingPipeline) !?@import("../execution_control.zig").ExecutionLane.Lease {
         if (self.execution_lane_held) return null;
         const lane = self.execution_lane orelse return null;
-        const lease = try lane.acquire(self.execution_control orelse .{});
+        const lease = try lane.acquireWithPriority(self.execution_control orelse .{}, self.interactive);
         self.execution_lane_held = true;
         return lease;
     }
@@ -4912,4 +4945,100 @@ test "embedding workspace admission happens only after execution ownership" {
     try std.testing.expect(probe.called and probe.gate_owned);
     try std.testing.expect(gate.tryLock());
     gate.unlock();
+}
+
+test "embedding cohorts let a query run before the bulk call finishes" {
+    const Lane = @import("../execution_control.zig").ExecutionLane;
+    const Probe = struct {
+        lane: *Lane,
+        started: std.Io.Event = .unset,
+        batches: [4]usize = @splat(0),
+        runs: usize = 0,
+
+        fn encode(_: *anyopaque, alloc: std.mem.Allocator, text: []const u8, max_len: usize) !EncodeResult {
+            const ids = try alloc.alloc(i32, max_len);
+            errdefer alloc.free(ids);
+            const mask = try alloc.alloc(i32, max_len);
+            @memset(ids, 0);
+            @memset(mask, 0);
+            ids[0] = @intCast(text.len);
+            mask[0] = 1;
+            return .{ .ids = ids, .attention_mask = mask, .allocator = alloc };
+        }
+        fn special(_: *anyopaque) tokenizer_mod.SpecialTokens {
+            return .{};
+        }
+        fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{
+                .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+                .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },
+            };
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "sentence_embedding", .dtype = .f32, .shape = &.{ -1, 2 } }};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn run(raw: *anyopaque, inputs: []const Tensor, alloc: std.mem.Allocator) ![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const batch: usize = @intCast(inputs[0].shape[0]);
+            self.batches[self.runs] = batch;
+            self.runs += 1;
+            if (self.runs == 1) {
+                self.started.set(std.testing.io);
+                const until = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+                while (true) {
+                    platform.sync.lockYielding(&self.lane.mutex);
+                    const queued = self.lane.head != null;
+                    self.lane.mutex.unlock();
+                    if (queued) break;
+                    if (platform.time.monotonicNs() >= until) return error.Timeout;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                }
+            }
+            const seq: usize = @intCast(inputs[0].shape[1]);
+            const values = try alloc.alloc(f32, batch * 2);
+            defer alloc.free(values);
+            for (0..batch) |i| {
+                values[i * 2] = @floatFromInt(inputs[0].asInt64()[i * seq]);
+                values[i * 2 + 1] = 1;
+            }
+            const outputs = try alloc.alloc(Tensor, 1);
+            errdefer alloc.free(outputs);
+            outputs[0] = try Tensor.initFloat32(alloc, "sentence_embedding", &.{ @intCast(batch), 2 }, values);
+            return outputs;
+        }
+        fn runControlled(raw: *anyopaque, inputs: []const Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]Tensor {
+            try control.check();
+            return run(raw, inputs, alloc);
+        }
+        fn query(probe: *@This(), base: EmbeddingPipeline) !void {
+            try probe.started.wait(std.testing.io);
+            var pipeline = base;
+            pipeline.interactive = true;
+            const rows = try pipeline.embed(&.{"query"});
+            defer freeEmbeddingSlices(std.testing.allocator, rows);
+            try std.testing.expectEqual(@as(f32, 5), rows[0][0]);
+        }
+    };
+    var lane = Lane{};
+    var probe = Probe{ .lane = &lane };
+    var pipeline = EmbeddingPipeline{
+        .allocator = std.testing.allocator,
+        .session = .{ .ptr = &probe, .vtable = &.{ .run = Probe.run, .runWithControl = Probe.runControlled, .inputInfo = Probe.inputInfo, .outputInfo = Probe.outputInfo, .backend = Probe.backend, .close = Probe.close } },
+        .tok = .{ .ptr = &probe, .vtable = &.{ .encode = undefined, .encodeInto = undefined, .encodeForModel = Probe.encode, .encodeGeneration = undefined, .decode = undefined, .specialTokens = Probe.special, .vocabSize = undefined, .deinit = undefined } },
+        .config = .{ .normalize = false, .max_length = 8, .batch_size = 4 },
+        .execution_lane = &lane,
+        .execution_control = .{ .io = std.testing.io },
+    };
+    var query = try std.testing.io.concurrent(Probe.query, .{ &probe, pipeline });
+    defer query.cancel(std.testing.io) catch {};
+    const rows = try pipeline.embed(&.{ "a", "bb", "ccc", "dddd", "eeeee", "ffffff", "ggggggg", "hhhhhhhh", "iiiiiiiii" });
+    defer freeEmbeddingSlices(std.testing.allocator, rows);
+    try query.await(std.testing.io);
+    try std.testing.expectEqualSlices(usize, &.{ 4, 1, 4, 1 }, &probe.batches);
+    for (rows, 1..) |row, i| try std.testing.expectEqual(@as(f32, @floatFromInt(i)), row[0]);
+    try std.testing.expectEqual(@as(usize, 9), pipeline.last_input_tokens);
 }

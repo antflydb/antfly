@@ -120,3 +120,18 @@ pub extern fn antfly_storage_context_create_with_runtime(
     request: *const Request,
     out_context: *?*anyopaque,
 ) abi.Status;
+
+/// Borrowed publisher; callbacks and context outlive the storage context.
+/// JSON crosses the compilation boundary, and its producer releases it.
+pub const RemoteContentSource = extern struct {
+    version: u32 = 1,
+    _reserved: u32 = 0,
+    context: *anyopaque,
+    acquire: *const fn (*anyopaque, *abi.OwnedBytes) callconv(.c) abi.Status,
+    release: *const fn (*anyopaque, abi.OwnedBytes) callconv(.c) void,
+};
+
+pub extern fn antfly_storage_context_configure_remote_content_source(
+    context: ?*anyopaque,
+    source: *const RemoteContentSource,
+) abi.Status;

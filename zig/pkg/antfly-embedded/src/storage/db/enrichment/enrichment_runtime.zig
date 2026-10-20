@@ -32527,7 +32527,7 @@ fn extractModelChunkSource(a: Allocator, config: Config, raw: []const u8, reques
     // Inline media is versioned with the document. Remote assets first pass
     // through the existing authorized asset materialization/retention path.
     const size = std.base64.standard.Decoder.calcSizeForSlice(data.string) catch return error.InvalidChunkSource;
-    if (size > document_extraction_mod.effectiveRemoteContentMaxDownloadSize(config.remote_content)) return error.SourceTooLarge;
+    if (size > try document_extraction_mod.effectiveRemoteContentMaxDownloadSize(config.remote_content)) return error.SourceTooLarge;
     const bytes = try a.alloc(u8, size);
     errdefer a.free(bytes);
     std.base64.standard.Decoder.decode(bytes, data.string) catch return error.InvalidChunkSource;
@@ -32544,7 +32544,7 @@ fn extractSourceText(
     if (request.source_template.len > 0) {
         // Render via Handlebars template
         const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
         if (rendered.len == 0) {
@@ -32597,13 +32597,14 @@ fn extractAssetSourceValue(
 ) !?[]const u8 {
     if (request.source_template.len > 0) {
         const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
         if (rendered.len == 0) {
             alloc.free(rendered);
             return null;
         }
+        errdefer alloc.free(rendered);
         try document_extraction_mod.validateInlineSourceSize(config.remote_content, rendered);
         return rendered;
     }
@@ -32641,12 +32642,12 @@ fn renderSourceParts(
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
         template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, config.io, config.cancellation, max_media_parts)) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         }
     else
         template_remote.renderJsonToParts(alloc, request.source_template, raw_doc) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.Canceled, error.Timeout, error.ResourceTemporarilyUnavailable, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
     if (parts.len == 0) {
@@ -35992,6 +35993,36 @@ test "extractSourceText with template and invalid JSON returns null" {
     };
     const result = try extractSourceText(alloc, .{}, "not json", request);
     try std.testing.expect(result == null);
+}
+
+test "enrichment preserves snapshot failures instead of skipping source content" {
+    const Probe = struct {
+        fn text(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]const u8 {
+            const failure: *anyerror = @ptrCast(@alignCast(raw.?));
+            return failure.*;
+        }
+        fn parts(raw: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8, _: template_remote.RenderConfig) anyerror![]template.ContentPart {
+            const failure: *anyerror = @ptrCast(@alignCast(raw.?));
+            return failure.*;
+        }
+    };
+    var failure: anyerror = error.ResourceTemporarilyUnavailable;
+    template_remote.setHostRenderer(.{ .ctx = &failure, .render_json_to_text = Probe.text, .render_json_to_parts = Probe.parts });
+    defer template_remote.setHostRenderer(null);
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "url",
+        .source_template = "{{remoteMedia url=url}}",
+    };
+    const doc = "{\"url\":\"file:///media.png\"}";
+    for ([_]anyerror{ error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.Timeout, error.Canceled }) |err| {
+        failure = err;
+        try std.testing.expectError(err, extractSourceText(std.testing.allocator, .{}, doc, request));
+        try std.testing.expectError(err, extractAssetSourceValue(std.testing.allocator, .{}, doc, request));
+        try std.testing.expectError(err, renderSourceParts(std.testing.allocator, .{}, doc, request, null));
+    }
 }
 
 test "enrichment extractSourceText with template error directive fails instead of returning text" {
