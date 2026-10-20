@@ -4,6 +4,47 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Original admission through native transaction BEGIN (2026-10-20)
+
+Source `e1c19bf0a44c40bd220cfffd4c4cffffbc68257a` replaces the context-aware source's uncontrolled JSON BEGIN
+with a typed synchronous owner operation. The original cancellation, deadline,
+runnable and supplied route controls now reach participant validation and native
+DB admission. Original failures retain their exact cause across the C boundary,
+including missing-shaped errors. The operation borrows checked participant
+metadata without a caller marshalling allocation. Before allocating native
+scratch, it reserves the full finite validation workspace against the DB's
+resource manager; physical freeing precedes retirement of that reservation.
+
+Replication admission may lend CPU before policy/apply holders are acquired.
+While those holders remain live, the DB retains lifetime checks and suppresses
+CPU loans; contention fails explicitly. Hidden BEGIN compares the actual durable
+restore plan under the apply fence. Durable success has no subsequent caller
+checkpoint, JSON parsing or response allocation that could turn successful
+contact into a reported rejection. Existing uncontrolled legacy entry points
+retain their prior behavior. Storage-owner ABI is now 105; native ABI 44, API
+ABI 54, engine descriptor 29, runtime-failure ABI 64, required reader floor 10,
+data-Raft protocol 28 and metadata protocol 36 remain unchanged.
+
+`native-controlled-begin-verified.json` binds all 5259 native/schema
+input hashes to 84/84 passing build steps, 110 coordinator cases, 46 companion
+cases and 10 native storage cases. Tests inject original failures at each
+observed checkpoint, verify no transaction for every injected rejection, exercise
+real pre-holder CPU lending and canceled reentry, reopen accepted transactions,
+reject a mismatched durable private plan, and deny workspace quota before a
+failing backing allocator can run. Workspace bounds cover geometric hash growth
+and long public/private table locators. Both production startup profiles and the
+actual source controller pass semantic analysis. The controller itself and the
+full linked storage-owner archive have not been runtime qualified. The immutable
+public package contains 4543 matching sources and passes 25/25
+ReleaseSafe consumer steps. Generated errors and the control catalog match.
+Full Linux qualification remains waived.
+
+The full design remains incomplete. This fixes ordinary context-aware BEGIN;
+required capability/BEGIN/PREPARE/seal providers and their independently funded
+original producers remain unwired and activation stays disabled. Fresh route
+authority, authenticated hidden-owner preparation, migration, large frames,
+completion resource bundles and broader scheduler/fault scope remain open.
+
 ## Shared durable preparation readiness epochs (2026-10-20)
 
 Source `488b54d1a194399c5a04490069be51547de92552` fixes the readiness audit's

@@ -18,12 +18,22 @@ implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `d227ec2811235d618b8e50d86ab4b1472b207cc4`
 (merge commit `b81563cddd6bd86941e40ebcdf2b1bf805113605`).
 
-Native ABI 44, storage-owner ABI 104, engine descriptor 29, required preparation
+Native ABI 44, storage-owner ABI 105, engine descriptor 29, required preparation
 file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
+
+Source `e1c19bf0a44c40bd220cfffd4c4cffffbc68257a` carries original admission through a typed native
+transaction BEGIN. Validation workspace is admitted before backing allocation;
+CPU is lent only before policy/apply holders, original failures remain errors,
+and the durable restore plan is checked under apply ownership. Successful BEGIN
+remains authoritative after physical completion. Ten native storage cases,
+156 coordinator/companion cases, both startup profiles and 25 packaged-source
+consumer steps pass. The actual source controller has semantic analysis only;
+full linked archive runtime qualification remains open. This ordinary BEGIN fix
+does not wire or activate required preparation providers.
 
 Source `488b54d1a194399c5a04490069be51547de92552` shares the durable reader
 epoch between local admission and capability negotiation. Stale readiness claims
