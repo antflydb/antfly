@@ -696,12 +696,18 @@ Cancellation drains or cancels both owned frame slots before freeing views.
 and `ANTFLY_EMBEDDINGGEMMA2_DISABLE_TILED_FFN=1` also disables that candidate.
 `ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_CACHE=1` bypasses retained mask metadata.
 
-Metal vision retains up to two admitted activation layouts per model. Each uses
-bounded 512-row FFN tiles, snapshots immutable norm coefficients and reuses
+Metal vision retains up to two admitted activation capacities per model. Each uses
+FFN tiles up to 2048 rows, shares immutable norm coefficients and reuses
 separate norm, residual, alternating hidden and prepared-head ranges. Activation
 storage is capped at 256 MiB per layout; normalization coefficients and tensor-view
 metadata are admitted separately. Layout replacement occurs only with no active
 or submitted frame, and vision pressure releases all retained layouts.
+Shared-cache or device-allocation pressure can narrow tiles to 512 rows without
+reducing cohort capacity. Smaller logical shapes repack disjoint activation and
+FFN ranges within the retained allocation, recovering wider tiles when they fit.
+All ranges are validated before publication, with no allocation, upload or
+admission growth. Repacking requires no active or submitted frame; the full
+physical capacity remains charged until reclamation.
 
 Packed QKV is normalized directly from its projection strides: Q/K retain their
 2D RoPE and Q scale; V uses unweighted RMSNorm without rotation. FFNs stream
@@ -756,10 +762,11 @@ the existing frame ownership and release boundaries. Slot replacement and model
 unload invalidate all cached shapes.
 
 Metal vision cohort selection and request admission share one execution plan:
-8192 patch rows and a 256 MiB activation-layout ceiling, including 512-row FFN
-tiles. Four full-size 2304-patch images therefore execute as three images plus
-one; 2520-patch geometries fit two per cohort. The request reserves bounded
-transient execution and all retained projected outputs; model-owned layouts and
+8192 patch rows and a 256 MiB activation-layout ceiling. Cohort capacity is
+calculated with 512-row FFN scratch; execution uses wider tiles up to 2048 rows
+when they fit the admitted allocation. Four full-size 2304-patch images execute
+as three images plus one; 2520-patch geometries fit two per cohort. The request
+reserves bounded transient execution and all retained projected outputs; model-owned layouts and
 coefficients retain independent cache leases. Prepared execution is required
 under this estimate. If a capability or cache admission declines, partial work
 is drained and a separate conservative fallback supplement is admitted before

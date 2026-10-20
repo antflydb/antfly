@@ -966,12 +966,12 @@ Cancellation drains both layer slots before clearing the request's layout view.
 CPU wall time, completed Metal command-buffer GPU time and host download bytes.
 Use it for attribution; its extra fences change serving latency. The maintained
 video oracle corpus attributed approximately 49% of measured layer GPU time to
-FFNs and 31% to attention, with no layer activation downloads. A larger FFN tile
-candidate did not establish a reliable gain in three alternating process pairs
-and increased median peak process footprint by approximately 53 MiB. Serving
-keeps the bounded 512-row tile policy. Qualify future kernel changes with paired
-completed timings, shape-specific throughput, memory and pretrained parity;
-process-wide medians alone can hide clock drift between paired runs.
+FFNs and 31% to attention, with no layer activation downloads. Serving selects
+FFN tiles up to 2048 rows within admitted storage, retaining 512-row tiles when
+geometry or memory pressure requires them. Repacking smaller logical shapes
+can recover wider tiles without growing the retained allocation. Qualify changes
+with paired completed timings, shape-specific throughput, memory and pretrained
+parity; process-wide medians alone can hide clock drift between paired runs.
 
 Metal image preparation consumes RGB or RGBA bytes with an explicit row stride,
 ignores alpha/padding, and writes exact torchvision bicubic, centered patch rows
@@ -1019,10 +1019,11 @@ the existing frame ownership and release boundaries. Slot replacement and model
 unload invalidate all cached shapes.
 
 Metal vision cohort selection and request admission share one execution plan:
-8192 patch rows and a 256 MiB activation-layout ceiling, including 512-row FFN
-tiles. Four full-size 2304-patch images therefore execute as three images plus
-one; 2520-patch geometries fit two per cohort. The request reserves bounded
-transient execution and all retained projected outputs; model-owned layouts and
+8192 patch rows and a 256 MiB activation-layout ceiling. Cohort capacity is
+calculated with 512-row FFN scratch; execution uses wider tiles up to 2048 rows
+when they fit the admitted allocation. Four full-size 2304-patch images execute
+as three images plus one; 2520-patch geometries fit two per cohort. The request
+reserves bounded transient execution and all retained projected outputs; model-owned layouts and
 coefficients retain independent cache leases. Prepared execution is required
 under this estimate. If a capability or cache admission declines, partial work
 is drained and a separate conservative fallback supplement is admitted before
@@ -1106,8 +1107,10 @@ all-device spans retain their direct import.
 
 Prepared Metal vision owns one immutable normalization snapshot across arena
 capacities. Up to two admitted arenas serve the smallest fitting capacity;
-smaller batches rebind logical views at completed boundaries, preserving each
-range's physical offset and capacity without allocating or uploading again.
+smaller batches repack logical views at completed boundaries. Region offsets
+change to recover wider FFN scratch while the backing allocation and its
+admission remain fixed. All ranges are validated before publication, without
+allocating or uploading again.
 The retained capacity keeps its full admission until reclamation. The 96
 coefficient views have a separate model owner and admission, released with the
 vision cache after all dependent arenas drain. Admission denial retains the
