@@ -2164,6 +2164,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_secret_backend_tests = addFilteredTestRunArtifact(b, secret_backend_tests);
     b.step("secret-backends-test", "Run distributed and serverless encrypted persistence tests").dependOn(&run_secret_backend_tests.step);
 
+    const remote_content_owner_tests = b.addTest(.{
+        .root_module = capi_root_mod,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        .filters = &.{"storage owner remote content source"},
+    });
+    const run_remote_content_owner_tests = b.addRunArtifact(remote_content_owner_tests);
+    b.step("antfly-remote-content-owner-test", "Verify live remote-content policy snapshots across the storage owner boundary")
+        .dependOn(&run_remote_content_owner_tests.step);
+
     const lite_native_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_native_test.zig"),
         .target = target,
@@ -2691,6 +2700,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     graph_page_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const graph_page_tests = b.addTest(.{
         .root_module = graph_page_test_mod,
+        .filters = selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const graph_test_step = b.step("antfly-graph-test", "Run graph algorithms, topology, pages, query and recovery tests");
@@ -5218,6 +5228,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_embedded_tests.step);
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     unit_test_step.dependOn(&run_capi_tests.step);
+    unit_test_step.dependOn(&run_remote_content_owner_tests.step);
     // The storage engine artifact owns Lite native tests; keep lite-native-test focused.
     unit_test_step.dependOn(&run_cmd_tests.step);
     unit_test_step.dependOn(&run_lite_cmd_tests.step);
@@ -5377,6 +5388,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const native_vector_store_test_mod = makeLmdbModule(b, "pkg/antfly/src/native_vector_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     antfly_imports.configureRuntimeContracts(native_vector_store_test_mod);
+    native_vector_store_test_mod.addImport("storage_engine_errors", antfly_imports.storage_boundary.engine_errors);
+    native_vector_store_test_mod.addImport("antfly_test_error_logs", antfly_imports.storage_boundary.test_error_logs);
     native_vector_store_test_mod.addImport("bloom", bloom_mod);
     native_vector_store_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     native_vector_store_test_mod.addImport("antfly-json", json_mod);
@@ -6140,6 +6153,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-query-capture-test", "Verify retained query consistency, cancellation and enrichment independence")
         .dependOn(&addFilteredTestRunArtifact(b, query_capture_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const lite_external_dimension_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .max_rss = 12 * 1024 * 1024 * 1024,
+        .filters = &.{"lite external dense dimension replacement"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-external-dimension-test", "Verify external vector dimension replacement, writes during rebuild, and restart")
+        .dependOn(&b.addRunArtifact(lite_external_dimension_tests).step);
     const graph_producer_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "inline resolver replacement replays graph producers without staged resolvers across reopen", "inline resolver replacement producer pages bound physical records bytes and deadlines", "inline resolver replacement preserves shared explicit and upstream producers", "capi resolver replacement retry budget resets only after durable progress" },
@@ -6691,6 +6712,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.column_scan_plan.",
             "storage.db.column_source.",
             "storage.db.db.",
+            "storage.db.artifact_graph_completion.",
+            "storage.db.artifact_input_test.",
+            "storage.db.entity_alias_curation.",
+            "storage.db.group_prior_context.",
+            "storage.db.group_prior_scan.",
+            "storage.db.group_source_baseline.",
+            "storage.db.group_source_bytes.",
+            "storage.db.group_source_debt.",
+            "storage.db.group_source_identity.",
+            "storage.db.group_source_index.",
+            "storage.db.group_source_lease_test.",
+            "storage.db.group_source_owner_identity.",
+            "storage.db.group_source_propagation_test.",
+            "storage.db.group_source_reads.",
+            "storage.db.group_source_retirement.",
+            "storage.db.group_source_snapshot.",
+            "storage.db.group_source_state.",
+            "storage.db.group_source_transfer.",
+            "storage.db.group_source_worker.",
+            "storage.db.group_sources.",
+            "storage.db.resolver_curation.",
             "storage.db.dense_exact.",
             "storage.db.doc_filter_wire.",
             "storage.db.doc_identity.",

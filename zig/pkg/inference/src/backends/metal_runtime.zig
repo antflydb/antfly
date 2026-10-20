@@ -19286,6 +19286,14 @@ pub extern fn termite_metal_buffer_copy(
     dst_offset: usize,
     length: usize,
 ) c_int;
+pub const BufferGatherSource = extern struct {
+    device: ?*anyopaque = null,
+    host: ?*const anyopaque = null,
+    source_offset: usize = 0,
+    destination_offset: usize,
+    length: usize,
+};
+pub extern fn termite_metal_buffer_gather(runtime: ?*RawMetalDecodeRuntime, destination: *anyopaque, sources: [*]const BufferGatherSource, count: usize) c_int;
 pub extern fn termite_metal_buffer_copy_pair(
     runtime: ?*RawMetalDecodeRuntime,
     src_a_handle: ?*anyopaque,
@@ -49606,3 +49614,5 @@ test "embeddinggemma2 Metal multiplication plans retain full tiles tails and des
 }
 
 pub extern fn antfly_metal_rotary_table(runtime: ?*RawMetalDecodeRuntime, output: ?*anyopaque, offset: usize, dim: u32, x: u32, y: u32, theta: f32, vision: u32) c_int;
+
+pub extern fn antfly_metal_video_position(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, rows: u32, grid_x: u32, grid_y: u32, axis: u32) c_int;

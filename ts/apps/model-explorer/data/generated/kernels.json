@@ -474,6 +474,22 @@
    }
   },
   {
+   "name": "antfly_compose_rows",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "antfly_masked_mean_batch",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "antfly_norm_clamp",
    "family": "norm_rope",
    "generated": false,
@@ -711,6 +727,14 @@
    "generated": true,
    "source": {
     "path": "zig/pkg/inference/src/ops/metal/generated/microkernel_rms_norm.metal"
+   }
+  },
+  {
+   "name": "antfly_rotary_table",
+   "family": "other",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
    }
   },
   {

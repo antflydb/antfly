@@ -109,3 +109,6 @@ zig/incoming-graph-routes/
 
 # Zig 0.17 local dependency extraction cache
 zig-pkg/
+
+# Executing workflow tooling, separate from the admitted PR checkout.
+.ci-dependency-policy/

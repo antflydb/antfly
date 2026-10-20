@@ -129,7 +129,18 @@ void av_preparation_cache_stats(void *p, uint64_t *out) {
 @implementation AVPreparer
 - (void)dealloc { av_metal_destroy(_cache); }
 @end
+// The completion block captures this small owner, avoiding a result/command
+// retain cycle. Clearing the callback under the lock fences foreign callbacks.
+@interface AVPreparationWake : NSObject
+@property(nonatomic, strong) NSLock *lock;
+@property(nonatomic) void *context;
+@property(nonatomic) void (*notify)(void *);
+@property(nonatomic) BOOL completed;
+@end
+@implementation AVPreparationWake
+@end
 @interface AVPrepared : NSObject
+@property(nonatomic, strong) AVPreparationWake *wake;
 @property(nonatomic, strong) id<MTLCommandBuffer> command;
 @property(nonatomic, strong) id<MTLBuffer> output;
 @property(nonatomic) size_t outputOffset;
@@ -281,6 +292,7 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         AVPreparer *p = (__bridge AVPreparer *)handle;
         AVCoefficients *c = (__bridge AVCoefficients *)coefficients;
         AVPrepared *result = [AVPrepared new];
+        result.wake = [AVPreparationWake new]; result.wake.lock = [NSLock new];
         if (params[8] < 8 || params[8] > 14 || params[11] > 16 - params[8] || (params[8] == 8 && params[11] != 0)) return -1;
         if ((!rgba && ((params[5] == 3 && (params[9] != 3 || !params[6] || params[12])) || params[5] > 3 || (params[5] == 2 && params[12] == 0))) || params[12] > 2 || (rgba && params[12] != 0)) return -1;
         id<MTLBuffer> toneLUT = params[12] == 1 ? p.pqLUT : p.hlgLUT;
@@ -384,8 +396,13 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         [encoder dispatchThreads:MTLSizeMake(params[2], params[3], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         result.completion = dispatch_semaphore_create(0);
         dispatch_semaphore_t completion = result.completion;
+        AVPreparationWake *wake = result.wake;
         [result.command addCompletedHandler:^(id<MTLCommandBuffer> command) {
             (void)command; dispatch_semaphore_signal(completion);
+            [wake.lock lock];
+            wake.completed = YES;
+            if (wake.notify) wake.notify(wake.context);
+            [wake.lock unlock];
         }];
         [result.command commit];
         if (slab) p.outputUsed += outputBytes;
@@ -402,6 +419,13 @@ int32_t av_prepare_rgba_submit(void *handle, const uint8_t *rgba, size_t size, c
 int32_t av_prepare_rgba_into_submit(void *handle, const uint8_t *rgba, size_t size, const uint32_t *params, void *coefficients, void *destination, size_t offset, void **out) {
     if (!rgba || !destination) { *out = NULL; return -1; }
     return prepare(handle, NULL, rgba, size, params, coefficients, NULL, out, nil, nil, (__bridge id<MTLBuffer>)destination, offset);
+}
+void av_prepared_notify(void *p, void *context, void (*notify)(void *)) {
+    AVPreparationWake *wake = ((__bridge AVPrepared *)p).wake;
+    [wake.lock lock];
+    wake.context = context; wake.notify = notify;
+    if (wake.completed && notify) notify(context);
+    [wake.lock unlock];
 }
 int av_prepared_poll(void *p) {
     AVPrepared *result = (__bridge AVPrepared *)p;
@@ -421,6 +445,7 @@ int av_prepared_wait(void *p, uint64_t timeout_ns) {
 int av_prepared_release_source(void *p) {
     if (av_prepared_poll(p) != 1) return -1;
     AVPrepared *result = (__bridge AVPrepared *)p;
+    if (result.completed) return 0;
     result.gpuSeconds = result.command.GPUEndTime - result.command.GPUStartTime;
     result.completed = YES;
     av_metal_import_release(result.imported); result.imported = NULL;
@@ -452,6 +477,7 @@ int32_t av_prepared_copy(void *p, float *out, size_t count) {
 void av_prepared_destroy(void *p) {
     if (p) {
         AVPrepared *result = (__bridge_transfer AVPrepared *)p;
+        av_prepared_notify((__bridge void *)result, NULL, NULL);
         // Destruction fences even abandoned/canceled jobs. Their admission
         // must not be released while the command still owns staging/resources.
         [result.command waitUntilCompleted];
