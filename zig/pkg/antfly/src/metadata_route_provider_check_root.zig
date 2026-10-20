@@ -40,3 +40,20 @@ export fn antfly_check_metadata_server_route(raw: *anyopaque, alloc: *const std.
     defer result.deinit(alloc.*);
     return 1;
 }
+
+// Instantiate the exact batch provider used by required hosted status workers.
+export fn antfly_check_bounded_group_routes(raw: *anyopaque, alloc: *const std.mem.Allocator, budget: *const @import("api/table_router.zig").RouteBudget) callconv(.c) u8 {
+    const svc: *services.MetadataHttpService = @ptrCast(@alignCast(raw));
+    const routing = @import("api/table_router.zig");
+    const router = server_mod.metadataDataBearingStoreGroupRouter(svc).withBudget(budget.*);
+    const routes = (routing.resolveGroupRoutes(alloc.*, catalog.CatalogSource.fromMetadataHttpService(svc), router, &.{7}, .prefer_leader) catch return 0) orelse return 0;
+    defer routing.freeGroupRoutes(alloc.*, routes);
+    return 1;
+}
+
+export fn antfly_check_opaque_control_routing(raw: *anyopaque, alloc: *const std.mem.Allocator, control: *const @import("antfly_local_sources").common_read_admission.Port) callconv(.c) u8 {
+    const store: *@import("storage/metadata_raft_apply_client.zig").RaftApplyStore = @ptrCast(@alignCast(raw));
+    const result = store.captureControlRoutingProjection(alloc.*, 21, &.{7}, control.*) catch return 0;
+    defer result.deinit();
+    return 1;
+}

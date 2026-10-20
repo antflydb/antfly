@@ -12021,6 +12021,131 @@ pub const RaftApplyStore = struct {
     /// One consistent read of store headers and authoritative group facts.
     /// Report payloads for unrelated groups and all index diagnostics stay in
     /// storage. Work scales with actual reporting replicas, not inventory size.
+    /// One read transaction pairs placement visibility with selected group facts.
+    /// It never repairs derived indexes, enters diagnostic projections, or
+    /// substitutes an unbudgeted lookup for an original admission failure.
+    pub fn captureControlRoutingProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, groups: []const u64, control: @import("antfly_local_sources").common_read_admission.Port) !std.json.Parsed(apply_contract.ControlRoutingProjection) {
+        const read = @import("antfly_local_sources").common_read_admission;
+        try control.validate();
+        var trace: read.RejectionTrace = .{};
+        const original = trace.bind(control).?;
+        const result = self.captureControlRoutingProjectionInner(alloc, group_id, groups, original) catch |err| return trace.failure orelse err;
+        if (trace.failure) |cause| {
+            result.deinit();
+            return cause;
+        }
+        return result;
+    }
+
+    fn captureControlRoutingProjectionInner(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, groups: []const u64, control: @import("antfly_local_sources").common_read_admission.Port) !std.json.Parsed(apply_contract.ControlRoutingProjection) {
+        const Snapshot = apply_contract.ControlRoutingProjection;
+        const codec = @import("../control_routing_codec.zig");
+        try control.checkpoint();
+        var txn = try self.store.beginReadTxnWithBudget(.retain, control);
+        defer txn.abort();
+        var marker_key: [160]u8 = undefined;
+        const marker = (try controlRoutingGet(&txn, try derivedCatalogIndexVersionKey(&marker_key, group_id), control)) orelse return error.InvalidDerivedCatalogIndex;
+        if (!std.mem.eql(u8, marker, derived_catalog_index_version)) return error.InvalidDerivedCatalogIndex;
+        const arena = try alloc.create(std.heap.ArenaAllocator);
+        arena.* = .init(alloc);
+        var result: std.json.Parsed(Snapshot) = .{ .arena = arena, .value = .{} };
+        errdefer result.deinit();
+        const a = arena.allocator();
+        var stores: std.ArrayListUnmanaged(Snapshot.Store) = .empty;
+        var addresses: std.ArrayListUnmanaged(ReportAddress) = .empty;
+        var facts: std.ArrayListUnmanaged(std.ArrayListUnmanaged(metadata.GroupStatusReport)) = .empty;
+        var positions: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+        var cursor = try txn.openCursorWithBudget(control);
+        defer cursor.close();
+        const prefix = try listingStorePrefix(a, group_id);
+        var row = try cursor.seekAtOrAfterWithAdmission(prefix, control);
+        while (row) |kv| {
+            try control.checkpoint();
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const raw = if (std.mem.startsWith(u8, kv.value, store_header_magic)) kv.value[store_header_magic.len..] else kv.value;
+            const header = try codec.storeHeader(a, raw, control);
+            const index = stores.items.len;
+            try stores.append(a, header);
+            const baseline = try controlRoutingBaseline(a, &txn, group_id, header.store_id, control);
+            try addresses.append(a, .{ .store_id = header.store_id, .generation = baseline.active });
+            try facts.append(a, .empty);
+            if (positions.contains(header.store_id)) return error.InvalidCatalogRecord;
+            try positions.put(a, header.store_id, index);
+            row = try cursor.nextWithAdmission(control);
+        }
+        var selected: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (groups) |id| {
+            try control.checkpoint();
+            const seen = try selected.getOrPut(a, id);
+            if (seen.found_existing) continue;
+            const report_prefix = try listingReportPrefix(a, group_id, id);
+            row = try cursor.seekAtOrAfterWithAdmission(report_prefix, control);
+            while (row) |kv| {
+                try control.checkpoint();
+                if (!std.mem.startsWith(u8, kv.key, report_prefix)) break;
+                if (kv.value.len != 16) return error.InvalidCatalogRecord;
+                const store_id = std.mem.readInt(u64, kv.value[0..8], .little);
+                if (positions.get(store_id)) |index| {
+                    const address = addresses.items[index];
+                    if (std.mem.eql(u8, kv.key, try listingReportKey(a, group_id, address, id))) {
+                        const slot = std.mem.readInt(u64, kv.value[8..16], .little);
+                        const payload = (try controlRoutingGet(&txn, try reportComponentKey(a, group_id, address, slot / report_page_slots, 2), control)) orelse return error.InvalidCatalogRecord;
+                        const clocks = (try controlRoutingGet(&txn, try reportComponentKey(a, group_id, address, slot / report_page_slots, 3), control)) orelse return error.InvalidCatalogRecord;
+                        const bytes = try reportPageEntry(payload, slot);
+                        const times = try reportPageEntry(clocks, slot);
+                        if (bytes.len < 5 or bytes[0] != 1 or std.mem.readInt(u32, bytes[1..5], .little) != 1 or times.len != 8) return error.InvalidCatalogRecord;
+                        var pos: usize = 5;
+                        var fact = try readGroupStatusRecord(a, bytes, &pos);
+                        fact.observed_reallocation_request_id = try readInt(bytes, &pos, u128);
+                        if (pos != bytes.len or fact.group_id != id) return error.InvalidCatalogRecord;
+                        fact.updated_at_millis = std.mem.readInt(u64, times[0..8], .little);
+                        try facts.items[index].append(a, fact);
+                    }
+                }
+                row = try cursor.nextWithAdmission(control);
+            }
+        }
+        var placements: std.ArrayListUnmanaged(Snapshot.Placement) = .empty;
+        var placement_prefix: [128]u8 = undefined;
+        const placement_key = try placementPrefixForGroup(&placement_prefix, group_id);
+        row = try cursor.seekAtOrAfterWithAdmission(placement_key, control);
+        while (row) |kv| {
+            try control.checkpoint();
+            if (!std.mem.startsWith(u8, kv.key, placement_key)) break;
+            if (kv.value.len < 8) return error.InvalidMetadataTransitionEncoding;
+            if (selected.contains(std.mem.readInt(u64, kv.value[0..8], .little))) try placements.append(a, try codec.placement(kv.value, control));
+            row = try cursor.nextWithAdmission(control);
+        }
+        for (stores.items, facts.items) |*store, group_facts| {
+            try control.checkpoint();
+            store.group_statuses = group_facts.items;
+        }
+        result.value = .{ .stores = stores.items, .placements = placements.items };
+        try control.checkpoint();
+        return result;
+    }
+
+    fn controlRoutingGet(txn: *docstore.DocStore.Txn, key: []const u8, control: @import("antfly_local_sources").common_read_admission.Port) !?[]const u8 {
+        var values: [1]?[]const u8 = .{null};
+        try txn.getManySortedWithAdmission(&.{key}, &values, control);
+        return values[0];
+    }
+
+    fn controlRoutingBaseline(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64, control: @import("antfly_local_sources").common_read_admission.Port) !BaselineState {
+        const bytes = (try controlRoutingGet(txn, try baselineKey(a, group_id, store_id), control)) orelse return .{};
+        const Adapter = struct {
+            port: @import("antfly_local_sources").common_read_admission.Port,
+            fn check(raw: *anyopaque) !void {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                try value.port.checkpoint();
+            }
+        };
+        var adapter: Adapter = .{ .port = control };
+        var parsed = try @import("../../api/sql_json_source.zig").parse(BaselineState, a, bytes, .{}, .{ .ptr = &adapter, .check = Adapter.check });
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub fn readControlStores(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, groups: []const u64) ![]metadata.StoreRecord {
         var txn = try self.beginIndexedReportRead(group_id);
         defer txn.abort();
@@ -38808,4 +38933,237 @@ test "remote initialization persists immutable grants through restart snapshots 
     foreign = identity;
     foreign.public_key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(other_seed)).public_key.toBytes();
     try std.testing.expectError(error.StoreRootEnrollmentChanged, T.preflight(&store, try remote_initialization.Request.sign(foreign, 5, .prepare, @splat(3), other_seed)));
+}
+
+const ControlRoutingTestPort = struct {
+    calls: usize = 0,
+    fail_at: usize = std.math.maxInt(usize),
+    cause: anyerror = error.Canceled,
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const index = self.calls;
+        self.calls += 1;
+        if (index == self.fail_at) return self.cause;
+    }
+    fn payload(self: *@This()) @import("antfly_local_sources").common_read_admission.Payload {
+        return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .wait_for_progress = check } };
+    }
+};
+
+fn seedControlRoutingFixture(store: *RaftApplyStore) !void {
+    const a = std.testing.allocator;
+    var reports = [_]metadata.GroupStatusReport{
+        .{ .group_id = 7, .local_leader = true, .doc_count = 42, .raft_term = 2 },
+        .{ .group_id = 8, .doc_count = 9000, .raft_term = 3 },
+    };
+    var txn = try store.store.beginWriteTxn();
+    errdefer txn.abort();
+    _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
+    try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = .{ .store_id = 20, .node_id = 30, .api_url = "http://node", .health_class = "healthy", .live = true, .reporter_incarnation = 77, .group_statuses = &reports } });
+    const placement = try encodePlacementIntent(a, .{ .record = .{ .group_id = 7, .replica_id = 1, .local_node_id = 30 }, .peer_node_ids = &.{30}, .serving_state = .serving });
+    defer a.free(placement);
+    var key: [192]u8 = undefined;
+    try txn.put(try placementKeyForGroup(&key, 21, 7, 30), placement);
+    try txn.commit();
+}
+
+test "bounded control routing capture selects indexed facts and preserves every original rejection" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/controlled-routing", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try seedControlRoutingFixture(&store);
+    var state: ControlRoutingTestPort = .{};
+    const payload = state.payload();
+    const port = @import("antfly_local_sources").common_read_admission.Port.init(&payload);
+    const captured = try store.captureControlRoutingProjection(a, 21, &.{ 7, 7 }, port);
+    defer captured.deinit();
+    try std.testing.expectEqual(@as(usize, 1), captured.value.stores.len);
+    try std.testing.expectEqualStrings("http://node", captured.value.stores[0].api_url);
+    try std.testing.expectEqual(@as(usize, 1), captured.value.stores[0].group_statuses.len);
+    try std.testing.expectEqual(@as(u64, 7), captured.value.stores[0].group_statuses[0].group_id);
+    try std.testing.expectEqual(@as(u64, 42), captured.value.stores[0].group_statuses[0].doc_count);
+    try std.testing.expectEqual(@as(usize, 1), captured.value.placements.len);
+    try std.testing.expectEqual(@as(u64, 30), captured.value.placements[0].node_id);
+    const checks = state.calls;
+    try std.testing.expect(checks > 10);
+    for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.MemoryLimitExceeded }) |cause| for (0..checks) |index| {
+        state = .{ .fail_at = index, .cause = cause };
+        try std.testing.expectError(cause, store.captureControlRoutingProjection(a, 21, &.{ 7, 7 }, port));
+    };
+    state = .{};
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator, target: *RaftApplyStore, control: @import("antfly_local_sources").common_read_admission.Port) !void {
+            const value = try target.captureControlRoutingProjection(alloc, 21, &.{7}, control);
+            defer value.deinit();
+        }
+    };
+    var baseline = std.testing.FailingAllocator.init(a, .{});
+    try Harness.run(baseline.allocator(), &store, port);
+    var rejected: usize = 0;
+    // Arena block alignment and storage cache warming can change allocation
+    // counts. Audit each fault and ownership without assuming a fixed count.
+    for (0..baseline.alloc_index + 16) |index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+        Harness.run(failing.allocator(), &store, port) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            rejected += 1;
+        };
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    try std.testing.expect(rejected > 0);
+}
+
+test "bounded control routing missing index never performs repair in a reader" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/controlled-routing-no-index", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    var state: ControlRoutingTestPort = .{};
+    const payload = state.payload();
+    const port = @import("antfly_local_sources").common_read_admission.Port.init(&payload);
+    try std.testing.expectError(error.InvalidDerivedCatalogIndex, store.captureControlRoutingProjection(a, 21, &.{7}, port));
+    var txn = try store.store.beginReadTxn();
+    defer txn.abort();
+    var key: [160]u8 = undefined;
+    try std.testing.expectError(error.NotFound, txn.get(try derivedCatalogIndexVersionKey(&key, 21)));
+}
+
+test "bounded control routing minimal codecs agree with durable encoders" {
+    const a = std.testing.allocator;
+    const codec = @import("../control_routing_codec.zig");
+    var state: ControlRoutingTestPort = .{};
+    const payload = state.payload();
+    const port = @import("antfly_local_sources").common_read_admission.Port.init(&payload);
+    for (std.meta.tags(raft_reconciler.PlacementServingState)) |serving| {
+        const bytes = try encodePlacementIntent(a, .{ .record = .{ .group_id = 7, .replica_id = 4, .local_node_id = 30 }, .peer_node_ids = &.{ 30, 31 }, .serving_state = serving });
+        defer a.free(bytes);
+        const view = try codec.placement(bytes, port);
+        try std.testing.expectEqual(@as(u64, 7), view.group_id);
+        try std.testing.expectEqual(@as(u64, 30), view.node_id);
+        try std.testing.expectEqual(serving, view.serving_state);
+    }
+    const large: [12000]u8 = @splat('x');
+    const bytes = try encodeStoreRecord(a, .{ .store_id = 20, .node_id = 30, .api_url = &large, .health_class = "healthy", .live = true });
+    defer a.free(bytes);
+    const header = try codec.storeHeader(a, bytes, port);
+    defer a.free(header.api_url);
+    defer a.free(header.health_class);
+    try std.testing.expectEqualSlices(u8, &large, header.api_url);
+    state = .{};
+    const checks_before = state.calls;
+    const another = try codec.storeHeader(a, bytes, port);
+    a.free(another.api_url);
+    a.free(another.health_class);
+    const checks = state.calls - checks_before;
+    for (0..checks) |index| {
+        state = .{ .fail_at = index, .cause = error.TxnNotFound };
+        try std.testing.expectError(error.TxnNotFound, codec.storeHeader(a, bytes, port));
+    }
+}
+
+test "bounded control routing production C entry and client preserve original fences and caller memory" {
+    const a = std.testing.allocator;
+    const owner = @import("../../capi/server_owner.zig");
+    const client = @import("../../storage/metadata_raft_apply_client.zig");
+    const abi = @import("kernel_owner_abi");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/control-route-cabi", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try seedControlRoutingFixture(&store);
+    // The fixture borrows the native store; only the original closes it.
+    var handle: owner.MetadataApplyStoreHandle = .{ .alloc = a, .store = store, .context = null };
+    var proxy: client.RaftApplyStore = .{ .alloc = a, .handle = &handle };
+    var state: ControlRoutingTestPort = .{};
+    const payload = state.payload();
+    const port = @import("antfly_local_sources").common_read_admission.Port.init(&payload);
+    const snapshot = try proxy.captureControlRoutingProjection(a, 21, &.{7}, port);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.value.stores.len);
+    try std.testing.expectEqual(@as(u64, 7), snapshot.value.stores[0].group_statuses[0].group_id);
+    try std.testing.expectEqual(@as(u64, 30), snapshot.value.placements[0].node_id);
+    const checks = state.calls;
+    for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.MemoryLimitExceeded }) |cause| for (0..checks) |index| {
+        state = .{ .fail_at = index, .cause = cause };
+        try std.testing.expectError(cause, proxy.captureControlRoutingProjection(a, 21, &.{7}, port));
+    };
+    state = .{};
+    var output: abi.OwnedBytes = .{ .ptr = @ptrFromInt(1), .len = 4 };
+    try std.testing.expectEqual(abi.Status.invalid_abi, owner.metadataApplyStoreControlRouting(null, &.{ .version = 0, .group_id = 21 }, &output));
+    try std.testing.expect(output.ptr == null and output.len == 0);
+    var memory: [64]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&memory);
+    try std.testing.expectError(error.OutOfMemory, proxy.captureControlRoutingProjection(bounded.allocator(), 21, &.{7}, port));
+    try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+}
+
+test "bounded control routing snapshot stays coherent during concurrent publication" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/routing-coherence", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    try seedControlRoutingFixture(&store);
+    const Writer = struct {
+        target: *RaftApplyStore,
+        failed: bool = false,
+        fn run(self: *@This()) void {
+            self.publish() catch {
+                self.failed = true;
+            };
+        }
+        fn publish(self: *@This()) !void {
+            for (0..32) |index| {
+                const newer = index % 2 == 0;
+                var txn = try self.target.store.beginWriteTxn();
+                errdefer txn.abort();
+                _ = try self.target.updateListingStoreTxn(&txn, 21, 20, .{
+                    .store_id = 20,
+                    .node_id = 30,
+                    .api_url = if (newer) "http://new" else "http://node",
+                    .health_class = "healthy",
+                    .live = true,
+                    .reporter_incarnation = 77,
+                });
+                const placement = try encodePlacementIntent(std.testing.allocator, .{
+                    .record = .{ .group_id = 7, .replica_id = 1, .local_node_id = 30 },
+                    .peer_node_ids = &.{30},
+                    .serving_state = if (newer) .draining else .serving,
+                });
+                defer std.testing.allocator.free(placement);
+                var key: [192]u8 = undefined;
+                try txn.put(try placementKeyForGroup(&key, 21, 7, 30), placement);
+                try txn.commit();
+            }
+        }
+    };
+    var writer: Writer = .{ .target = &store };
+    const thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    defer {
+        thread.join();
+        std.testing.expect(!writer.failed) catch @panic("metadata publisher failed");
+    }
+    var state: ControlRoutingTestPort = .{};
+    const payload = state.payload();
+    const port = @import("antfly_local_sources").common_read_admission.Port.init(&payload);
+    for (0..32) |_| {
+        const captured = try store.captureControlRoutingProjection(a, 21, &.{7}, port);
+        defer captured.deinit();
+        try std.testing.expectEqual(@as(usize, 1), captured.value.stores.len);
+        try std.testing.expectEqual(@as(usize, 1), captured.value.placements.len);
+        const newer = std.mem.eql(u8, captured.value.stores[0].api_url, "http://new");
+        const expected: @TypeOf(captured.value.placements[0].serving_state) = if (newer) .draining else .serving;
+        try std.testing.expectEqual(expected, captured.value.placements[0].serving_state);
+    }
 }

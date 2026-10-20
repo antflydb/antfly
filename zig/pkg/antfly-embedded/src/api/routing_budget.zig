@@ -117,6 +117,7 @@ pub const RouteBudget = struct {
     }
 
     pub fn check(self: RouteBudget) !void {
+        if (self.clock.admission) |original| try original.checkpoint();
         if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         if (self.clock.deadline_ns) |deadline| if (self.clock.nowNs() >= deadline) return error.Timeout;
     }

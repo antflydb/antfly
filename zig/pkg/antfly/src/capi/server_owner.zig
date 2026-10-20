@@ -1691,6 +1691,39 @@ pub fn metadataApplyStoreBindHotStandby(
     return .ok;
 }
 
+pub fn metadataApplyStoreControlRouting(store_ptr: ?*anyopaque, request: *const kernel_owner_abi.MetadataControlRoutingRequest, out_json: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out_json.* = .{};
+    if (request.version != kernel_owner_abi.MetadataControlRoutingRequest.abi_version or request._reserved != 0) return .invalid_abi;
+    const read = @import("antfly_local_sources").common_read_admission;
+    const raw = request.control orelse return .invalid_argument;
+    if (@intFromPtr(raw) % @alignOf(read.Port) != 0) return .invalid_argument;
+    const control: *const read.Port = @ptrCast(@alignCast(raw));
+    control.validate() catch return .invalid_abi;
+    control.checkpoint() catch |err| return kernel_error_identity.statusFromError(err);
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    const bytes = request.groups.slice();
+    if (bytes.len % 8 != 0 or (bytes.len != 0 and @intFromPtr(bytes.ptr) % @alignOf(u64) != 0)) return .invalid_argument;
+    const groups: []const u64 = if (bytes.len == 0) &.{} else std.mem.bytesAsSlice(u64, @as([]align(@alignOf(u64)) const u8, @alignCast(bytes)));
+    const alloc = @import("../storage/transaction_routing_memory_port.zig").receive(request.allocator) catch |err| return if (err == error.UnsupportedVersion) .invalid_abi else .invalid_argument;
+    const captured = handle.store.captureControlRoutingProjection(alloc, request.group_id, groups, control.*) catch |err| return storageOwnerStatusFromError(err);
+    defer captured.deinit();
+    const Adapter = struct {
+        original: read.Port,
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.original.checkpoint();
+        }
+    };
+    var adapter: Adapter = .{ .original = control.* };
+    const encoded = @import("antfly_local_sources").sql_cooperative_json_output.valueAlloc(alloc, captured.value, .{}, .{ .ptr = &adapter, .check = Adapter.check }) catch |err| return storageOwnerStatusFromError(err);
+    control.checkpoint() catch |err| {
+        alloc.free(encoded);
+        return kernel_error_identity.statusFromError(err);
+    };
+    out_json.* = .{ .ptr = encoded.ptr, .len = @intCast(encoded.len) };
+    return .ok;
+}
+
 pub fn metadataApplyStoreTransactionRouting(
     store_ptr: ?*anyopaque,
     request: *const kernel_owner_abi.MetadataTransactionRoutingRequest,

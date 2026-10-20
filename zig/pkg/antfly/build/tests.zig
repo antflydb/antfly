@@ -5930,6 +5930,26 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("docstore-artifact-replay-inventory-test", "Run physical artifact replay accounting, reconciliation and legacy-epoch fences")
         .dependOn(&addCuratedTestRunArtifact(b, artifact_inventory_tests, &artifact_inventory_filters).step);
+    const control_routing_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/control_routing_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, control_routing_mod, true, true);
+    control_routing_mod.addImport("antfly_source_root", control_routing_mod);
+    const control_routing_capi_options = b.addOptions();
+    control_routing_capi_options.addOption(bool, "linked_storage", false);
+    control_routing_capi_options.addOption(bool, "inference_enabled", true);
+    const control_routing_sources = control_routing_mod.import_table.get("antfly_local_sources").?;
+    control_routing_sources.addOptions("capi_build_options", control_routing_capi_options);
+    control_routing_sources.addImport("antfly_storage_root", control_routing_mod);
+    const control_routing_tests = b.addTest(.{
+        .root_module = control_routing_mod,
+        .filters = &.{"bounded control routing"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-control-routing-test", "Verify coherent routing capture and original bounded admission")
+        .dependOn(&addCuratedTestRunArtifact(b, control_routing_tests, &.{"bounded control routing"}).step);
     const required_begin_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/required_begin_test_root.zig"),
         .target = target,

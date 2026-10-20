@@ -679,6 +679,32 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    pub fn captureControlRoutingProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, groups: []const u64, original: @import("antfly_local_sources").common_read_admission.Port) !std.json.Parsed(contract.ControlRoutingProjection) {
+        const read = @import("antfly_local_sources").common_read_admission;
+        try original.validate();
+        var trace: read.RejectionTrace = .{};
+        const control = trace.bind(original).?;
+        var caller_allocator = alloc;
+        const memory = @import("runtime_memory_abi").Allocator.fromStd(&caller_allocator);
+        var response: abi.OwnedBytes = .{};
+        defer if (response.ptr) |bytes| alloc.free(bytes[0..@intCast(response.len)]);
+        const status = abi.antfly_metadata_apply_store_control_routing(self.handle, &.{ .group_id = group_id, .groups = .fromSlice(std.mem.sliceAsBytes(groups)), .control = &control, .allocator = &memory }, &response);
+        if (trace.failure) |cause| return cause;
+        try statusToError(status);
+        const Adapter = struct {
+            original: read.Port,
+            fn check(ptr: *anyopaque) !void {
+                const adapter: *@This() = @ptrCast(@alignCast(ptr));
+                try adapter.original.checkpoint();
+            }
+        };
+        var adapter: Adapter = .{ .original = original };
+        const parsed = try @import("../api/sql_json_source.zig").parse(contract.ControlRoutingProjection, alloc, response.slice(), .{ .allocate = .alloc_always }, .{ .ptr = &adapter, .check = Adapter.check });
+        errdefer parsed.deinit();
+        try original.checkpoint();
+        return parsed;
+    }
+
     pub fn captureTransactionRoutingProjection(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,

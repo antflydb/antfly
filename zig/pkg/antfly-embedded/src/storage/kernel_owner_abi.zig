@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 102;
+pub const abi_version: u32 = 103;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1960,6 +1960,19 @@ pub extern fn antfly_metadata_apply_prepared_snapshot_cancel(prepared: ?*anyopaq
 pub extern fn antfly_metadata_apply_prepared_snapshot_destroy(prepared: ?*anyopaque) callconv(.c) void;
 /// A synchronous checked native control borrow. The port retains the exact
 /// caller budget; no duration is reconstructed at the storage boundary.
+pub const MetadataControlRoutingRequest = extern struct {
+    pub const abi_version: u32 = 1;
+    version: u32 = MetadataControlRoutingRequest.abi_version,
+    _reserved: u32 = 0,
+    group_id: u64,
+    /// Borrowed native-endian u64 IDs, aligned and retained through return.
+    groups: BorrowedBytes = .{},
+    control: ?*const anyopaque = null,
+    allocator: ?*const anyopaque = null,
+};
+/// Response memory belongs to request.allocator, not the storage owner.
+pub extern fn antfly_metadata_apply_store_control_routing(store: ?*anyopaque, request: *const MetadataControlRoutingRequest, out_json: *OwnedBytes) callconv(.c) Status;
+
 pub const MetadataTransactionRoutingRequest = extern struct {
     /// Independent version rejects earlier capture requests before reading
     /// the newly required allocator field.

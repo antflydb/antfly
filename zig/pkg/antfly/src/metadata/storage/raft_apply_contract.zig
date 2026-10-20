@@ -88,6 +88,26 @@ pub const CatalogProjectionSnapshot = struct {
 
 /// Atomic admission projection: transactions must fence both topology and
 /// in-progress transitions from the same committed storage revision.
+/// One coherent minimal routing view. Report diagnostics and unrelated group
+/// payloads are not copied into the control request's memory budget.
+pub const ControlRoutingProjection = struct {
+    pub const Store = struct {
+        store_id: u64,
+        node_id: u64,
+        api_url: []const u8,
+        health_class: []const u8,
+        live: bool,
+        group_statuses: []metadata.GroupStatusReport = &.{},
+    };
+    pub const Placement = struct {
+        group_id: u64,
+        node_id: u64,
+        serving_state: @import("../../raft/reconciler.zig").PlacementServingState,
+    };
+    stores: []Store = &.{},
+    placements: []Placement = &.{},
+};
+
 pub const TransactionRoutingProjectionSnapshot = struct {
     metadata_incarnation: ?metadata_incarnation.MetadataClusterIncarnation,
     catalog_revision: u64,

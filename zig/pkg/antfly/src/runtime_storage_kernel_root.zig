@@ -128,6 +128,7 @@ comptime {
     exportInternal(&storage_kernel_exports.metadataApplyPreparedSnapshotCancel, "antfly_metadata_apply_prepared_snapshot_cancel");
     exportInternal(&storage_kernel_exports.metadataApplyPreparedSnapshotDestroy, "antfly_metadata_apply_prepared_snapshot_destroy");
     exportInternal(&storage_kernel_exports.metadataApplyStoreProjection, "antfly_metadata_apply_store_projection");
+    exportInternal(&storage_kernel_exports.metadataApplyStoreControlRouting, "antfly_metadata_apply_store_control_routing");
     exportInternal(&storage_kernel_exports.metadataApplyStoreTransactionRouting, "antfly_metadata_apply_store_transaction_routing");
     exportInternal(&storage_kernel_exports.metadataApplyStoreBindHotStandby, "antfly_metadata_apply_store_bind_ha");
     exportInternal(&storage_kernel_exports.metadataApplyStoreAddListeners, "antfly_metadata_apply_store_add_listeners");
