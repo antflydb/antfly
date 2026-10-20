@@ -1087,10 +1087,10 @@ Work proceeds from `origin/main` at `51cfaa8f6ef8ccc8b14f7c7b3201b84a36863449`
 in `.worktrees/perf-hn-rc-search-comparison`. The published `v0.3.0-rc.1`
 runtime is a separate qualification target at
 `408644a86163292366dc54d5306f4a4657e4e755`; it contains #1128, while main
-has additional retained-query recovery and publication fixes. Its optimized
-build is still running; no latest-main runtime measurements are recorded in this
-section yet. Latest-main results must not be represented as release-candidate
-results.
+has additional retained-query recovery and publication fixes. The optimized
+main builds and post-merge one-file comparison have completed; their results
+are recorded below separately from the release candidate. Latest-main results
+must not be represented as release-candidate results.
 
 The original local fixture was gone. A surviving bounded sample was downloaded
 from the existing import bucket without another export or cloud compute job.
@@ -1188,5 +1188,59 @@ ranking, so they do not identify the precise optimization on their own.
 
 PR #1196 coverage and suggested qualification are recorded in the
 [review comment](https://github.com/antflydb/antfly/pull/1196#issuecomment-6296069184).
-Its head is absent from both the RC and pinned main baseline; this evidence does
-not measure that PR's performance improvement.
+That reviewed head is absent from both the RC and initial pinned main baseline;
+the RC evidence does not measure that PR's performance improvement.
+
+#### Main comparison after merging #1196
+
+PR #1196 merged as `f322acc4deaf5d57c8f6b117f0d21e2c5729e176`.
+The isolated benchmark branch merged that main revision without conflicts at
+`9ddf7e7f98e94c1d43b947c9f3b1c1975c03d088`; its changes relative to main
+are this qualification document. Both optimized builds passed. Preserved base
+`51cfaa8f6e` and merged-main executable SHA-256 values are respectively
+`c4ab2a09952bd3a031af7ceb5b86f33eb5fc24cb94a8533c1eda9084fab883b9`
+and `b0036ee479760d39f2deb9aa419fb2d7a1552efbc0b7d297e7516a14b92c5071`.
+These revisions include intervening changes beyond #1196, so their difference
+does not isolate the PR's causal effect.
+
+The merged `native_search_comparison.py` harness ran two serial cycles on the
+same one-file source, alternating binary order. Each case used a fresh private
+state, a 4,096 MiB process envelope, concurrency one, disabled navigation warming,
+an empty serving cache after publication, and an immediate first archive query
+without metric-refresh sleeps. Each warm p95 uses 20 samples. OS pages remained
+uncontrolled and CPU affinity was unset. Our build had finished before testing;
+other builds remained active, load average was approximately 10 and swap usage
+was approximately 32 GiB near the start. These are diagnostic observations.
+
+| Measurement | Pre-merge main, two cycles | Merged main, two cycles | Refreshed DuckDB, two cycles |
+| --- | ---: | ---: | ---: |
+| First plain BM25 search | 47 / 263 ms | 93 / 97 ms | 236 / 53 ms |
+| Warm plain BM25 p95 | 14 / 11 ms | 23 / 17 ms | 25 / 25 ms |
+| Search after restart | 38 / 52 ms | 52 / 94 ms | Not measured |
+| Publication readiness | 56 / 123 s | 66 / 106 s | Existing FTS index reused |
+| Physical post-run artifact bytes | 3.15 / 3.01 GB | 3.55 / 3.47 GB | Not comparable |
+| Physical post-run artifact objects | 83,976 / 80,277 | 96,100 / 93,692 | Not comparable |
+
+All four native cases passed ranked search, exact indexed filters, residual-filter
+agreement, snapshot pagination, restart scores and cursor replay, empty date
+filters and concurrent-search checks. The DuckDB refresh reused the same source
+and FTS database with the previous four-thread setup. Its fresh-process cold
+variation, and pre-merge main's cold variation, prevent a controlled cold-parity
+or regression claim. Merged-main warm p95 was higher than the pre-merge samples;
+an isolated rerun is needed before attributing that difference to code.
+The artifact counts include retained and attempt-private objects after the run,
+not live or post-GC storage. A single-file run does not qualify shared-scan gains
+over fragmented input.
+
+The first merged-main post-restart phase profile recorded 51 ms inside lake
+execution, including 35 ms search. Inclusive text subphases recorded 1.5 ms
+reader opening, 1.4 ms term planning, 2.2 ms navigation and 32.5 ms postings.
+They overlap and must not be summed. This is a restart profile, not the
+immediate cold request, whose profiling sleeps were intentionally bypassed.
+It does not support treating reader opening as the dominant remaining cost.
+
+The 1,024-file highlighted/composed base-versus-main run is in progress.
+Publication duration, physical footprint, union/overlay latency and restart
+correctness must be recorded before drawing conclusions about fragmentation.
+Focused harness and metrics tests passed (16 tests). No new cloud compute,
+catalog apply, instance upgrade or release tag was created for these runs.
