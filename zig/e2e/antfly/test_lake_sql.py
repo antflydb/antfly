@@ -255,8 +255,7 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                 length = struct.unpack_from("<I", original, pack + 5)[0]
                 candidate = json.loads(original[pack + 9 : pack + 9 + length])
                 if not candidate["recipe"]["keys"] and any(
-                    item["spec"]["kind"] == "sum"
-                    and item["column"]["path"] == "amount"
+                    item["spec"]["kind"] == "sum" and item["column"]["path"] == "amount"
                     for item in candidate["recipe"]["inputs"]
                 ):
                     packed_candidates.add(artifact_path)
@@ -6449,7 +6448,11 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
                         type=pa.int64(),
                     ),
                     "body": [None if i % 13 == 0 else f"quasar item {i}" for i in ids],
-                    **({"wide": ["x" * 80 + f"{i % key_count:04}" for i in ids]} if key_count > 256 else {}),
+                    **(
+                        {"wide": ["x" * 80 + f"{i % key_count:04}" for i in ids]}
+                        if key_count > 256
+                        else {}
+                    ),
                 }
             ),
             path,
@@ -6514,7 +6517,11 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
                                     "k": {"type": "integer"},
                                     "amount": {"type": "integer"},
                                     "body": {"type": "string"},
-                                    **({"wide": {"type": "string"}} if key_count > 256 else {}),
+                                    **(
+                                        {"wide": {"type": "string"}}
+                                        if key_count > 256
+                                        else {}
+                                    ),
                                 },
                                 "additionalProperties": False,
                             }
@@ -6536,7 +6543,17 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
                         "aggregates": [
                             {"name": "global_rows", "op": "count"},
                             {"name": "counts", "op": "count", "group_by": ["k"]},
-                            *([{"name": "wide_counts", "op": "count", "group_by": ["wide"]}] if key_count > 256 else []),
+                            *(
+                                [
+                                    {
+                                        "name": "wide_counts",
+                                        "op": "count",
+                                        "group_by": ["wide"],
+                                    }
+                                ]
+                                if key_count > 256
+                                else []
+                            ),
                             {
                                 "name": "sums",
                                 "op": "sum",
@@ -6582,7 +6599,9 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
         assert call("POST", "/sql", {"statement": statement})["rows"] == rows
         # Filtered global aggregates preserve their ordinary empty-input path.
         assert call(
-            "POST", "/sql", {"statement": "SELECT COUNT(*) FROM native_cohorts WHERE FALSE"}
+            "POST",
+            "/sql",
+            {"statement": "SELECT COUNT(*) FROM native_cohorts WHERE FALSE"},
         )["rows"] == [["0"]]
         server.pause()
         for target, header, payload in originals:
@@ -6613,33 +6632,57 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
         last = key_count - 1
         for predicate in (f"k = {last}", f"k >= {last}"):
             selective = call(
-                "POST", "/sql",
-                {"statement": f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts WHERE {predicate} GROUP BY k LIMIT 1"},
+                "POST",
+                "/sql",
+                {
+                    "statement": f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts WHERE {predicate} GROUP BY k LIMIT 1"
+                },
             )["rows"]
-            assert selective == [[str(last), str(expected[last][0]), str(expected[last][1])]]
+            assert selective == [
+                [str(last), str(expected[last][0]), str(expected[last][1])]
+            ]
         # The source payloads are corrupt after restart. Ordered native
         # frontiers must preserve SQL bounds, HAVING and result pagination.
         for ordering, nulls in (("ASC", "NULLS LAST"), ("DESC", "NULLS FIRST")):
             for predicate in ("TRUE", "k >= 3", "k >= 3 AND k < 12"):
-                keys = [k for k in sorted(expected, reverse=ordering == "DESC") if predicate == "TRUE" or (k >= 3 and ("< 12" not in predicate or k < 12))]
+                keys = [
+                    k
+                    for k in sorted(expected, reverse=ordering == "DESC")
+                    if predicate == "TRUE"
+                    or (k >= 3 and ("< 12" not in predicate or k < 12))
+                ]
                 ordered = call(
-                    "POST", "/sql",
-                    {"statement": f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts WHERE {predicate} GROUP BY k HAVING COUNT(*) > 0 ORDER BY k {ordering} {nulls} LIMIT 3 OFFSET 2"},
+                    "POST",
+                    "/sql",
+                    {
+                        "statement": f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts WHERE {predicate} GROUP BY k HAVING COUNT(*) > 0 ORDER BY k {ordering} {nulls} LIMIT 3 OFFSET 2"
+                    },
                 )["rows"]
-                assert ordered == [[str(k), str(expected[k][0]), str(expected[k][1])] for k in keys[2:5]]
+                assert ordered == [
+                    [str(k), str(expected[k][0]), str(expected[k][1])]
+                    for k in keys[2:5]
+                ]
         if key_count > 256:
             # Every group shares the full old 64-byte fence prefix. Deliver
             # several native pages after source loss, in both seek directions.
             for direction in ("ASC", "DESC"):
                 wide_keys = sorted(expected, reverse=direction == "DESC")[:400]
                 wide_rows = call(
-                    "POST", "/sql",
-                    {"statement": f"SELECT wide, COUNT(*) FROM native_cohorts GROUP BY wide ORDER BY wide {direction} LIMIT 400"},
+                    "POST",
+                    "/sql",
+                    {
+                        "statement": f"SELECT wide, COUNT(*) FROM native_cohorts GROUP BY wide ORDER BY wide {direction} LIMIT 400"
+                    },
                 )["rows"]
-                assert wide_rows == [["x" * 80 + f"{k:04}", str(expected[k][0])] for k in wide_keys]
+                assert wide_rows == [
+                    ["x" * 80 + f"{k:04}", str(expected[k][0])] for k in wide_keys
+                ]
         limited = call(
-            "POST", "/sql",
-            {"statement": "SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k LIMIT 3 OFFSET 2"},
+            "POST",
+            "/sql",
+            {
+                "statement": "SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k LIMIT 3 OFFSET 2"
+            },
         )["rows"]
         assert len(limited) == 3
         assert len({row[0] for row in limited}) == 3
@@ -6649,26 +6692,37 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
         # No ORDER BY authorizes an arbitrary prefix, including across a
         # provider-frame boundary. Unsupported sorts must still see all groups.
         one = call(
-            "POST", "/sql",
-            {"statement": "SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k LIMIT 1"},
+            "POST",
+            "/sql",
+            {
+                "statement": "SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k LIMIT 1"
+            },
         )["rows"]
         assert len(one) == 1
         key = int(one[0][0])
         assert one[0] == [str(key), str(expected[key][0]), str(expected[key][1])]
         for order, key in [
             ("k + 0 DESC", max(expected)),
-            ("SUM(amount) DESC, k DESC", max(expected, key=lambda k: (expected[k][1], k))),
+            (
+                "SUM(amount) DESC, k DESC",
+                max(expected, key=lambda k: (expected[k][1], k)),
+            ),
         ]:
             assert call(
-                "POST", "/sql",
-                {"statement": f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k ORDER BY {order} LIMIT 1"},
+                "POST",
+                "/sql",
+                {
+                    "statement": f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k ORDER BY {order} LIMIT 1"
+                },
             )["rows"] == [[str(key), str(expected[key][0]), str(expected[key][1])]]
         failed = False
     finally:
         server.stop(test_failed=failed)
 
 
-def test_prefix_compressed_repeated_predicates_without_statistics_survive_restart(tmp_path):
+def test_prefix_compressed_repeated_predicates_without_statistics_survive_restart(
+    tmp_path,
+):
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     count = 65536
