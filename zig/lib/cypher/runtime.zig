@@ -1118,7 +1118,10 @@ const Engine = struct {
     const Invariants = struct {
         const Identity = struct { address: usize, length: usize };
         work: value_work.Work,
+        parent: ?*Invariants = null,
         bytes: ?*v.BytePool = null,
+        scalars: std.AutoHashMapUnmanaged(u64, v.Value) = .empty,
+        strings: ?@import("string_work.zig").Runtime = null,
         lists: std.AutoHashMapUnmanaged(u64, @import("invariant_membership.zig").Membership) = .empty,
         owned_lists: std.AutoHashMapUnmanaged(Identity, @import("invariant_membership.zig").Membership) = .empty,
         fn deinit(self: *@This()) void {
@@ -1130,6 +1133,7 @@ const Engine = struct {
     scratch_allocator: A,
     planning_allocator: A = undefined,
     invariants: ?*Invariants = null,
+    local_invariants: ?*Invariants = null,
     anchor_estimates: std.StringHashMapUnmanaged(?usize) = .empty,
     regex: @import("regex.zig").Runtime,
     backend: backend_mod.Backend,
@@ -1203,6 +1207,7 @@ const Engine = struct {
     postimages: v.EntityMap(v.Value) = .empty,
     values: value_work.Work = undefined,
     strings: @import("string_work.zig").Runtime = undefined,
+    scalar_strings: ?*@import("string_work.zig").Runtime = null,
     const SummaryTail = struct { clauses: []const ast.Clause, parent: ?*const SummaryTail = null };
     const WeightedRows = struct {
         rows: []const Row,
@@ -1377,6 +1382,85 @@ const Engine = struct {
             self.weight += copies;
         }
     };
+    const FoldState = struct {
+        initialized: bool = false,
+        accumulator: v.Value = .null,
+        owned: ?std.heap.ArenaAllocator = null,
+        metadata: ?value_work.Work = null,
+        constants: ?std.heap.ArenaAllocator = null,
+        local_invariants: ?*Invariants = null,
+        fn deinit(self: *@This()) void {
+            if (self.owned) |*arena| arena.deinit();
+            if (self.local_invariants) |owner| owner.deinit();
+            if (self.constants) |*arena| arena.deinit();
+        }
+        fn own(self: *@This(), engine: *Engine, value: v.Value) !void {
+            if (engine.immutableOwner(value)) |_| {
+                // Statement inputs and invariant results outlive this fold.
+                // Borrow them rather than making an identical new accumulator
+                // allocation on every iteration and losing immutable provenance.
+                if (self.owned) |*old| old.deinit();
+                self.owned = null;
+                self.metadata = null;
+                self.accumulator = value;
+                self.initialized = true;
+                return;
+            }
+            const metadata = try engine.values.info(value);
+            var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            errdefer arena.deinit();
+            // Clone once with DAG sharing before releasing the old state.
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            var context: v.CloneContext = .{ .a = arena.allocator(), .scratch = scratch.allocator() };
+            const copied = try context.clone(value);
+            var owned_metadata: value_work.Work = .{ .a = arena.allocator(), .ptr = engine, .charge = chargeWork, .parent = if (engine.scalarOwner()) |owner| &owner.work else null };
+            try owned_metadata.remember(copied, metadata);
+            if (self.owned) |*old| old.deinit();
+            self.owned = arena;
+            self.accumulator = copied;
+            self.initialized = true;
+            self.metadata = owned_metadata;
+            self.metadata.?.a = self.owned.?.allocator();
+        }
+        fn advance(self: *@This(), engine: *Engine, projection: *const ast.Expr, outer: Row, accumulator: []const u8, alias: []const u8, value: v.Value, weight: Count) !void {
+            const previous = engine.local_invariants;
+            defer engine.local_invariants = previous;
+            if (!engine.read_only) {
+                // An expression cannot mutate the graph. Cache its closed
+                // computations for this fold, never across mutation stages.
+                if (self.local_invariants == null) {
+                    self.constants = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                    const allocator = self.constants.?.allocator();
+                    const owner = try allocator.create(Invariants);
+                    const parent = engine.scalarOwner();
+                    owner.* = .{ .parent = parent, .work = .{ .a = allocator, .ptr = engine, .charge = chargeWork, .parent = if (parent) |outer_owner| &outer_owner.work else null } };
+                    self.local_invariants = owner;
+                }
+                engine.local_invariants = self.local_invariants;
+            }
+            const copies = std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
+            for (0..copies) |_| {
+                try engine.state();
+                var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                defer scratch.deinit();
+                const scope = EvalScope.enter(engine, scratch.allocator());
+                defer scope.leave(engine);
+                if (self.metadata) |*metadata| {
+                    metadata.parent = if (engine.scalarOwner()) |owner| &owner.work else null;
+                    engine.values.parent = metadata;
+                }
+                const row = try engine.projectionScope(outer, &.{ .{ .name = accumulator, .value = self.accumulator }, .{ .name = alias, .value = value } });
+                try self.own(engine, try engine.eval(projection, row, null));
+            }
+        }
+        fn escape(self: *@This(), engine: *Engine) !v.Value {
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            var context: v.CloneContext = .{ .a = engine.a, .scratch = scratch.allocator() };
+            return context.clone(self.accumulator);
+        }
+    };
     const StreamingAggregate = struct {
         function: ast.Function,
         released: bool = false,
@@ -1408,26 +1492,11 @@ const Engine = struct {
             unknown: bool = false,
             decided: ?bool = null,
             window: ?*StreamingAggregate = null,
-            initialized: bool = false,
             embedding_failure: bool = false,
-            accumulator: v.Value = .null,
-            owned: ?std.heap.ArenaAllocator = null,
+            fold: FoldState = .{},
             fn deinit(self: *@This()) void {
                 if (self.window) |window| window.deinit();
-                if (self.owned) |*arena| arena.deinit();
-            }
-            fn own(self: *@This(), engine: *Engine, value: v.Value) !void {
-                var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
-                errdefer arena.deinit();
-                // Clone once with DAG sharing before releasing the old state.
-                var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
-                defer scratch.deinit();
-                var context: v.CloneContext = .{ .a = arena.allocator(), .scratch = scratch.allocator() };
-                const copied = try context.clone(value);
-                if (self.owned) |*old| old.deinit();
-                self.owned = arena;
-                self.accumulator = copied;
-                self.initialized = true;
+                self.fold.deinit();
             }
             fn result(self: @This(), kind: ast.CollectionFilter.Kind) v.Value {
                 if (kind == .count) return .{ .integer = @intCast(self.count) };
@@ -1465,7 +1534,7 @@ const Engine = struct {
             };
         }
         fn initFold(engine: *Engine, filter: ast.CollectionFilter, state_value: *FilterState) !void {
-            if (!state_value.initialized) try state_value.own(engine, try engine.eval(filter.initial.?, &.{}, null));
+            if (!state_value.fold.initialized) try state_value.fold.own(engine, try engine.eval(filter.initial.?, &.{}, null));
         }
         fn addConsumer(self: *@This(), engine: *Engine, filter: ast.CollectionFilter, state_value: *FilterState, value: v.Value, weight: Count) !void {
             const previous = engine.projection_locals;
@@ -1476,19 +1545,7 @@ const Engine = struct {
                 try initFold(engine, filter, state_value);
                 const accumulator_local: @import("expressions.zig").Local = .{ .name = filter.accumulator.?, .parent = &local };
                 engine.projection_locals = &accumulator_local;
-                const copies = std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
-                for (0..copies) |_| {
-                    try engine.state();
-                    // Each transition has its own scratch lifetime; only the new
-                    // accumulator survives. Never reassociate an arbitrary fold.
-                    var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
-                    defer scratch.deinit();
-                    const scope = EvalScope.enter(engine, scratch.allocator());
-                    defer scope.leave(engine);
-                    const initial_row = &.{v.Entry{ .name = filter.accumulator.?, .value = state_value.accumulator }};
-                    const row = try engine.replace(initial_row, filter.alias, value);
-                    try state_value.own(engine, try engine.eval(filter.projection.?, row, null));
-                }
+                try state_value.fold.advance(engine, filter.projection.?, &.{}, filter.accumulator.?, filter.alias, value, weight);
                 return;
             }
             const row = &.{v.Entry{ .name = filter.alias, .value = value }};
@@ -1830,7 +1887,7 @@ const Engine = struct {
             @memcpy(tuple.items[header + 1 ..], window.list);
             for (self.function.collect_filters, 0..) |filter, i| {
                 const state_value = &self.filter_states[i];
-                if (filter.kind == .fold and state_value.failure == null and !state_value.initialized) {
+                if (filter.kind == .fold and state_value.failure == null and !state_value.fold.initialized) {
                     initFold(engine, filter, state_value) catch |err| {
                         if (!consumerFailure(err)) return err;
                         state_value.failure = err;
@@ -1839,7 +1896,7 @@ const Engine = struct {
                 if (state_value.failure == null and state_value.embedding_failure) state_value.failure = error.CypherValueDepthExceeded;
                 const consumer_value: v.Value = if (state_value.failure != null) .null else switch (filter.kind) {
                     .window => if (state_value.window) |retained| try retained.finishWindow(engine) else .{ .list = &.{} },
-                    .fold => state_value.accumulator,
+                    .fold => state_value.fold.accumulator,
                     else => state_value.result(filter.kind),
                 };
                 const encoded = if (state_value.failure) |err| @import("collection_summary.zig").Packed{ .value = .null, .code = @intFromError(err) } else try @import("collection_summary.zig").pack(engine.a, &tuple, consumer_value);
@@ -2265,6 +2322,7 @@ const Engine = struct {
         active_calls: ?[]const bool = null,
         moment_direct: ?struct { calls: []const ?DirectMoment, values: PathMoments } = null,
         record_rows: bool = true,
+        consumer: ?*PatternConsumer = null,
         continuation: ?struct { parent: *StreamFold, index: usize, apply: ?Row = null, returned: ?*bool = null, capture: ?*StreamCapture = null, admission: bool = false } = null,
         fn add(fold: *@This(), engine: *Engine, initial: Row) anyerror!void {
             const weight = @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
@@ -2309,7 +2367,7 @@ const Engine = struct {
                         defer engine.retain_windows = retention;
                         engine.match_weight_demand = null;
                         engine.retain_windows = false;
-                        if (try engine.streamMatchProjectionInto(&.{row}, &.{fold.weight}, operation, .{ .items = &.{}, .wildcard = true }, &.{}, clause.span, clause.span, .{ .parent = fold, .index = index + 1 })) |_| return;
+                        if (try engine.streamMatchProjectionInto(&.{row}, &.{fold.weight}, operation, .{ .items = &.{}, .wildcard = true }, &.{}, clause.span, clause.span, .{ .parent = fold, .index = index + 1 }, null)) |_| return;
                         // Unproved shapes retain the regular per-binding
                         // operator; no row has been emitted on a decline.
                         for (try engine.match(&.{row}, operation)) |child| try fold.expand(engine, child, index + 1);
@@ -2343,7 +2401,7 @@ const Engine = struct {
                             }
                             if (start + 1 < inner.len and inner[start].operation == .match) {
                                 const last = inner[inner.len - 1].operation.project.value;
-                                if (try engine.streamMatchProjectionInto(&.{input}, &.{Count.one}, inner[start].operation.match, last, inner[start + 1 .. inner.len - 1], inner[start].span, inner[inner.len - 1].span, .{ .parent = fold, .index = index + 1, .apply = row, .returned = &child_returned, .capture = &capture })) |_| {
+                                if (try engine.streamMatchProjectionInto(&.{input}, &.{Count.one}, inner[start].operation.match, last, inner[start + 1 .. inner.len - 1], inner[start].span, inner[inner.len - 1].span, .{ .parent = fold, .index = index + 1, .apply = row, .returned = &child_returned, .capture = &capture }, null)) |_| {
                                     if (!child_returned) {
                                         try apply.memo.put(engine, key, null, .{ .rows = &.{}, .weights = &.{} });
                                     } else if (!capture.disabled) {
@@ -2384,6 +2442,7 @@ const Engine = struct {
                 }
                 return;
             }
+            if (fold.consumer) |consumer| return consumer.add(engine, row, fold.weight);
             if (fold.continuation) |next| {
                 if (next.admission) {
                     var output = row;
@@ -2646,7 +2705,7 @@ const Engine = struct {
                 middle = inner[start + 1 .. inner.len - 1];
                 apply = row;
             }
-            const result = engine.streamMatchProjectionInto(&.{input}, &.{Count.one}, matching, projection, middle, .{}, .{}, .{ .parent = fold, .index = index + 1, .apply = apply, .admission = true }) catch |err| switch (err) {
+            const result = engine.streamMatchProjectionInto(&.{input}, &.{Count.one}, matching, projection, middle, .{}, .{}, .{ .parent = fold, .index = index + 1, .apply = apply, .admission = true }, null) catch |err| switch (err) {
                 error.CypherAdmissionFound => {
                     try memo.put(engine, row, epoch, .{ .rows = &.{&.{}}, .weights = &.{Count.one} });
                     return true;
@@ -3112,7 +3171,7 @@ const Engine = struct {
         return self.streamMatchProjectionWeighted(input, null, operation, projection, original_middle, match_span, projection_span);
     }
     fn streamMatchProjectionWeighted(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
-        return self.streamMatchProjectionInto(input, input_weights, operation, projection, original_middle, match_span, projection_span, null);
+        return self.streamMatchProjectionInto(input, input_weights, operation, projection, original_middle, match_span, projection_span, null, null);
     }
     fn streamShape(self: *Engine, initial: Row, clause: ast.Clause) anyerror!Row {
         var shape = initial;
@@ -3185,7 +3244,7 @@ const Engine = struct {
         };
         return true;
     }
-    fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation")) anyerror!?[]const Row {
+    fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer) anyerror!?[]const Row {
         // The row pipeline nests only within the statement's stack allowance.
         // Longer clause sequences retain the iterative general executor.
         if (original_middle.len > self.limits.recursion_depth -| self.recursion) return null;
@@ -3344,7 +3403,7 @@ const Engine = struct {
         for (probes, middle) |*probe, clause| probe.* = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) }, .disabled = clause.operation != .match and clause.operation != .subquery };
         defer for (probes) |*probe| probe.deinit();
         const retention: GroupRetention = if (grouped) try self.groupRetention(projection) else .{ .a = self.a };
-        var fold: StreamFold = .{ .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
+        var fold: StreamFold = .{ .consumer = consumer, .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
         var adaptive_probe = adaptive_candidate;
         if (adaptive_probe) for (input) |row| {
             if (operation.predicate) |predicate| if (!endpointExpression(predicate, path, row)) {
@@ -3469,7 +3528,7 @@ const Engine = struct {
         }
         self.shortest_count = previous_count;
         self.stream_fold = previous_fold;
-        if (continuation != null) return &.{};
+        if (continuation != null or consumer != null) return &.{};
         const rows = if (top) |*value| try value.finish(true) else try self.finishStreamGroups(groups.items, &calls, &retention, projection);
         try self.stages.append(self.a, .{ .operation = "match", .span = match_span, .input_rows = input.len, .output_rows = stage_counts[0] });
         for (middle, 0..) |clause, index| try self.stages.append(self.a, .{ .operation = @tagName(clause.operation), .span = clause.span, .input_rows = stage_counts[index], .output_rows = stage_counts[index + 1] });
@@ -8174,21 +8233,74 @@ const Engine = struct {
             key = captured.items;
             if (try self.expression_memo.?.find(self, key, @intFromPtr(expression))) |cached| return cached.rows[0][0].value;
         }
-        const result = try self.evalInner(expression, row, group);
+        const invariant = (self.read_only or self.local_invariants != null) and expression.execution_invariant != null;
+        const previous_strings = self.scalar_strings;
+        self.scalar_strings = null;
+        defer self.scalar_strings = previous_strings;
+        const result = result: {
+            if (!invariant) break :result try self.evalInner(expression, row, group);
+            const owner = try self.invariantState();
+            if (owner.scalars.get(expression.execution_invariant.?)) |cached| break :result cached;
+            if (owner.strings == null) owner.strings = .{ .a = owner.work.a, .ptr = self, .charge = chargeWork };
+            self.scalar_strings = &owner.strings.?;
+            // Closed expressions cannot borrow recycled row values. Allocate
+            // their computations directly in statement storage: cloning a
+            // materialized RANGE or list here would double its peak memory.
+            const scope = EvalScope.enter(self, owner.work.a);
+            defer scope.leave(self);
+            const owned = try self.evalInner(expression, row, group);
+            _ = try owner.work.info(owned);
+            try owner.scalars.put(owner.work.a, expression.execution_invariant.?, owned);
+            break :result owned;
+        };
         if (memoizable) try self.expression_memo.?.put(self, key, @intFromPtr(expression), .{ .rows = &.{&.{.{ .name = "value", .value = result }}}, .weights = &.{Count.one} });
-        if (expression.value == .parameter) {
+        if (expression.value == .parameter or (expression.value == .literal and result == .string)) {
             _ = try (try self.invariantState()).work.info(result);
         } else _ = try self.values.info(result);
         return result;
     }
+    fn stringWork(self: *Engine) *@import("string_work.zig").Runtime {
+        return self.scalar_strings orelse &self.strings;
+    }
+    fn immutableOwner(self: *Engine, value: v.Value) ?*Invariants {
+        var owner = self.scalarOwner();
+        while (owner) |current| : (owner = current.parent) {
+            if (current.work.hasMetadata(value)) return current;
+        }
+        return null;
+    }
+    fn stringInputWork(self: *Engine, input: v.Value) *@import("string_work.zig").Runtime {
+        if (self.immutableOwner(input)) |owner| {
+            if (owner.strings == null) owner.strings = .{ .a = owner.work.a, .ptr = self, .charge = chargeWork };
+            return &owner.strings.?;
+        }
+        return self.stringWork();
+    }
+    fn stringResult(self: *Engine, input: v.Value, result: v.Value) !v.Value {
+        if (self.immutableOwner(input)) |owner| {
+            // Cached conversion results and borrowed trims share the immutable
+            // input owner's lifetime; dynamic substrings are not registered.
+            _ = try owner.work.info(result);
+        }
+        return result;
+    }
+    fn scalarOwner(self: *Engine) ?*Invariants {
+        return if (self.local_invariants) |owner| owner else self.invariants;
+    }
     fn invariantState(self: *Engine) !*Invariants {
-        if (self.invariants == null) {
+        if (self.scalarOwner() == null) {
             const state_value = try self.planning_allocator.create(Invariants);
             state_value.* = .{ .work = .{ .a = self.planning_allocator, .ptr = self, .charge = chargeWork } };
             self.invariants = state_value;
         }
-        self.values.parent = &self.invariants.?.work;
-        return self.invariants.?;
+        const owner = self.scalarOwner().?;
+        var parent = &self.values.parent;
+        while (parent.*) |current| {
+            if (current == &owner.work) return owner;
+            parent = &current.parent;
+        }
+        parent.* = &owner.work;
+        return owner;
     }
     fn evalMembership(self: *Engine, left: v.Value, right: *const ast.Expr, row: Row, group: ?[]const Row) !v.Value {
         const invariant = self.read_only and right.execution_invariant != null;
@@ -8223,6 +8335,59 @@ const Engine = struct {
         try state_value.lists.put(self.planning_allocator, right.execution_invariant.?, built);
         return state_value.lists.getPtr(right.execution_invariant.?).?.contains(&self.values, left);
     }
+    fn rangeInput(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?@import("range.zig").Range {
+        const call_value = expression.value.call;
+        const start = try self.eval(call_value.args[0], row, group);
+        const end = try self.eval(call_value.args[1], row, group);
+        const step = if (call_value.args.len == 3) try self.eval(call_value.args[2], row, group) else v.Value{ .integer = 1 };
+        return @import("range.zig").Range.init(start, end, step);
+    }
+    fn isRange(expression: *const ast.Expr) bool {
+        return expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "range") and !expression.value.call.star and !expression.value.call.distinct and (expression.value.call.args.len == 2 or expression.value.call.args.len == 3);
+    }
+    fn rangeCells(self: *Engine, sequence: @import("range.zig").Range, first: u128, length: u128) !v.Value {
+        const count_value = std.math.cast(usize, length) orelse return error.CypherStateBudgetExceeded;
+        try chargeWork(self, count_value);
+        const items = try self.a.alloc(v.Value, count_value);
+        for (items, 0..) |*item, i| {
+            if (i % 4096 == 0) try self.checkpoint();
+            item.* = sequence.at(first + i);
+        }
+        return .{ .list = items };
+    }
+    fn rangeConsumer(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) !?v.Value {
+        const base = switch (expression.value) {
+            .call => |call_value| if (!call_value.star and !call_value.distinct and call_value.args.len == 1 and
+                (std.ascii.eqlIgnoreCase(call_value.name, "size") or std.ascii.eqlIgnoreCase(call_value.name, "head") or std.ascii.eqlIgnoreCase(call_value.name, "last"))) call_value.args[0] else return null,
+            .index => |index| index.base,
+            .slice => |slice| slice.base,
+            else => return null,
+        };
+        if (!isRange(base)) return null;
+        const sequence = try self.rangeInput(base, row, group);
+        switch (expression.value) {
+            .call => |call_value| {
+                const range = sequence orelse return v.Value.null;
+                if (std.ascii.eqlIgnoreCase(call_value.name, "size")) return v.Value{ .integer = std.math.cast(i64, range.length) orelse return error.CypherNumericOverflow };
+                return if (range.length == 0) v.Value.null else range.at(if (std.ascii.eqlIgnoreCase(call_value.name, "head")) 0 else range.length - 1);
+            },
+            .index => |index| {
+                const position = try self.eval(index.index, row, group);
+                if (sequence == null or position == .null) return v.Value.null;
+                if (position != .integer) return error.CypherTypeMismatch;
+                return sequence.?.index(position.integer);
+            },
+            .slice => |slice| {
+                const first = if (slice.start) |bound| try self.eval(bound, row, group) else v.Value{ .integer = 0 };
+                const last = if (slice.end) |bound| try self.eval(bound, row, group) else null;
+                if (sequence == null or first == .null or (last != null and last.? == .null)) return v.Value.null;
+                if (first != .integer or (last != null and last.? != .integer)) return error.CypherTypeMismatch;
+                const bounds = sequence.?.slice(first.integer, if (last) |end| end.integer else null);
+                return try self.rangeCells(sequence.?, bounds.start, bounds.length);
+            },
+            else => unreachable,
+        }
+    }
     fn evalInner(self: *Engine, expression: *const ast.Expr, row: Row, group: ?[]const Row) anyerror!v.Value {
         if (expression.value != .variable) if (self.projection_overrides) |overrides| for (overrides.items, overrides.row) |item, entry| {
             if (@import("expressions.zig").same(item.expression, expression) and @import("expressions.zig").unshadowed(expression, self.projection_locals)) return entry.value;
@@ -8250,6 +8415,10 @@ const Engine = struct {
             return overrides.values[index];
         };
         try self.checkpoint();
+        if (try self.rangeConsumer(expression, row, group)) |result| return result;
+        if (reduction_plan.collectionConsumer(expression)) |demand| if (demand.input.value == .pattern_comprehension) {
+            if (try self.patternDemand(demand.input, row, demand.bounds)) |value| return self.listWindowConsumer(expression, value, row, group);
+        };
         return switch (expression.value) {
             .literal => |value| switch (value) {
                 .null => .null,
@@ -8341,7 +8510,7 @@ const Engine = struct {
                 } };
             },
             .reduce => |c| blk: {
-                var accumulator = try self.eval(c.initial, row, group);
+                const accumulator = try self.eval(c.initial, row, group);
                 const input = try self.eval(c.input, row, group);
                 if (input == .null) break :blk .null;
                 if (input != .list) return error.CypherTypeMismatch;
@@ -8351,12 +8520,10 @@ const Engine = struct {
                 self.projection_locals = &local;
                 const accumulator_local: @import("expressions.zig").Local = .{ .name = c.accumulator, .parent = &local };
                 self.projection_locals = &accumulator_local;
-                for (input.list) |item| {
-                    try self.state();
-                    const inner = try self.replace(try self.replace(row, c.accumulator, accumulator), c.alias, item);
-                    accumulator = try self.eval(c.projection, inner, null);
-                }
-                break :blk accumulator;
+                var fold: FoldState = .{ .initialized = true, .accumulator = accumulator };
+                defer fold.deinit();
+                for (input.list) |item| try fold.advance(self, c.projection, row, c.accumulator, c.alias, item, Count.one);
+                break :blk if (input.list.len == 0) accumulator else try fold.escape(self);
             },
             .comprehension => |c| blk: {
                 const input = try self.eval(c.input, row, group);
@@ -8457,7 +8624,7 @@ const Engine = struct {
             .call => |c| if (c.collection_extract) |extract|
                 try self.collectionExtract(extract, try self.eval(c.args[0], row, group))
             else if (std.ascii.eqlIgnoreCase(c.name, "size") and c.args.len == 1 and c.args[0].value == .pattern_comprehension and weightedExpression(c.args[0]))
-                try self.comprehensionSize(c.args[0], row)
+                (try self.patternDemand(c.args[0], row, null)) orelse try self.comprehensionSize(c.args[0], row)
             else if (aggregateName(c.name)) try self.aggregate(c, group orelse return error.CypherAggregateScope, null) else try self.function(c.name, c.args, row, group),
             .case_when => |c| blk: {
                 const operand = if (c.operand) |x| try self.eval(x, row, group) else null;
@@ -8483,6 +8650,107 @@ const Engine = struct {
             .window => |header| .{ .list = value.list[header + 1 ..][0..@intCast(value.list[header].integer)] },
             .cardinality => if (value.list[0].integer < 0) error.CypherNumericOverflow else value.list[0],
             .filtered => |slot| try @import("collection_summary.zig").unpack(self.a, value.list, .{ .value = value.list[1 + slot * 2], .code = value.list[2 + slot * 2].integer }),
+        };
+    }
+    const PatternConsumer = struct {
+        projection: *const ast.Expr,
+        cardinality: bool,
+        reducer: StreamingAggregate,
+        count: u64 = 0,
+        failure: ?anyerror = null,
+        embedding_failure: bool = false,
+        fn add(self: *@This(), engine: *Engine, row: Row, weight: Count) !void {
+            if (self.failure != null) return;
+            self.addInner(engine, row, weight) catch |err| {
+                if (!StreamingAggregate.consumerFailure(err)) return err;
+                self.failure = err;
+            };
+        }
+        fn addInner(self: *@This(), engine: *Engine, row: Row, weight: Count) !void {
+            try engine.state();
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            const scope = EvalScope.enter(engine, scratch.allocator());
+            defer scope.leave(engine);
+            const value = try engine.eval(self.projection, row, null);
+            if (self.cardinality) {
+                // A comprehension counts NULL projections too.
+                self.count = try addPathCount(self.count, weight.cap(std.math.maxInt(u64)));
+            } else {
+                _ = engine.values.info(.{ .list = &.{value} }) catch |err| blk: {
+                    if (err != error.CypherValueDepthExceeded) return err;
+                    self.embedding_failure = true;
+                    break :blk null;
+                };
+                try self.reducer.retainCollection(engine, value, weight, null);
+            }
+        }
+    };
+    fn patternDemand(self: *Engine, expression: *const ast.Expr, row: Row, demand: ?reduction_plan.Bounds) !?v.Value {
+        if (!self.read_only or !weightedExpression(expression)) return null;
+        const scope = PatternScope.enter(self);
+        defer scope.leave(self);
+        const comprehension = expression.value.pattern_comprehension;
+        var input = row;
+        if (comprehension.path.alias) |alias| {
+            var bindings: std.ArrayList(v.Entry) = .empty;
+            for (row) |entry| if (!std.mem.eql(u8, entry.name, alias)) try bindings.append(self.a, entry);
+            input = bindings.items;
+        }
+        const bounds = demand orelse reduction_plan.Bounds{};
+        var consumer: PatternConsumer = .{ .projection = comprehension.projection, .cardinality = demand == null, .reducer = .{
+            .function = .{ .name = "collect", .args = &.{comprehension.projection}, .collect_limit = bounds.prefix, .collect_suffix = bounds.suffix },
+            .arena = std.heap.ArenaAllocator.init(self.scratch_allocator),
+            .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator),
+        } };
+        defer consumer.reducer.deinit();
+        // Use the ordinary collection dependency/ordering proof. The sink owns
+        // finalization, but compressed routes must retain exactly these values.
+        const observer: ast.Expr = .{ .span = expression.span, .value = .{ .call = consumer.reducer.function } };
+        // Cardinality is insensitive to encounter order. Keep exact weighted
+        // endpoint bags, but decline symbolic/path-observing projections to the
+        // existing weighted dependency planner rather than expanding their DAG.
+        if (demand == null and !endpointExpression(comprehension.projection, comprehension.path, input)) return null;
+        const projection: ast.Projection = .{ .items = &.{.{ .expression = if (demand == null) comprehension.projection else &observer, .alias = "_pattern_consumer" }} };
+        const previous_demand = self.match_weight_demand;
+        defer self.match_weight_demand = previous_demand;
+        if (demand == null) self.match_weight_demand = .exact;
+        const columns = self.columns;
+        const stages = self.stages.items.len;
+        defer self.columns = columns;
+        defer self.stages.shrinkRetainingCapacity(stages);
+        if ((try self.streamMatchProjectionInto(&.{input}, null, .{ .paths = &.{comprehension.path}, .predicate = comprehension.predicate }, projection, &.{}, .{}, .{}, null, &consumer)) == null) return null;
+        // Matching/predicate failures always precede projection failures, as
+        // they do when the entire MATCH bag is produced before projection.
+        if (consumer.failure) |err| return err;
+        if (consumer.embedding_failure) return error.CypherValueDepthExceeded;
+        if (consumer.cardinality) return v.Value{ .integer = @intCast(consumer.count) };
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        var context: v.CloneContext = .{ .a = self.a, .scratch = scratch.allocator() };
+        return try context.clone(try consumer.reducer.finishWindow(self));
+    }
+    fn listWindowConsumer(self: *Engine, expression: *const ast.Expr, value: v.Value, row: Row, group: ?[]const Row) !v.Value {
+        return switch (expression.value) {
+            .call => |call_value| if (value.list.len == 0) .null else if (std.ascii.eqlIgnoreCase(call_value.name, "head")) value.list[0] else value.list[value.list.len - 1],
+            .index => |index| blk: {
+                const position = try self.eval(index.index, row, group);
+                if (position == .null) break :blk .null;
+                if (position != .integer) return error.CypherTypeMismatch;
+                const ordinal: i128 = if (position.integer < 0) @as(i128, value.list.len) + position.integer else position.integer;
+                break :blk if (ordinal < 0 or ordinal >= value.list.len) .null else value.list[@intCast(ordinal)];
+            },
+            .slice => |slice| blk: {
+                const first = if (slice.start) |bound| try self.eval(bound, row, group) else v.Value{ .integer = 0 };
+                const last = if (slice.end) |bound| try self.eval(bound, row, group) else v.Value{ .integer = @intCast(value.list.len) };
+                if (first == .null or last == .null) break :blk .null;
+                if (first != .integer or last != .integer) return error.CypherTypeMismatch;
+                const length: i128 = value.list.len;
+                const begin: usize = @intCast(std.math.clamp(if (first.integer < 0) length + first.integer else first.integer, 0, length));
+                const end: usize = @intCast(std.math.clamp(if (last.integer < 0) length + last.integer else last.integer, 0, length));
+                break :blk .{ .list = value.list[begin..@max(begin, end)] };
+            },
+            else => unreachable,
         };
     }
     fn comprehensionSize(self: *Engine, expression: *const ast.Expr, row: Row) anyerror!v.Value {
@@ -8553,9 +8821,9 @@ const Engine = struct {
         }
         if (op == .starts_with or op == .ends_with or op == .contains) {
             if (left != .string or right != .string) return .null;
-            if (op == .contains) return .{ .boolean = try self.strings.contains(left.string, right.string) };
+            if (op == .contains) return .{ .boolean = try self.stringInputWork(right).contains(left.string, right.string) };
             if (right.string.len > left.string.len) return .{ .boolean = false };
-            try self.strings.reserve(right.string.len, 1);
+            try self.stringWork().reserve(right.string.len, 1);
             return .{ .boolean = if (op == .starts_with) std.mem.startsWith(u8, left.string, right.string) else std.mem.endsWith(u8, left.string, right.string) };
         }
         if (op == .regex) {
@@ -8568,7 +8836,7 @@ const Engine = struct {
         if (op == .add and (left == .string or right == .string) and left != .list and right != .list) {
             const lhs = try self.scalarString(left);
             const rhs = try self.scalarString(right);
-            try self.strings.reserve(lhs.len +| rhs.len, 1);
+            try self.stringWork().reserve(lhs.len +| rhs.len, 1);
             return .{ .string = try std.fmt.allocPrint(self.a, "{s}{s}", .{ lhs, rhs }) };
         }
         if (op == .add and (left == .list or right == .list)) {
@@ -8626,20 +8894,9 @@ const Engine = struct {
             return .null;
         }
         if (std.ascii.eqlIgnoreCase(name, "range")) {
-            const start = try self.eval(args[0], row, group);
-            const end = try self.eval(args[1], row, group);
-            const step = if (args.len == 3) try self.eval(args[2], row, group) else v.Value{ .integer = 1 };
-            if (start == .null or end == .null or step == .null) return .null;
-            if (start != .integer or end != .integer or step != .integer) return error.CypherTypeMismatch;
-            if (step.integer == 0) return error.CypherInvalidRange;
-            const distance: i128 = @as(i128, end.integer) - start.integer;
-            if ((distance > 0 and step.integer < 0) or (distance < 0 and step.integer > 0)) return .{ .list = &.{} };
-            const length = std.math.cast(usize, @divTrunc(distance, step.integer) + 1) orelse return error.CypherStateBudgetExceeded;
-            if (length > self.limits.intermediate_states -| self.stats.intermediate_states) return error.CypherStateBudgetExceeded;
-            self.stats.intermediate_states += length;
-            const items = try self.a.alloc(v.Value, length);
-            for (items, 0..) |*item, i| item.* = .{ .integer = @intCast(@as(i128, start.integer) + @as(i128, step.integer) * i) };
-            return .{ .list = items };
+            const range_call: ast.Expr = .{ .span = .{}, .value = .{ .call = .{ .name = "range", .args = args } } };
+            const sequence = (try self.rangeInput(&range_call, row, group)) orelse return .null;
+            return self.rangeCells(sequence, 0, sequence.length);
         }
         if (std.ascii.eqlIgnoreCase(name, "substring")) {
             const text = try self.eval(args[0], row, group);
@@ -8648,7 +8905,7 @@ const Engine = struct {
             if (text == .null or start == .null or substring_length == .null) return .null;
             if (text != .string or start != .integer or substring_length != .integer) return error.CypherTypeMismatch;
             if (start.integer < 0 or substring_length.integer < 0) return error.CypherInvalidSubstring;
-            return .{ .string = try self.strings.substring(text.string, std.math.cast(usize, start.integer) orelse std.math.maxInt(usize), std.math.cast(usize, substring_length.integer) orelse std.math.maxInt(usize)) };
+            return .{ .string = try self.stringWork().substring(text.string, std.math.cast(usize, start.integer) orelse std.math.maxInt(usize), std.math.cast(usize, substring_length.integer) orelse std.math.maxInt(usize)) };
         }
         if (args.len != 1) return error.CypherFunctionArity;
         const value = try self.eval(args[0], row, group);
@@ -8673,11 +8930,11 @@ const Engine = struct {
                 return .{ .list = items };
             }
             if (value != .string) return error.CypherTypeMismatch;
-            return .{ .string = try self.strings.reverse(value.string) };
+            return self.stringResult(value, .{ .string = try self.stringInputWork(value).reverse(value.string) });
         }
         if (std.ascii.eqlIgnoreCase(name, "trim") or std.ascii.eqlIgnoreCase(name, "ltrim") or std.ascii.eqlIgnoreCase(name, "rtrim")) {
             if (value != .string) return error.CypherTypeMismatch;
-            return .{ .string = try self.strings.trim(value.string, !std.ascii.eqlIgnoreCase(name, "rtrim"), !std.ascii.eqlIgnoreCase(name, "ltrim")) };
+            return self.stringResult(value, .{ .string = try self.stringInputWork(value).trim(value.string, !std.ascii.eqlIgnoreCase(name, "rtrim"), !std.ascii.eqlIgnoreCase(name, "ltrim")) });
         }
         if (std.ascii.eqlIgnoreCase(name, "toString")) return switch (value) {
             .string => value,
@@ -8690,7 +8947,7 @@ const Engine = struct {
             .boolean => value,
             .integer => .{ .boolean = value.integer != 0 },
             .string => blk: {
-                const text = try self.strings.trim(value.string, true, true);
+                const text = try self.stringInputWork(value).trim(value.string, true, true);
                 break :blk if (std.ascii.eqlIgnoreCase(text, "true")) .{ .boolean = true } else if (std.ascii.eqlIgnoreCase(text, "false")) .{ .boolean = false } else .null;
             },
             else => error.CypherTypeMismatch,
@@ -8700,7 +8957,7 @@ const Engine = struct {
             if (integer and value == .integer) return value;
             if (integer and value == .boolean) return .{ .integer = @intFromBool(value.boolean) };
             if (value != .integer and value != .number and value != .string) return error.CypherTypeMismatch;
-            if (value == .string) return if (integer) self.strings.integer(value.string) else self.strings.float(value.string);
+            if (value == .string) return if (integer) self.stringInputWork(value).integer(value.string) else self.stringInputWork(value).float(value.string);
             const number = try value.numeric();
             if (!std.math.isFinite(number)) return .null;
             if (!integer) return .{ .number = number };
@@ -8750,7 +9007,7 @@ const Engine = struct {
         }
         if (std.ascii.eqlIgnoreCase(name, "size")) return .{ .integer = @intCast(switch (value) {
             .list => |l| l.len,
-            .string => |s| try self.strings.size(s),
+            .string => |s| try self.stringInputWork(value).size(s),
             else => return error.CypherTypeMismatch,
         }) };
         if (std.ascii.eqlIgnoreCase(name, "head") or std.ascii.eqlIgnoreCase(name, "last")) {
@@ -8759,11 +9016,11 @@ const Engine = struct {
         }
         if (std.ascii.eqlIgnoreCase(name, "toLower")) {
             if (value != .string) return error.CypherTypeMismatch;
-            return .{ .string = try self.strings.caseConvert(value.string, false) };
+            return self.stringResult(value, .{ .string = try self.stringInputWork(value).caseConvert(value.string, false) });
         }
         if (std.ascii.eqlIgnoreCase(name, "toUpper")) {
             if (value != .string) return error.CypherTypeMismatch;
-            return .{ .string = try self.strings.caseConvert(value.string, true) };
+            return self.stringResult(value, .{ .string = try self.stringInputWork(value).caseConvert(value.string, true) });
         }
         if (std.ascii.eqlIgnoreCase(name, "abs")) return if (value == .integer) .{ .integer = std.math.cast(i64, @abs(value.integer)) orelse return error.CypherNumericOverflow } else .{ .number = @abs(try value.numeric()) };
         return error.UnknownCypherFunction;
@@ -8935,7 +9192,7 @@ const Engine = struct {
         fn enter(engine: *Engine, a: A) EvalScope {
             const scope: EvalScope = .{ .a = engine.a, .values = engine.values, .strings = engine.strings, .regex = engine.regex, .reads = engine.read_nodes, .cache_reads = engine.cache_reads };
             engine.a = a;
-            engine.values = .{ .a = a, .ptr = engine, .charge = chargeWork, .parent = if (engine.invariants) |state_value| &state_value.work else null };
+            engine.values = .{ .a = a, .ptr = engine, .charge = chargeWork, .parent = if (engine.scalarOwner()) |state_value| &state_value.work else null };
             engine.strings = .{ .a = a, .ptr = engine, .charge = chargeWork };
             engine.regex = .{ .a = a, .scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator) };
             engine.read_nodes = .empty;

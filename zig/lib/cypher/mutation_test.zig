@@ -1397,3 +1397,31 @@ test "native pair pages merge clean document replacements across producer retire
         try std.testing.expectEqual(@as(usize, if (age == 0) 0 else 1), count);
     }
 }
+
+test "write folds cache closed scalar work locally without crossing deleted entity epochs" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var diagnostic: root.compiler.Diagnostic = .{};
+    var compiled = try root.compiler.compile(std.testing.allocator, "CREATE(n:Person {id:'cache'}) RETURN reduce(s=0,i IN range(1,1000)|s+size(toLower($word)))", .{}, &diagnostic);
+    defer compiled.deinit();
+    const word: [16384]u8 = @splat('A');
+    var result = try root.runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "word", .value = .{ .string = &word } }}, .{ .intermediate_states = 50000, .memory_bytes = 8 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 16384000), result.rows[0][0].integer);
+    var deletion = try root.compiler.compile(std.testing.allocator, "WITH $entity AS n,reduce(s=0,i IN range(1,3)|s+size(keys($entity))) AS before DELETE n RETURN before,reduce(s=0,i IN range(1,3)|s+size(keys($entity)))", .{}, &diagnostic);
+    defer deletion.deinit();
+    try std.testing.expectError(error.CypherDeletedEntity, root.runtime.execute(std.testing.allocator, fixture.backend(), graph, &deletion, &.{.{ .name = "entity", .value = .{ .node = fixture.nodes[0] } }}, .{}));
+    try std.testing.expectEqual(@as(usize, 1), fixture.nodes.len);
+    const Campaign = struct {
+        fn run(a: A) !void {
+            var state = Fixture.init();
+            defer state.arena.deinit();
+            var diag: root.compiler.Diagnostic = .{};
+            var query = try root.compiler.compile(a, "CREATE(n:Person {id:'fold'}) RETURN reduce(s='',i IN range(1,3)|s+toLower($word))", .{}, &diag);
+            defer query.deinit();
+            var value = try root.runtime.execute(a, state.backend(), graph, &query, &.{.{ .name = "word", .value = .{ .string = "AbC" } }}, .{});
+            defer value.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}

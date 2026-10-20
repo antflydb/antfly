@@ -4838,3 +4838,109 @@ def test_streaming_collection_consumers_match_materialized_entity_and_weighted_i
         fused = db.cypher_json("g", {"query": prefix + "RETURN " + projection})
         materialized = db.cypher_json("g", {"query": prefix + "RETURN " + projection + ",xs"})
         assert fused["rows"] == [row[:-1] for row in materialized["rows"]]
+
+
+def test_invariant_scalar_work_survives_recycled_fold_and_window_scopes(graph_db):
+    db = graph_db
+    word = "A" * 16384
+    for query in (
+        "RETURN reduce(s=0,x IN range(1,1000)|s+size(toLower($word)))",
+        "WITH $word AS text RETURN reduce(s=0,x IN range(1,1000)|s+size(toLower(text)))",
+        "CREATE(n:D {id:'fold_alias'}) WITH $word AS text RETURN reduce(s=0,x IN range(1,1000)|s+size(toLower(text)))",
+        "CREATE(n:D {id:'fold'}) RETURN reduce(s=0,x IN range(1,1000)|s+size(toLower($word)))",
+        "UNWIND range(1,1000) AS x WITH collect(x) AS xs RETURN reduce(s=0,y IN xs|s+size(toLower($word)))",
+    ):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": query,
+                "parameters": {"word": word},
+                "limits": {"intermediate_states": 50000, "memory_bytes": 8 << 20},
+            },
+        )
+        assert int(result["rows"][0][0]["value"]) == 1000 * len(word)
+    result = db.cypher_json(
+        "g",
+        {
+            "query": "UNWIND range(1,1000) AS x WITH collect(x) AS xs RETURN head([y IN xs | toLower($word)])",
+            "parameters": {"word": word},
+            "limits": {"intermediate_states": 50000, "memory_bytes": 8 << 20},
+        },
+    )
+    assert result["rows"][0][0]["value"] == word.lower()
+
+
+def test_general_fold_reclaims_history_and_range_consumers_do_not_materialize(graph_db):
+    db = graph_db
+    result = db.cypher_json(
+        "g",
+        {"query": "RETURN size(reduce(s='',x IN range(1,5000)|s+'x'))", "limits": {"memory_bytes": 8 << 20}},
+    )
+    assert int(result["rows"][0][0]["value"]) == 5000
+    result = db.cypher_json(
+        "g",
+        {
+            "query": "RETURN head(range($a,$b)),last(range($a,$b)),size(range($a,$b)),range($a,$b)[100..102],range($a,$b)[-1]",
+            "parameters": {"a": 1, "b": 300000},
+            "limits": {"memory_bytes": 1 << 20, "intermediate_states": 1000},
+        },
+    )
+    cells = result["rows"][0]
+    assert [int(cell["value"]) for cell in cells[:3]] == [1, 300000, 300000]
+    assert [int(cell["value"]) for cell in cells[3]["value"]] == [101, 102]
+    assert int(cells[4]["value"]) == 300000
+
+
+def test_pattern_window_and_cardinality_sinks_do_not_retain_match_payloads(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 1500, 4092, unique=True)
+    with db.open_table("payloads") as table:
+        table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "payloads",
+            "expected_revision": "1",
+            "definition": {
+                "labels": [{"name": "W", "table": "payloads"}],
+                "relationships": [
+                    {"name": "R", "index": "links", "source_label": "W", "target_label": "W", "stored_type": "r"}
+                ],
+            },
+        }
+    )
+    for start in range(1, 1500, 250):
+        db.cypher_json(
+            "payloads",
+            {
+                "query": f"MATCH(a:W),(b:W) WHERE antfly.documentKey(a)='n0' AND b.score>={start} AND b.score<{start + 250} CREATE(a)-[:R]->(b)"
+            },
+        )
+    expected = db.cypher_json(
+        "payloads",
+        {
+            "query": "MATCH(a:W) WHERE antfly.documentKey(a)='n0' MATCH(a)-[:R]->(b:W) RETURN head(collect(b.payload)),last(collect(b.payload)),collect(b.payload)[-2..-1]",
+            "limits": {"memory_bytes": 8 << 20},
+        },
+    )["rows"][0]
+    prefix = "MATCH(a:W) WHERE antfly.documentKey(a)='n0' RETURN "
+    for index, tail in enumerate(
+        (
+            "head([(a)-[:R]->(b:W)|b.payload])",
+            "last([(a)-[:R]->(b:W)|b.payload])",
+            "[(a)-[:R]->(b:W)|b.payload][-2..-1]",
+            "size([(a)-[:R]->(b:W)|b.payload])",
+            "size([(a)-[:R]->(b:W)|null])",
+        )
+    ):
+        response = db.cypher_json("payloads", {"query": prefix + tail, "limits": {"memory_bytes": 8 << 20}})
+        cell = response["rows"][0][0]
+        if index < 3:
+            assert cell == expected[index]
+        if tail.startswith("size"):
+            assert int(cell["value"]) == 1499
+        elif cell["type"] == "list":
+            assert len(cell["value"]) == 1
+            assert len(cell["value"][0]["value"]) == 4092
+        else:
+            assert len(cell["value"]) == 4092

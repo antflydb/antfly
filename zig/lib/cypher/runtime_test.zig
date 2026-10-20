@@ -665,7 +665,7 @@ test "unique grouping DISTINCT aggregates projections and UNION use linear work"
     }
 }
 
-test "repeated string predicates pay each scan while immutable Unicode functions reuse analysis" {
+test "row dependent string predicates pay each scan while immutable Unicode functions reuse analysis" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const text = try arena.allocator().alloc(u8, 400_000);
@@ -678,9 +678,9 @@ test "repeated string predicates pay each scan while immutable Unicode functions
     defer result.deinit();
     try std.testing.expectEqual(@as(i64, 400_000_000), result.rows[0][0].integer);
     for ([_][]const u8{
-        "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS 'z' THEN 1 ELSE 0 END)",
-        "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s STARTS WITH $s THEN 1 ELSE 0 END)",
-        "RETURN reduce(a=0,i IN range(1,1000)|a+size(substring($s,1)))",
+        "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS toString(i) THEN 1 ELSE 0 END)",
+        "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN ($s+toString(i)) STARTS WITH $s THEN 1 ELSE 0 END)",
+        "RETURN reduce(a=0,i IN range(1,1000)|a+size(substring($s,i)))",
     }) |query| {
         var scanned = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
         defer scanned.deinit();
@@ -3933,4 +3933,122 @@ test "streaming consumer plans specialize parameters independently for repeated 
         }
     }
     try std.testing.expectEqual(@as(usize, 0), compiled.query.clauses[1].operation.project.value.items[0].expression.value.call.collect_filters.len);
+}
+
+test "bounded pattern consumers agree with materialization and keep projection error precedence" {
+    try check("MATCH(a:Document {id:'a'}) RETURN head([(a)-[r:CITES]->(b)|r.weight]),last([(a)-[r:CITES]->(b)|r.weight]),[(a)-[r:CITES]->(b)|r.weight][-2..-1]", "[[1,2,[1]]]");
+    try check("MATCH(a:Document {id:'a'}) RETURN head([(a)-[:CITES]->(b)|b.title]),last([(a)-[:CITES]->(b)|b.title]),size([(a)-[:CITES]->(b)|null])", "[[\"Beta\",\"Beta\",2]]");
+    try check("MATCH(a:Document {id:'a'}) RETURN [(a)-[:CITES]->(b)|b.rank][-2..-1],[(a)-[:CITES]->(b)|null][0],size([(a)<-[:CITES]-(b)|b])", "[[[2],null,1]]");
+    try check("MATCH(a:Document {id:'a'}) RETURN size([(a)-[:CITES*1..3]->(b)|null])", "[[8]]");
+    try check("MATCH(a:Document {id:'a'}) RETURN CASE WHEN true THEN 7 ELSE head([(a)-[:CITES]->(b)|1/0]) END", "[[7]]");
+    var diagnostic: c.Diagnostic = .{};
+    for ([_][]const u8{
+        "MATCH(a:Document {id:'a'}) RETURN head([(a)-[:CITES]->(b)|1/0])",
+        "MATCH(a:Document {id:'a'}) RETURN [(a)-[:CITES]->(b)|1/0][..0]",
+        "MATCH(a:Document {id:'a'}) RETURN size([(a)-[:CITES]->(b)|1/0])",
+    }) |text| {
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+    for ([_][]const u8{
+        "MATCH(a:Document {id:'a'}) RETURN head([(a)-[r:CITES]->(b) WHERE CASE WHEN r.weight=1 THEN true ELSE 1/0>0 END | true+1])",
+        "MATCH(a:Document {id:'a'}) RETURN size([(a)-[r:CITES]->(b) WHERE CASE WHEN r.weight=1 THEN true ELSE 1/0>0 END | true+1])",
+    }) |text| {
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "range consumers are bounded and preserve dynamic null errors and inclusive arithmetic" {
+    try check("RETURN head(range(1,300000)),last(range(1,300000)),size(range(1,300000)),range(1,300000)[100..102]", "[[1,300000,300000,[101,102]]]");
+    try check("RETURN range(5,-5,-3)[-1],range(5,-5,-3)[-2..],range(5,-5,-3)[4],range(5,-5,-3)[8..1]", "[[-4,[-1,-4],null,[]]]");
+    try check("RETURN head(range(2,1)),last(range(null,1)),size(range(1,null)),range(1,3)[null],range(null,3)[1..2]", "[[null,null,null,null,null]]");
+    try check("RETURN head(range(-9223372036854775808,9223372036854775807)),last(range(-9223372036854775808,9223372036854775807)),range(-9223372036854775808,9223372036854775807)[-1..]", "[[-9223372036854775808,9223372036854775807,[9223372036854775807]]]");
+    const Case = struct { query: []const u8, err: anyerror };
+    for ([_]Case{
+        .{ .query = "RETURN head(range(1,2,0))", .err = error.CypherInvalidRange },
+        .{ .query = "RETURN range(null,2)[1/0]", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN range(null,2)[1/0..2]", .err = error.CypherDivisionByZero },
+        .{ .query = "RETURN range(1,2)[true]", .err = error.CypherTypeMismatch },
+        .{ .query = "RETURN size(range(-9223372036854775808,9223372036854775807))", .err = error.CypherNumericOverflow },
+    }) |case| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(case.err, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "scalar invariants and general folds use independent ownership and preserve lazy errors" {
+    try check("RETURN size(reduce(s='',x IN range(1,5000)|s+'x'))", "[[5000]]");
+    try check("WITH 10 AS k RETURN reduce(s=0,x IN [1,2,3] | s+x+k)", "[[36]]");
+    try check("RETURN reduce(s=[1],x IN [2,3] | [s,s])=reduce(s=[1],x IN [2,3] | [s,s])", "[[true]]");
+}
+
+test "invariant scalar results are lazy and owned independently for each prepared invocation" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND range(1,1000) AS x WITH collect(x) AS xs RETURN reduce(s=0,y IN xs|s+size(toLower($word))),CASE WHEN $safe THEN 7 ELSE size(toLower(1/0)) END", .{}, &diagnostic);
+    defer compiled.deinit();
+    const wide: [16384]u8 = @splat('A');
+    for ([_][]const u8{ &wide, "BcD", &wide }) |word| {
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{
+            .{ .name = "word", .value = .{ .string = word } },
+            .{ .name = "safe", .value = .{ .boolean = true } },
+        }, .{ .intermediate_states = 50000, .memory_bytes = 8 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, @intCast(word.len * 1000)), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 7), result.rows[0][1].integer);
+    }
+    try std.testing.expect(compiled.query.clauses[2].operation.project.value.items[0].expression.execution_invariant == null);
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{
+        .{ .name = "word", .value = .{ .string = "x" } },
+        .{ .name = "safe", .value = .{ .boolean = false } },
+    }, .{}));
+}
+
+test "range descriptors generic folds and pattern sinks release every failed allocation" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator, text: []const u8) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    inline for (.{
+        "RETURN reduce(s={v:'start'},x IN range(1,3)|{v:s.v+'!'}),range(1,300000)[-3..-1]",
+        "MATCH(a:Document {id:'a'}) RETURN head([(a)-[:CITES]->(b)|b.title]),size([(a)-[:CITES*1..3]->(b)|null])",
+        "RETURN size(toLower('AbC')),CASE WHEN true THEN 7 ELSE size(toLower(1/0)) END",
+    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as([]const u8, text)});
+}
+
+test "immutable string aliases retain analysis and borrowed fold results escape safely" {
+    const word: [400000]u8 = @splat('X');
+    for ([_][]const u8{
+        "WITH $word AS text RETURN reduce(s=0,i IN range(1,1000)|s+size(ltrim(text)))",
+        "WITH $word AS text RETURN reduce(s=0,i IN range(1,1000)|s+size(toLower(text)))",
+        "RETURN size(reduce(s=$word,i IN range(1,1000)|ltrim(s)))*1000",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "word", .value = .{ .string = &word } }}, .{ .intermediate_states = 50000, .memory_bytes = 8 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 400000000), result.rows[0][0].integer);
+    }
+    try check("RETURN reduce(s=0,i IN range(1,3)|'done'),reduce(s=[],i IN [1,2]|[3,4])", "[[\"done\",[3,4]]]");
 }

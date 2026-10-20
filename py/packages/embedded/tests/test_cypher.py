@@ -967,7 +967,7 @@ def test_bulk_mutations_and_string_scans_share_the_statement_budget(require_nati
             database.cypher_json(
                 "g",
                 {
-                    "query": "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS 'z' THEN 1 ELSE 0 END)",
+                    "query": "RETURN reduce(a=0,i IN range(1,1000)|a+CASE WHEN $s CONTAINS toString(i) THEN 1 ELSE 0 END)",
                     "parameters": {"s": text},
                     "limits": {"intermediate_states": 30000},
                 },

@@ -1946,6 +1946,40 @@ every original COLLECT argument continues to evaluate. SINGLE caps true
 multiplicity at two, including promoted weighted bags; empty inputs and unknown
 answers retain ordinary Cypher semantics.
 
+Ordinary REDUCE expressions share the collection fold's bounded accumulator
+ownership and per-transition scratch lifetime. Each ownership transfer preserves
+immutable DAG sharing and transfers root structural metadata into an accumulator
+cache that expires with that allocation. Obsolete accumulator values, metadata
+and temporary row environments are released after each transition. Closed,
+repeatable scalar subexpressions are identified by invocation-local plan IDs and
+cached in independently owned statement storage on first reached evaluation.
+String analysis/conversion caches also follow proven immutable input allocations
+through aliases; dynamic strings remain in recyclable scopes. Folds borrow
+already immutable results instead of cloning them on every transition. These
+immutable caches survive recycled fold/window/traversal scopes without retaining
+transient input addresses; errors remain lazy and prepared executions
+never share parameter-dependent values. Writes confine invariant storage to one fold invocation, so entity-dependent
+values never cross mutation stages.
+
+Direct HEAD/LAST, SIZE, index and slice consumers of RANGE use a checked arithmetic
+sequence descriptor. Range arguments evaluate once in their original order;
+NULLs, noninteger arguments, zero steps, descending and empty ranges preserve
+normal semantics. Point/cardinality consumers allocate no element list. Slices
+retain and charge only selected elements, and ordinary range materialization is
+still governed by the work and allocation budgets. Cardinalities outside signed
+integer output range report numeric overflow; endpoint access can handle the full
+signed integer domain without constructing it.
+
+Bounded pattern-comprehension windows and endpoint-local cardinalities feed
+projection sinks directly from the MATCH pipeline. Cardinalities retain exact
+weighted endpoint bags; windows retain the ordinary collection ordering proof
+and independently owned front/back runs. All matching predicates and required
+projections still evaluate. Scalar projection failures are deferred until MATCH
+finishes so later matching failures retain precedence; resource and cancellation
+failures propagate immediately. Symbolic/path-observing cardinalities and
+unsupported nested scopes keep the existing weighted dependency/materialization
+fallbacks rather than expanding compressed route bags.
+
 Invocation-local integer parameter bounds specialize front/back retention without
 replacing the original bound expressions. Invalid, NULL, missing and unproved
 bounds retain their original evaluation behavior. Private annotations and stable

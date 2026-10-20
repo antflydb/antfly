@@ -335,18 +335,18 @@ const BoundSpecialization = struct {
                 }
             };
             expression.value = try self.lower(value.value);
-            if (expression.value == .binary and expression.value.binary.op == .in) {
-                const right = expression.value.binary.right;
-                if (!expressions.aggregates(right) and expressions.rowLocal(right, struct {
-                    pub fn permits(_: @This(), _: []const u8) bool {
-                        return false;
-                    }
-                }{})) {
-                    const owned = try self.a.create(ast.Expr);
-                    owned.* = right.*;
-                    owned.execution_invariant = @intCast(try self.invariants.intern(self.a, right, self.invariants.entries.items.len));
-                    expression.value.binary.right = owned;
+            // Closed repeatable expressions are evaluated lazily at their
+            // original position, then owned for this invocation. Never hoist
+            // a failure or cache a row-dependent allocation by its address.
+            if (expression.value != .literal and expression.value != .parameter and !expressions.aggregates(value) and expressions.rowLocal(value, struct {
+                pub fn permits(_: @This(), _: []const u8) bool {
+                    return false;
                 }
+            }{})) {
+                const owned = try self.a.create(ast.Expr);
+                owned.* = expression;
+                owned.execution_invariant = @intCast(try self.invariants.intern(self.a, owned, self.invariants.entries.items.len));
+                return owned;
             }
             if (std.meta.eql(expression, value.*)) return value;
             const result = try self.a.create(ast.Expr);

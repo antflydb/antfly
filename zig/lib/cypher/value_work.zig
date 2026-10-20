@@ -185,6 +185,12 @@ pub const Work = struct {
         if (cache_key) |k| try self.cache.put(self.a, k, result);
         return result;
     }
+    /// Transfer root metadata with an ownership clone. The caller proves that
+    /// both roots have identical contents and owns this cache for that clone's
+    /// lifetime; source allocation addresses never enter the new cache.
+    pub fn remember(self: *Work, value: v.Value, metadata: Info) !void {
+        if (key(value)) |cache_key| try self.cache.put(self.a, cache_key, metadata);
+    }
     pub fn traversal(self: *Work, value: v.Value) !void {
         try self.charge(self.ptr, (try self.info(value)).work);
     }

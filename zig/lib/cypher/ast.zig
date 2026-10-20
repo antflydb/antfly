@@ -26,7 +26,7 @@ pub const Expr = struct {
     /// Invocation-local bound inference. Evaluation still reads the original
     /// expression; prepared/public ASTs never contain parameter values.
     execution_integer: ?i64 = null,
-    /// Stable invocation-local ownership key for a proved invariant IN RHS.
+    /// Stable invocation-local ownership key for a proved closed repeatable value.
     execution_invariant: ?u64 = null,
     value: union(enum) {
         literal: Value,
