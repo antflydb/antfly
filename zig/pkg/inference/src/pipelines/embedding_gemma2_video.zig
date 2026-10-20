@@ -1651,8 +1651,14 @@ pub const Prefetch = struct {
             };
             poll_row = (poll_row + 1) % producers.len;
             var ready_mask: [8]bool = @splat(false);
-            for (jobs[0..count], 0..) |job, index| ready_mask[index] = switch (job) {
-                .metal => |value| try value.prepared.isReady(),
+            for (jobs[0..count], 0..) |*job, index| ready_mask[index] = switch (job.*) {
+                .metal => |*value| ready: {
+                    if (!try value.prepared.isReady()) break :ready false;
+                    // Return command/surface credit before acquiring the model
+                    // lane. Only the immutable patch output waits for inference.
+                    try value.prepared.releaseSource();
+                    break :ready true;
+                },
                 .header => unreachable,
                 else => true,
             };
@@ -2593,6 +2599,10 @@ const Capture = struct {
         if (host_count == 0) return self.projectGpuBatchNow(gpu[0..gpu_count]);
         if (gpu_count == 0) return self.projectHostBatchNow(host[0..host_count]);
         defer for (jobs) |*job| if (job.* == .metal) job.metal.prepared.deinit();
+        for (jobs) |*job| if (job.* == .metal) {
+            try job.metal.prepared.wait(self.io orelse return error.MissingVideoIo, self.control);
+            try job.metal.prepared.releaseSource();
+        };
         const options = Prefetch.jobOptions(jobs[0]);
         var first: usize = 0;
         while (first < jobs.len) {
@@ -2643,6 +2653,13 @@ const Capture = struct {
             const required = self.preparedVision();
             const geometry_capacity = if (required) try projector.embeddingGemma2VideoPreparedCapacity(options.width, options.height, 768 * 1024 * 1024) else try projector.embeddingGemma2VideoBatchCapacity(options.width, options.height, 768 * 1024 * 1024);
             var ceiling = @min(ready - first, geometry_capacity);
+            // Shrink completed preparation leases before tower admission. This
+            // path also serves the standalone projection worker, without the
+            // cohort ready-queue scan above.
+            for (jobs[first..][0..ceiling]) |*job| {
+                try job.prepared.wait(self.io orelse return error.MissingVideoIo, self.control);
+                try job.prepared.releaseSource();
+            }
             // Admission precedes imports, allocation and consumption. Re-select
             // against a reduced live ceiling, so pressure cannot trap learning
             // at an unobserved larger width while a faster small width is known.
@@ -2756,6 +2773,7 @@ const Capture = struct {
         if (comptime build_options.enable_metal) {
             const io = self.io orelse return error.MissingVideoIo;
             try prepared.wait(io, self.control);
+            try prepared.releaseSource();
             const input = try MetalCompute.importVideoBufferSpan(self.cb, try prepared.buffer(), prepared.output_byte_offset, prepared.geometry.values());
             defer self.cb.free(input);
             // Give sole ownership to inference before runtime reuse can occur.
@@ -4335,6 +4353,73 @@ test "embeddinggemma2 Metal final patch slab imports contiguous frames and nonze
     try std.testing.expectEqualSlices(f32, values[g.values()..], last);
     try std.testing.expectError(error.MetalPreparationFailed, preparer.submitRgba(a, &white, 48, 48, options, .{}));
     try std.testing.expectEqual(baseline, pool.snapshot());
+}
+
+test "embeddinggemma2 video completed preparations return staging and command credit before tower admission" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const metal = @import("../ops/metal_compute.zig");
+    const hosted = @import("../ops/gpu_hosted_store.zig");
+    const a = std.testing.allocator;
+    var store = hosted.WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer {
+        metal.deinitPrefetchQueue(&store);
+        store.lazy_weights.deinit(a);
+    }
+    metal.initPrefetchQueue(&store, a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    if (!cb.decoderRuntimeReady()) return error.SkipZigTest;
+    const Hook = struct {
+        pool: *media.admission.Pool,
+        expected_bytes: u64,
+        calls: usize = 0,
+        fn reserve(raw: *anyopaque, _: ?usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u64, 0), self.pool.snapshot().commands);
+            try std.testing.expectEqual(self.expected_bytes, self.pool.snapshot().device_bytes);
+            return error.UnsupportedPrimitiveOp;
+        }
+        fn unused(_: *anyopaque) !void {
+            return error.UnexpectedStageCall;
+        }
+        fn cleanup(_: *anyopaque) void {}
+    };
+    for ([_]bool{ false, true }) |slab| {
+        var pool = media.admission.Pool{ .limits = .{ .device_bytes = 64 * 1024 * 1024, .commands = 2 } };
+        var preparer = try video.preparation.Metal.init(try MetalCompute.videoDevice(&cb));
+        defer preparer.deinit();
+        const options = video.preparation.Options{ .width = 48, .height = 48, .matrix = .bt601, .torchvision = true, .admission_pool = &pool };
+        const span = (try video.preparation.geometry(48, 48, options)).values() * @sizeOf(f32);
+        if (slab) try preparer.admitOutputSlab(&pool, 2 * span);
+        const baseline = pool.snapshot();
+        const pixels: [48 * 48 * 4]u8 = @splat(127);
+        var jobs: [2]ProjectionJob = undefined;
+        var made: usize = 0;
+        errdefer for (jobs[0..made]) |*job| job.prepared.deinit();
+        for (&jobs, 0..) |*job, i| {
+            job.* = .{ .slot = i, .options = options, .prepared = try preparer.submitRgba(a, &pixels, 48, 48, options, .{}) };
+            made += 1;
+        }
+        try jobs[0].prepared.wait(std.testing.io, .{});
+        try jobs[0].prepared.releaseSource();
+        const gpu_seconds = try jobs[0].prepared.gpuSeconds();
+        try jobs[0].prepared.releaseSource();
+        try std.testing.expectEqual(gpu_seconds, try jobs[0].prepared.gpuSeconds());
+        const patches = try jobs[0].prepared.readback(a);
+        defer a.free(patches);
+        for (patches) |v| try std.testing.expectApproxEqAbs(@as(f32, 127.0 / 127.5 - 1), v, 1e-6);
+        var hook = Hook{ .pool = &pool, .expected_bytes = baseline.device_bytes + if (slab) @as(u64, 0) else 2 * std.mem.alignForward(usize, span, 16384) };
+        const stage = @import("../ops/ops.zig").EmbeddingStageControl{ .ptr = &hook, .pause_fn = Hook.unused, .resume_fn = Hook.unused, .cleanup_fn = Hook.cleanup, .workspace_fn = Hook.reserve };
+        cb.embedding_stage = &stage;
+        defer cb.embedding_stage = null;
+        var capture = Capture{ .a = a, .cb = &cb, .track = undefined, .control = .{}, .output = &.{}, .frame_tokens = &.{}, .selected = &.{}, .io = std.testing.io };
+        made = 0; // Projection consumes every preparation on failure too.
+        try std.testing.expectError(error.UnsupportedPrimitiveOp, capture.projectGpuBatchNow(&jobs));
+        try std.testing.expectEqual(@as(usize, 1), hook.calls);
+        try std.testing.expectEqual(baseline, pool.snapshot());
+    }
 }
 
 test "embeddinggemma2 video cache admission removes only pinned unique preparation misses" {

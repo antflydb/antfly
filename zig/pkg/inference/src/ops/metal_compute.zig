@@ -16770,7 +16770,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn bindVisionWorkspace(workspace: *@import("metal_embedding_bindings.zig").VisionWorkspace, spec: ops.EmbeddingVisionSpec) !void {
         if (std.meta.eql(workspace.spec, spec)) return;
         std.debug.assert(spec.rows <= workspace.capacity_rows);
-        const tile = @min(spec.rows, 512);
+        const tile = @import("embedding_vision_plan.zig").tileRows(spec.rows, workspace.tile_capacity);
         for (workspace.views[0..11], 0..) |ct, i| {
             const rows = if (i == 8 or i == 9) tile else spec.rows;
             const width = if (i == 4) 3 * spec.hidden else if (i == 8) 2 * spec.intermediate else if (i == 9) spec.intermediate else spec.hidden;
@@ -16786,10 +16786,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
     fn prepareVisionWorkspace(self: *MetalCompute, spec: ops.EmbeddingVisionSpec, clock: u64) !*@import("metal_embedding_bindings.zig").VisionWorkspace {
         const Workspace = @import("metal_embedding_bindings.zig").VisionWorkspace;
-        const tile: usize = @min(spec.rows, 512);
+        const plan = @import("embedding_vision_plan.zig");
+        var tile = plan.tileCapacity(spec.rows, spec.hidden, spec.intermediate) catch return error.AudioScheduleAdmission;
         // Four hidden regions, packed QKV, three prepared heads and FFN down.
         // Each range has an explicit last-use; private writes follow queue order.
-        const bytes = @import("embedding_vision_plan.zig").arenaBytes(spec.rows, spec.hidden, spec.intermediate) catch return error.AudioScheduleAdmission;
         const cache = if (self.data.tier_cache) |*v| v else return error.AudioScheduleAdmission;
         self.data.prefetch.lock();
         cache.reserve(.host, @sizeOf(Workspace)) catch |err| {
@@ -16804,13 +16804,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.data.prefetch.unlock();
             return err;
         };
-        workspace.* = .{ .spec = spec, .capacity_rows = spec.rows, .stamp = clock, .tile = tile };
+        workspace.* = .{ .spec = spec, .capacity_rows = spec.rows, .tile_capacity = tile, .stamp = clock, .tile = tile };
         workspace.owner.outputs = workspace.views[0..11];
         errdefer {
             self.dropVisionWorkspace(workspace);
         }
-        var storage = (try self.audioPlanBuffer(&workspace.owner, bytes, false)) orelse return error.AudioScheduleAdmission;
+        // Admit immutable coefficients first, so optional wider scratch cannot
+        // consume their last bytes and force a viable narrow plan to decline.
+        const coefficients = try self.prepareVisionCoefficients();
+        var storage = while (true) {
+            const bytes = try plan.arenaBytesForTile(spec.rows, spec.hidden, spec.intermediate, tile);
+            const allocated = self.audioPlanBuffer(&workspace.owner, bytes, false) catch |err| switch (err) {
+                error.OutOfMemory, error.MetalBufferAllocFailed => null,
+                else => return err,
+            };
+            if (allocated) |buffer| break buffer;
+            const minimum = @min(spec.rows, plan.minimum_tile);
+            if (tile == minimum) return error.AudioScheduleAdmission;
+            // Admission denial rolls back every attempted charge. Prefer a
+            // smaller retained tile to evicting warm weights or falling back.
+            tile = @max(minimum, tile / 2);
+        };
         defer storage.deinit();
+        workspace.tile = tile;
+        workspace.tile_capacity = tile;
         var offset: usize = 0;
         for (workspace.views[0..11], 0..) |*dest, i| {
             const rows = if (i == 8 or i == 9) tile else spec.rows;
@@ -16824,7 +16841,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             toBuf(ct).persistent_model = true;
             dest.* = ct;
         }
-        const coefficients = try self.prepareVisionCoefficients();
         @memcpy(workspace.views[11..], &coefficients.views);
         self.provider_impl.embedding_vision_workspace_builds += 1;
         return workspace;
@@ -47520,7 +47536,7 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
                 try std.testing.expectEqual(coefficient, bound.views[11].?);
                 try std.testing.expectEqual(rows, bound.spec.rows);
                 try std.testing.expectEqual(rows * 768, MetalCompute.denseDeviceF32(bound.views[0].?).?.elemCount());
-                try std.testing.expectEqual(@as(usize, @min(rows, 512)) * 6144, MetalCompute.denseDeviceF32(bound.views[8].?).?.elemCount());
+                try std.testing.expectEqual(@import("embedding_vision_plan.zig").tileRows(rows, bound.tile_capacity) * 6144, MetalCompute.denseDeviceF32(bound.views[8].?).?.elemCount());
             }
             try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, null);
         }
@@ -47528,6 +47544,94 @@ test "embeddinggemma2 Metal vision workspace survives wrappers bounds retention 
     const p = store.shared_metal_native_provider.?;
     try std.testing.expect(try p.reclaimEmbeddingGemma2Weights(.vision) > 0);
     for (p.embedding_vision_workspaces) |entry| try std.testing.expect(entry == null);
+    {
+        // 1025-row wide FFN scratch exceeds this cache budget; the original
+        // 512-row tile still fits, without reducing the admitted cohort.
+        var compute = try MetalCompute.init(a, &store, null);
+        defer compute.deinit();
+        compute.require_f32_linears = true;
+        const cb = compute.computeBackend();
+        try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = 1025, .hidden = 768, .intermediate = 3072 });
+        const workspace = compute.embedding_vision_workspace.?;
+        try std.testing.expectEqual(@as(usize, 512), workspace.tile_capacity);
+        try std.testing.expectEqual(@as(usize, 1025), workspace.capacity_rows);
+        try std.testing.expect(workspace.owner.backend_bytes <= 64 * 1024 * 1024);
+        try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = 700, .hidden = 768, .intermediate = 3072 });
+        try std.testing.expectEqual(@as(usize, 512), workspace.tile);
+        try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, null);
+    }
+    try std.testing.expect(try p.reclaimEmbeddingGemma2Weights(.vision) > 0);
+    store.tier_cache.?.budget.backend_limit_bytes = 512 * 1024 * 1024;
+    {
+        var compute = try MetalCompute.init(a, &store, null);
+        defer compute.deinit();
+        compute.require_f32_linears = true;
+        const cb = compute.computeBackend();
+        const runtime = compute.provider_impl.raw_decode_runtime.?;
+        const h = 768;
+        const intermediate = 3072;
+        // Synthetic dense weights exercise exactly the production packed FFN,
+        // including nonzero source offsets and a final partial tile.
+        const weights = try a.alloc(f32, h * intermediate * 2);
+        defer a.free(weights);
+        for (weights, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) * 0.0005;
+        const bias: [intermediate * 2]f32 = @splat(0);
+        for (0..2) |slot| {
+            const n_in: usize = if (slot == 0) h else intermediate;
+            const n_out: usize = if (slot == 0) intermediate * 2 else h;
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_prepare_linear_owned_shared(runtime, @intCast(slot), weights.ptr, &bias, @intCast(n_in), @intCast(n_out)));
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_prefer_linear_mps(runtime, @intCast(slot)));
+            compute.provider_impl.raw_linear_slot_kinds[slot] = .dense;
+            compute.provider_impl.raw_linear_slots_prepared[slot] = true;
+            compute.provider_impl.raw_linear_slot_in_dims[slot] = n_in;
+            compute.provider_impl.raw_linear_slot_out_dims[slot] = n_out;
+        }
+        const benchmark = getenvBool("ANTFLY_EMBEDDINGGEMMA2_BENCH_VISION_TILES");
+        for ([_]usize{ 513, 2049, 4752 }) |rows| {
+            if (!benchmark and rows != 513) continue;
+            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, .{ .rows = rows, .hidden = h, .intermediate = intermediate });
+            const workspace = compute.embedding_vision_workspace.?;
+            workspace.slots[0][1] = 0;
+            workspace.slots[0][2] = 1;
+            const values = try a.alloc(f32, rows * h);
+            defer a.free(values);
+            for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i % 8192)) * 0.017);
+            const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(values, &.{ @intCast(rows), h }));
+            defer cb.free(input);
+            const iterations: usize = if (benchmark) 9 else 1;
+            var reference: ?[]f32 = null;
+            defer if (reference) |v| a.free(v);
+            var timings: [3][7]u64 = undefined;
+            var gpu_timings: [3][7]u128 = undefined;
+            for (0..iterations) |iteration| for (0..3) |phase| {
+                const route = (phase + iteration) % 3;
+                workspace.tile = @min(rows, @min(workspace.tile_capacity, @as(usize, 512) << @intCast(route)));
+                const gpu_before = if (benchmark) cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos else 0;
+                const started = @import("antfly_platform").time.monotonicNs();
+                try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+                _ = (try cb.vtable.embeddingVisionFFN.?(cb.ptr, input, 0)).?;
+                try cb.decoderRuntimeSubmitAndWaitFrame();
+                const elapsed = @import("antfly_platform").time.monotonicNs() -| started;
+                if (iteration >= 2) {
+                    timings[route][iteration - 2] = elapsed;
+                    gpu_timings[route][iteration - 2] = cb.debugTimingSnapshot().provider.decoder_runtime_frame_gpu_nanos -| gpu_before;
+                }
+                const actual = try cb.toFloat32(workspace.views[10].?, a);
+                defer a.free(actual);
+                if (reference) |want| {
+                    for (want, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
+                } else reference = try a.dupe(f32, actual);
+            };
+            if (benchmark) {
+                for (&timings) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+                for (&gpu_timings) |*samples| std.mem.sort(u128, samples, {}, std.sort.asc(u128));
+                std.debug.print("embeddinggemma2 vision_ffn_tiles rows={d} capacity={d} tile512_completed_ns={d} tile1024_completed_ns={d} tile2048_completed_ns={d} tile512_gpu_ns={d} tile1024_gpu_ns={d} tile2048_gpu_ns={d} parity=true\n", .{ rows, workspace.tile_capacity, timings[0][3], timings[1][3], timings[2][3], gpu_timings[0][3], gpu_timings[1][3], gpu_timings[2][3] });
+            }
+            workspace.tile = @import("embedding_vision_plan.zig").tileRows(rows, workspace.tile_capacity);
+            try cb.vtable.embeddingVisionWorkspace.?(cb.ptr, null);
+        }
+    }
+    try std.testing.expect(try p.reclaimEmbeddingGemma2Weights(.vision) > 0);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.host_bytes);
     try std.testing.expectEqual(@as(usize, 0), store.tier_cache.?.backend_bytes);
 }

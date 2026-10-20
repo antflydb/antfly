@@ -445,6 +445,7 @@ int av_prepared_wait(void *p, uint64_t timeout_ns) {
 int av_prepared_release_source(void *p) {
     if (av_prepared_poll(p) != 1) return -1;
     AVPrepared *result = (__bridge AVPrepared *)p;
+    if (result.completed) return 0;
     result.gpuSeconds = result.command.GPUEndTime - result.command.GPUStartTime;
     result.completed = YES;
     av_metal_import_release(result.imported); result.imported = NULL;

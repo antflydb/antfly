@@ -152,6 +152,7 @@ pub const VisionWorkspace = struct {
     owner: tape.Plan = .{ .host_bytes = @sizeOf(VisionWorkspace), .metadata_bytes = @sizeOf(VisionWorkspace) },
     spec: ops.EmbeddingVisionSpec,
     capacity_rows: usize,
+    tile_capacity: usize,
     stamp: u64,
     tile: usize,
     views: [107]?ops.CT = @splat(null),

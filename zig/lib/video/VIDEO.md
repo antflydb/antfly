@@ -934,12 +934,20 @@ failure retain synchronous operation. Statistics report prefetched fragments and
 publications overlapping caller-side preparation/execution/delivery; these are
 not GPU utilization measurements.
 
-Metal vision retains up to two admitted activation layouts per model. Each uses
-bounded 512-row FFN tiles, snapshots immutable norm coefficients and reuses
+Metal vision retains up to two admitted activation capacities per model. Each uses
+FFN tiles of up to 2048 rows, shares immutable norm coefficients and reuses
 separate norm, residual, alternating hidden and prepared-head ranges. Activation
 storage is capped at 256 MiB per layout; normalization coefficients and tensor-view
 metadata are admitted separately. Layout replacement occurs only with no active
 or submitted frame, and vision pressure releases all retained layouts.
+Tiles above 512 rows use power-of-two widths, leaving small remainders to a
+separate iteration rather than widening every GEMM. Tile scratch fits inside
+that same 256 MiB ceiling. Shared-cache or device-allocation pressure can reduce
+tiles to 512 rows without reducing the existing cohort capacity; smaller
+logical shapes reuse the retained tile storage without reallocating it.
+`ANTFLY_EMBEDDINGGEMMA2_BENCH_VISION_TILES=1` enables completed-command comparisons
+of 512/1024/2048-row tiles in the Metal vision workspace regression, with rotating
+execution order, warm samples and output parity checks.
 
 Packed QKV is normalized directly from its projection strides: Q/K retain their
 2D RoPE and Q scale; V uses unweighted RMSNorm without rotation. FFNs stream
@@ -1228,6 +1236,11 @@ memory; unsupported planning policies retain their conservative envelopes.
 
 Preparation completion uses driver notifications. Normal completion wakes the
 consumer immediately; a 10 ms timeout only bounds cancellation/deadline checks.
+Ready Metal jobs release source imports, upload staging and command admission
+before acquiring the model lane or reserving tower scratch. Their immutable patch
+outputs remain live for projection and fallback. Individually allocated outputs
+retain their aligned device charge; shared slabs and caller destinations retain
+only their original owner charge. Repeated source release preserves GPU timing.
 Consumers project a ready prefix and keep later submitted jobs pending outside
 the model lane. Error/cancellation cleanup drains pending and queued owners.
 
