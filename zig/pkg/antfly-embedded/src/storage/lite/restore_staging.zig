@@ -90,13 +90,23 @@ const PortableManifestMetadata = struct {
 };
 
 pub const preflight = @import("backup_preflight.zig");
+const lite_backend = @import("backend.zig");
+const embedded_catalog = @import("embedded_catalog.zig");
+
+/// The owner of a Lite catalog resolves logical tables. Shared storage never
+/// guesses a server catalog's key format or treats an unknown owner as root.
+pub const LiteInspector = *const fn (Allocator, std.Io, *lite_backend.Handle, *StoreInspection) anyerror!void;
 
 /// Always returns a versioned report for source failures. Partial counts are
 /// explicitly incomplete, and no failed scan can produce a compatible verdict.
 pub fn inspectInputJsonAlloc(allocator: Allocator, input_path: []const u8, destination_json: ?[]const u8, options: preflight.Options) ![]u8 {
+    return inspectInputJsonAllocWithLiteInspector(allocator, input_path, destination_json, options, inspectEmbeddedLite);
+}
+
+pub fn inspectInputJsonAllocWithLiteInspector(allocator: Allocator, input_path: []const u8, destination_json: ?[]const u8, options: preflight.Options, lite_inspector: LiteInspector) ![]u8 {
     var report: preflight.Report = .{ .allocator = allocator };
     defer report.deinit();
-    inspectInput(allocator, input_path, options, &report) catch |err| {
+    inspectInput(allocator, input_path, options, &report, lite_inspector) catch |err| {
         if (err == error.OutOfMemory) return err;
         report.analysis_complete = false;
         report.failure_code = switch (err) {
@@ -105,16 +115,18 @@ pub fn inspectInputJsonAlloc(allocator: Allocator, input_path: []const u8, desti
             error.SourceFileChanged => "source_changed",
             error.WriterLocked => "source_busy",
             error.BackupBaseRequired => "base_required",
+            error.UnsupportedLiteInspectionLayout, error.StandaloneLiteCatalogRequiresApi => "unsupported_lite_layout",
             else => "input_uninspectable",
         };
     };
     return report.jsonAlloc(destination_json);
 }
 
-fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight.Options, report: *preflight.Report) !void {
+fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight.Options, report: *preflight.Report, lite_inspector: LiteInspector) !void {
     var io_impl = std.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
+    var stores = StoreInspection.init(allocator, io, options, report);
     try options.cancellation.check();
     var source = try openInputFile(io, input_path);
     defer source.close(io);
@@ -129,13 +141,13 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
     if (std.mem.startsWith(u8, &magic, "AFLITE")) {
         report.format = "lite";
         report.format_version = magic[6];
-        var lite = try LiteDb.open(allocator, input_path, .query_readonly);
-        defer lite.close();
+        var lite = try lite_backend.Handle.open(allocator, input_path, .{ .read_only = true });
+        defer lite.deinit();
         // The reopened path must still identify the descriptor hashed above.
         var reopened = try openInputFile(io, input_path);
         defer reopened.close(io);
         if (!backups_api.localArtifactStatsEqual(initial, try reopened.stat(io))) return error.SourceFileChanged;
-        try inspectStore(allocator, io, lite.db.core.store, options, report, null);
+        try lite_inspector(allocator, io, &lite, &stores);
     } else if (backup_codec.isAfbFormat(&magic)) {
         var framing = backup_codec.FileReader.init(io, source, initial.size);
         const header = try framing.readHeader();
@@ -153,6 +165,10 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
             try backup_bundle.validatePreparationSizeLimit(root.value, if (native) options.max_expanded_bytes / 2 else options.max_expanded_bytes);
             if (native) {
                 report.format = "native";
+                // Extraction keeps included blobs and materialized objects.
+                // Charge both before allowing exports of any shard.
+                for (root.value.objects) |object| try stores.reserveExpansion(object.size_bytes);
+                for (root.value.blobs) |blob| if (blob.included) try stores.reserveExpansion(blob.logical_size_bytes);
                 const scratch = try temporaryPreparationPath(allocator, io, "antfly-inspect-", "");
                 defer allocator.free(scratch);
                 defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {};
@@ -175,7 +191,7 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                     defer allocator.free(path);
                     var store = try @import("../docstore.zig").DocStore.open(allocator, path, .{ .read_only = true });
                     defer store.close();
-                    try inspectStore(allocator, io, &store, options, report, manifest.indexes_json);
+                    try stores.inspect(&store, &.{manifest.indexes_json});
                 }
             }
         }
@@ -212,30 +228,94 @@ fn preflightFileDigest(io: std.Io, source: std.Io.File, size: u64, options: pref
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-fn inspectStore(allocator: Allocator, io: std.Io, store: *@import("../docstore.zig").DocStore, options: preflight.Options, report: *preflight.Report, catalog: ?[]const u8) !void {
-    const scratch = try temporaryPortablePath(allocator, io);
-    defer allocator.free(scratch);
-    defer std.Io.Dir.cwd().deleteFile(io, scratch) catch {};
-    var file = try fs_paths.createFilePortable(io, scratch, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
-    defer file.close(io);
-    var buffer: [64 * 1024]u8 = undefined;
-    var writer = file.writer(io, &buffer);
-    var limited = LimitedWriter.init(&writer.interface, options.max_expanded_bytes / 2);
-    portable_backup.exportPortableToWriterWithOptions(allocator, store, &limited.interface, .{ .cancellation = options.cancellation }) catch |err| {
-        if (limited.exceeded) return error.BackupExpansionLimitExceeded;
-        return err;
+/// One budget for the entire source, including every table/shard. Each store
+/// gets its own selector/model scope so names cannot leak between tables.
+pub const StoreInspection = struct {
+    allocator: Allocator,
+    io: std.Io,
+    options: preflight.Options,
+    report: *preflight.Report,
+    remaining_expanded_bytes: u64,
+    remaining_logical_bytes: u64,
+
+    pub fn init(allocator: Allocator, io: std.Io, options: preflight.Options, report: *preflight.Report) StoreInspection {
+        return .{ .allocator = allocator, .io = io, .options = options, .report = report, .remaining_expanded_bytes = options.max_expanded_bytes, .remaining_logical_bytes = options.max_expanded_bytes };
+    }
+
+    pub fn reserveExpansion(self: *StoreInspection, bytes: u64) !void {
+        if (bytes > self.remaining_expanded_bytes) return error.BackupExpansionLimitExceeded;
+        self.remaining_expanded_bytes -= bytes;
+    }
+
+    pub fn inspectNamespace(self: *StoreInspection, backend: *lite_backend.Handle, namespace: []const u8, catalogs: []const []const u8) !void {
+        var store = try @import("../docstore.zig").DocStore.openRuntime(self.allocator, try backend.runtimeStoreForNamespace(namespace));
+        defer store.close();
+        try self.inspect(&store, catalogs);
+    }
+
+    pub fn inspect(self: *StoreInspection, store: *@import("../docstore.zig").DocStore, catalogs: []const []const u8) !void {
+        try self.options.cancellation.check();
+        const scratch = try temporaryPortablePath(self.allocator, self.io);
+        defer self.allocator.free(scratch);
+        defer std.Io.Dir.cwd().deleteFile(self.io, scratch) catch {};
+        var file = try fs_paths.createFilePortable(self.io, scratch, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        defer file.close(self.io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var writer = file.writer(self.io, &buffer);
+        var limited = LimitedWriter.init(&writer.interface, self.remaining_expanded_bytes / 2);
+        portable_backup.exportPortableToWriterWithOptions(self.allocator, store, &limited.interface, .{ .cancellation = self.options.cancellation }) catch |err| {
+            if (limited.exceeded) return error.BackupExpansionLimitExceeded;
+            return err;
+        };
+        try writer.end();
+        const size = (try file.stat(self.io)).size;
+        try self.reserveExpansion(size * 2);
+        var normalized = self.options;
+        normalized.max_input_bytes = size;
+        normalized.max_expanded_bytes = self.remaining_logical_bytes;
+        const inspected = try inspectPortableCatalogs(self.allocator, self.io, file, normalized, self.report, catalogs);
+        self.remaining_logical_bytes -= inspected.logical_bytes;
+    }
+};
+
+pub fn inspectEmbeddedLite(allocator: Allocator, io: std.Io, backend: *lite_backend.Handle, stores: *StoreInspection) !void {
+    _ = io;
+    try backend.requireEmbeddedCatalogOwnership();
+    var root = try @import("../docstore.zig").DocStore.openRuntime(allocator, backend.native_runtime_store.?);
+    defer root.close();
+    var read = try root.beginReadTxn();
+    defer read.abort();
+    const raw = read.get(embedded_catalog.key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
     };
-    try writer.end();
-    var normalized = options;
-    normalized.max_input_bytes = options.max_expanded_bytes / 2;
-    try inspectPortable(allocator, io, file, normalized, report, catalog);
+    // Parse the directory before exporting anything. It is small, bounded
+    // executable metadata, not a request to open every index or provider.
+    var catalog: ?std.json.Parsed(embedded_catalog.Catalog) = null;
+    defer if (catalog) |*value| value.deinit();
+    if (raw) |bytes| {
+        if (bytes.len > stores.options.max_metadata_bytes) return error.PreflightLimitExceeded;
+        catalog = try std.json.parseFromSlice(embedded_catalog.Catalog, allocator, bytes, .{});
+        if (catalog.?.value.tables.len >= stores.options.max_definitions) return error.PreflightLimitExceeded;
+        try embedded_catalog.validate(catalog.?.value);
+    }
+    try stores.inspect(&root, &.{});
+    if (catalog) |value| for (value.value.tables) |table| {
+        const namespace = try embedded_catalog.namespaceAlloc(allocator, table.id);
+        defer allocator.free(namespace);
+        try stores.inspectNamespace(backend, namespace, &.{});
+    };
 }
 
 fn inspectPortable(allocator: Allocator, io: std.Io, file: std.Io.File, options: preflight.Options, report: *preflight.Report, catalog: ?[]const u8) !void {
+    _ = try inspectPortableCatalogs(allocator, io, file, options, report, if (catalog) |json| &.{json} else &.{});
+}
+
+fn inspectPortableCatalogs(allocator: Allocator, io: std.Io, file: std.Io.File, options: preflight.Options, report: *preflight.Report, catalogs: []const []const u8) !portable_backup.FileInspection {
     var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
     defer inspector.deinit();
-    if (catalog) |json| try inspector.metadataJson(json);
-    _ = try portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
+    for (catalogs) |json| if (json.len != 0) try inspector.metadataJson(json);
+    return portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
 }
 
 pub fn defaultBackupIdAlloc(allocator: Allocator, path: []const u8) ![]u8 {
@@ -656,12 +736,12 @@ pub fn embeddedTableDefinition(
 ) !tables_api.CreateTableRequest {
     var txn = try store.beginRead();
     defer txn.abort();
-    const embedded_tables = txn.get("\x00antfly/embedded/tables/v1") catch |err| switch (err) {
+    const embedded_tables = txn.get(embedded_catalog.key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
     if (embedded_tables) |raw| {
-        var catalog = try std.json.parseFromSlice(struct { tables: []const std.json.Value = &.{} }, alloc, raw, .{ .ignore_unknown_fields = true });
+        var catalog = try std.json.parseFromSlice(embedded_catalog.Catalog, alloc, raw, .{ .ignore_unknown_fields = true });
         defer catalog.deinit();
         if (catalog.value.tables.len != 0) {
             std.log.err("embedded Lite adoption supports only the default root table; transfer additional embedded tables through a supported explicit restore", .{});
@@ -2372,6 +2452,74 @@ test "backup preflight Lite and portable inspect all records without changing so
         try std.testing.expect(std.mem.indexOf(u8, limited, "limit_exceeded") != null);
         try std.testing.expect(std.mem.indexOf(u8, limited, "\"scan_complete\":false") != null);
     }
+}
+
+test "backup preflight Lite enumerates named embedded tables with isolated selectors and one expansion budget" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "multi.aflite" });
+    defer a.free(path);
+    {
+        var backend = try lite_backend.Handle.openOrCreate(a, path, .{ .no_sync = true });
+        defer backend.deinit();
+        var write = try backend.native_runtime_store.?.beginWrite();
+        errdefer write.abort();
+        try write.put(embedded_catalog.key, "{\"next_id\":3,\"tables\":[{\"name\":\"later\",\"id\":2}]}");
+        const key = try internal_keys.documentKeyAlloc(a, "root-row");
+        defer a.free(key);
+        try write.put(key, "{\"media\":\"file:///private/inert-root.pdf\"}");
+        try write.commit();
+        const namespace = try embedded_catalog.namespaceAlloc(a, 2);
+        defer a.free(namespace);
+        const table = try backend.runtimeStoreForNamespace(namespace);
+        var named = try table.beginWrite();
+        errdefer named.abort();
+        const named_key = try internal_keys.documentKeyAlloc(a, "named-row");
+        defer a.free(named_key);
+        try named.put(named_key, "{\"media\":\"file:///private/active-named.pdf\"}");
+        const enrichment_json = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "reader", .kind = .asset, .source_field = "media", .producer_json = "{\"type\":\"reader\"}" }});
+        defer a.free(enrichment_json);
+        try named.put("\x00\x00__metadata__:enrichments", enrichment_json);
+        try named.commit();
+    }
+    const destination = "{\"version\":1,\"configuration_id\":\"test\",\"requirements\":[]}";
+    const json = try inspectInputJsonAlloc(a, path, destination, .{});
+    defer a.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const report = parsed.value;
+    if (!report.object.get("completeness").?.object.get("scan_complete").?.bool) std.debug.print("inspection report: {s}\n", .{json});
+    try std.testing.expect(report.object.get("completeness").?.object.get("scan_complete").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), report.object.get("inventory").?.object.get("documents").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), report.object.get("inventory").?.object.get("shards").?.integer);
+    try std.testing.expectEqualStrings("blocked", report.object.get("compatibility").?.object.get("verdict").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, json, "named-row") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "root-row") == null);
+    // Compute each bounded export's size, then admit each individually while
+    // refusing their aggregate. This catches resetting the budget per table.
+    var backend = try lite_backend.Handle.open(a, path, .{ .read_only = true });
+    defer backend.deinit();
+    var report_scratch: preflight.Report = .{ .allocator = a };
+    defer report_scratch.deinit();
+    var stores = StoreInspection.init(a, io, .{}, &report_scratch);
+    var root_store = try @import("../docstore.zig").DocStore.openRuntime(a, backend.native_runtime_store.?);
+    defer root_store.close();
+    const before = stores.remaining_expanded_bytes;
+    try stores.inspect(&root_store, &.{});
+    const root_size = before - stores.remaining_expanded_bytes;
+    const mid = stores.remaining_expanded_bytes;
+    try stores.inspectNamespace(&backend, "embedded/tables/2", &.{});
+    const named_size = mid - stores.remaining_expanded_bytes;
+    const limited = try inspectInputJsonAlloc(a, path, destination, .{ .max_expanded_bytes = @max(root_size, named_size) });
+    defer a.free(limited);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "limit_exceeded") != null);
+    const catalog_limited = try inspectInputJsonAlloc(a, path, destination, .{ .max_definitions = 1 });
+    defer a.free(catalog_limited);
+    try std.testing.expect(std.mem.indexOf(u8, catalog_limited, "limit_exceeded") != null);
 }
 
 test "backup preflight native multishard scans later shards and table producers" {

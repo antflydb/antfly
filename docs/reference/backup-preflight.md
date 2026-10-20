@@ -55,7 +55,22 @@ are never emitted. Digests are identity bindings, not encrypted secret storage.
 The inspector uses the restore format readers and schema decoders. It validates
 all portable records, primes metadata before visiting rows, and decodes
 relational rows with their historical schema. Lite uses the existing read-only
-snapshot/export path. Native archives are authenticated into private scratch;
+snapshot/export path and enumerates the embedded table directory or the
+standalone metadata owner's authoritative tables and ranges. Standalone index
+and replication definitions are inspected alongside each table's physical
+catalog and records, including definitions not yet reconciled into that table.
+Selectors and model names are scoped to one table; the expansion budget covers
+the entire file, rather than restarting for each namespace. Catalog discovery
+is bounded by the definition and metadata-byte limits.
+
+Unknown ownership profiles, unsupported mixed-engine/migrating layouts,
+missing standalone catalogs, and private FK publication owners cannot produce
+a complete compatible report. They return an incomplete report; unsupported
+Lite layouts use `unsupported_lite_layout`. An embedded-only library reader
+also returns this code for a standalone-owned file, whose catalog requires the
+server inspector.
+
+Native archives are authenticated into private scratch;
 every shard is opened read-only and exported through the same bounded portable
 visitor. No target table or enrichment runtime is started. Scratch uses
 `TMPDIR`, then `TEMP`, then `/tmp`, and is removed on normal completion/error.

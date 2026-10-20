@@ -168,7 +168,7 @@ extern fn antfly_backup_preflight(context: *const InspectContext) callconv(.c) c
 extern fn antfly_backup_preflight_free(ptr: [*]u8, len: usize) callconv(.c) void;
 
 pub fn inspectInputJsonAlloc(allocator: std.mem.Allocator, input: []const u8, destination: ?[]const u8, max_input_bytes: u64, max_expanded_bytes: u64) ![]u8 {
-    if (comptime use_direct_implementation) return direct_impl.inspectInputJsonAlloc(allocator, input, destination, .{ .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes });
+    if (comptime use_direct_implementation) return @import("backup_inspection.zig").inspectInputJsonAlloc(allocator, input, destination, .{ .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes });
     var ptr: ?[*]u8 = null;
     var len: usize = 0;
     const status = antfly_backup_preflight(&.{ .input_ptr = input.ptr, .input_len = input.len, .destination_ptr = if (destination) |d| d.ptr else null, .destination_len = if (destination) |d| d.len else 0, .max_input_bytes = max_input_bytes, .max_expanded_bytes = max_expanded_bytes, .result_ptr = &ptr, .result_len = &len });
