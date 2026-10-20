@@ -3877,3 +3877,47 @@ matching, authorization and response work. The shared
 [design](../../../docs/design/logical-field-queries.md) documents the migration and
 dataflow contracts, including requirements for a future versioned stored-field
 layout that could avoid validating unrelated source bytes.
+
+
+The [follow-up qualification report](bench/results/logical-cost-validation.json)
+pins the merged implementation, compiler, source and final binary hashes. It
+retains all 16 primary configurations, a paired Linux repeat, initial variable
+observations, an idle-threshold rejection, all timed trials and CPU/memory data.
+Real process-upgrade tests on macOS and Linux reject the historical witness,
+rebuild through the public repair endpoint, then verify restart durability.
+
+Optimized macOS medians use nine timed queries per workload on the shared host,
+with fresh predicate work for every query and warm code/source caches:
+
+| Workload | Preserved baseline | Updated default |
+| --- | ---: | ---: |
+| Tiny sources (4,096 documents) | 6.89 ms | 7.00 ms |
+| Selected 4 KiB strings (4,096 documents) | 20.08 ms | 9.53 ms |
+| Unused escaped arrays (1,024 documents) | 48.48 ms | 17.61 ms |
+
+Selected strings improve about 2.1× and escaped arrays about 2.8× in that macOS
+run; tiny-source latency is effectively unchanged. The two native ARM64 Linux VM
+comparisons observe 1.6–2.5× and 3.1–4.5× respectively, with substantial absolute
+timing variation. The VM has a two-CPU quota and shares the Apple host. An
+unchanged tiny-source decoder control also varied, so those observations do not
+establish a physical Linux speed guarantee or isolate every control's causal
+cost. Fixed windows sometimes have lower latency than the learned choice;
+CPU and process RSS improvements are not uniform. Default-window allocation
+peaks stay below 1 MiB on these corpora, compared with roughly 0.5 MiB in the
+preserved baseline; they are higher despite the latency gains. Every individual
+window stays within the existing 8 MiB allocation ceiling. Independent physical Linux,
+cold-storage and broader production concurrency qualification remain outstanding.
+
+Reproduce one configuration from the repository root with the optimized server
+and matching native CLI paths:
+
+```sh
+ANTFLY_BIN=/path/to/antfly ANTFLY_GREP_BIN=/path/to/antfly-grep \
+ANTFLY_LOGICAL_SCALABLE_REPORT=/path/to/run.json \
+uv run --project zig/e2e/antfly pytest -q \
+  zig/e2e/antfly/test_grep_indexed.py -k logical_scalable_work_profile
+```
+
+The report records internal scalar, fixed-16/32/64, full-DOM and combined controls.
+Profile counters and source hashes accompany each observation; scanner-only
+ratios above remain separate from complete-query latency.

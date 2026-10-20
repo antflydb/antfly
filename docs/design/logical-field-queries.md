@@ -343,3 +343,18 @@ independent of measured query results: native control-plane maintenance can
 otherwise make an absolute five-percent threshold impossible on a healthy
 server. Earlier variable trials and the rejected absolute-threshold observation
 remain separate from qualified comparisons.
+
+
+[Verification-cost qualification](../../zig/pkg/antfly-grep/bench/results/logical-cost-validation.json)
+pins the final artifacts and source, both real process-upgrade/public-repair
+checks, native contracts and 14 CLI/server HTTP integrations per platform. It
+retains 16 primary benchmark configurations, a paired Linux comparison and all
+initial observations. The macOS selected-string and escaped-array medians improve
+about 2.1× and 2.8×; tiny sources are effectively unchanged. Shared-VM Linux
+comparisons vary substantially in absolute time, including an unchanged decoder
+control. Fixed windows sometimes outperform the default policy, and sampled
+process RSS is not the window allocation bound. Default-window peaks below 1 MiB
+are higher than the preserved baseline's roughly 0.5 MiB, within the unchanged
+8 MiB ceiling. These results support the
+measured implementation on the recorded corpora; physical Linux, cold-storage
+and fleet-wide concurrency qualification remain separate work.
