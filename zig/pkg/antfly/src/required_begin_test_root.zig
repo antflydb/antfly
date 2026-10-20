@@ -243,6 +243,20 @@ test "required replicated begin seal codec rejects downgrade and damaged frames 
 
 test "required replicated begin bound seal receipts survive restart and reject route or participant drift" {
     const a = std.testing.allocator;
+    const runtime = @import("antfly_runtime_abi");
+    const Denied = struct {
+        fn lifetime(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.Canceled);
+        }
+        fn cpu(_: *anyopaque, _: u64) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.Canceled);
+        }
+        fn phase(_: *anyopaque, _: u32) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.Canceled);
+        }
+    };
+    var caller_state: u8 = 0;
+    const expired: runtime.runnable_abi.Borrowed = .{ .context = &caller_state, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .check_lifetime = Denied.lifetime, .checkpoint = Denied.cpu, .park = Denied.phase, .enter = Denied.phase };
     for (std.meta.tags(codec.Mode)) |mode| {
         var directory = try sources.common_test_directory.TestDirectory.init("bound-seal-receipts");
         defer directory.cleanup();
@@ -263,9 +277,10 @@ test "required replicated begin bound seal receipts survive restart and reject r
             var parsed = try raft_batch.decode(a, bytes);
             defer parsed.deinit(a);
             try std.testing.expectEqual(@as(u16, 25), @import("data/runtime.zig").DataServer.requiredRaftBatchProtocolVersion(parsed.batch.req));
-            try dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &db, "docs", 7, parsed.batch.req, .{ .term = 1, .index = 1 });
+            try std.testing.expectError(error.Canceled, dispatch.applyReplicatedTransactionMutationInternalWithExecution(a, &db, "docs", 7, parsed.batch.req, .none, null, expired));
+            try dispatch.applyReplicatedTransactionMutationInternalWithExecution(a, &db, "docs", 7, parsed.batch.req, .none, .{ .term = 1, .index = 1 }, expired);
             const prepare: db_mod.types.BatchRequest = .{ .transaction = .{ .prepare = .{ .txn_id = id, .topology_epoch = 3, .preparation_requirement = .{ .mode = mode }, .preparation_binding = binding } } };
-            try dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &db, "docs", 7, prepare, .{ .term = 1, .index = 2 });
+            try dispatch.applyReplicatedTransactionMutationInternalWithExecution(a, &db, "docs", 7, prepare, .none, .{ .term = 1, .index = 2 }, expired);
             var manager = try db.core.initTxnManager();
             defer manager.deinit();
             try std.testing.expectEqualDeep(binding, (try manager.getPreparationDecision(id, null)).binding.?);
@@ -305,7 +320,7 @@ test "required replicated begin bound seal receipts survive restart and reject r
             const bare = try std.mem.replaceOwned(u8, a, batch_bytes, "seal_bound_v1", "seal_required_v1");
             defer a.free(bare);
             try rejected(a, batch.parseInternalBatchRequest(a, bare));
-            try dispatch.applyReplicatedTransactionMutationAtRaftEntry(a, &db, "docs", 7, decoded.batch.req, .{ .term = 1, .index = 3 });
+            try dispatch.applyReplicatedTransactionMutationInternalWithExecution(a, &db, "docs", 7, decoded.batch.req, .none, .{ .term = 1, .index = 3 }, expired);
             const durable = try manager.getBoundPreparedSealReceipt(id, binding, null);
             const receipt = sources.api_prepared_transaction_protocol.SealReceipt.fromDurable(durable);
             try receipt.validate(expected);

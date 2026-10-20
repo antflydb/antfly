@@ -100,7 +100,7 @@ pub fn applyReplicatedTransactionMutationInternalWithExecution(
     var admission_borrow: @import("transaction_execution_admission.zig").Borrow = .{};
     switch (mutation) {
         .begin => |begin| {
-            try validatePreparationBinding(alloc, table_name, group_id, begin.topology_epoch, req.restore_staging_scope, req.restore_staging_plan_id, begin.preparation_binding, execution);
+            try validatePreparationBinding(alloc, table_name, group_id, begin.topology_epoch, req.restore_staging_scope, req.restore_staging_plan_id, begin.preparation_binding, if (raft_entry == null) execution else null);
             if (begin.preparation_requirement != null and raft_entry == null) return error.PreparedTransactionProtocolUnavailable;
             const local_participant = try local_transaction_contract.participantIdForGroupScoped(alloc, table_name, group_id, req.restore_staging_scope, req.restore_staging_plan_id);
             defer alloc.free(local_participant);
@@ -147,7 +147,7 @@ pub fn applyReplicatedTransactionMutationInternalWithExecution(
             );
         },
         .prepare => |prepare| {
-            try validatePreparationBinding(alloc, table_name, group_id, prepare.topology_epoch, req.restore_staging_scope, req.restore_staging_plan_id, prepare.preparation_binding, execution);
+            try validatePreparationBinding(alloc, table_name, group_id, prepare.topology_epoch, req.restore_staging_scope, req.restore_staging_plan_id, prepare.preparation_binding, if (raft_entry == null) execution else null);
             if (prepare.sealed_effects) |frame| {
                 try @import("antfly_local_sources").api_batch.validatePreparedSealRequest(req);
                 const required = prepare.preparation_requirement orelse return error.InvalidBatchRequest;
