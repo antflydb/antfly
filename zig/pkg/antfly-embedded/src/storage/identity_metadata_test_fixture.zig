@@ -81,3 +81,17 @@ pub fn setPayloadLimit(manager: *resources.ResourceManager, bytes: u64, descenda
     manager.memory.budget.hard_limit_bytes = bytes + manager.identity_metadata_bytes;
     for (descendants) |child| manager.memory.budget.hard_limit_bytes += child.identity_metadata_bytes;
 }
+
+/// Assert the complete physical envelope: payload/control storage plus every
+/// explicitly listed live identity table in this manager and its descendants.
+/// Do not subtract cache headers, cleanup cells or other control allocations.
+pub fn expectUsage(bytes: u64, manager: *resources.ResourceManager, table_owners: []const *resources.ResourceManager) !void {
+    var total = bytes;
+    for (table_owners) |owner| {
+        total = try std.math.add(u64, total, owner.identity_metadata_bytes);
+        total = try std.math.add(u64, total, owner.identity_metadata_retirement_bytes);
+    }
+    const snapshot = manager.snapshot();
+    try std.testing.expectEqual(total, snapshot.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.memory.accounting_errors);
+}

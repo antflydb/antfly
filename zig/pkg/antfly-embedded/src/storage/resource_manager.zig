@@ -8581,13 +8581,13 @@ pub fn qualifyControlledCreditNotifications(control: read_admission.Port) !void 
     defer credit.release();
     var retained: u64 = 0;
     try child.adoptReservationUsageWithAdmission(&credit, .lsm_block_table_cache, &retained, 136, control);
-    try std.testing.expectEqual(@as(u64, 136), root.snapshot().memory.used_bytes);
+    try metadata_fixture.expectUsage(@as(u64, 136), &root, &.{ &root, &middle, &child });
     try std.testing.expect(root.pressure_change.snapshot() != before);
     try std.testing.expectEqual(ResourceManager.MemoryParent.ReleaseResult.released, child.tryReleaseReservation(&credit));
     try child.adjustUsageWithAdmission(.lsm_block_table_cache, &retained, 0, control);
-    try std.testing.expectEqual(@as(u64, 0), root.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 0), middle.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.used_bytes);
+    try metadata_fixture.expectUsage(@as(u64, 0), &root, &.{ &root, &middle, &child });
+    try metadata_fixture.expectUsage(@as(u64, 0), &middle, &.{ &middle, &child });
+    try metadata_fixture.expectUsage(@as(u64, 0), &child, &.{&child});
     try qualifyNoLiveReservations(&child);
 }
 
@@ -8649,7 +8649,7 @@ pub fn qualifyConstructionRetirement(control: read_admission.Port, parent_busy: 
     for (&claims) |*claim| claim.* = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, 8, control);
     try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveConstructionWithAdmission(.lsm_read_working_set, 8, control));
     const before = parent.snapshot().memory.used_bytes;
-    try std.testing.expectEqual(@as(u64, 512), before);
+    try metadata_fixture.expectUsage(512, &parent, &.{ &parent, &manager });
     // Completion cannot enter either held ledger. Rejecting the original
     // scope still leaves a live accounting owner, never an uncharged buffer.
     const result = blk: {
@@ -8679,22 +8679,22 @@ pub fn qualifyConstructionRetirement(control: read_admission.Port, parent_busy: 
     // Ordinary construction must visit and release every completed slot before
     // taking the first free slot; later debt cannot be starved by slot zero.
     var retry = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, 8, cleanup);
-    try std.testing.expectEqual(@as(u64, 8), manager.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 8), parent.snapshot().memory.used_bytes);
+    try metadata_fixture.expectUsage(@as(u64, 8), &manager, &.{&manager});
+    try metadata_fixture.expectUsage(@as(u64, 8), &parent, &.{ &parent, &manager });
     // Reuse and successful ownership transfer free the slot without releasing
     // the payload's reservation; stale consumed tokens cannot retire it.
     var published = retry.transfer();
     retry.retire();
-    try std.testing.expectEqual(@as(u64, 8), manager.snapshot().memory.used_bytes);
+    try metadata_fixture.expectUsage(@as(u64, 8), &manager, &.{&manager});
     published.release();
     var final = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, 8, cleanup);
     std.debug.assert(manager.mutex.tryLock());
     final.retire();
     manager.mutex.unlock();
-    try std.testing.expectEqual(@as(u64, 8), manager.snapshot().memory.used_bytes);
+    try metadata_fixture.expectUsage(@as(u64, 8), &manager, &.{&manager});
     try manager.drainConstructionCleanupWithAdmission(cleanup);
     try qualifyNoLiveReservations(&manager);
-    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+    try metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &manager });
     try result;
 }
 
@@ -8758,9 +8758,9 @@ pub fn qualifyPressurePayloadRetirement(control: read_admission.Port, fixture: u
         break :blk checkpoint;
     };
     try manager.drainConstructionCleanupWithAdmission(cleanup);
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 0), root.snapshot().memory.used_bytes);
+    try metadata_fixture.expectUsage(@as(u64, 0), &manager, &.{&manager});
+    try metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &manager });
+    try metadata_fixture.expectUsage(@as(u64, 0), &root, &.{ &root, &parent, &manager });
     if (supports_pressure_wait) try std.testing.expect(held.snapshot() != epoch);
     try result;
 }
@@ -8777,6 +8777,8 @@ pub fn qualifyControlledReclaimerChunks(control: read_admission.Port, grow: bool
     var manager_live = true;
     defer if (manager_live) manager.deinit(a);
     try manager.installMemoryParent(parent.memoryParentPort());
+    try manager.reservation_identities.ensureUnusedCapacity(&manager, 4);
+    parent.memory.budget.hard_limit_bytes += manager.identity_metadata_bytes;
     var calls: u64 = 0;
     const Callback = struct {
         fn reclaim(raw: *anyopaque, _: u64) u64 {
@@ -8789,15 +8791,15 @@ pub fn qualifyControlledReclaimerChunks(control: read_admission.Port, grow: bool
     defer if (manager_live) for (ids) |id| if (id != 0) manager.unregisterReclaimer(id);
     for (ids[0..64]) |*id| id.* = try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &calls, Callback.reclaim, control);
     const first = manager.reclaimers.items[0];
-    try std.testing.expectEqual(@as(u64, cost), manager.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, cost), parent.snapshot().memory.used_bytes);
+    try metadata_fixture.expectUsage(@as(u64, cost), &manager, &.{&manager});
+    try metadata_fixture.expectUsage(@as(u64, cost), &parent, &.{ &parent, &manager });
     if (grow) {
         ids[64] = try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &calls, Callback.reclaim, control);
         try std.testing.expectEqual(first, manager.reclaimers.items[0]);
-        try std.testing.expectEqual(@as(u64, growth_peak), manager.snapshot().memory.used_bytes);
-        try std.testing.expectEqual(@as(u64, growth_peak), parent.snapshot().memory.used_bytes);
+        try metadata_fixture.expectUsage(@as(u64, growth_peak), &manager, &.{&manager});
+        try metadata_fixture.expectUsage(@as(u64, growth_peak), &parent, &.{ &parent, &manager });
         try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(control));
-        try std.testing.expectEqual(@as(u64, grown), parent.snapshot().memory.used_bytes);
+        try metadata_fixture.expectUsage(@as(u64, grown), &parent, &.{ &parent, &manager });
     } else {
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
         manager.identity_allocator = failing.allocator();
@@ -8806,7 +8808,7 @@ pub fn qualifyControlledReclaimerChunks(control: read_admission.Port, grow: bool
         try std.testing.expectError(error.ResourceBudgetExceeded, result);
         try std.testing.expect(!failing.has_induced_failure);
         try std.testing.expectEqual(@as(usize, 64), manager.reclaimers.items.len);
-        try std.testing.expectEqual(@as(u64, cost), parent.snapshot().memory.used_bytes);
+        try metadata_fixture.expectUsage(@as(u64, cost), &parent, &.{ &parent, &manager });
         manager.unregisterReclaimer(ids[0]);
         ids[0] = 0;
         manager.identity_allocator = failing.allocator();
@@ -8815,14 +8817,14 @@ pub fn qualifyControlledReclaimerChunks(control: read_admission.Port, grow: bool
         ids[64] = try reused;
         try std.testing.expect(!failing.has_induced_failure);
         try std.testing.expectEqual(first, manager.reclaimers.items[0]);
-        try std.testing.expectEqual(@as(u64, cost), parent.snapshot().memory.used_bytes);
+        try metadata_fixture.expectUsage(@as(u64, cost), &parent, &.{ &parent, &manager });
     }
     for (&ids) |*id| {
         if (id.* != 0) manager.unregisterReclaimer(id.*);
         id.* = 0;
     }
     // Empty slots remain physically allocated and charged for later reuse.
-    try std.testing.expectEqual(@as(u64, if (grow) grown else cost), parent.snapshot().memory.used_bytes);
+    try metadata_fixture.expectUsage(@as(u64, if (grow) grown else cost), &parent, &.{ &parent, &manager });
     try std.testing.expectEqual(@as(u64, 0), calls);
     manager.deinit(a);
     manager_live = false;
@@ -8859,19 +8861,19 @@ pub fn qualifyControlledReclaimerPointers(control: read_admission.Port, fixture:
         try std.testing.expectEqual(first, manager.reclaimers.items[0]);
         const chunks = @divTrunc(capacity + 63, 64) * @sizeOf(ReclaimerChunk);
         const old_owner_bytes = try ReclaimerPointers.bytes(capacity);
-        try std.testing.expectEqual(@as(u64, chunks + expected + old_owner_bytes), manager.snapshot().memory.used_bytes);
-        try std.testing.expectEqual(@as(u64, chunks + expected + old_owner_bytes), parent.snapshot().memory.peak_bytes);
+        try metadata_fixture.expectUsage(@as(u64, chunks + expected + old_owner_bytes), &manager, &.{&manager});
+        try std.testing.expectEqual(@as(u64, chunks + expected + old_owner_bytes) + manager.identity_metadata_bytes + parent.identity_metadata_bytes, parent.snapshot().memory.peak_bytes);
         try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(control));
-        try std.testing.expectEqual(@as(u64, chunks + expected), parent.snapshot().memory.used_bytes);
+        try metadata_fixture.expectUsage(@as(u64, chunks + expected), &parent, &.{ &parent, &manager });
     } else if (fixture == 1) {
         for (0..64) |_| try ids.append(a, try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &context, Callback.reclaim, control));
         const first = manager.reclaimers.items[0];
         try ids.append(a, try manager.registerReclaimer(.lsm_block_table_cache, &context, Callback.reclaim));
         try std.testing.expectEqual(first, manager.reclaimers.items[0]);
         const expected = 2 * @sizeOf(ReclaimerChunk) + (try ReclaimerPointers.bytes(128));
-        try std.testing.expectEqual(@as(u64, expected + (try ReclaimerPointers.bytes(64))), manager.snapshot().memory.used_bytes);
+        try metadata_fixture.expectUsage(@as(u64, expected + (try ReclaimerPointers.bytes(64))), &manager, &.{&manager});
         try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(control));
-        try std.testing.expectEqual(@as(u64, expected), parent.snapshot().memory.used_bytes);
+        try metadata_fixture.expectUsage(@as(u64, expected), &parent, &.{ &parent, &manager });
     } else {
         // Failure may occur in credit identity, chunk, pointer header or array
         // preparation. No callback identity may escape a failed preparation.
@@ -8886,7 +8888,7 @@ pub fn qualifyControlledReclaimerPointers(control: read_admission.Port, fixture:
             try std.testing.expectEqual(@as(usize, 0), manager.reclaimers.items.len);
             _ = try manager.drainPayloadRetirementWithAdmission(control);
             try manager.drainConstructionCleanupWithAdmission(control);
-            try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+            try metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &manager });
         }
         // Captured allocator contexts remain live through physical retirement.
         for (ids.items) |id| manager.unregisterReclaimer(id);
@@ -8928,16 +8930,16 @@ pub fn qualifyLegacyReclaimerAdoption(control: read_admission.Port, fixture: usi
     ids[0] = 0;
     // Prime accounting identities so the fault probe observes registry header
     // allocation, rather than the separately retained accounting map itself.
-    try manager.reservation_identities.map.ensureUnusedCapacity(a, 4);
-    parent.memory.budget.hard_limit_bytes = if (fixture == 1) @sizeOf(ReclaimerChunk) - 1 else expected;
+    try manager.reservation_identities.ensureUnusedCapacity(&manager, 4);
+    parent.memory.budget.hard_limit_bytes = (if (fixture == 1) @sizeOf(ReclaimerChunk) - 1 else expected) + manager.identity_metadata_bytes;
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     if (fixture != 0) manager.identity_allocator = failing.allocator();
     const result = manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &context, Callback.reclaim, control);
     manager.identity_allocator = a;
     if (fixture == 0) {
         ids[0] = try result;
-        try std.testing.expectEqual(@as(u64, expected), manager.snapshot().memory.used_bytes);
-        try std.testing.expectEqual(@as(u64, expected), parent.snapshot().memory.used_bytes);
+        try metadata_fixture.expectUsage(@as(u64, expected), &manager, &.{&manager});
+        try metadata_fixture.expectUsage(@as(u64, expected), &parent, &.{ &parent, &manager });
         try std.testing.expectEqual(buffer, manager.reclaimers.items.ptr);
         try std.testing.expect(manager.reclaimer_pointers != null);
     } else {
@@ -8950,8 +8952,8 @@ pub fn qualifyLegacyReclaimerAdoption(control: read_admission.Port, fixture: usi
         try std.testing.expectEqual(fixture == 2, failing.has_induced_failure);
         const charged: u64 = if (fixture == 1) 0 else 2 * @sizeOf(ReclaimerChunk);
         // Partial migration keeps credit for chunks that remain physically live.
-        try std.testing.expectEqual(charged, manager.snapshot().memory.used_bytes);
-        try std.testing.expectEqual(charged, parent.snapshot().memory.used_bytes);
+        try metadata_fixture.expectUsage(charged, &manager, &.{&manager});
+        try metadata_fixture.expectUsage(charged, &parent, &.{ &parent, &manager });
         try std.testing.expect(manager.reclaimer_pointers == null);
     }
     try std.testing.expectEqual(first, manager.reclaimers.items[0]);
@@ -9011,8 +9013,8 @@ pub fn qualifyBoundConsumerConstruction(control: read_admission.Port, deny: bool
     // Only the independent consumer API can perform physical destruction.
     try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(control));
     try std.testing.expectEqual(@as(usize, 1), destroyed);
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+    try metadata_fixture.expectUsage(@as(u64, 0), &manager, &.{&manager});
+    try metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &manager });
 }
 
 test "logical resident credit cleanup preserves host charge through ledger contention" {

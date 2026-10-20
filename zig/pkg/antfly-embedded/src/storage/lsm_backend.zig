@@ -27775,8 +27775,8 @@ pub fn qualifyLocalPayloadRetirement(control: @import("../common/read_admission.
     if (fixture == 2) try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(cleanup));
     try std.testing.expect(manager.payload_retirement_head == null);
     try std.testing.expect(manager.payload_retirement_cursor == null);
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+    try resources.metadata_fixture.expectUsage(@as(u64, 0), &manager, &.{&manager});
+    try resources.metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &manager });
     try result;
 }
 
@@ -27791,8 +27791,9 @@ pub fn qualifyControlledLocalCache(control: @import("../common/read_admission.zi
     defer parent.deinit(a);
     var options: resources.Options = .{ .identity_allocator = a };
     options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = if (fixture == 3) 1 else if (fixture == 2) cost + metadata else parent_limit;
-    var manager = resources.ResourceManager.init(options);
+    var manager = try resources.metadata_fixture.init(options);
     defer manager.deinit(a);
+    parent.memory.budget.hard_limit_bytes += manager.identity_metadata_bytes;
     try manager.installMemoryParent(parent.memoryParentPort());
     var backend = Backend.init(a, .{ .resource_manager = &manager, .local_block_cache_bytes = 8, .local_block_cache_max_block_bytes = 4096 });
     defer backend.close();
@@ -27864,7 +27865,8 @@ pub fn qualifyControlledLocalCache(control: @import("../common/read_admission.zi
         if (fixture == 4) try std.testing.expectEqualStrings("oldbytes", backend.run_block_cache.items[0].payload.bytes);
         try std.testing.expectEqual(resources.Slice.lsm_read_working_set, value.reservation.?.slice);
     }
-    try std.testing.expect(parent.snapshot().memory.peak_bytes <= parent_limit);
+    // The parent also owns the charged identity tables installed above.
+    try std.testing.expect(parent.snapshot().memory.peak_bytes <= parent.memory.budget.hard_limit_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }
 
@@ -27994,8 +27996,9 @@ pub fn qualifyControlledLocalCacheMetadata(control: read_admission.Port, deny: b
     const slab_cost = @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock);
     var parent = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = if (deny) payload_cost else payload_cost + path_cost + slab_cost + registry_cost } });
     defer parent.deinit(a);
-    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .identity_allocator = a });
     defer manager.deinit(a);
+    parent.memory.budget.hard_limit_bytes += manager.identity_metadata_bytes;
     try manager.installMemoryParent(parent.memoryParentPort());
     var backend = Backend.init(a, .{ .resource_manager = &manager });
     defer backend.close();
@@ -28019,12 +28022,12 @@ pub fn qualifyControlledLocalCacheMetadata(control: read_admission.Port, deny: b
         try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
         try std.testing.expect(!failing.has_induced_failure);
         try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache.items.len);
-        try std.testing.expectEqual(@as(u64, payload_cost), manager.snapshot().memory.used_bytes);
+        try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, payload_cost), &manager, &.{&manager});
         return;
     }
     const charged = payload_cost + path_cost + slab_cost + registry_cost;
-    try std.testing.expectEqual(@as(u64, charged), manager.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, charged), parent.snapshot().memory.used_bytes);
+    try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, charged), &manager, &.{&manager});
+    try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, charged), &parent, &.{ &parent, &manager });
     value_owned = false;
     value.release();
     std.debug.assert(parent.mutex.tryLock());
@@ -28035,8 +28038,8 @@ pub fn qualifyControlledLocalCacheMetadata(control: read_admission.Port, deny: b
     defer manager.payload_retirement_mutex.unlock();
     backend.deinitRunBlockCache();
     // Dropping cache ownership runs no destructor, ledger callback or lock wait.
-    try std.testing.expectEqual(@as(u64, charged), manager.memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, charged), parent.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, charged) + manager.identity_metadata_bytes + manager.identity_metadata_retirement_bytes, manager.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, charged) + manager.identity_metadata_bytes + manager.identity_metadata_retirement_bytes + parent.identity_metadata_bytes + parent.identity_metadata_retirement_bytes, parent.memory.used_bytes);
     try std.testing.expectEqual(@as(usize, 3), manager.payload_retirement_ready.load(.acquire));
     try std.testing.expect(backend.run_block_cache_owner == null);
 }

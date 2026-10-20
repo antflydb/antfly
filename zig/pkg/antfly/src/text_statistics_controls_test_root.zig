@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 const std = @import("std");
 pub const antfly_sources = @import("source_owner_embedded_db.zig");
 const sources = @import("antfly_local_sources");
@@ -241,6 +254,9 @@ test "text statistics trusted controls loan CPU only during native physical file
         pub fn checkpoint(self: *@This()) !void {
             try self.budget.checkpoint();
         }
+        pub fn checkLifetime(self: *@This()) !void {
+            try self.budget.checkLifetime();
+        }
         pub fn waitForProgress(self: *@This()) !void {
             try self.budget.waitForProgress();
         }
@@ -403,6 +419,9 @@ test "text statistics trusted controls pin metadata and whole file reads across 
         pub fn checkpoint(self: *@This()) !void {
             try self.budget.checkpoint();
         }
+        pub fn checkLifetime(self: *@This()) !void {
+            try self.budget.checkLifetime();
+        }
         pub fn waitForProgress(self: *@This()) !void {
             try self.budget.waitForProgress();
         }
@@ -550,6 +569,9 @@ test "text statistics trusted controls descriptor FIFO preserves original native
         pub fn checkpoint(self: *@This()) !void {
             try self.budget.checkpoint();
         }
+        pub fn checkLifetime(self: *@This()) !void {
+            try self.budget.checkLifetime();
+        }
         pub fn executionBoundary(self: *@This()) ?sources.common_execution_wait.Boundary {
             return self.budget.executionBoundary();
         }
@@ -679,6 +701,9 @@ test "text statistics trusted controls cold native descriptor open retires succe
         pub fn checkpoint(self: *@This()) !void {
             try self.budget.checkpoint();
         }
+        pub fn checkLifetime(self: *@This()) !void {
+            try self.budget.checkLifetime();
+        }
         pub fn waitForProgress(self: *@This()) !void {
             try self.budget.waitForProgress();
         }
@@ -783,6 +808,9 @@ test "text statistics trusted controls asynchronous native read joins physical w
         ends: usize = 0,
         pub fn checkpoint(self: *@This()) !void {
             try self.budget.checkpoint();
+        }
+        pub fn checkLifetime(self: *@This()) !void {
+            try self.budget.checkLifetime();
         }
         pub fn waitForProgress(self: *@This()) !void {
             try self.budget.waitForProgress();
@@ -1191,6 +1219,9 @@ test "text statistics trusted controls Lite native and transaction batches loan 
         pub fn checkpoint(self: *@This()) !void {
             try self.parent.checkpoint();
         }
+        pub fn checkLifetime(self: *@This()) !void {
+            try self.parent.checkLifetime();
+        }
         pub fn waitForProgress(_: *@This()) !void {
             return error.TestUnexpectedResult;
         }
@@ -1382,6 +1413,9 @@ test "text statistics trusted controls uncached LSM batches loan only physical r
         loans: usize = 0,
         pub fn checkpoint(self: *@This()) !void {
             try self.parent.checkpoint();
+        }
+        pub fn checkLifetime(self: *@This()) !void {
+            try self.parent.checkLifetime();
         }
         pub fn waitForProgress(_: *@This()) !void {
             return error.TestUnexpectedResult;
@@ -1981,7 +2015,10 @@ test "text statistics trusted controls local cache publication replacement and d
                 const payload = adapter.payload();
                 const result = sources.storage_lsm_backend.qualifyControlledLocalCache(admission.Port.init(&payload), fixture);
                 if (requested_stop == 0) completion_checkpoint = budget.calls;
-                if (stop_at != 0 and budget.calls >= stop_at) try std.testing.expectError(error.Canceled, result) else try result;
+                if (stop_at != 0 and budget.calls >= stop_at) try std.testing.expectError(error.Canceled, result) else result catch |err| {
+                    std.debug.print("local publication phase={s} fixture={} stop={} checks={} error={s}\n", .{ @tagName(phase), fixture, stop_at, budget.calls, @errorName(err) });
+                    return err;
+                };
                 try std.testing.expectEqual(phase, try execution.retainedClass());
                 try std.testing.expectEqual(@as(?u64, deadline), execution.entry.?.options.deadline_ns);
                 execution.finish();
@@ -2133,8 +2170,8 @@ test "text statistics trusted controls manager cleanup dispatch retires canceled
             if (clock.monotonicNs() >= until) return error.TestCleanupDidNotRetire;
             try std.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
-        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
-        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+        try resources.metadata_fixture.expectUsage(@as(u64, 0), &manager, &.{&manager});
+        try resources.metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &manager });
         try std.testing.expectEqual(@as(u64, 1), cleanup.snapshot().retired_payloads);
         try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 46), scheduler.stats().retained_bytes);
@@ -2311,7 +2348,7 @@ test "text statistics trusted controls manager cleanup shutdown joins stalled ph
     try std.testing.expectEqual(@as(usize, 2), scheduler.stats().control_slots);
     health.finish();
     foreground.finish();
-    try std.testing.expectEqual(@as(u64, charged), manager.snapshot().memory.used_bytes);
+    try resources.metadata_fixture.expectUsage(@as(u64, charged), &manager, &.{&manager});
     var joining = try lane.io().concurrent(Gate.joinWorker, .{ &gate, worker });
     defer {
         gate.release.store(true, .release);
@@ -2323,7 +2360,7 @@ test "text statistics trusted controls manager cleanup shutdown joins stalled ph
     try std.testing.expect(!gate.join_done.load(.acquire));
     try std.testing.expect(manager.cleanup_consumer_bound.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), gate.destroyed.load(.acquire));
-    try std.testing.expectEqual(@as(u64, charged), manager.snapshot().memory.used_bytes);
+    try resources.metadata_fixture.expectUsage(@as(u64, charged), &manager, &.{&manager});
     try std.testing.expectEqual(@as(usize, 1), scheduler.stats().cleanup_operations);
     scheduler.close();
     gate.release.store(true, .release);
@@ -2331,7 +2368,7 @@ test "text statistics trusted controls manager cleanup shutdown joins stalled ph
     try std.testing.expect(gate.join_done.load(.acquire));
     try std.testing.expect(!manager.cleanup_consumer_bound.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), gate.destroyed.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try resources.metadata_fixture.expectUsage(@as(u64, 0), &manager, &.{&manager});
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }
@@ -2604,7 +2641,7 @@ noinline fn qualifyWarmCleanupStartupFailure(failure: CleanupStartupFailure) !vo
     try std.testing.expect(buffer == manager.reclaimers.items.ptr);
     try std.testing.expectEqual(ids[0], cell.identity);
     const retained = manager.snapshot().memory.used_bytes;
-    try std.testing.expectEqual(failure == .header or failure == .worker, retained > 0);
+    try std.testing.expectEqual(failure == .header or failure == .worker, retained > manager.identity_metadata_bytes + manager.identity_metadata_retirement_bytes);
     try std.testing.expectEqual(retained, parent.snapshot().memory.used_bytes);
     if (failure == .header) try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(@as(usize, if (failure == .cleanup_capacity) 2 else 0), scheduler.stats().operations);

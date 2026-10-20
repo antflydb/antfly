@@ -15169,8 +15169,8 @@ pub fn qualifyControlledPointPromotion(control: read_admission.Port, fixture: us
     defer peer.deinit(a);
     try peer.installMemoryParent(parent.memoryParentPort());
     defer {
-        std.debug.assert(parent.snapshot().memory.used_bytes == 0);
-        std.debug.assert(child.snapshot().memory.used_bytes == 0);
+        resources.metadata_fixture.expectUsage(0, &parent, &.{ &parent, &child, &peer }) catch unreachable;
+        resources.metadata_fixture.expectUsage(0, &child, &.{&child}) catch unreachable;
         std.debug.assert(parent.snapshot().memory.accounting_errors == 0);
         std.debug.assert(child.snapshot().memory.accounting_errors == 0);
     }
@@ -15209,7 +15209,7 @@ pub fn qualifyControlledPointPromotion(control: read_admission.Port, fixture: us
     try promoteCachedPointBlockWithAdmission(&backend, path, 1, 1, window, offset, payload, prepared, control);
     if (fixture == 4) {
         try std.testing.expect(cache.retainRunTableBlock(path, 1, 1, offset, window.physicalLen()) == null);
-        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+        try resources.metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &child, &peer });
         return;
     }
     var retained = cache.retainRunTableBlock(path, 1, 1, offset, window.physicalLen()) orelse return error.TestUnexpectedResult;
@@ -15217,7 +15217,7 @@ pub fn qualifyControlledPointPromotion(control: read_admission.Port, fixture: us
     try std.testing.expectEqualSlices(u8, expected, retained.runTableBlock());
     try cache.drainLoadCleanupWithAdmission(control);
     try std.testing.expectEqual(@as(u64, 0), child.sliceStats(.lsm_read_working_set).used_bytes);
-    try std.testing.expectEqual(@as(u64, 0), peer.snapshot().memory.used_bytes);
+    try resources.metadata_fixture.expectUsage(@as(u64, 0), &peer, &.{&peer});
     try std.testing.expectEqual(child.snapshot().memory.used_bytes, parent.snapshot().memory.used_bytes);
     try std.testing.expectEqual(child.snapshot().memory.peak_bytes, parent.snapshot().memory.peak_bytes);
     try std.testing.expect(parent.snapshot().memory.peak_bytes < @as(u64, window.len) * 2);

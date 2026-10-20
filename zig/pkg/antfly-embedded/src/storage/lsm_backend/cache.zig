@@ -2380,8 +2380,8 @@ pub fn qualifyOptionalLoadClaim(control: read_admission.Port) !void {
     defer claim.transferToCache();
     try std.testing.expect((try cache.tryBeginLoadClaim(path, 1, 1, .run_table_block, 8, 32, control)) == null);
     const bytes: u64 = path.len * 2;
-    try std.testing.expectEqual(bytes, child.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(bytes, parent.snapshot().memory.used_bytes);
+    try resource_manager_mod.metadata_fixture.expectUsage(bytes, &child, &.{&child});
+    try resource_manager_mod.metadata_fixture.expectUsage(bytes, &parent, &.{ &parent, &child });
     // Destruction of the request's path cannot invalidate the cleanup key.
     @memset(path, 'x');
     // Cleanup must complete its ownership transfer even while both ledgers
@@ -2397,12 +2397,12 @@ pub fn qualifyOptionalLoadClaim(control: read_admission.Port) !void {
     try std.testing.expect(claim.isFinished());
     var next = (try cache.tryBeginLoadClaim("optional-promotion-owned-path", 1, 1, .run_table_block, 8, 32, control)) orelse return error.TestUnexpectedResult;
     defer next.transferToCache();
-    try std.testing.expectEqual(bytes, child.snapshot().memory.used_bytes);
+    try resource_manager_mod.metadata_fixture.expectUsage(bytes, &child, &.{&child});
     next.transferToCache();
     try cache.drainLoadCleanupWithAdmission(control);
     try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
-    try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+    try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, 0), &child, &.{&child});
+    try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &child });
 }
 
 pub fn qualifyOptionalLoadClaimAllocation() !void {
@@ -2426,16 +2426,16 @@ pub fn qualifyOptionalLoadClaimAllocation() !void {
         try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
         // Both failures keep admitted key bytes owned until an independent
         // pass; the next load must recover that slot and the exact charge.
-        try std.testing.expectEqual(@as(u64, path.len * 2), child.snapshot().memory.used_bytes);
+        try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, path.len * 2), &child, &.{&child});
         var claim = (try cache.tryBeginLoadClaim(path, 1, 1, .run_table_block, 8, 32, null)) orelse return error.TestUnexpectedResult;
         defer claim.transferToCache();
-        try std.testing.expectEqual(@as(u64, path.len * 2), parent.snapshot().memory.used_bytes);
+        try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, path.len * 2), &parent, &.{ &parent, &child });
         claim.transferToCache();
         shard.pending_sync.lock();
         cache.drainLoadCleanupLocked(shard);
         shard.pending_sync.unlock();
-        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
-        try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.used_bytes);
+        try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &child });
+        try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, 0), &child, &.{&child});
         try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
     }
 }
@@ -2449,8 +2449,8 @@ pub fn qualifyPromotionCreditContention(control: read_admission.Port, stage: usi
     defer child.deinit(a);
     try child.installMemoryParent(parent.memoryParentPort());
     defer {
-        std.debug.assert(parent.snapshot().memory.used_bytes == 0);
-        std.debug.assert(child.snapshot().memory.used_bytes == 0);
+        resource_manager_mod.metadata_fixture.expectUsage(0, &parent, &.{ &parent, &child }) catch unreachable;
+        resource_manager_mod.metadata_fixture.expectUsage(0, &child, &.{&child}) catch unreachable;
         resource_manager_mod.qualifyNoLiveReservations(&child) catch unreachable;
     }
     var cache = Cache.init(a, 4096);
@@ -2525,7 +2525,7 @@ pub fn qualifyPromotionCreditCleanup(control: read_admission.Port, deny_retentio
     if (deny_retention) {
         try std.testing.expectError(error.ResourceBudgetExceeded, cache.putRunTableBlockWithCreditAdmission(path, 1, 1, 8, 128, try a.dupe(u8, &@as([128]u8, @splat('x'))), credit, control));
         try std.testing.expectEqual(@as(u64, 128), credit.bytes);
-        try std.testing.expectEqual(@as(u64, 128 + path.len * 2), parent.snapshot().memory.peak_bytes);
+        try std.testing.expectEqual(@as(u64, 128 + path.len * 2) + child.identity_metadata_bytes + parent.identity_metadata_bytes, parent.snapshot().memory.peak_bytes);
         try std.testing.expectEqual(@as(usize, 0), cache.charged_transient_entries.load(.acquire));
     }
     const slot = claim.cleanup;
@@ -2545,8 +2545,8 @@ pub fn qualifyPromotionCreditCleanup(control: read_admission.Port, deny_retentio
     try std.testing.expectEqual(@as(u64, 128), slot.construction_credit.?.bytes);
     try cache.drainLoadCleanupWithAdmission(control);
     try std.testing.expect(slot.construction_credit == null);
-    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
-    try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.used_bytes);
+    try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &child });
+    try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, 0), &child, &.{&child});
     try resource_manager_mod.qualifyNoLiveReservations(&child);
 }
 
