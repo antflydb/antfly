@@ -1153,6 +1153,8 @@ const Engine = struct {
     join: ?*const Join = null,
     lookups: []Lookup = &.{},
     lookup: ?*Lookup = null,
+    distinct_sequence: usize = 0,
+    distinct_input_token: ?usize = null,
     aggregate_overrides: ?AggregateOverrides = null,
     group_overrides: ?GroupOverrides = null,
     projection_overrides: ?struct { items: []const ast.Item, row: Row } = null,
@@ -1196,7 +1198,7 @@ const Engine = struct {
     const AggregateOverrides = struct {
         index: *const std.AutoHashMapUnmanaged(*const ast.Expr, usize),
         values: []v.Value,
-        lazy: ?struct { ready: []bool, rows: []const Row } = null,
+        lazy: ?struct { ready: []bool, rows: []const Row, leaders: []const usize, inputs: []?[]const v.Value } = null,
     };
     const GroupOverrides = struct { index: *const std.AutoHashMapUnmanaged(*const ast.Expr, usize), values: []const v.Value, aliases: Row = &.{} };
     fn checkpoint(self: *Engine) !void {
@@ -1252,6 +1254,45 @@ const Engine = struct {
         }
         return output[0..length];
     }
+    // Values and their collision-checked equality index are shared by compatible
+    // DISTINCT inputs. Each consumer owns a compact ordinal bitmap: compressed
+    // packets can activate only part of a cohort without stealing another
+    // reducer's first contribution or collection order.
+    const DistinctMembership = struct {
+        arena: std.heap.ArenaAllocator,
+        values: std.ArrayList(v.Value) = .empty,
+        index: value_work.Index = .{},
+        last_token: ?usize = null,
+        last_ordinal: usize = 0,
+        last_created: bool = false,
+        fn remember(self: *@This(), engine: *Engine, ordinal_value: usize, created: bool) usize {
+            self.last_token = engine.distinct_input_token;
+            self.last_ordinal = ordinal_value;
+            self.last_created = created;
+            return ordinal_value;
+        }
+        fn ordinal(self: *@This(), engine: *Engine, value: v.Value) !usize {
+            if (engine.distinct_input_token) |token| if (self.last_token == token) return self.last_ordinal;
+            const hash = (try engine.values.info(value)).hash;
+            var candidate = self.index.head(hash);
+            while (candidate) |position| {
+                const link = self.index.links.items[position];
+                if (try engine.values.eql(self.values.items[link.index], value)) return self.remember(engine, link.index, false);
+                candidate = link.next;
+            }
+            const a = self.arena.allocator();
+            const owned = try value.clone(a);
+            const position = self.values.items.len;
+            try self.index.insert(a, hash, position);
+            try self.values.append(a, owned);
+            return self.remember(engine, position, true);
+        }
+    };
+    const DistinctConsumer = struct {
+        membership: *DistinctMembership,
+        owner: bool = false,
+        consumed: std.ArrayList(u64) = .empty,
+    };
     const StreamingAggregate = struct {
         function: ast.Function,
         arena: std.heap.ArenaAllocator,
@@ -1259,6 +1300,7 @@ const Engine = struct {
         distinct_values: std.ArrayList(v.Value) = .empty,
         distinct_index: value_work.Index = .{},
         distinct_support: ?*Statistic.SupportSet = null,
+        cohort: ?*DistinctConsumer = null,
         count: u64 = 0,
         sum: v.Value = .{ .integer = 0 },
         sum_sign: enum { zero, positive, negative } = .zero,
@@ -1269,6 +1311,26 @@ const Engine = struct {
         mean_scaled: ?*Count.Scaled = null,
         best: v.Value = .null,
         collected: std.ArrayList(v.Value) = .empty,
+        fn consumedOrdinal(self: *const @This(), ordinal: usize) bool {
+            const word = ordinal / 64;
+            return word < self.cohort.?.consumed.items.len and self.cohort.?.consumed.items[word] & (@as(u64, 1) << @intCast(ordinal % 64)) != 0;
+        }
+        fn consumeOrdinal(self: *@This(), ordinal: usize) !bool {
+            const word = ordinal / 64;
+            if (self.consumedOrdinal(ordinal)) return false;
+            if (word >= self.cohort.?.consumed.items.len) {
+                const old = self.cohort.?.consumed.items.len;
+                try self.cohort.?.consumed.resize(self.distinct_arena.allocator(), word + 1);
+                @memset(self.cohort.?.consumed.items[old..], 0);
+            }
+            self.cohort.?.consumed.items[word] |= @as(u64, 1) << @intCast(ordinal % 64);
+            return true;
+        }
+        fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.distinct_arena.deinit();
+            if (self.cohort) |cohort| if (cohort.owner) cohort.membership.arena.deinit();
+        }
         fn add(self: *StreamingAggregate, engine: *Engine, row: Row) !void {
             return self.addWeighted(engine, row, Count.one);
         }
@@ -1286,8 +1348,12 @@ const Engine = struct {
                 set.* = .{};
                 // A previous anchor may have used ordinary enumeration. Import
                 // its integral keys without counting those values twice.
-                try Engine.chargeWork(engine, self.distinct_values.items.len);
-                for (self.distinct_values.items) |value| if (supportInteger(value)) |integer| {
+                try Engine.chargeWork(engine, if (self.cohort) |cohort| cohort.membership.values.items.len else self.distinct_values.items.len);
+                if (self.cohort) |cohort| {
+                    for (cohort.membership.values.items, 0..) |value, ordinal| if (self.consumedOrdinal(ordinal)) {
+                        if (supportInteger(value)) |integer| _ = try set.insert(a, integer);
+                    };
+                } else for (self.distinct_values.items) |value| if (supportInteger(value)) |integer| {
                     _ = try set.insert(a, integer);
                 };
                 self.distinct_support = set;
@@ -1308,10 +1374,36 @@ const Engine = struct {
             // MIN/MAX are duplicate insensitive and need no distinct set.
             // Other DISTINCT reducers retain only unique arguments, using the
             // same equality and hashing as GROUP BY.
+            var distinct_owned: ?v.Value = null;
             if (self.function.distinct and !std.ascii.eqlIgnoreCase(self.function.name, "min") and !std.ascii.eqlIgnoreCase(self.function.name, "max")) {
                 const integer = supportInteger(value);
                 if (self.distinct_support != null and integer != null) {
                     if (!try self.distinct_support.?.insert(self.distinct_arena.allocator(), integer.?)) return;
+                } else if (self.cohort) |cohort| {
+                    const membership = cohort.membership;
+                    const ordinal = try membership.ordinal(engine, value);
+                    if (!try self.consumeOrdinal(ordinal)) return;
+                    distinct_owned = membership.values.items[ordinal];
+                    // Equality canonicalizes numeric representations. A consumer
+                    // activated later must keep its own first representation.
+                    if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) {
+                        const canonical = distinct_owned.?;
+                        // A value first cloned during this emission came from
+                        // this very argument, including its nested representation.
+                        const fresh = membership.last_created and engine.distinct_input_token != null and membership.last_token == engine.distinct_input_token;
+                        const same_representation = if (fresh) true else if (std.meta.activeTag(value) != std.meta.activeTag(canonical)) false else switch (value) {
+                            // Equality has already proved their exact value.
+                            .null, .boolean, .integer, .string => true,
+                            .number => @as(u64, @bitCast(value.number)) == @as(u64, @bitCast(canonical.number)),
+                            else => blk: {
+                                var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                                defer scratch.deinit();
+                                var identity: value_work.Work = .{ .a = scratch.allocator(), .ptr = engine, .charge = chargeWork, .binding_identity = true };
+                                break :blk try identity.eql(value, canonical);
+                            },
+                        };
+                        if (!same_representation) distinct_owned = try value.clone(self.arena.allocator());
+                    }
                 } else {
                     const hash = (try engine.values.info(value)).hash;
                     var candidate = self.distinct_index.head(hash);
@@ -1335,7 +1427,7 @@ const Engine = struct {
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) {
                 const retained = self.arena.allocator();
-                const owned = if (self.function.distinct) self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
+                const owned = if (self.function.distinct) distinct_owned orelse self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
                 try Engine.chargeWork(engine, std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded);
                 try self.collected.ensureUnusedCapacity(retained, @intCast(weight.exact().?));
                 for (0..@intCast(weight.exact().?)) |_| self.collected.appendAssumeCapacity(owned);
@@ -1529,8 +1621,128 @@ const Engine = struct {
         try reduction_plan.keyUses(self.a, &plan.keys, projection.order, &plan.uses);
         return plan;
     }
-    const StreamGroup = struct { key: []const v.Value, source: Row, states: []StreamingAggregate };
-    fn newStreamGroup(self: *Engine, a: A, key: []const v.Value, input: Row, retention: ?*const GroupRetention, projection: ast.Projection, calls: []const *const ast.Expr) !StreamGroup {
+    const StreamGroup = struct {
+        key: []const v.Value,
+        source: Row,
+        states: []StreamingAggregate,
+        window: ?*GroupWindow.Owned = null,
+        fn deinit(self: *@This()) void {
+            for (self.states) |*state_value| state_value.deinit();
+            if (self.window) |window| {
+                // The ownership record itself lives inside this arena.
+                var arena = window.arena;
+                arena.deinit();
+            }
+        }
+    };
+    /// A group-key ranked window is monotone: an evicted key can never enter
+    /// again. Only scalar COUNT reducers are currently licensed. Their count
+    /// cannot overflow within the work budget; rejected argument expressions
+    /// are still evaluated, preserving their errors and effects.
+    const GroupWindow = struct {
+        const Owned = struct { arena: std.heap.ArenaAllocator, rank: []const v.Value, hash: u64, sequence: usize };
+        capacity: usize,
+        slots: []const usize,
+        heap: std.ArrayList(usize) = .empty,
+        sequence: usize = 0,
+        fn init(engine: *Engine, projection: ast.Projection, scalar: bool) !?@This() {
+            if (!scalar or @as(u64, engine.limits.intermediate_states) > std.math.maxInt(i64) or projection.distinct or projection.predicate != null or projection.order.len == 0 or !engine.boundedGroupWindow(projection)) return null;
+            var keys: std.ArrayList(*const ast.Expr) = .empty;
+            for (projection.items) |item| {
+                if (aggregates(item.expression)) {
+                    if (item.expression.value != .call or !std.ascii.eqlIgnoreCase(item.expression.value.call.name, "count") or item.expression.value.call.distinct) return null;
+                } else try keys.append(engine.a, item.expression);
+            }
+            if (keys.items.len == 0) return null;
+            const slots = try engine.a.alloc(usize, projection.order.len);
+            for (projection.order, slots) |order, *slot| {
+                var found: ?usize = null;
+                if (order.expression.value == .variable) {
+                    var key: usize = 0;
+                    for (projection.items) |item| {
+                        const grouped = aggregates(item.expression);
+                        const name = item.alias orelse try engine.expressionName(item.expression);
+                        if (std.mem.eql(u8, name, order.expression.value.variable)) {
+                            if (grouped) return null;
+                            found = key;
+                            break;
+                        }
+                        if (!grouped) key += 1;
+                    }
+                }
+                if (found == null) {
+                    // Aliases shadow input bindings in ORDER BY.
+                    for (projection.items) |item| if (@import("expressions.zig").references(order.expression, item.alias orelse try engine.expressionName(item.expression))) return null;
+                    for (keys.items, 0..) |key, index| if (reduction_plan.repeatable(key) and @import("expressions.zig").same(key, order.expression)) {
+                        found = index;
+                        break;
+                    };
+                }
+                slot.* = found orelse return null;
+            }
+            const limit = try engine.count(projection.limit.?);
+            return .{ .capacity = if (limit == 0) 0 else (if (projection.skip) |skip| try engine.count(skip) else 0) + limit, .slots = slots };
+        }
+        fn projected(group: StreamGroup) Projected {
+            return .{ .row = &.{}, .source = &.{}, .group = null, .keys = group.window.?.rank, .sequence = group.window.?.sequence };
+        }
+        fn compare(engine: *Engine, left: StreamGroup, right: StreamGroup, orders: []const ast.Order) !std.math.Order {
+            return engine.compareProjected(projected(left), projected(right), orders);
+        }
+        fn admit(self: *@This(), engine: *Engine, fold: *StreamFold, key: []const v.Value, row: Row, hash: u64) !?usize {
+            const rank = try engine.a.alloc(v.Value, self.slots.len);
+            for (self.slots, rank) |slot, *value| value.* = key[slot];
+            const candidate: Projected = .{ .row = &.{}, .source = &.{}, .group = null, .keys = rank, .sequence = self.sequence };
+            self.sequence += 1;
+            const full = self.heap.items.len == self.capacity;
+            if (self.capacity == 0 or (full and try engine.compareProjected(candidate, projected(fold.groups.items[self.heap.items[0]]), fold.projection.order) != .lt)) {
+                // These values would have been consumed even for discarded
+                // groups. Do not hide type/arithmetic/pattern errors in args.
+                for (fold.calls) |expression| {
+                    if (!expression.value.call.star) _ = try engine.eval(expression.value.call.args[0], row, null);
+                }
+                return null;
+            }
+            var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            var owned = true;
+            defer if (owned) arena.deinit();
+            var group = try engine.newStreamGroup(arena.allocator(), key, row, fold.retention, fold.projection, fold.calls, fold.membership_leaders);
+            const retained_rank = try arena.allocator().alloc(v.Value, self.slots.len);
+            for (self.slots, retained_rank) |slot, *value| value.* = group.key[slot];
+            const ownership = try arena.allocator().create(Owned);
+            ownership.* = .{ .arena = arena, .rank = retained_rank, .hash = hash, .sequence = candidate.sequence };
+            group.window = ownership;
+            const index = if (full) self.heap.items[0] else fold.groups.items.len;
+            if (full) {
+                fold.group_index.remove(fold.groups.items[index].window.?.hash, index);
+                fold.groups.items[index].deinit();
+                fold.groups.items[index] = group;
+            } else try fold.groups.append(fold.retained, group);
+            owned = false;
+            try fold.group_index.insert(engine.scratch_allocator, hash, index);
+            if (!full) {
+                try self.heap.append(engine.scratch_allocator, index);
+                var position = self.heap.items.len - 1;
+                while (position > 0) {
+                    const parent = (position - 1) / 2;
+                    if (try compare(engine, fold.groups.items[self.heap.items[parent]], fold.groups.items[self.heap.items[position]], fold.projection.order) != .lt) break;
+                    std.mem.swap(usize, &self.heap.items[parent], &self.heap.items[position]);
+                    position = parent;
+                }
+            } else {
+                var position: usize = 0;
+                while (position * 2 + 1 < self.heap.items.len) {
+                    var worst = position * 2 + 1;
+                    if (worst + 1 < self.heap.items.len and try compare(engine, fold.groups.items[self.heap.items[worst + 1]], fold.groups.items[self.heap.items[worst]], fold.projection.order) == .gt) worst += 1;
+                    if (try compare(engine, fold.groups.items[self.heap.items[position]], fold.groups.items[self.heap.items[worst]], fold.projection.order) != .lt) break;
+                    std.mem.swap(usize, &self.heap.items[position], &self.heap.items[worst]);
+                    position = worst;
+                }
+            }
+            return index;
+        }
+    };
+    fn newStreamGroup(self: *Engine, a: A, key: []const v.Value, input: Row, retention: ?*const GroupRetention, projection: ast.Projection, calls: []const *const ast.Expr, leaders: []const usize) !StreamGroup {
         const states = try a.alloc(StreamingAggregate, calls.len);
         for (states, calls) |*state_value, call_value| state_value.* = .{ .function = call_value.value.call, .arena = std.heap.ArenaAllocator.init(self.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
         const copied = try (v.Value{ .list = key }).clone(a);
@@ -1545,6 +1757,18 @@ const Engine = struct {
         if (retention) |plan| for (input) |entry| {
             if ((plan.all or plan.fields.contains(entry.name)) and lookup(source.items, entry.name) == null)
                 try source.append(a, .{ .name = try a.dupe(u8, entry.name), .value = try entry.value.clone(a) });
+        };
+        for (leaders, 0..) |leader, index| if (leader != index) {
+            if (states[leader].cohort == null) {
+                const membership = try a.create(DistinctMembership);
+                membership.* = .{ .arena = std.heap.ArenaAllocator.init(self.scratch_allocator) };
+                const consumer = try a.create(DistinctConsumer);
+                consumer.* = .{ .membership = membership, .owner = true };
+                states[leader].cohort = consumer;
+            }
+            const consumer = try a.create(DistinctConsumer);
+            consumer.* = .{ .membership = states[leader].cohort.?.membership };
+            states[index].cohort = consumer;
         };
         return .{ .key = copied.list, .source = source.items, .states = states };
     }
@@ -1572,7 +1796,8 @@ const Engine = struct {
         const previous = self.aggregate_overrides;
         defer self.aggregate_overrides = previous;
         var unique_rows: DistinctRows = .{};
-        for (groups, 0..) |group, sequence| {
+        for (groups, 0..) |group, index| {
+            const sequence = if (group.window) |window_| window_.sequence else index;
             _ = scratch.reset(.free_all);
             const evaluation = if (window != null) scratch.allocator() else retained;
             const eval_scope: ?EvalScope = if (window != null) EvalScope.enter(self, evaluation) else null;
@@ -1639,6 +1864,8 @@ const Engine = struct {
         middle: []const ast.Clause,
         projection: ast.Projection,
         calls: []const *const ast.Expr,
+        group_window: ?*GroupWindow = null,
+        membership_leaders: []const usize = &.{},
         call_aliases: ?*const std.AutoHashMapUnmanaged(*const ast.Expr, usize) = null,
         retention: ?*const GroupRetention = null,
         top: *?TopK,
@@ -1818,16 +2045,28 @@ const Engine = struct {
             var candidate = fold.group_index.head(hash);
             while (candidate) |position| {
                 const link = fold.group_index.links.items[position];
-                if (try engine.values.eql(.{ .list = fold.groups.items[link.index].key }, .{ .list = key.items })) {
+                const equal = if (fold.group_window != null) blk: {
+                    // Selected group arenas are recyclable. Their comparison
+                    // metadata must have a shorter lifetime than an eviction.
+                    var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                    defer scratch.deinit();
+                    var work: value_work.Work = .{ .a = scratch.allocator(), .ptr = engine, .charge = chargeWork };
+                    break :blk try work.eql(.{ .list = fold.groups.items[link.index].key }, .{ .list = key.items });
+                } else try engine.values.eql(.{ .list = fold.groups.items[link.index].key }, .{ .list = key.items });
+                if (equal) {
                     found = link.index;
                     break;
                 }
                 candidate = link.next;
             }
             if (found == null) {
-                found = fold.groups.items.len;
-                try fold.group_index.insert(fold.retained, hash, found.?);
-                try fold.groups.append(fold.retained, try engine.newStreamGroup(fold.retained, key.items, row, fold.retention, fold.projection, fold.calls));
+                if (fold.group_window) |window| {
+                    found = try window.admit(engine, fold, key.items, row, hash) orelse return;
+                } else {
+                    found = fold.groups.items.len;
+                    try fold.group_index.insert(fold.retained, hash, found.?);
+                    try fold.groups.append(fold.retained, try engine.newStreamGroup(fold.retained, key.items, row, fold.retention, fold.projection, fold.calls, fold.membership_leaders));
+                }
             } else if (!fold.has_keys and fold.groups.items[0].source.len == 0) {
                 // Capture only fields needed by an ORDER BY expression behind
                 // alias shadowing; global aggregate arguments are already consumed.
@@ -1837,6 +2076,17 @@ const Engine = struct {
                         try retained_source.append(fold.retained, .{ .name = try fold.retained.dupe(u8, entry.name), .value = try entry.value.clone(fold.retained) });
                     fold.groups.items[0].source = retained_source.items;
                 }
+            }
+            // One ordinary fold emission feeds the same repeatable argument to
+            // every member. Reuse its ordinal instead of rehashing wide values.
+            // Synthetic statistic bins and moment inputs have independent
+            // arguments and must not inherit this row-level cache token.
+            const previous_token = engine.distinct_input_token;
+            defer engine.distinct_input_token = previous_token;
+            engine.distinct_input_token = null;
+            if (engine.statistic_packet == null and fold.moment_direct == null) {
+                engine.distinct_sequence += 1;
+                engine.distinct_input_token = engine.distinct_sequence;
             }
             if (engine.statistic_packet) |arguments| {
                 for (arguments) |argument| {
@@ -2685,13 +2935,23 @@ const Engine = struct {
         const retained = self.a;
         var groups: std.ArrayList(StreamGroup) = .empty;
         var group_index: value_work.Index = .{};
-        defer for (groups.items) |group| for (group.states) |*state_value| {
-            state_value.arena.deinit();
-            state_value.distinct_arena.deinit();
+        defer for (groups.items) |*group| group.deinit();
+        const scalar_groups = path.edges.len == 0 and operation.paths.len == 1 and blk: {
+            if (input_weights) |weights| for (weights) |weight| if (!weight.isOne()) break :blk false;
+            for (middle) |clause| switch (clause.operation) {
+                .project, .unwind => {},
+                else => break :blk false,
+            };
+            break :blk true;
+        };
+        var group_window = if (grouped) try GroupWindow.init(self, projection, scalar_groups) else null;
+        defer if (group_window) |*window| {
+            window.heap.deinit(self.scratch_allocator);
+            group_index.deinit(self.scratch_allocator);
         };
         var has_keys = false;
         for (projection.items) |item| has_keys = has_keys or !aggregates(item.expression);
-        if (grouped and !has_keys) try groups.append(retained, try self.newStreamGroup(retained, &.{}, &.{}, null, projection, calls.items));
+        if (grouped and !has_keys) try groups.append(retained, try self.newStreamGroup(retained, &.{}, &.{}, null, projection, calls.items, calls.distinct_leaders.items));
         var matched: usize = 0;
         const stage_counts = try retained.alloc(usize, middle.len + 1);
         @memset(stage_counts, 0);
@@ -2704,7 +2964,7 @@ const Engine = struct {
         for (probes, middle) |*probe, clause| probe.* = .{ .budget = .{ .backing = self.scratch_allocator, .limit = @min(4 << 20, self.limits.memory_bytes / 32) }, .disabled = clause.operation != .match and clause.operation != .subquery };
         defer for (probes) |*probe| probe.deinit();
         const retention: GroupRetention = if (grouped) try self.groupRetention(projection) else .{ .a = self.a };
-        var fold: StreamFold = .{ .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
+        var fold: StreamFold = .{ .retention = &retention, .probes = probes, .optional = operation.optional, .applies = applies, .continuation = continuation, .distinct = distinct_stages, .retained = retained, .middle = middle, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = stage_counts, .matched = &matched };
         var adaptive_probe = adaptive_candidate;
         if (adaptive_probe) for (input) |row| {
             if (operation.predicate) |predicate| if (!endpointExpression(predicate, path, row)) {
@@ -3640,19 +3900,25 @@ const Engine = struct {
                     defer if (top) |*value| value.deinit();
                     var groups: std.ArrayList(StreamGroup) = .empty;
                     var group_index: value_work.Index = .{};
-                    defer for (groups.items) |group| for (group.states) |*state_value| {
-                        state_value.arena.deinit();
-                        state_value.distinct_arena.deinit();
+                    defer for (groups.items) |*group| group.deinit();
+                    const scalar_groups = blk: {
+                        for (bags.weights) |weight| if (!weight.isOne()) break :blk false;
+                        break :blk true;
+                    };
+                    var group_window = if (grouped) try GroupWindow.init(self, projection, scalar_groups) else null;
+                    defer if (group_window) |*window| {
+                        window.heap.deinit(self.scratch_allocator);
+                        group_index.deinit(self.scratch_allocator);
                     };
                     // DISTINCT over an empty binding still has one empty
                     // key per input, and no group at all for empty input.
                     var has_keys = projection.distinct and calls.items.len == 0;
                     for (projection.items) |item| has_keys = has_keys or !aggregates(item.expression);
-                    if (calls.items.len != 0 and !has_keys) try groups.append(self.a, try self.newStreamGroup(self.a, &.{}, &.{}, null, projection, calls.items));
+                    if (calls.items.len != 0 and !has_keys) try groups.append(self.a, try self.newStreamGroup(self.a, &.{}, &.{}, null, projection, calls.items, calls.distinct_leaders.items));
                     var matched: usize = 0;
                     var counts = [_]usize{0};
                     const retention: GroupRetention = if (grouped) try self.groupRetention(projection) else .{ .a = self.a };
-                    var fold: StreamFold = .{ .retention = &retention, .retained = self.a, .middle = &.{}, .projection = projection, .calls = calls.items, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = &counts, .matched = &matched, .distinct = &.{} };
+                    var fold: StreamFold = .{ .retention = &retention, .retained = self.a, .middle = &.{}, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .group_window = if (group_window) |*window| window else null, .call_aliases = &calls.index.pointers, .top = &top, .groups = &groups, .group_index = &group_index, .has_keys = has_keys, .stage_counts = &counts, .matched = &matched, .distinct = &.{} };
                     for (bags.rows, bags.weights) |row, weight| {
                         fold.weight = weight;
                         fold.add(self, row) catch |err| switch (err) {
@@ -7539,7 +7805,16 @@ const Engine = struct {
         };
         if (self.aggregate_overrides) |overrides| if (overrides.index.get(expression)) |index| {
             if (overrides.lazy) |lazy| if (!lazy.ready[index]) {
-                overrides.values[index] = try self.aggregate(expression.value.call, lazy.rows);
+                const call_value = expression.value.call;
+                const leader = lazy.leaders[index];
+                const shareable = call_value.distinct and call_value.args.len == 1 and reduction_plan.repeatable(call_value.args[0]) and
+                    !std.ascii.eqlIgnoreCase(call_value.name, "min") and !std.ascii.eqlIgnoreCase(call_value.name, "max");
+                var input: ?[]const v.Value = null;
+                if (shareable) {
+                    if (lazy.inputs[leader] == null) lazy.inputs[leader] = try self.distinctInput(call_value, lazy.rows);
+                    input = lazy.inputs[leader];
+                }
+                overrides.values[index] = try self.aggregate(call_value, lazy.rows, input);
                 lazy.ready[index] = true;
             };
             return overrides.values[index];
@@ -7757,7 +8032,7 @@ const Engine = struct {
             },
             .call => |c| if (std.ascii.eqlIgnoreCase(c.name, "size") and c.args.len == 1 and c.args[0].value == .pattern_comprehension and weightedExpression(c.args[0]))
                 try self.comprehensionSize(c.args[0], row)
-            else if (aggregateName(c.name)) try self.aggregate(c, group orelse return error.CypherAggregateScope) else try self.function(c.name, c.args, row, group),
+            else if (aggregateName(c.name)) try self.aggregate(c, group orelse return error.CypherAggregateScope, null) else try self.function(c.name, c.args, row, group),
             .case_when => |c| blk: {
                 const operand = if (c.operand) |x| try self.eval(x, row, group) else null;
                 for (c.branches) |branch| {
@@ -8060,7 +8335,30 @@ const Engine = struct {
         if (std.ascii.eqlIgnoreCase(name, "abs")) return if (value == .integer) .{ .integer = std.math.cast(i64, @abs(value.integer)) orelse return error.CypherNumericOverflow } else .{ .number = @abs(try value.numeric()) };
         return error.UnknownCypherFunction;
     }
-    fn aggregate(self: *Engine, call_value: ast.Function, group: []const Row) !v.Value {
+    fn distinctInput(self: *Engine, call_value: ast.Function, group: []const Row) ![]const v.Value {
+        var items: std.ArrayList(v.Value) = .empty;
+        var index: value_work.Index = .{};
+        for (group) |row| {
+            const value = if (call_value.star) v.Value{ .integer = 1 } else try self.eval(call_value.args[0], row, null);
+            if (value == .null) continue;
+            const hash = (try self.values.info(value)).hash;
+            var candidate = index.head(hash);
+            var duplicate = false;
+            while (candidate) |position| {
+                const link = index.links.items[position];
+                if (try self.values.eql(items.items[link.index], value)) {
+                    duplicate = true;
+                    break;
+                }
+                candidate = link.next;
+            }
+            if (duplicate) continue;
+            try index.insert(self.a, hash, items.items.len);
+            try items.append(self.a, value);
+        }
+        return items.items;
+    }
+    fn aggregate(self: *Engine, call_value: ast.Function, group: []const Row, prepared: ?[]const v.Value) !v.Value {
         if (call_value.args.len != (if (call_value.star) @as(usize, 0) else 1)) return error.CypherFunctionArity;
         if (!call_value.distinct and !std.ascii.eqlIgnoreCase(call_value.name, "collect")) {
             var count_values: usize = 0;
@@ -8089,30 +8387,18 @@ const Engine = struct {
             if (std.ascii.eqlIgnoreCase(call_value.name, "avg")) return .{ .number = mean };
             return best;
         }
+        if (call_value.distinct and prepared == null) return self.aggregate(call_value, group, try self.distinctInput(call_value, group));
         var items: std.ArrayList(v.Value) = .empty;
-        var distinct_values: value_work.Index = .{};
-        for (group) |row| {
-            const value = if (call_value.star) v.Value{ .integer = 1 } else try self.eval(call_value.args[0], row, null);
-            if (value == .null) continue;
-            if (call_value.distinct) {
-                const hash = (try self.values.info(value)).hash;
-                var candidate = distinct_values.head(hash);
-                var duplicate = false;
-                while (candidate) |position| {
-                    const link = distinct_values.links.items[position];
-                    if (try self.values.eql(items.items[link.index], value)) {
-                        duplicate = true;
-                        break;
-                    }
-                    candidate = link.next;
-                }
-                if (duplicate) continue;
-                try distinct_values.insert(self.a, hash, items.items.len);
+        if (prepared) |values| {
+            items.items = @constCast(values);
+        } else {
+            for (group) |row| {
+                const value = if (call_value.star) v.Value{ .integer = 1 } else try self.eval(call_value.args[0], row, null);
+                if (value != .null) try items.append(self.a, value);
             }
-            try items.append(self.a, value);
         }
         if (std.ascii.eqlIgnoreCase(call_value.name, "count")) return .{ .integer = @intCast(items.items.len) };
-        if (std.ascii.eqlIgnoreCase(call_value.name, "collect")) return .{ .list = try items.toOwnedSlice(self.a) };
+        if (std.ascii.eqlIgnoreCase(call_value.name, "collect")) return .{ .list = if (prepared) |values| values else try items.toOwnedSlice(self.a) };
         if (items.items.len == 0) return if (std.ascii.eqlIgnoreCase(call_value.name, "sum")) .{ .integer = 0 } else .null;
         if (std.ascii.eqlIgnoreCase(call_value.name, "min") or std.ascii.eqlIgnoreCase(call_value.name, "max")) {
             var best = items.items[0];
@@ -8401,10 +8687,44 @@ const Engine = struct {
         if (final) self.columns = try columns.toOwnedSlice(self.a);
         return output.items[start..end];
     }
+    fn projectBoundedCountGroups(self: *Engine, rows: []const Row, projection: ast.Projection, final: bool, plan: GroupWindow) ![]const Row {
+        var window = plan;
+        defer window.heap.deinit(self.scratch_allocator);
+        var calls: reduction_plan.Calls = .{};
+        for (projection.items) |item| if (!try self.collectStreamingAggregates(item.expression, &calls)) return error.CypherInvalidAggregate;
+        var groups: std.ArrayList(StreamGroup) = .empty;
+        defer for (groups.items) |*group| group.deinit();
+        var index: value_work.Index = .{};
+        defer index.deinit(self.scratch_allocator);
+        const retention = try self.groupRetention(projection);
+        var top: ?TopK = null;
+        var matched: usize = 0;
+        var counts = [_]usize{0};
+        var fold: StreamFold = .{ .retention = &retention, .retained = self.a, .middle = &.{}, .projection = projection, .calls = calls.items, .membership_leaders = calls.distinct_leaders.items, .call_aliases = &calls.index.pointers, .group_window = &window, .top = &top, .groups = &groups, .group_index = &index, .has_keys = true, .stage_counts = &counts, .matched = &matched, .distinct = &.{} };
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_allocator);
+        defer scratch.deinit();
+        for (rows) |row| {
+            _ = scratch.reset(.free_all);
+            const scope = EvalScope.enter(self, scratch.allocator());
+            defer scope.leave(self);
+            try fold.add(self, row);
+        }
+        const columns = self.columns;
+        defer if (!final) {
+            self.columns = columns;
+        };
+        return self.finishStreamGroups(groups.items, &calls, &retention, projection);
+    }
     fn project(self: *Engine, rows: []const Row, projection: ast.Projection, final: bool) anyerror![]const Row {
         var grouped = false;
         for (projection.items) |item| grouped = grouped or aggregates(item.expression);
         if (grouped and projection.wildcard) return error.CypherAggregateWildcard;
+        if (grouped) bounded: {
+            // Materialized reducers normally run group by group. COUNT(*) is
+            // total, so switching it to row order cannot reorder argument errors.
+            for (projection.items) |item| if (aggregates(item.expression) and (item.expression.value != .call or !item.expression.value.call.star)) break :bounded;
+            if (try GroupWindow.init(self, projection, true)) |window| return self.projectBoundedCountGroups(rows, projection, final, window);
+        }
         if (!grouped and !projection.distinct and projection.order.len == 0) return self.projectUnordered(rows, projection, final);
         if (!grouped and !projection.distinct and projection.limit != null and projection.order.len != 0) top_k: {
             // Pattern/subquery evaluation retains nested execution plans and
@@ -8461,6 +8781,7 @@ const Engine = struct {
         }
         const values = try self.a.alloc(v.Value, calls.items.len);
         const ready = try self.a.alloc(bool, calls.items.len);
+        const distinct_inputs = try self.a.alloc(?[]const v.Value, calls.items.len);
         const previous_aggregates = self.aggregate_overrides;
         defer self.aggregate_overrides = previous_aggregates;
         var projected: std.ArrayList(Projected) = .empty;
@@ -8470,7 +8791,8 @@ const Engine = struct {
         for (projection.items) |item| try columns.append(self.a, item.alias orelse try self.expressionName(item.expression));
         for (groups.items) |group| {
             @memset(ready, false);
-            if (grouped) self.aggregate_overrides = .{ .index = &calls.index.pointers, .values = values, .lazy = .{ .ready = ready, .rows = group.items } };
+            @memset(distinct_inputs, null);
+            if (grouped) self.aggregate_overrides = .{ .index = &calls.index.pointers, .values = values, .lazy = .{ .ready = ready, .rows = group.items, .leaders = calls.distinct_leaders.items, .inputs = distinct_inputs } };
             const source: Row = if (group.items.len > 0) group.items[0] else &.{};
             var row: std.ArrayList(v.Entry) = .empty;
             if (projection.wildcard) try row.appendSlice(self.a, source);
@@ -9026,4 +9348,34 @@ test "materialized reductions share pure calls without evaluating unused aggrega
     try std.testing.expectEqual(@as(i64, 2), output[0][0].value.integer);
     try std.testing.expectEqual(@as(i64, 2), output[0][1].value.integer);
     try std.testing.expect(engine.aggregate_overrides == null);
+}
+
+test "shared DISTINCT membership keeps independent consumer ordinals and numeric representations" {
+    const Noop = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dummy: u8 = 0;
+    var engine: Engine = .{ .a = arena.allocator(), .scratch_allocator = std.testing.allocator, .regex = undefined, .backend = .{ .ptr = &dummy, .vtable = &.{ .bind = undefined, .checkpoint = Noop.checkpoint, .scan = undefined, .get = undefined, .expand = undefined } }, .graph = undefined, .source = "", .parameters = &.{}, .limits = .{} };
+    engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
+    var operand: ast.Expr = .{ .span = .{}, .value = .{ .variable = "x" } };
+    var membership: Engine.DistinctMembership = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer membership.arena.deinit();
+    var counter_consumer: Engine.DistinctConsumer = .{ .membership = &membership };
+    var collector_consumer: Engine.DistinctConsumer = .{ .membership = &membership };
+    var counter: Engine.StreamingAggregate = .{ .function = .{ .name = "count", .args = &.{&operand}, .distinct = true }, .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .distinct_arena = std.heap.ArenaAllocator.init(std.testing.allocator), .cohort = &counter_consumer };
+    defer counter.deinit();
+    var collector: Engine.StreamingAggregate = .{ .function = .{ .name = "collect", .args = &.{&operand}, .distinct = true }, .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .distinct_arena = std.heap.ArenaAllocator.init(std.testing.allocator), .cohort = &collector_consumer };
+    defer collector.deinit();
+    try counter.add(&engine, &.{.{ .name = "x", .value = .{ .integer = 1 } }});
+    try collector.add(&engine, &.{.{ .name = "x", .value = .{ .number = 1.0 } }});
+    try collector.add(&engine, &.{.{ .name = "x", .value = .{ .integer = 2 } }});
+    try counter.add(&engine, &.{.{ .name = "x", .value = .{ .integer = 2 } }});
+    try collector.add(&engine, &.{.{ .name = "x", .value = .{ .integer = 1 } }});
+    try std.testing.expectEqual(@as(i64, 2), counter.result().integer);
+    try std.testing.expectEqual(@as(usize, 2), membership.values.items.len);
+    try std.testing.expectEqual(@as(usize, 2), collector.result().list.len);
+    try std.testing.expect(collector.result().list[0] == .number);
+    try std.testing.expectEqual(@as(i64, 2), collector.result().list[1].integer);
 }

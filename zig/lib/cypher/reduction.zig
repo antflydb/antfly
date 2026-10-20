@@ -109,9 +109,16 @@ pub const Calls = struct {
     items: []const *const ast.Expr = &.{},
     storage: std.ArrayList(*const ast.Expr) = .empty,
     index: Index = .{},
+    distinct_inputs: Index = .{},
+    distinct_leaders: std.ArrayList(usize) = .empty,
     pub fn append(self: *Calls, a: A, expression: *const ast.Expr) !void {
         const slot = try self.index.intern(a, expression, self.items.len);
         if (slot == self.items.len) {
+            const call = expression.value.call;
+            const shared = call.distinct and call.args.len == 1 and repeatable(call.args[0]) and
+                !std.ascii.eqlIgnoreCase(call.name, "min") and !std.ascii.eqlIgnoreCase(call.name, "max");
+            const leader = if (shared) try self.distinct_inputs.intern(a, call.args[0], slot) else slot;
+            try self.distinct_leaders.append(a, leader);
             try self.storage.append(a, expression);
             self.items = self.storage.items;
         }

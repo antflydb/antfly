@@ -3295,3 +3295,52 @@ test "group key reuse preserves ORDER BY alias type errors" {
     try std.testing.expectError(error.CypherTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
     try check("UNWIND [{x:1}] AS n RETURN DISTINCT n.x AS n,count(*) AS c ORDER BY n.x", "[[1,1]]");
 }
+
+test "DISTINCT input cohorts preserve nulls representations first-seen order and lazy errors" {
+    try check("UNWIND [null,2,1,2,1.0,null] AS x RETURN count(DISTINCT x),collect(DISTINCT x),sum(DISTINCT x),avg(DISTINCT x)", "[[2,[2,1],3,1.5]]");
+    try check("UNWIND [1.0,1,2,null] AS x RETURN collect(DISTINCT x),count(DISTINCT x),sum(DISTINCT x)", "[[[1,2],2,3]]");
+    try check("UNWIND [[1],[1],[2],null] AS x RETURN count(DISTINCT x),collect(DISTINCT x)", "[[2,[[1],[2]]]]");
+    try check("UNWIND [1,2,1] AS x RETURN x%2 AS key,count(DISTINCT x),collect(DISTINCT x) ORDER BY key", "[[0,1,[2]],[1,1,[1]]]");
+    try check("UNWIND [1,2] AS x RETURN CASE WHEN true THEN count(DISTINCT x) ELSE sum(DISTINCT 1/0) END,collect(DISTINCT x)", "[[2,[1,2]]]");
+}
+
+test "bounded group keys retain exact counts stable ties nulls and multiple order columns" {
+    try check("UNWIND [3,1,2,3,1,3] AS x RETURN x AS key,count(*) AS c ORDER BY key LIMIT 1", "[[1,2]]");
+    try check("UNWIND [3,1,2,3,1,3] AS x RETURN x AS key,count(*) AS c ORDER BY key DESC SKIP 1 LIMIT 1", "[[2,1]]");
+    try check("UNWIND [3,1,2,3,1,3] AS x RETURN x AS key,count(*) AS c ORDER BY key%2 LIMIT 2", "[[2,1],[3,3]]");
+    try check("UNWIND [3,1,2,3,1,3] AS x RETURN x%2 AS rank,x AS key,count(*) AS c ORDER BY rank,key DESC LIMIT 2", "[[0,2,1],[1,3,3]]");
+    try check("UNWIND [null,1,2,null,1] AS x RETURN x AS key,count(x) AS c ORDER BY key DESC LIMIT 1", "[[null,0]]");
+    try check("UNWIND [1,1,2] AS x RETURN x AS key,count(*) AS c ORDER BY key LIMIT 0", "[]");
+    try check("MATCH (n:Document) RETURN n.rank AS key,count(*) AS c ORDER BY key DESC LIMIT 1", "[[3,1]]");
+    try check("MATCH (n:Document) RETURN n.rank%2 AS r,n.rank AS k,count(*) AS c ORDER BY r LIMIT 2", "[[0,2,1],[1,1,1]]");
+    for ([_][]const u8{
+        "UNWIND [0,1] AS x RETURN x AS key,count(1/(1-x)) AS c ORDER BY key LIMIT 1",
+        "UNWIND [0,1] AS x RETURN x AS key,count(1/(1-x)) AS c ORDER BY key LIMIT 0",
+        "UNWIND [0,1] AS x RETURN x AS key,sum(1/(1-x)) AS c ORDER BY key LIMIT 1",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "DISTINCT cohorts and evicting group windows release every allocation failure" {
+    const Campaign = struct {
+        fn run(a: std.mem.Allocator, bounded: bool) !void {
+            var diagnostic: c.Diagnostic = .{};
+            const text = if (bounded)
+                "MATCH (n:Document) RETURN n.rank AS key,count(n.title) AS c ORDER BY key DESC LIMIT 1"
+            else
+                "UNWIND [2,1,2,3] AS x RETURN count(DISTINCT x),collect(DISTINCT x),avg(DISTINCT x)";
+            var compiled = try c.compile(a, text, .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        }
+    };
+    inline for (.{ false, true }) |bounded| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{bounded});
+}

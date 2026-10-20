@@ -293,14 +293,45 @@ pub const Index = struct {
     const Link = struct { index: usize, next: ?usize };
     heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     links: std.ArrayList(Link) = .empty,
+    free: ?usize = null,
+    pub fn deinit(self: *Index, a: A) void {
+        self.heads.deinit(a);
+        self.links.deinit(a);
+    }
+    pub fn remove(self: *Index, hash: u64, index: usize) void {
+        var previous: ?usize = null;
+        var candidate = self.head(hash);
+        while (candidate) |position| {
+            const link = self.links.items[position];
+            if (link.index == index) {
+                if (previous) |prior| self.links.items[prior].next = link.next else if (link.next) |next| {
+                    self.heads.getPtr(hash).?.* = next;
+                } else {
+                    _ = self.heads.remove(hash);
+                }
+                self.links.items[position].next = self.free;
+                self.free = position;
+                return;
+            }
+            previous = position;
+            candidate = link.next;
+        }
+        unreachable;
+    }
     pub fn head(self: Index, hash: u64) ?usize {
         return self.heads.get(hash);
     }
     pub fn insert(self: *Index, a: A, hash: u64, index: usize) !void {
         const next = self.head(hash);
-        const position = self.links.items.len;
-        try self.links.append(a, .{ .index = index, .next = next });
-        try self.heads.put(a, hash, position);
+        if (self.free) |position| {
+            try self.heads.put(a, hash, position);
+            self.free = self.links.items[position].next;
+            self.links.items[position] = .{ .index = index, .next = next };
+        } else {
+            const position = self.links.items.len;
+            try self.links.append(a, .{ .index = index, .next = next });
+            try self.heads.put(a, hash, position);
+        }
     }
 };
 
@@ -371,4 +402,22 @@ test "large immutable property maps are indexed once and preserve first-key and 
     try std.testing.expectEqual(@as(usize, 1), work.fields.count());
     counter.canceled = true;
     try std.testing.expectError(error.Canceled, work.property(.{ .map = entries }, "field:0"));
+}
+
+test "mutable equality index reuses collision links after eviction" {
+    var index: Index = .{};
+    defer index.deinit(std.testing.allocator);
+    try index.insert(std.testing.allocator, 7, 0);
+    try index.insert(std.testing.allocator, 7, 1);
+    try index.insert(std.testing.allocator, 7, 2);
+    index.remove(7, 1);
+    index.remove(7, 2);
+    try std.testing.expectEqual(@as(usize, 0), index.links.items[index.head(7).?].index);
+    for (0..1000) |i| {
+        try index.insert(std.testing.allocator, @intCast(i + 8), 1);
+        index.remove(@intCast(i + 8), 1);
+    }
+    try std.testing.expectEqual(@as(usize, 3), index.links.items.len);
+    index.remove(7, 0);
+    try std.testing.expect(index.head(7) == null);
 }

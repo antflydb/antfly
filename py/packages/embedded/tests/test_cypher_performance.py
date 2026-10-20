@@ -4349,3 +4349,67 @@ def test_group_sources_release_payloads_consumed_only_by_aggregates(graph_db):
         )
         expected = [0, 1] if tail.startswith("RETURN n.score AS") else [1, 2 if "+(n.score+1)" in tail else 1]
         assert [int(cell["value"]) for cell in result["rows"][0]] == expected
+
+
+def test_distinct_reducers_share_wide_membership_values(graph_db):
+    db = graph_db
+    count = 3000
+    db.sql("CREATE TABLE payloads (score BIGINT,payload TEXT)")
+    payload = "x" * 4080
+    for start in range(0, count, 50):
+        db.sql(
+            "INSERT INTO payloads (_id,score,payload) VALUES "
+            + ",".join(f"('n{i}',{i},'{i:012d}{payload}')" for i in range(start, min(start + 50, count)))
+        )
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "payloads",
+            "definition": {"labels": [{"name": "W", "table": "payloads"}], "relationships": []},
+        }
+    )
+    result = db.cypher_json(
+        "payloads",
+        {
+            "query": "MATCH(n:W) RETURN count(DISTINCT n.payload),size(collect(DISTINCT n.payload))",
+            "limits": {"memory_bytes": 48 << 20, "intermediate_states": 600000},
+        },
+    )
+    assert [int(cell["value"]) for cell in result["rows"][0]] == [count, count]
+
+
+def test_group_key_window_retains_only_selected_count_groups(graph_db):
+    db = graph_db
+    populate(db, 20000)
+    for order, expected in (("key", [2, 3, 4]), ("key DESC", [19997, 19996, 19995])):
+        result = db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH(n:D) RETURN n.score AS key,count(*) AS c,count(n.score) AS d ORDER BY {order} SKIP 2 LIMIT 3",
+                "limits": {"memory_bytes": 2 << 20},
+            },
+        )
+        assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[key, 1, 1] for key in expected]
+    # Public limits are capped at one million work units. Keep expanded-row
+    # semantics separate from the high-cardinality retention regression.
+    repeated = db.cypher_json(
+        "g",
+        {
+            "query": "MATCH(n:D) WHERE n.score<1000 UNWIND [1,2,null] AS x RETURN n.score AS key,count(*) AS c,count(x) AS d ORDER BY key DESC SKIP 2 LIMIT 3",
+            "limits": {"memory_bytes": 2 << 20},
+        },
+    )
+    assert [[int(cell["value"]) for cell in row] for row in repeated["rows"]] == [
+        [key, 3, 2] for key in (997, 996, 995)
+    ]
+
+    # Compare against complete aggregation for repeated keys, partial rank ties,
+    # and composite values whose heap-owned allocations are repeatedly recycled.
+    for projection, order in (
+        ("n.score%3 AS rank,n.score%17 AS key,count(*) AS c", "rank DESC"),
+        ("[n.score%17,n.score%5] AS key,count(*) AS c", "key DESC"),
+    ):
+        query = f"MATCH(n:D) RETURN {projection} ORDER BY {order}"
+        exact = db.cypher_json("g", {"query": query})["rows"]
+        bounded = db.cypher_json("g", {"query": query + " SKIP 2 LIMIT 7"})["rows"]
+        assert bounded == exact[2:9]

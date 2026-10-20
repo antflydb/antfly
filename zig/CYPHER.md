@@ -1883,12 +1883,31 @@ variables); unproved pattern dependencies conservatively retain their source.
 Entity-valued keys keep their complete observed entity. Aggregate-only input
 payloads are released with their producer pages.
 
-Grouped projection constructs its source/alias environment once. Proved finite
+General grouped projection constructs its source/alias environment once. Proved finite
 SKIP/LIMIT windows use the existing stable TopK selector, with per-group scratch
 for projection and ordering and independent ownership for selected rows. Every
 group still evaluates its projection and predicates, including losing candidates
 and LIMIT 0, so selection cannot suppress arithmetic errors. Unknown or invalid
 window expressions retain their original late evaluation order.
+
+Compatible repeatable DISTINCT arguments also share a collision-checked value
+store across different reducers (for example COUNT and COLLECT). Ordinary row
+emissions resolve each cohort ordinal once; synthetic statistic bins and moment
+inputs bypass that emission cache. Each reducer
+has its own compact ordinal membership bitmap, so independently activated
+statistic cohorts preserve their first contribution and COLLECT order. Compressed
+integer supports remain per consumer and import only that consumer's observed
+ordinary values. Materialized scopes cache distinct argument sequences lazily,
+without evaluating an unused CASE branch or merging effectful inputs.
+
+A scalar COUNT projection ordered directly by grouping keys can retain just
+SKIP + LIMIT groups while consuming the input. Its stable max heap owns each
+selected group's arena and recycles hash collision links on eviction. Rejected
+rows still evaluate COUNT arguments. This proof requires unit multiplicities
+and a scalar-row work bound that rules out count overflow; weighted producers,
+fallible reducer outputs, aggregate-ranked order, and post-group predicates
+retain general aggregation. Heap comparison metadata has scratch lifetime so
+recycled group allocations cannot enter the statement's identity caches.
 
 Unproved length predicates, length grouping keys, non-extremum DISTINCT
 arguments and other distribution-dependent expressions retain exact hop states. Cyclic
