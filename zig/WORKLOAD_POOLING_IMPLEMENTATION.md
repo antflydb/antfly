@@ -4,6 +4,76 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Independently prepared online status owners (2026-10-20)
+
+Source `090dc709dce3b77143bc5444f9013c7e1fd13625` schedules current online owner
+preparation after a genuine ordinary typed-status residency miss. The miss still
+returns availability failure, never successful absence. A caller-side rejection
+trace prevents original admission failures from becoming preparation requests.
+Hidden restore status does not enqueue public-catalog work.
+
+The queue owns at most 64 fixed-size group/table requests, including active
+work. It copies at most 255 name bytes, performs no allocation and retains no
+foreground execution, I/O or descriptor. Coalescing, retries and workspace
+growth preserve each accepted request's original 30-second native expiry.
+Expired requests drop. Preparation uses the existing independently reserved
+opening worker and background admission; release/close progress stays on the
+other worker. Committed cold opens take priority. New apply debt preempts an
+online admission or initial quorum wait so certification cannot wait on an
+opening request behind itself. Once certification crosses that dependency,
+physical opening finishes without apply-driven cancellation. Shutdown still
+cancels the entire attempt. Optional preparation never retires a busy historical
+apply owner.
+
+Each attempt funds its workspace before allocating it. The workspace starts at
+64 KiB and grows on capture exhaustion through a new admitted attempt, without
+renewing expiry. Scheduler/process limits remain authoritative. Descriptor
+capture and confirmation use checked caller-owned memory. The producer obtains
+quorum authority, captures fresh metadata, opens a current owner, captures again
+and compares generation, identity, schema, indexes, restore binding and initial
+range with cooperative 4096-byte string checks. Retained quorum, root generation
+and publication checks precede readiness. A new owner remains marked pending
+until confirmation; status cannot borrow it early. A public preparation cannot
+retire or inherit a racing private restore owner. Historical owners remain
+ineligible for required status until a current owner is actually prepared.
+
+The producer uses checked read-execution suspension during quorum/metadata I/O.
+CPU can be borrowed by foreground work and resumes only after original lifetime
+checks. The public read budget now exposes lifetime-only checks with sticky
+original errors, so a registry scan never parks or reacquires CPU while locked.
+The original deadline, shutdown cancellation and all physical ownership survive
+through join. This does not establish interruptibility of every native-open I/O.
+
+`native-online-owner-preparation-v8-verified.json` records nine focused targets,
+actual source scheduling/pending/confirmation/lifetime/suspension/preemption
+runtime checks, queue and scheduler tests, the persistent metadata C bridge,
+transaction and fanout runtime suites, and controller/status plus both
+production startup-profile analysis checks. The final focused build passes
+108/108 steps and 14/14 standard tests. Native cold-open completion through
+readiness and private-restore/busy-historical admission guards are analyzed
+rather than full linked runtime qualified. The immutable public package has 4483
+exact sources and passes 25 ReleaseSafe consumer steps. Error generation and
+storage control catalog checks pass. Native ABI 43, owner ABI 103, engine
+descriptor 28, API kernel 53, file floor 7 and Raft protocol 25 remain
+unchanged.
+
+The broader text-statistics controls suite is still failing. A one-file baseline
+experiment on the final source reproduces 27 failures with the committed read
+budget and 25 with the new lifetime method; all remaining first-error signatures
+match and no new failing case appears. Two cases improve: unconsumed async
+result retirement and local cache contention. The 25 remaining failures include
+four crashes and cover lifetime capabilities and resource/retirement accounting.
+Their exact names and both failed receipts are retained in the proof. Repairing
+these focused correctness failures is the next priority; the user waived full
+qualification, not correctness.
+
+The full goal is incomplete. Required mutation providers and their independently
+funded original producers, authenticated hidden-owner preparation, fresh route
+authority, migration/activation, large-frame transport, completion resource
+bundles and the broader scheduler/fault scope remain open. Required mutation
+callbacks remain disabled. Full linked storage-owner runtime remains
+unqualified; full Linux qualification remains waived.
+
 ## Funded cold Raft owner opening (2026-10-20)
 
 Source `e83e2d9a1b090aac7ad0f597cdba30b6a1968746` gives cold committed-Raft

@@ -24,18 +24,20 @@ cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
 
-Source `e83e2d9a1b090aac7ad0f597cdba30b6a1968746` adds independently funded
-background cold Raft opens and a separate bounded release/close worker. Ordinary
-execution waiting therefore leaves health, cleanup and lease-release progress
-available. Attempts keep finite deadlines and descriptor accounting through
-physical return. Coherent bounded batch routing remains implemented. Twelve
-focused runtime cases, actual controller/status and both startup-profile
-analysis checks, and 25 public-package consumer steps pass. Full linked
-storage-owner runtime remains unqualified and full Linux qualification remains
-waived. Online cold-owner preparation and original required mutation producers,
-required BEGIN/PREPARE/seal providers, fresh route authority, transport and
-migration/activation still gate delivery. The broader scheduler design and
-distributed fault/restart qualification remain open.
+Source `090dc709dce3b77143bc5444f9013c7e1fd13625` adds independently funded
+current online status-owner preparation with bounded scheduling metadata,
+original expiry, adaptive admitted workspace and fresh metadata/quorum
+confirmation. Pending owners cannot serve status; original failures remain
+errors. Committed apply work preempts initial online certification, and checked
+I/O suspension leaves foreground CPU available. The focused build and
+public-package consumer checks pass. The broader storage controls suite still
+has 25 failures, including four crashes, versus 27 in the one-file baseline; no
+new failing case appears. Repairing those correctness failures takes priority
+before activation. Required mutation providers and original producers,
+hidden-owner preparation, fresh route authority, transport,
+migration/activation, completion resource bundles and broader fault
+qualification remain open. Full linked storage-owner runtime remains unqualified
+and full Linux qualification remains waived.
 
 The full goal remains safe, bounded execution sharing across many connections
 by default, with fair scheduling and bounded waiting, preserving session
