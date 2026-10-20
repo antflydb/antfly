@@ -137,7 +137,7 @@ pub const Reuse = struct {
         @memcpy(buffer[0..self.prefix.len], self.prefix);
         @memcpy(buffer[self.prefix.len..][0..path.len], path);
         const name = buffer[0 .. self.prefix.len + path.len];
-        var file = (if (self.navigation) |navigation| try navigation.lookup(self.root, store, name, token, null) else try native_directory.lookup(self.root, store, name, token, null)) orelse return null;
+        var file = (if (self.navigation) |navigation| try navigation.lookupPublication(self.root, store, name, token) else try native_directory.lookupPublication(self.root, store, name, token)) orelse return null;
         if (self.root.directory) |directory| {
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(name, &digest, .{});
@@ -151,9 +151,9 @@ pub const Reuse = struct {
         if (!std.mem.eql(u8, &scope.domain, &self.root.domain)) return error.InvalidNativeLakeFiles;
         const file = (try self.lookup(store.*, path, token)) orelse return null;
         if (ordinal >= file.bytes / chunk_bytes + @intFromBool(file.bytes % chunk_bytes != 0)) return null;
-        if (self.navigation) |navigation| return (try navigation.chunks(a, self.root, store.*, file, ordinal, 1, token, null))[0];
+        if (self.navigation) |navigation| return (try navigation.chunksPublication(a, self.root, store.*, file, ordinal, 1, token))[0];
         var access: native_directory.Access = undefined;
-        access.init(store.*, self.root.domain, token, null);
+        access.initPublication(store.*, self.root.domain, token);
         return try native_directory.chunk(a, &access, file, ordinal);
     }
 };
@@ -170,17 +170,60 @@ pub const OutputBudget = struct {
         if (self.work) |remaining| try stores.chargeReadBudget(remaining, bytes);
     }
 };
-fn putChunk(out: A, path: []const u8, ordinal: usize, bytes: []const u8, store: *stores.ArtifactStore, cancellation: Cancellation, reuse: ?Reuse, budget: OutputBudget) !artifacts.ChunkRef {
-    try cancellation.check();
-    if (reuse) |old| if (try old.prior(out, store, path, ordinal, cancellation)) |ref| {
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        if (ref.byte_len == bytes.len and std.mem.eql(u8, &digest, &try stores.sha256DigestFromChecksum(ref.checksum))) return .{ .artifact_id = try out.dupe(u8, ref.artifact_id), .checksum = try out.dupe(u8, ref.checksum), .byte_len = ref.byte_len };
+/// Optional physical read-ahead uses known allocator headroom, including arena
+/// capacity overhead. Required inline and opaque allocators retain one chunk.
+pub fn captureWidth(a: A, store: *const stores.ArtifactStore) usize {
+    const phase = store.io_phase orelse return 1;
+    const available = local.sql_memory_budget.headroom(a) orelse return 1;
+    return @max(1, @min(stores.ArtifactStore.max_upload_batch, phase.max_parallel, available / (2 * chunk_bytes)));
+}
+
+/// One bounded wave, with ordered metadata and no detached payload ownership.
+/// Publication workers provide the shared I/O capability and a synchronized
+/// allocator. Required inline execution retains the same cancellation contract.
+pub fn uploadChunks(out: A, store: *stores.ArtifactStore, token: Cancellation, budget: OutputBudget, contents: []const []const u8, refs: []artifacts.ChunkRef) !void {
+    std.debug.assert(contents.len == refs.len and contents.len <= stores.ArtifactStore.max_upload_batch);
+    for (contents) |bytes| {
+        if (bytes.len > chunk_bytes) return error.NativeLakeFilesTooLarge;
+        try budget.produced(bytes.len);
+    }
+    var metadata: [stores.ArtifactStore.max_upload_batch]stores.ArtifactMetadata = undefined;
+    try store.putBatchWithCancellation(if (store.io_phase) |phase| phase.io else null, contents, metadata[0..contents.len], token);
+    defer for (metadata[0..contents.len]) |*item| item.deinit(store.allocator);
+    var initialized: usize = 0;
+    errdefer for (refs[0..initialized]) |ref| {
+        out.free(ref.artifact_id);
+        out.free(ref.checksum);
     };
-    try budget.produced(bytes.len);
-    var uploaded = try store.putWithCancellation(bytes, cancellation);
-    defer uploaded.deinit(store.allocator);
-    return .{ .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
+    for (metadata[0..contents.len], refs) |item, *ref| {
+        const id = try out.dupe(u8, item.artifact_id);
+        errdefer out.free(id);
+        const checksum = try out.dupe(u8, item.checksum);
+        ref.* = .{ .artifact_id = id, .checksum = checksum, .byte_len = item.byte_len };
+        initialized += 1;
+    }
+}
+fn putChunkBatch(out: A, path: []const u8, first: usize, contents: []const []const u8, store: *stores.ArtifactStore, token: Cancellation, reuse: ?Reuse, budget: OutputBudget, result: []artifacts.ChunkRef) !void {
+    var pending: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
+    var positions: [stores.ArtifactStore.max_upload_batch]usize = undefined;
+    var count: usize = 0;
+    for (contents, first..) |bytes, ordinal| {
+        try token.check();
+        if (reuse) |old| if (try old.prior(out, store, path, ordinal, token)) |ref| {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            if (ref.byte_len == bytes.len and std.mem.eql(u8, &digest, &try stores.sha256DigestFromChecksum(ref.checksum))) {
+                result[ordinal - first] = .{ .artifact_id = try out.dupe(u8, ref.artifact_id), .checksum = try out.dupe(u8, ref.checksum), .byte_len = ref.byte_len };
+                continue;
+            }
+        };
+        pending[count] = bytes;
+        positions[count] = ordinal - first;
+        count += 1;
+    }
+    var refs: [stores.ArtifactStore.max_upload_batch]artifacts.ChunkRef = undefined;
+    try uploadChunks(out, store, token, budget, pending[0..count], refs[0..count]);
+    for (positions[0..count], refs[0..count]) |position, ref| result[position] = ref;
 }
 
 pub fn publishBytes(out: A, path: []const u8, bytes: []const u8, store: *stores.ArtifactStore, cancellation: Cancellation, output_budget: anytype, reuse: ?Reuse) !File {
@@ -189,9 +232,16 @@ pub fn publishBytes(out: A, path: []const u8, bytes: []const u8, store: *stores.
     try stores.chargeReadBudget(budget.generation, bytes.len);
     const chunks = try out.alloc(artifacts.ChunkRef, std.math.divCeil(usize, bytes.len, chunk_bytes) catch return error.InvalidNativeLakeFiles);
     if (chunks.len > max_chunks) return error.NativeLakeFilesTooLarge;
-    for (chunks, 0..) |*chunk, ordinal| {
-        const first = ordinal * chunk_bytes;
-        chunk.* = try putChunk(out, path, ordinal, bytes[first..@min(first + chunk_bytes, bytes.len)], store, cancellation, reuse, budget);
+    var begin: usize = 0;
+    while (begin < chunks.len) {
+        const end = @min(chunks.len, begin + stores.ArtifactStore.max_upload_batch);
+        var contents: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
+        for (contents[0 .. end - begin], begin..) |*part, ordinal| {
+            const first = ordinal * chunk_bytes;
+            part.* = bytes[first..@min(first + chunk_bytes, bytes.len)];
+        }
+        try putChunkBatch(out, path, begin, contents[0 .. end - begin], store, cancellation, reuse, budget, chunks[begin..end]);
+        begin = end;
     }
     return .{ .path = try out.dupe(u8, path), .bytes = bytes.len, .chunks = chunks, .origin = if (reuse) |old| if (try old.lookup(store.*, path, cancellation)) |prior| prior.origin else null else null };
 }
@@ -204,20 +254,32 @@ pub fn publishPrefix(a: A, out: A, source: Storage, physical: []const u8, relati
     if (n > 8 or (if (reuse) |old| old.root.directory != null else false)) return native_directory.publishPrefix(a, out, source, physical, relative, size, store, cancellation, budget, reuse);
     try stores.chargeReadBudget(budget.generation, size);
     const chunks = try out.alloc(artifacts.ChunkRef, n);
-    for (chunks, 0..) |*chunk, ordinal| {
-        const offset = @as(u64, @intCast(ordinal)) * chunk_bytes;
-        try cancellation.check();
-        const length = @min(chunk_bytes, size - offset);
-        if (reuse) |old| if (try old.prior(out, store, relative, ordinal, cancellation)) |ref| {
-            // A full old block is immutable even when this WAL prefix grows.
-            if (ref.byte_len == length) {
-                chunk.* = .{ .artifact_id = try out.dupe(u8, ref.artifact_id), .checksum = try out.dupe(u8, ref.checksum), .byte_len = ref.byte_len };
-                continue;
-            }
-        };
-        const bytes = try source.readFileRangeAlloc(a, physical, offset, @intCast(length));
-        defer a.free(bytes);
-        chunk.* = try putChunk(out, relative, ordinal, bytes, store, cancellation, reuse, budget);
+    var begin: usize = 0;
+    while (begin < chunks.len) {
+        const end = @min(chunks.len, begin + captureWidth(a, store));
+        var wave = std.heap.ArenaAllocator.init(a);
+        defer wave.deinit();
+        var contents: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
+        var positions: [stores.ArtifactStore.max_upload_batch]usize = undefined;
+        var count: usize = 0;
+        for (begin..end) |ordinal| {
+            const offset = @as(u64, @intCast(ordinal)) * chunk_bytes;
+            try cancellation.check();
+            const length = @min(chunk_bytes, size - offset);
+            if (reuse) |old| if (try old.prior(out, store, relative, ordinal, cancellation)) |ref| {
+                if (ref.byte_len == length) {
+                    chunks[ordinal] = .{ .artifact_id = try out.dupe(u8, ref.artifact_id), .checksum = try out.dupe(u8, ref.checksum), .byte_len = ref.byte_len };
+                    continue;
+                }
+            };
+            contents[count] = try source.readFileRangeAlloc(wave.allocator(), physical, offset, @intCast(length));
+            positions[count] = ordinal;
+            count += 1;
+        }
+        var refs: [stores.ArtifactStore.max_upload_batch]artifacts.ChunkRef = undefined;
+        try uploadChunks(out, store, cancellation, budget, contents[0..count], refs[0..count]);
+        for (positions[0..count], refs[0..count]) |position, ref| chunks[position] = ref;
+        begin = end;
     }
     return .{ .path = try out.dupe(u8, relative), .bytes = size, .chunks = chunks };
 }
@@ -296,7 +358,7 @@ pub fn publishExtentDelta(a: A, out: A, source: Storage, before: []const Extent,
             const edits = try out.alloc(native_directory.tree.Mutation, file.chunks.len);
             for (file.chunks, edits, 0..) |chunk_ref, *edit, ordinal| edit.* = .{ .key = try out.dupe(u8, &native_directory.key(ordinal)), .value = try std.json.Stringify.valueAlloc(out, chunk_ref, .{}) };
             var access: native_directory.Access = undefined;
-            access.init(store.*, prior.domain, token, null);
+            access.initPublication(store.*, prior.domain, token);
             access.work = budget.work;
             file.chunk_root = try native_directory.tree.apply(a, access.backing(), null, edits);
             file.chunks = &.{};
@@ -316,14 +378,7 @@ pub fn publishCheckpoint(a: A, out: A, checkpoint: *const local.storage_lsm_back
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
     if (checkpoint.run_paths.len != checkpoint.run_ids.len or checkpoint.run_paths.len >= 8192) return error.InvalidNativeLakeFiles;
     const files = try out.alloc(File, checkpoint.run_paths.len + 1);
-    const manifest = checkpoint.manifest_bytes;
-    try stores.chargeReadBudget(budget.generation, manifest.len);
-    const chunks = try out.alloc(artifacts.ChunkRef, std.math.divCeil(usize, manifest.len, chunk_bytes) catch return error.InvalidNativeLakeFiles);
-    for (chunks, 0..) |*chunk, ordinal| {
-        const first = ordinal * chunk_bytes;
-        chunk.* = try putChunk(out, "manifest.bin", ordinal, manifest[first..@min(first + chunk_bytes, manifest.len)], store, cancellation, reuse, budget);
-    }
-    files[0] = .{ .path = try out.dupe(u8, "manifest.bin"), .bytes = manifest.len, .chunks = chunks, .origin = if (reuse) |old| if (try old.lookup(store.*, "manifest.bin", cancellation)) |prior| prior.origin else null else null };
+    files[0] = try publishBytes(out, "manifest.bin", checkpoint.manifest_bytes, store, cancellation, budget, reuse);
     for (checkpoint.run_paths, checkpoint.run_ids, files[1..]) |physical, id, *file| {
         const relative = try std.fmt.allocPrint(out, "runs/{d}.tbl", .{id});
         const size = try checkpoint.storage.fileSize(physical);
@@ -357,12 +412,19 @@ pub fn publishFiles(a: A, out: A, source: Storage, source_root: []const u8, path
         if (total > max_chunks) return error.NativeLakeFilesTooLarge;
         try stores.chargeReadBudget(budget.generation, size);
         const chunks = try out.alloc(artifacts.ChunkRef, n);
-        for (chunks, 0..) |*chunk, ordinal| {
-            try cancellation.check();
-            const offset = @as(u64, @intCast(ordinal)) * chunk_bytes;
-            const bytes = try source.readFileRangeAlloc(a, physical, offset, @intCast(@min(chunk_bytes, size - offset)));
-            defer a.free(bytes);
-            chunk.* = try putChunk(out, path, ordinal, bytes, store, cancellation, reuse, budget);
+        var begin: usize = 0;
+        while (begin < chunks.len) {
+            const end = @min(chunks.len, begin + captureWidth(a, store));
+            var wave = std.heap.ArenaAllocator.init(a);
+            defer wave.deinit();
+            var contents: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
+            for (contents[0 .. end - begin], begin..) |*bytes, ordinal| {
+                try cancellation.check();
+                const offset = @as(u64, @intCast(ordinal)) * chunk_bytes;
+                bytes.* = try source.readFileRangeAlloc(wave.allocator(), physical, offset, @intCast(@min(chunk_bytes, size - offset)));
+            }
+            try putChunkBatch(out, path, begin, contents[0 .. end - begin], store, cancellation, reuse, budget, chunks[begin..end]);
+            begin = end;
         }
         file.* = .{ .path = try out.dupe(u8, path), .bytes = size, .chunks = chunks };
     }
@@ -1278,4 +1340,147 @@ test "external lake cumulative output charges new chunks while generation limits
     try std.testing.expectError(error.ArtifactReadBudgetExceeded, publishPrefix(a, out, undefined, "unused", "runs/1.tbl", payload.len, &store, .none, budget, reuse));
     generation = payload.len;
     try std.testing.expectError(error.ArtifactReadBudgetExceeded, publishBytes(out, "runs/2.tbl", payload, &store, .none, budget, reuse));
+}
+
+test "external lake native publication chunk waves overlap preserve order reuse and drain failures" {
+    const scheduler_api = local.sql_parallel_scheduler;
+    const Fixture = struct {
+        var active: *@This() = undefined;
+        original: stores.ArtifactStore,
+        execution: scheduler_api.Execution,
+        pending: ?scheduler_api.Execution.Io = null,
+        current: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        puts: std.atomic.Value(usize) = .init(0),
+        fail: bool = false,
+        begins: usize = 0,
+        fn begin(raw: *anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pending = try self.execution.beginIo(std.testing.io, count);
+            self.begins += 1;
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 0), self.current.load(.acquire));
+            var pending = self.pending.?;
+            self.pending = null;
+            try pending.finish();
+        }
+        fn abort(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.pending) |*pending| pending.abort();
+            self.pending = null;
+        }
+        fn put(_: *anyopaque, _: A, scope: stores.UploadScope, bytes: []const u8, token: Cancellation) !stores.ArtifactMetadata {
+            const self = active;
+            try std.testing.expect(!self.execution.active);
+            const current = self.current.fetchAdd(1, .acq_rel) + 1;
+            _ = self.peak.fetchMax(current, .acq_rel);
+            _ = self.puts.fetchAdd(1, .acq_rel);
+            defer _ = self.current.fetchSub(1, .acq_rel);
+            try std.testing.io.sleep(.fromMilliseconds(3), .awake);
+            if (self.fail and bytes.len != 0 and bytes[0] == 3) return error.InjectedUploadFailure;
+            return self.original.putScoped(scope, bytes, token);
+        }
+    };
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("native-chunk-upload-waves");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var original = fs.artifactStore();
+    original.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    var scheduler: scheduler_api.Scheduler = .{ .max_workers = 1, .max_io_workers = 3 };
+    var fixture: Fixture = .{ .original = original, .execution = .{ .scheduler = &scheduler, .bytes = 1024 } };
+    Fixture.active = &fixture;
+    try fixture.execution.enter(std.testing.io);
+    defer fixture.execution.pause();
+    var vtable = original.vtable.*;
+    vtable.put_scoped = Fixture.put;
+    var store = original;
+    store.vtable = &vtable;
+    const capability: stores.IoPhase = .{ .io = std.testing.io, .ptr = &fixture, .max_parallel = 3, .begin = Fixture.begin, .finish = Fixture.finish, .abort = Fixture.abort };
+    store.io_phase = &capability;
+    const bytes = try a.alloc(u8, 17 * chunk_bytes - 7);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, index| byte.* = @intCast(index / chunk_bytes);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var generation: u64 = bytes.len;
+    var work: u64 = bytes.len;
+    const file = try publishBytes(out, "manifest.bin", bytes, &store, .none, OutputBudget{ .generation = &generation, .work = &work }, null);
+    try std.testing.expectEqual(@as(u64, 0), generation);
+    try std.testing.expectEqual(@as(u64, 0), work);
+    try std.testing.expectEqual(@as(usize, 17), fixture.puts.load(.acquire));
+    try std.testing.expect(fixture.peak.load(.acquire) > 1 and fixture.peak.load(.acquire) <= 3);
+    for (file.chunks, 0..) |ref, ordinal| {
+        const value = try original.getAlloc(ref.artifact_id);
+        defer a.free(value);
+        try std.testing.expectEqualSlices(u8, bytes[ordinal * chunk_bytes .. @min((ordinal + 1) * chunk_bytes, bytes.len)], value);
+    }
+    generation = bytes.len;
+    const before = fixture.puts.load(.acquire);
+    const reused = try publishBytes(out, "manifest.bin", bytes, &store, .none, OutputBudget{ .generation = &generation, .work = &work }, .{ .root = .{ .domain = @splat(7), .files = &.{file} } });
+    try std.testing.expectEqual(before, fixture.puts.load(.acquire));
+    for (file.chunks, reused.chunks) |old, current| try std.testing.expectEqualStrings(old.artifact_id, current.artifact_id);
+    fixture.fail = true;
+    generation = bytes.len;
+    work = bytes.len;
+    try std.testing.expectError(error.InjectedUploadFailure, publishBytes(out, "manifest.bin", bytes, &store, .none, OutputBudget{ .generation = &generation, .work = &work }, null));
+    try std.testing.expectEqual(@as(usize, 0), fixture.current.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    try std.testing.expect(fixture.execution.active);
+    fixture.fail = false;
+    // The same bounded writer backs paged physical-file publication. A retained
+    // source reader supplies real range reads, then a no-op refresh must touch
+    // neither source payloads nor new objects.
+    var source: Reader = .{ .root = .{ .domain = @splat(7), .files = &.{file} }, .prefix = "/candidate", .store = original, .context = .{}, .scratch = a };
+    defer source.deinit();
+    generation = bytes.len;
+    work = 2 * bytes.len;
+    var capture_budget: local.sql_memory_budget = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+    const prefix = try publishPrefix(capture_budget.allocator(), out, source.storage(), "/candidate/manifest.bin", "manifest.bin", bytes.len, &store, .none, OutputBudget{ .generation = &generation, .work = &work }, null);
+    const paged = try native_directory.persist(a, out, &store, .{ .domain = @splat(7), .files = &.{prefix} }, null, .none, &work);
+    try std.testing.expectEqual(@as(u64, 17), prefix.chunk_root.?.records);
+    try std.testing.expectEqual(@as(usize, 0), capture_budget.live);
+    try std.testing.expect(capture_budget.peak <= capture_budget.limit);
+    const before_noop = fixture.puts.load(.acquire);
+    generation = bytes.len;
+    work = 0;
+    const unchanged = try publishPrefix(a, out, undefined, "unread", "manifest.bin", bytes.len, &store, .none, OutputBudget{ .generation = &generation, .work = &work }, .{ .root = paged });
+    try std.testing.expect(prefix.chunk_root.?.eql(unchanged.chunk_root.?));
+    try std.testing.expectEqual(before_noop, fixture.puts.load(.acquire));
+    // Required inline publication retains the same chunk identities and order.
+    var inline_store = original;
+    generation = bytes.len;
+    work = bytes.len;
+    const inline_file = try publishBytes(out, "manifest.bin", bytes, &inline_store, .none, OutputBudget{ .generation = &generation, .work = &work }, null);
+    for (file.chunks, inline_file.chunks) |parallel, inline_ref| try std.testing.expectEqualStrings(parallel.artifact_id, inline_ref.artifact_id);
+    std.debug.print("native chunk publication: chunks=17 peak_uploads={} io_phases={}\n", .{ fixture.peak.load(.acquire), fixture.begins });
+}
+
+test "external lake chunk upload metadata transfer unwinds every output allocation failure" {
+    const Fixture = struct {
+        fn run(a: A, store: *stores.ArtifactStore) !void {
+            var generation: u64 = 3;
+            var work: u64 = 3;
+            const contents = [_][]const u8{ "a", "bc" };
+            var refs: [2]artifacts.ChunkRef = undefined;
+            try uploadChunks(a, store, .none, .{ .generation = &generation, .work = &work }, &contents, &refs);
+            defer for (refs) |ref| {
+                a.free(ref.artifact_id);
+                a.free(ref.checksum);
+            };
+            try std.testing.expectEqual(@as(u64, 0), work);
+        }
+    };
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("native-chunk-output-faults");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{&store});
 }

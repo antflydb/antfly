@@ -78,7 +78,7 @@ pub const Builder = struct {
             }
         }.less);
         var access: directory.Access = undefined;
-        access.init(self.store.*, self.store.upload_scope.?.domain, self.token, null);
+        access.initPublication(self.store.*, self.store.upload_scope.?.domain, self.token);
         access.reads = self.reads;
         access.work = &self.writes;
         if (self.allow_inline and self.page == null) {

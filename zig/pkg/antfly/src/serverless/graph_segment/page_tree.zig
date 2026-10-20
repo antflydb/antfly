@@ -108,7 +108,7 @@ pub const Cache = struct {
     }
 
     pub fn store(self: *Cache) Store {
-        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .ptr = self, .get = get, .put = put, .check = check, .reduce = self.underlying.reduce };
+        return .{ .domain = self.underlying.domain, .attempt = self.underlying.attempt, .ptr = self, .get = get, .put = put, .put_many = if (self.underlying.put_many != null) putMany else null, .check = check, .reduce = self.underlying.reduce };
     }
 
     fn check(ptr: *anyopaque) !void {
@@ -158,6 +158,10 @@ pub const Cache = struct {
     fn put(ptr: *anyopaque, ref: Ref, bytes: []const u8) !void {
         const self: *Cache = @ptrCast(@alignCast(ptr));
         try self.underlying.put(self.underlying.ptr, ref, bytes);
+    }
+    fn putMany(ptr: *anyopaque, writes: []const Write) !void {
+        const self: *Cache = @ptrCast(@alignCast(ptr));
+        try self.underlying.put_many.?(self.underlying.ptr, writes);
     }
 };
 

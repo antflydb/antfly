@@ -3212,3 +3212,48 @@ the 65,536-row statless repeated-predicate case. The stripped Debug server build
 with Zig 0.17.0; formatting, license/boundary and generated-catalogue checks pass.
 The final full lake run passes 231 shared and 381 native cases with zero leaks,
 including the unchanged 16 KiB compact-reader retention test.
+
+### Bounded native publication transport
+
+Native chunk capture and immutable tree publication share one ordered upload
+primitive. The owner lends at most eight payloads until the group drains; the
+publication capability supplies the executor and caps each wave by shared I/O
+admission. Children borrow a store copy without the serial execution callback.
+Results transfer in input order only after every child finishes, cancellation is
+checked, and CPU admission resumes. Failure at any of these boundaries releases
+all returned metadata, including provider version strings. An unsuccessful wave
+leaves only attempt-private objects, covered by the existing publication fencing
+and reader-safe GC. It cannot publish a partially completed generation.
+
+Physical native files read at most eight 256 KiB chunks per wave, limited by
+known allocator headroom with space for arena capacity overhead. Inline and
+opaque-allocator paths retain a single captured chunk. Byte-backed control files
+borrow their existing immutable buffers. Retained full prefixes
+and equal content keep their original object identities and consume no new
+upload budget. Logical generation size and new physical work retain their
+independent limits. The serial fallback uses the same writer and result order.
+
+Construction opts into page transport through `Access.initPublication` or
+`PageStore.admitPublication`. Aggregate state trees, key indexes, native file
+and chunk maps, and ordered-index dictionaries use this explicit capability.
+The operation-local page cache preserves `put_many`, so a reducer's sorted
+builder can actually batch its immutable leaf writes through the shared
+uploader. Routing dependencies still persist before a durable root is adopted.
+
+Synchronous publication tree reads release CPU admission while waiting on
+storage and restore it before page integrity checks, decoding, or reducer work.
+The decoded navigation cache carries this capability only in the active
+publication's access bridge; cached pages contain no execution pointer. Cache
+hits in the local page cache keep CPU admission. Serving and asynchronous
+prefetch readers retain their own authority and scheduling, with no publication
+callback installed on a shared backend. A failed read restores CPU admission
+before recoverable error handling; canceled resumption frees fetched buffers and
+ends the operation without retaining an I/O permit.
+
+These are automatic transport improvements with no new user options or persisted
+format changes. Validation distinguishes deterministic concurrency/work bounds
+from archive or cloud latency claims. The native chunk test covers both byte and
+physical-file publishers, ordered payload identities, exhausted upload budgets
+on unchanged refresh, required inline execution, and injected partial upload
+failure. Page-store checks cover batch forwarding through the cache, failed and
+canceled resumption, and a competing CPU operator running during a page read.

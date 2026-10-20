@@ -351,7 +351,7 @@ pub fn publishKeyed(a: A, out: A, store: *stores.ArtifactStore, names: []const [
         return publishRadixStream(a, out, store, names, &input, recipe, &pool, token, 0, null);
     }
     var access: @import("lake_index_native_directory.zig").Access = undefined;
-    access.init(store.*, scope.domain, token, null);
+    access.initPublication(store.*, scope.domain, token);
     var builder: state_tree.tree.SortedBuilder = .{ .alloc = a, .store = access.backing() };
     defer builder.deinit();
     while (true) {

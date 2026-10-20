@@ -40,6 +40,15 @@ pub const PageStore = struct {
     /// Background streaming builders bound each page, rather than archive size.
     /// Query stores retain cumulative request budgets by default.
     streaming: bool = false,
+    /// Explicitly borrowed by synchronous publication tree operations only.
+    /// Async readers keep their independent scheduling and never inherit this.
+    read_phase: ?*const artifacts.IoPhase = null,
+    pub fn admitPublication(self: *PageStore) void {
+        if (self.artifacts.io_phase) |phase| {
+            self.io = phase.io;
+            self.read_phase = phase;
+        }
+    }
 
     pub fn store(self: *PageStore) tree.Store {
         return .{ .domain = self.domain, .attempt = self.attempt, .ptr = self, .get = get, .put = put, .put_many = if (self.io != null) putMany else null, .check = check };
@@ -118,16 +127,23 @@ pub const PageStore = struct {
         try ref.validate();
         const id = try identity(self.domain, ref);
         if (self.streaming) self.remaining_read_bytes.* = tree.max_page_bytes;
+        if (self.read_phase) |phase| try phase.begin(phase.ptr, 1);
+        var guard: artifacts.IoGuard = .{ .phase = self.read_phase };
+        defer guard.abort();
+        const bytes = self.read(alloc, ref, &id) catch |err| return guard.failed(err);
+        errdefer alloc.free(bytes);
+        try guard.finish();
+        return bytes;
+    }
+    fn read(self: *PageStore, alloc: std.mem.Allocator, ref: tree.Ref, id: []const u8) ![]u8 {
         if (self.read_cache) |cache| return cache.read(cache.ptr, alloc, self.artifacts, .{
             .kind = .graph_segment,
-            .artifact_id = &id,
+            .artifact_id = id,
             .checksum = id[7..71],
             .byte_len = ref.bytes,
         }, 0, ref.bytes, ref.digest, self.cancellation, self.remaining_read_bytes);
         try artifacts.chargeReadBudget(self.remaining_read_bytes, ref.bytes);
-        // A bounded range read avoids an extra stat request per small page.
-        // page_tree verifies both exact length and digest before decoding.
-        return self.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, &id, 0, ref.bytes, self.cancellation);
+        return self.artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, id, 0, ref.bytes, self.cancellation);
     }
 
     fn put(ptr: *anyopaque, ref: tree.Ref, bytes: []const u8) !void {
@@ -165,41 +181,20 @@ pub const PageStore = struct {
         if (bytes > self.remaining_write_bytes.*) return error.GraphPageWriteBudgetExceeded;
         self.remaining_write_bytes.* -= bytes;
         try self.cancellation.check();
-        const width = if (self.artifacts.io_phase) |phase| phase.max_parallel else tree.max_write_batch;
-        var begin: usize = 0;
-        while (begin < writes.len) {
-            const end = @min(writes.len, begin + width);
-            var phase = try self.artifacts.beginIo(end - begin);
-            defer phase.abort();
-            var backend = self.artifacts.*;
-            backend.io_phase = null;
-            var worker = self.*;
-            worker.artifacts = &backend;
-            worker.uploadBatch(writes[begin..end]) catch |err| return phase.failed(err);
-            try phase.finish();
-            begin = end;
+        var contents: [tree.max_write_batch][]const u8 = undefined;
+        var results: [tree.max_write_batch]artifacts.ArtifactMetadata = undefined;
+        for (writes, contents[0..writes.len]) |write, *bytes_| bytes_.* = write.bytes;
+        var backend = self.artifacts.*;
+        if (backend.upload_scope) |scope| {
+            if (!std.mem.eql(u8, &scope.domain, &self.domain) or !std.mem.eql(u8, &scope.attempt, &self.attempt)) return error.InvalidArtifactUploadScope;
+        } else backend.upload_scope = .{ .domain = self.domain, .attempt = self.attempt };
+        try backend.putBatchWithCancellation(self.io, contents[0..writes.len], results[0..writes.len], self.cancellation);
+        defer for (results[0..writes.len]) |*metadata| metadata.deinit(self.artifacts.allocator);
+        for (writes, results[0..writes.len]) |write, metadata| {
+            const id = try identity(self.domain, write.ref);
+            if (metadata.byte_len != write.ref.bytes or !std.mem.eql(u8, metadata.artifact_id, &id) or
+                !std.mem.eql(u8, metadata.checksum, id[7..71])) return error.ArtifactIntegrityMismatch;
         }
-    }
-    fn uploadBatch(self: *PageStore, writes: []const tree.Write) !void {
-        var failures: [tree.max_write_batch]?anyerror = @splat(null);
-        var group: std.Io.Group = .init;
-        const io = self.io.?;
-        const Worker = struct {
-            fn run(owner: *PageStore, write: tree.Write, failure: *?anyerror) void {
-                owner.upload(write.ref, write.bytes) catch |err| {
-                    failure.* = err;
-                };
-            }
-        };
-        for (writes, 0..) |write, index| group.async(io, Worker.run, .{ self, write, &failures[index] });
-        // Even cancellation must drain all children before borrowed pages and
-        // the publication owner are released.
-        group.await(io) catch |err| {
-            group.cancel(io);
-            return err;
-        };
-        for (failures[0..writes.len]) |failure| if (failure) |err| return err;
-        try self.cancellation.check();
     }
 };
 
@@ -278,6 +273,7 @@ const TestArtifacts = struct {
     active_uploads: std.atomic.Value(usize) = .init(0),
     peak_uploads: std.atomic.Value(usize) = .init(0),
     upload_io: ?std.Io = null,
+    read_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
 
     fn capability(self: *@This()) artifacts.ArtifactStore {
         return .{ .allocator = self.memory.alloc, .ptr = self, .vtable = &.{
@@ -345,6 +341,7 @@ const TestArtifacts = struct {
 
     fn range(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8, offset: u64, len: usize) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.read_hook) |hook| try hook.call(hook.ptr);
         const bytes = self.memory.pages.get(address(id)) orelse return error.FileNotFound;
         if (offset > bytes.len or len > bytes.len - offset) return error.InvalidRange;
         self.memory.reads += 1;
@@ -353,6 +350,7 @@ const TestArtifacts = struct {
 
     fn stat(ptr: *anyopaque, alloc: std.mem.Allocator, id: []const u8) !artifacts.ArtifactMetadata {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.read_hook) |hook| try hook.call(hook.ptr);
         const bytes = self.memory.pages.get(address(id)) orelse return error.FileNotFound;
         return metadata(alloc, id, bytes.len);
     }
@@ -689,6 +687,7 @@ test "serverless graph publication IO phases bound batch fanout and drain before
         begins: usize = 0,
         finishes: usize = 0,
         aborted: usize = 0,
+        resume_failure: ?anyerror = null,
         fn begin(raw: *anyopaque, slots: usize) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expect(!self.active);
@@ -701,6 +700,7 @@ test "serverless graph publication IO phases bound batch fanout and drain before
             try std.testing.expect(self.active);
             self.active = false;
             self.finishes += 1;
+            if (self.resume_failure) |failure| return failure;
         }
         fn abort(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -716,7 +716,7 @@ test "serverless graph publication IO phases bound batch fanout and drain before
     defer fixture.memory.deinit();
     var phase: Phase = .{};
     var backend = fixture.capability();
-    const io_capability: artifacts.IoPhase = .{ .ptr = &phase, .max_parallel = 2, .begin = Phase.begin, .finish = Phase.finish, .abort = Phase.abort };
+    const io_capability: artifacts.IoPhase = .{ .io = io_impl.io(), .ptr = &phase, .max_parallel = 2, .begin = Phase.begin, .finish = Phase.finish, .abort = Phase.abort };
     backend.io_phase = &io_capability;
     var read_bytes: u64 = 1024;
     var write_bytes: u64 = 1024;
@@ -725,7 +725,9 @@ test "serverless graph publication IO phases bound batch fanout and drain before
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
     const writes: [8]tree.Write = @splat(.{ .ref = .{ .digest = digest, .attempt = @splat(1), .bytes = bytes.len, .height = 0, .records = 1 }, .bytes = &bytes });
-    const store = pages.store();
+    var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store() };
+    defer cache.deinit();
+    const store = cache.store();
     try store.put_many.?(store.ptr, &writes);
     try std.testing.expectEqual(@as(usize, 4), phase.begins);
     try std.testing.expectEqual(phase.begins, phase.finishes);
@@ -737,4 +739,92 @@ test "serverless graph publication IO phases bound batch fanout and drain before
     try std.testing.expectEqual(phase.begins, phase.finishes);
     try std.testing.expectEqual(@as(usize, 0), fixture.active_uploads.load(.acquire));
     try std.testing.expect(!phase.active);
+    fixture.fail_upload = false;
+    phase.resume_failure = error.Canceled;
+    try std.testing.expectError(error.Canceled, store.put_many.?(store.ptr, &writes));
+    try std.testing.expectEqual(@as(usize, 0), fixture.active_uploads.load(.acquire));
+    try std.testing.expect(!phase.active);
+    try std.testing.expectEqual(@as(usize, 0), phase.aborted);
+}
+
+test "serverless graph publication reads park CPU preserve cache hits and unwind resume cancellation" {
+    const scheduler_api = @import("antfly_local_sources").sql_parallel_scheduler;
+    const Phase = struct {
+        execution: scheduler_api.Execution,
+        pending: ?scheduler_api.Execution.Io = null,
+        canceled: bool = false,
+        cancel_resume: bool = false,
+        begins: usize = 0,
+        reads: usize = 0,
+        failure: ?anyerror = null,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.canceled) return error.Canceled;
+        }
+        fn begin(raw: *anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pending = try self.execution.beginIo(std.testing.io, count);
+            self.begins += 1;
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var pending = self.pending.?;
+            self.pending = null;
+            self.canceled = self.cancel_resume;
+            try pending.finish();
+        }
+        fn abort(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.pending) |*pending| pending.abort();
+            self.pending = null;
+        }
+        fn read(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.execution.active);
+            try std.testing.expectEqual(@as(usize, 1), self.execution.scheduler.io_workers);
+            // Competing CPU work can run while this remote page is blocked.
+            var other: scheduler_api.Execution = .{ .scheduler = self.execution.scheduler, .bytes = 8 };
+            try other.enter(std.testing.io);
+            other.pause();
+            self.reads += 1;
+            if (self.failure) |failure| return failure;
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: TestArtifacts = .{ .memory = .{ .alloc = a } };
+    defer fixture.memory.deinit();
+    var backend = fixture.capability();
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    var pages: PageStore = .{ .domain = @splat(7), .attempt = @splat(1), .artifacts = &backend, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const root = (try tree.apply(a, pages.store(), null, &.{.{ .key = "a", .value = "authenticated" }})).?;
+    var scheduler: scheduler_api.Scheduler = .{ .max_workers = 1, .max_io_workers = 2, .max_bytes = 64, .max_io_bytes = 32 };
+    var phase: Phase = .{ .execution = .{ .scheduler = &scheduler, .bytes = 8 } };
+    phase.execution.checkpoint = .{ .ptr = &phase, .check = Phase.check };
+    defer phase.execution.pause();
+    try phase.execution.enter(std.testing.io);
+    const capability: artifacts.IoPhase = .{ .io = std.testing.io, .ptr = &phase, .max_parallel = 2, .begin = Phase.begin, .finish = Phase.finish, .abort = Phase.abort };
+    backend.io_phase = &capability;
+    fixture.read_hook = .{ .ptr = &phase, .call = Phase.read };
+    pages.admitPublication();
+    var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store() };
+    defer cache.deinit();
+    const backing = cache.store();
+    for (0..2) |_| {
+        var loaded = try tree.readPage(a, backing, root);
+        loaded.deinit(a);
+        try std.testing.expect(phase.execution.active);
+    }
+    try std.testing.expectEqual(@as(usize, 1), phase.reads);
+    try std.testing.expectEqual(@as(usize, 1), phase.begins);
+    phase.failure = error.InjectedReadFailure;
+    try std.testing.expectError(error.InjectedReadFailure, tree.readPage(a, pages.store(), root));
+    try std.testing.expect(phase.execution.active);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    phase.failure = null;
+    phase.cancel_resume = true;
+    try std.testing.expectError(error.Canceled, tree.readPage(a, pages.store(), root));
+    try std.testing.expect(!phase.execution.active);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    try std.testing.expect(phase.pending == null);
 }

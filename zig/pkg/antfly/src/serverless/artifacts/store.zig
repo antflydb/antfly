@@ -193,6 +193,7 @@ pub const RetentionWitness = struct { scope: UploadScope, stamp: [32]u8 };
 /// A batch reserves its full fan-out before starting children. Children borrow
 /// a copy with this capability removed and drain before the owner resumes CPU.
 pub const IoPhase = struct {
+    io: std.Io,
     ptr: *anyopaque,
     max_parallel: usize,
     begin: *const fn (*anyopaque, usize) anyerror!void,
@@ -384,6 +385,52 @@ pub const ArtifactStore = struct {
         try phase.finish();
         try cancellation.check();
         return metadata;
+    }
+
+    pub const max_upload_batch = 8;
+    /// Borrow bounded payloads until every upload drains. The caller provides a
+    /// concurrency-safe store allocator when opting into parallel I/O. Results
+    /// retain input order; no result ownership transfers on failure, including
+    /// cancellation while the publication owner resumes CPU execution.
+    pub fn putBatchWithCancellation(self: *ArtifactStore, io: ?std.Io, contents: []const []const u8, result: []ArtifactMetadata, cancellation: CancellationToken) !void {
+        std.debug.assert(contents.len == result.len and contents.len <= max_upload_batch);
+        var completed: [max_upload_batch]?ArtifactMetadata = @splat(null);
+        defer for (&completed) |*item| if (item.*) |*metadata| metadata.deinit(self.allocator);
+        var begin: usize = 0;
+        const width = if (self.io_phase) |phase| @max(1, @min(max_upload_batch, phase.max_parallel)) else max_upload_batch;
+        while (begin < contents.len) {
+            try cancellation.check();
+            const end = @min(contents.len, begin + width);
+            var phase = try self.beginIo(end - begin);
+            defer phase.abort();
+            var backend = self.*;
+            backend.io_phase = null;
+            const Worker = struct {
+                fn run(owner: *ArtifactStore, bytes: []const u8, token: CancellationToken, output: *?ArtifactMetadata, failure: *?anyerror) void {
+                    output.* = owner.putWithCancellation(bytes, token) catch |err| {
+                        failure.* = err;
+                        return;
+                    };
+                }
+            };
+            var failures: [max_upload_batch]?anyerror = @splat(null);
+            if (io) |executor| {
+                var group: std.Io.Group = .init;
+                for (begin..end) |index| group.async(executor, Worker.run, .{ &backend, contents[index], cancellation, &completed[index], &failures[index] });
+                group.await(executor) catch |err| {
+                    group.cancel(executor);
+                    return phase.failed(err);
+                };
+            } else for (begin..end) |index| Worker.run(&backend, contents[index], cancellation, &completed[index], &failures[index]);
+            for (failures[begin..end]) |failure| if (failure) |err| return phase.failed(err);
+            try phase.finish();
+            begin = end;
+        }
+        try cancellation.check();
+        for (result, completed[0..result.len]) |*output, *metadata| {
+            output.* = metadata.*.?;
+            metadata.* = null;
+        }
     }
 
     pub fn getAlloc(self: *ArtifactStore, artifact_id: []const u8) ![]u8 {

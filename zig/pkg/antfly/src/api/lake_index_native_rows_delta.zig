@@ -62,6 +62,7 @@ fn currentSeed(a: A, store: *stores.ArtifactStore, root: ordered.Root, provider:
     var reads: u64 = 256 * 1024 * 1024;
     var writes: u64 = 0;
     var bridge: pages.PageStore = .{ .domain = root.domain, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    bridge.admitPublication();
     var planning = std.heap.ArenaAllocator.init(a);
     defer planning.deinit();
     var plan = try state.Plan.fromDelta(a, planning.allocator(), delta);
@@ -113,6 +114,7 @@ fn planSlots(a: A, out: A, entry: *Entry, provider: *Provider, store: *stores.Ar
     var reads: u64 = 256 * 1024 * 1024;
     var writes: u64 = 256 * 1024 * 1024;
     var bridge: pages.PageStore = .{ .domain = entry.root.domain, .attempt = store.upload_scope.?.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    bridge.admitPublication();
     roots = try dictionaries.ensureFree(a, bridge.store(), roots, .{ .identity_version = roots.public_identity_version, .root = roots.public, .count = roots.public_count, .source = entry.root.source, .snapshot = entry.root.snapshot });
     entry.root.file_dictionary = roots;
     var holes = try @import("../serverless/graph_segment/page_tree.zig").Cursor.init(a, bridge.store(), roots.free, "", null);

@@ -215,6 +215,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     var read_bytes: u64 = 256 * 1024 * 1024;
     var write_bytes: u64 = 512 * 1024 * 1024;
     var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes, .streaming = true, .io = sort.manager.io };
+    pages.admitPublication();
     if (delta.sparse_slots and delta.dictionary_edits != null and delta.retired_slots != null and delta.retired_slots.?.len == 0 and sort.total == 0) {
         const previous = delta.previous orelse return error.InvalidNativeLakeRowIndex;
         const shared = delta.public_navigation orelse return error.InvalidNativeLakeRowIndex;
@@ -510,6 +511,7 @@ fn persistRoot(a: A, result_alloc: A, store: *stores.ArtifactStore, root: Root, 
         var writes: u64 = 512 * 1024 * 1024;
         const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
         var dictionary_pages: page_store.PageStore = .{ .domain = root.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+        dictionary_pages.admitPublication();
         const prior: ?file_dictionary.Previous = if (previous_root) |old| if (old.file_dictionary) |dictionary| .{ .roots = dictionary, .files = old.files, .fingerprints = old.file_fingerprints, .same_snapshot = std.mem.eql(u8, old.source, root.source) and std.mem.eql(u8, old.snapshot, root.snapshot) } else null else null;
         persisted.file_dictionary = try file_dictionary.publishWithOptions(a, dictionary_pages.store(), root.source, root.snapshot, root.files, root.file_fingerprints, prior, .{ .shared = root.public_navigation, .manager = manager });
     }
@@ -589,6 +591,7 @@ pub fn publishRunCheckpoint(a: A, out: A, store: *stores.ArtifactStore, sort: *l
         var reads: u64 = 16 * 1024 * 1024;
         var writes: u64 = 0;
         var pages: page_store.PageStore = .{ .domain = scope.domain, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        pages.admitPublication();
         var slot_arena = std.heap.ArenaAllocator.init(a);
         defer slot_arena.deinit();
         const slots = delta.dictionary_slots;
@@ -620,6 +623,7 @@ pub fn publishRunCheckpoint(a: A, out: A, store: *stores.ArtifactStore, sort: *l
     var reads: u64 = 256 * 1024 * 1024;
     var writes: u64 = 512 * 1024 * 1024;
     var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    pages.admitPublication();
     while (incoming) |page| {
         const match = for (runs.items, 0..) |run, index| {
             if (run.level == level) break index;

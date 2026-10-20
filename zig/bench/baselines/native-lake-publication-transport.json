@@ -1,0 +1,25 @@
+{
+  "scope": "Deterministic local publication transport contracts; no cloud or archive latency claim",
+  "native_chunk_wave": {
+    "chunks": 17,
+    "chunk_payload_bytes": 262144,
+    "maximum_payloads_per_wave": 8,
+    "maximum_borrowed_or_captured_payload_bytes_per_wave": 2097152,
+    "shared_io_slots_in_test": 3,
+    "required_peak_uploads": {"greater_than": 1, "at_most": 3},
+    "unchanged_refresh_new_uploads": 0,
+    "ordered_parallel_and_inline_identities": "equal",
+    "failure_contract": "drain children, release metadata, restore CPU before returning backend error"
+  },
+  "tree_publication": {
+    "page_cache_forwards_batched_writes": true,
+    "read_io_reservation_slots": 1,
+    "competing_cpu_execution_during_remote_read": true,
+    "cache_hit_additional_io_phases": 0,
+    "canceled_read_resumption_retained_permits": 0
+  },
+  "qualification_outstanding": [
+    "Controlled identical-fixture base/head HN one-file and 1024-file latency and post-GC footprint",
+    "Live object-provider publication throughput and durable retention qualification"
+  ]
+}
