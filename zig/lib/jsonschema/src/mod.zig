@@ -17,6 +17,7 @@ const std = @import("std");
 const json = @import("antfly-json");
 const schema_regex = @import("antfly_regex");
 const value_semantics = @import("value_semantics.zig");
+pub const parseValueLosslessLeaky = json.parseValueLosslessLeaky;
 pub const unsignedInteger = value_semantics.unsignedInteger;
 
 const TableSchema = struct {
@@ -391,9 +392,9 @@ pub fn validateJsonSchemaJson(
     schema_json: []const u8,
     value_json: []const u8,
 ) !void {
-    var schema_parsed = try json.parseFromSlice(json.Value, alloc, schema_json, .{});
+    var schema_parsed = try json.parseValueLossless(alloc, schema_json);
     defer schema_parsed.deinit();
-    var value_parsed = try json.parseFromSlice(json.Value, alloc, value_json, .{});
+    var value_parsed = try json.parseValueLossless(alloc, value_json);
     defer value_parsed.deinit();
     try validateJsonSchemaValue(alloc, schema_parsed.value, value_parsed.value);
 }

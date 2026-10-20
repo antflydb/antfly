@@ -256,3 +256,16 @@ fn integerAllocationSweep(allocator: std.mem.Allocator) !void {
 test "checked JSON integer conversion propagates allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, integerAllocationSweep, .{});
 }
+
+test "JSON wire numbers remain exact in constraints and instances" {
+    try check("{\"type\":\"number\",\"maximum\":1}", "1.0000000000000001", false);
+    try check("{\"type\":\"integer\",\"const\":0}", "1e-400", false);
+    try check("{\"type\":\"integer\"}", "1.0000000000000001", false);
+    try check("{\"minimum\":1e-400}", "0", false);
+    try check("{\"maximum\":1e-400}", "2e-400", false);
+    try check("{\"const\":1.0000000000000001}", "1", false);
+    try check("{\"enum\":[1.0000000000000001]}", "1.00000000000000010", true);
+    try check("{\"uniqueItems\":true}", "[1,1.0000000000000001]", true);
+    try check("{\"uniqueItems\":true}", "[1e-400,10e-401]", false);
+    try check("{\"type\":\"integer\",\"minimum\":1e100000}", "2e100000", true);
+}

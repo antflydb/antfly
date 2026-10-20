@@ -209,7 +209,7 @@ pub const Provider = struct {
             .tool_choice_json = self.tool_choice_json,
         });
         defer alloc.free(envelope);
-        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, envelope, .{});
+        const parsed = try @import("antfly-json").parseValueLossless(alloc, envelope);
         defer parsed.deinit();
         const wire_messages = try alloc.alloc(openai_api.types.ChatCompletionRequestMessage, messages.len);
         defer alloc.free(wire_messages);
@@ -238,7 +238,7 @@ pub const Provider = struct {
             .messages = wire_messages,
             .tools = if (parsed.value.object.get("tools")) |tools| tools.array.items else null,
             .tool_choice = parsed.value.object.get("tool_choice"),
-            .response_format = if (self.response_format_json) |raw| try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{}) else null,
+            .response_format = if (self.response_format_json) |raw| try @import("antfly-json").parseValueLosslessLeaky(alloc, raw) else null,
             .logprobs = if (self.logprobs) .{ .value = true } else .absent,
             .top_logprobs = if (self.logprobs) .{ .integer = 20 } else null,
         };
@@ -549,4 +549,20 @@ test "openai generate round trip and empty choices failure" {
     group.await(io) catch {};
 
     try std.testing.expectEqual(error.GenerateRequestFailed, state.err);
+}
+
+test "generating backend OpenAI preserves numeric literals in tools and response schemas" {
+    const a = std.testing.allocator;
+    const provider = Provider{
+        .allocator = a,
+        .http = undefined,
+        .base_url = "https://api.openai.com/v1",
+        .use_openai_schema = true,
+        .tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"antfly_output\",\"parameters\":{\"type\":\"number\",\"const\":1.0000000000000001}}}]",
+        .response_format_json = "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"test\",\"schema\":{\"type\":\"number\",\"minimum\":1e-400}}}",
+    };
+    const body = try provider.chatRequestJsonAlloc(a, "model", &.{});
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "1.0000000000000001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "1e-400") != null);
 }

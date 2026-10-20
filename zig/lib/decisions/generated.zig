@@ -102,7 +102,10 @@ pub fn responseValue(a: A, cfg: Options, questions: V, value: V, proof: ?c.Token
             },
             .score => {
                 if (cfg.probabilities != .verdict_only) return error.UnsupportedConstrainedProbabilities;
-                try c.put(a, &answer, "score", raw);
+                // Projection into the typed score API happens after exact validation;
+                // raw_structured_answer above retains the authoritative literal.
+                const score: V = if (raw == .number_string) .{ .float = try std.fmt.parseFloat(f64, raw.number_string) } else raw;
+                try c.put(a, &answer, "score", score);
             },
         }
         try c.put(a, &answers, name, answer);
@@ -223,4 +226,16 @@ test "generated constrained public questions cover choice multiple predicate and
     var unsupported = value;
     try c.put(a, &unsupported, "probabilities", .{ .string = "token_logprobs" });
     try std.testing.expectError(error.UnsupportedConstrainedProbabilities, parseRequest(a, unsupported));
+}
+
+test "generated constrained scores project only after exact validation and retain raw literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const questions = try c.parseReply(a, "{\"rating\":{\"type\":\"score\"}}");
+    const raw = try c.parseReply(a, "{\"rating\":0.12345678901234567890123456789}");
+    const response = try responseValue(a, .{ .model = "fixture", .probabilities = .verdict_only }, questions, raw, null, 0, 0, 0);
+    const answer = response.object.get("answers").?.object.get("rating").?;
+    try std.testing.expectEqualStrings("0.12345678901234567890123456789", answer.object.get("raw_structured_answer").?.number_string);
+    try std.testing.expect(answer.object.get("score").? == .float);
 }

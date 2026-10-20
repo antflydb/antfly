@@ -550,7 +550,7 @@ test "generated extraction accepts mathematical integer endpoints through materi
     const schema = try outputSchema(a, config.value);
     for ([_][]const u8{ "0", "0.0", "-0e10" }, [_][]const u8{ "1", "1e0", "1.00" }) |source, target| {
         const raw = try std.fmt.allocPrint(a, "{{\"entities\":[{{\"label\":\"person\",\"text\":\"Alice\",\"present\":true}},{{\"label\":\"person\",\"text\":\"Bob\",\"present\":true}}],\"relations\":[{{\"type\":\"knows\",\"source\":{s},\"target\":{s},\"present\":true}}]}}", .{ source, target });
-        const value = try std.json.parseFromSliceLeaky(V, a, raw, .{});
+        const value = try c.parseReply(a, raw);
         try constrained.validateJsonSchemaValue(a, schema, value);
         var validation = Validation{ .config = config.value };
         try Validation.validate(&validation, a, 0, value, null);

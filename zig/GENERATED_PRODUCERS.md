@@ -53,7 +53,12 @@ instance type, so `minimum` constrains numbers without imposing a numeric type.
 Enums, constants, and unique items use JSON value equality: object member order
 is irrelevant and mathematically equal numbers compare equally. Integer and
 numeric-literal comparisons retain decimal precision instead of rounding through
-floating point. The owned constraint tree compiles once per batch and serves all
+floating point. Provider replies, schema configuration, and native output checks
+preserve decimal/exponent literals before validation, including tool arguments
+and replay. This rejects values such as `1.0000000000000001` against a maximum
+of `1`, and prevents `1e-400` from becoming integer zero. Typed score projection
+happens after validation; `raw_structured_answer` retains its exact literal.
+The owned constraint tree compiles once per batch and serves all
 items and repair attempts. Validation collects evaluated-field and evaluated-item
 coverage in the same traversal, retaining annotations only from successful
 branches. Schemas without coverage consumers allocate no coverage state;

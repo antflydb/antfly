@@ -621,3 +621,7 @@ test "decisions public rejects duplicate questions and extraction decision alias
     }) |json| try std.testing.expectError(error.UnsupportedExtractionFeature, validateExtractionBoundary(try std.json.parseFromSliceLeaky(V, a, json, .{})));
     try validateExtractionBoundary(try std.json.parseFromSliceLeaky(V, a, "{\"schema\":{\"entities\":[\"person\"],\"classifications\":[{\"mode\":\"multi\",\"labels\":[\"a\",\"b\"]}]}}", .{}));
 }
+
+test {
+    _ = generated;
+}

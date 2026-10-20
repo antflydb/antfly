@@ -43,7 +43,7 @@ pub const Config = struct {
 };
 
 pub fn parse(alloc: Allocator, raw: []const u8) !Config {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    var parsed = try @import("antfly-json").parseValueLossless(alloc, raw);
     errdefer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGeneratorConfig;
 
@@ -127,4 +127,14 @@ pub fn forcedToolName(tool_choice: ?std.json.Value) ?[]const u8 {
         },
         else => return null,
     }
+}
+
+test "generating backend producer configuration retains exact output schema literals" {
+    const a = std.testing.allocator;
+    var cfg = try parse(a,
+        \\{"generator":{"provider":"antfly","model":"fixture","temperature":0.5},"output_schema":{"type":"number","minimum":1e-400,"maximum":1.0000000000000001}}
+    );
+    defer cfg.deinit(a);
+    try std.testing.expectEqualStrings("1e-400", cfg.output_schema.?.object.get("minimum").?.number_string);
+    try std.testing.expectEqualStrings("1.0000000000000001", cfg.output_schema.?.object.get("maximum").?.number_string);
 }

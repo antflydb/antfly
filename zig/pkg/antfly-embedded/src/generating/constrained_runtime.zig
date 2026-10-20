@@ -135,7 +135,7 @@ pub const Runtime = struct {
                     return emptyReply(a, result.usage);
                 break :blk result.tool_calls[0].arguments;
             } else result.content;
-            const value = std.json.parseFromSliceLeaky(Json, a, raw, .{ .allocate = .alloc_always }) catch |err| {
+            const value = constrained.parseReply(a, raw) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 return emptyReply(a, result.usage);
             };

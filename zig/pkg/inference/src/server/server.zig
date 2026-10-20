@@ -12563,7 +12563,7 @@ pub const Node = struct {
         var parsed_body_value: ?std.json.Parsed(std.json.Value) = null;
         defer if (parsed_body_value) |*owned| owned.deinit();
         if (std.mem.indexOf(u8, request_json, "chat_template_kwargs") != null) {
-            parsed_body_value = std.json.parseFromSlice(std.json.Value, ctx.allocator, request_json, .{}) catch null;
+            parsed_body_value = @import("antfly-json").parseValueLossless(ctx.allocator, request_json) catch null;
         }
         if (parsed_body_value) |owned| {
             if (!generateRequestChatTemplateKwargsAreValid(owned.value)) {
@@ -12576,7 +12576,7 @@ pub const Node = struct {
         var parsed = if (parsed_body_value) |owned|
             try std.json.parseFromValue(api.GenerateRequest, ctx.allocator, owned.value, .{ .ignore_unknown_fields = true })
         else
-            std.json.parseFromSlice(api.GenerateRequest, ctx.allocator, request_json, .{ .ignore_unknown_fields = true }) catch
+            parseGenerateBody(api.GenerateRequest, ctx.allocator, request_json) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid generation request" });
         defer parsed.deinit();
         const body = parsed.value;
@@ -14865,7 +14865,7 @@ pub const Node = struct {
                 .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
             });
         }
-        var parsed = std.json.parseFromSlice(api.GenerateBatchRequest, ctx.allocator, request_json, .{ .ignore_unknown_fields = true }) catch
+        var parsed = parseGenerateBody(api.GenerateBatchRequest, ctx.allocator, request_json) catch
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid generation batch request" });
         defer parsed.deinit();
         const body = parsed.value;
@@ -20327,7 +20327,7 @@ pub const Node = struct {
             if (choices != .array or choices.array.items.len != 1) return error.InvalidConstrainedOutput;
             const raw = choices.array.items[0].object.get("message").?.object.get("content").?;
             if (raw != .string) return error.InvalidConstrainedOutput;
-            const value = std.json.parseFromSliceLeaky(std.json.Value, a, raw.string, .{ .allocate = .alloc_always }) catch |err| {
+            const value = c.parseReply(a, raw.string) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 return .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"items\":[]}", .{}) };
             };
@@ -36793,6 +36793,20 @@ fn audioTooLargeResponse(ctx: *httpx.Context) !httpx.Response {
     });
 }
 
+// Preserve schema literals in typed requests too. Ordinary generation retains
+// its direct typed parse; escaped keys take the lossless path too.
+fn parseGenerateBody(comptime T: type, a: std.mem.Allocator, raw: []const u8) !std.json.Parsed(T) {
+    if (std.mem.indexOf(u8, raw, "response_format") != null or std.mem.indexOfScalar(u8, raw, '\\') != null) {
+        var exact = try @import("antfly-json").parseValueLossless(a, raw);
+        errdefer exact.deinit();
+        // Value.jsonParseFromValue borrows dynamic nodes even with alloc_always.
+        // Keep source and typed nodes in one owned arena for the full request.
+        const value = try std.json.parseFromValueLeaky(T, exact.arena.allocator(), exact.value, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+        return .{ .arena = exact.arena, .value = value };
+    }
+    return std.json.parseFromSlice(T, a, raw, .{ .ignore_unknown_fields = true });
+}
+
 fn coerceGenerateResponseFormat(
     allocator: std.mem.Allocator,
     response_format: ?api.GenerateResponseFormat,
@@ -36822,7 +36836,7 @@ fn validateGeneratedJsonSchema(
     schema_cfg: api.GenerateJsonSchemaConfig,
 ) !void {
     const schema = schema_cfg.schema orelse return error.MissingJsonSchema;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_text, .{});
+    var parsed = try @import("antfly-json").parseValueLossless(allocator, json_text);
     defer parsed.deinit();
     try jsonschema.validateJsonSchemaValue(allocator, .{ .object = schema.map }, parsed.value);
 }
@@ -39105,4 +39119,37 @@ test "generated constrained extraction transport retains typed document failures
         try std.testing.expectEqual(expected.retryable, if (body.value.object.get("retryable")) |retryable| retryable.bool else false);
         if (cause == error.GenerationCapacityUnavailable) try std.testing.expectEqual(@as(i64, 1000), body.value.object.get("retry_after_ms").?.integer);
     }
+}
+
+test "generated constrained native output validates numeric literals before rounding" {
+    const a = std.testing.allocator;
+    var schema = try @import("antfly-json").parseValueLossless(a, "{\"type\":\"number\",\"maximum\":1}");
+    defer schema.deinit();
+    const cfg: api.GenerateJsonSchemaConfig = .{ .schema = .{ .map = schema.value.object } };
+    try std.testing.expectError(error.InvalidBatchRequest, validateGeneratedJsonSchema(a, "1.0000000000000001", cfg));
+    try validateGeneratedJsonSchema(a, "1e-400", cfg);
+    var integer = try @import("antfly-json").parseValueLossless(a, "{\"type\":\"integer\",\"const\":0}");
+    defer integer.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, validateGeneratedJsonSchema(a, "1e-400", .{ .schema = .{ .map = integer.value.object } }));
+}
+
+test "generated constrained native request parsing preserves single and batch schema precision" {
+    const a = std.testing.allocator;
+    const raw =
+        \\{"model":"m","temperature":0.5,"messages":[],"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"number","minimum":1e-400,"const":1.0000000000000001}}}}
+    ;
+    const escaped = try std.mem.replaceOwned(u8, a, raw, "response_format", "\\u0072esponse_format");
+    defer a.free(escaped);
+    var escaped_request = try parseGenerateBody(api.GenerateRequest, a, escaped);
+    defer escaped_request.deinit();
+    try std.testing.expectEqualStrings("1e-400", escaped_request.value.response_format.?.json_schema.?.schema.?.map.get("minimum").?.number_string);
+    var single = try parseGenerateBody(api.GenerateRequest, a, raw);
+    defer single.deinit();
+    try std.testing.expectEqualStrings("1e-400", single.value.response_format.?.json_schema.?.schema.?.map.get("minimum").?.number_string);
+    try std.testing.expectEqualStrings("1.0000000000000001", single.value.response_format.?.json_schema.?.schema.?.map.get("const").?.number_string);
+    const batch_raw = try std.fmt.allocPrint(a, "{{\"requests\":[{{\"custom_id\":\"test\",\"body\":{s}}}]}}", .{raw});
+    defer a.free(batch_raw);
+    var batch = try parseGenerateBody(api.GenerateBatchRequest, a, batch_raw);
+    defer batch.deinit();
+    try std.testing.expectEqualStrings("1e-400", batch.value.requests[0].body.response_format.?.json_schema.?.schema.?.map.get("minimum").?.number_string);
 }

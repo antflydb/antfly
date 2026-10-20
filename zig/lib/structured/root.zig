@@ -23,6 +23,9 @@ pub const token_evidence = @import("token_evidence.zig");
 const Json = std.json.Value;
 const Allocator = std.mem.Allocator;
 
+/// Preserve model-authored numbers until schema validation has accepted them.
+pub const parseReply = schema_validator.parseValueLosslessLeaky;
+
 pub const Output = enum { auto, tool_call, json_schema, grammar };
 pub const Probabilities = enum { token_logprobs, verdict_only };
 pub const Batch = struct {
@@ -150,7 +153,7 @@ fn validateSchemaAt(schema: Json, depth: usize, nodes: *usize) anyerror!void {
         } else if (std.mem.eql(u8, key, "uniqueItems")) {
             if (value != .bool) return error.InvalidConstrainedSchema;
         } else if (std.mem.eql(u8, key, "minimum") or std.mem.eql(u8, key, "maximum") or std.mem.eql(u8, key, "exclusiveMinimum") or std.mem.eql(u8, key, "exclusiveMaximum")) {
-            if (value != .integer and (value != .float or !std.math.isFinite(value.float))) return error.InvalidConstrainedSchema;
+            if (value != .integer and value != .number_string and (value != .float or !std.math.isFinite(value.float))) return error.InvalidConstrainedSchema;
         } else if (std.mem.eql(u8, key, "minItems") or std.mem.eql(u8, key, "maxItems") or std.mem.eql(u8, key, "minLength") or std.mem.eql(u8, key, "maxLength")) {
             if (value != .integer or value.integer < 0 or value.integer > 65536) return error.InvalidConstrainedSchema;
         } else if (std.mem.eql(u8, key, "title") or std.mem.eql(u8, key, "description")) {
@@ -647,4 +650,35 @@ test "constrained extraction repairs fractional endpoints and accepts numeric ba
     const result = try execute(a, .{ .ptr = &context, .invoke = Context.invoke, .validate_item = Context.validate }, .json_schema, try extraction.outputSchema(a, config.value), "", .{}, &.{ "Alice", "empty" });
     try std.testing.expectEqual(@as(usize, 2), context.fake.calls);
     try std.testing.expect(result.failures[0] == null and result.failures[1] == null);
+}
+
+test "constrained wire precision repairs only genuinely invalid numeric values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try parseReply(a,
+        \\{"type":"object","properties":{"value":{"type":"number","maximum":1}},"required":["value"],"additionalProperties":false}
+    );
+    const Fake = struct {
+        calls: usize = 0,
+        fn invoke(ptr: *anyopaque, alloc: Allocator, request: Invocation) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) return .{ .value = try parseReply(alloc,
+                \\{"items":[{"item":0,"value":{"value":1.0000000000000001}},{"item":1e0,"value":{"value":1e-400}}]}
+            ) };
+            try std.testing.expectEqual(@as(usize, 1), request.items.len);
+            try std.testing.expectEqual(@as(usize, 0), request.items[0].id);
+            try std.testing.expect(request.validation_error != null);
+            return .{ .value = try parseReply(alloc,
+                \\{"items":[{"item":0.0,"value":{"value":0.12345678901234567890123456789}}]}
+            ) };
+        }
+    };
+    var fake = Fake{};
+    const result = try execute(a, .{ .ptr = &fake, .invoke = Fake.invoke }, .json_schema, schema, "", .{}, &.{ "a", "b" });
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expect(result.failures[0] == null and result.failures[1] == null);
+    try std.testing.expectEqualStrings("1e-400", result.values[1].?.object.get("value").?.number_string);
+    try std.testing.expectEqualStrings("0.12345678901234567890123456789", result.values[0].?.object.get("value").?.number_string);
 }

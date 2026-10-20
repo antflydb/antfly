@@ -1005,6 +1005,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     inference_openai_mod.addImport("httpx", httpx_mod);
+    inference_openai_mod.addImport("antfly-json", json_mod);
     inference_openai_mod.addImport("openai_api", openai_api_mod);
     inference_openai_mod.addImport("antfly_inference_types", inference_types_mod);
     const inference_provider_defaults_mod = b.createModule(.{
@@ -1042,6 +1043,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     inference_vertex_mod.addImport("antfly_scraping", scraping_mod);
     inference_vertex_mod.addImport("httpx", httpx_mod);
+    inference_vertex_mod.addImport("antfly-json", json_mod);
     inference_vertex_mod.addImport("antfly_google", google_mod);
     inference_vertex_mod.addImport("antfly_inference_types", inference_types_mod);
     inference_vertex_mod.addImport("antfly_inference_provider_defaults", inference_provider_defaults_mod);
