@@ -479,10 +479,13 @@ pub const EmbeddingPipeline = struct {
             var sorted_lengths: [4]usize = undefined;
             const candidates = @min(@as(usize, 4), order.len - cursor);
             for (order[cursor..][0..candidates], sorted_lengths[0..candidates]) |i, *length| length.* = lengths[i];
-            var count = @import("embedding_gemma2.zig").preparedCohortCount(sorted_lengths[0..candidates], candidates);
+            const compact_policy = @import("../architectures/embedding_gemma2.zig").compactRowsEnabled(self.session.backend() == .metal);
+            var count = @import("embedding_gemma2.zig").preparedCohortCountForBackend(sorted_lengths[0..candidates], candidates, compact_policy);
             while (true) {
                 const seq = lengths[order[cursor + count - 1]];
-                const request = session_mod.RunRequest{ .batch = count, .sequence = seq, .input_bytes = count * seq * 24, .host_preprocess_bytes = count * seq * 32, .workspace_bytes = 256 * 1024 * 1024 + count * seq * 192 * 1024, .output_bytes = count * self.config.embedding_gemma2_dimensions * @sizeOf(f32) };
+                var cohort_rows: usize = 0;
+                for (sorted_lengths[0..count]) |length| cohort_rows += length;
+                const request = session_mod.RunRequest{ .batch = if (compact_policy) 1 else count, .sequence = if (compact_policy) cohort_rows else seq, .input_bytes = count * seq * 24, .host_preprocess_bytes = count * seq * 32, .workspace_bytes = 256 * 1024 * 1024 + (if (compact_policy) cohort_rows else count * seq) * 192 * 1024, .output_bytes = count * self.config.embedding_gemma2_dimensions * @sizeOf(f32) };
                 if (count > 1 and !try self.session.fitsRun(request)) {
                     count -= 1;
                     continue;
@@ -1080,6 +1083,14 @@ pub const EmbeddingPipeline = struct {
             mask_i32[index] = std.math.cast(i32, value) orelse return error.InvalidInputShape;
         }
         if (self.execution_control) |control| try control.check();
+        const compact_policy = @import("../architectures/embedding_gemma2.zig").compactRowsEnabled(text_session.backend() == .metal) and
+            self.config.resident_text_encoder and self.config.normalize and self.config.pooling == .mean and self.text_projection == null and session_factory.getEmbeddingGemma2Config(self.session) != null;
+        var active_rows: usize = 0;
+        for (attention_mask) |value| {
+            if (compact_policy and value != 0 and value != 1) return error.InvalidAttentionMask;
+            active_rows += @intFromBool(value != 0);
+        }
+        if (compact_policy and (active_rows == 0 or active_rows > 8192)) return error.EmbeddingInputTooLong;
         // Workspace belongs to the running batch, not to waiters behind the
         // serialized backend. Admission stays inside this execution gate.
         const owns_gate = !self.execution_gate_held;
@@ -1090,14 +1101,15 @@ pub const EmbeddingPipeline = struct {
             self.unlockExecution();
         };
         var run_permit = try text_session.admit(.{
-            .batch = batch,
-            .sequence = seq_len,
+            .batch = if (compact_policy) 1 else batch,
+            .sequence = if (compact_policy) active_rows else seq_len,
+            .output_bytes = if (compact_policy) batch * self.config.embedding_gemma2_dimensions * @sizeOf(f32) else null,
             .input_bytes = std.math.mul(usize, total, 24) catch
                 return error.ResourceLimitExceeded,
             .host_preprocess_bytes = std.math.mul(usize, total, 32) catch
                 return error.ResourceLimitExceeded,
             .workspace_bytes = if (session_factory.getEmbeddingGemma2Config(self.session) != null)
-                try std.math.add(usize, 256 * 1024 * 1024, try std.math.mul(usize, total, 192 * 1024))
+                try std.math.add(usize, 256 * 1024 * 1024, try std.math.mul(usize, if (compact_policy) active_rows else total, 192 * 1024))
             else
                 0,
         });
@@ -1124,13 +1136,9 @@ pub const EmbeddingPipeline = struct {
         const alloc = self.allocator;
         const lock_started = if (self.trace != null) embedding_trace.now() else 0;
         if (self.execution_control) |control| try control.update(.executing, 0, 0);
-        if (!self.execution_gate_held) if (self.execution_lock) |lock| {
-            if (self.execution_control) |control|
-                try control.lock(lock)
-            else
-                platform.sync.lockYielding(lock);
-        };
-        defer if (!self.execution_gate_held) if (self.execution_lock) |lock| lock.unlock();
+        var cohort_waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+        if (!self.execution_gate_held) try self.session.enterExecutionCohort(self.execution_lock, self.execution_control orelse .{}, &cohort_waiter);
+        defer if (!self.execution_gate_held) self.session.leaveExecutionCohort(self.execution_lock, &cohort_waiter);
         const execute_started = if (self.trace != null) embedding_trace.now() else 0;
         if (self.trace) |trace| trace.execution_lock_ns += execute_started -| lock_started;
         defer if (self.trace) |trace| {
@@ -1147,7 +1155,7 @@ pub const EmbeddingPipeline = struct {
                 const mask = try alloc.alloc(i64, all_mask.len);
                 defer alloc.free(mask);
                 for (mask, all_mask) |*dest, source| dest.* = source;
-                const embeddings = if (batch * effective_len <= 8192)
+                const embeddings = if (@import("../architectures/embedding_gemma2.zig").compactRowsEnabled(managed.backend.kind() == .metal) or batch * effective_len <= 8192)
                     try @import("embedding_gemma2.zig").preparedTexts(&managed.backend, alloc, cfg, ids_i64, mask, batch, effective_len, dimensions)
                 else blk: {
                     const vectors = try alloc.alloc([]f32, batch);
