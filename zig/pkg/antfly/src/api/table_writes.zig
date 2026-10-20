@@ -20356,6 +20356,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local_with_execution = txnResolveGroupLocalWithExecution,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
+                .txn_preparation_status_group_local = txnPreparationStatusGroupLocal,
                 .txn_status_group_linearizable = txnStatusGroupLinearizable,
                 .txn_status_group_linearizable_until = txnStatusGroupLinearizableUntil,
                 .txn_status_group_authoritative_local = txnStatusGroupAuthoritativeLocal,
@@ -23977,6 +23978,12 @@ pub const ProvisionedTableWriteSource = struct {
         return owner.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, req, context);
     }
 
+    fn txnPreparationStatusGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, req: distributed_txn.TxnStatusRequest, context: @import("antfly_local_sources").api_operation.RequestContext, runnable: ?runnable_abi.Borrowed) !?distributed_txn.preparation_protocol.Observation {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.PreparedTransactionProtocolUnavailable;
+        return owner.txnPreparationStatusGroupLocal(alloc, group, table, req, context, runnable);
+    }
+
     fn txnStatusGroupLocalOrdinary(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -25956,6 +25963,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .txn_resolve_group_local_with_execution = txnResolveGroupLocalWithExecution,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
+                .txn_preparation_status_group_local = txnPreparationStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
                 .reprocess_document_artifact = reprocessDocumentArtifact,
@@ -27293,6 +27301,12 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
         return owner.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, req, context);
+    }
+
+    fn txnPreparationStatusGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, req: distributed_txn.TxnStatusRequest, context: @import("antfly_local_sources").api_operation.RequestContext, runnable: ?runnable_abi.Borrowed) !?distributed_txn.preparation_protocol.Observation {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const owner = self.groupLocalWriteSource() orelse return error.PreparedTransactionProtocolUnavailable;
+        return owner.txnPreparationStatusGroupLocal(alloc, group, table, req, context, runnable);
     }
 
     fn txnStatusGroupLocalOrdinary(

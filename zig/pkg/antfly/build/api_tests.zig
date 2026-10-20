@@ -3321,6 +3321,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const owner_preflight_sources = owner_preflight_context_root.import_table.get("antfly_local_sources").?;
     owner_preflight_sources.addOptions("capi_build_options", owner_preflight_capi_options);
     owner_preflight_sources.addImport("antfly_storage_root", owner_preflight_context_root);
+    const preparation_status_owner_check = b.addTest(.{
+        .name = "preparation-status-owner-check",
+        .root_module = owner_preflight_context_root,
+        .filters = &.{"distributed txn typed native status"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-preparation-status-owner-check", "Analyze resident status leases and quorum admission without the full storage archive")
+        .dependOn(&preparation_status_owner_check.step);
     const owner_preflight_context_check = b.addTest(.{
         .name = "owner-preflight-context-check",
         .root_module = owner_preflight_context_root,

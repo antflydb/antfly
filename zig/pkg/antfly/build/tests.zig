@@ -5936,6 +5936,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     test_imports.configure(b, required_begin_mod, true, true);
+    required_begin_mod.addImport("antfly_source_root", required_begin_mod);
+    const required_status_capi_options = b.addOptions();
+    required_status_capi_options.addOption(bool, "linked_storage", false);
+    required_status_capi_options.addOption(bool, "inference_enabled", true);
+    const required_status_sources = required_begin_mod.import_table.get("antfly_local_sources").?;
+    required_status_sources.addOptions("capi_build_options", required_status_capi_options);
+    required_status_sources.addImport("antfly_storage_root", required_begin_mod);
     const required_begin_tests = b.addTest(.{
         .root_module = required_begin_mod,
         .filters = &.{"required replicated begin"},

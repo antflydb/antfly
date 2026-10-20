@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 101;
+pub const abi_version: u32 = 102;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1546,6 +1546,26 @@ pub const TransactionStatusResult = extern struct {
     version: u32 = abi_version,
     status: TxnStatus = .pending,
 };
+
+/// Additive status operation. Old enum-only status request/result layouts are
+/// unchanged. The read port is checked, borrowed and never retained.
+pub const TransactionPreparationStatusRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    txn_id: TxnId = .{},
+    port: ?*const anyopaque = null,
+};
+pub const TransactionPreparationStatusResult = extern struct {
+    version: u32 = abi_version,
+    status: TxnStatus = .pending,
+    present: u8 = 0,
+    mode: u8 = 255,
+    has_binding: u8 = 0,
+    _reserved: [5]u8 = @splat(0),
+    binding: [80]u8 = @splat(0),
+};
+pub extern fn antfly_storage_owner_transaction_preparation_status(owner: ?*anyopaque, request: *const TransactionPreparationStatusRequest, output: *TransactionPreparationStatusResult) callconv(.c) Status;
 
 pub const BulkProgressPhase = enum(u32) {
     begin = 0,

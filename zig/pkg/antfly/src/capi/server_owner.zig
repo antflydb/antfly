@@ -4119,6 +4119,41 @@ pub fn storageOwnerTransactionStatus(
     return .ok;
 }
 
+pub fn storageOwnerTransactionPreparationStatus(owner: ?*anyopaque, request: *const kernel_owner_abi.TransactionPreparationStatusRequest, output: *kernel_owner_abi.TransactionPreparationStatusResult) callconv(.c) kernel_owner_abi.Status {
+    output.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    if (request._reserved != 0) return .invalid_argument;
+    const raw = request.port orelse return .invalid_argument;
+    const read = @import("antfly_local_sources").common_read_admission;
+    if (@intFromPtr(raw) % @alignOf(read.Port) != 0) return .invalid_argument;
+    const original: *const read.Port = @ptrCast(@alignCast(raw));
+    original.validate() catch |err| return storageOwnerStatusFromError(err);
+    var trace: read.RejectionTrace = .{};
+    const control = trace.bind(original.*).?;
+    control.checkpoint() catch |err| return kernel_error_identity.statusFromError(err);
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const decision = handle.db.getTransactionPreparationDecision(request.txn_id.bytes, control) catch |err| {
+        if (trace.failure) |cause| return kernel_error_identity.statusFromError(cause);
+        if (err == error.TxnNotFound) return .ok;
+        return storageOwnerStatusFromError(err);
+    };
+    if (trace.failure) |cause| return kernel_error_identity.statusFromError(cause);
+    output.present = 1;
+    output.status = switch (decision.status) {
+        .pending => .pending,
+        .committed => .committed,
+        .aborted => .aborted,
+    };
+    if (decision.requirement) |requirement| output.mode = @backingInt(requirement.mode);
+    if (decision.binding) |binding| {
+        const bytes = binding.encode() catch |err| return storageOwnerStatusFromError(err);
+        output.has_binding = 1;
+        output.binding = bytes;
+    }
+    return .ok;
+}
+
 pub fn storageOwnerWaitForSync(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.SyncRequest,

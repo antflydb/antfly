@@ -4314,6 +4314,18 @@ pub const AntflyApiHandler = struct {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
+        if (std.mem.startsWith(u8, body, "ATPS")) {
+            const protocol = distributed_txn.preparation_protocol;
+            const input = protocol.decodeStatusQuery(body, null) catch return textResponse(ctx, 400, "invalid transaction request");
+            const observation = self.internalGroupOperations().txnPreparationStatusWithRequest(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
+                return internalTxnErrorResponse(ctx, err, .status);
+            const encoded = try protocol.encodeStatusReply(input, params.group_id, observation, null);
+            const owned = try ctx.allocator.dupe(u8, &encoded);
+            errdefer ctx.allocator.free(owned);
+            try ctx.setHeader("content-type", "application/octet-stream");
+            _ = ctx.response.bodyOwned(ctx.allocator, owned);
+            return ctx.response.build();
+        }
         const input = distributed_txn.parseTxnStatusRequestWithScope(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         const status = self.internalGroupOperations().txnStatusWithRequest(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
             return internalTxnErrorResponse(ctx, err, .status);

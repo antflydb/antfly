@@ -84,6 +84,115 @@ pub const Decision = struct {
     }
 };
 
+/// Absence is successful read evidence, never an error-name convention.
+pub const Observation = union(enum) { missing, known: Decision };
+pub fn observationFromOwner(value: anytype) !Observation {
+    if (value.present > 1 or value.has_binding > 1 or !std.mem.allEqual(u8, &value._reserved, 0)) return error.InvalidTxnRequest;
+    if (value.has_binding == 0 and !std.mem.allEqual(u8, &value.binding, 0)) return error.InvalidTxnRequest;
+    if (value.present == 0) {
+        if (value.status != .pending or value.mode != 255 or value.has_binding != 0) return error.InvalidTxnRequest;
+        return .missing;
+    }
+    const mode: ?Requirement = if (value.mode == 255) null else .{ .mode = std.enums.fromInt(Mode, value.mode) orelse return error.InvalidTxnRequest };
+    const binding = if (value.has_binding == 0) null else try @import("../storage/db/prepared_transaction_effects.zig").Binding.decode(&value.binding);
+    if (binding != null and mode == null) return error.InvalidTxnRequest;
+    return .{ .known = .{ .status = switch (value.status) {
+        .pending => .pending,
+        .committed => .committed,
+        .aborted => .aborted,
+    }, .requirement = mode, .binding = binding } };
+}
+pub const StatusQuery = @import("distributed_txn_contract.zig").TxnStatusRequest;
+pub const status_query_bytes = 112;
+pub const status_reply_bytes = 200;
+
+fn statusScope(raw: []const u8, flag: u8) !struct { scope: ?[32]u8, plan: ?[16]u8 } {
+    if (flag > 1) return error.InvalidTxnRequest;
+    if (flag == 0) {
+        if (!std.mem.allEqual(u8, raw, 0)) return error.InvalidTxnRequest;
+        return .{ .scope = null, .plan = null };
+    }
+    if (std.mem.allEqual(u8, raw[32..48], 0)) return error.InvalidTxnRequest;
+    return .{ .scope = raw[0..32].*, .plan = raw[32..48].* };
+}
+fn writeStatusScope(raw: []u8, query: StatusQuery) !void {
+    if ((query.restore_staging_scope == null) != (query.restore_staging_plan_id == null)) return error.InvalidTxnRequest;
+    if (query.restore_staging_scope) |scope| {
+        const plan = query.restore_staging_plan_id.?;
+        if (std.mem.allEqual(u8, &plan, 0)) return error.InvalidTxnRequest;
+        @memcpy(raw[0..32], &scope);
+        @memcpy(raw[32..48], &plan);
+    }
+}
+fn checkStatusFrame(raw: []const u8, magic: []const u8, size: usize, original: ?admission.Port) !void {
+    if (original) |owner| try owner.checkpoint();
+    if (raw.len != size or !std.mem.eql(u8, raw[0..4], magic) or std.mem.readInt(u16, raw[4..6], .little) != 1 or !std.mem.allEqual(u8, raw[6..8], 0)) return error.InvalidTxnRequest;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(raw[0 .. size - 32], &digest, .{});
+    if (!std.mem.eql(u8, &digest, raw[size - 32 ..])) return error.InvalidTxnRequest;
+    if (original) |owner| try owner.checkpoint();
+}
+pub fn encodeStatusQuery(query: StatusQuery, original: ?admission.Port) ![status_query_bytes]u8 {
+    if (original) |owner| try owner.checkpoint();
+    var raw: [status_query_bytes]u8 = @splat(0);
+    @memcpy(raw[0..4], "ATPS");
+    std.mem.writeInt(u16, raw[4..6], 1, .little);
+    @memcpy(raw[8..24], &query.txn_id);
+    raw[24] = @intFromBool(query.restore_staging_scope != null);
+    try writeStatusScope(raw[32..80], query);
+    std.crypto.hash.Blake3.hash(raw[0..80], raw[80..112], .{});
+    if (original) |owner| try owner.checkpoint();
+    return raw;
+}
+pub fn decodeStatusQuery(raw: []const u8, original: ?admission.Port) !StatusQuery {
+    try checkStatusFrame(raw, "ATPS", status_query_bytes, original);
+    if (!std.mem.allEqual(u8, raw[25..32], 0)) return error.InvalidTxnRequest;
+    const identity = try statusScope(raw[32..80], raw[24]);
+    return .{ .txn_id = raw[8..24].*, .restore_staging_scope = identity.scope, .restore_staging_plan_id = identity.plan };
+}
+pub fn encodeStatusReply(query: StatusQuery, group_id: u64, observation: Observation, original: ?admission.Port) ![status_reply_bytes]u8 {
+    if (original) |owner| try owner.checkpoint();
+    if (group_id == 0) return error.InvalidTxnRequest;
+    var raw: [status_reply_bytes]u8 = @splat(0);
+    @memcpy(raw[0..4], "ATPR");
+    std.mem.writeInt(u16, raw[4..6], 1, .little);
+    @memcpy(raw[8..24], &query.txn_id);
+    std.mem.writeInt(u64, raw[24..32], group_id, .little);
+    raw[32] = 255;
+    raw[33] = 255;
+    raw[35] = @intFromBool(query.restore_staging_scope != null);
+    try writeStatusScope(raw[40..88], query);
+    if (observation == .known) {
+        const value = observation.known;
+        raw[32] = @backingInt(value.status);
+        if (value.requirement) |requirement| raw[33] = @backingInt(requirement.mode);
+        if (value.binding) |binding| {
+            if (binding.group_id != group_id or value.requirement == null) return error.InvalidTxnRequest;
+            raw[34] = 1;
+            const bytes = try binding.encode();
+            @memcpy(raw[88..168], &bytes);
+        }
+    }
+    std.crypto.hash.Blake3.hash(raw[0..168], raw[168..200], .{});
+    if (original) |owner| try owner.checkpoint();
+    return raw;
+}
+pub fn decodeStatusReply(raw: []const u8, query: StatusQuery, group_id: u64, original: ?admission.Port) !Observation {
+    try checkStatusFrame(raw, "ATPR", status_reply_bytes, original);
+    const identity = try statusScope(raw[40..88], raw[35]);
+    if (group_id == 0 or std.mem.readInt(u64, raw[24..32], .little) != group_id or !std.mem.eql(u8, raw[8..24], &query.txn_id) or !std.meta.eql(identity.scope, query.restore_staging_scope) or !std.meta.eql(identity.plan, query.restore_staging_plan_id) or !std.mem.allEqual(u8, raw[36..40], 0) or raw[34] > 1) return error.InvalidTxnRequest;
+    if (raw[34] == 0 and !std.mem.allEqual(u8, raw[88..168], 0)) return error.InvalidTxnRequest;
+    if (raw[32] == 255) {
+        if (raw[33] != 255 or raw[34] != 0) return error.InvalidTxnRequest;
+        return .missing;
+    }
+    const status = std.enums.fromInt(@import("../storage/db/types.zig").TxnStatus, raw[32]) orelse return error.InvalidTxnRequest;
+    const requirement: ?Requirement = if (raw[33] == 255) null else .{ .mode = std.enums.fromInt(Mode, raw[33]) orelse return error.InvalidTxnRequest };
+    const binding = if (raw[34] == 0) null else try @import("../storage/db/prepared_transaction_effects.zig").Binding.decode(raw[88..168]);
+    if (binding) |value| if (value.group_id != group_id or requirement == null) return error.InvalidTxnRequest;
+    return .{ .known = .{ .status = status, .requirement = requirement, .binding = binding } };
+}
+
 pub const SealRequest = struct {
     txn_id: [16]u8,
     group_id: u64,

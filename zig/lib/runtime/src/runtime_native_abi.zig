@@ -76,7 +76,8 @@ const builtin = @import("builtin");
 // Required transaction records and native methods retain exact seal bindings.
 // CommitControl retains a lease-fenced original participant-plan store.
 // Required status evidence carries the saved participant/route binding.
-pub const abi_version: u32 = 42;
+// Typed status callbacks distinguish successful absence from original errors.
+pub const abi_version: u32 = 43;
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

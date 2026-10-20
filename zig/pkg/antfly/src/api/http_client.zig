@@ -3447,6 +3447,14 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         timeout_ms: ?u32,
     ) !QueryResponse {
+        return self.fetchGroupTxnStatusTransport(base_uri, group_id, table_name, body, timeout_ms, false);
+    }
+
+    pub fn fetchGroupTxnPreparationStatusWithTimeout(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: u32) !QueryResponse {
+        return self.fetchGroupTxnStatusTransport(base_uri, group_id, table_name, body, timeout_ms, true);
+    }
+
+    fn fetchGroupTxnStatusTransport(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, body: []const u8, timeout_ms: ?u32, prepared: bool) !QueryResponse {
         const server_budget_ms = if (timeout_ms) |value| blk: {
             if (value <= txn_contract.status_server_response_reserve_ms) return error.Timeout;
             break :blk @min(
@@ -3477,10 +3485,11 @@ pub const ApiHttpClient = struct {
         var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
-            .content_type = "application/json",
+            .content_type = if (prepared) "application/octet-stream" else "application/json",
             .body = body,
             .headers = headers,
             .timeout_ms = timeout_ms,
+            .max_response_bytes = if (prepared) @import("antfly_local_sources").api_prepared_transaction_protocol.status_reply_bytes else null,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {

@@ -589,6 +589,20 @@ pub const Owner = struct {
         return result.status;
     }
 
+    pub fn transactionPreparationStatus(self: *Owner, table_name: []const u8, txn_id: [16]u8, port: *const @import("antfly_local_sources").common_read_admission.Port) !abi.TransactionPreparationStatusResult {
+        try port.validate();
+        // The status-only C ABI cannot enumerate arbitrary original controls.
+        // Retain rejection at the caller edge before translating owner status.
+        var trace: @import("antfly_local_sources").common_read_admission.RejectionTrace = .{};
+        const original = trace.bind(port.*).?;
+        var result: abi.TransactionPreparationStatusResult = .{};
+        const status = abi.antfly_storage_owner_transaction_preparation_status(self.handle, &.{ .table_name = .fromSlice(table_name), .txn_id = .{ .bytes = txn_id }, .port = &original }, &result);
+        if (trace.failure) |cause| return cause;
+        try statusToError(status);
+        if (std.enums.fromInt(abi.TxnStatus, @backingInt(result.status)) == null or result.version != abi.abi_version or result.present > 1 or result.has_binding > 1 or !std.mem.allEqual(u8, &result._reserved, 0)) return error.InvalidAbi;
+        return result;
+    }
+
     pub fn waitForSync(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel) !void {
         return try self.waitForSyncWithCancellation(table_name, sync_level, .none);
     }

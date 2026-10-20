@@ -118,6 +118,7 @@ pub const TableWriteSource = struct {
 
     pub const VTable = struct {
         activate_range_tracking: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, @import("operation.zig").RequestContext) anyerror!void = null,
+        txn_preparation_status_group_local: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, distributed_txn.TxnStatusRequest, @import("operation.zig").RequestContext, ?runnable_abi.Borrowed) anyerror!?@import("prepared_transaction_protocol.zig").Observation = null,
         txn_status_group_local_with_request: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1306,6 +1307,11 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.TxnStatus {
         const fn_ptr = self.vtable.txn_status_group_local orelse return null;
         return try BoundaryAbi.call("txn_status_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, txn_id });
+    }
+
+    pub fn txnPreparationStatusGroupLocal(self: TableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: []const u8, req: distributed_txn.TxnStatusRequest, context: @import("operation.zig").RequestContext, runnable: ?runnable_abi.Borrowed) !?@import("prepared_transaction_protocol.zig").Observation {
+        const callback = self.vtable.txn_preparation_status_group_local orelse return error.PreparedTransactionProtocolUnavailable;
+        return BoundaryAbi.call("txn_preparation_status_group_local", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table, req, context, runnable });
     }
 
     pub fn txnStatusGroupLocalWithRequest(

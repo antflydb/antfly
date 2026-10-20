@@ -34,6 +34,10 @@ pub const HostedGroupRouter = struct {
     budget: RouteBudget = .{},
 
     pub const VTable = struct {
+        /// Explicit opt-in: the batch callback bounds snapshot capture, locks,
+        /// allocation and traversal by RouteBudget, preserving its admission.
+        /// A budget parameter alone does not qualify a legacy implementation.
+        bounded_group_routes: bool = false,
         local_node_id: *const fn (ptr: *anyopaque) u64,
         local_status: *const fn (ptr: *anyopaque, group_id: u64) raft_host.HostedReplicaStatus,
         group_leader_node_id: ?*const fn (ptr: *anyopaque, group_id: u64) ?u64 = null,

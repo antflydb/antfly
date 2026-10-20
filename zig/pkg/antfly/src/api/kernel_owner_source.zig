@@ -936,6 +936,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_status_group_local_with_request = txnStatusGroupLocalWithRequest,
+                .txn_preparation_status_group_local = txnPreparationStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .begin_bulk_ingest_group_local = beginBulkIngestGroupLocal,
                 .finish_bulk_ingest_group_local = finishBulkIngestGroupLocal,
@@ -6031,6 +6032,102 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
     }
 
+    /// Control reads borrow existing residency only. They cannot open storage,
+    /// retire owners, join workers, or wait for the registry mutex. Release uses
+    /// the existing atomic release queue, so a concurrent cold open cannot
+    /// block completion of this read either.
+    fn borrowPreparationStatusResident(self: *ProvisionedKernelOwnerSource, group: u64, table: []const u8, generation: u64, identity: ?Identity, control: @import("antfly_local_sources").common_read_admission.Port) !Lease {
+        try control.checkpoint();
+        if (!self.mutex.tryLock()) return error.StorageReadTemporarilyUnavailable;
+        defer self.mutex.unlock();
+        if (self.quiescing) return error.Canceled;
+        if (self.apply_control_stopping) return error.StorageReadTemporarilyUnavailable;
+        if (self.publicationPendingLocked(group, table)) return error.StorageReadTemporarilyUnavailable;
+        for (self.entries.items, 0..) |entry, index| {
+            if (index % 64 == 0) try control.checkpoint();
+            if (entry.group_id != group or !std.mem.eql(u8, entry.table_name, table)) continue;
+            if (entry.retired or entry.closing or !entry.resident or entry.catalog_deferred or
+                entry.opened_for_historical_apply or entry.generation != generation or
+                (if (identity) |expected| !entry.identity.eql(expected) else false)) return error.StorageReadTemporarilyUnavailable;
+            const released = entry.pending_apply_releases.swap(0, .acq_rel);
+            std.debug.assert(released <= entry.active_users);
+            entry.active_users -= released;
+            if (!tryReserveEntryLeaseLocked(entry, .shared)) return error.StorageReadTemporarilyUnavailable;
+            _ = self.owner_cache_hits.fetchAdd(1, .monotonic);
+            return .{ .source = self, .entry = entry, .apply_only = true };
+        }
+        return error.StorageReadTemporarilyUnavailable;
+    }
+
+    fn txnPreparationStatusGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table: []const u8, req: @import("antfly_local_sources").api_distributed_txn_contract.TxnStatusRequest, context: request_operation.RequestContext, runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed) !?@import("antfly_local_sources").api_prepared_transaction_protocol.Observation {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
+        try original.checkOriginal(context, runnable);
+        if (context.deadline_ns == null or (req.restore_staging_scope == null) != (req.restore_staging_plan_id == null)) return error.InvalidTxnRequest;
+        const barrier = self.read_safety_barrier;
+        if (self.online_source_authority == .raft and (barrier.vtable.capture_frozen == null or barrier.vtable.validate_frozen_with_admission == null or barrier.vtable.validate_retained_snapshot == null)) return error.PreparedTransactionProtocolUnavailable;
+        // Deferred read pins need an independent drainer; a source without
+        // that control worker cannot safely advertise this status provider.
+        if (!self.apply_control_started.load(.acquire)) return error.PreparedTransactionProtocolUnavailable;
+        var receiver = if (context.deadline_io) |borrow| try borrow.receive() else null;
+        const io = if (receiver) |*received| received.io() else if (self.context_runtime) |runtime| runtime.io() orelse return error.PreparedTransactionProtocolUnavailable else return error.PreparedTransactionProtocolUnavailable;
+        const Controls = struct {
+            require_checked_reentry: bool = true,
+            context: request_operation.RequestContext,
+            execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+            fn check(value: @This()) !void {
+                try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(value.context, value.execution_runnable);
+            }
+        };
+        const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
+        var budget: Budget = .{ .controls = .{ .context = context, .execution_runnable = runnable }, .io = io };
+        const read = @import("antfly_local_sources").common_read_admission;
+        var adapter: read.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = read.Port.init(&payload);
+        const native = try platformDeadlineContext(context);
+        var owner = if (req.restore_staging_scope != null)
+            try self.borrowPreparationStatusResident(group, table, self.visibleRootGeneration(group), null, control)
+        else block: {
+            var catalog_budget = self.catalog.budget(self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }));
+            catalog_budget.cancellation = context.cancellation;
+            catalog_budget.admission = control;
+            var descriptor = try self.loadDescriptorWithBudget(alloc, group, table, catalog_budget);
+            defer descriptor.deinit(alloc);
+            break :block try self.borrowPreparationStatusResident(group, table, descriptor.generation, descriptor.identity, control);
+        };
+        defer owner.deinit();
+        if (req.restore_staging_scope) |scope| {
+            const registry = @import("../storage/restore_descriptor_admission.zig");
+            var bootstrap = try registry.parseBootstrap(alloc, owner.entry.restore_bootstrap_json, control);
+            defer bootstrap.deinit();
+            try registry.validateBootstrap(bootstrap.value, control);
+            const target = bootstrap.value.scope.target_namespace;
+            if (!std.mem.eql(u8, &scope, &bootstrap.value.scope.digest()) or
+                !std.mem.eql(u8, &req.restore_staging_plan_id.?, &bootstrap.value.scope.plan_id) or
+                !std.mem.eql(u8, table, bootstrap.value.table_name) or target.shard_id != group or
+                target.table_id != owner.entry.identity.table_id or target.shard_id != owner.entry.identity.shard_id or
+                target.range_id != owner.entry.identity.range_id) return error.RestoreStagingScopeChanged;
+        } else if (owner.entry.restore_bootstrap_json.len != 0) return error.RestoreStagingScopeChanged;
+        // Bounded, admission-aware quorum certification is required. An old
+        // unbounded wait_read_safe callback is never a substitute.
+        const proof = if (self.online_source_authority == .raft) block: {
+            if (barrier.vtable.validate_frozen_with_admission == null or barrier.vtable.validate_retained_snapshot == null) return error.PreparedTransactionProtocolUnavailable;
+            const frozen = try barrier.captureFrozen(group);
+            try barrier.validateFrozenWithAdmission(group, frozen, native.deadline_ns, native.cancellation, control);
+            break :block frozen;
+        } else null;
+        try control.checkpoint();
+        const result = try owner.owner().transactionPreparationStatus(table, req.txn_id, &control);
+        if (proof) |frozen| try barrier.validateRetainedSnapshotWithAdmission(group, frozen, native.deadline_ns, native.cancellation, control);
+        if (owner.entry.generation != self.visibleRootGeneration(group)) return error.StorageReadTemporarilyUnavailable;
+        var confirmation = try self.borrowPreparationStatusResident(group, table, owner.entry.generation, owner.entry.identity, control);
+        defer confirmation.deinit();
+        if (confirmation.entry != owner.entry) return error.StorageReadTemporarilyUnavailable;
+        try control.checkpoint();
+        return try @import("antfly_local_sources").api_prepared_transaction_protocol.observationFromOwner(result);
+    }
+
     fn txnAcknowledgeGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -8120,4 +8217,107 @@ test "retained routed snapshot preserves certified cut across later writes and r
     var canceled = std.atomic.Value(bool).init(true);
     snapshot.cancellation = db_types.CancellationToken.fromAtomic(&canceled);
     try std.testing.expectError(error.Canceled, snapshot.checkControlled(port));
+}
+
+test "distributed txn typed native status refuses unbounded quorum before touching owners" {
+    const Barrier = struct {
+        fn legacy(_: *anyopaque, _: u64, _: []const u8) !void {
+            return error.UnexpectedLegacyRead;
+        }
+    };
+    var marker: u8 = 0;
+    var source: ProvisionedKernelOwnerSource = undefined;
+    source.online_source_authority = .raft;
+    source.read_safety_barrier = .{ .ptr = &marker, .vtable = &.{ .wait_read_safe = Barrier.legacy } };
+    const request: @import("antfly_local_sources").api_distributed_txn_contract.TxnStatusRequest = .{ .txn_id = @splat(1) };
+    try std.testing.expectError(error.DeadlineExceeded, txnPreparationStatusGroupLocalForTest(&source, request, .{ .deadline_ns = 0 }));
+    try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, txnPreparationStatusGroupLocalForTest(&source, request, .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s }));
+}
+
+fn txnPreparationStatusGroupLocalForTest(source: *ProvisionedKernelOwnerSource, request: @import("antfly_local_sources").api_distributed_txn_contract.TxnStatusRequest, context: request_operation.RequestContext) !void {
+    _ = try source.writeSource().txnPreparationStatusGroupLocal(std.testing.allocator, 7, "docs", request, context, null);
+}
+
+test "distributed txn typed native status borrows existing residency and releases without registry waits" {
+    const read = @import("antfly_local_sources").common_read_admission;
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.TxnNotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ordinal = self.calls;
+            self.calls += 1;
+            if (ordinal == self.fail_at) return self.cause;
+        }
+    };
+    var control: Control = .{};
+    const payload: read.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+    const port = read.Port.init(&payload);
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    defer source.entries.deinit(std.testing.allocator);
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 1, null, port));
+    try std.testing.expect(source.context.handle == null and source.entries.items.len == 0);
+    var entry: ProvisionedKernelOwnerSource.Entry = .{
+        .group_id = 7,
+        .table_name = @constCast("docs"),
+        .generation = 1,
+        .identity = .{ .table_id = 4, .shard_id = 7, .range_id = 8 },
+        .schema_json = @constCast("{}"),
+        .indexes_json = @constCast("{}"),
+        .restore_bootstrap_json = @constCast(""),
+        .initial_child_bootstrap_json = @constCast(""),
+        .owner = .{ .handle = null },
+        .resident = true,
+    };
+    try source.entries.append(std.testing.allocator, &entry);
+    control = .{};
+    var first = try source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port);
+    const checks = control.calls;
+    try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+    var confirmation = try source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port);
+    try std.testing.expect(confirmation.entry == first.entry);
+    try std.testing.expectEqual(@as(usize, 2), entry.active_users);
+    confirmation.deinit();
+    // Another request may hold the registry through a slow open. This read's
+    // release must still finish without joining it or creating an executor.
+    try std.testing.expect(source.mutex.tryLock());
+    first.deinit();
+    source.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 2), entry.pending_apply_releases.load(.acquire));
+    var second = try source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port);
+    try std.testing.expectEqual(@as(usize, 1), entry.active_users);
+    second.deinit();
+    try std.testing.expect(source.mutex.tryLock());
+    source.reconcileApplyReleasesLocked();
+    source.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+    for ([_]anyerror{ error.TxnNotFound, error.Canceled, error.Timeout, error.MemoryLimitExceeded }) |cause| for (0..checks) |index| {
+        control = .{ .fail_at = index, .cause = cause };
+        try std.testing.expectError(cause, source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port));
+        try std.testing.expect(source.mutex.tryLock());
+        source.mutex.unlock();
+        try std.testing.expectEqual(@as(usize, 0), entry.active_users);
+    };
+    control = .{};
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 2, entry.identity, port));
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 1, .{ .table_id = 9, .shard_id = 7, .range_id = 8 }, port));
+    entry.retired = true;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port));
+    entry.retired = false;
+    entry.resident = false;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, source.borrowPreparationStatusResident(7, "docs", 1, entry.identity, port));
+    try std.testing.expect(!entry.resident and source.context.handle == null);
+}
+
+test "distributed txn typed native status requires an independent release worker" {
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
+    source.online_source_authority = .native;
+    const io = std.testing.io;
+    const context: request_operation.RequestContext = .{
+        .deadline_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, io).nanoseconds)) + std.time.ns_per_s,
+        .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
+    };
+    try std.testing.expectError(error.PreparedTransactionProtocolUnavailable, txnPreparationStatusGroupLocalForTest(&source, .{ .txn_id = @splat(1) }, context));
+    try std.testing.expect(source.context.handle == null and source.entries.items.len == 0);
 }

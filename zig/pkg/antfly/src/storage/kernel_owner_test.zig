@@ -4600,3 +4600,64 @@ test "opaque context retains the node runnable owner across runtime birth and de
     context.deinit();
     try std.testing.expectEqual(@as(usize, 0), probe.references);
 }
+
+test "opaque owner typed transaction status separates absence from original failure across reopen" {
+    const admission = @import("antfly_local_sources").common_read_admission;
+    const protocol = @import("antfly_local_sources").api_prepared_transaction_protocol;
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.TxnNotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ordinal = self.calls;
+            self.calls += 1;
+            if (ordinal == self.fail_at) return self.cause;
+        }
+        fn write(owner: *client.Owner, input: @import("antfly_local_sources").storage_db_types.BatchRequest) !void {
+            const encoded = try @import("antfly_local_sources").api_batch.encodeBatchRequest(std.testing.allocator, input);
+            defer std.testing.allocator.free(encoded);
+            var response = try owner.replicatedBatchJson("docs", encoded);
+            response.deinit();
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    const options: abi.OpenRequest = .{ .context = context.handle, .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 72 };
+    var owner = try client.Owner.open(options);
+    var open = true;
+    defer if (open) owner.deinit();
+    const id: [16]u8 = @splat(5);
+    var baseline: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &baseline, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .wait_for_progress = Control.check } };
+    const port = admission.Port.init(&payload);
+    const missing = try owner.transactionPreparationStatus("docs", id, &port);
+    try std.testing.expect((try protocol.observationFromOwner(missing)) == .missing);
+    const checkpoints = baseline.calls;
+    for ([_]anyerror{ error.TxnNotFound, error.Canceled, error.Timeout, error.MemoryLimitExceeded }) |cause| for (0..checkpoints) |index| {
+        var state: Control = .{ .fail_at = index, .cause = cause };
+        const denied: admission.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .wait_for_progress = Control.check } };
+        const original = admission.Port.init(&denied);
+        try std.testing.expectError(cause, owner.transactionPreparationStatus("docs", id, &original));
+    };
+    try Control.write(&owner, .{ .transaction = .{ .begin = .{ .txn_id = id, .begin_timestamp = 1, .created_at_ns = 1, .topology_epoch = 1, .retain_terminal = true, .participants = &.{"table2:00000004:docs:72"} } } });
+    const pending = (try protocol.observationFromOwner(try owner.transactionPreparationStatus("docs", id, &port))).known;
+    try std.testing.expectEqual(@import("antfly_local_sources").storage_transactions.TxnStatus.pending, pending.status);
+    try std.testing.expect(pending.requirement == null and pending.binding == null);
+    try Control.write(&owner, .{ .transaction = .{ .resolve = .{ .txn_id = id, .status = .aborted, .commit_version = 2 } } });
+    owner.deinit();
+    open = false;
+    owner = try client.Owner.open(options);
+    open = true;
+    const terminal = (try protocol.observationFromOwner(try owner.transactionPreparationStatus("docs", id, &port))).known;
+    try std.testing.expectEqual(@import("antfly_local_sources").storage_transactions.TxnStatus.aborted, terminal.status);
+    try std.testing.expect(terminal.requirement == null and terminal.binding == null);
+    var result: abi.TransactionPreparationStatusResult = .{ .present = 1, .has_binding = 1 };
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_transaction_preparation_status(null, &.{ .version = 0 }, &result));
+    try std.testing.expectEqualDeep(abi.TransactionPreparationStatusResult{}, result);
+}

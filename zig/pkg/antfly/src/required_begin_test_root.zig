@@ -13,6 +13,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+pub const consumer_tests_only = true;
+pub const capi_dependencies = @import("capi_dependencies.zig");
 pub const antfly_sources = @import("source_owner_physical.zig");
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
 const std = @import("std");
@@ -333,6 +335,7 @@ test "required replicated begin bound seal receipts survive restart and reject r
             try receipt.validate(expected);
             const decision = sources.api_prepared_transaction_protocol.Decision.fromDurable(try db.getTransactionPreparationDecision(id, null));
             try std.testing.expectEqual(sources.storage_transactions.TxnStatus.pending, try decision.validate(expected.requirement, binding));
+            try assertPreparationOwnerStatus(&db, id);
             fingerprint = receipt.frame_digest;
         }
         var reopened = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
@@ -347,6 +350,7 @@ test "required replicated begin bound seal receipts survive restart and reject r
         const decision = sources.api_prepared_transaction_protocol.Decision.fromDurable(try reopened.getTransactionPreparationDecision(id, null));
         try std.testing.expectEqual(sources.storage_transactions.TxnStatus.committed, try decision.validate(expected.requirement, binding));
         try assertPreparationStatusAdmission(&reopened, id);
+        try assertPreparationOwnerStatus(&reopened, id);
         try std.testing.expectError(error.PreparedEffectsRequired, manager.getBoundPreparedSealReceipt(id, binding, null));
         var read = try reopened.core.store.beginReadTxn();
         defer read.abort();
@@ -390,4 +394,71 @@ fn assertPreparationStatusAdmission(db: *db_mod.DB, id: [16]u8) !void {
         db.core.unlockApplyExclusive();
         try std.testing.expectError(cause, observed);
     }
+}
+
+/// Exercise the production C entry on the actual native DB without requiring
+/// the full storage archive qualification build.
+fn assertPreparationOwnerStatus(db: *db_mod.DB, txn_id: [16]u8) !void {
+    const owner = @import("capi/server_owner.zig");
+    const abi = @import("kernel_owner_abi");
+    const handles = sources.capi_handles;
+    const protocol = sources.api_prepared_transaction_protocol;
+    const admission = sources.common_read_admission;
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.TxnNotFound,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ordinal = self.calls;
+            self.calls += 1;
+            if (ordinal == self.fail_at) return self.cause;
+        }
+    };
+    // The handle borrows this DB's core; only the caller closes it.
+    var handle: handles.Handle = .{ .alloc = std.testing.allocator, .db = db.*, .storage_owner_table_name = @constCast("docs") };
+    const registry = handles.handleRegistry();
+    const registered = try registry.register(&handle);
+    defer {
+        _, const id = registry.beginClose(registered).?;
+        registry.finishClose(id);
+    }
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .wait_for_progress = Control.check } };
+    const port = admission.Port.init(&payload);
+    const status_request: abi.TransactionPreparationStatusRequest = .{ .table_name = .fromSlice("docs"), .txn_id = .{ .bytes = txn_id }, .port = &port };
+    var result: abi.TransactionPreparationStatusResult = .{};
+    try std.testing.expectEqual(abi.Status.ok, owner.storageOwnerTransactionPreparationStatus(registered, &status_request, &result));
+    const actual = (try protocol.observationFromOwner(result)).known;
+    const expected = protocol.Decision.fromDurable(try db.getTransactionPreparationDecision(txn_id, null));
+    try std.testing.expectEqualDeep(expected, actual);
+    const checkpoints = control.calls;
+    for ([_]anyerror{ error.TxnNotFound, error.Canceled, error.Timeout, error.MemoryLimitExceeded }) |cause| for (0..checkpoints) |index| {
+        control = .{ .fail_at = index, .cause = cause };
+        // Mirror the caller-edge trace used by the typed owner client: unknown
+        // original errors must survive the narrower C status enum.
+        var caller: admission.RejectionTrace = .{};
+        const traced = caller.bind(port).?;
+        var traced_request = status_request;
+        traced_request.port = &traced;
+        const status = owner.storageOwnerTransactionPreparationStatus(registered, &traced_request, &result);
+        try std.testing.expect(status != .ok);
+        try std.testing.expectEqual(cause, caller.failure.?);
+        try std.testing.expectEqual(@as(u8, 0), result.present);
+    };
+    control = .{};
+    var missing = status_request;
+    missing.txn_id.bytes = @splat(0x5d);
+    try std.testing.expectEqual(abi.Status.ok, owner.storageOwnerTransactionPreparationStatus(registered, &missing, &result));
+    try std.testing.expect((try protocol.observationFromOwner(result)) == .missing);
+    // An original missing-shaped error wins even when no transaction exists.
+    control = .{ .fail_at = 0 };
+    const missing_failure = owner.storageOwnerTransactionPreparationStatus(registered, &missing, &result);
+    try std.testing.expectError(error.TxnNotFound, @import("kernel_error_identity").statusToError(missing_failure));
+    control = .{};
+    var invalid = status_request;
+    invalid.version = 0;
+    result = .{ .present = 1, .has_binding = 1 };
+    try std.testing.expectEqual(abi.Status.invalid_abi, owner.storageOwnerTransactionPreparationStatus(null, &invalid, &result));
+    try std.testing.expectEqualDeep(abi.TransactionPreparationStatusResult{}, result);
 }

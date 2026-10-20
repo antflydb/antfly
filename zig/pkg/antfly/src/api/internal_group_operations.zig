@@ -835,6 +835,27 @@ pub const Operations = struct {
         }) orelse error.NotFound;
     }
 
+    /// Absence is a successful typed observation. No read failure, including
+    /// an original admission error named TxnNotFound, may become absence.
+    pub fn txnPreparationStatusWithRequest(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnStatusRequest) Error!distributed_txn.preparation_protocol.Observation {
+        try request.ensureActive();
+        if (request.deadline_ns == null) return error.InvalidArgument;
+        const writes = self.writes orelse return error.GroupLeaderUnavailable;
+        return (writes.txnPreparationStatusGroupLocal(alloc, group_id, table_name, input, request, null) catch |err| switch (err) {
+            error.InvalidTxnRequest, error.RestoreStagingScopeChanged => return error.InvalidArgument,
+            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.StorageReadTemporarilyUnavailable,
+            error.DeadlineExceeded,
+            error.PreparedTransactionProtocolUnavailable,
+            error.UnknownGroup,
+            error.LeaderUnavailable,
+            error.NotLeader,
+            error.Timeout,
+            => return error.GroupLeaderUnavailable,
+            else => return error.Internal,
+        }) orelse error.GroupLeaderUnavailable;
+    }
+
     pub fn txnAcknowledge(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnAcknowledgeRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
@@ -2406,4 +2427,31 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "distributed txn typed status operation never translates read rejection into absence" {
+    const Fixture = struct {
+        cause: ?anyerror = null,
+        calls: usize = 0,
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnexpectedMutation;
+        }
+        fn status(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: distributed_txn.TxnStatusRequest, _: operation.RequestContext, _: ?@import("antfly_runtime_abi").runnable_abi.Borrowed) !?distributed_txn.preparation_protocol.Observation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.cause) |cause| return cause;
+            return .missing;
+        }
+    };
+    var fixture: Fixture = .{};
+    const ops: Operations = .{ .reads = null, .shard_db_adapter = null, .writes = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .txn_preparation_status_group_local = Fixture.status } } };
+    const context: operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s };
+    const query: distributed_txn.TxnStatusRequest = .{ .txn_id = @splat(1) };
+    try std.testing.expect((try ops.txnPreparationStatusWithRequest(std.testing.allocator, context, 7, "docs", query)) == .missing);
+    fixture.cause = error.TxnNotFound;
+    try std.testing.expectError(error.Internal, ops.txnPreparationStatusWithRequest(std.testing.allocator, context, 7, "docs", query));
+    fixture.cause = error.NotLeader;
+    try std.testing.expectError(error.GroupLeaderUnavailable, ops.txnPreparationStatusWithRequest(std.testing.allocator, context, 7, "docs", query));
+    try std.testing.expectError(error.InvalidArgument, ops.txnPreparationStatusWithRequest(std.testing.allocator, .{}, 7, "docs", query));
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
 }
