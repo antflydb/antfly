@@ -16,14 +16,16 @@ branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `fc9bea9f20194754644605d796c00beeb1f325d0`.
-Native ABI 35 also fences the catalog-revision witness carried by transactions
-and catalog publication. Required BEGIN checks validated store/revision/import
-identity and durable reader floors without parsing the full resolver catalog.
-Storage owner ABI remains 101. Ten focused native targets pass on
-`6683d34283f1edfb5e8c70b8651352d9aba229a4`, including all 20 required-preparation
-cases and real socket overload coverage. The retained pgwire fix preserves
-completion authority through held-cursor COMMIT. Distributed required preparation
-and the full design remain in progress.
+Native ABI 36 now fences the opt-in required-preparation coordinator callbacks;
+storage owner ABI remains 101. The earlier validated catalog witness still makes
+required BEGIN eligibility bounded. Commit
+`3542715d2d636ccf0a97497a0f46992a22a1a57a` adds capability negotiation before BEGIN,
+all-participant sealing before decision, exact mode checks on retained retries and
+shared ATPW binary framing. Five focused native targets and 25 ReleaseSafe package
+consumer checks pass. Production transport/storage adapters, durable retained
+contract history and migration remain required before activation. The retained
+pgwire fix preserves completion authority through held-cursor COMMIT. Distributed
+required preparation and the full design remain in progress.
 
 The full goal remains safe, bounded execution sharing across many connections
 by default, with fair scheduling and bounded waiting, preserving session

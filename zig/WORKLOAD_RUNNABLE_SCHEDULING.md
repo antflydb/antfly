@@ -19,6 +19,41 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Required-preparation coordinator foundation (2026-10-19)
+
+Commit `3542715d2d636ccf0a97497a0f46992a22a1a57a` adds an explicit opt-in
+coordinator policy. It negotiates every participant before BEGIN, uses only
+requirement-aware BEGIN/PREPARE callbacks and validates every seal before the
+first commit decision. Seals bind transaction, participant, pinned route and exact
+preparation mode. Original execution authority, deadlines and cancellation reach
+those callbacks; deliberate recovery detaches the original execution authority.
+The mode remains independent of later acknowledgement levels. Matching retained
+commits can resume without fresh readiness, aborts remain terminal, and bare legacy
+status cannot establish a preparation contract, including after ambiguous BEGIN.
+
+Shared ATPW v1 framing uses fixed binary headers and checksums, bounded payloads
+and original admission checkpoints. Codec support alone grants no readiness:
+capabilities also require durable BEGIN/seal/recovery, retained contract evidence,
+reader floors and completed catalog/import migration. Native ABI 36 fences the
+new coordinator callback and option layouts; storage owner ABI remains 101.
+
+The five-target native receipt `native-prepared-coordinator-v6-verified.json`
+records coordinator model tests, all 20 required-preparation storage cases,
+participant fanout, inference checkpoints and independent native ownership.
+Twelve new cases cover ordering, failures before decision, every readiness bit,
+retained retries, authority, fixed framing, corruption/truncation and allocation
+failure. The immutable source package passes 25 ReleaseSafe consumer checks.
+These are focused checks; full Linux qualification remains waived.
+
+This is a coordinator and codec foundation. Production participant providers do
+not advertise readiness, existing entry points do not select the new policy, and
+the binary wrapper is not yet wired into HTTP or replicated batches. Next are
+durable retained-contract history after intent/effect retirement, actual strict
+RPC/Raft BEGIN/PREPARE/seal adapters and eligible predecision producers, followed
+by ordered-catalog/import/downgrade migration and real distributed restart and
+failure tests. Future replay/output credit, minimum completion resource bundles
+and the remaining scheduler design stay open.
+
 ## Held-cursor completion after the main merge (2026-10-19)
 
 Internal `completion_drain` authority follows a retained pgwire page through both
@@ -50,8 +85,9 @@ Native ABI 35 fences the new transaction and publication-stamp layouts; storage
 owner ABI remains 101. The ten-target native check passes at
 `6683d34283f1edfb5e8c70b8651352d9aba229a4`, including 20 required-preparation
 cases and the existing actual HTTP/pgwire saturation regression. This completes the
-local catalog-check step, while distributed capability negotiation, participant
-sealing and the remaining minimum-completion resource policy stay open.
+local catalog-check step. The newer opt-in coordinator foundation above adds
+negotiation and participant sealing; production adapters and the remaining
+minimum-completion resource policy stay open.
 
 ## Read execution lanes
 
