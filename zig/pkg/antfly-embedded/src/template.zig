@@ -244,24 +244,13 @@ fn eqHelper(ctx: HelperContext) anyerror!Value {
     const a = ctx.params[0];
     const b = ctx.params[1];
 
-    if (a == .number_string or b == .number_string) {
-        const left = templateNumber(a) orelse return .{ .boolean = false };
+    if (templateNumber(a)) |left| {
         const right = templateNumber(b) orelse return .{ .boolean = false };
         return .{ .boolean = try @import("antfly_jsonschema").compareNumbers(ctx.arena, left, right) == .eq };
     }
     const equal = switch (a) {
         .string => |s| switch (b) {
             .string => |s2| std.mem.eql(u8, s, s2),
-            else => false,
-        },
-        .integer => |int_a| switch (b) {
-            .integer => |int_b| int_a == int_b,
-            .float => |f| @as(f64, @floatFromInt(int_a)) == f,
-            else => false,
-        },
-        .float => |f| switch (b) {
-            .float => |f2| f == f2,
-            .integer => |int_b| f == @as(f64, @floatFromInt(int_b)),
             else => false,
         },
         .boolean => |bl| switch (b) {
@@ -1098,4 +1087,11 @@ test "templates safely convert deeply nested unused model output" {
     const rendered = try renderDocument(a, "{{title}}", raw.items);
     defer a.free(rendered);
     try std.testing.expectEqualStrings("kept", rendered);
+}
+
+test "template numeric equality never rounds integer operands through float" {
+    const a = std.testing.allocator;
+    const rendered = try renderDocument(a, "{{#if (eq big 9007199254740992.0)}}bad{{else}}distinct{{/if}}|{{#if (eq 9007199254740992.0 big)}}bad{{else}}distinct{{/if}}|{{#if (eq one 1.0)}}equal{{/if}}|{{#if (eq one \"1\")}}bad{{else}}typed{{/if}}", "{\"big\":9007199254740993,\"one\":1}");
+    defer a.free(rendered);
+    try std.testing.expectEqualStrings("distinct|distinct|equal|typed", rendered);
 }
