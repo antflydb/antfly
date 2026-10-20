@@ -34540,7 +34540,7 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
         .artifact_name = "generated",
         .doc_key = "blocked",
         .source_field = "body",
-        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
         .execution_json = "{\"batch_items\":8,\"batch_bytes\":1}",
         .sequence = 7,
     };
