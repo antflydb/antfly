@@ -63098,10 +63098,12 @@ test "db controlled generated providers retain original controls and retire reje
     const a = std.testing.allocator;
     const Context = @import("antfly_inference_execution_context").RequestContext;
     const Probe = struct {
+        db: ?*DB = null,
         calls: usize = 0,
         rejected: bool = false,
         cause: anyerror,
         reject_output: bool = false,
+        race_policy: bool = false,
         thread: @TypeOf(std.Thread.getCurrentId()),
         deadline: u64 = std.math.maxInt(u64) - 1,
         fn check(raw: *const anyopaque) !void {
@@ -63118,7 +63120,14 @@ test "db controlled generated providers retain original controls and retire reje
             try std.testing.expectEqual(@as(?u64, self.deadline), context.deadline_ns);
             try std.testing.expect(context.io.userdata == std.testing.io.userdata);
             try context.check();
+            const db = self.db.?;
+            try std.testing.expect(db.local_execution.row_policy_gate.quiesced());
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApply();
+            var capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedMutationAdmission;
+            capture.release();
             self.calls += 1;
+            if (self.race_policy) try db.local_execution.row_policy_gate.beginPreparing(.disabled);
             const output = try alloc.alloc(f32, dims);
             @memset(output, 1);
             self.rejected = self.reject_output;
@@ -63135,50 +63144,177 @@ test "db controlled generated providers retain original controls and retire reje
             return .{ .indices = indices, .values = values };
         }
     };
-    for ([_]bool{ false, true }) |sparse| {
-        for ([_]anyerror{ error.OriginalProviderAuthorityRejected, error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
-            var probe: Probe = .{ .thread = std.Thread.getCurrentId(), .cause = cause };
-            var directory = try TestDirectory.init("controlled-generated-providers");
-            defer directory.cleanup();
-            var db = try DB.open(a, directory.path(), .{
-                .enrichment = .{ .owner_id = "controlled-request", .dense_embedder = if (sparse) null else .{ .ptr = &probe, .dense_embed_fn = Probe.legacy, .dense_embed_with_context_fn = Probe.controlled, .foreground_bounded = true, .part_request_context = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) - 1 } }, .sparse_embedder = if (!sparse) null else .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseLegacy, .sparse_embed_with_context_fn = Probe.sparseControlled, .foreground_bounded = true, .request_context = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) - 1 } } },
-            });
-            defer db.close();
-            try db.addIndex(if (sparse) .{ .name = "sp_controls", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}" } else .{ .name = "dv_controls", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}" });
-            const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &probe, .check_fn = Probe.check } };
-            const io = std.testing.io;
-            var roots: @import("../../api/batch_execution_admission.zig").RootContext = .{ .producer = .{ .io = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&io), .deadline_ns = 0 } };
-            const request: types.BatchRequest = .{ .writes = &.{.{ .key = "doc:controls", .value = "{\"body\":\"alpha\"}" }}, .sync_level = .enrichments };
-            try std.testing.expectError(error.Timeout, db.batchWithAdmissionControlsAndRootContext(request, controls, .none, roots, null, null));
-            try std.testing.expectEqual(@as(usize, 0), probe.calls);
-            roots.producer.?.deadline_ns = std.math.maxInt(u64);
-            probe.reject_output = true;
-            try std.testing.expectError(cause, db.batchWithAdmissionControlsAndRootContext(request, controls, .none, roots, null, null));
-            try std.testing.expectEqual(@as(usize, 1), probe.calls);
-            try std.testing.expect((try db.get(a, "doc:controls")) == null);
-            try std.testing.expect(db.core.tryLockApplyExclusive());
-            db.core.unlockApply();
-            var capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedMutationAdmission;
-            capture.release();
-            const resident = db.enrichment_runtime.?;
-            try std.testing.expect(resident.provider_request_context == null);
-            try std.testing.expectEqual(@as(?u64, probe.deadline), if (sparse) resident.config.sparse_embedder.?.request_context.?.deadline_ns else resident.config.dense_embedder.?.part_request_context.?.deadline_ns);
-            const failed_stats = resident.stats();
-            try std.testing.expectEqual(@as(u64, 1), failed_stats.embed_batches_started);
-            try std.testing.expectEqual(@as(u64, 0), failed_stats.embed_batches_completed);
-            probe.rejected = false;
-            probe.reject_output = false;
-            try db.batchWithAdmissionControlsAndRootContext(request, controls, .none, roots, null, null);
-            const value = (try db.get(a, "doc:controls")).?;
-            defer a.free(value);
-            try std.testing.expectEqualStrings(request.writes[0].value, value);
-            try std.testing.expectEqual(@as(usize, 2), probe.calls);
-            const stats = resident.stats();
-            try std.testing.expectEqual(@as(u64, 2), stats.embed_batches_started);
-            try std.testing.expectEqual(@as(u64, 1), stats.embed_batches_completed);
-            try std.testing.expect(resident.provider_request_context == null);
-            try std.testing.expectEqual(@as(?u64, probe.deadline), if (sparse) resident.config.sparse_embedder.?.request_context.?.deadline_ns else resident.config.dense_embedder.?.part_request_context.?.deadline_ns);
+    for ([_]bool{ false, true }) |relational| {
+        for ([_]bool{ false, true }) |sparse| {
+            for ([_]anyerror{ error.OriginalProviderAuthorityRejected, error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+                var probe: Probe = .{ .thread = std.Thread.getCurrentId(), .cause = cause };
+                var directory = try TestDirectory.init("controlled-generated-providers");
+                defer directory.cleanup();
+                var db = try DB.open(a, directory.path(), .{
+                    .enrichment = .{ .owner_id = "controlled-request", .dense_embedder = if (sparse) null else .{ .ptr = &probe, .dense_embed_fn = Probe.legacy, .dense_embed_with_context_fn = Probe.controlled, .foreground_bounded = true, .part_request_context = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) - 1 } }, .sparse_embedder = if (!sparse) null else .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseLegacy, .sparse_embed_with_context_fn = Probe.sparseControlled, .foreground_bounded = true, .request_context = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) - 1 } } },
+                });
+                defer db.close();
+                probe.db = &db;
+                if (relational) try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "body", .path = "body", .column_type = .string }} });
+                try db.addIndex(if (sparse) .{ .name = "sp_controls", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}" } else .{ .name = "dv_controls", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"model\"}}" });
+                const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &probe, .check_fn = Probe.check } };
+                const io = std.testing.io;
+                var roots: @import("../../api/batch_execution_admission.zig").RootContext = .{ .producer = .{ .io = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&io), .deadline_ns = 0 } };
+                const request: types.BatchRequest = .{ .writes = &.{.{ .key = "doc:controls", .value = "{\"body\":\"alpha\"}" }}, .sync_level = .enrichments };
+                try std.testing.expectError(error.Timeout, db.batchWithAdmissionControlsAndRootContext(request, controls, .none, roots, null, null));
+                try std.testing.expectEqual(@as(usize, 0), probe.calls);
+                roots.producer.?.deadline_ns = std.math.maxInt(u64);
+                probe.reject_output = true;
+                try std.testing.expectError(cause, db.batchWithAdmissionControlsAndRootContext(request, controls, .none, roots, null, null));
+                try std.testing.expectEqual(@as(usize, 1), probe.calls);
+                try std.testing.expect((try db.get(a, "doc:controls")) == null);
+                try std.testing.expect(db.core.tryLockApplyExclusive());
+                db.core.unlockApply();
+                var capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedMutationAdmission;
+                capture.release();
+                const resident = db.enrichment_runtime.?;
+                try std.testing.expect(resident.provider_request_context == null);
+                try std.testing.expectEqual(@as(?u64, probe.deadline), if (sparse) resident.config.sparse_embedder.?.request_context.?.deadline_ns else resident.config.dense_embedder.?.part_request_context.?.deadline_ns);
+                const failed_stats = resident.stats();
+                try std.testing.expectEqual(@as(u64, 1), failed_stats.embed_batches_started);
+                try std.testing.expectEqual(@as(u64, 0), failed_stats.embed_batches_completed);
+                probe.rejected = false;
+                probe.reject_output = false;
+                probe.race_policy = true;
+                const raced = db.batchWithAdmissionControlsAndRootContext(request, controls, .none, roots, null, null);
+                // The fixture simulates publication starting, then its abort. No
+                // durable policy is changed and this attempt must not commit rows.
+                db.local_execution.row_policy_gate.phase.store(@backingInt(@import("table_catalog.zig").RowPolicyPhase.disabled), .release);
+                try std.testing.expectError(error.RowPolicyCatalogChanged, raced);
+                try std.testing.expect((try db.get(a, "doc:controls")) == null);
+                try std.testing.expect(db.local_execution.row_policy_gate.quiesced());
+                probe.race_policy = false;
+                try db.batchWithAdmissionControlsAndRootContext(request, controls, .none, roots, null, null);
+                const value = (try db.get(a, "doc:controls")).?;
+                defer a.free(value);
+                try std.testing.expectEqualStrings(request.writes[0].value, value);
+                try std.testing.expectEqual(@as(usize, 3), probe.calls);
+                const stats = resident.stats();
+                try std.testing.expectEqual(@as(u64, 3), stats.embed_batches_started);
+                try std.testing.expectEqual(@as(u64, 2), stats.embed_batches_completed);
+                try std.testing.expect(resident.provider_request_context == null);
+                try std.testing.expectEqual(@as(?u64, probe.deadline), if (sparse) resident.config.sparse_embedder.?.request_context.?.deadline_ns else resident.config.dense_embedder.?.part_request_context.?.deadline_ns);
+            }
         }
+    }
+}
+
+test "db controlled generated providers policy preparation preserves identity and original expiry" {
+    const Gate = row_policy_gate_mod.Gate;
+    var gate = Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 3 });
+    var lease = try gate.enterRaw();
+    defer lease.release();
+    lease.expires_at_seconds = 10;
+    lease.expires_at_monotonic_ns = std.math.maxInt(u64);
+    var preparation = try lease.retireForPreparation(5);
+    try std.testing.expect(gate.quiesced() and lease.released);
+    // The guard owns the saved authority, even if a caller changes its slot.
+    lease.expires_at_seconds = 100;
+    try preparation.reenter(6);
+    try std.testing.expectEqual(@as(?i64, 10), lease.expires_at_seconds);
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), lease.expires_at_monotonic_ns);
+    try std.testing.expectEqual(@as(usize, 1), gate.readers.load(.acquire));
+    try std.testing.expectError(error.RowPolicyCatalogChanged, preparation.reenter(6));
+    preparation = try lease.retireForPreparation(7);
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, preparation.reenter(11));
+    try std.testing.expect(gate.quiesced() and lease.released);
+    try std.testing.expectError(error.RowPolicyCatalogChanged, preparation.reenter(8));
+    lease = try gate.enterRaw();
+    lease.expires_at_monotonic_ns = 0;
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, lease.retireForPreparation(8));
+    try std.testing.expect(!lease.released and !gate.quiesced());
+}
+
+test "db controlled generated providers policy preparation rejects raced publication identities" {
+    const Gate = row_policy_gate_mod.Gate;
+    for (0..5) |change| {
+        var gate = Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 3 });
+        var lease = try gate.enterRaw();
+        defer lease.release();
+        var preparation = try lease.retireForPreparation(1);
+        switch (change) {
+            0 => try gate.beginPreparing(.disabled),
+            1 => gate.generation.store(1, .release),
+            2 => gate.catalog_epoch.store(1, .release),
+            3 => gate.schema_version.store(4, .release),
+            4 => gate.phase.store(@backingInt(@import("table_catalog.zig").RowPolicyPhase.active), .release),
+            else => unreachable,
+        }
+        try std.testing.expectError(error.RowPolicyCatalogChanged, preparation.reenter(1));
+        try std.testing.expect(gate.quiesced() and lease.released);
+    }
+}
+
+test "db controlled generated providers retire nested capture and policy until checked reentry" {
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    const admission = @import("mutation_admission.zig");
+    const Owner = struct {
+        barrier: *Barrier,
+        core: struct { apply_mutex: struct { io: ?std.Io = std.testing.io } = .{} } = .{},
+        pub fn replicationMutationBarrier(self: *@This()) ?*Barrier {
+            return self.barrier;
+        }
+    };
+    const Check = struct {
+        rejected: bool = false,
+        pub fn checkpoint(_: *@This()) !void {}
+        pub fn executionBoundary(_: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+            return null;
+        }
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.rejected) return error.SchedulerClosed;
+        }
+    };
+    for (0..5) |scenario| {
+        var barrier: Barrier = .{};
+        var root = Barrier.RootSharedLease.initRetired(&barrier);
+        defer root.release();
+        var check: Check = .{};
+        var outer: ?Barrier.SharedLease = try root.borrowPhaseControlled(std.testing.io, &check);
+        defer if (outer) |*held| held.release();
+        var inner: ?Barrier.SharedLease = try root.borrowControlled(&check);
+        defer if (inner) |*held| held.release();
+        var gate = row_policy_gate_mod.Gate.init(.{});
+        var policy = try gate.enterRaw();
+        defer policy.release();
+        const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &check, .check_fn = Check.check } };
+        if (scenario == 4) {
+            var peer = try root.borrowControlled(&check);
+            defer peer.release();
+            try std.testing.expectError(error.InvalidRunnableTransition, admission.SpeculativePreparation.begin(&inner, &outer, &root, &policy, controls));
+            try std.testing.expect(root.held and inner != null and outer != null and !gate.quiesced());
+            continue;
+        }
+        var scope = try admission.SpeculativePreparation.begin(&inner, &outer, &root, &policy, controls);
+        try std.testing.expect(!root.held and inner == null and outer == null and gate.quiesced());
+        var capture = barrier.tryAcquireExclusive() orelse return error.TestUnexpectedResult;
+        capture.release();
+        var owner: Owner = .{ .barrier = &barrier };
+        check.rejected = scenario == 1;
+        if (scenario == 2) try gate.beginPreparing(.disabled);
+        var competing_capture: ?Barrier.ExclusiveLease = if (scenario == 3) barrier.tryAcquireExclusive() orelse return error.TestUnexpectedResult else null;
+        defer if (competing_capture) |*held| held.release();
+        if (scenario != 0) {
+            const expected = switch (scenario) {
+                1 => error.SchedulerClosed,
+                2 => error.RowPolicyCatalogChanged,
+                3 => error.Backpressured,
+                else => unreachable,
+            };
+            try std.testing.expectError(expected, scope.reenter(&owner));
+            try std.testing.expect(!root.held and inner == null and outer == null and gate.quiesced());
+        } else {
+            try scope.reenter(&owner);
+            try std.testing.expect(root.held and inner != null and outer != null and !gate.quiesced());
+            try std.testing.expectEqual(@as(usize, 2), root.borrowers.load(.acquire));
+        }
+        try std.testing.expectError(error.InvalidRunnableTransition, scope.reenter(&owner));
     }
 }
 

@@ -40,6 +40,66 @@ pub const MutationRetirement = struct {
     }
 };
 
+/// Pre-apply generated computation may retire its owned policy and capture
+/// admissions. The caller retains CPU for now; this scope never lends it while
+/// a service holder is live. Snapshot-bearing callers use their retained path.
+pub const SpeculativePreparation = struct {
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    current: *?Barrier.SharedLease,
+    enclosing: ?*?Barrier.SharedLease,
+    root: ?*Barrier.RootSharedLease,
+    controls: ?lock.ApplyRwLock.Acquisition,
+    policy: ?@import("row_policy_gate.zig").Gate.Preparation = null,
+    restore_current: bool,
+    restore_enclosing: bool,
+    active: bool = true,
+
+    pub fn begin(current: *?Barrier.SharedLease, enclosing: ?*?Barrier.SharedLease, root: ?*Barrier.RootSharedLease, policy: ?*@import("row_policy_gate.zig").Gate.Lease, controls: ?lock.ApplyRwLock.Acquisition) !@This() {
+        try checkLifetime(controls);
+        var readers: usize = 0;
+        for ([_]?*?Barrier.SharedLease{ current, enclosing }) |slot| if (slot) |owned| {
+            if (owned.*) |lease| {
+                if (root == null or lease.root != root or lease.barrier != root.?.barrier) return error.InvalidRunnableTransition;
+                readers += 1;
+            }
+        };
+        if (enclosing) |outer| if (outer == current) return error.InvalidRunnableTransition;
+        if (current.*) |lease| if (lease.phase_owner and readers != 1) return error.InvalidRunnableTransition;
+        if (root) |shared| if (shared.borrowers.load(.acquire) != readers) return error.InvalidRunnableTransition;
+        const self: @This() = .{
+            .current = current,
+            .enclosing = enclosing,
+            .root = root,
+            .controls = controls,
+            .restore_current = current.* != null,
+            .restore_enclosing = if (enclosing) |outer| outer.* != null else false,
+            .policy = if (policy) |lease| try lease.retireForPreparation(nowSeconds()) else null,
+        };
+        (MutationRetirement{ .current = current, .enclosing = enclosing }).retire();
+        if (root) |shared| try shared.retirePhase();
+        return self;
+    }
+
+    pub fn reenter(self: *@This(), owner: anytype) !void {
+        const root = self.root;
+        const controls = self.controls;
+        if (!self.active) return error.InvalidRunnableTransition;
+        self.active = false;
+        try checkLifetime(controls);
+        // Reacquire capture without waiting while the original CPU is held.
+        // Every partial admission is retired if policy or lifetime changed.
+        errdefer (MutationRetirement{ .current = self.current, .enclosing = self.enclosing }).retire();
+        if (self.restore_enclosing) self.enclosing.?.* = try acquireReplicationMutationSharedPreDecisionScoped(owner, retainedLeaseControls(controls), root);
+        if (self.restore_current) self.current.* = try acquireReplicationMutationSharedPreDecisionScoped(owner, retainedLeaseControls(controls), root);
+        try checkLifetime(controls);
+        if (self.policy) |*policy| try policy.reenter(nowSeconds());
+    }
+
+    fn nowSeconds() i64 {
+        return @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), @import("std").time.ns_per_s));
+    }
+};
+
 /// Synchronous authority for one resident publication attempt. The DB and
 /// retry owner outlive it because teardown joins every claimed job. No request
 /// borrow, fresh deadline, CPU transfer, or separately allocated owner is used.

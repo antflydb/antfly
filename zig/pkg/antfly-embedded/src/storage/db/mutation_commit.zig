@@ -691,6 +691,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         var extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, rows.len);
                         defer preparation_alloc.free(extracted_rows);
                         for (rows, 0..) |maybe_row, index| extracted_rows[index] = maybe_row.?.extracted;
+                        var preparation_holders: ?mutation_admission.SpeculativePreparation = if (opts.provider_context != null and opts.snapshot_mutation == null and (opts.row_policy_lease == null or opts.row_policy_retirement != null))
+                            try mutation_admission.SpeculativePreparation.begin(&replication_mutation, opts.enclosing_mutation_retirement, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self), opts.row_policy_retirement, opts.admission_controls)
+                        else
+                            null;
                         preprepared_generated = try prepareGeneratedEnrichmentsWithContext(
                             self,
                             preparation_alloc,
@@ -702,6 +706,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             generated_memo,
                             opts.provider_context,
                         );
+                        if (preparation_holders) |*holders| {
+                            if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
+                            try holders.reenter(self);
+                        }
                     }
                     if (profile) |active_profile| {
                         recordProfileNs(profile, &active_profile.relational_prepare_ns, prepare_start_ns);
@@ -781,6 +789,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
                         }
                     }
+                    var preparation_holders: ?mutation_admission.SpeculativePreparation = if (opts.provider_context != null and opts.snapshot_mutation == null and (opts.row_policy_lease == null or opts.row_policy_retirement != null))
+                        try mutation_admission.SpeculativePreparation.begin(&replication_mutation, opts.enclosing_mutation_retirement, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self), opts.row_policy_retirement, opts.admission_controls)
+                    else
+                        null;
                     preprepared_document_generated = try prepareGeneratedEnrichmentsWithContext(
                         self,
                         preparation_alloc,
@@ -792,6 +804,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         generated_memo,
                         opts.provider_context,
                     );
+                    if (preparation_holders) |*holders| {
+                        if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
+                        try holders.reenter(self);
+                    }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
                 }
             }
