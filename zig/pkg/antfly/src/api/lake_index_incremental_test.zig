@@ -248,10 +248,17 @@ test "external lake incremental native publication appends replaces removes and 
                 else
                     (try @import("lake_index_native_sparse.zig").loadRoot(ca, store, declaration.artifact, .none, null)).generation;
                 var reused_chunks: usize = 0;
-                for (generation.files) |file| for (file.chunks) |ref| {
-                    if (phase == 0) try retained.put(a, ref.artifact_id, {});
-                    if (phase == 1 and retained.contains(ref.artifact_id)) reused_chunks += 1;
-                };
+                const directory_map = @import("lake_index_native_directory.zig");
+                var access: directory_map.Access = undefined;
+                access.init(store, generation.domain, .none, null);
+                for (try directory_map.entries(ca, generation, store, .none)) |file| {
+                    const chunks = file.bytes / @import("lake_index_native_files.zig").chunk_bytes + @intFromBool(file.bytes % @import("lake_index_native_files.zig").chunk_bytes != 0);
+                    for (0..@intCast(chunks)) |ordinal| {
+                        const ref = try directory_map.chunk(ca, &access, file, ordinal);
+                        if (phase == 0) try retained.put(a, ref.artifact_id, {});
+                        if (phase == 1 and retained.contains(ref.artifact_id)) reused_chunks += 1;
+                    }
+                }
                 if (phase == 1) try std.testing.expect(reused_chunks != 0);
                 var count: u64 = 0;
                 for (states) |file| {

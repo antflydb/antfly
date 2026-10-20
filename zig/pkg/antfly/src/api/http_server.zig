@@ -44276,12 +44276,22 @@ test "api http server authenticates bounded online merge owner routes" {
     const Fixture = struct {
         calls: usize = 0,
         missing_pin: bool = false,
+        expect_budget: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table_name: []const u8, request: contract.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
+            if (self.expect_budget) {
+                try std.testing.expect(context.deadline_ns != null);
+                try std.testing.expect(context.deadline_io != null);
+                // The wire budget belongs to the transport clock, rather
+                // than to the process platform clock or an unbounded owner.
+                var clock = try context.deadline_io.?.receive();
+                const now = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, clock.io()).nanoseconds)));
+                try std.testing.expect(context.deadline_ns.? -| now <= 500 * std.time.ns_per_ms);
+            } else try std.testing.expect(context.deadline_ns == null);
             try std.testing.expectEqual(@as(u64, 2), group);
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(contract.Side.donor, request.operation.status);
@@ -44319,12 +44329,27 @@ test "api http server authenticates bounded online merge owner routes" {
     defer accepted.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), accepted.status);
     try std.testing.expectEqualStrings("{\"bounded\":true}", accepted.body);
+    const bounded_headers = [_]http_common.RequestHeader{
+        headers[0], .{ .name = contract.remaining_ms_header, .value = "500" },
+    };
+    fixture.expect_budget = true;
+    var bounded = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = uri, .headers = &bounded_headers, .content_type = "application/json", .body = body });
+    defer bounded.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), bounded.status);
+    const exhausted_headers = [_]http_common.RequestHeader{
+        headers[0], .{ .name = contract.remaining_ms_header, .value = "0" },
+    };
+    var exhausted = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = uri, .headers = &exhausted_headers, .content_type = "application/json", .body = body });
+    defer exhausted.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), exhausted.status);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    fixture.expect_budget = false;
     fixture.missing_pin = true;
     var missing = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = uri, .headers = &headers, .content_type = "application/json", .body = body });
     defer missing.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), missing.status);
     try std.testing.expectEqualStrings("online merge source pin missing", missing.body);
-    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
 }
 
 test "api http server serves internal group transaction routes" {

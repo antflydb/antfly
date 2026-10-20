@@ -92,7 +92,7 @@ fn priorRoot(a: A, scratch: A, store: *stores.ArtifactStore, binding: local.serv
     }
     return null;
 }
-fn bindingFor(a: A, source: *local.serverless_query_lake_serving.ServingSource, tuple: tuples.TuplePlan, predicate: ?predicates.Plan, cover: []const []const u8) !local.serverless_segment_source_binding.Binding {
+pub fn bindingFor(a: A, source: *local.serverless_query_lake_serving.ServingSource, tuple: tuples.TuplePlan, predicate: ?predicates.Plan, cover: []const []const u8) !local.serverless_segment_source_binding.Binding {
     return .{ .sidecar_kind = .ordered_rows, .source_kind = switch (source.inventory.format) {
         .parquet => .external_parquet,
         .iceberg => .external_iceberg,
@@ -125,6 +125,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = if (definition.element_type == .numeric) "numeric" else @tagName(definition.type), .required = !definition.nullable };
     var input = provider.*;
     input.schema_contract = if (source.iceberg_schema) |selected| selected.columns else contract;
+    if (try @import("lake_index_native_rows_delta.zig").buildAppend(a, out, &input, store, schema, &layout, definitions, candidates, cancellation, &manager)) |built| return built;
+    if (try @import("lake_index_native_rows_delta.zig").build(a, out, &input, store, schema, &layout, definitions, reusable, candidates, cancellation, &manager)) |built| {
+        provider.ordered_delta_plans += 1;
+        return built;
+    }
     // Publication normally supplies a replay shared with text/vector builders.
     // Direct callers also need one decode pipeline across ordered cohorts.
     var replay_columns: std.StringHashMapUnmanaged(void) = .empty;
@@ -164,8 +169,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     for (shared_columns) |*column| column.* = replay_keys.next().?.*;
     var replay = @import("lake_index_build_replay.zig").Replay.init(a, &input, shared_columns);
     defer replay.deinit();
-    replay.only_files = replay_files;
-    if (shared_columns.len != 0) input.replay = &replay;
+    replay.only_files = if (replay_files) |mask| try @import("lake_index_build_replay.zig").Needed.fromMask(a, mask) else null;
+    if (shared_columns.len != 0 and input.replay == null) input.replay = &replay;
     var files: std.StringHashMapUnmanaged(u32) = .empty;
     defer files.deinit(a);
     for (source.inventory.files, 0..) |file, index| try files.put(a, file.file_id, std.math.cast(u32, index) orelse return error.LakeSidecarBuildLimitExceeded);
@@ -253,7 +258,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             };
             const retained = try a.alloc(bool, slot_names.items.len);
             errdefer a.free(retained);
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .retired_slots = retired.items, .files = slot_names.items, .fingerprints = slot_hashes.items, .public_navigation = if (input.native_delta) |delta| delta.public_navigation else null } });
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .retired_slots = retired.items, .files = slot_names.items, .fingerprints = slot_hashes.items, .public_navigation = if (input.resume_work) |work| work.navigation else if (input.native_delta) |delta| delta.public_navigation else null, .source_cut = if (input.resume_work) |work| work.source_cut else if (input.native_delta) |delta| delta.source_cut else null, .checkpoint_base = if (input.native_delta) |delta| delta.prior_cut else null, .pending_files = if (input.native_delta != null or (if (input.resume_work) |work| work.source_cut != null else false)) @intCast(std.mem.count(bool, changed, &.{true})) else 0 } });
             entries.items[entries.items.len - 1].sort.shared_runs = true;
             entries.items[entries.items.len - 1].sort.encoded_bytes = true;
         }
@@ -283,7 +288,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer base_sort.deinit();
             base_sort.encoded_bytes = true;
             base_sort.shared_runs = true;
-            const ref = try ordered.publishIncremental(a, ca, store, &base_sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, .{ .public_navigation = entry.delta.public_navigation, .run_only = true, .previous = prior, .keep = entry.delta.keep, .retired_slots = entry.delta.retired_slots, .files = entry.delta.files, .fingerprints = entry.built_hashes });
+            const ref = try ordered.publishIncremental(a, ca, store, &base_sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, .{ .source_cut = entry.delta.source_cut, .checkpoint_base = entry.delta.checkpoint_base, .pending_files = entry.delta.pending_files, .public_navigation = entry.delta.public_navigation, .run_only = true, .previous = prior, .keep = entry.delta.keep, .retired_slots = entry.delta.retired_slots, .files = entry.delta.files, .fingerprints = entry.built_hashes });
             entry.published = ref;
             try input.checkpoint(.{ .name = entry.name, .binding = entry.binding, .artifact = ref });
             entry.delta.previous = try ordered.loadRootLazy(entry.root_arena.allocator(), store.*, ref, cancellation, null);
@@ -308,67 +313,18 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var ordinal: u64 = 0;
         // Checkpoint one source file at a time into durable merge levels.
         // Fused sorts and replay never retain archive-sized local runs.
-        for (needed, 0..) |need, file_index| {
-            if (!need) continue;
+        var scan_order = state.ScanOrder.init(&input);
+        while (try scan_order.next()) |file_index| {
+            if (!needed[file_index]) continue;
             input.only_files = null;
             input.only_file = file_index;
             const rows = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation);
             defer rows.deinit(a);
-            var key: std.ArrayList(u8) = .empty;
-            defer key.deinit(a);
-            var condition_key: std.ArrayList(u8) = .empty;
-            defer condition_key.deinit(a);
-            var row_scratch = std.heap.ArenaAllocator.init(a);
-            defer row_scratch.deinit();
             while (try rows.next(a)) |batch| {
                 try cancellation.check();
                 for (entries.items) |*entry| {
-                    var bound = try entry.tuple.bindExternalBatch(a, batch);
-                    defer bound.deinit();
-                    var condition_batches: std.ArrayList(tuples.BatchKeys) = .empty;
-                    defer {
-                        for (condition_batches.items) |*condition| condition.deinit();
-                        condition_batches.deinit(a);
-                    }
-                    if (entry.predicate) |plan| for (plan.conditions) |condition| {
-                        var selected = try condition.tuple.bindExternalBatch(a, batch);
-                        errdefer selected.deinit();
-                        try condition_batches.append(a, selected);
-                    };
-                    for (0..batch.rowCount()) |row| {
-                        const ref = batch.rowRef(row);
-                        if (row % 128 == 0) {
-                            try cancellation.check();
-                            try provider.context.ensureActive();
-                        }
-                        var live = true;
-                        if (entry.predicate) |plan| for (plan.conditions, condition_batches.items) |condition, *selected| {
-                            condition_key.clearRetainingCapacity();
-                            const is_null = try selected.append(a, &condition_key, row);
-                            if (!condition.evaluateEncoded(condition_key.items, is_null).matches()) {
-                                live = false;
-                                break;
-                            }
-                        };
-                        if (!live) continue;
-                        if (ref != .external) return error.InvalidNativeLakeRowIndex;
-                        const file = files.get(ref.external.file_id) orelse return error.InvalidNativeLakeRowIndex;
-                        if (!entry.changed[file]) continue;
-                        key.clearRetainingCapacity();
-                        _ = try bound.append(a, &key, row);
-                        try key.appendSlice(a, &ordered.coordinate(entry.slots[file], ref.external));
-                        _ = row_scratch.reset(.retain_capacity);
-                        const values = try a.alloc(local.sql_scalar.Datum, entry.cover.len);
-                        defer a.free(values);
-                        const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{row} };
-                        for (values, entry.cover) |*value, column| {
-                            const cell = try page.cell(row_scratch.allocator(), 0, column);
-                            value.* = .{ .value = cell.value, .sql_null = cell.sql_null };
-                        }
-                        if (entry.reverse) |reverse| try reverse.add(key.items);
-                        try entry.sort.add(.{ .values = values, .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key.items })}, .ordinal = ordinal });
-                        ordinal = std.math.add(u64, ordinal, 1) catch return error.LakeSidecarBuildLimitExceeded;
-                    }
+                    if (!entry.changed[file_index]) continue;
+                    try consumeBatch(a, entry, batch, source.inventory.files[file_index].file_id, entry.slots[file_index], &ordinal, provider.context, cancellation);
                 }
             }
             for (entries.items) |*entry| {
@@ -381,7 +337,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const keep = if (first_checkpoint) try a.dupe(bool, entry.delta.keep) else entry.retained;
                 defer if (first_checkpoint) a.free(keep);
                 if (slot < keep.len) keep[slot] = false;
-                var delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .retired_slots = if (first_checkpoint) entry.delta.retired_slots else &.{slot}, .files = entry.delta.files, .fingerprints = entry.built_hashes, .public_navigation = entry.delta.public_navigation, .dictionary_slots = if (entry.published != null) &.{slot} else null };
+                var delta: ordered.Delta = .{ .source_cut = entry.delta.source_cut, .checkpoint_base = entry.delta.checkpoint_base, .pending_files = if (entry.delta.source_cut != null) entry.delta.pending_files - 1 else 0, .previous = entry.delta.previous, .keep = keep, .retired_slots = if (first_checkpoint) entry.delta.retired_slots else &.{slot}, .files = entry.delta.files, .fingerprints = entry.built_hashes, .public_navigation = entry.delta.public_navigation, .dictionary_slots = if (entry.published != null) &.{slot} else null };
                 if (entry.reverse) |reverse| {
                     delta.built_reverse = try reverse.finish();
                     delta.reverse_built = true;
@@ -408,6 +364,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 entry.delta.keep = entry.retained;
                 entry.delta.dictionary_slots = &.{};
                 entry.delta.retired_slots = &.{};
+                entry.delta.pending_files = delta.pending_files;
                 entry.sort.deinit();
                 entry.sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / entries.items.len);
                 entry.sort.shared_runs = true;
@@ -680,4 +637,354 @@ test "external lake dense ordered refresh checkpoints durable deltas and resumes
     }
     try std.testing.expectEqual(@as(usize, 4), old_count);
     try std.testing.expectEqual(@as(usize, 8), new_count);
+}
+
+/// Shared typed ingestion boundary for full reconciliations and sparse edits.
+pub fn consumeBatch(a: A, entry: anytype, batch: anytype, file_id: []const u8, slot: u32, ordinal: *u64, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !void {
+    var key: std.ArrayList(u8) = .empty;
+    defer key.deinit(a);
+    var condition_key: std.ArrayList(u8) = .empty;
+    defer condition_key.deinit(a);
+    var bound = try entry.tuple.bindExternalBatch(a, batch);
+    defer bound.deinit();
+    var condition_batches: std.ArrayList(tuples.BatchKeys) = .empty;
+    defer {
+        for (condition_batches.items) |*condition| condition.deinit();
+        condition_batches.deinit(a);
+    }
+    if (entry.predicate) |plan| for (plan.conditions) |condition| {
+        var selected = try condition.tuple.bindExternalBatch(a, batch);
+        errdefer selected.deinit();
+        try condition_batches.append(a, selected);
+    };
+    var begin: usize = 0;
+    while (begin < batch.rowCount()) {
+        try cancellation.check();
+        try context.ensureActive();
+        var window = std.heap.ArenaAllocator.init(a);
+        defer window.deinit();
+        const pa = window.allocator();
+        var positions: [64]usize = undefined;
+        var key_values: [64][1]local.sql_scalar.Datum = undefined;
+        var key_rows: [64][]const local.sql_scalar.Datum = undefined;
+        var ordinals: [64]u64 = undefined;
+        var count: usize = 0;
+        const end = @min(begin + 64, batch.rowCount());
+        for (begin..end) |row| {
+            var live = true;
+            if (entry.predicate) |plan| for (plan.conditions, condition_batches.items) |condition, *selected| {
+                condition_key.clearRetainingCapacity();
+                const is_null = try selected.append(a, &condition_key, row);
+                if (!condition.evaluateEncoded(condition_key.items, is_null).matches()) {
+                    live = false;
+                    break;
+                }
+            };
+            if (!live) continue;
+            const ref = batch.rowRef(row);
+            if (ref != .external or !std.mem.eql(u8, ref.external.file_id, file_id)) return error.InvalidNativeLakeRowIndex;
+            key.clearRetainingCapacity();
+            _ = try bound.append(a, &key, row);
+            try key.appendSlice(a, &ordered.coordinate(slot, ref.external));
+            if (entry.reverse) |reverse| try reverse.add(key.items);
+            positions[count] = row;
+            key_values[count][0] = local.sql_scalar.Datum.json(.{ .string = try pa.dupe(u8, key.items) });
+            key_rows[count] = &key_values[count];
+            ordinals[count] = std.math.add(u64, ordinal.*, count) catch return error.LakeSidecarBuildLimitExceeded;
+            count += 1;
+        }
+        const next_ordinal = std.math.add(u64, ordinal.*, count) catch return error.LakeSidecarBuildLimitExceeded;
+        if (count != 0) {
+            var cover: CoverBatch = .{ .page = .{ .batch = batch, .selection = positions[0..count] }, .names = entry.cover };
+            const borrowed: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &cover, .read = CoverBatch.cell, .read_physical = CoverBatch.physical, .read_frozen = CoverBatch.frozen, .read_json = CoverBatch.json, .count = count, .width = entry.cover.len } };
+            const values = try borrowed.preparePhysical(pa);
+            try entry.sort.addBatch(values, key_rows[0..count], ordinals[0..count]);
+        }
+        ordinal.* = next_ordinal;
+        begin = end;
+    }
+}
+
+/// Preserve the raw covering-cell contract while forwarding native scalar and
+/// JSON payloads directly into the sort's typed store. Decimal text and encoded
+/// interpretations use the same lazy cell accessor as ordinary row ingestion.
+const CoverBatch = struct {
+    page: local.sql_catalog.ColumnPage,
+    names: []const []const u8,
+    fn cell(raw: *anyopaque, a: A, row: usize, column: usize) !local.sql_scalar.Datum {
+        const self: *CoverBatch = @ptrCast(@alignCast(raw));
+        return self.page.cell(a, row, self.names[column]);
+    }
+    fn physical(raw: *anyopaque, _: A, column: usize) !?local.sql_execution_batch.PhysicalColumn {
+        const self: *CoverBatch = @ptrCast(@alignCast(raw));
+        const vector = self.page.batch.findColumn(self.names[column]) orelse return null;
+        const kind: local.sql_ast.ColumnType = switch (vector.values) {
+            .i64, .dictionary_i64 => .integer,
+            .f64, .dictionary_f64 => .number,
+            .bool => .boolean,
+            .bytes, .dictionary_bytes => .string,
+            else => return null,
+        };
+        return .{ .vector = vector, .selection = self.page.selection, .kind = kind, .element = if (kind == .number) .float64 else null };
+    }
+    fn frozen(raw: *anyopaque, row: usize, column: usize) !?local.sql_execution_batch.FrozenJson {
+        const self: *CoverBatch = @ptrCast(@alignCast(raw));
+        return self.page.frozenJson(row, self.names[column]);
+    }
+    fn json(raw: *anyopaque, row: usize, column: usize) !?[]const u8 {
+        const self: *CoverBatch = @ptrCast(@alignCast(raw));
+        return self.page.encodedJson(row, self.names[column]);
+    }
+};
+
+test "external lake ordered sparse publication preserves covering rows across authenticated file churn" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-sparse-refresh");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const bytes = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ 1, 2, 3, 4 }, .field_id = 1 }});
+    defer a.free(bytes);
+    for (0..12) |index| {
+        const name = try std.fmt.allocPrint(a, "part-{d}.parquet", .{index});
+        defer a.free(name);
+        var uploaded = try client.putObject("antfly", name, bytes, .{});
+        uploaded.deinit(a);
+    }
+    const schema_json = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"relational_indexes":[{{"name":"amount_idx","keys":[{{"column":"amount"}}]}}],"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"amount":{{"type":"integer"}}}},"additionalProperties":false}}}}}}}}
+    , .{directory.path()});
+    defer a.free(schema_json);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
+    defer binding.deinit(a);
+    const path = try std.fs.path.join(a, &.{ directory.path(), "artifacts" });
+    defer a.free(path);
+    var artifacts = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, path);
+    defer artifacts.deinit();
+    var store = artifacts.artifactStore();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const navigation_api = @import("lake_source_navigation.zig");
+    var previous_navigation: ?navigation_api.Root = null;
+    var previous: []const Declared = &.{};
+    const Denied = struct {
+        var base: local.storage_object_storage.ObjectStorage = undefined;
+        var allowed: []const u8 = "";
+        fn get(_: *anyopaque, alloc: A, bucket: []const u8, key: []const u8, options: local.storage_object_storage.GetOptions) !local.storage_object_storage.GetResult {
+            if (!std.mem.eql(u8, key, allowed) and !(std.mem.eql(u8, allowed, "new-*") and std.mem.startsWith(u8, key, "new-"))) return error.UnexpectedUnchangedParquetRead;
+            var copy = base;
+            copy.allocator = alloc;
+            return copy.getObject(bucket, key, options);
+        }
+    };
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = schema_json, .indexes_json = "{}" };
+    for (0..7) |phase| {
+        if (phase == 1 or phase == 4 or phase == 5) {
+            if (phase == 4) try client.deleteObject("antfly", "part-2.parquet", .{});
+            var uploaded = try client.putObject("antfly", if (phase == 1) "new-a.parquet" else if (phase == 5) "later.parquet" else "renamed.parquet", bytes, .{});
+            uploaded.deinit(a);
+            if (phase == 1) {
+                var other = try client.putObject("antfly", "new-b.parquet", bytes, .{});
+                other.deinit(a);
+            }
+        } else if (phase == 2) {
+            try client.deleteObject("antfly", "part-1.parquet", .{});
+            const changed = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ 100, 101, 102, 103 }, .field_id = 1 }});
+            defer a.free(changed);
+            var uploaded = try client.putObject("antfly", "part-0.parquet", changed, .{});
+            uploaded.deinit(a);
+        }
+        var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+        defer source.deinit();
+        var denied = source.scanner.object_reader.client.vtable.*;
+        Denied.base = source.scanner.object_reader.client;
+        Denied.allowed = if (phase == 1) "new-*" else if (phase == 2) "part-0.parquet" else if (phase == 4) "renamed.parquet" else if (phase == 5) "later.parquet" else "";
+        denied.get_object = Denied.get;
+        if (phase != 0) source.scanner.object_reader.client.vtable = &denied;
+        store.upload_scope = .{ .domain = @splat(9), .attempt = @splat(@as(u8, @intCast(phase + 1))) };
+        if (phase == 3) {
+            // Upgrade a dictionary that has a valid census commitment but
+            // predates the persistent free-slot directory. Migration must own
+            // new pages under this publication attempt, including on quiet cuts.
+            var legacy = try ordered.loadRootLazy(ca, store, previous[0].artifact, .none, null);
+            legacy.file_dictionary.?.free = null;
+            legacy.file_dictionary.?.free_complete = false;
+            var upload = store;
+            upload.allocator = ca;
+            const migrated = try upload.put(try std.json.Stringify.valueAlloc(ca, legacy, .{}));
+            const copy = try ca.dupe(Declared, previous);
+            copy[0].artifact.artifact_id = migrated.artifact_id;
+            copy[0].artifact.checksum = migrated.checksum;
+            copy[0].artifact.byte_len = migrated.byte_len;
+            previous = copy;
+        }
+        var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
+        var navigation = try navigation_api.build(a, ca, &store, &provider, previous_navigation, .none);
+        defer navigation.deinit();
+        provider.native_delta = navigation.delta;
+        if (phase == 1) {
+            var parsed_failure = try local.schema_mod.parseValidatedTableSchema(a, schema_json);
+            defer parsed_failure.deinit(a);
+            const runtime_failure = try local.schema_mod.deriveRuntimeTableSchema(a, parsed_failure);
+            defer local.storage_schema.freeSchema(a, runtime_failure);
+            var layout_failure = try local.storage_db_algebraic_relational_row_codec.PhysicalLayout.init(a, runtime_failure);
+            defer layout_failure.deinit();
+            const definitions_failure = (try parsed_failure.relationalIndexDefinitions(ca)).?;
+            var partial = definitions_failure[0];
+            partial.where = &.{.{ .field = "amount", .op = .gt, .value_json = "0" }};
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+            var unopened: spill.Manager = undefined;
+            const selected: []const @TypeOf(partial) = &.{partial};
+            // The tuple allocation succeeds; the first predicate allocation
+            // fails before the builder can transfer either owner into Entry.
+            try std.testing.expectError(error.OutOfMemory, @import("lake_index_native_rows_delta.zig").build(failing.allocator(), ca, &provider, &store, runtime_failure, &layout_failure, selected, &.{}, previous, .none, &unopened));
+        }
+        var candidates = previous;
+        if (phase == 1) {
+            const Interrupted = struct {
+                out: A,
+                declaration: ?Declared = null,
+                fn save(raw: *anyopaque, declaration: Declared) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.declaration = try std.json.parseFromSliceLeaky(Declared, self.out, try std.json.Stringify.valueAlloc(self.out, declaration, .{}), .{ .allocate = .alloc_always });
+                    return error.TestPublicationInterrupted;
+                }
+            };
+            var interrupted: Interrupted = .{ .out = ca };
+            provider.progress = .{ .ptr = &interrupted, .save = Interrupted.save };
+            try std.testing.expectError(error.TestPublicationInterrupted, buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, previous));
+            provider.progress = null;
+            const checkpoint = interrupted.declaration orelse return error.TestUnexpectedResult;
+            const checkpoint_root = try ordered.loadRootLazy(ca, store, checkpoint.artifact, .none, null);
+            try std.testing.expectEqual(@as(u32, 1), checkpoint_root.pending_files);
+            try std.testing.expectEqualDeep(navigation.delta.source_cut, checkpoint_root.source_cut);
+            try std.testing.expectEqualDeep(navigation.delta.prior_cut, checkpoint_root.checkpoint_base);
+            // One changed file completed, one still pending. Probe the exact
+            // fingerprint to forbid reads from the completed file on resume.
+            var reads: u64 = 16 * 1024 * 1024;
+            var writes: u64 = 0;
+            var bridge: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = checkpoint_root.domain, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+            var completed_a = false;
+            for (source.inventory.files) |file| if (std.mem.endsWith(u8, file.file_id, "new-a.parquet")) {
+                const slot = (try ordered.file_dictionary.named(ca, bridge.store(), checkpoint_root.file_dictionary.?, file.file_id)).?;
+                const record = try ordered.file_dictionary.file(ca, bridge.store(), checkpoint_root.file_dictionary.?, slot);
+                completed_a = !std.mem.allEqual(u8, &record.fingerprint, 0);
+            };
+            Denied.allowed = if (completed_a) "new-b.parquet" else "new-a.parquet";
+            candidates = try std.mem.concat(ca, Declared, &.{ previous, &.{checkpoint} });
+            const good_cut = provider.native_delta.?.source_cut;
+            provider.native_delta.?.source_cut.?[0] ^= 1;
+            // Identical public names cannot authorize a checkpoint from a
+            // different logical file-content cut. It must reread changed files.
+            try std.testing.expectError(error.UnexpectedUnchangedParquetRead, buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, candidates));
+            provider.native_delta.?.source_cut = good_cut;
+            provider.ordered_delta_plans = 0;
+            // A durable retry owns a new upload attempt and physical directory,
+            // while both authenticated logical census commitments stay exact.
+            store.upload_scope.?.attempt = @splat(77);
+            var retried_navigation = try navigation_api.build(a, ca, &store, &provider, previous_navigation, .none);
+            defer retried_navigation.deinit();
+            try std.testing.expectEqualDeep(navigation.delta.source_cut, retried_navigation.delta.source_cut);
+            provider.native_delta = retried_navigation.delta;
+            candidates = &.{checkpoint};
+        }
+        const built = try buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, candidates);
+        if (phase != 0) try std.testing.expectEqual(@as(usize, 1), provider.ordered_delta_plans);
+        if (phase == 3) {
+            const reused = try build(a, ca, table, &source, &store, &provider, .none, built);
+            try std.testing.expectEqualStrings(built[0].artifact.artifact_id, reused[0].artifact.artifact_id);
+        }
+        if (phase == 1) {
+            const complete_candidates = try std.mem.concat(ca, Declared, &.{ previous, built });
+            Denied.allowed = "";
+            const resumed = try buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, complete_candidates);
+            const resumed_root = try ordered.loadRootLazy(ca, store, resumed[0].artifact, .none, null);
+            try std.testing.expectEqual(@as(u64, 56), resumed_root.page.?.records);
+        }
+        const root = try ordered.loadRootLazy(ca, store, built[0].artifact, .none, null);
+        try std.testing.expectEqual(@as(u32, 0), root.pending_files);
+        if (phase == 3) {
+            try std.testing.expect(root.file_dictionary.?.free_complete);
+            try std.testing.expectEqualDeep(store.upload_scope.?.attempt, root.file_dictionary.?.free.?.attempt);
+        }
+        try std.testing.expectEqual(@as(usize, if (phase == 0) 12 else 14), root.fileCount());
+        try std.testing.expectEqual(@as(u64, if (phase == 1 or phase >= 5) 56 else if (phase == 0) 48 else 52), root.page.?.records);
+        var reader: ordered.Reader = undefined;
+        try reader.init(a, &store, root, root.fingerprint, "", null, .none);
+        defer reader.deinit();
+        var rows: usize = 0;
+        var fresh: usize = 0;
+        while (!reader.exhausted) for (try reader.nextEntries(ca, 16)) |entry| {
+            const ref = entry.ref;
+            try std.testing.expect(navigation.delta.by_id.contains(ref.external.file_id));
+            const cover = entry.cover.?;
+            const payload = try @import("lake_index_aggregate_artifact.zig").readArtifact(ca, store, cover.block, .none, null);
+            const block = try spill.decodeColumnarBlockInArena(ca, payload, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+            if ((try block.cell(cover.row, 0)).value.integer >= 100) fresh += 1;
+            rows += 1;
+        };
+        try std.testing.expectEqual(@as(usize, if (phase == 1 or phase >= 5) 56 else if (phase == 0) 48 else 52), rows);
+        try std.testing.expectEqual(@as(usize, if (phase >= 2) 4 else 0), fresh);
+        previous_navigation = try navigation_api.load(ca, store, navigation.ref, .none, null);
+        previous = built;
+    }
+}
+
+test "external lake ordered batches preserve covering nulls dictionaries JSON decimals and spill ownership" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    var integers = [_]i64{ 9007199254740993, -9007199254740993, 0, 4 };
+    var floating = [_]f64{ -0.0, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) };
+    var coefficients = [_]i128{ 123, -999, 0, 42 };
+    var dictionary = [_][]const u8{ "alpha", "beta" };
+    const ids = [_]u32{ 1, 999999, 0, 1 };
+    const batch: local.storage_rowsource_types.ColumnBatch = .{ .snapshot = .{ .table_id = "lake", .snapshot_id = "snapshot" }, .external_span = .{ .first = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "file", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = 4 }, .columns = &.{
+        .{ .name = "n", .values = .{ .i64 = &integers } },
+        .{ .name = "f", .values = .{ .f64 = &floating } },
+        .{ .name = "label", .values = .{ .dictionary_bytes = .{ .values = &dictionary, .indices = &ids } }, .nulls = .{ .bytes = &.{ 0, 1, 0, 0 } } },
+        .{ .name = "exact", .values = .{ .decimal128 = .{ .values = &coefficients, .precision = 12, .scale = 2 } } },
+        .{ .name = "doc", .values = .{ .json = &.{ "{ \"a\": 1 }", "null", "[1,2]", "\"text\"" } } },
+    } };
+    try batch.validate();
+    const selection = [_]usize{ 3, 1, 0, 2 };
+    const names = &.{ "n", "f", "label", "exact", "doc", "_id" };
+    var cover: CoverBatch = .{ .page = .{ .batch = batch, .selection = &selection }, .names = names };
+    const input: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &cover, .read = CoverBatch.cell, .read_physical = CoverBatch.physical, .read_frozen = CoverBatch.frozen, .read_json = CoverBatch.json, .count = 4, .width = 6 } };
+    const expected = try pa.alloc([]const local.sql_scalar.Datum, 4);
+    for (expected, 0..) |*row, index| row.* = try input.row(pa, index);
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check, .async_writes = false };
+    defer manager.deinit();
+    var sort = spill.Sort.init(a, &manager, &.{.{}}, 1024);
+    defer sort.deinit();
+    sort.shared_runs = true;
+    const keys = [_][]const local.sql_scalar.Datum{ &.{local.sql_scalar.Datum.json(.{ .integer = 3 })}, &.{local.sql_scalar.Datum.json(.{ .integer = 2 })}, &.{local.sql_scalar.Datum.json(.{ .integer = 1 })}, &.{local.sql_scalar.Datum.json(.{ .integer = 0 })} };
+    try sort.addBatch(try input.preparePhysical(pa), &keys, &.{ 0, 1, 2, 3 });
+    // The producer page may disappear as soon as addBatch returns.
+    @memset(&integers, 0);
+    @memset(&floating, 0);
+    @memset(&coefficients, 0);
+    @memset(&dictionary, "changed");
+    var count: usize = 0;
+    while (try sort.next(pa)) |row| {
+        try std.testing.expectEqual(@as(i64, @intCast(count)), row.keys[0].value.integer);
+        for (row.values, expected[@intCast(row.ordinal)]) |actual, wanted| {
+            try std.testing.expectEqual(wanted.sql_null, actual.sql_null);
+            if (!wanted.sql_null) {
+                try std.testing.expectEqual(std.math.Order.eq, try local.sql_scalar.compareDatums(actual, wanted));
+                if (wanted.value == .float) try std.testing.expectEqual(@as(u64, @bitCast(wanted.value.float)), @as(u64, @bitCast(actual.value.float)));
+            }
+        }
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expect(manager.written_bytes > 0);
 }
