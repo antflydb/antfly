@@ -2991,6 +2991,23 @@ const InspectionReader = struct {
         if (block.payload.len > self.options.max_logical_bytes -| self.logical_bytes)
             return error.BackupExpansionLimitExceeded;
         self.logical_bytes += block.payload.len;
+        // A document may be compressed inside an already decoded block. Charge
+        // its expansion on every inspection pass, before invoking any visitor.
+        if (block.block_type == .document_batch) {
+            const entries = try backup_codec.decodeDocumentBatchBorrowed(alloc, block.payload);
+            defer alloc.free(entries);
+            for (entries) |entry| {
+                if (entry.value_flags & backup_codec.doc_value_flag_compressed == 0) continue;
+                try self.options.cancellation.check();
+                const remaining = self.options.max_logical_bytes - self.logical_bytes;
+                const limit = std.math.cast(usize, remaining +| entry.value.len) orelse std.math.maxInt(usize);
+                const expanded_size = backup_codec.zstdExpandedSizeLimited(alloc, entry.value, limit) catch |err| switch (err) {
+                    error.StreamTooLong => return error.BackupExpansionLimitExceeded,
+                    else => return err,
+                };
+                self.logical_bytes += expanded_size -| entry.value.len;
+            }
+        }
         return block;
     }
 

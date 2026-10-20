@@ -272,7 +272,7 @@ fn eqHelper(ctx: HelperContext) anyerror!Value {
 
 /// GenKit dotprompt media directive: {{media url=imageDataURI}}
 /// Returns: <<<dotprompt:media:url {url}>>>
-fn mediaHelper(ctx: HelperContext) anyerror!Value {
+pub fn mediaHelper(ctx: HelperContext) anyerror!Value {
     const url = ctx.hash.get("url") orelse return .{ .string = "" };
     const url_str = switch (url) {
         .string => |s| s,

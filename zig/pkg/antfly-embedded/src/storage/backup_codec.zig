@@ -451,6 +451,23 @@ pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
     return decomp.reader.allocRemaining(alloc, .limited(max_block_payload_bytes));
 }
 
+/// Count nested document expansion without retaining decoded output. Enforce the
+/// caller's remaining budget even for frames without a declared content size.
+pub fn zstdExpandedSizeLimited(alloc: Allocator, compressed: []const u8, max_bytes: usize) !usize {
+    var input = std.Io.Reader.fixed(compressed);
+    const window_buf = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+    defer alloc.free(window_buf);
+    var decomp = std.compress.zstd.Decompress.init(&input, window_buf, .{});
+    const limit = @min(max_bytes, max_block_payload_bytes);
+    const size = try decomp.reader.discardShort(limit);
+    if (size < limit) return size;
+    _ = decomp.reader.peekByte() catch |err| switch (err) {
+        error.EndOfStream => return size,
+        else => return err,
+    };
+    return error.StreamTooLong;
+}
+
 test "file reader detects same-size archive replacement between passes" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

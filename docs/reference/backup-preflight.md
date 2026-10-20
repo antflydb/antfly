@@ -1,8 +1,8 @@
 # Read-only backup preflight
 
 `antfly restore --preflight --input snapshot.afb2` emits one JSON report without
-creating a table, connecting to a server, fetching media, rendering helpers, or
-running producers. Input detection uses bytes, so the filename suffix is not
+creating a table, connecting to a server, fetching media, executing remote
+helpers, or running producers. Input detection uses bytes, so the filename suffix is not
 significant. Supported sources are closed/stable Lite databases, full portable
 AFB1/AFB2 archives, and supported full native AFB2 table archives, including
 multiple shards. Deltas require a base and are not admitted by this interface.
@@ -42,8 +42,9 @@ An incomplete, blocked, or unknown report is not admission to restore.
 The default library limits are 64 GiB input, 128 GiB scratch/expansion admission,
 4,096 selectors and requirement groups, 16 MiB retained selector bytes, 64 MiB
 per materialized document, and 32 total examples (at most four per group).
-Exceeding a limit produces an incomplete report. Examples identify affected
-fields and document IDs; unsafe/long identifiers become `sha256:...` labels.
+The expansion budget includes per-document compression inside decoded portable
+blocks and is checked before dependency callbacks. Exceeding a limit produces an
+incomplete report. Examples identify affected fields and document IDs; unsafe/long identifiers become `sha256:...` labels.
 Source URLs, query strings, passwords, producer configuration and credentials
 are never emitted. Digests are identity bindings, not encrypted secret storage.
 
@@ -99,16 +100,20 @@ unit documents. Grouped model evidence also binds the group source definition,
 including its source field, filtering, ordering and window policy.
 
 Simple field paths, simple substitutions and static `media`, `remoteMedia`,
-`remoteText` and `remotePDF` URL arguments are analyzed without helper execution.
+`remoteText` and `remotePDF` URL arguments are analyzed without fetching resources.
 The inspector uses the runtime's Handlebars parser and path lookup, and combines
-supported literal/substitution output before scanning media directives. No helper
-is called. Remote helpers use `credentials="name"` (or a supported field reference); quoting and argument
-order follow the runtime parser.
+supported literal/substitution output before scanning media directives, using
+the same whitespace-control functions as execution. The pure `media` formatter
+is shared with runtime; remote helpers are never called. Remote helpers use
+`credentials="name"` (or a supported field reference); quoting and argument order
+follow the runtime parser.
 
-Unsupported helper syntax, opaque helper output composed into locators, and
-custom loaders are reported as `dependency_uninspectable`. This deliberately
-does not claim to interpret all Handlebars programs. Unsupported schemes and structured locators are
-`source_unresolved`. Local paths/gateways and credential-bearing or expiring
+Remote helper output is opaque: it can contain or complete media directives,
+even when the fetch URL is known. Its dependencies remain incomplete and cannot
+be certified by destination evidence. Unsupported helper syntax, opaque helper
+output, and custom loaders are reported as `dependency_uninspectable`. This
+deliberately does not claim to interpret all Handlebars programs. Unsupported
+schemes and structured locators are `source_unresolved`. Local paths/gateways and credential-bearing or expiring
 URLs block compatibility. Archive-member and page/fragment selection generate
 separate destination retrieval requirements. No resolver or URL rewrite occurs.
 

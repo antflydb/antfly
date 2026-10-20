@@ -2457,3 +2457,42 @@ test "backup preflight relational rows use archived schema for active media fiel
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "row:late") != null);
 }
+
+test "backup preflight document decompression respects expanded byte limit" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const compressed = "\x28\xb5\x2f\xfd\x04\x58\x94\x00\x00\x50\x7b\x22\x62\x6f\x64\x79\x22\x3a\x22\x61\x01\x00\xf3\xff\x39\x40\x02\x02\x00\x10\x61\x59\x00\x00\x61\x61\x61\x61\x61\x61\x61\x61\x61\x22\x7d\x14\x68\xf4\x0a";
+    const decoded = try backup_codec.decompressZstd(a, compressed);
+    defer a.free(decoded);
+    try std.testing.expectEqual(@as(usize, 262155), decoded.len);
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(a);
+    try backup_codec.writeHeader(&archive, a, .{ .format_version = backup_codec.legacy_format_version, .flags = 0, .created_at_ns = 0, .backup_id = @splat(0), .table_count = 1, .shard_count = 1 });
+    const payload = try backup_codec.encodeDocumentBatch(a, &.{.{ .key = "doc", .value_flags = backup_codec.doc_value_flag_compressed, .value = compressed, .timestamp_ns = 0 }});
+    defer a.free(payload);
+    try backup_codec.writeBlock(&archive, a, .document_batch, payload);
+    // This proves the input itself is accepted by the shared restore reader.
+    try portable_backup.validatePortable(a, archive.items);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(io, "compressed.afb", .{ .read = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, archive.items, 0);
+    const path = try tmp.dir.realPathFileAlloc(io, "compressed.afb", a);
+    defer a.free(path);
+    const json = try inspectInputJsonAlloc(a, path, "{\"version\":1,\"configuration_id\":\"empty\"}", .{ .max_expanded_bytes = 4096 });
+    defer a.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "limit_exceeded") != null);
+    var counter: InspectionCounter = .{};
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_logical_bytes = 4096 }, &counter, InspectionCounter.visit));
+    try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+    const inspected = try portable_backup.inspectPortableFileBlocks(a, io, file, .{}, &counter, InspectionCounter.visit);
+    try std.testing.expect(inspected.logical_bytes >= decoded.len);
+    counter = .{};
+    _ = try portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_logical_bytes = inspected.logical_bytes }, &counter, InspectionCounter.visit);
+    try std.testing.expectEqual(@as(u64, 1), counter.documents);
+    counter = .{};
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, portable_backup.inspectPortableFileBlocks(a, io, file, .{ .max_logical_bytes = inspected.logical_bytes - 1 }, &counter, InspectionCounter.visit));
+    try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+}

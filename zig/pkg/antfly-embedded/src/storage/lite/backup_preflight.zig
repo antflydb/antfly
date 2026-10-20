@@ -870,7 +870,7 @@ pub const Inspector = struct {
         };
     }
 
-    fn templateHelper(self: *@This(), eval: *hbs.Eval, expression: *const hbs.Node, doc: []const u8, field: []const u8, definition: bool) !bool {
+    fn templateHelper(self: *@This(), eval: *hbs.Eval, expression: *const hbs.Node, doc: []const u8, field: []const u8, definition: bool, locator_mode: bool) !bool {
         const expr = expression.expression;
         const name = expr.path.path.original;
         if (!(eq(name, "media") or eq(name, "remoteMedia") or eq(name, "remoteText") or eq(name, "remotePDF"))) return false;
@@ -894,7 +894,10 @@ pub const Inspector = struct {
                 } else try self.report.add(self.options, .connection, reference, doc, field, 0);
             } else if (!definition) try self.report.add(self.options, .source_unresolved, "template_credential", doc, field, 0);
         }
-        if (try self.templateArgument(eval, source, doc, field, definition)) |reference| try self.locator(reference, doc, field);
+        // The pure media helper is rendered with the runtime implementation.
+        if (locator_mode or !eq(name, "media")) {
+            if (try self.templateArgument(eval, source, doc, field, definition)) |reference| try self.locator(reference, doc, field);
+        }
         return true;
     }
 
@@ -927,7 +930,8 @@ pub const Inspector = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const helpers: hbs.HelperMap = .{};
+        var helpers: hbs.HelperMap = .{};
+        try helpers.put(a, "media", hbs.Helper.from(&template_runtime.mediaHelper));
         const partials: std.StringArrayHashMapUnmanaged([]const u8) = .{};
         var eval = hbs.Eval.init(a, try template_runtime.jsonToValue(a, root), &helpers, &partials);
         var output: std.ArrayListUnmanaged(u8) = .empty;
@@ -949,19 +953,23 @@ pub const Inspector = struct {
                     const name = expr.path.path.original;
                     const known_helper = eq(name, "media") or eq(name, "remoteMedia") or eq(name, "remoteText") or eq(name, "remotePDF");
                     if (known_helper or expr.params.len > 0 or expr.hash != null) {
-                        if (!try self.templateHelper(&eval, expression, doc, field, definition)) {
+                        if (!try self.templateHelper(&eval, expression, doc, field, definition, locator_mode)) {
                             try self.report.add(self.options, .dynamic_loader, "template", doc, field, 0);
                             return;
                         }
                         has_helper = true;
-                        // Preserve boundaries and whitespace without running any
-                        // helper. Unknown fetched output cannot join literals.
-                        const literal = try a.create(hbs.Node);
-                        literal.* = .{ .string_literal = .{ .value = "\x00" } };
-                        const inert = try a.create(hbs.Node);
-                        inert.* = .{ .expression = .{ .path = literal } };
-                        safe_node.mustache.expression = inert;
-                        safe_node.mustache.unescaped = true;
+                        if (!eq(name, "media")) {
+                            // Fetch results can contain or complete media markers. Keep
+                            // known surrounding output for inventory, but never certify
+                            // an opaque result, even with destination URL evidence.
+                            try self.report.add(self.options, .dynamic_loader, "helper_output", doc, field, 0);
+                            const literal = try a.create(hbs.Node);
+                            literal.* = .{ .string_literal = .{ .value = "\x00" } };
+                            const inert = try a.create(hbs.Node);
+                            inert.* = .{ .expression = .{ .path = literal } };
+                            safe_node.mustache.expression = inert;
+                            safe_node.mustache.unescaped = true;
+                        }
                     }
                 },
                 else => {
@@ -974,11 +982,11 @@ pub const Inspector = struct {
                 .comment => |c| c.strip,
                 else => .{},
             };
-            if (strip.open) output.shrinkRetainingCapacity(std.mem.trimEnd(u8, output.items, " \t\r\n").len);
+            if (strip.open) hbs.trimTrailingWhitespace(&output);
             const body = [_]*hbs.Node{&safe_node};
             var single: hbs.Node = .{ .program = .{ .body = &body } };
             const rendered = try eval.exec(&single);
-            const fragment = if (strip_next) std.mem.trimStart(u8, rendered, " \t\r\n") else rendered;
+            const fragment = if (strip_next) hbs.trimLeadingWhitespace(rendered) else rendered;
             if (fragment.len > self.options.max_document_bytes -| output.items.len) return error.PreflightLimitExceeded;
             try output.appendSlice(self.allocator, fragment);
             strip_next = strip.close;
@@ -1239,7 +1247,7 @@ test "backup preflight prior context selects runtime artifact items and rejects 
             "{\"items\":[{\"source\":\"file:///private/c\"}],\"source\":\"file:///private/not-selected\"}",
         }) |artifact| try inspector.document("previous-unit", artifact, "claims");
         try std.testing.expectEqual(@as(u64, 3), count(report, .source_local));
-        try std.testing.expect(report.analysis_complete);
+        try std.testing.expect(!report.analysis_complete);
         try inspector.document("invalid", "invalid-json", "claims");
         try std.testing.expect(!report.analysis_complete);
     }
@@ -1730,7 +1738,7 @@ test "backup preflight runtime credentials keyword is inspectable" {
     defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "my-credential") == null);
     try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
-    try std.testing.expect(report.analysis_complete);
+    try std.testing.expect(!report.analysis_complete);
 }
 
 test "backup preflight template AST respects argument order quoting and runtime path lookup" {
@@ -1748,7 +1756,7 @@ test "backup preflight template AST respects argument order quoting and runtime 
         defer a.free(metadata);
         try inspector.metadataJson(metadata);
         try inspector.document("doc", "{\"media\":{\"uri\":\"https://example.org/private\"},\"media.uri\":\"file:///decoy\",\"credential\":\"team media\"}", "");
-        try std.testing.expect(report.analysis_complete);
+        try std.testing.expect(!report.analysis_complete);
         try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
         try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
         try std.testing.expect(count(report, .connection) > 0);
@@ -1840,4 +1848,72 @@ test "backup preflight template inventory limits preserve selector ownership" {
     var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{ .max_requirements = 1 } };
     defer inspector.deinit();
     try std.testing.expectError(error.PreflightLimitExceeded, inspector.metadataJson("{\"kind\":\"asset\",\"source_template\":\"{{remoteText url='https://one.example/a'}}{{remoteText url='https://two.example/b'}}\",\"producer\":{\"type\":\"copy\"}}"));
+}
+
+test "backup preflight opaque helper text cannot certify active media" {
+    const a = std.testing.allocator;
+    const source = "{{{remoteText url='data:text/plain,%3C%3C%3Cdotprompt%3Amedia%3A'}}}url {{{uri}}}>>>";
+    const raw = "{\"uri\":\"file:///private/helper.pdf\"}";
+    const parts = try @import("../../template_remote.zig").renderJsonToPartsWithConfig(a, source, raw, .{ .io = std.testing.io });
+    defer template_runtime.freeContentParts(a, parts);
+    try std.testing.expectEqual(@as(usize, 1), parts.len);
+    try std.testing.expectEqualStrings("file:///private/helper.pdf", parts[0].media_url);
+    const producer = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"mock\"}}";
+    try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "summary", .kind = .asset, .template = source, .producer_json = producer });
+    const metadata = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "summary", .kind = .asset, .source_field = "", .source_template = source, .producer_json = producer }});
+    defer a.free(metadata);
+    var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(metadata);
+    try inspector.document("doc", raw, "");
+    const caps = try a.alloc(Capability, report.requirements.items.len);
+    defer a.free(caps);
+    for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .future_ingestion = true, .model_revision_verified = true };
+    const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "model-only", .requirements = caps }, .{});
+    defer a.free(evidence);
+    const json = try report.jsonAlloc(evidence);
+    defer a.free(json);
+    try std.testing.expect(!report.analysis_complete);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"compatible\"") == null);
+    try std.testing.expect(count(report, .dynamic_loader) > 0);
+}
+
+test "backup preflight whitespace control matches runtime" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "<<<dotprompt:media:\x0c{{~kind}} {{{uri}}}>>>",
+        "<<<dotprompt:media:\x0b{{~kind}} {{{uri}}}>>>",
+        "<<<dotprompt:media:{{prefix~}}\x0c{{kind}} {{{uri}}}>>>",
+        "<<<dotprompt:media:{{prefix~}}\x0b{{kind}} {{{uri}}}>>>",
+        "{{media url=uri}}",
+    }) |source| {
+        const raw = "{\"kind\":\"url\",\"uri\":\"file:///private/whitespace.pdf\"}";
+        const rendered = try template_runtime.renderDocument(a, source, raw);
+        defer a.free(rendered);
+        try std.testing.expectEqualStrings("<<<dotprompt:media:url file:///private/whitespace.pdf>>>", rendered);
+        const parts = try template_runtime.textToParts(a, rendered);
+        defer template_runtime.freeContentParts(a, parts);
+        try std.testing.expectEqualStrings("file:///private/whitespace.pdf", parts[0].media_url);
+        const producer = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"mock\"}}";
+        try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "summary", .kind = .asset, .template = source, .producer_json = producer });
+        const metadata = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "summary", .kind = .asset, .source_field = "", .source_template = source, .producer_json = producer }});
+        defer a.free(metadata);
+        var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.metadataJson(metadata);
+        try inspector.document("doc", raw, "");
+        const caps = try a.alloc(Capability, report.requirements.items.len);
+        defer a.free(caps);
+        for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .future_ingestion = true, .model_revision_verified = true };
+        const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "model-only", .requirements = caps }, .{});
+        defer a.free(evidence);
+        const json = try report.jsonAlloc(evidence);
+        defer a.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"verdict\":\"blocked\"") != null);
+        try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
+    }
 }

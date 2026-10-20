@@ -1026,13 +1026,13 @@ fn nodeStripAfter(node: *const ast.Node) bool {
     };
 }
 
-fn trimLeadingWhitespace(s: []const u8) []const u8 {
+pub fn trimLeadingWhitespace(s: []const u8) []const u8 {
     var start: usize = 0;
     while (start < s.len and std.ascii.isWhitespace(s[start])) start += 1;
     return s[start..];
 }
 
-fn trimTrailingWhitespace(buf: *std.ArrayListUnmanaged(u8)) void {
+pub fn trimTrailingWhitespace(buf: *std.ArrayListUnmanaged(u8)) void {
     while (buf.items.len > 0 and std.ascii.isWhitespace(buf.items[buf.items.len - 1])) {
         _ = buf.pop();
     }
