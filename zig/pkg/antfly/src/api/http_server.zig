@@ -58237,6 +58237,25 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try std.testing.expect(std.mem.indexOf(u8, accepted_source.body, "TableNotFound") != null);
     source.fail_after_commit = null;
     source.observation_failure = null;
+    // Legacy policy still belongs to each source until destination adoption.
+    // Both catalog capabilities must retain narrowed API-key read scopes.
+    {
+        const DestinationOnly = struct {
+            fn allows(_: *const anyopaque, name: []const u8) bool {
+                return std.mem.eql(u8, name, "entities");
+            }
+        };
+        var read_context: u8 = 0;
+        source.forbid_snapshot = false;
+        for ([_]StatusSource{ source.iface(), source.narrowIface() }) |iface| {
+            server.source = iface;
+            var denied_legacy = try resources.handle(&server, alloc, .entity_redirects, "entities", "", "concept/noise", "", "", .{ .principal = .{ .kind = .user, .subject = "destination-only" }, .table_read_authorization = .{ .ptr = &read_context, .allows = DestinationOnly.allows } });
+            defer denied_legacy.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 403), denied_legacy.status);
+            try std.testing.expect(std.mem.indexOf(u8, denied_legacy.body, "private source text") == null);
+        }
+        source.forbid_snapshot = true;
+    }
     // Initial adoption folds borrowed legacy policy from independent page arenas.
     server.source = source.narrowIface();
     source.stress_pages = 2;

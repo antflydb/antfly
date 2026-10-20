@@ -618,7 +618,7 @@ const EntityValidation = struct {
 /// Both passes read the same revision-fenced catalog cut. A page arena owns
 /// transport bytes, table schemas and parsed configs; callbacks retain only
 /// output identities or the folded namespace policy.
-fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anytype, entity_table: anytype, key: []const u8, request: operation.RequestContext, adoption_revision: ?u64, context: anytype) !void {
+fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anytype, entity_table: anytype, key: []const u8, request: operation.RequestContext, adoption_revision: ?u64, stored: curation.Namespaces, context: anytype) !void {
     if (server.source.vtable.supports_resolver_catalog_read) {
         var cursor: ?[]const u8 = null;
         defer if (cursor) |value| owner.free(value);
@@ -633,6 +633,11 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
                 if ((try seen.getOrPut(owner, consumer.table.table_id)).found_existing) continue;
                 for (try configs(scratch, consumer.table.indexes_json)) |cfg| {
                     for (consumer.names) |name| if (std.mem.eql(u8, cfg.name, name)) {
+                        // Before adoption, the aggregate contains source-owned
+                        // policy. Preserve the caller's source scopes while
+                        // folding it; destination authority only owns adopted
+                        // namespaces, even on the bounded catalog read path.
+                        if (!namespaceAdopted(stored, cfg.key_template)) try server.authorizeTableReads(scratch, request, &.{consumer.table.name});
                         try context.consume(scratch, consumer.table.name, cfg);
                         break;
                     };
@@ -672,6 +677,7 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
         }
         for (snapshot.tables, source_configs) |source, all| for (all) |cfg| {
             if (!std.mem.eql(u8, destinations.get(cfg.table).?, entity_table.name) or !curation.keyInNamespace(cfg.key_template, key)) continue;
+            if (!namespaceAdopted(stored, cfg.key_template)) try server.authorizeTableReads(a, request, &.{source.name});
             try context.consume(a, source.name, cfg);
         };
     }
@@ -693,7 +699,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
     for (stored.namespaces) |namespace| if (curation.keyInNamespace(namespace.key_template, key)) try namespaces.put(a, namespace.key_template, namespace);
     var discovery: EntityDiscovery = .{ .a = a, .owner = alloc, .namespaces = &namespaces, .stored = stored, .adoption_revision = adoption_revision, .standalone = server.cfg.deployment_mode == .standalone, .key = key, .observations = op != .entity_redirects, .aliases = op == .entity_merge or op == .entity_unmerge };
     defer discovery.deinit();
-    try scanEntityConsumers(server, alloc, snapshot, entity_table, key, request, adoption_revision, &discovery);
+    try scanEntityConsumers(server, alloc, snapshot, entity_table, key, request, adoption_revision, stored, &discovery);
     if (namespaces.count() == 0) return error.ResolverNotFound;
     if (op == .entity_redirects) {
         var states = std.json.Array.init(a);
@@ -749,7 +755,7 @@ fn entityOperation(server: anytype, alloc: std.mem.Allocator, a: std.mem.Allocat
         }
     }
     var validation: EntityValidation = .{ .namespaces = &namespaces };
-    try scanEntityConsumers(server, alloc, snapshot, entity_table, key, request, adoption_revision, &validation);
+    try scanEntityConsumers(server, alloc, snapshot, entity_table, key, request, adoption_revision, stored, &validation);
     var replacement = entity_table.*;
     replacement.indexes_json = try std.json.Stringify.valueAlloc(a, root, .{});
     try request.ensureActive();
