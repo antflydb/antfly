@@ -23028,6 +23028,7 @@ export interface components {
                 lifecycle: "active" | "disputed" | "superseded" | "retracted";
                 valid_to: number | null;
                 superseded_by: string | null;
+                superseded_valid_at?: number | null;
                 recorded_to: number | null;
                 conflicts_with: string[];
                 reason: string | null;
@@ -23043,6 +23044,7 @@ export interface components {
             conflicts_with?: string[];
             recorded_to?: number | null;
             superseded_by?: string | null;
+            superseded_valid_at?: number | null;
             config_generation: number;
         };
         MemoryEntity: {
@@ -23160,6 +23162,7 @@ export interface components {
                         lifecycle: "active" | "disputed" | "superseded" | "retracted";
                         valid_to: number | null;
                         superseded_by: string | null;
+                        superseded_valid_at?: number | null;
                         recorded_to: number | null;
                         conflicts_with: string[];
                         reason: string | null;
@@ -23175,6 +23178,7 @@ export interface components {
                     conflicts_with?: string[];
                     recorded_to?: number | null;
                     superseded_by?: string | null;
+                    superseded_valid_at?: number | null;
                     config_generation: number;
                 };
                 score: number;
@@ -23274,6 +23278,7 @@ export interface components {
                     lifecycle: "active" | "disputed" | "superseded" | "retracted";
                     valid_to: number | null;
                     superseded_by: string | null;
+                    superseded_valid_at?: number | null;
                     recorded_to: number | null;
                     conflicts_with: string[];
                     reason: string | null;
@@ -23289,6 +23294,7 @@ export interface components {
                 conflicts_with?: string[];
                 recorded_to?: number | null;
                 superseded_by?: string | null;
+                superseded_valid_at?: number | null;
                 config_generation: number;
             }[];
             next_cursor: string | null;

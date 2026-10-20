@@ -145,6 +145,12 @@ audit view; current recall excludes stale dependencies and historical guidance.
 Structural enumeration and ranked recall share lifecycle and validity filtering.
 An explicit `valid_at` can select a superseded version in its original interval;
 it never requires `include_history` merely to reconstruct that valid state.
+`superseded_valid_at` stores the business-time boundary accepted by supersession,
+separately from an assertion's original `valid_to`. A null boundary means the
+replacement date is unknown: no current or valid-time query may use that
+superseded premise as support. A `known_at` before the replacement can still
+select the active premise revision. Dated boundaries survive policy rebuilds and
+forgetting of the replacement; restoring a premise explicitly clears its boundary.
 Dependency applicability is evaluated against the same valid and recorded times at
 every depth, including during reconciliation. Ordinary supersession, dispute, or
 retraction of a premise never rewrites dependent facts to globally `stale` during
@@ -303,6 +309,27 @@ and before returning read results. Producer paths requesting background processi
 must use a qualified revocable Basic/API-key execution identity; ordinary external
 capture does not persist a caller's session credentials. Per-source TTL requires
 a space maintenance identity. Unsupported producer paths fail admission explicitly.
+Both native storage adapters persist policy rows in a versioned object envelope
+(`memory_record_version: 1`, `value: <policy JSON>`). Policy values may be objects,
+scalars, or arrays. Routed scans unwrap that payload after handling transport
+metadata; they never flatten policy values into the NDJSON document. This keeps
+scalar forget fences and producer metadata readable during full-table cleanup,
+with the same policy row representation in embedded and routed execution. OCC
+versions and content digests continue to refer to the stored envelope.
+Background selection rotates an opaque cursor per immutable table identity and
+alternates operation work with cleanup. Each pass examines at most 64 pending
+entries; an empty continuation may wrap once. Selection advances before checking
+execution authority, retry readiness, inference, or publication. Revoked or
+unsupported bindings stay fenced and pending without consuming model attempts;
+they cannot pin later jobs, including jobs beyond the first queue page. Execution
+deadlines and transient failures also leave the selection cursor advanced.
+Cleanup uses the space's own saved binding, independently of every operation's
+binding. A revoked cleanup identity does not block valid operations, and a busy
+operation queue does not starve authorized cleanup. Each authorized quantum still
+passes the shared live grant/publication checks. Cursors are in-memory scheduling
+hints owned and serialized by the server's existing maintenance lifecycle;
+pending receipts, retry state, and cleanup obligations remain durable, so cursor
+loss on restart or leader transfer cannot lose work or grant authority.
 Grant authenticators and worker cursors are never returned in public receipts.
 Every admitted configuration generation is retained as an immutable snapshot,
 so an assertion's producing generation remains auditable after reconfiguration.

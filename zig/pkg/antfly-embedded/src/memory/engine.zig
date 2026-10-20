@@ -22,6 +22,32 @@ const writes_mod = @import("../api/table_write_source.zig");
 const db_types = @import("../storage/db/types.zig");
 const A = std.mem.Allocator;
 
+// Memory policy rows may be objects, scalars, or arrays. Storage adapters own
+// one versioned object envelope so routed NDJSON never flattens policy values.
+fn encodeRow(a: A, json: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{{\"memory_record_version\":1,\"value\":{s}}}", .{json});
+}
+pub fn decodeRow(a: A, json: []const u8) ![]const u8 {
+    // Preserve full-width integer fields instead of round-tripping via f64.
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, json, .{ .parse_numbers = false }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.MemoryCorruptState,
+    };
+    return decodeValue(a, value);
+}
+fn decodeValue(a: A, value: std.json.Value) ![]const u8 {
+    if (value != .object) return error.MemoryCorruptState;
+    const version = value.object.get("memory_record_version") orelse return error.MemoryCorruptState;
+    const current_version = switch (version) {
+        .integer => version.integer == 1,
+        .number_string => std.mem.eql(u8, version.number_string, "1"),
+        else => false,
+    };
+    if (!current_version) return error.MemoryCorruptState;
+    const payload = value.object.get("value") orelse return error.MemoryCorruptState;
+    return std.json.Stringify.valueAlloc(a, payload, .{});
+}
+
 pub const Routed = struct {
     table: []const u8,
     reads: reads_mod.TableReadSource,
@@ -36,7 +62,7 @@ pub const Routed = struct {
         const self: *Routed = @ptrCast(@alignCast(ptr));
         try self.context.check();
         const row = (try self.reads.lookup(a, self.table, key, .{ .execution_deadline_ns = self.request.deadline_ns, .execution_io = self.request.deadline_io, .cancellation = self.request.cancellation }, .read_index)) orelse return null;
-        return .{ .key = key, .json = row.json, .version = row.version, .digest = row.expected_content_digest };
+        return .{ .key = key, .json = try decodeRow(a, row.json), .version = row.version, .digest = row.expected_content_digest };
     }
     fn scan(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) !service.Page {
         const self: *Routed = @ptrCast(@alignCast(ptr));
@@ -47,13 +73,13 @@ pub const Routed = struct {
         var rows: std.ArrayList(service.Row) = .empty;
         var lines = std.mem.tokenizeScalar(u8, response.ndjson, '\n');
         while (lines.next()) |line| {
-            var value = try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{});
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{ .parse_numbers = false });
             const id = value.object.get("_id") orelse return error.MemoryCorruptState;
             if (id != .string or !std.mem.startsWith(u8, id.string, prefix)) return error.MemoryCorruptState;
             _ = value.object.swapRemove("_id");
             _ = value.object.swapRemove("_content_hash");
             const document = value.object.get("_source") orelse value;
-            try rows.append(a, .{ .key = id.string, .json = try std.json.Stringify.valueAlloc(a, document, .{}) });
+            try rows.append(a, .{ .key = id.string, .json = try decodeValue(a, document) });
         }
         const count = @min(rows.items.len, limit);
         return .{ .rows = rows.items[0..count], .next = if (rows.items.len > count) rows.items[count - 1].key else null };
@@ -64,7 +90,7 @@ pub const Routed = struct {
         var writes: std.ArrayList(db_types.TransactionWrite) = .empty;
         var deletes: std.ArrayList([]const u8) = .empty;
         for (changes) |change| {
-            if (change.json) |json| try writes.append(a, .{ .key = change.key, .value = json }) else try deletes.append(a, change.key);
+            if (change.json) |json| try writes.append(a, .{ .key = change.key, .value = try encodeRow(a, json) }) else try deletes.append(a, change.key);
         }
         const result = (try self.writes.commitTransactionWithCancellation(a, &.{.{ .table_name = self.table, .writes = writes.items, .deletes = deletes.items, .predicates = &.{.{ .key = "control", .expected_version = if (expected) |row| row.version else 0, .expected_content_digest = if (expected) |row| row.digest else null, .unique_absence = expected == null }} }}, .write, self.request.cancellation)) orelse return error.MemoryCapabilityUnavailable;
         switch (result) {
@@ -86,7 +112,7 @@ pub fn Native(comptime DB: type) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             try self.context.check();
             const result = (try self.db.getDocument(a, key, .{})) orelse return null;
-            return .{ .key = key, .json = result.json, .version = result.version orelse try self.db.getTimestamp(a, key), .digest = result.expected_content_digest };
+            return .{ .key = key, .json = try decodeRow(a, result.json), .version = result.version orelse try self.db.getTimestamp(a, key), .digest = result.expected_content_digest };
         }
         fn scan(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) !service.Page {
             const self: *Self = @ptrCast(@alignCast(ptr));
@@ -94,7 +120,7 @@ pub fn Native(comptime DB: type) type {
             try validateCursor(prefix, cursor);
             const result = try self.db.scan(a, cursor orelse prefix, try prefixEnd(a, prefix), .{ .include_documents = true, .inclusive_from = cursor == null, .exclusive_to = true, .limit = limit + 1 });
             const rows = try a.alloc(service.Row, result.documents.len);
-            for (result.documents, rows) |document, *row| row.* = .{ .key = document.id, .json = document.json };
+            for (result.documents, rows) |document, *row| row.* = .{ .key = document.id, .json = try decodeRow(a, document.json) };
             const count = @min(rows.len, limit);
             return .{ .rows = rows[0..count], .next = if (rows.len > count) rows[count - 1].key else null };
         }
@@ -104,7 +130,7 @@ pub fn Native(comptime DB: type) type {
             var writes: std.ArrayList(db_types.BatchWrite) = .empty;
             var deletes: std.ArrayList([]const u8) = .empty;
             for (changes) |change| {
-                if (change.json) |json| try writes.append(a, .{ .key = change.key, .value = json }) else try deletes.append(a, change.key);
+                if (change.json) |json| try writes.append(a, .{ .key = change.key, .value = try encodeRow(a, json) }) else try deletes.append(a, change.key);
             }
             self.db.batch(.{ .writes = writes.items, .deletes = deletes.items, .sync_level = .write, .predicates = &.{.{ .key = "control", .expected_version = if (expected) |row| row.version else 0, .expected_content_digest = if (expected) |row| row.digest else null, .unique_absence = expected == null }} }) catch |err| switch (err) {
                 error.VersionConflict, error.IntentConflict => return error.MemoryRevisionConflict,

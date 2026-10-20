@@ -1654,3 +1654,195 @@ test "memory delayed identity invalidation preserves artifacts regenerated after
         try std.testing.expect(!page.items[0].stale);
     }
 }
+
+test "memory supersession support uses accepted business boundaries independently of original validity" {
+    for ([_]?i64{ null, 1000 }) |original_end| for ([_]?i64{ null, 300 }) |replacement_start| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        try authoritySources(&store, false);
+        const parent: m.types.Assertion = .{ .id = "parent", .subject = "premise", .predicate = "status", .value = "old", .statement = "Old premise", .valid_from = 100, .valid_to = original_end, .evidence = &.{.{ .id = "low" }} };
+        _ = try store.service("alice", true, 3).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{parent} }, .{}), "parent");
+        const child: m.types.Assertion = .{ .id = "old", .subject = "production", .predicate = "deploys_with", .value = "Helm", .statement = "Use Helm", .valid_from = 100, .evidence = &.{.{ .id = "high" }}, .depends_on = &.{"parent"} };
+        _ = try store.service("alice", true, 4).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{child} }, .{}), "child");
+        var leaf = child;
+        leaf.id = "leaf";
+        leaf.subject = "leaf";
+        leaf.depends_on = &.{"old"};
+        _ = try store.service("alice", true, 4).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{leaf} }, .{}), "leaf");
+        var next = parent;
+        next.id = "next";
+        next.value = "new";
+        next.statement = "New premise";
+        next.valid_from = replacement_start;
+        next.valid_to = null;
+        next.supersedes = &.{"parent"};
+        _ = try store.service("alice", true, 5).execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = &.{next} }, .{}), "next");
+        for (0..3) |phase| {
+            if (phase == 1) try advanceTemporalMaintenance(&store, "supersession");
+            if (phase == 2) {
+                const inspected = try std.json.parseFromSliceLeaky(m.types.Inspection, a, try store.service("alice", true, 40).execute(a, .inspect, "", "{}", ""), .{});
+                var config = inspected.state.config;
+                config.policy_version = "v2";
+                _ = try store.service("alice", true, 41).execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = inspected.state.revision, .config = config }, .{}), "rebuild");
+            }
+            const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 49).execute(a, .get, "parent", "{}", ""), .{});
+            try std.testing.expectEqual(replacement_start, record.superseded_valid_at);
+            try std.testing.expectEqual(replacement_start, record.explicit_disposition.?.superseded_valid_at);
+            try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 500).execute(a, .get, "old", "{}", ""));
+            for ([_]m.Action{ .list, .recall }) |action| for ([_][]const u8{ "production", "leaf" }) |subject| {
+                const raw = try store.service("alice", true, 500).execute(a, action, "", try std.json.Stringify.valueAlloc(a, .{ .subject = subject, .token_budget = @as(u32, 8192) }, .{}), "");
+                const result = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+                try std.testing.expectEqual(@as(usize, 0), result.object.get("items").?.array.items.len);
+                try std.testing.expectEqual(@as(usize, if (replacement_start != null) 1 else 0), try temporalReadCount(&store, action, subject, 200, null));
+                try std.testing.expectEqual(@as(usize, 1), try temporalReadCount(&store, action, subject, 200, 4));
+            };
+        }
+        // Forgetting the replacement cannot erase an already accepted dated
+        // boundary or make an undated replacement acquire a fabricated date.
+        _ = try store.service("alice", true, 45).execute(a, .forget, "", "{\"assertion_ids\":[\"next\"]}", "forget-next");
+        try std.testing.expectEqual(@as(usize, if (replacement_start != null) 1 else 0), try temporalReadCount(&store, .recall, "production", 200, null));
+        try std.testing.expectEqual(if (replacement_start != null) m.types.Lifecycle.disputed else .active, (try authorityNewFact(&store, 200)).lifecycle);
+    };
+}
+
+const ScheduledMemory = struct {
+    store: *Store,
+    denied: std.StringHashMapUnmanaged(void) = .empty,
+    cleanup_allowed: bool = true,
+    denial: anyerror = error.StoredDestinationAuthorizationRevoked,
+    jobs: usize = 0,
+    cleanups: usize = 0,
+    now: i64 = 100,
+    calls: usize = 0,
+
+    fn generate(_: *anyopaque, a: A, _: m.types.Config, inputs: []const m.types.StoredEvidence) !m.types.Generated {
+        const claims = try a.alloc(m.types.Assertion, 1);
+        claims[0] = .{ .id = try std.fmt.allocPrint(a, "claim-{s}", .{inputs[0].evidence.id}), .subject = "scheduled", .predicate = "fact", .value = inputs[0].evidence.id, .statement = inputs[0].evidence.text, .evidence = try a.dupe(m.types.EvidenceRef, &.{.{ .id = inputs[0].evidence.id }}) };
+        return .{ .assertions = claims };
+    }
+    fn execute(ptr: *anyopaque, item: ?m.types.Operation) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const a = self.store.arena.allocator();
+        self.calls += 1;
+        if (item) |pending| {
+            if (self.denied.contains(pending.id)) return self.denial;
+            try std.testing.expectEqualStrings("saved-binding", pending.execution_signature);
+            var service = modelService(self.store, self.now);
+            service.context.principal = pending.owner;
+            service.context.admin = false;
+            service.backend.generate = generate;
+            _ = try service.execute(a, .advance, pending.id, "{}", try std.fmt.allocPrint(a, "advance-{d}", .{self.calls}));
+            self.jobs += 1;
+        } else {
+            if (!self.cleanup_allowed) return error.StoredDestinationAuthorizationRevoked;
+            _ = try self.store.service("alice", true, self.now).execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{self.calls}));
+            self.cleanups += 1;
+        }
+    }
+    fn tick(self: *@This(), cursor: *@import("scheduling.zig").Cursor) !void {
+        const a = self.store.arena.allocator();
+        const service = self.store.service("alice", true, self.now);
+        const raw = (try service.backend.get(service.backend.ptr, a, "control")).?.json;
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, raw, .{});
+        try @import("scheduling.zig").advance(service.backend, a, self.now, state, cursor, .{ .ptr = self, .execute = execute });
+        self.now += 1;
+    }
+};
+fn scheduledMemorySetup(store: *Store, count: usize) !void {
+    const a = store.arena.allocator();
+    const config: m.types.Config = .{ .processing = .hybrid, .features = .{ .assertion_distillation = true }, .models = .{ .generator = fake_model } };
+    _ = try modelService(store, 1).execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try store.service("alice", true, 2).execute(a, .observe, "", source, "source");
+    _ = try store.service("alice", true, 3).execute(a, .assertions, "", helm, "old");
+    for (0..count) |i| {
+        var service = modelService(store, 4);
+        service.context.principal = try std.fmt.allocPrint(a, "owner-{d}", .{i});
+        service.context.execution_signature = "saved-binding";
+        const evidence: m.types.Evidence = .{ .id = try std.fmt.allocPrint(a, "e-{d}", .{i}), .source_id = try std.fmt.allocPrint(a, "source-{d}", .{i}), .source_version = "1", .text = "Managed fact", .managed = true };
+        _ = try service.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &.{evidence} }, .{}), "observe");
+    }
+    _ = try store.service("alice", true, 5).execute(a, .forget, "", "{\"evidence_ids\":[\"e1\"]}", "forget");
+}
+test "memory scheduling passes revoked and delayed queue pages while independently advancing cleanup" {
+    for ([_]bool{ false, true }) |delayed| {
+        var store = Store.init();
+        defer store.deinit();
+        try scheduledMemorySetup(&store, 96);
+        const a = store.arena.allocator();
+        var fixture: ScheduledMemory = .{ .store = &store };
+        const service = store.service("alice", true, 100);
+        const page = try service.backend.scan(service.backend.ptr, a, "pending/", null, 64);
+        for (page.rows) |row| {
+            const queued = try std.json.parseFromSliceLeaky(struct { id: []const u8 }, a, row.json, .{});
+            if (delayed) {
+                const Failing = struct {
+                    fn generate(_: *anyopaque, _: A, _: m.types.Config, _: []const m.types.StoredEvidence) !m.types.Generated {
+                        return error.TransientInferenceFailure;
+                    }
+                };
+                const raw = try service.execute(a, .operation, queued.id, "{}", "");
+                const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, raw, .{});
+                var processing = modelService(&store, 6);
+                processing.context.principal = receipt.owner;
+                processing.backend.generate = Failing.generate;
+                _ = try processing.execute(a, .advance, queued.id, "{}", "delay");
+            } else try fixture.denied.put(a, queued.id, {});
+        }
+        var cursor: @import("scheduling.zig").Cursor = .{};
+        for (0..8) |_| try fixture.tick(&cursor);
+        try std.testing.expect(fixture.jobs > 0 and fixture.cleanups > 0);
+        try std.testing.expectError(error.MemoryNotFound, store.service("alice", true, 200).execute(a, .get, "helm", "{}", ""));
+        var rows = store.values.iterator();
+        while (rows.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, "assertion/")) {
+            const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, entry.value_ptr.*, .{});
+            try std.testing.expect(!std.mem.eql(u8, record.assertion.id, "helm"));
+        };
+        for (page.rows) |row| {
+            const queued = try std.json.parseFromSliceLeaky(struct { id: []const u8 }, a, row.json, .{});
+            const raw = try store.service("alice", true, 200).execute(a, .operation, queued.id, "{}", "");
+            const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, raw, .{});
+            try std.testing.expectEqual(m.types.Stage.pending, receipt.phase);
+            try std.testing.expectEqual(@as(u8, if (delayed) 1 else 0), receipt.attempts);
+        }
+        // A restart discards only selection position; durable jobs still advance.
+        const before = fixture.jobs;
+        cursor = .{};
+        for (0..8) |_| try fixture.tick(&cursor);
+        try std.testing.expect(fixture.jobs > before);
+    }
+}
+
+test "memory scheduling gives cleanup a turn under ingestion and preserves jobs when cleanup binding is revoked" {
+    for ([_]bool{ false, true }) |cleanup_allowed| {
+        var store = Store.init();
+        defer store.deinit();
+        try scheduledMemorySetup(&store, 16);
+        var fixture: ScheduledMemory = .{ .store = &store, .cleanup_allowed = cleanup_allowed };
+        var cursor: @import("scheduling.zig").Cursor = .{};
+        for (0..6) |_| try fixture.tick(&cursor);
+        try std.testing.expect(fixture.jobs > 0);
+        try std.testing.expectEqual(cleanup_allowed, fixture.cleanups > 0);
+        try std.testing.expect(fixture.jobs < 16);
+    }
+}
+
+test "memory scheduling advances its cursor before execution deadline failures" {
+    var store = Store.init();
+    defer store.deinit();
+    try scheduledMemorySetup(&store, 4);
+    const a = store.arena.allocator();
+    const service = store.service("alice", true, 100);
+    const page = try service.backend.scan(service.backend.ptr, a, "pending/", null, 1);
+    const first = try std.json.parseFromSliceLeaky(struct { id: []const u8 }, a, page.rows[0].json, .{});
+    var fixture: ScheduledMemory = .{ .store = &store, .denial = error.DeadlineExceeded };
+    try fixture.denied.put(a, first.id, {});
+    var cursor: @import("scheduling.zig").Cursor = .{};
+    try std.testing.expectError(error.DeadlineExceeded, fixture.tick(&cursor));
+    try fixture.tick(&cursor);
+    try fixture.tick(&cursor);
+    try std.testing.expect(fixture.jobs > 0 and fixture.cleanups > 0);
+    const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try service.execute(a, .operation, first.id, "{}", ""), .{});
+    try std.testing.expectEqual(m.types.Stage.pending, receipt.phase);
+    try std.testing.expectEqual(@as(u8, 0), receipt.attempts);
+}

@@ -40,6 +40,7 @@ pub const api_local_write_contract = @import("api/write_contract.zig");
 pub const api_local_write_test_hooks = @import("api/write_test_hooks.zig");
 pub const api_operation = @import("api/operation.zig");
 pub const memory_service = @import("memory/service.zig");
+pub const memory_scheduling = @import("memory/scheduling.zig");
 pub const memory_engine = @import("memory/engine.zig");
 pub const memory_models = @import("memory/models.zig");
 pub const api_public_embedding_query = @import("api/public_embedding_query.zig");

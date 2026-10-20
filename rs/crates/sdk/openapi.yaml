@@ -47634,6 +47634,10 @@ components:
             superseded_by:
               type: string
               nullable: true
+            superseded_valid_at:
+              type: integer
+              nullable: true
+              x-go-type-skip-optional-pointer: false
             recorded_to:
               type: integer
               nullable: true
@@ -47683,6 +47687,10 @@ components:
         superseded_by:
           type: string
           nullable: true
+        superseded_valid_at:
+          type: integer
+          nullable: true
+          x-go-type-skip-optional-pointer: false
         config_generation:
           type: integer
       required:
@@ -48062,6 +48070,10 @@ components:
                       superseded_by:
                         type: string
                         nullable: true
+                      superseded_valid_at:
+                        type: integer
+                        nullable: true
+                        x-go-type-skip-optional-pointer: false
                       recorded_to:
                         type: integer
                         nullable: true
@@ -48111,6 +48123,10 @@ components:
                   superseded_by:
                     type: string
                     nullable: true
+                  superseded_valid_at:
+                    type: integer
+                    nullable: true
+                    x-go-type-skip-optional-pointer: false
                   config_generation:
                     type: integer
                 required:
@@ -48437,6 +48453,10 @@ components:
                   superseded_by:
                     type: string
                     nullable: true
+                  superseded_valid_at:
+                    type: integer
+                    nullable: true
+                    x-go-type-skip-optional-pointer: false
                   recorded_to:
                     type: integer
                     nullable: true
@@ -48486,6 +48506,10 @@ components:
               superseded_by:
                 type: string
                 nullable: true
+              superseded_valid_at:
+                type: integer
+                nullable: true
+                x-go-type-skip-optional-pointer: false
               config_generation:
                 type: integer
             required:

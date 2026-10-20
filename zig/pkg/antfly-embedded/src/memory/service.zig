@@ -539,7 +539,12 @@ const Run = struct {
             const parent = (if (known) |time| try self.asOf(dependency, time) else try self.assertion(dependency)) orelse return false;
             self.authorize(parent.owner, parent.assertion.visibility) catch return false;
             if (parent.stale or parent.lifecycle == .retracted or parent.lifecycle == .disputed or parent.conflicts_with.len > 0) return false;
-            if (parent.lifecycle == .superseded and valid == null) return false;
+            if (parent.lifecycle == .superseded) {
+                // A finite original validity interval is not proof of when an
+                // undated replacement took effect. Never invent that boundary.
+                const boundary = parent.superseded_valid_at orelse return false;
+                if (valid == null or valid.? >= boundary) return false;
+            }
             if (valid) |time| {
                 if (parent.assertion.valid_from) |start| if (start > time) return false;
                 if (parent.assertion.valid_to) |end| if (end <= time) return false;
@@ -774,6 +779,7 @@ const Run = struct {
             if (!try self.sameCanonicalGroup(claim, old.assertion) or claim.modality != .actual or claim.role == .hypothesized or claim.stability != .settled) return error.MemoryInvalidSupersession;
             old.lifecycle = .superseded;
             old.superseded_by = claim.id;
+            old.superseded_valid_at = claim.valid_from;
             if (claim.valid_from) |start| {
                 if (old.assertion.valid_from) |previous_start| if (start < previous_start) return error.MemoryInvalidSupersession;
                 if (old.assertion.valid_to == null or old.assertion.valid_to.? > start) old.assertion.valid_to = start;
@@ -958,6 +964,7 @@ const Run = struct {
                 record.lifecycle = baseline.lifecycle;
                 record.assertion.valid_to = baseline.valid_to;
                 record.superseded_by = baseline.superseded_by;
+                record.superseded_valid_at = baseline.superseded_valid_at;
                 record.recorded_to = baseline.recorded_to;
                 record.conflicts_with = baseline.conflicts_with;
                 record.reason = baseline.reason;
@@ -1202,7 +1209,10 @@ const Run = struct {
             const previous = try self.assertion(id);
             replace = previous == null or previous.?.assertion.valid_from == null or next.assertion.valid_from.? < previous.?.assertion.valid_from.?;
         }
-        if (replace) record.superseded_by = next.assertion.id;
+        if (replace) {
+            record.superseded_by = next.assertion.id;
+            record.superseded_valid_at = next.assertion.valid_from;
+        }
         if (record.lifecycle != .disputed) record.lifecycle = .superseded;
         if (record.assertion.valid_to == null or record.assertion.valid_to.? > next.assertion.valid_from.?) record.assertion.valid_to = next.assertion.valid_from;
     }
@@ -1274,6 +1284,7 @@ const Run = struct {
         if (request.lifecycle == .active) {
             record.recorded_to = null;
             record.superseded_by = null;
+            record.superseded_valid_at = null;
             record.conflicts_with = &.{};
             record.assertion.valid_to = record.asserted_valid_to;
         }
@@ -1820,7 +1831,7 @@ const Run = struct {
 };
 
 fn explicitDisposition(record: t.StoredAssertion) t.ExplicitDisposition {
-    return .{ .lifecycle = record.lifecycle, .valid_to = record.assertion.valid_to, .superseded_by = record.superseded_by, .recorded_to = record.recorded_to, .conflicts_with = record.conflicts_with, .reason = record.reason };
+    return .{ .lifecycle = record.lifecycle, .valid_to = record.assertion.valid_to, .superseded_by = record.superseded_by, .superseded_valid_at = record.superseded_valid_at, .recorded_to = record.recorded_to, .conflicts_with = record.conflicts_with, .reason = record.reason };
 }
 
 fn matchesTime(request: t.Recall, record: t.StoredAssertion, now: i64) bool {

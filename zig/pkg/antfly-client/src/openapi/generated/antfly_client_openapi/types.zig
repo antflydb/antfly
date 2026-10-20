@@ -32745,6 +32745,7 @@ pub const MemoryRecord = struct {
     conflicts_with: ?[]const []const u8 = null,
     recorded_to: OpenApiOptionalNullable(i64) = .absent,
     superseded_by: OpenApiOptionalNullable([]const u8) = .absent,
+    superseded_valid_at: OpenApiOptionalNullable(i64) = .absent,
     config_generation: i64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -32763,6 +32764,7 @@ pub const MemoryRecord = struct {
         .{ "conflicts_with", "conflicts_with", true },
         .{ "recorded_to", "recorded_to", false },
         .{ "superseded_by", "superseded_by", false },
+        .{ "superseded_valid_at", "superseded_valid_at", false },
         .{ "config_generation", "config_generation", false },
     };
 
@@ -32856,6 +32858,17 @@ pub const MemoryRecord = struct {
             },
             .value => |value| {
                 try jw.objectField("superseded_by");
+                try jw.write(value);
+            },
+        }
+        switch (self.superseded_valid_at) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("superseded_valid_at");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("superseded_valid_at");
                 try jw.write(value);
             },
         }

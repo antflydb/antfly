@@ -28,6 +28,7 @@ class MemoryRecordExplicitDispositionType0:
         conflicts_with (list[str]):
         reason (None | str):
         provenance (MemoryRecordExplicitDispositionType0ProvenanceType0 | None | Unset):
+        superseded_valid_at (int | None | Unset):
     """
 
     lifecycle: MemoryRecordExplicitDispositionType0Lifecycle
@@ -37,6 +38,7 @@ class MemoryRecordExplicitDispositionType0:
     conflicts_with: list[str]
     reason: None | str
     provenance: MemoryRecordExplicitDispositionType0ProvenanceType0 | None | Unset = UNSET
+    superseded_valid_at: int | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.memory_record_explicit_disposition_type_0_provenance_type_0 import (
@@ -67,6 +69,12 @@ class MemoryRecordExplicitDispositionType0:
         else:
             provenance = self.provenance
 
+        superseded_valid_at: int | None | Unset
+        if isinstance(self.superseded_valid_at, Unset):
+            superseded_valid_at = UNSET
+        else:
+            superseded_valid_at = self.superseded_valid_at
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -81,6 +89,8 @@ class MemoryRecordExplicitDispositionType0:
         )
         if provenance is not UNSET:
             field_dict["provenance"] = provenance
+        if superseded_valid_at is not UNSET:
+            field_dict["superseded_valid_at"] = superseded_valid_at
 
         return field_dict
 
@@ -140,6 +150,15 @@ class MemoryRecordExplicitDispositionType0:
 
         provenance = _parse_provenance(d.pop("provenance", UNSET))
 
+        def _parse_superseded_valid_at(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        superseded_valid_at = _parse_superseded_valid_at(d.pop("superseded_valid_at", UNSET))
+
         memory_record_explicit_disposition_type_0 = cls(
             lifecycle=lifecycle,
             valid_to=valid_to,
@@ -148,6 +167,7 @@ class MemoryRecordExplicitDispositionType0:
             conflicts_with=conflicts_with,
             reason=reason,
             provenance=provenance,
+            superseded_valid_at=superseded_valid_at,
         )
 
         return memory_record_explicit_disposition_type_0

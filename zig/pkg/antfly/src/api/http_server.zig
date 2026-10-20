@@ -3930,6 +3930,7 @@ pub const ApiHttpServer = struct {
     last_session_maintenance_schedule_ns: std.atomic.Value(u64) = .init(0),
     memory_in_flight: std.atomic.Value(bool) = .init(false),
     memory_range_cursor: std.atomic.Value(usize) = .init(0),
+    memory_work_cursors: std.AutoHashMapUnmanaged(u64, @import("antfly_local_sources").memory_scheduling.Cursor) = .empty,
     relational_activation_range_cursor: std.atomic.Value(usize) = .init(0),
     row_policy_publication_cursor: std.atomic.Value(u64) = .init(0),
     fk_generation_publication_cursor: std.atomic.Value(u64) = .init(0),
@@ -4774,6 +4775,7 @@ pub const ApiHttpServer = struct {
         self.mcp_sessions.deinit(self.owner_alloc);
         self.a2a_tasks.deinit(self.owner_alloc);
         self.txn_sessions.deinit(self.alloc);
+        self.memory_work_cursors.deinit(self.alloc);
         if (self.opened_session_store) |opened| {
             opened.deinit();
             self.owner_alloc.destroy(opened);
@@ -5367,16 +5369,19 @@ pub const ApiHttpServer = struct {
         }
     };
     fn scheduleMemoryOnce(self: *ApiHttpServer) !void {
+        // Serialize cursor ownership in both threaded and inline runtimes.
+        if (self.memory_in_flight.swap(true, .acq_rel)) return;
+        var submitted = false;
+        defer if (!submitted) self.memory_in_flight.store(false, .release);
         const runtime = self.cfg.backend_runtime orelse return self.advanceMemoryOnce();
         if (runtime.threaded_jobs == null or self.session_maintenance_owner_id == 0) return self.advanceMemoryOnce();
-        if (self.memory_in_flight.swap(true, .acq_rel)) return;
-        errdefer self.memory_in_flight.store(false, .release);
         const work = try self.alloc.create(MemoryMaintenanceWork);
         errdefer self.alloc.destroy(work);
         work.* = .{ .server = self };
-        // Share the server's existing owner lifecycle; closing it joins both
-        // session cleanup and memory tasks before server resources are freed.
+        // Closing this existing owner joins session cleanup and memory tasks
+        // before either server resources or selection cursors are freed.
         try runtime.durable_jobs.submit(.{ .owner_id = self.session_maintenance_owner_id, .class = .maintenance, .ptr = work, .run = MemoryMaintenanceWork.run, .deinit = MemoryMaintenanceWork.deinit });
+        submitted = true;
     }
     fn advanceMemoryOnce(self: *ApiHttpServer) !void {
         const module = @import("memory.zig");
@@ -5396,7 +5401,8 @@ pub const ApiHttpServer = struct {
             if (entry.table_id == owner_range.table_id) break entry.name;
         } else return;
         const control = (try reader.lookup(a, table, "control", .{}, .read_index)) orelse return;
-        const state = std.json.parseFromSliceLeaky(module.memory.types.State, a, control.json, .{}) catch return;
+        const control_json = module.engine.decodeRow(a, control.json) catch return;
+        const state = std.json.parseFromSliceLeaky(module.memory.types.State, a, control_json, .{}) catch return;
         if (state.space.len == 0) return;
         const Deadline = struct {
             end: u64,
@@ -5406,69 +5412,74 @@ pub const ApiHttpServer = struct {
             }
         };
         var deadline: Deadline = .{ .end = platform_time.monotonicNs() +| 5 * std.time.ns_per_s };
-        var context: module.memory.Context = .{ .check_ptr = &deadline, .check_fn = Deadline.check, .principal = state.owner, .admin = false, .now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms) };
+        const context: module.memory.Context = .{ .check_ptr = &deadline, .check_fn = Deadline.check, .principal = state.owner, .admin = false, .now_ms = @intCast(platform_time.realtimeNs() / std.time.ns_per_ms) };
         var adapter: module.engine.Routed = .{ .table = table, .reads = reader, .writes = writer, .context = context };
-        const queue = try adapter.backend().scan(adapter.backend().ptr, a, "pending/", null, 64);
-        var pending: ?module.memory.types.Operation = null;
-        for (queue.rows) |row| {
-            const queued = try std.json.parseFromSliceLeaky(struct { id: []const u8 }, a, row.json, .{});
-            // Operation IDs are opaque receipt hashes; read through the policy
-            // only after authenticating the exact recorded execution binding.
-            var receipt_key_hash: [32]u8 = undefined;
-            const encoded_id = try std.json.Stringify.valueAlloc(a, queued.id, .{});
-            std.crypto.hash.sha2.Sha256.hash(encoded_id, &receipt_key_hash, .{});
-            const path = try std.fmt.allocPrint(a, "operation/{s}", .{std.fmt.bytesToHex(receipt_key_hash, .lower)});
-            const value = (try reader.lookup(a, table, path, .{}, .read_index)) orelse continue;
-            const item = try std.json.parseFromSliceLeaky(module.memory.types.Operation, a, value.json, .{});
-            if (item.phase != .pending) continue;
-            if (item.next_retry_at) |time| if (time > context.now_ms) continue;
-            pending = item;
-            break;
-        }
-        const work = if (pending != null) true else (try adapter.backend().scan(adapter.backend().ptr, a, "dependency/work/", null, 1)).rows.len > 0 or (try reader.lookup(a, table, "cleanup", .{}, .read_index)) != null or (state.next_expiry_at != null and state.next_expiry_at.? <= context.now_ms);
-        if (!work) return;
-        const executor = if (pending) |item| item.execution_principal else state.execution_principal;
-        const signature = if (pending) |item| item.execution_signature else state.execution_signature;
-        context.principal = if (pending) |item| item.owner else if (state.execution_owner.len > 0) state.execution_owner else state.owner;
-        const table_label = try std.fmt.allocPrint(a, "memory_{s}", .{state.space});
-        const logical = if (self.source.vtable.system_catalog != null) try (system_catalog.Target{ .database = state.database, .namespace = state.namespace, .table = table_label }).resourceNameAlloc(a) else table_label;
-        const bound_logical = (try self.logicalTableNamesInArena(a, .{}, &.{table}))[0];
-        if (!std.mem.eql(u8, logical, bound_logical)) return error.StoredDestinationAuthorizationInvalid;
-        const payload = try std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.memory.execution.v1", .table = logical, .owner = context.principal }, .{});
-        const authority: stored_destination_authorization.Authorizer = .{ .manager = self.cfg.user_manager, .auth_enabled = self.cfg.auth_enabled };
-        try authority.authorize(a, executor, &.{logical}, payload, signature);
-        if (std.mem.eql(u8, executor, stored_destination_authorization.auth_disabled_principal)) {
-            context.admin = !self.cfg.auth_enabled;
-        } else {
-            const manager = self.cfg.user_manager orelse return error.StoredDestinationAuthorizationRevoked;
-            const permissions = if (std.mem.startsWith(u8, executor, "basic:")) try manager.getPermissionsForUser(executor[6..]) else if (std.mem.startsWith(u8, executor, "api-key:")) try manager.effectiveApiKeyPermissions(executor[8..]) else return error.StoredDestinationCredentialUnsupported;
-            defer {
-                for (permissions) |*permission| permission.deinit(manager.alloc);
-                manager.alloc.free(permissions);
-            }
-            if (!permissionsAllow(permissions, .table, logical, .read)) return error.StoredDestinationAuthorizationRevoked;
-            const filters = try manager.durableCredentialRowFilters(executor);
-            defer {
-                for (filters) |*filter| filter.deinit(manager.alloc);
-                manager.alloc.free(filters);
-            }
-            if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
-            context.admin = permissionsAllow(permissions, .table, logical, .admin);
-        }
-        var publication: MemoryPublicationAuthority = .{ .server = self, .alloc = a, .executor = executor, .signature = signature, .payload = payload, .logical = logical, .table = table, .required = if (pending) |item| if (module.memory.operationGrant(item) == .admin) .admin else .write else .admin };
-        context.grant_ptr = &publication;
-        context.require_grant_fn = MemoryPublicationAuthority.requireGrant;
-        context.final_check_ptr = &publication;
-        context.final_check_fn = MemoryPublicationAuthority.check;
-        adapter.context = context;
         adapter.request = .{ .deadline_ns = deadline.end };
-        const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
-        const runtime = try Runtime.createOwned(a, self.inferenceIo(), .{ .antfly_provider = self.antfly_provider, .inference_api_url = self.configuredInferenceAPIURL(), .secret_store = self.cfg.secret_store, .source_table = table });
-        defer runtime.deinit();
-        var bridge: @import("antfly_local_sources").memory_models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = self.inferenceIo(), .deadline_ns = deadline.end, .max_response_bytes = state.config.max_input_bytes }), .alloc = a, .embedding_options = .{ .deadline_ns = deadline.end, .bounded_http_request = true, .antfly_provider = self.antfly_provider, .io = self.inferenceIo(), .secret_store = self.cfg.secret_store, .inference_api_url = self.configuredInferenceAPIURL(), .source_table = table } };
-        const token = try std.fmt.allocPrint(a, "worker:{d}:{s}", .{ state.revision, if (pending) |item| item.id else "maintenance" });
-        _ = try (module.memory.Service{ .backend = bridge.backend(), .context = context }).execute(a, .advance, if (pending) |item| item.id else "", "{}", token);
+        const entry = try self.memory_work_cursors.getOrPut(self.alloc, owner_range.table_id);
+        if (!entry.found_existing) entry.value_ptr.* = .{};
+        var work: MemoryWorkExecution = .{ .server = self, .alloc = a, .table = table, .state = state, .context = context, .deadline_ns = deadline.end };
+        try @import("antfly_local_sources").memory_scheduling.advance(adapter.backend(), a, context.now_ms, state, entry.value_ptr, .{ .ptr = &work, .execute = MemoryWorkExecution.execute });
     }
+    const MemoryWorkExecution = struct {
+        server: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table: []const u8,
+        state: @import("memory.zig").memory.types.State,
+        context: @import("memory.zig").memory.Context,
+        deadline_ns: u64,
+
+        fn execute(ptr: *anyopaque, pending: ?@import("memory.zig").memory.types.Operation) !void {
+            const work: *@This() = @ptrCast(@alignCast(ptr));
+            const server = work.server;
+            const a = work.alloc;
+            const table = work.table;
+            const state = work.state;
+            const module = @import("memory.zig");
+            var context = work.context;
+            var adapter: module.engine.Routed = .{ .table = table, .reads = server.table_reads.?, .writes = server.table_writes.?, .context = context };
+            const executor = if (pending) |item| item.execution_principal else state.execution_principal;
+            const signature = if (pending) |item| item.execution_signature else state.execution_signature;
+            context.principal = if (pending) |item| item.owner else if (state.execution_owner.len > 0) state.execution_owner else state.owner;
+            const table_label = try std.fmt.allocPrint(a, "memory_{s}", .{state.space});
+            const logical = if (server.source.vtable.system_catalog != null) try (system_catalog.Target{ .database = state.database, .namespace = state.namespace, .table = table_label }).resourceNameAlloc(a) else table_label;
+            const bound_logical = (try server.logicalTableNamesInArena(a, .{}, &.{table}))[0];
+            if (!std.mem.eql(u8, logical, bound_logical)) return error.StoredDestinationAuthorizationInvalid;
+            const payload = try std.json.Stringify.valueAlloc(a, .{ .domain = "antfly.memory.execution.v1", .table = logical, .owner = context.principal }, .{});
+            const authority: stored_destination_authorization.Authorizer = .{ .manager = server.cfg.user_manager, .auth_enabled = server.cfg.auth_enabled };
+            try authority.authorize(a, executor, &.{logical}, payload, signature);
+            if (std.mem.eql(u8, executor, stored_destination_authorization.auth_disabled_principal)) {
+                context.admin = !server.cfg.auth_enabled;
+            } else {
+                const manager = server.cfg.user_manager orelse return error.StoredDestinationAuthorizationRevoked;
+                const permissions = if (std.mem.startsWith(u8, executor, "basic:")) try manager.getPermissionsForUser(executor[6..]) else if (std.mem.startsWith(u8, executor, "api-key:")) try manager.effectiveApiKeyPermissions(executor[8..]) else return error.StoredDestinationCredentialUnsupported;
+                defer {
+                    for (permissions) |*permission| permission.deinit(manager.alloc);
+                    manager.alloc.free(permissions);
+                }
+                if (!permissionsAllow(permissions, .table, logical, .read)) return error.StoredDestinationAuthorizationRevoked;
+                const filters = try manager.durableCredentialRowFilters(executor);
+                defer {
+                    for (filters) |*filter| filter.deinit(manager.alloc);
+                    manager.alloc.free(filters);
+                }
+                if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
+                context.admin = permissionsAllow(permissions, .table, logical, .admin);
+            }
+            var publication: MemoryPublicationAuthority = .{ .server = server, .alloc = a, .executor = executor, .signature = signature, .payload = payload, .logical = logical, .table = table, .required = if (pending) |item| if (module.memory.operationGrant(item) == .admin) .admin else .write else .admin };
+            context.grant_ptr = &publication;
+            context.require_grant_fn = MemoryPublicationAuthority.requireGrant;
+            context.final_check_ptr = &publication;
+            context.final_check_fn = MemoryPublicationAuthority.check;
+            adapter.context = context;
+            adapter.request = .{ .deadline_ns = work.deadline_ns };
+            const Runtime = @import("antfly_local_sources").asset_producer_runtime.Runtime;
+            const runtime = try Runtime.createOwned(a, server.inferenceIo(), .{ .antfly_provider = server.antfly_provider, .inference_api_url = server.configuredInferenceAPIURL(), .secret_store = server.cfg.secret_store, .source_table = table });
+            defer runtime.deinit();
+            var bridge: @import("antfly_local_sources").memory_models.Bridge = .{ .base = adapter.backend(), .producer = runtime.producer().withInvocationContext(.{ .io = server.inferenceIo(), .deadline_ns = work.deadline_ns, .max_response_bytes = state.config.max_input_bytes }), .alloc = a, .embedding_options = .{ .deadline_ns = work.deadline_ns, .bounded_http_request = true, .antfly_provider = server.antfly_provider, .io = server.inferenceIo(), .secret_store = server.cfg.secret_store, .inference_api_url = server.configuredInferenceAPIURL(), .source_table = table } };
+            const token = try std.fmt.allocPrint(a, "worker:{d}:{s}", .{ state.revision, if (pending) |item| item.id else "maintenance" });
+            _ = try (module.memory.Service{ .backend = bridge.backend(), .context = context }).execute(a, .advance, if (pending) |item| item.id else "", "{}", token);
+        }
+    };
 
     fn advanceRelationalActivationOnce(self: *ApiHttpServer) !void {
         const reader = self.table_reads orelse return;
@@ -58996,4 +59007,74 @@ test "external lake read refresh hints coalesce without superseding active publi
     try std.testing.expect(server.index_installation_queue.items[0].generation != generation);
     try std.testing.expectEqual(@as(u8, 0), server.index_installation_queue.items[0].failures);
     try std.testing.expectEqual(@as(u64, 0), server.index_installation_queue.items[0].retry_after_ns);
+}
+
+test "native memory background selection isolates revoked execution bindings and runs retention cleanup" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("memory-worker-authority-fairness");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const memory = @import("memory.zig");
+    const Fixture = struct {
+        tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "memory_team", .schema_json = tables_api.default_schema_json, .indexes_json = tables_api.default_indexes_json, .placement_role = "data" }},
+        ranges: [1]metadata_table_manager.RangeRecord = .{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }},
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.tables, .ranges = &self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn validate(_: *anyopaque, _: memory.memory.types.Config) !void {}
+        fn generate(_: *anyopaque, _: std.mem.Allocator, _: memory.memory.types.Config, _: []const memory.memory.types.StoredEvidence) !memory.memory.types.Generated {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const context: memory.memory.Context = .{ .principal = "owner", .admin = true, .now_ms = 1, .space = "team", .execution_principal = stored_destination_authorization.auth_disabled_principal, .execution_signature = "auth-disabled" };
+    var native: memory.engine.Native(db_mod.DB) = .{ .db = &db, .context = context };
+    var backend = native.backend();
+    backend.generate = Fixture.generate;
+    backend.validate_models = Fixture.validate;
+    var service: memory.memory.Service = .{ .backend = backend, .context = context };
+    var config: memory.memory.types.Config = .{ .processing = .hybrid, .features = .{ .assertion_distillation = true }, .models = .{ .generator = .{ .provider = "fixture", .model = "fixture", .revision = "v1" } } };
+    _ = try service.execute(alloc, .create, "", try std.json.Stringify.valueAlloc(alloc, config, .{}), "create");
+    service.context.now_ms = 2;
+    _ = try service.execute(alloc, .observe, "", "{\"evidence\":[{\"id\":\"manual\",\"source_id\":\"manual\",\"source_version\":\"1\",\"text\":\"Retire this payload\"}],\"assertions\":[{\"id\":\"retired\",\"subject\":\"cleanup\",\"predicate\":\"fact\",\"value\":\"old\",\"statement\":\"Retire this payload\",\"evidence\":[{\"id\":\"manual\"}]}]}", "manual");
+    var receipts: [2]memory.memory.types.OperationStatus = undefined;
+    for ([_][]const u8{ "revoked", "healthy" }, 0..) |owner, index| {
+        service.context.principal = owner;
+        service.context.execution_principal = if (index == 0) "basic:revoked" else stored_destination_authorization.auth_disabled_principal;
+        service.context.execution_signature = if (index == 0) "revoked-binding" else "auth-disabled";
+        service.context.now_ms = @intCast(3 + index);
+        const source_value: memory.memory.types.Evidence = .{ .id = owner, .source_id = owner, .source_version = "1", .text = "Managed input", .managed = true };
+        const raw = try service.execute(alloc, .observe, "", try std.json.Stringify.valueAlloc(alloc, .{ .evidence = &.{source_value} }, .{}), "observe");
+        receipts[index] = try std.json.parseFromSliceLeaky(memory.memory.types.OperationStatus, alloc, raw, .{});
+    }
+    service.context = context;
+    service.context.now_ms = 5;
+    const inspected = try std.json.parseFromSliceLeaky(memory.memory.types.Inspection, alloc, try service.execute(alloc, .inspect, "", "{}", ""), .{});
+    config.policy_version = "v2";
+    _ = try service.execute(alloc, .configure, "", try std.json.Stringify.valueAlloc(alloc, .{ .expected_revision = inspected.state.revision, .config = config }, .{}), "reconfigure");
+    _ = try service.execute(alloc, .forget, "", "{\"evidence_ids\":[\"manual\"]}", "forget");
+    var reads = table_reads.BoundTableReadSource.init("memory_team", 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("memory_team", &db);
+    var fixture: Fixture = .{};
+    var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .control_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.free } }, reads.source(), writes.source());
+    defer server.deinit();
+    for (0..6) |_| try server.advanceMemoryOnce();
+    try std.testing.expectEqual(@as(usize, 1), server.memory_work_cursors.count());
+    for (receipts, 0..) |receipt, index| {
+        const operation = try std.json.parseFromSliceLeaky(memory.memory.types.OperationStatus, alloc, try service.execute(alloc, .operation, receipt.id, "{}", ""), .{});
+        try std.testing.expectEqual(if (index == 0) memory.memory.types.Stage.pending else .cancelled, operation.phase);
+        try std.testing.expectEqual(@as(u8, 0), operation.attempts);
+    }
+    const rows = try backend.scan(backend.ptr, alloc, "assertion/", null, 64);
+    try std.testing.expectEqual(@as(usize, 0), rows.rows.len);
+    // Saved operation authority was never replaced with the cleanup owner's
+    // authority, even though that owner's independent cleanup made progress.
 }

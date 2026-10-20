@@ -222,6 +222,7 @@ pub const ExplicitDisposition = struct {
     lifecycle: Lifecycle,
     valid_to: ?i64,
     superseded_by: ?[]const u8,
+    superseded_valid_at: ?i64 = null,
     recorded_to: ?i64,
     conflicts_with: []const []const u8,
     reason: ?[]const u8,
@@ -243,6 +244,8 @@ pub const StoredAssertion = struct {
     conflicts_with: []const []const u8 = &.{},
     recorded_to: ?i64 = null,
     superseded_by: ?[]const u8 = null,
+    /// Accepted replacement boundary; null means business time is unknown.
+    superseded_valid_at: ?i64 = null,
     config_generation: u64,
 };
 pub const Stage = enum { pending, running, succeeded, failed, cancelled };

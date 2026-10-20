@@ -37,6 +37,7 @@ class MemoryRecordPageItemsItem:
         conflicts_with (list[str] | Unset):
         recorded_to (int | None | Unset):
         superseded_by (None | str | Unset):
+        superseded_valid_at (int | None | Unset):
     """
 
     assertion: MemoryRecordPageItemsItemAssertion
@@ -54,6 +55,7 @@ class MemoryRecordPageItemsItem:
     conflicts_with: list[str] | Unset = UNSET
     recorded_to: int | None | Unset = UNSET
     superseded_by: None | str | Unset = UNSET
+    superseded_valid_at: int | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.memory_record_page_items_item_explicit_disposition_type_0 import (
@@ -116,6 +118,12 @@ class MemoryRecordPageItemsItem:
         else:
             superseded_by = self.superseded_by
 
+        superseded_valid_at: int | None | Unset
+        if isinstance(self.superseded_valid_at, Unset):
+            superseded_valid_at = UNSET
+        else:
+            superseded_valid_at = self.superseded_valid_at
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -147,6 +155,8 @@ class MemoryRecordPageItemsItem:
             field_dict["recorded_to"] = recorded_to
         if superseded_by is not UNSET:
             field_dict["superseded_by"] = superseded_by
+        if superseded_valid_at is not UNSET:
+            field_dict["superseded_valid_at"] = superseded_valid_at
 
         return field_dict
 
@@ -238,6 +248,15 @@ class MemoryRecordPageItemsItem:
 
         superseded_by = _parse_superseded_by(d.pop("superseded_by", UNSET))
 
+        def _parse_superseded_valid_at(data: object) -> int | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(int | None | Unset, data)
+
+        superseded_valid_at = _parse_superseded_valid_at(d.pop("superseded_valid_at", UNSET))
+
         memory_record_page_items_item = cls(
             assertion=assertion,
             owner=owner,
@@ -254,6 +273,7 @@ class MemoryRecordPageItemsItem:
             conflicts_with=conflicts_with,
             recorded_to=recorded_to,
             superseded_by=superseded_by,
+            superseded_valid_at=superseded_valid_at,
         )
 
         return memory_record_page_items_item

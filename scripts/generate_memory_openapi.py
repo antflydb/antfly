@@ -33,7 +33,12 @@ def convert(value):
     if "anyOf" in value and any(item.get("type") == "null" for item in value["anyOf"]):
         inner = next(item for item in value["anyOf"] if item.get("type") != "null")
         return {**convert(inner), "nullable": True}
-    return {key: convert(child) for key, child in value.items()}
+    result = {key: convert(child) for key, child in value.items()}
+    boundary = result.get("properties", {}).get("superseded_valid_at")
+    if boundary is not None:
+        # Unknown replacement time must not collapse into Unix epoch zero.
+        boundary["x-go-type-skip-optional-pointer"] = False
+    return result
 
 
 def optional(schema, required=()):
