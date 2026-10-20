@@ -41993,6 +41993,7 @@ components:
           minimum: 0
           maximum: 1
           nullable: true
+          x-go-type-skip-optional-pointer: false
         evidence:
           type: object
           additionalProperties: true
@@ -42034,6 +42035,7 @@ components:
           type: number
           format: double
           nullable: true
+          x-go-type-skip-optional-pointer: false
         evidence:
           type: object
           additionalProperties: true
@@ -42068,7 +42070,9 @@ components:
       additionalProperties: false
       properties:
         options:
-          $ref: '#/components/schemas/CurationProposalOptions'
+          allOf:
+            - $ref: '#/components/schemas/CurationProposalOptions'
+          x-go-type-skip-optional-pointer: false
         pin_distinct:
           type: boolean
           default: false

@@ -165,3 +165,32 @@ func TestCurationProposalAcceptReturnsPendingReplay(t *testing.T) {
 		t.Fatalf("lost pending result: %+v", result)
 	}
 }
+
+func TestCurationProposalPreservesExplicitZeroAndEmptyOptions(t *testing.T) {
+	cases := []struct {
+		name, input, field string
+		value              any
+	}{
+		{"request zero confidence", `{"action":"suppress","key":"concept/noise","confidence":0}`, "confidence", new(CurationProposalRequest)},
+		{"response zero confidence", `{"id":"id","action":"suppress","key":"concept/noise","state":"open","origin":{},"confidence":0}`, "confidence", new(CurationProposal)},
+		{"empty options override", `{"options":{}}`, "options", new(CurationProposalDecisionRequest)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := json.Unmarshal([]byte(tc.input), tc.value); err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(encoded, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := fields[tc.field]; !exists {
+				t.Fatalf("lost explicit %s in %s", tc.field, encoded)
+			}
+		})
+	}
+}

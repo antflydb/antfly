@@ -2303,8 +2303,13 @@ test "capi resolver curation proposals persist decisions and resume per resolver
     const manifest_before = try root.db.core.store.get(a, @import("antfly_resolver").curation.proposal_store_key);
     defer a.free(manifest_before);
 
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(id, .fromSlice("default"), .fromSlice(proposal_id), .fromSlice("{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\"}"), &out));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(id, .fromSlice("default"), .fromSlice(proposal_id), .fromSlice("{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\",\"wait\":{\"timeout_ms\":10}}"), &out));
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"complete\":true") != null);
+    {
+        const observed = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+        defer observed.deinit();
+        try std.testing.expect(observed.value.object.get("applied").? == .bool);
+    }
     api.antfly_buffer_free(&out);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolver_curation_json(id, .fromSlice("concepts"), &out));
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"origin\":\"review\"") != null);
@@ -2323,7 +2328,7 @@ test "capi resolver curation proposals persist decisions and resume per resolver
     defer unfinished.deinit();
     const scratch = unfinished.arena.allocator();
     try unfinished.value.object.put(scratch, "pending_id", .{ .string = proposal_id });
-    try unfinished.value.object.put(scratch, "pending_decision", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\"}", .{}));
+    try unfinished.value.object.put(scratch, "pending_decision", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\",\"wait\":{\"timeout_ms\":10}}", .{}));
     try unfinished.value.object.put(scratch, "pending_origin", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"actor\":\"curator\",\"reason\":\"confirmed\",\"created_at_ms\":1}", .{}));
     const pending_bytes = try std.json.Stringify.valueAlloc(a, unfinished.value, .{});
     defer a.free(pending_bytes);
@@ -2333,8 +2338,13 @@ test "capi resolver curation proposals persist decisions and resume per resolver
     const reopened = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
     const reopened_id = try api.publishHandle(reopened);
     defer api.antfly_db_close(reopened_id);
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(proposal_id), .fromSlice("{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\"}"), &out));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(proposal_id), .fromSlice("{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\",\"wait\":{\"timeout_ms\":10}}"), &out));
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"complete\":true") != null);
+    {
+        const observed = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+        defer observed.deinit();
+        try std.testing.expect(observed.value.object.get("applied").? == .bool);
+    }
     api.antfly_buffer_free(&out);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolver_curation_json(reopened_id, .fromSlice("concepts"), &out));
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"origin\":\"cascade\"") != null);

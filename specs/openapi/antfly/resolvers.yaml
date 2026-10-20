@@ -71,7 +71,7 @@ components:
         key: {type: string, minLength: 1, maxLength: 16384}
         into: {type: string, nullable: true}
         options: {$ref: '#/components/schemas/CurationProposalOptions'}
-        confidence: {type: number, format: double, minimum: 0, maximum: 1, nullable: true}
+        confidence: {type: number, format: double, minimum: 0, maximum: 1, nullable: true, x-go-type-skip-optional-pointer: false}
         evidence: {type: object, additionalProperties: true, nullable: true, description: "At most 16 KiB, 4096 values and depth 32."}
         actor: {type: string, maxLength: 256}
         reason: {type: string, maxLength: 4096}
@@ -84,7 +84,7 @@ components:
         key: {type: string}
         into: {type: string, nullable: true}
         options: {$ref: '#/components/schemas/CurationProposalOptions'}
-        confidence: {type: number, format: double, nullable: true}
+        confidence: {type: number, format: double, nullable: true, x-go-type-skip-optional-pointer: false}
         evidence: {type: object, additionalProperties: true, nullable: true}
         origin: {$ref: '#/components/schemas/CurationOrigin'}
         state: {type: string, enum: [open, accepted, rejected, superseded]}
@@ -93,7 +93,9 @@ components:
       type: object
       additionalProperties: false
       properties:
-        options: {$ref: '#/components/schemas/CurationProposalOptions'}
+        options:
+          allOf: [{$ref: '#/components/schemas/CurationProposalOptions'}]
+          x-go-type-skip-optional-pointer: false
         pin_distinct: {type: boolean, default: false, description: "On rejection of a merge, pin the proposed pair distinct in the same commit."}
         actor: {type: string, maxLength: 256}
         reason: {type: string, maxLength: 4096}

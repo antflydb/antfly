@@ -1833,8 +1833,8 @@ revision; clients cannot supply a server origin through entity/redirect writes.
 Read projections attach provenance to redirects and distinct pairs. Runtime
 suppressions retain the compatible `keys`/`texts` sets and add attributed
 `entries`/`text_entries`. Cascades name their original target in `cascade_from`;
-review acceptance names its proposal in `proposal_id`. Legacy records have an
-unknown creation time/revision represented by zero. Persisting this extended
+review acceptance names its proposal in `proposal_id`. Legacy attribution remains absent or has zero creation time/revision; table-level
+proposals can also have revision zero until an individual policy edit is recorded. Persisting this extended
 curation format requires reader version 10.
 
 `/tables/{entity_table}/curation/proposals` is the entity-level review surface;
@@ -1863,7 +1863,10 @@ unchanged and do not enqueue resolver work. Lite retains the existing per-resolv
 atomicity of entity actions: each accepted effect and its decision receipt share
 one catalog publication. A durable pending decision fences competing decisions
 and supports resuming a partial fanout after reopening. `complete: false` means
-the caller should retry the same decision. Ordered/HA maintenance is rejected by
+the caller should retry the same decision. Effect options and attribution remain
+frozen, while revision fences and wait budgets belong to the current request.
+Both initial decisions and terminal retries use the ordinary post-commit replay
+observer after releasing writer admission. Ordered/HA maintenance is rejected by
 the raw embedded queue path rather than bypassing ordered mutation admission.
 
 The C ABI and Rust embedded crate expose `propose_curation_json`,

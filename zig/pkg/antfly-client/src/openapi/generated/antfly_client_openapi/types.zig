@@ -8458,7 +8458,7 @@ pub const CurationProposal = struct {
 };
 
 pub const CurationProposalDecisionRequest = struct {
-    options: ?CurationProposalOptions = null,
+    options: ?std.json.Value = null,
     /// On rejection of a merge, pin the proposed pair distinct in the same commit.
     pin_distinct: ?bool = null,
     actor: ?[]const u8 = null,

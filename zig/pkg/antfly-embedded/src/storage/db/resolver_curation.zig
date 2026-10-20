@@ -410,6 +410,10 @@ pub fn namespaceConfig(a: std.mem.Allocator, cfg: catalog.ResolverConfig, reques
     next.table = request.table;
     next.key_template = request.key_template;
     var state = try resolver.curation.parseState(a, cfg.curation_json);
+    // Receipts are scoped to the exact destination namespace. The table queue
+    // retains history; carrying receipts to another table could mistake that
+    // table's equal action/key proposal ID for an already applied decision.
+    if (!std.mem.eql(u8, cfg.table, request.table) or !std.mem.eql(u8, cfg.key_template, request.key_template)) state.proposals = &.{};
     var suppression = if (cfg.suppress_json.len > 0) try std.json.parseFromSliceLeaky(resolver.curation.Suppression, a, cfg.suppress_json, .{}) else resolver.curation.Suppression{};
     if (request.reset_merges and !request.reset_curation and (state.distinct.len > 0 or state.removed_aliases.len > 0 or state.suppress.keys.len > 0 or suppression.keys.len > 0)) return error.InvalidResolverCurationRequest;
     if (request.reset_merges) {
@@ -973,4 +977,18 @@ test "resolver curation proposal evidence cannot declare indexes or resolver ide
     var out: std.ArrayListUnmanaged(catalog.ResolverConfig) = .empty;
     try @import("../../metadata/index_reconcile.zig").collectDesiredResolvers(a, root, &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "resolver curation namespace changes cannot carry equal proposal receipts into another table" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const proposed = try resolver.curation.propose(a, .{}, &.{}, .{ .action = .suppress, .key = "concept/noise" }, .{});
+    const accepted = try resolver.curation.decide(a, proposed.state, &.{}, &.{}, proposed.state.proposals[0].id, .{ .accept = true }, .{});
+    const cfg: catalog.ResolverConfig = .{ .name = "concepts", .table = "old", .key_template = "concept/{{uslug _entity.text}}", .source_artifact = "kg", .resolution_artifact = "resolved", .curation_json = try std.json.Stringify.valueAlloc(a, accepted.state, .{}), .curation_revision = 1 };
+    const moved = try namespaceConfig(a, cfg, .{ .table = "new", .key_template = cfg.key_template, .reset_merges = true, .reset_curation = true });
+    const next = try resolver.curation.parseState(a, moved.curation_json);
+    try std.testing.expectEqual(@as(usize, 0), next.proposals.len);
+    const same = try namespaceConfig(a, cfg, .{ .table = "old", .key_template = cfg.key_template, .reset_merges = true, .reset_curation = true });
+    try std.testing.expectEqual(@as(usize, 1), (try resolver.curation.parseState(a, same.curation_json)).proposals.len);
 }

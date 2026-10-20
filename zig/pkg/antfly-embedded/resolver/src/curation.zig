@@ -519,6 +519,9 @@ pub fn planWithOrigin(a: std.mem.Allocator, state_json: []const u8, merges: []co
                     var kept: std.ArrayListUnmanaged(Redirect) = .empty;
                     for (next.items) |alias| if (!released.contains(alias.key)) try kept.append(a, alias);
                     next = kept;
+                    var origins: std.ArrayListUnmanaged(RedirectOrigin) = .empty;
+                    for (state.redirect_origins) |entry| if (!released.contains(entry.key)) try origins.append(a, entry);
+                    state.redirect_origins = origins.items;
                     state.removed_aliases = try editSet(a, state.removed_aliases, try mapKeys(a, released), true, false);
                     changed = true;
                     if (request.absorbed == .suppress) {
@@ -561,20 +564,26 @@ pub fn planWithOrigin(a: std.mem.Allocator, state_json: []const u8, merges: []co
 /// Queue supersession is independent of policy serialization. Evidence never
 /// enters a resolver catalog or the scratch state used to plan its action.
 pub fn supersede(a: std.mem.Allocator, current: []const Proposal, request: Request, absorbed: []const AbsorbedResult, origin: Origin) ![]const Proposal {
+    var affected: std.StringHashMapUnmanaged(void) = .empty;
+    const key = request.from orelse request.key;
+    if (key) |value| try affected.put(a, value, {});
+    for (request.keys) |value| try affected.put(a, value, {});
+    for (absorbed) |value| try affected.put(a, value.key, {});
+    const other = request.to orelse request.target;
     const proposals = try a.dupe(Proposal, current);
     for (proposals) |*proposal| {
         if (proposal.state != .open) continue;
-        const key = request.from orelse request.key;
-        const same_key = if (key) |value| std.mem.eql(u8, value, proposal.key) else false;
-        var selected_key = same_key;
-        for (request.keys) |value| selected_key = selected_key or std.mem.eql(u8, value, proposal.key);
-        for (absorbed) |value| selected_key = selected_key or std.mem.eql(u8, value.key, proposal.key);
+        const references = affected.contains(proposal.key) or (proposal.into != null and affected.contains(proposal.into.?));
+        const same_pair = if (key != null and other != null and proposal.into != null)
+            (std.mem.eql(u8, key.?, proposal.key) and std.mem.eql(u8, other.?, proposal.into.?)) or
+                (std.mem.eql(u8, other.?, proposal.key) and std.mem.eql(u8, key.?, proposal.into.?))
+        else
+            false;
         const moot = switch (request.action) {
-            .suppress => selected_key and (proposal.action == .suppress or proposal.action == .merge or proposal.action == .unsuppress),
-            .unsuppress => selected_key and proposal.action == .unsuppress,
-            .merge => same_key and (proposal.action == .merge or proposal.action == .unmerge),
-            .unmerge => same_key and proposal.action == .unmerge,
-            .distinct => proposal.action == .distinct and std.mem.eql(u8, try pairKey(a, request.from orelse request.key orelse "", request.to orelse request.target orelse ""), try pairKey(a, proposal.key, proposal.into orelse "")),
+            // Identity changes invalidate older judgments of either endpoint.
+            .merge, .unmerge, .suppress, .unsuppress => references,
+            // A distinct assertion settles both directions of a merge judgment.
+            .distinct => same_pair and (proposal.action == .distinct or proposal.action == .merge),
             .suppressions => false,
         };
         if (moot) {
@@ -916,9 +925,12 @@ test "curation suppress absorbed chains atomically with cascade provenance and e
     const aliases = [_]Redirect{ .{ .key = "a", .target = "b" }, .{ .key = "b", .target = "c" }, .{ .key = "other", .target = "elsewhere" } };
     try std.testing.expectError(error.SuppressedResolverRedirectTarget, plan(a, "", &aliases, &aliases, .{ .action = .suppress, .key = "c" }));
     const stamp: Origin = .{ .actor = "curator", .reason = "generic", .created_at_ms = 123, .revision = 7 };
-    const cascade = try planWithOrigin(a, "", &aliases, &aliases, .{ .action = .suppress, .key = "c", .absorbed = .suppress }, stamp);
+    const previous = try std.json.Stringify.valueAlloc(a, State{ .redirect_origins = &.{ .{ .key = "a", .target = "b", .origin = stamp }, .{ .key = "b", .target = "c", .origin = stamp }, .{ .key = "other", .target = "elsewhere", .origin = stamp } } }, .{});
+    const cascade = try planWithOrigin(a, previous, &aliases, &aliases, .{ .action = .suppress, .key = "c", .absorbed = .suppress }, stamp);
     try std.testing.expectEqual(@as(usize, 2), cascade.absorbed.len);
     try std.testing.expectEqual(@as(usize, 1), cascade.merges.len);
+    try std.testing.expectEqual(@as(usize, 1), cascade.state.redirect_origins.len);
+    try std.testing.expectEqualStrings("other", cascade.state.redirect_origins[0].key);
     try std.testing.expectEqual(@as(usize, 3), cascade.state.suppress.keys.len);
     try std.testing.expectEqual(@as(usize, 2), cascade.state.removed_aliases.len);
     for (cascade.state.suppress.entries) |entry| {
@@ -1001,4 +1013,29 @@ test "curation absorbed disposition handles intermediate targets and large disti
     const released = try plan(a, "", aliases, aliases, .{ .action = .suppress, .key = "target", .absorbed = .release, .pin_distinct = true });
     try std.testing.expectEqual(@as(usize, 5000), released.state.distinct.len);
     try std.testing.expectEqual(@as(usize, 0), released.merges.len);
+}
+
+test "curation supersession follows both entity references and symmetric merge judgments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var queue: State = .{};
+    for ([_]ProposalRequest{
+        .{ .action = .merge, .key = "a", .into = "b" },
+        .{ .action = .suppress, .key = "a" },
+        .{ .action = .distinct, .key = "a", .into = "b" },
+        .{ .action = .merge, .key = "x", .into = "a" },
+        .{ .action = .unmerge, .key = "x" },
+    }) |request| queue = (try propose(a, queue, &.{}, request, .{})).state;
+    const merged = try supersede(a, queue.proposals, .{ .action = .merge, .key = "a", .to = "elsewhere" }, &.{}, .{});
+    for (merged[0..4]) |proposal| try std.testing.expectEqual(.superseded, proposal.state);
+    try std.testing.expectEqual(.open, merged[4].state);
+    const pinned = try supersede(a, queue.proposals, .{ .action = .distinct, .key = "b", .to = "a" }, &.{}, .{});
+    try std.testing.expectEqual(.superseded, pinned[0].state);
+    try std.testing.expectEqual(.superseded, pinned[2].state);
+    try std.testing.expectEqual(.open, pinned[1].state);
+    const suppressed = try supersede(a, queue.proposals, .{ .action = .suppress, .key = "b" }, &.{}, .{});
+    try std.testing.expectEqual(.superseded, suppressed[0].state);
+    try std.testing.expectEqual(.superseded, suppressed[2].state);
+    try std.testing.expectEqual(.open, suppressed[3].state);
 }

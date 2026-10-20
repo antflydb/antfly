@@ -7767,6 +7767,39 @@ fn proposalManifest(a: std.mem.Allocator, db: *db_mod.DB) !ProposalManifest {
     const bytes = db.core.store.get(a, proposal_store_key) catch |err| return if (err == error.NotFound) .{} else err;
     return @import("antfly_resolver").curation.parseProposalManifest(a, bytes);
 }
+const ProposalObservation = struct { applied: bool, rows: std.json.Value };
+/// A retry observes receipts, never replays the accepted action. Current policy
+/// can contain later corrections, whose progress is a conservative wait floor.
+fn observeProposal(handle: *handles.Handle, a: std.mem.Allocator, table: []const u8, id: []const u8) !ProposalObservation {
+    const pure = @import("antfly_resolver").curation;
+    const owner = @import("../storage/db/resolver_curation.zig");
+    var sources: std.ArrayListUnmanaged(struct { db: *db_mod.DB, name: []const u8 }) = .empty;
+    try sources.append(a, .{ .db = &handle.db, .name = "default" });
+    var it = handle.embedded_tables.iterator();
+    while (it.next()) |entry| try sources.append(a, .{ .db = &entry.value_ptr.*.db, .name = entry.key_ptr.* });
+    var rows = std.json.Array.init(a);
+    var applied = true;
+    for (sources.items) |source| {
+        const configs = source.db.core.index_manager.listResolverIdentities(a) catch |err| {
+            applied = false;
+            try rows.append(try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .source_table = source.name, .resolver = "", .accepted = true, .applied = false, .@"error" = @errorName(err) }, .{}), .{}));
+            continue;
+        };
+        for (configs) |cfg| {
+            if (!std.mem.eql(u8, cfg.table, table)) continue;
+            const state = try pure.parseState(a, cfg.curation_json);
+            const participant = for (state.proposals) |receipt| {
+                if (std.mem.eql(u8, receipt.id, id) and receipt.state != .open) break true;
+            } else false;
+            if (!participant) continue;
+            const done = owner.applied(source.db, cfg) catch false;
+            applied = applied and done;
+            try rows.append(try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .source_table = source.name, .resolver = cfg.name, .revision = cfg.curation_revision, .replay_sequence = cfg.curation_revision, .replay_sequence_kind = "resolver_revision", .accepted = true, .applied = done }, .{}), .{}));
+        }
+    }
+    return .{ .applied = applied, .rows = .{ .array = rows } };
+}
+
 /// The root table owns queue admission. Accepted actions use per-resolver
 /// receipts, so a partial fanout can resume after process restart without
 /// applying an already accepted action again.
@@ -7775,7 +7808,8 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
     const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
     if (request.len > 4 * 1024 * 1024) return capi.mapError(error.ResolverCurationLimitExceeded);
     const guard = enterHandle(handle_ptr, if (operation_name == .list or operation_name == .get) .read else .exclusive) orelse return capi.mapError(error.InvalidArgument);
-    defer guard.leave();
+    var admitted = true;
+    defer if (admitted) guard.leave();
     if (guard.entry_error) |value| return capi.ensureError(value, @src().fn_name);
     const handle = guard.handle.parent_handle orelse guard.handle;
     var arena = std.heap.ArenaAllocator.init(handle.alloc);
@@ -7854,11 +7888,16 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
         selected = manifest.queue.proposals.len - 1;
         break :blk manifest.queue.proposals[selected.?];
     } else return capi.mapError(error.NotFound);
+    if (input_decision.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return capi.mapError(error.InvalidResolverCurationRequest);
     if (operation_name == .decide and proposal.state != .open) {
         const wanted: pure.ProposalState = if (input_decision.accept) .accepted else .rejected;
         if (proposal.state != wanted) return capi.mapError(error.ResolverCurationConflict);
-        out.* = stringifyJson(.{ .proposal = proposal, .changed = false, .complete = true }) catch |err| return capi.mapError(err);
-        return .ok;
+        const observation = observeProposal(handle, a, table.bytes(), proposal.id) catch |err| return capi.mapError(err);
+        out.* = stringifyJson(.{ .proposal = proposal, .atomicity = "resolver", .changed = false, .complete = true, .applied = observation.applied, .results = observation.rows }) catch |err| return capi.mapError(err);
+        policy_lease.release();
+        admitted = false;
+        guard.leave();
+        return waitResolverCurationResponse(handle_ptr, if (input_decision.wait) |wait| wait.timeout_ms else 0, out);
     }
     if (!input_decision.accept and (input_decision.options != null or (input_decision.pin_distinct and proposal.action != .merge))) return capi.mapError(error.InvalidResolverCurationRequest);
     if (input_decision.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return capi.mapError(error.InvalidResolverCurationRequest);
@@ -7903,7 +7942,7 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
             const has_receipt = for (state.proposals) |old| {
                 if (std.mem.eql(u8, old.id, proposal.id) and old.state != .open) break true;
             } else false;
-            if (!has_receipt) if (decision.expected_revision) |revision| if (revision != cfg.curation_revision) return capi.mapError(error.ResolverCurationConflict);
+            if (!has_receipt) if (input_decision.expected_revision) |revision| if (revision != cfg.curation_revision) return capi.mapError(error.ResolverCurationConflict);
             var origin = stamp;
             origin.revision = std.math.add(u64, cfg.curation_revision, 1) catch |err| return capi.mapError(err);
             if (source.db.maintenanceRequiresOrderedApply() catch |err| return capi.mapError(err)) return capi.mapError(error.OrderedResolverReviewRequired);
@@ -7983,7 +8022,21 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
     policy_lease.release();
     policy_lease = db.local_execution.row_policy_gate.enterRaw() catch |err| return capi.mapError(err);
     saveProposalManifest(a, db, manifest) catch |err| return capi.mapError(err);
-    out.* = if (operation_name == .create) stringifyJson(manifest.queue.proposals[selected.?]) catch |err| return capi.mapError(err) else stringifyJson(.{ .proposal = manifest.queue.proposals[selected.?], .atomicity = "resolver", .complete = complete, .results = std.json.Value{ .array = results } }) catch |err| return capi.mapError(err);
+    var applied = complete;
+    for (results.items) |row| {
+        const observed = row.object.get("applied") orelse {
+            applied = false;
+            continue;
+        };
+        applied = applied and observed == .bool and observed.bool;
+    }
+    out.* = if (operation_name == .create) stringifyJson(manifest.queue.proposals[selected.?]) catch |err| return capi.mapError(err) else stringifyJson(.{ .proposal = manifest.queue.proposals[selected.?], .atomicity = "resolver", .complete = complete, .applied = applied, .results = std.json.Value{ .array = results } }) catch |err| return capi.mapError(err);
+    if (operation_name == .decide) {
+        policy_lease.release();
+        admitted = false;
+        guard.leave();
+        return waitResolverCurationResponse(handle_ptr, if (input_decision.wait) |wait| wait.timeout_ms else 0, out);
+    }
     return .ok;
 }
 pub fn antfly_db_propose_curation_json(handle: ?*anyopaque, table: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
