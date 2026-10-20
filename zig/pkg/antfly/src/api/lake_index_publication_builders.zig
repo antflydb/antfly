@@ -63,7 +63,7 @@ const PublicationIo = struct {
     fn capability(self: *PublicationIo) ?*const stores.IoPhase {
         // Disabling I/O lanes retains the established required-inline fallback.
         if (self.execution.scheduler.max_io_workers == 0) return null;
-        self.bridge = .{ .io = self.io, .ptr = self, .max_parallel = @min(8, self.execution.scheduler.max_io_workers), .begin = begin, .finish = finish, .abort = abort };
+        self.bridge = .{ .io = self.io, .ptr = self, .max_parallel = @min(8, self.execution.scheduler.max_io_workers), .scheduler = self.execution.scheduler, .begin = begin, .finish = finish, .abort = abort };
         return &self.bridge;
     }
     fn begin(raw: *anyopaque, count: usize) !void {

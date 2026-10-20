@@ -111,9 +111,11 @@ const Reader = struct {
     reads: u64 = 128 * 1024 * 1024,
     writes: u64 = 0,
     external_budget: ?*u64 = null,
+    publication: bool = false,
     pages: pages_mod.PageStore = undefined,
     fn init(self: *@This(), domain: Id) void {
         self.pages = .{ .domain = domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = self.external_budget orelse &self.reads, .remaining_write_bytes = &self.writes, .read_cache = if (self.cached != null) .{ .ptr = self, .read = readPage } else null };
+        if (self.publication) self.pages.admitPublication();
     }
     fn check(self: *@This()) !void {
         try self.token.check();
@@ -440,11 +442,15 @@ pub fn publishManifests(a: A, store: *stores.ArtifactStore, refs: []const Chunk,
     defer publisher.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
+    var manifests: corpus.ManifestReader = .{ .a = a, .store = store.*, .domain = domain, .token = token };
+    defer manifests.deinit();
     for ([_]bool{ true, false }) |deleting| {
-        for (if (deleting) removed else refs) |ref| {
+        const inputs = if (deleting) removed else refs;
+        for (inputs, 0..) |ref, index| {
             try token.check();
             _ = arena.reset(.free_all);
-            const group = try corpus.loadFileManifestPublication(arena.allocator(), store.*, ref, domain, token);
+            const group = try manifests.load(arena.allocator(), ref);
+            if (index + 1 < inputs.len) manifests.prefetch(inputs[index + 1]) else if (deleting and refs.len != 0) manifests.prefetch(refs[0]);
             try publisher.add(group, ref, deleting);
         }
     }
@@ -504,8 +510,15 @@ pub fn fileRecords(a: A, root: corpus.Root, store: stores.ArtifactStore, cached:
     var budget: u64 = 128 * 1024 * 1024;
     return fileRecordsBudget(a, root, store, cached, token, &budget);
 }
+pub fn fileRecordsPublication(a: A, root: corpus.Root, store: stores.ArtifactStore, token: Cancellation) ![]const FileRecord {
+    var budget: u64 = 128 * 1024 * 1024;
+    return fileRecordsInner(a, root, store, null, token, &budget, true);
+}
 pub fn fileRecordsBudget(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation, budget: *u64) ![]const FileRecord {
-    var read: Reader = .{ .store = store, .cached = cached, .token = token, .external_budget = budget };
+    return fileRecordsInner(a, root, store, cached, token, budget, false);
+}
+fn fileRecordsInner(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation, budget: *u64, publication: bool) ![]const FileRecord {
+    var read: Reader = .{ .store = store, .cached = cached, .token = token, .external_budget = budget, .publication = publication };
     read.init(root.domain);
     try read.check();
     var cursor = try tree.Cursor.init(a, read.pages.store(), root.directories.files, "", null);
@@ -697,7 +710,13 @@ pub fn loadAll(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactStore,
 /// Stream the authenticated retained serving closure with one record decoded.
 /// Maintenance manifests are deliberately not required by the serving audit.
 pub fn walkSegments(a: A, root: corpus.Root, store: stores.ArtifactStore, token: Cancellation, visitor: anytype) !void {
-    var read: Reader = .{ .store = store, .cached = null, .token = token };
+    return walkSegmentsInner(a, root, store, token, visitor, false);
+}
+pub fn walkSegmentsPublication(a: A, root: corpus.Root, store: stores.ArtifactStore, token: Cancellation, visitor: anytype) !void {
+    return walkSegmentsInner(a, root, store, token, visitor, true);
+}
+fn walkSegmentsInner(a: A, root: corpus.Root, store: stores.ArtifactStore, token: Cancellation, visitor: anytype, publication: bool) !void {
+    var read: Reader = .{ .store = store, .cached = null, .token = token, .publication = publication };
     read.init(root.domain);
     var cursor = try tree.Cursor.init(a, read.pages.store(), root.directories.segments, "", null);
     defer cursor.deinit();

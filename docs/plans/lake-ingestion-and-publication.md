@@ -3301,3 +3301,34 @@ after its referenced packs succeed. A 13-pack regression observes three uploads
 in flight with three I/O slots, preserves the serial directory identity, reads
 across every pack boundary, and drains an injected partial-wave failure. These
 are deterministic request/concurrency bounds, without a cloud latency claim.
+
+### Compaction admission, manifest read-ahead, and typed text projection
+
+Serving compaction now explicitly opts its ownership, term, source-route and tie
+reducers into publication page I/O. Canonical inventories, retained serving roots,
+checkpoint bases, file manifests and separately paged spans use synchronous
+publication reads. These operations park the CPU lane while transport waits and
+resume before metadata decoding or reduction. Batched sorted tree writes retain
+the existing dependency and publication order.
+
+Canonical metadata construction, directory reconstruction and added compaction
+inputs can prefetch one verified manifest while the current group is reduced.
+The child has independent shared I/O admission and no serial publication callback.
+Only wire bytes cross the task boundary; the decode arena remains owner-local.
+Prefetch requires known working-set headroom, is bounded by the existing 4 MiB
+manifest limit, and declines under scheduler or memory pressure. Joining parks the
+owner, restores CPU admission before decoding, and drains cancellation/errors
+before releasing reference strings or buffers. Required inline reads remain the
+fallback. This introduces no archive-sized queue or persistent cache state.
+
+Text projection binds native vectors once per input batch. Selected-field indexes
+consume values directly, including arrays, dictionary strings and nulls, through
+the shared text field/provenance rules. General schema extraction continues to use
+the same mapper. Immutable column leases allow text values to borrow producer
+payloads until segment encoding; retained leases are bounded by eight owners and
+8 MiB, and are released on flush or unwind. Encoded/non-retainable producers copy
+values, and stored-source projections retain their owned tree. No producer view
+survives without a lease, and scalar/vector, analyzer, typed-value and highlight
+behavior remain identical. These changes preserve existing artifact formats and
+require no new public configuration. Archive/cloud throughput still needs the
+controlled qualification described above.

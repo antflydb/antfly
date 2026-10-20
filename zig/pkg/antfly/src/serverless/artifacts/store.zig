@@ -196,6 +196,7 @@ pub const IoPhase = struct {
     io: std.Io,
     ptr: *anyopaque,
     max_parallel: usize,
+    scheduler: ?*@import("antfly_local_sources").sql_parallel_scheduler.Scheduler = null,
     begin: *const fn (*anyopaque, usize) anyerror!void,
     finish: *const fn (*anyopaque) anyerror!void,
     abort: *const fn (*anyopaque) void,

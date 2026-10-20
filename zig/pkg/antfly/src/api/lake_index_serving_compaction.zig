@@ -94,7 +94,7 @@ const Builder = struct {
         for (self.candidates[level].items) |tail| {
             try self.check();
             _ = arena.reset(.free_all);
-            const group = try corpus.loadFileManifest(arena.allocator(), self.store.*, tail.ref, self.pages.domain, self.token, null);
+            const group = try corpus.loadFileManifestPublication(arena.allocator(), self.store.*, tail.ref, self.pages.domain, self.token);
             if (group.segments.len != 1 or group.sources.len != tail.spans or group.admissions[0].bytes != tail.bytes) return error.InvalidNativeLakeTextCorpus;
             try self.removed.append(self.out, tail.ref);
             try self.contribution(group, -1);
@@ -268,9 +268,9 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, current: corpus.Root,
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
-    const base: ?corpus.Root = if (previous) |old| if (old.checkpoint_base != null) try corpus.checkpointBase(ca, store.*, old, token) else old else null;
-    const removed = if (base) |old| try corpus.text_directory.fileRecords(ca, old, store.*, null, token) else &.{};
-    const files = try corpus.text_directory.fileRecords(ca, current, store.*, null, token);
+    const base: ?corpus.Root = if (previous) |old| if (old.checkpoint_base != null) try corpus.checkpointBasePublication(ca, store.*, old, token) else old else null;
+    const removed = if (base) |old| try corpus.text_directory.fileRecordsPublication(ca, old, store.*, token) else &.{};
+    const files = try corpus.text_directory.fileRecordsPublication(ca, current, store.*, token);
     var added: std.ArrayList(corpus.text_directory.FileRecord) = .empty;
     var previous_files: std.StringHashMapUnmanaged(state.File) = .empty;
     defer previous_files.deinit(a);
@@ -289,6 +289,7 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     var writes: u64 = 512 * 1024 * 1024;
     const scope = store.upload_scope.?;
     var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    pages.admitPublication();
     var cancellation = token;
     const Check = struct {
         fn call(raw: *anyopaque) !void {
@@ -311,16 +312,16 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     defer for (&builder.pending_arena) |*pending| pending.deinit();
     var prior: ?corpus.Root = null;
     if (previous) |old| if (old.serving != null) {
-        prior = try corpus.servingRoot(ca, store.*, old, token, null);
+        prior = try corpus.servingRootPublication(ca, store.*, old, token);
     };
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     if (prior) |old| {
         builder.collect_term_deltas = old.term_directory.leaves != null;
         if (old.source_routes_version == 0) {
-            for (try corpus.text_directory.fileRecords(ca, old, store.*, null, token)) |record| {
+            for (try corpus.text_directory.fileRecordsPublication(ca, old, store.*, token)) |record| {
                 _ = scratch.reset(.free_all);
-                const group = try corpus.loadFileManifest(scratch.allocator(), store.*, record.manifest, old.domain, token, null);
+                const group = try corpus.loadFileManifestPublication(scratch.allocator(), store.*, record.manifest, old.domain, token);
                 try @import("lake_index_source_routes.zig").mutate(a, &source_routes, group, false);
             }
         }
@@ -354,7 +355,7 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
             try builder.check();
             _ = scratch.reset(.free_all);
             const sa = scratch.allocator();
-            const group = try corpus.loadFileManifest(sa, store.*, ref.*, current.domain, token, null);
+            const group = try corpus.loadFileManifestPublication(sa, store.*, ref.*, current.domain, token);
             if (group.segments.len != 1 or group.sources.len == 0) return error.InvalidNativeLakeTextCorpus;
             var sources: std.ArrayList(Span) = .empty;
             for (group.sources) |span| if (plan.by_id.get(span.file.id)) |ordinal| {
@@ -370,11 +371,14 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
             if (sources.items.len != 0) try builder.add(.{ .ref = group.segments[0], .admission = group.admissions[0], .sources = sources.items, .original_docs = group.admissions[0].doc_count, .summary = group.summaries[0] });
         }
     }
-    for (delta.added) |record| {
+    var manifests: corpus.ManifestReader = .{ .a = a, .store = store.*, .domain = current.domain, .token = token };
+    defer manifests.deinit();
+    for (delta.added, 0..) |record, index| {
         try builder.check();
         _ = scratch.reset(.free_all);
         const sa = scratch.allocator();
-        const group = try corpus.loadFileManifest(sa, store.*, record.manifest, current.domain, token, null);
+        const group = try manifests.load(sa, record.manifest);
+        if (index + 1 < delta.added.len) manifests.prefetch(delta.added[index + 1].manifest);
         const physical = group.physical_manifest orelse return error.InvalidNativeLakeTextCorpus;
         const rows: u32 = @intCast(try corpus.physical.validate(group.rows));
         var lower: u32 = 0;
@@ -414,14 +418,14 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
             }
         };
         var bootstrap: Bootstrap = .{ .pages = &pages, .terms = &terms, .context = context, .token = token };
-        try corpus.text_directory.walkSegments(a, root, store.*, token, &bootstrap);
+        try corpus.text_directory.walkSegmentsPublication(a, root, store.*, token, &bootstrap);
     }
     if (prior == null or prior.?.tie_bounds == null) {
         // Bootstrap compact navigation once for an older publication. Only
         // manifests/spans are read, never postings or source Parquet data.
-        for (try corpus.text_directory.fileRecords(ca, root, store.*, null, token)) |record| {
+        for (try corpus.text_directory.fileRecordsPublication(ca, root, store.*, token)) |record| {
             _ = scratch.reset(.free_all);
-            const group = try corpus.loadFileManifest(scratch.allocator(), store.*, record.manifest, root.domain, token, null);
+            const group = try corpus.loadFileManifestPublication(scratch.allocator(), store.*, record.manifest, root.domain, token);
             try @import("lake_index_text_ties.zig").mutate(a, &ties, group, false);
         }
     }
@@ -532,7 +536,57 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     var current = try Helper.root(ca, &store, refs[0..128]);
     var first_plan = try Helper.plan(ca, current, store, null);
     defer first_plan.deinit();
-    current.serving = try publish(a, ca, &store, current, null, &first_plan, .{ .io = std.testing.io }, .none);
+    const IoProbe = struct {
+        var active: *@This() = undefined;
+        original: stores.ArtifactStore,
+        execution: local.sql_parallel_scheduler.Execution,
+        pending: ?local.sql_parallel_scheduler.Execution.Io = null,
+        peak: usize = 0,
+        parked_reads: usize = 0,
+        fn begin(raw: *anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.peak = @max(self.peak, count);
+            self.pending = try self.execution.beginIo(std.testing.io, count);
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var pending = self.pending.?;
+            self.pending = null;
+            try pending.finish();
+        }
+        fn abort(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.pending) |*pending| pending.abort();
+            self.pending = null;
+        }
+        fn range(_: *anyopaque, alloc: A, id: []const u8, offset: u64, count: usize, token: Cancellation) ![]u8 {
+            const self = active;
+            if (!self.execution.active) {
+                self.parked_reads += 1;
+                var other: local.sql_parallel_scheduler.Execution = .{ .scheduler = self.execution.scheduler, .bytes = 1024 };
+                try other.enter(std.testing.io);
+                other.pause();
+            }
+            return self.original.getRangeAllocWithCancellationUsingAllocator(alloc, id, offset, count, token);
+        }
+    };
+    var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = 3 };
+    var probe: IoProbe = .{ .original = store, .execution = .{ .scheduler = &scheduler, .bytes = 1024 } };
+    IoProbe.active = &probe;
+    try probe.execution.enter(std.testing.io);
+    defer probe.execution.pause();
+    const capability: stores.IoPhase = .{ .io = std.testing.io, .ptr = &probe, .scheduler = &scheduler, .max_parallel = 3, .begin = IoProbe.begin, .finish = IoProbe.finish, .abort = IoProbe.abort };
+    var vtable = store.vtable.*;
+    vtable.get_range_alloc_with_cancellation = IoProbe.range;
+    var publication_store = store;
+    publication_store.io_phase = &capability;
+    publication_store.vtable = &vtable;
+    current.serving = try publish(a, ca, &publication_store, current, null, &first_plan, .{ .io = std.testing.io }, .none);
+    try std.testing.expect(probe.execution.active);
+    try std.testing.expect(probe.parked_reads > 0);
+    try std.testing.expect(probe.peak > 1 and probe.peak <= 3);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    probe.execution.pause();
     const first = try corpus.servingRoot(ca, store, current, .none, null);
     try std.testing.expectEqual(@as(u32, 1), first.segment_count);
     try std.testing.expectEqual(@as(u64, 1), first.tie_bounds.?.records);

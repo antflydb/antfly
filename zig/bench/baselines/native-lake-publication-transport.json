@@ -43,6 +43,18 @@
     "serial_and_parallel_directory_identities": "equal",
     "partial_upload_failure": "drain children before returning; no directory published"
   },
+  "compaction_and_projection": {
+    "serving_compaction_metadata_reads_park_cpu": true,
+    "serving_compaction_trees_batch_writes": true,
+    "maximum_prefetched_manifests": 1,
+    "maximum_prefetched_manifest_payload_bytes": 4194304,
+    "prefetch_uses_independent_io_admission": true,
+    "opaque_or_saturated_prefetch": "required inline fallback",
+    "maximum_retained_text_column_owners": 8,
+    "maximum_retained_text_column_bytes": 8388608,
+    "typed_projection_reference_segment_identity": "equal across schema, selected-field, stored-source and borrowing modes",
+    "unleased_projection_payloads": "owned copies"
+  },
   "qualification_outstanding": [
     "Controlled identical-fixture base/head HN one-file and 1024-file latency and post-GC footprint",
     "Live object-provider publication throughput and durable retention qualification"
