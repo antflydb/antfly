@@ -4,6 +4,63 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Binding-aware coordinator status (2026-10-19)
+
+Commit `141e2a2f824c518a7081444fd0e55fe6ce402c08` adds typed status evidence
+carrying the actual durable status, original preparation mode and
+participant/route binding. The coordinator compares that evidence with its
+retained original cohort for pending/terminal retries and ambiguous commit
+recovery. Missing mode or binding cannot qualify a committed required
+transaction. Every group, epoch, participant or route mismatch prevents follower
+commit propagation; required status never falls back to a mode-only legacy read. Expected
+binding values are comparisons, not evidence returned by a provider.
+
+Final source `85e2ca05fac9ced3552bf1960ad40cb702f325b0` also verifies both
+abort-confirmation paths: the BEGIN contact-mask path and the later full-cohort
+path. A mismatched bound abort cannot authorize follower cleanup. Legacy aborts
+remain terminal after their sidecars retire. Required abort observations have a
+finite recovery deadline bounded by completion authority; ordinary legacy status
+behavior is preserved.
+
+The native DB read `getTransactionPreparationDecision` captures status, mode and
+binding under one shared apply fence. It yields through original read admission
+while a writer holds that fence, preserves original errors (including
+errors that resemble missing keys), and releases its lock on every rejection. It reads
+retained history after accepted effect frames retire, and performs no producer
+work or query/index admission. Its caller must establish the appropriate
+quorum/owner read barrier and hidden-owner authorization before reading local
+storage. This local snapshot alone does not establish distributed authority or
+readiness.
+
+The new `bound_retained_contract` capability defaults false and is required
+before fresh required BEGIN. Native ABI is 42 and engine descriptor 28; storage
+owner ABI 101, file floor 7 and Raft protocol 25 are unchanged. The shared error
+registry now includes `PreparationRequirementMismatch`.
+
+`native-bound-status-v3-verified.json` records six focused native targets (Build
+Summary: 108/108 steps succeeded; 16/16 tests passed) and 184 selected cases.
+Four new coordinator regressions cover all binding-field drift, hidden
+scope/plan drift, ambiguous commit replies, both abort replies, terminal legacy
+aborts and refusal of legacy status fallback in both modes. The persistent
+bound-Raft test also exercises the actual native snapshot before/after
+resolution and reopen, every original error at every read checkpoint, and
+original rejections while waiting on a held write fence. Existing SQL/HTTP session, cohort,
+ownership and control-progress regressions pass.
+
+The immutable public package from `141e2a2f824c518a7081444fd0e55fe6ce402c08`
+passes 25 ReleaseSafe consumer steps; all 4,483 exported sources match final
+source, whose later change is an ELv2 coordinator file excluded from that
+package. Full Linux qualification remains waived. Actual required status
+delivery through native owner/quorum and RPC providers remains unwired, as do
+required BEGIN/PREPARE/seal providers and funded original-authority producers.
+Those adapters must return actual saved metadata and correlate the original
+transaction/owner identity. They must never construct durable proof from the
+request's expected binding. Production proposals remain gated pending those
+providers, original route authority, legacy-session and
+all-member/import/downgrade migration, large-frame transport and distributed
+fault/restart qualification. Completion resource bundles and the broader
+original scheduler scope remain open.
+
 ## Original routed cohorts for stable recovery (2026-10-19)
 
 Commit `120da6eb7d999590e292fb4fc5fe846d3bfc00e6` adds a lease-fenced

@@ -16,20 +16,21 @@ branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `fc9bea9f20194754644605d796c00beeb1f325d0`.
-Native ABI 41, engine descriptor 27, file floor 7 and Raft protocol 25 fence
-persistent participant/route bindings and original cohort handoff; storage owner
-ABI remains 101. New stable SQL/HTTP sessions retain their complete routed
-cohort before BEGIN. Retry and maintenance use original participants, scopes,
-epochs and inputs without regrouping against current topology. Both preparation
-modes check the original terminal decision before new admission. Versioned
-session records reject older readers; older executing sessions retain their
-compatibility path.
+Native ABI 42, engine descriptor 28, file floor 7 and Raft protocol 25 fence
+persistent bindings, original cohort handoff and bound recovery status; storage
+owner ABI remains 101. New stable SQL/HTTP sessions retain their complete routed
+cohort before BEGIN. Required coordinator status checks compare actual saved
+mode and binding against that original cohort, including ambiguous commit and
+both abort confirmations. Missing proof cannot authorize follower commit; a
+mismatched bound observation cannot authorize follower commit or cleanup. Required
+status never falls back to legacy status. Legacy terminal aborts remain final.
 
-Final source `cdf9393e72e3724f5be6e5e39f46f9fc47cfdee9` passes six focused
-native targets and 25 public-package consumer checks, including actual SQL/HTTP
-handoffs, persistent bound apply and expired-request cancellation isolation.
-Production required proposals remain gated pending binding-aware global status,
-actual adapters/providers, fresh route authority, funded producers, large-frame
+Final source `85e2ca05fac9ced3552bf1960ad40cb702f325b0` passes six focused
+native targets and 25 public-package consumer checks, including original
+cohorts, actual SQL/HTTP handoffs, persistent bound apply and fenced status
+reads that preserve original admission errors. Production required proposals
+remain gated pending actual owner/quorum and RPC status delivery, required
+adapters/providers, fresh route authority, funded producers, large-frame
 transport and coordinated migration. The broader scheduler design and
 distributed fault/restart qualification remain open.
 

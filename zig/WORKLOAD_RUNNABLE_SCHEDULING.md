@@ -19,6 +19,24 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Bound recovery status (2026-10-19)
+
+Required coordinator status checks now verify the actual saved mode and binding
+against original participant routing, including ambiguous commit and both abort
+confirmation paths. A mismatched proof cannot authorize follower propagation or
+cleanup, and required status never falls back to legacy mode-only status. Legacy
+terminal aborts remain final. One native shared-apply snapshot returns the
+actual status/mode/binding and preserves original admission through reads and
+waiting.
+
+Native ABI 42, engine descriptor 28 and a required bound-retained capability
+fence the new path; storage owner ABI 101, file floor 7 and Raft protocol 25 are
+unchanged. Source `85e2ca05fac9ced3552bf1960ad40cb702f325b0` passes six native
+targets and 25 immutable public package consumer checks. Actual owner/RPC
+delivery and required providers, funded producers and coordinated migration
+remain required before activation. See the implementation ledger for exact
+evidence and remaining design scope.
+
 ## Original participant cohorts for recovery (2026-10-19)
 
 New stable SQL/HTTP commits durably retain one complete original routed cohort
