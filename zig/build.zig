@@ -160,8 +160,13 @@ pub fn create(b: *std.Build) ?Artifacts {
     const apple_reader_enabled = b.option(bool, "apple-providers", "Enable native Apple OCR, generation, and transcription (macOS 27 SDK and Swift required)") orelse false;
     if (apple_reader_enabled and (target.result.os.tag != .macos or !link_libc))
         @panic("-Dapple-providers=true requires macOS and libc");
+    // Vision OCR is Objective-C and supports cross compilation with the
+    // release SDK. Generation/transcription additionally need the Swift sidecar.
+    const apple_ocr_enabled = b.option(bool, "apple-ocr", "Enable Apple Vision OCR (macOS and libc required)") orelse apple_reader_enabled;
+    if (apple_ocr_enabled and (target.result.os.tag != .macos or !link_libc))
+        @panic("-Dapple-ocr=true requires macOS and libc");
     const apple_reader_options = b.addOptions();
-    apple_reader_options.addOption(bool, "enabled", apple_reader_enabled);
+    apple_reader_options.addOption(bool, "enabled", apple_ocr_enabled);
     const apple_options_module = apple_reader_options.createModule();
     readers_mod.addImport("apple_reader_options", apple_options_module);
     readers_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
@@ -171,7 +176,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
-    apple_native_mod.addImport("apple_native_options", apple_options_module);
+    const apple_native_options = b.addOptions();
+    apple_native_options.addOption(bool, "enabled", apple_reader_enabled);
+    apple_native_mod.addImport("apple_native_options", if (apple_ocr_enabled == apple_reader_enabled) apple_options_module else apple_native_options.createModule());
     apple_native_mod.addImport("antfly_platform", platform_mod);
     apple_native_mod.addImport("httpx", httpx_mod);
     generating_mod.addImport("antfly_apple_native", apple_native_mod);
@@ -203,7 +210,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
         });
     }
-    if (apple_reader_enabled) {
+    if (apple_ocr_enabled) {
         addMacosSdkPaths(b, readers_mod, target);
         readers_mod.linkFramework("Foundation", .{});
         readers_mod.linkFramework("CoreGraphics", .{});
@@ -455,6 +462,22 @@ pub fn create(b: *std.Build) ?Artifacts {
         },
     });
     const run_httpx_transport_regression_tests = b.addRunArtifact(httpx_transport_regression_tests);
+
+    const group_source_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/group_sources.zig"), .target = target, .optimize = optimize }) });
+    group_source_tests.root_module.addImport("antfly-json", json_mod);
+    const run_group_source_tests = b.addRunArtifact(group_source_tests);
+    b.step("group-sources-test", "Run durable grouped-source membership and fencing tests").dependOn(&run_group_source_tests.step);
+    const structured_test_module = b.createModule(.{ .root_source_file = b.path("lib/structured/root.zig"), .target = target, .optimize = optimize });
+    var structured_imports = b.modules.get("antfly_structured").?.import_table.iterator();
+    while (structured_imports.next()) |entry| structured_test_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    const structured_tests = b.addTest(.{ .root_module = structured_test_module });
+    const run_structured_tests = b.addRunArtifact(structured_tests);
+    b.step("lib-structured-test", "Run constrained output, evidence and generated extraction tests").dependOn(&run_structured_tests.step);
+    const decisions_test_module = b.createModule(.{ .root_source_file = b.path("lib/decisions/root.zig"), .target = target, .optimize = optimize });
+    decisions_test_module.addImport("antfly_structured", b.modules.get("antfly_structured").?);
+    const decisions_tests = b.addTest(.{ .root_module = decisions_test_module });
+    const run_decisions_tests = b.addRunArtifact(decisions_tests);
+    b.step("lib-decisions-test", "Run shared decision wire and generated contract tests").dependOn(&run_decisions_tests.step);
 
     const lib_generating_tests = b.addTest(.{
         .root_module = generating_mod,
@@ -803,6 +826,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_raft_library_tests.step);
     lib_test_step.dependOn(&run_lib_jsonschema_tests.step);
     lib_test_step.dependOn(&run_lib_generating_tests.step);
+    lib_test_step.dependOn(&run_structured_tests.step);
+    lib_test_step.dependOn(&run_group_source_tests.step);
+    lib_test_step.dependOn(&run_decisions_tests.step);
     lib_test_step.dependOn(&run_lib_embeddings_tests.step);
     lib_test_step.dependOn(&run_lib_vectorindex_tests.step);
     lib_test_step.dependOn(&run_lib_hash_tests.step);

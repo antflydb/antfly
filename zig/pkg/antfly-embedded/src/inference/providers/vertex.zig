@@ -628,7 +628,7 @@ fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8, history_len: u
             content: struct { parts: []const std.json.Value = &.{} },
         } = &.{},
     };
-    var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true });
+    var parsed = try std.json.parseFromSlice(Response, alloc, body, .{ .ignore_unknown_fields = true, .parse_numbers = false });
     defer parsed.deinit();
     if (parsed.value.candidates.len == 0) return error.GenerateRequestFailed;
     const parts = parsed.value.candidates[0].content.parts;
@@ -649,7 +649,7 @@ fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8, history_len: u
                 args: ?std.json.Value = null,
             } = null,
         };
-        const part = try std.json.parseFromValue(Part, alloc, raw, .{ .ignore_unknown_fields = true });
+        const part = try std.json.parseFromValue(Part, alloc, raw, .{ .ignore_unknown_fields = true, .parse_numbers = false });
         defer part.deinit();
         if (!part.value.thought) {
             if (part.value.text) |text| try out.appendSlice(alloc, text);
@@ -677,9 +677,11 @@ fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8, history_len: u
     // Preserve part ordering and thought signatures verbatim for Google replay.
     const google_parts = try std.json.Stringify.valueAlloc(alloc, parts, .{});
     errdefer alloc.free(google_parts);
+    var usage = inference.GenerationUsage.fromValue(parsed.value.usageMetadata, "promptTokenCount", "candidatesTokenCount", "totalTokenCount");
+    if (usage) |*measured| measured.output_tokens +|= inference.GenerationUsage.count(parsed.value.usageMetadata, "thoughtsTokenCount") orelse 0;
     return .{
         .content = content,
-        .usage = inference.GenerationUsage.fromValue(parsed.value.usageMetadata, "promptTokenCount", "candidatesTokenCount", "totalTokenCount"),
+        .usage = usage,
         .tool_calls = try calls.toOwnedSlice(alloc),
         .google_parts_json = google_parts,
         .allocator = alloc,
@@ -781,7 +783,7 @@ fn appendVertexContent(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), messa
         }
         if (message.tool_calls) |calls| for (calls) |call| {
             if (count > 0) try out.append(alloc, ',');
-            const args = try std.json.parseFromSlice(std.json.Value, alloc, call.arguments, .{});
+            const args = try @import("antfly-json").parseValueLossless(alloc, call.arguments);
             defer args.deinit();
             if (args.value != .object) return error.InvalidAgentToolCall;
             // Imported tool history has no Google thought signatures. Use Google's
@@ -818,7 +820,7 @@ fn appendVertexToolResponse(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), 
             if (!std.mem.eql(u8, call.id, id)) continue;
             name = call.name;
             if (previous.google_parts_json) |json| {
-                raw_parts = try std.json.parseFromSlice([]const std.json.Value, alloc, json, .{});
+                raw_parts = try std.json.parseFromSlice([]const std.json.Value, alloc, json, .{ .parse_numbers = false });
                 wire_id = null;
                 var call_index: usize = 0;
                 for (raw_parts.?.value) |part| {
@@ -840,7 +842,7 @@ fn appendVertexToolResponse(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), 
         else => return error.InvalidAgentToolCall,
     };
     // Tool results may be arbitrary text or JSON, but Google requires an object.
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch |err| switch (err) {
+    const parsed = @import("antfly-json").parseValueLossless(alloc, text) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => null,
     };
@@ -872,7 +874,7 @@ fn appendVertexTools(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), options
                 parameters: ?std.json.Value = null,
             },
         };
-        const tools = try std.json.parseFromSlice([]const Tool, alloc, json, .{ .ignore_unknown_fields = true });
+        const tools = try std.json.parseFromSlice([]const Tool, alloc, json, .{ .ignore_unknown_fields = true, .parse_numbers = false });
         defer tools.deinit();
         if (tools.value.len > 0) {
             try out.appendSlice(alloc, ",\"tools\":[{\"functionDeclarations\":[");
@@ -1581,4 +1583,38 @@ test "provider registry gateway Google generation retains measured token usage a
     var unknown = try parseGenerateResponseAlloc(a, base ++ "}", 1);
     defer unknown.deinit();
     try std.testing.expectEqual(@as(?inference.GenerationUsage, null), unknown.usage);
+}
+
+test "generating backend Gemini preserves exact tool arguments across response and replay" {
+    const a = std.testing.allocator;
+    var result = try parseGenerateResponseAlloc(a,
+        \\{"candidates":[{"content":{"parts":[{"functionCall":{"name":"antfly_output","args":{"value":1.0000000000000001,"tiny":1e-400}}}]}}]}
+    , 0);
+    defer result.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_calls[0].arguments, "1.0000000000000001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_calls[0].arguments, "1e-400") != null);
+    const body = try vertexGenerateRequestJsonAlloc(a, &.{.{ .role = .assistant, .tool_calls = result.tool_calls }}, .{});
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "1.0000000000000001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "1e-400") != null);
+}
+
+test "generating backend Gemini preserves numeric schema constraints" {
+    const a = std.testing.allocator;
+    const body = try vertexGenerateRequestJsonAlloc(a, &.{}, .{ .tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"antfly_output\",\"parameters\":{\"type\":\"number\",\"minimum\":1e-400,\"const\":1.0000000000000001}}}]" });
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "1.0000000000000001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "1e-400") != null);
+}
+
+test "provider registry gateway Google retains thought usage alongside exact tool arguments" {
+    const a = std.testing.allocator;
+    var result = try parseGenerateResponseAlloc(a,
+        \\{"candidates":[{"content":{"parts":[{"text":"hello"},{"functionCall":{"name":"output","args":{"value":1.0000000000000001}}}]}}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1,"thoughtsTokenCount":3,"totalTokenCount":6}}
+    , 0);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 2), result.usage.?.input_tokens);
+    try std.testing.expectEqual(@as(u64, 4), result.usage.?.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 6), result.usage.?.total_tokens);
+    try std.testing.expect(std.mem.indexOf(u8, result.tool_calls[0].arguments, "1.0000000000000001") != null);
 }

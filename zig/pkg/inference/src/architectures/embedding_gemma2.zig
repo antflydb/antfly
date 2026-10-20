@@ -25,6 +25,7 @@ const model_config = @import("embedding_gemma2_config.zig");
 pub const checkpoint_revision = model_config.checkpoint_revision;
 pub const recipe_version = model_config.recipe_version;
 pub const max_tokens = model_config.max_tokens;
+pub const output_dim: usize = 768;
 pub const Config = model_config.Config;
 pub const isModel = model_config.isModel;
 pub const parseConfig = model_config.parseConfig;
@@ -109,7 +110,7 @@ fn requireWeight(allocator: std.mem.Allocator, store: anytype, name: []const u8,
 }
 
 pub fn validDimension(dim: usize) bool {
-    return dim == 768 or dim == 512 or dim == 256 or dim == 128;
+    return dim > 0 and dim <= output_dim;
 }
 
 pub fn taskPrefix(task: []const u8) ![]const u8 {
@@ -118,7 +119,9 @@ pub fn taskPrefix(task: []const u8) ![]const u8 {
         .{ .task = "RETRIEVAL_DOCUMENT", .prefix = "title: none | text: " },
         .{ .task = "QUESTION_ANSWERING", .prefix = "task: question answering | query: " },
         .{ .task = "FACT_VERIFICATION", .prefix = "task: fact checking | query: " },
+        .{ .task = "FACT_CHECKING", .prefix = "task: fact checking | query: " },
         .{ .task = "CODE_RETRIEVAL_QUERY", .prefix = "task: code retrieval | query: " },
+        .{ .task = "CODE_RETRIEVAL", .prefix = "task: code retrieval | query: " },
         .{ .task = "CLASSIFICATION", .prefix = "task: classification | query: " },
         .{ .task = "CLUSTERING", .prefix = "task: clustering | query: " },
         .{ .task = "SEMANTIC_SIMILARITY", .prefix = "task: sentence similarity | query: " },
@@ -269,24 +272,38 @@ test "embeddinggemma2 CPU last use preserves source ownership after operation fa
     try std.testing.expectEqual(@as(?CT, null), source);
 }
 
-fn weight(cb: *const ComputeBackend, layer: usize, suffix: []const u8) !CT {
+fn weight(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8) !CT {
+    if (comptime ops.EmbeddingModelWeight.fromSuffix(suffix)) |kind| if (cb.vtable.embeddingModelWeight) |get| {
+        if (get(cb.ptr, layer, kind)) |ct| return ct;
+    };
     var buf: [192]u8 = undefined;
     return cb.getWeight(try std.fmt.bufPrint(&buf, "language_model.layers.{d}.{s}", .{ layer, suffix }));
 }
 
-fn norm(cb: *const ComputeBackend, layer: usize, suffix: []const u8, input: CT, dim: usize, eps: f32) !CT {
+fn globalWeight(cb: *const ComputeBackend, comptime kind: ops.EmbeddingModelWeight) !CT {
+    if (cb.vtable.embeddingModelWeight) |get| if (get(cb.ptr, 0, kind)) |ct| return ct;
+    return cb.getWeight(kind.suffix());
+}
+
+fn norm(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8, input: CT, dim: usize, eps: f32) !CT {
+    if (comptime ops.EmbeddingModelWeight.fromSuffix(suffix)) |kind| if (cb.vtable.embeddingWorkspaceNorm) |run| {
+        if (try run(cb.ptr, layer, kind, input, null, dim, eps, 1)) |result| return result;
+    };
     const w = try weight(cb, layer, suffix);
     defer cb.free(w);
     return cb.rmsNorm(input, w, dim, eps);
 }
 
-fn normLastUse(cb: *const ComputeBackend, layer: usize, suffix: []const u8, input: *?CT, dim: usize, eps: f32) !CT {
+fn normLastUse(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8, input: *?CT, dim: usize, eps: f32) !CT {
     const w = try weight(cb, layer, suffix);
     defer cb.free(w);
     return rmsNormLastUse(cb, input, w, dim, eps);
 }
 
-fn normResidual(cb: *const ComputeBackend, layer: usize, suffix: []const u8, input: *?CT, residual: CT, dim: usize, eps: f32, output_scale: f32) !CT {
+fn normResidual(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8, input: *?CT, residual: CT, dim: usize, eps: f32, output_scale: f32) !CT {
+    if (comptime ops.EmbeddingModelWeight.fromSuffix(suffix)) |kind| if (cb.vtable.embeddingWorkspaceNorm) |run| {
+        if (try run(cb.ptr, layer, kind, input.*.?, residual, dim, eps, output_scale)) |result| return finishLastUse(cb, input, result);
+    };
     const w = try weight(cb, layer, suffix);
     defer cb.free(w);
     if (try cb.rmsNormResidual(input.*.?, w, residual, dim, eps, 1, output_scale)) |result| return finishLastUse(cb, input, result);
@@ -298,23 +315,29 @@ fn normResidual(cb: *const ComputeBackend, layer: usize, suffix: []const u8, inp
     return scaled(cb, sum, output_scale);
 }
 
-fn linear(cb: *const ComputeBackend, layer: usize, suffix: []const u8, input: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
+fn linear(cb: *const ComputeBackend, layer: usize, comptime suffix: []const u8, input: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
+    if (comptime ops.EmbeddingModelProjection.fromSuffix(suffix)) |kind| if (cb.vtable.embeddingModelLinear) |run| {
+        if (try run(cb.ptr, layer, kind, input, rows, in_dim, out_dim)) |ct| return ct;
+    };
     const w = try weight(cb, layer, suffix);
     defer cb.free(w);
     return cb.linearNoBias(input, w, rows, in_dim, out_dim);
 }
 
-const Visibility = struct {
+pub const Visibility = struct {
     ranges: []u32,
     positions: []i32,
     key_positions: []i32,
     gather: []i64,
     device_gather: ?CT = null,
+    device_positions: ?CT = null,
     global_metadata: ?CT = null,
     window_metadata: ?CT = null,
     windowed: ?[]u32 = null,
     allocator: std.mem.Allocator,
-    fn deinit(self: Visibility) void {
+    borrowed: bool = false,
+    pub fn deinit(self: Visibility) void {
+        if (self.borrowed) return;
         self.allocator.free(self.ranges);
         self.allocator.free(self.positions);
         self.allocator.free(self.key_positions);
@@ -323,7 +346,7 @@ const Visibility = struct {
     }
 };
 
-fn visibility(allocator: std.mem.Allocator, mask: []const i64, batch: usize, seq: usize) !Visibility {
+pub fn visibility(allocator: std.mem.Allocator, mask: []const i64, batch: usize, seq: usize) !Visibility {
     const count = batch * seq;
     const ranges = try allocator.alloc(u32, count * 6);
     errdefer allocator.free(ranges);
@@ -375,7 +398,7 @@ fn visibilityMetadata(cb: *const ComputeBackend, a: std.mem.Allocator, vis: Visi
 // Keys are position-sorted within each item's range. Restrict the work itself,
 // rather than computing a full-sequence score tile and masking it afterwards.
 // Keep the original positions so padding holes do not change window semantics.
-fn windowedRanges(allocator: std.mem.Allocator, vis: Visibility, window: u32) ![]u32 {
+pub fn windowedRanges(allocator: std.mem.Allocator, vis: Visibility, window: u32) ![]u32 {
     const ranges = try allocator.dupe(u32, vis.ranges);
     for (vis.positions, 0..) |position, row| {
         const first: i64 = @as(i64, position) - window;
@@ -463,7 +486,8 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
     // Full-context CPU execution otherwise retains several redundant Q/K/V
     // copies until attention returns, exceeding the admitted workspace.
     var names: [3][128]u8 = undefined;
-    var packed_rows = try cb.linearPackedNamed(input, &.{
+    var packed_rows = if (cb.vtable.embeddingModelLinear) |run| try run(cb.ptr, layer, .packed_qkv, input, rows, cfg.hidden_size, (heads + 2 * kv) * d) else null;
+    if (packed_rows == null) packed_rows = try cb.linearPackedNamed(input, &.{
         try std.fmt.bufPrint(&names[0], "language_model.layers.{d}.self_attn.q_proj.weight", .{layer}),
         try std.fmt.bufPrint(&names[1], "language_model.layers.{d}.self_attn.k_proj.weight", .{layer}),
         try std.fmt.bufPrint(&names[2], "language_model.layers.{d}.self_attn.v_proj.weight", .{layer}),
@@ -475,17 +499,17 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
             defer if (packed_rows == null) cb.free(source);
             const norm_weight = try weight(cb, layer, "self_attn.q_norm.weight");
             defer cb.free(norm_weight);
-            break :blk try cb.vtable.embeddingHeadPrepare.?(cb.ptr, source, norm_weight, null, .{
+            break :blk try cb.vtable.embeddingHeadPrepare.?(cb.ptr, source, norm_weight, vis.device_positions, .{
                 .source_rows = @intCast(rows),
                 .rows = @intCast(rows),
                 .source_heads = @intCast(heads),
                 .heads = @intCast(heads),
                 .dim = @intCast(d),
-                .sequence = @intCast(seq),
+                .sequence = @intCast(if (vis.device_positions != null) max_tokens else seq),
                 .stride = @intCast(if (packed_rows != null) (heads + 2 * kv) * d else heads * d),
                 .start = 0,
                 .rotate = 1,
-                .gather = 0,
+                .gather = if (vis.device_positions != null) 2 else 0,
                 .weighted = 1,
                 .eps = cfg.rms_norm_eps,
                 .theta = cfg.theta(layer),
@@ -512,17 +536,17 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
             defer if (packed_rows == null) cb.free(source);
             const norm_weight = try weight(cb, layer, "self_attn.k_norm.weight");
             defer cb.free(norm_weight);
-            break :blk try cb.vtable.embeddingHeadPrepare.?(cb.ptr, source, norm_weight, if (row_identity) null else vis.device_gather, .{
+            break :blk try cb.vtable.embeddingHeadPrepare.?(cb.ptr, source, norm_weight, if (vis.device_positions) |positions| positions else if (row_identity) null else vis.device_gather, .{
                 .source_rows = @intCast(rows),
                 .rows = @intCast(vis.gather.len),
                 .source_heads = @intCast(kv),
                 .heads = @intCast(gathered_heads),
                 .dim = @intCast(d),
-                .sequence = @intCast(seq),
+                .sequence = @intCast(if (vis.device_positions != null) max_tokens else seq),
                 .stride = @intCast(if (packed_rows != null) (heads + 2 * kv) * d else kv * d),
                 .start = @intCast(if (packed_rows != null) heads * d else 0),
                 .rotate = 1,
-                .gather = @intFromBool(!row_identity),
+                .gather = if (vis.device_positions != null) 2 else @intFromBool(!row_identity),
                 .weighted = 1,
                 .eps = cfg.rms_norm_eps,
                 .theta = cfg.theta(layer),
@@ -546,17 +570,17 @@ fn attention(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Confi
         if (fused) {
             const source = packed_rows orelse try linear(cb, layer, "self_attn.v_proj.weight", input, rows, cfg.hidden_size, kv * d);
             defer if (packed_rows == null) cb.free(source);
-            break :blk try cb.vtable.embeddingHeadPrepare.?(cb.ptr, source, null, if (row_identity) null else vis.device_gather, .{
+            break :blk try cb.vtable.embeddingHeadPrepare.?(cb.ptr, source, null, if (vis.device_positions) |positions| positions else if (row_identity) null else vis.device_gather, .{
                 .source_rows = @intCast(rows),
                 .rows = @intCast(vis.gather.len),
                 .source_heads = @intCast(kv),
                 .heads = @intCast(gathered_heads),
                 .dim = @intCast(d),
-                .sequence = @intCast(seq),
+                .sequence = @intCast(if (vis.device_positions != null) max_tokens else seq),
                 .stride = @intCast(if (packed_rows != null) (heads + 2 * kv) * d else kv * d),
                 .start = @intCast(if (packed_rows != null) (heads + kv) * d else 0),
                 .rotate = 0,
-                .gather = @intFromBool(!row_identity),
+                .gather = if (vis.device_positions != null) 2 else @intFromBool(!row_identity),
                 .weighted = 0,
                 .eps = cfg.rms_norm_eps,
                 .theta = cfg.theta(layer),
@@ -676,9 +700,12 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     const fnorm = try norm(cb, layer, "pre_feedforward_layernorm.weight", residual, h, cfg.rms_norm_eps);
     defer cb.free(fnorm);
     var down: ?CT = blk: {
+        if (try cb.embeddingFFN(layer, fnorm, rows, h, cfg.intermediate_size, true)) |output| break :blk output;
         const product = product: {
+            if (try cb.embeddingFFN(layer, fnorm, rows, h, cfg.intermediate_size, false)) |fused| break :product fused;
             var names: [2][128]u8 = undefined;
-            if (try cb.linearPackedNamed(fnorm, &.{
+            const prepared = if (cb.vtable.embeddingModelLinear) |run| try run(cb.ptr, layer, .packed_ffn, fnorm, rows, h, 2 * cfg.intermediate_size) else null;
+            if (prepared orelse try cb.linearPackedNamed(fnorm, &.{
                 try std.fmt.bufPrint(&names[0], "language_model.layers.{d}.mlp.gate_proj.weight", .{layer}),
                 try std.fmt.bufPrint(&names[1], "language_model.layers.{d}.mlp.up_proj.weight", .{layer}),
             }, &.{ cfg.intermediate_size, cfg.intermediate_size }, rows, h)) |packed_rows| {
@@ -715,7 +742,7 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
         defer cb.free(projected);
         const ps = try scaled(cb, projected, 1 / @sqrt(@as(f32, @floatFromInt(h))));
         defer cb.free(ps);
-        const pnw = try cb.getWeight("language_model.ple.per_layer_projection_norm.weight");
+        const pnw = try globalWeight(cb, .ple_norm);
         defer cb.free(pnw);
         break :blk try cb.rmsNorm(ps, pnw, cfg.per_layer_input_dim, cfg.rms_norm_eps);
     };
@@ -730,12 +757,16 @@ fn encoderLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Co
     defer cb.free(pp);
     var po: ?CT = try linear(cb, layer, "ple_block.per_layer_projection.weight", pp, rows, cfg.per_layer_input_dim, h);
     defer if (po) |value| cb.free(value);
-    const scalar = try weight(cb, layer, "layer_scalar");
-    defer cb.free(scalar);
-    const value = try cb.toFloat32(scalar, allocator);
-    defer allocator.free(value);
-    if (value.len != 1 or !std.math.isFinite(value[0])) return error.InvalidEmbeddingGemma2Weight;
-    const result = try normResidual(cb, layer, "ple_block.post_per_layer_input_norm.weight", &po, ffn, h, cfg.rms_norm_eps, value[0]);
+    const scale: f32 = cached: {
+        if (cb.vtable.embeddingModelScalar) |get| if (get(cb.ptr, layer)) |value| break :cached value;
+        const scalar = try weight(cb, layer, "layer_scalar");
+        defer cb.free(scalar);
+        const value = try cb.toFloat32(scalar, allocator);
+        defer allocator.free(value);
+        if (value.len != 1 or !std.math.isFinite(value[0])) return error.InvalidEmbeddingGemma2Weight;
+        break :cached value[0];
+    };
+    const result = try normResidual(cb, layer, "ple_block.post_per_layer_input_norm.weight", &po, ffn, h, cfg.rms_norm_eps, scale);
     errdefer cb.free(result);
     ple_region.deinit();
     if (comptime @import("build_options").enable_metal) {
@@ -779,7 +810,7 @@ fn packedPerLayerInputs(cb: *const ComputeBackend, cfg: Config, embeddings: CT, 
     defer cb.free(ps);
     const shaped = (try cb.reshape2d(ps, rows * cfg.num_hidden_layers, cfg.per_layer_input_dim)) orelse return error.EmbeddingGemma2OperationUnavailable;
     defer cb.free(shaped);
-    const pnw = try cb.getWeight("language_model.ple.per_layer_projection_norm.weight");
+    const pnw = try globalWeight(cb, .ple_norm);
     defer cb.free(pnw);
     const normalized = try cb.rmsNorm(shaped, pnw, cfg.per_layer_input_dim, cfg.rms_norm_eps);
     defer cb.free(normalized);
@@ -845,41 +876,308 @@ test "embeddinggemma2 video cohorts cross former frame boundaries without single
 }
 
 pub fn forwardEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize) !CT {
-    return forwardEmbeddingsImpl(cb, allocator, cfg, embeddings, mask, batch, seq, null);
+    return forwardEmbeddingsImpl(cb, allocator, cfg, embeddings, mask, batch, seq, null, null);
 }
 
 /// Embedding-only output: normalize tokens, pool, project once per item, then
 /// truncate and normalize. Token-level callers retain forwardEmbeddingsCT.
 pub fn forwardPooledEmbeddingsCT(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
     if (!validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
-    return forwardEmbeddingsImpl(cb, allocator, cfg, embeddings, mask, batch, seq, dimensions);
+    if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;
+    if (compactRowsEnabled(cb.kind() == .metal) and cb.vtable.embeddingHeadPrepare != null and cb.vtable.maskedMeanSegments != null and cb.vtable.maskedMeanBatch != null) {
+        if (batch == 0 or seq == 0 or seq > max_tokens or mask.len != try std.math.mul(usize, batch, seq)) return error.InvalidEmbeddingInputLength;
+        var active: usize = 0;
+        for (mask) |value| {
+            if (value != 0 and value != 1) return error.InvalidAttentionMask;
+            active += @intFromBool(value != 0);
+        }
+        if (active < mask.len) return forwardCompactPooled(cb, allocator, cfg, embeddings, mask, batch, seq, dimensions);
+    }
+    return forwardEmbeddingsImpl(cb, allocator, cfg, embeddings, mask, batch, seq, dimensions, null);
 }
 
-fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: ?usize) !CT {
+pub fn compactRowsEnabled(metal: bool) bool {
+    const env = @import("antfly_platform").env;
+    return metal and !env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_FOLLOWUP") and !env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL_DISABLE_BATCHED_HEAD") and !env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_ROWS");
+}
+
+/// Inputs already contain active rows in original item/position order.
+pub fn forwardPackedPooledEmbeddingsCT(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize, compact_input: bool) !CT {
+    if (!compact_input) return forwardPooledEmbeddingsCT(cb, a, cfg, embeddings, mask, batch, seq, dimensions);
+    if (!validDimension(dimensions) or !compactRowsEnabled(cb.kind() == .metal)) return error.InvalidEmbeddingInputLength;
+    if (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return error.EmbeddingGemma2ExternalFrame;
+    if (batch == 0 or batch > 64 or seq == 0 or seq > max_tokens or mask.len != try std.math.mul(usize, batch, seq)) return error.InvalidEmbeddingInputLength;
+    return forwardCompactInput(cb, a, cfg, embeddings, mask, batch, seq, dimensions, true);
+}
+
+const CompactOutput = struct { offsets: []const usize };
+
+fn forwardCompactPooled(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
+    return forwardCompactInput(cb, a, cfg, embeddings, mask, batch, seq, dimensions, false);
+}
+fn forwardCompactInput(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize, compact_input: bool) !CT {
+    if (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame()) return error.EmbeddingGemma2ExternalFrame;
+    if (cb.vtable.embeddingModelPrepare) |prepare| try prepare(cb.ptr, cfg.num_hidden_layers);
+    if (cb.vtable.embeddingCompactVisibility) |get| if (try get(cb.ptr, mask, batch, seq, cfg.sliding_window)) |cached| {
+        const v = cached.visibility;
+        const vis = Visibility{ .ranges = v.ranges, .positions = v.positions, .key_positions = v.positions, .gather = v.gather, .windowed = v.windowed, .global_metadata = v.global_metadata, .window_metadata = v.window_metadata, .device_positions = cached.device_positions, .allocator = a, .borrowed = true };
+        const input = if (compact_input) embeddings else try cb.embeddingLookup(embeddings, cached.source_rows, cached.source_rows.len, cfg.hidden_size);
+        defer if (!compact_input) cb.free(input);
+        return forwardEmbeddingsImpl(cb, a, cfg, input, cached.ones, 1, cached.ones.len, dimensions, .{ .visibility = vis, .output = .{ .offsets = cached.offsets } });
+    };
+    var original = try visibility(a, mask, batch, seq);
+    defer original.deinit();
+    var vis = try compactVisibility(a, original);
+    defer vis.deinit();
+    vis.windowed = try windowedRanges(a, vis, cfg.sliding_window);
+    vis.global_metadata = try visibilityMetadata(cb, a, vis, vis.ranges);
+    defer if (vis.global_metadata) |tensor| cb.free(tensor);
+    vis.window_metadata = try visibilityMetadata(cb, a, vis, vis.windowed.?);
+    defer if (vis.window_metadata) |tensor| cb.free(tensor);
+    vis.device_positions = (try cb.fromInt32Shape(vis.positions, &.{@intCast(vis.positions.len)})) orelse return error.EmbeddingGemma2OperationUnavailable;
+    defer cb.free(vis.device_positions.?);
+    const input = if (compact_input) embeddings else try cb.embeddingLookup(embeddings, original.gather, original.gather.len, cfg.hidden_size);
+    defer if (!compact_input) cb.free(input);
+    const offsets = try a.alloc(usize, batch + 1);
+    defer a.free(offsets);
+    offsets[0] = 0;
+    for (0..batch) |item| {
+        var count: usize = 0;
+        for (mask[item * seq ..][0..seq]) |value| count += @intFromBool(value != 0);
+        offsets[item + 1] = offsets[item] + count;
+    }
+    const ones = try a.alloc(i64, vis.positions.len);
+    defer a.free(ones);
+    @memset(ones, 1);
+    return forwardEmbeddingsImpl(cb, a, cfg, input, ones, 1, ones.len, dimensions, .{ .visibility = vis, .output = .{ .offsets = offsets } });
+}
+
+test "embeddinggemma2 compact visibility preserves holes positions windows and item isolation" {
+    const a = std.testing.allocator;
+    var original = try visibility(a, &.{ 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1 }, 2, 6);
+    defer original.deinit();
+    var compact = try compactVisibility(a, original);
+    defer compact.deinit();
+    try std.testing.expectEqualSlices(i32, &.{ 0, 2, 3, 1, 3, 4, 5 }, compact.positions);
+    const windows = try windowedRanges(a, compact, 2);
+    defer a.free(windows);
+    for (original.gather, 0..) |q_original, q| for (original.gather, 0..) |k_original, k| {
+        const same_item = @divTrunc(q_original, 6) == @divTrunc(k_original, 6);
+        try std.testing.expectEqual(same_item, k >= compact.ranges[q * 6] and k < compact.ranges[q * 6 + 1]);
+        const near = @abs(compact.positions[q] - compact.positions[k]) <= 2;
+        try std.testing.expectEqual(same_item and near, k >= windows[q * 6] and k < windows[q * 6 + 1]);
+    };
+}
+
+/// Offline checkpoint qualification: compare compact execution with the dense
+/// masked reference, including holes, uneven items and non-finite padding.
+pub fn qualifyCompactPooled(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config) !void {
+    const count = 512;
+    for ([_]usize{ 1, 64 }) |padding| {
+        const data = try a.alloc(f32, count * cfg.hidden_size);
+        defer a.free(data);
+        for (data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.017);
+        var mask: [count]i64 = @splat(1);
+        for (0..padding) |hole| mask[hole * 4 + 1] = 0;
+        for (mask, 0..) |valid, row| if (valid == 0) @memset(data[row * cfg.hidden_size ..][0..cfg.hidden_size], std.math.nan(f32));
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, &.{ count, @intCast(cfg.hidden_size) }));
+        defer cb.free(input);
+        var expected: ?[]f32 = null;
+        defer if (expected) |values| a.free(values);
+        var elapsed: [2][7]u64 = undefined;
+        for (0..9) |iteration| for (0..2) |phase| {
+            const route = phase ^ (iteration & 1);
+            const started = @import("antfly_platform").time.monotonicNs();
+            const output = if (route == 0) try forwardEmbeddingsImpl(cb, a, cfg, input, &mask, 2, 256, 128, null) else try forwardCompactPooled(cb, a, cfg, input, &mask, 2, 256, 128);
+            defer cb.free(output);
+            const values = try cb.toFloat32(output, a);
+            defer a.free(values);
+            if (iteration >= 2) elapsed[route][iteration - 2] = @import("antfly_platform").time.monotonicNs() -| started;
+            if (expected == null) expected = try a.dupe(f32, values);
+            for (expected.?, values) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-4);
+        };
+        for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        std.debug.print("embeddinggemma2 compact_checkpoint dense_rows=512 compact_rows={d} dense_completed_ns={d} compact_completed_ns={d} holes=true nan_padding=true parity=true\n", .{ count - padding, elapsed[0][3], elapsed[1][3] });
+    }
+}
+
+/// Projection/GELU qualification uses the actual checkpoint's prepared MPS slot.
+/// Each timed route includes completion and readback, not enqueue duration.
+pub fn qualifyTiledFFN(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config) !void {
+    const rows = 3000;
+    const data = try a.alloc(f32, rows * cfg.hidden_size);
+    defer a.free(data);
+    for (data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 8192)) * 0.017);
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, &.{ rows, @intCast(cfg.hidden_size) }));
+    defer cb.free(input);
+    try cb.vtable.embeddingModelPrepare.?(cb.ptr, cfg.num_hidden_layers);
+    try cb.vtable.embeddingWorkspacePrepare.?(cb.ptr, .{ .rows = rows, .hidden = cfg.hidden_size, .alternate_qkv_width = 3072, .widths = .{ 2048, cfg.hidden_size, 2 * cfg.intermediate_size, cfg.hidden_size, cfg.per_layer_input_dim, cfg.hidden_size } });
+    var elapsed: [2][7]u64 = undefined;
+    for (0..9) |iteration| {
+        var expected: ?[]f32 = null;
+        defer if (expected) |values| a.free(values);
+        for (0..2) |route| {
+            const start = @import("antfly_platform").time.monotonicNs();
+            var frame = try cb.decoderRuntimeBeginFrame();
+            if (!frame) return error.EmbeddingGemma2OperationUnavailable;
+            defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
+            const output = if (route == 1) (try cb.vtable.embeddingGatedFFN.?(cb.ptr, 0, input, rows, cfg.hidden_size, cfg.intermediate_size)) orelse return error.EmbeddingGemma2OperationUnavailable else dense: {
+                const projection = (try cb.vtable.embeddingModelLinear.?(cb.ptr, 0, .packed_ffn, input, rows, cfg.hidden_size, 2 * cfg.intermediate_size)) orelse return error.EmbeddingGemma2OperationUnavailable;
+                defer cb.free(projection);
+                break :dense (try cb.vtable.packedGeluMultiply.?(cb.ptr, projection, rows, cfg.intermediate_size)) orelse return error.EmbeddingGemma2OperationUnavailable;
+            };
+            defer cb.free(output);
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            frame = false;
+            const values = try cb.toFloat32(output, a);
+            const duration = @import("antfly_platform").time.monotonicNs() -| start;
+            if (iteration >= 2) elapsed[route][iteration - 2] = duration;
+            if (route == 0) expected = values else {
+                defer a.free(values);
+                for (expected.?, values) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-3);
+            }
+        }
+    }
+    for (&elapsed) |*samples| std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    std.debug.print("embeddinggemma2 long_ffn rows=3000 dense_completed_ns={d} tiled_completed_ns={d} avoided_packed_bytes={d} parity=true\n", .{ elapsed[0][3], elapsed[1][3], rows * cfg.intermediate_size * 8 });
+}
+
+/// Compare full 24-layer execution, including tail tiles and completed output.
+/// This is an offline qualification hook, never a serving-time calibration.
+pub fn qualifyStreamedEncoder(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config) !void {
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const env = @import("antfly_platform").env;
+    const flags = [_][*:0]const u8{ "ANTFLY_EMBEDDINGGEMMA2_DISABLE_STREAMED_FFN", "ANTFLY_EMBEDDINGGEMMA2_DISABLE_TILED_FFN" };
+    var saved: [2]?[:0]u8 = @splat(null);
+    for (flags, &saved) |flag, *value| if (env.getenv(std.mem.span(flag))) |old| {
+        value.* = try a.dupeSentinel(u8, old, 0);
+    };
+    defer for (flags, saved) |flag, value| {
+        if (value) |old| {
+            _ = Env.setenv(flag, old, 1);
+            a.free(old);
+        } else {
+            _ = Env.unsetenv(flag);
+        }
+    };
+    for ([_]usize{ 2560, 3000, 4096 }) |rows| {
+        const data = try a.alloc(f32, rows * cfg.hidden_size);
+        defer a.free(data);
+        for (data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 8192)) * 0.017);
+        const mask = try a.alloc(i64, rows);
+        defer a.free(mask);
+        @memset(mask, 1);
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, &.{ @intCast(rows), @intCast(cfg.hidden_size) }));
+        defer cb.free(input);
+        var samples: [3][5]u64 = undefined;
+        var reference: ?[]f32 = null;
+        defer if (reference) |vector| a.free(vector);
+        for (0..7) |iteration| for (0..3) |phase| {
+            const route = (iteration + phase) % 3;
+            try std.testing.expect(Env.setenv(flags[0], if (route < 2) "1" else "0", 1) == 0);
+            try std.testing.expect(Env.setenv(flags[1], if (route == 0) "1" else "0", 1) == 0);
+            const started = @import("antfly_platform").time.monotonicNs();
+            const output = try forwardPooledEmbeddingsCT(cb, a, cfg, input, mask, 1, rows, 128);
+            defer cb.free(output);
+            const vector = try cb.toFloat32(output, a);
+            defer a.free(vector);
+            if (iteration >= 2) samples[route][iteration - 2] = @import("antfly_platform").time.monotonicNs() -| started;
+            if (reference == null) reference = try a.dupe(f32, vector);
+            for (reference.?, vector) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-4);
+        };
+        for (&samples) |*values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
+        std.debug.print("embeddinggemma2 full_encoder rows={d} dense_ns={d} tiled_product_ns={d} streamed_down_ns={d} samples=5 parity=true\n", .{ rows, samples[0][2], samples[1][2], samples[2][2] });
+        // A cancelled retry must drain its frame and leave the next request usable.
+        var cancelled = cb.*;
+        const Stop = struct {
+            backend: *const ComputeBackend,
+            active_checks: usize = 0,
+            fn check(raw: ?*anyopaque) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                if (self.backend.decoderRuntimeHasActiveFrame()) {
+                    self.active_checks += 1;
+                    if (self.active_checks >= 32) return error.Cancelled;
+                }
+            }
+        };
+        var stop = Stop{ .backend = cb };
+        cancelled.execution_control = .{ .ptr = &stop, .check_fn = Stop.check };
+        try std.testing.expectError(error.Cancelled, forwardPooledEmbeddingsCT(&cancelled, a, cfg, input, mask, 1, rows, 128));
+        try std.testing.expect(stop.active_checks >= 32);
+        try std.testing.expect(!cb.decoderRuntimeHasActiveFrame() and !cb.decoderRuntimeHasSubmittedFrame());
+        const retry = try forwardPooledEmbeddingsCT(cb, a, cfg, input, mask, 1, rows, 128);
+        defer cb.free(retry);
+        const vector = try cb.toFloat32(retry, a);
+        defer a.free(vector);
+        for (reference.?, vector) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-4);
+    }
+}
+
+pub fn compactVisibility(a: std.mem.Allocator, original: Visibility) !Visibility {
+    const count = original.gather.len;
+    const ranges = try a.alloc(u32, count * 6);
+    errdefer a.free(ranges);
+    const positions = try a.alloc(i32, count);
+    errdefer a.free(positions);
+    const keys = try a.dupe(i32, original.key_positions);
+    errdefer a.free(keys);
+    const gather = try a.alloc(i64, count);
+    for (original.gather, positions, gather, 0..) |source, *pos, *id, i| {
+        const row: usize = @intCast(source);
+        @memcpy(ranges[i * 6 ..][0..6], original.ranges[row * 6 ..][0..6]);
+        pos.* = original.positions[row];
+        id.* = @intCast(i);
+    }
+    return .{ .ranges = ranges, .positions = positions, .key_positions = keys, .gather = gather, .allocator = a };
+}
+
+const CompactRun = struct { visibility: Visibility, output: CompactOutput };
+
+fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: Config, embeddings: CT, mask: []const i64, batch: usize, seq: usize, dimensions: ?usize, compact: ?CompactRun) !CT {
     if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .wasm) return error.UnsupportedEmbeddingGemma2Backend;
     if (cb.kind() == .metal and (cb.decoderRuntimeHasActiveFrame() or cb.decoderRuntimeHasSubmittedFrame())) return error.EmbeddingGemma2ExternalFrame;
     if (batch == 0 or seq == 0 or seq > max_tokens) return error.InvalidEmbeddingInputLength;
     const rows = std.math.mul(usize, batch, seq) catch return error.InvalidEmbeddingInputLength;
     if (mask.len != rows) return error.InvalidEmbeddingInputLength;
-    var vis = try visibility(allocator, mask, batch, seq);
+    if (cb.vtable.embeddingRotaryPrepare) |prepare| {
+        for ([_]usize{ 0, 5 }) |layer| try prepare(cb.ptr, .{ .dim = @intCast(cfg.headDim(layer)), .x = max_tokens, .theta = cfg.theta(layer) });
+    }
+    if (cb.vtable.embeddingModelPrepare) |prepare| try prepare(cb.ptr, cfg.num_hidden_layers);
+    if (cb.vtable.embeddingWorkspacePrepare) |prepare| try prepare(cb.ptr, .{
+        .rows = rows,
+        .hidden = cfg.hidden_size,
+        .alternate_qkv_width = (cfg.num_attention_heads + 2 * cfg.kvHeads(5)) * cfg.headDim(5),
+        .widths = .{ (cfg.num_attention_heads + 2 * cfg.kvHeads(0)) * cfg.headDim(0), cfg.hidden_size, 2 * cfg.intermediate_size, cfg.hidden_size, cfg.per_layer_input_dim, cfg.hidden_size },
+    });
+    const cached = if (compact != null) null else if (cb.vtable.embeddingModelVisibility) |get| try get(cb.ptr, mask, batch, seq, cfg.sliding_window) else null;
+    var vis = if (compact) |compact_run| blk: {
+        var borrowed = compact_run.visibility;
+        borrowed.borrowed = true;
+        break :blk borrowed;
+    } else if (cached) |view| Visibility{ .ranges = view.ranges, .positions = view.positions, .key_positions = view.positions, .gather = view.gather, .windowed = view.windowed, .global_metadata = view.global_metadata, .window_metadata = view.window_metadata, .allocator = allocator, .borrowed = true } else try visibility(allocator, mask, batch, seq);
     defer vis.deinit();
-    vis.windowed = try windowedRanges(allocator, vis, cfg.sliding_window);
-    if (cb.vtable.embeddingHeadPrepare != null) {
-        const ids = try allocator.alloc(i32, vis.gather.len);
-        defer allocator.free(ids);
-        for (vis.gather, ids) |id, *dest| dest.* = @intCast(id);
-        vis.device_gather = (try cb.fromInt32Shape(ids, &.{@intCast(ids.len)})) orelse return error.EmbeddingGemma2OperationUnavailable;
+    if (!vis.borrowed) {
+        vis.windowed = try windowedRanges(allocator, vis, cfg.sliding_window);
+        if (cb.vtable.embeddingHeadPrepare != null) {
+            const ids = try allocator.alloc(i32, vis.gather.len);
+            defer allocator.free(ids);
+            for (vis.gather, ids) |id, *dest| dest.* = @intCast(id);
+            vis.device_gather = (try cb.fromInt32Shape(ids, &.{@intCast(ids.len)})) orelse return error.EmbeddingGemma2OperationUnavailable;
+        }
+        if (cb.kind() == .metal) {
+            vis.global_metadata = try visibilityMetadata(cb, allocator, vis, vis.ranges);
+            vis.window_metadata = visibilityMetadata(cb, allocator, vis, vis.windowed.?) catch |err| {
+                if (vis.global_metadata) |tensor| cb.free(tensor);
+                return err;
+            };
+        }
     }
     defer if (vis.device_gather) |tensor| cb.free(tensor);
-    if (cb.kind() == .metal) {
-        vis.global_metadata = try visibilityMetadata(cb, allocator, vis, vis.ranges);
-        vis.window_metadata = visibilityMetadata(cb, allocator, vis, vis.windowed.?) catch |err| {
-            if (vis.global_metadata) |tensor| cb.free(tensor);
-            return err;
-        };
-    }
-    defer if (vis.global_metadata) |tensor| cb.free(tensor);
-    defer if (vis.window_metadata) |tensor| cb.free(tensor);
+    defer if (compact == null) if (vis.global_metadata) |tensor| cb.free(tensor);
+    defer if (compact == null) if (vis.window_metadata) |tensor| cb.free(tensor);
     // Native BF16 weights are widened on acquisition. Keep this shared
     // projection alive through all layers instead of widening its entire
     // 24-layer matrix again for each layer's row slice.
@@ -998,13 +1296,13 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
             if (!shared_frame) return error.EmbeddingGemma2OperationUnavailable;
         }
     }
-    const nw = try cb.getWeight("language_model.norm.weight");
+    const nw = try globalWeight(cb, .final_norm);
     defer cb.free(nw);
     const normalized = try cb.rmsNorm(hidden, nw, cfg.hidden_size, cfg.rms_norm_eps);
     defer cb.free(normalized);
     const projection = try cb.getWeight("language_model.embedding_projection.weight");
     defer cb.free(projection);
-    const result = if (dimensions) |dim| try poolProjectNormalize(cb, allocator, cfg, normalized, projection, mask, batch, seq, dim) else try cb.linearNoBias(normalized, projection, rows, cfg.hidden_size, cfg.embedding_dim);
+    const result = if (dimensions) |dim| (if (compact) |compact_run| try poolCompactProjectNormalize(cb, cfg, normalized, projection, compact_run.output.offsets, dim) else try poolProjectNormalize(cb, allocator, cfg, normalized, projection, mask, batch, seq, dim)) else try cb.linearNoBias(normalized, projection, rows, cfg.hidden_size, cfg.embedding_dim);
     errdefer cb.free(result);
     if (pending_frame) {
         try cb.decoderRuntimeWaitSubmittedFrame();
@@ -1023,9 +1321,25 @@ fn forwardEmbeddingsImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator
     return result;
 }
 
+fn poolCompactProjectNormalize(cb: *const ComputeBackend, cfg: Config, normalized: CT, projection: CT, offsets: []const usize, dimensions: usize) !CT {
+    const pooled = (try cb.vtable.maskedMeanSegments.?(cb.ptr, normalized, offsets, cfg.hidden_size)) orelse return error.EmbeddingGemma2OperationUnavailable;
+    defer cb.free(pooled);
+    const projected = try cb.linearNoBias(pooled, projection, offsets.len - 1, cfg.hidden_size, cfg.embedding_dim);
+    defer cb.free(projected);
+    return (try cb.vtable.maskedMeanBatch.?(cb.ptr, projected, null, offsets.len - 1, 1, cfg.embedding_dim, dimensions, true)) orelse error.EmbeddingGemma2OperationUnavailable;
+}
+
 /// Mean commutes only with the final linear projection, never with token RMSNorm.
 fn poolProjectNormalize(cb: *const ComputeBackend, a: std.mem.Allocator, cfg: Config, normalized: CT, projection: CT, mask: []const i64, batch: usize, seq: usize, dimensions: usize) !CT {
     if (cb.kind() == .metal) {
+        if (cb.vtable.maskedMeanBatch) |pool| {
+            if (try pool(cb.ptr, normalized, mask, batch, seq, cfg.hidden_size, cfg.hidden_size, false)) |pooled| {
+                defer cb.free(pooled);
+                const projected = try cb.linearNoBias(pooled, projection, batch, cfg.hidden_size, cfg.embedding_dim);
+                defer cb.free(projected);
+                return (try pool(cb.ptr, projected, null, batch, 1, cfg.embedding_dim, dimensions, true)) orelse error.EmbeddingGemma2OperationUnavailable;
+            }
+        }
         const mean = cb.vtable.maskedMeanRows orelse return error.EmbeddingGemma2OperationUnavailable;
         const normalize = cb.vtable.maskedMeanNormalizedRows orelse return error.EmbeddingGemma2OperationUnavailable;
         const pooled = (try cb.allocUninitF32Shape(&.{ @intCast(batch), @intCast(cfg.hidden_size) })) orelse return error.EmbeddingGemma2OperationUnavailable;
@@ -1206,8 +1520,12 @@ test "embeddinggemma2 official task prefixes and matryoshka dimensions" {
     try std.testing.expectEqualStrings("title: none | text: ", try taskPrefix("RETRIEVAL_DOCUMENT"));
     try std.testing.expectEqualStrings("task: clustering | query: ", try taskPrefix("CLUSTERING"));
     try std.testing.expectError(error.UnsupportedEmbeddingTask, taskPrefix("unknown"));
+    try std.testing.expect(validDimension(1));
     try std.testing.expect(validDimension(128));
-    try std.testing.expect(!validDimension(384));
+    try std.testing.expect(validDimension(384));
+    try std.testing.expect(validDimension(768));
+    try std.testing.expect(!validDimension(0));
+    try std.testing.expect(!validDimension(769));
 }
 
 test "embeddinggemma2 real official checkpoint matches F32 oracle" {
@@ -1468,7 +1786,9 @@ test "embeddinggemma2 real padded batch is invariant and cancellation permits re
 test "embeddinggemma2 rejects incompatible checkpoint semantics" {
     const a = std.testing.allocator;
     const fixture = @embedFile("embedding_gemma2_config.json");
-    _ = try parseConfig(a, fixture);
+    const cfg = try parseConfig(a, fixture);
+    try std.testing.expect(cfg.resident != null);
+    try std.testing.expect(cfg.resident.?.isOfficialTextTopology());
     const parsed = try std.json.parseFromSlice(std.json.Value, a, fixture, .{});
     defer parsed.deinit();
     const tc = parsed.value.object.getPtr("text_config").?;
@@ -1562,12 +1882,25 @@ fn checkPreparedHeadFusion(cb: ComputeBackend, _: ComputeBackend) !void {
     const ids = [_]i32{ 0, 2, 3, 5 };
     const gather = (try cb.fromInt32Shape(&ids, &.{4})).?;
     defer cb.free(gather);
-    for ([_]u32{ 2, 4 }) |heads| for ([_]bool{ false, true }) |rotate| {
-        const p = ops.EmbeddingHeadParams{ .source_rows = 6, .rows = 4, .source_heads = 2, .heads = heads, .dim = 8, .sequence = 3, .stride = 64, .start = 7, .rotate = @intFromBool(rotate), .gather = 1, .weighted = @intFromBool(rotate), .eps = 1e-6, .theta = 10000, .scale = 0.75 };
+    const compact_source = try cb.embeddingLookup(input, &.{ 0, 2, 3, 5 }, 4, 64);
+    defer cb.free(compact_source);
+    const positions = (try cb.fromInt32Shape(&.{ 0, 2, 0, 2 }, &.{4})).?;
+    defer cb.free(positions);
+    for ([_]bool{ false, true }) |explicit| for ([_]u32{ 2, 4 }) |heads| for ([_]bool{ false, true }) |rotate| {
+        var p = ops.EmbeddingHeadParams{ .source_rows = 6, .rows = 4, .source_heads = 2, .heads = heads, .dim = 8, .sequence = 3, .stride = 64, .start = 7, .rotate = @intFromBool(rotate), .gather = 1, .weighted = @intFromBool(rotate), .eps = 1e-6, .theta = 10000, .scale = 0.75 };
         var frame = if (cb.kind() == .metal) try cb.decoderRuntimeBeginFrame() else false;
         defer if (frame) cb.decoderRuntimeCancelFrame() catch {};
         const transfers = @import("../ops/media_residency_test.zig").Transfers.snapshot(cb);
-        const result = try op(cb.ptr, input, if (rotate) weight_tensor else null, gather, p);
+        if (explicit) {
+            p.source_rows = 4;
+            p.gather = 2;
+        }
+        if (explicit) {
+            var invalid = p;
+            invalid.source_rows = 3;
+            try std.testing.expectError(error.InvalidTensorShape, invalid.validate());
+        }
+        const result = try op(cb.ptr, if (explicit) compact_source else input, if (rotate) weight_tensor else null, if (explicit) positions else gather, p);
         defer cb.free(result);
         if (frame) {
             try cb.decoderRuntimeSubmitAndWaitFrame();

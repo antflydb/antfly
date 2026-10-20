@@ -347,6 +347,8 @@ pub const PreparedRelationalProjection = struct {
 /// parse supplies validation, special-field extraction, the semantic digest,
 /// and the physical base row.
 pub const PreparedRelationalWrite = struct {
+    /// Bounded grouped projections retained with the prepared row region.
+    group_changes: ?[]const @import("group_source_mutations.zig").Plan.Change = null,
     parsed: ?std.json.Parsed(std.json.Value),
     extracted: ExtractedWrite,
     packed_row: []u8,

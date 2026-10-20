@@ -26,6 +26,7 @@ fn createCpuComputeModule(ctx: Context, source: []const u8) *std.Build.Module {
         .optimize = ctx.optimize,
         .link_libc = true,
         .imports = &.{
+            .{ .name = "antfly_runtime_abi", .module = ctx.graph.runtime_abi_mod },
             .{ .name = "ml", .module = ctx.graph.ml_mod },
             .{ .name = "antfly_platform", .module = ctx.graph.platform_mod },
             .{ .name = "inference_linalg", .module = ctx.graph.inference_linalg_mod },
@@ -152,6 +153,7 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         .target = ctx.target,
         .optimize = ctx.optimize,
     });
+    bge_m3_runtime_mod.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
     runtime_build.addInferenceRootImports(bge_m3_runtime_mod, .{
         .build_info_mod = ctx.graph.build_info_mod,
         .identities = ctx.graph.identities,

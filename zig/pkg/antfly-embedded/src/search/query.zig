@@ -88,6 +88,10 @@ pub const Filter = union(enum) {
     pub fn execute(self: Filter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
         seg.beginAccess();
         defer seg.endAccess();
+        switch (self) {
+            inline .prefix, .wildcard, .regexp, .fuzzy => |filter| if (filter.control.pattern_cache) |cache| return cache.execute(alloc, self, seg, filter.control),
+            else => {},
+        }
         return switch (self) {
             .term => |f| f.execute(alloc, seg),
             .bool_filter => |f| f.execute(alloc, seg),
@@ -134,6 +138,285 @@ pub const Filter = union(enum) {
     }
 };
 
+/// Query-owned immutable programs. Only compilation runs under the lock;
+/// dictionary I/O and private DFA execution never hold it. Full/oversized
+/// caches decline reuse and preserve the ordinary per-consumer execution path.
+pub const PatternPrograms = struct {
+    const Kind = enum { regexp, wildcard, fuzzy };
+    const Entry = struct {
+        key: [32]u8,
+        pattern: []u8,
+        program: union(Kind) { regexp: regex_mod.RegexAutomaton, wildcard: wildcard_mod.SearchPlan, fuzzy: levenshtein.LevenshteinAutomaton },
+        executions: [4]?*Execution = @splat(null),
+    };
+    const Execution = struct {
+        budget: @import("../sql/memory_budget.zig"),
+        program: union(enum) { regexp: regex_mod.RegexAutomaton, fuzzy: levenshtein.LevenshteinAutomaton },
+        busy: bool = false,
+        fn deinit(self: *@This()) void {
+            switch (self.program) {
+                inline else => |*program| program.deinit(),
+            }
+            std.debug.assert(self.budget.live == 0);
+        }
+    };
+    const ExecutionLease = struct {
+        owner: *PatternPrograms,
+        execution: *Execution,
+        fn release(self: @This()) void {
+            @import("antfly_platform").sync.lockYielding(&self.owner.mutex);
+            defer self.owner.mutex.unlock();
+            self.execution.busy = false;
+            // A parent allocator can refuse growth without exhausting the
+            // child budget. Failed DFA tables are never reusable, regardless
+            // of which admission owner rejected their allocation.
+            const failed = switch (self.execution.program) {
+                inline else => |program| program.allocation_failed,
+            };
+            if (failed or self.execution.budget.isLocallyExhausted()) {
+                for (self.owner.entries) |entry| if (entry) |held| {
+                    for (&held.executions) |*slot| if (slot.* == self.execution) {
+                        slot.* = null;
+                        self.execution.deinit();
+                        self.owner.budget.allocator().destroy(self.execution);
+                        return;
+                    };
+                };
+                unreachable;
+            }
+        }
+    };
+    /// Mutable DFA tables are exclusive to one traversal, but survive between
+    /// segments. Slots and their allocations belong to this bounded query owner.
+    fn checkout(self: *@This(), entry: *Entry, control: ExecutionControl) !?ExecutionLease {
+        try control.check();
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (entry.executions) |slot| if (slot) |execution| if (!execution.busy and !execution.budget.isLocallyExhausted()) {
+            execution.busy = true;
+            self.execution_hits += 1;
+            return .{ .owner = self, .execution = execution };
+        };
+        const slot = for (&entry.executions) |*candidate| {
+            if (candidate.* == null) break candidate;
+        } else return null;
+        const a = self.budget.allocator();
+        const execution = a.create(Execution) catch |err| {
+            if (self.budget.isExhausted()) return null;
+            return err;
+        };
+        execution.* = .{ .budget = .{ .backing = a, .limit = @min(256 * 1024, self.budget.limit / 4) }, .program = undefined, .busy = true };
+        execution.program = switch (entry.program) {
+            .regexp => |*program| .{ .regexp = program.fork(execution.budget.allocator()) },
+            .fuzzy => |program| .{ .fuzzy = .{ .term = program.term, .max_distance = program.max_distance, .alloc = execution.budget.allocator() } },
+            .wildcard => unreachable,
+        };
+        slot.* = execution;
+        self.execution_builds += 1;
+        return .{ .owner = self, .execution = execution };
+    }
+    budget: @import("../sql/memory_budget.zig"),
+    entries: [16]?*Entry = @splat(null),
+    mutex: std.atomic.Mutex = .unlocked,
+    builds: usize = 0,
+    hits: usize = 0,
+    execution_builds: usize = 0,
+    execution_hits: usize = 0,
+    pub fn init(a: Allocator, bytes: usize) @This() {
+        return .{ .budget = .{ .backing = a, .limit = bytes } };
+    }
+    pub fn deinit(self: *@This()) void {
+        const a = self.budget.allocator();
+        for (self.entries) |entry| if (entry) |held| {
+            for (held.executions) |slot| if (slot) |execution| {
+                std.debug.assert(!execution.busy);
+                execution.deinit();
+                a.destroy(execution);
+            };
+            switch (held.program) {
+                .regexp => |*program| program.deinit(),
+                .wildcard => |*program| program.deinit(a),
+                .fuzzy => |*program| program.deinit(),
+            }
+            a.free(held.pattern);
+            a.destroy(held);
+        };
+        std.debug.assert(self.budget.live == 0);
+    }
+    fn get(self: *@This(), kind: Kind, pattern: []const u8, control: ExecutionControl) !?*Entry {
+        return self.getDistance(kind, pattern, 0, control);
+    }
+    fn getDistance(self: *@This(), kind: Kind, pattern: []const u8, distance: u8, control: ExecutionControl) !?*Entry {
+        try control.check();
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(@tagName(kind));
+        if (kind == .fuzzy) hasher.update(&.{distance});
+        hasher.update(pattern);
+        var key: [32]u8 = undefined;
+        hasher.final(&key);
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries) |entry| if (entry) |held| if (std.mem.eql(u8, &held.key, &key)) {
+            self.hits += 1;
+            return held;
+        };
+        const slot = for (&self.entries) |*entry| {
+            if (entry.* == null) break entry;
+        } else return null;
+        const built = self.build(kind, pattern, key, distance) catch |err| {
+            if (err == error.OutOfMemory and self.budget.isExhausted()) return null;
+            return err;
+        };
+        slot.* = built;
+        self.builds += 1;
+        try control.check();
+        return built;
+    }
+    fn build(self: *@This(), kind: Kind, pattern: []const u8, key: [32]u8, distance: u8) !*Entry {
+        const a = self.budget.allocator();
+        const entry = try a.create(Entry);
+        errdefer a.destroy(entry);
+        const owned = try a.dupe(u8, pattern);
+        errdefer a.free(owned);
+        entry.* = .{ .key = key, .pattern = owned, .program = switch (kind) {
+            .regexp => .{ .regexp = try regex_mod.compile(a, owned) },
+            .wildcard => .{ .wildcard = try wildcard_mod.searchPlanAlloc(a, owned) },
+            .fuzzy => .{ .fuzzy = .{ .term = owned, .max_distance = distance } },
+        } };
+        return entry;
+    }
+};
+
+/// Bounded query-owned pattern leaves for one immutable corpus/pack. Keys own
+/// only digests; encoded segments and request syntax are never retained. Each
+/// mutable caller receives a private bitmap. Scorers can instead pin immutable
+/// membership until their independent iterators close, preventing eviction.
+pub const PatternMembership = struct {
+    const Bitmap = roaring.RoaringBitmap;
+    const Entry = struct { key: [32]u8, bitmap: Bitmap, age: u64, pins: usize = 0 };
+    /// Cache lifetime encloses every scorer. Pinned slots cannot be evicted;
+    /// consumers own independent iterators over immutable segment-local IDs.
+    pub const Pin = struct {
+        cache: *PatternMembership,
+        slot: usize,
+        pub fn bitmap(self: Pin) *const Bitmap {
+            return &self.cache.entries[self.slot].?.bitmap;
+        }
+        pub fn release(self: Pin) void {
+            self.cache.lock();
+            defer self.cache.mutex.unlock();
+            std.debug.assert(self.cache.entries[self.slot].?.pins != 0);
+            self.cache.entries[self.slot].?.pins -= 1;
+        }
+    };
+    budget: @import("../sql/memory_budget.zig"),
+    entries: [32]?Entry = @splat(null),
+    mutex: std.atomic.Mutex = .unlocked,
+    tick: u64 = 0,
+    hits: usize = 0,
+    builds: usize = 0,
+    pub fn init(a: Allocator, bytes: usize) PatternMembership {
+        return .{ .budget = .{ .backing = a, .limit = bytes } };
+    }
+    fn lock(self: *@This()) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+    }
+    fn evict(self: *@This()) bool {
+        var oldest: ?usize = null;
+        for (self.entries, 0..) |entry, i| if (entry) |held| {
+            if (held.pins != 0) continue;
+            if (oldest == null or held.age < self.entries[oldest.?].?.age) oldest = i;
+        };
+        const index = oldest orelse return false;
+        self.entries[index].?.bitmap.deinit();
+        self.entries[index] = null;
+        return true;
+    }
+    pub fn deinit(self: *@This()) void {
+        while (self.evict()) {}
+        for (self.entries) |entry| std.debug.assert(entry == null);
+        std.debug.assert(self.budget.live == 0);
+    }
+    pub fn pin(self: *@This(), filter: Filter, seg: *const index_mod.SegmentEntry, control: ExecutionControl) !?Pin {
+        switch (filter) {
+            .prefix, .wildcard, .regexp, .fuzzy => {},
+            else => return null,
+        }
+        try control.check();
+        const key = identity(filter, seg);
+        self.lock();
+        defer self.mutex.unlock();
+        self.tick +%= 1;
+        for (&self.entries, 0..) |*entry, i| if (entry.*) |*held| if (std.mem.eql(u8, &held.key, &key)) {
+            held.pins += 1;
+            held.age = self.tick;
+            self.hits += 1;
+            return .{ .cache = self, .slot = i };
+        };
+        return null;
+    }
+    fn identity(filter: Filter, seg: *const index_mod.SegmentEntry) [32]u8 {
+        var buffer: [1024]u8 = undefined;
+        var writer: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+        std.json.Stringify.value(.{ seg.id, seg.reader.doc_count, @tagName(filter) }, .{}, &writer.writer) catch unreachable;
+        switch (filter) {
+            inline .prefix, .wildcard, .regexp, .fuzzy => |value| inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
+                if (comptime !std.mem.eql(u8, name, "control")) {
+                    std.json.Stringify.value(@field(value, name), .{}, &writer.writer) catch unreachable;
+                    writer.writer.writeByte(0) catch unreachable;
+                }
+            },
+            else => unreachable,
+        }
+        writer.writer.flush() catch unreachable;
+        var digest: [32]u8 = undefined;
+        writer.hasher.final(&digest);
+        return digest;
+    }
+    fn execute(self: *@This(), a: Allocator, filter: Filter, seg: *const index_mod.SegmentEntry, control: ExecutionControl) !Bitmap {
+        try control.check();
+        const key = identity(filter, seg);
+        self.lock();
+        self.tick +%= 1;
+        for (&self.entries) |*entry| if (entry.*) |*held| if (std.mem.eql(u8, &held.key, &key)) {
+            held.age = self.tick;
+            const result = held.bitmap.clone(a);
+            self.hits += 1;
+            self.mutex.unlock();
+            var owned = try result;
+            errdefer owned.deinit();
+            try control.check();
+            return owned;
+        };
+        self.mutex.unlock();
+        var uncached = control;
+        uncached.pattern_cache = null;
+        var result = try filter.withControl(uncached).execute(a, seg);
+        errdefer result.deinit();
+        try control.check();
+        self.lock();
+        defer self.mutex.unlock();
+        self.builds += 1;
+        while (true) {
+            var free: ?usize = null;
+            for (self.entries, 0..) |entry, i| if (entry == null) {
+                free = i;
+                break;
+            };
+            if (free == null) {
+                if (!self.evict()) return result;
+                continue;
+            }
+            const copy = result.clone(self.budget.allocator()) catch {
+                if (!self.evict()) return result;
+                continue;
+            };
+            self.entries[free.?] = .{ .key = key, .bitmap = copy, .age = self.tick };
+            return result;
+        }
+    }
+};
+
 /// Exact term match: extracts the posting bitmap for a single term.
 /// If the segment has a synonym section for the field, synonyms are automatically expanded.
 pub const TermFilter = struct {
@@ -163,10 +446,16 @@ pub const TermFilter = struct {
 
         // Synonym expansion: check if field has a synonym section
         if (try seg.reader.getSection(self.field, .synonym)) |syn_data| {
-            var syn_reader = synonyms_mod.SynonymReader.init(alloc, syn_data) catch return result;
+            var syn_reader = synonyms_mod.SynonymReader.init(alloc, syn_data) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return result,
+            };
             defer syn_reader.deinit();
 
-            const expanded = syn_reader.expandTerm(alloc, self.term) catch return result;
+            const expanded = syn_reader.expandTerm(alloc, self.term) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return result,
+            };
             if (expanded) |terms| {
                 defer {
                     for (terms) |t| alloc.free(t);
@@ -661,13 +950,31 @@ pub const FuzzyFilter = struct {
         return fuzzyPrefixMatches(self.term, term, self.prefix_len);
     }
 
-    fn executeInternal(
+    fn executeInternal(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+        const original_stats = if (stats) |value| value.* else null;
+        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+            error.PatternProgramBudgetExceeded => blk: {
+                // The failed attempt has released its reader, iterator and
+                // execution lease before the private traversal starts.
+                var fallback = self;
+                fallback.control.pattern_programs = null;
+                if (stats) |value| value.* = original_stats.?;
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                    error.PatternProgramBudgetExceeded => unreachable,
+                    else => return failure,
+                };
+            },
+            else => return err,
+        };
+    }
+
+    fn executeAttempt(
         self: FuzzyFilter,
         alloc: Allocator,
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
-    ) FilterError!roaring.RoaringBitmap {
+    ) (FilterError || error{PatternProgramBudgetExceeded})!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
         defer inv_reader.deinit();
@@ -676,14 +983,24 @@ pub const FuzzyFilter = struct {
         // shared prefix is already more than `max_edits` away are skipped
         // without decoding, and each decoded term only feeds its front-coded
         // leaf bytes through the DFA.
-        var lev = levenshtein.LevenshteinAutomaton{ .term = self.term, .max_distance = self.max_edits, .alloc = alloc };
-        defer lev.deinit();
+        const cached = if (self.control.pattern_programs) |programs| try programs.getDistance(.fuzzy, self.term, self.max_edits, self.control) else null;
+        const execution = if (cached) |entry| try self.control.pattern_programs.?.checkout(entry, self.control) else null;
+        defer if (execution) |lease| lease.release();
+        var local = levenshtein.LevenshteinAutomaton{ .term = self.term, .max_distance = self.max_edits, .alloc = alloc };
+        defer local.deinit();
+        const lev = if (execution) |lease| &lease.execution.program.fuzzy else &local;
         var term_iter = try inv_reader.fstSearchIterator(lev.automaton());
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
         try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
+        if (lev.allocation_failed) {
+            if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
+                return error.PatternProgramBudgetExceeded;
+            };
+            return error.OutOfMemory;
+        }
         return result;
     }
 };
@@ -737,22 +1054,49 @@ pub const RegexpFilter = struct {
         return true;
     }
 
-    fn executeInternal(
+    fn executeInternal(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+        const original_stats = if (stats) |value| value.* else null;
+        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+            error.PatternProgramBudgetExceeded => blk: {
+                // The failed attempt has released its reader, iterator and
+                // execution lease before the private traversal starts.
+                var fallback = self;
+                fallback.control.pattern_programs = null;
+                if (stats) |value| value.* = original_stats.?;
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                    error.PatternProgramBudgetExceeded => unreachable,
+                    else => return failure,
+                };
+            },
+            else => return err,
+        };
+    }
+
+    fn executeAttempt(
         self: RegexpFilter,
         alloc: Allocator,
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
-    ) FilterError!roaring.RoaringBitmap {
+    ) (FilterError || error{PatternProgramBudgetExceeded})!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
         defer inv_reader.deinit();
 
         // Compile regex → automaton; the dictionary walk prunes whole blocks
         // whose shared prefix cannot reach an accepting state.
-        var regex = regex_mod.compile(alloc, self.pattern) catch
-            return roaring.RoaringBitmap.init(alloc);
-        defer regex.deinit();
+        const cached = if (self.control.pattern_programs) |programs| programs.get(.regexp, self.pattern, self.control) catch |err| switch (err) {
+            error.InvalidRegex => return roaring.RoaringBitmap.init(alloc),
+            else => return err,
+        } else null;
+        const execution = if (cached) |entry| try self.control.pattern_programs.?.checkout(entry, self.control) else null;
+        defer if (execution) |lease| lease.release();
+        var local = if (execution != null) null else if (cached) |entry| entry.program.regexp.fork(alloc) else regex_mod.compile(alloc, self.pattern) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return roaring.RoaringBitmap.init(alloc),
+        };
+        defer if (local) |*program| program.deinit();
+        const regex = if (execution) |lease| &lease.execution.program.regexp else &local.?;
 
         var term_iter = try inv_reader.fstSearchIterator(regex.automaton());
         defer term_iter.deinit();
@@ -760,6 +1104,12 @@ pub const RegexpFilter = struct {
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
         try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
+        if (regex.allocation_failed) {
+            if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
+                return error.PatternProgramBudgetExceeded;
+            };
+            return error.OutOfMemory;
+        }
         return result;
     }
 };
@@ -1574,7 +1924,10 @@ fn collectFuzzyCandidateTerms(
     defer term_iter.deinit();
 
     var out = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer out.deinit(alloc);
+    errdefer {
+        for (out.items) |text| alloc.free(text);
+        out.deinit(alloc);
+    }
 
     while (try term_iter.next()) |entry| {
         if (!fuzzyPrefixMatches(term, entry.term, prefix_len)) continue;
@@ -1585,10 +1938,17 @@ fn collectFuzzyCandidateTerms(
                 break;
             }
         }
-        if (!seen) try out.append(alloc, try alloc.dupe(u8, entry.term));
+        if (!seen) {
+            try out.ensureUnusedCapacity(alloc, 1);
+            out.appendAssumeCapacity(try alloc.dupe(u8, entry.term));
+        }
     }
 
-    if (out.items.len == 0) try out.append(alloc, try alloc.dupe(u8, term));
+    if (lev.allocation_failed) return error.OutOfMemory;
+    if (out.items.len == 0) {
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(try alloc.dupe(u8, term));
+    }
     return out.toOwnedSlice(alloc);
 }
 
@@ -1683,8 +2043,9 @@ pub const WildcardFilter = struct {
         // lookup; otherwise seek to the literal prefix and stop as soon as
         // the sorted dictionary leaves it. Only a leading operator still has
         // to walk the whole dictionary.
-        var plan = try wildcard_mod.searchPlanAlloc(alloc, self.pattern);
-        defer plan.deinit(alloc);
+        const cached = if (self.control.pattern_programs) |programs| try programs.get(.wildcard, self.pattern, self.control) else null;
+        var plan = if (cached) |entry| entry.program.wildcard else try wildcard_mod.searchPlanAlloc(alloc, self.pattern);
+        defer if (cached == null) plan.deinit(alloc);
         const literal_prefix = plan.literal_prefix;
 
         if (plan.exact) {
@@ -3811,7 +4172,7 @@ test "geo shape filter point in polygon" {
     try testing.expect(contains.isEmpty());
 }
 
-test "term filter with synonym expansion" {
+test "external lake metadata navigation term filter keeps synonym membership complete under pressure" {
     const alloc = testing.allocator;
 
     // Build inverted index: doc0 has "fast", doc1 has "quick"
@@ -3855,4 +4216,175 @@ test "term filter with synonym expansion" {
     try testing.expect(bm.contains(0)); // "fast" — direct match
     try testing.expect(bm.contains(1)); // "quick" — synonym expansion
     try testing.expect(!bm.contains(2)); // "slow" — not a synonym
+    const Checked = struct {
+        fn run(a: Allocator, segment: *const index_mod.SegmentEntry) !void {
+            var matches = try (Filter{ .term = .{ .field = "text", .term = "fast" } }).execute(a, segment);
+            defer matches.deinit();
+            try testing.expectEqual(@as(usize, 2), matches.cardinality());
+            try testing.expect(matches.contains(0) and matches.contains(1));
+        }
+    };
+    try testing.checkAllAllocationFailures(alloc, Checked.run, .{seg});
+}
+
+test "external lake metadata navigation pattern leaves reuse immutable membership and honor controls" {
+    const a = testing.allocator;
+    const bytes = try buildTestSegmentWithTerms(a, &.{
+        .{ .terms = &.{ .{ .term = "alpine", .freq = 1, .norm = 2 }, .{ .term = "common", .freq = 1, .norm = 2 } } },
+        .{ .terms = &.{.{ .term = "beta", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const segment = &writer.snapshot().segments[0];
+    var memo = PatternMembership.init(a, 1024 * 1024);
+    defer memo.deinit();
+    const leaves = [_]Filter{
+        .{ .prefix = .{ .field = "body", .prefix = "alp" } },
+        .{ .wildcard = .{ .field = "body", .pattern = "alp*" } },
+        .{ .regexp = .{ .field = "body", .pattern = "alp.*" } },
+        .{ .fuzzy = .{ .field = "body", .term = "alpine" } },
+    };
+    for (leaves) |leaf| {
+        const filter = leaf.withControl(.{ .pattern_cache = &memo });
+        var first = try filter.execute(a, segment);
+        defer first.deinit();
+        try first.remove(0);
+        var second = try filter.execute(a, segment);
+        defer second.deinit();
+        try testing.expectEqual(@as(usize, 1), second.cardinality());
+        try testing.expect(second.contains(0));
+        try testing.expectError(error.Timeout, leaf.withControl(.{ .pattern_cache = &memo, .deadline_ns = 0 }).execute(a, segment));
+    }
+    try testing.expectEqual(@as(usize, 4), memo.builds);
+    try testing.expectEqual(@as(usize, 4), memo.hits);
+    const pin = (try memo.pin(leaves[0], segment, .{})).?;
+    const immutable = pin.bitmap();
+    try testing.expect(immutable.contains(0));
+    while (memo.evict()) {}
+    try testing.expect(pin.bitmap() == immutable and immutable.contains(0));
+    try testing.expect(!memo.evict());
+    pin.release();
+    try testing.expect(memo.evict());
+    try testing.expectError(error.Timeout, memo.pin(leaves[0], segment, .{ .deadline_ns = 0 }));
+    var pressure = PatternMembership.init(a, 1);
+    defer pressure.deinit();
+    for (0..2) |_| {
+        var result = try leaves[0].withControl(.{ .pattern_cache = &pressure }).execute(a, segment);
+        defer result.deinit();
+        try testing.expect(result.contains(0));
+    }
+    try testing.expectEqual(@as(usize, 2), pressure.builds);
+    try testing.expectEqual(@as(usize, 0), pressure.budget.live);
+    const Failure = struct {
+        fn run(alloc: Allocator, seg: *const index_mod.SegmentEntry, leaf: Filter) !void {
+            var local = PatternMembership.init(alloc, 1024 * 1024);
+            defer local.deinit();
+            for (0..2) |_| {
+                var matches = try leaf.withControl(.{ .pattern_cache = &local }).execute(alloc, seg);
+                defer matches.deinit();
+                try testing.expect(matches.contains(0));
+            }
+        }
+    };
+    try testing.checkAllAllocationFailures(a, Failure.run, .{ segment, leaves[0] });
+}
+
+test "external lake metadata navigation compiled programs share immutable plans across segments" {
+    const a = std.testing.allocator;
+    const data = try buildTestSegmentWithTerms(a, &.{
+        .{ .terms = &.{.{ .term = "alpine", .freq = 1, .norm = 1 }} },
+        .{ .terms = &.{.{ .term = "beta", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(data);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    for (0..4) |_| try writer.addSegment(data);
+    var programs = PatternPrograms.init(a, 1024 * 1024);
+    defer programs.deinit();
+    const leaves = [_]Filter{
+        .{ .regexp = .{ .field = "body", .pattern = "alp.*" } },
+        .{ .wildcard = .{ .field = "body", .pattern = "al\\p*" } },
+        .{ .fuzzy = .{ .field = "body", .term = "alpina", .max_edits = 1 } },
+    };
+    const Worker = struct {
+        fn run(alloc: Allocator, leaf: Filter, segment: *const index_mod.SegmentEntry) anyerror!void {
+            var matches = try leaf.execute(alloc, segment);
+            defer matches.deinit();
+            try testing.expect(matches.contains(0));
+            try testing.expect(!matches.contains(1));
+        }
+    };
+    for (leaves) |leaf| {
+        const controlled = leaf.withControl(.{ .pattern_programs = &programs });
+        var futures: [4]std.Io.Future(anyerror!void) = undefined;
+        for (&futures, 0..) |*future, index| future.* = std.Io.async(std.testing.io, Worker.run, .{ a, controlled, &writer.snapshot().segments[index] });
+        var failure: ?anyerror = null;
+        for (&futures) |*future| future.await(std.testing.io) catch |err| {
+            failure = failure orelse err;
+        };
+        if (failure) |err| return err;
+        try testing.expectError(error.Timeout, leaf.withControl(.{ .pattern_programs = &programs, .deadline_ns = 0 }).execute(a, &writer.snapshot().segments[0]));
+    }
+    try testing.expectEqual(@as(usize, 3), programs.builds);
+    try testing.expectEqual(@as(usize, 9), programs.hits);
+    const built = programs.execution_builds;
+    for (leaves) |leaf| for (writer.snapshot().segments) |*segment| try Worker.run(a, leaf.withControl(.{ .pattern_programs = &programs }), segment);
+    try testing.expectEqual(built, programs.execution_builds);
+    try testing.expect(programs.execution_hits >= 8);
+    const entry = (try programs.get(.regexp, "alp.*", .{})).?;
+    var leases: [4]?PatternPrograms.ExecutionLease = @splat(null);
+    defer for (leases) |lease| if (lease) |held| held.release();
+    for (&leases) |*lease| lease.* = (try programs.checkout(entry, .{})).?;
+    try testing.expect((try programs.checkout(entry, .{})) == null);
+    try Worker.run(a, leaves[0].withControl(.{ .pattern_programs = &programs }), &writer.snapshot().segments[0]);
+    for (&leases) |*lease| {
+        lease.*.?.release();
+        lease.* = null;
+    }
+    for ([_]bool{ false, true }) |fuzzy| {
+        var bounded = PatternPrograms.init(a, 1024 * 1024);
+        defer bounded.deinit();
+        const plan = (try bounded.getDistance(if (fuzzy) .fuzzy else .regexp, if (fuzzy) "alpina" else "alp.*", if (fuzzy) 1 else 0, .{})).?;
+        const lease = (try bounded.checkout(plan, .{})).?;
+        lease.execution.budget.limit = 0;
+        lease.release();
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &bounded }), &writer.snapshot().segments[0]);
+        try testing.expect(plan.executions[0] == null);
+    }
+    for ([_]bool{ false, true }) |fuzzy| {
+        var pressure = PatternPrograms.init(a, 1024 * 1024);
+        defer pressure.deinit();
+        const plan = (try pressure.getDistance(if (fuzzy) .fuzzy else .regexp, if (fuzzy) "alpina" else "alp.*", if (fuzzy) 1 else 0, .{})).?;
+        const lease = (try pressure.checkout(plan, .{})).?;
+        const initial_live = pressure.budget.live;
+        pressure.budget.limit = initial_live;
+        lease.release();
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &pressure }), &writer.snapshot().segments[0]);
+        try testing.expect(pressure.budget.isExhausted());
+        try testing.expect(plan.executions[0] == null);
+        try testing.expect(pressure.budget.live < initial_live);
+        // Restoring headroom builds a healthy execution, then reuses it.
+        pressure.budget.limit = 1024 * 1024;
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &pressure }), &writer.snapshot().segments[0]);
+        const builds = pressure.execution_builds;
+        try Worker.run(a, leaves[if (fuzzy) 2 else 0].withControl(.{ .pattern_programs = &pressure }), &writer.snapshot().segments[1]);
+        try testing.expectEqual(builds, pressure.execution_builds);
+        try testing.expect(pressure.execution_hits > 0);
+    }
+    // Optional cache admission never makes a valid pattern disappear.
+    var tiny = PatternPrograms.init(a, 0);
+    defer tiny.deinit();
+    try Worker.run(a, leaves[0].withControl(.{ .pattern_programs = &tiny }), &writer.snapshot().segments[0]);
+    const Failure = struct {
+        fn run(alloc: Allocator, segment: *const index_mod.SegmentEntry) !void {
+            var cache = PatternPrograms.init(alloc, 1024 * 1024);
+            defer cache.deinit();
+            var matches = try (Filter{ .regexp = .{ .field = "body", .pattern = "alp.*", .control = .{ .pattern_programs = &cache } } }).execute(alloc, segment);
+            defer matches.deinit();
+            try testing.expect(matches.contains(0));
+        }
+    };
+    try testing.checkAllAllocationFailures(a, Failure.run, .{&writer.snapshot().segments[0]});
 }

@@ -104,6 +104,35 @@ pub const Summary = struct {
         }
         return result;
     }
+    /// An exact f32 ceiling for the common single-occurrence population.
+    /// Quantized maxima of one prove every posting has frequency one. Norm
+    /// minima remain conservative for both canonical scoring arithmetic paths.
+    pub fn fixedFrequencyScore(self: Summary, average: f32, config: inverted.BM25Config, idf: f32, legacy: bool) ?f32 {
+        if (!(average > 0) or !std.math.isFinite(average) or !std.math.isFinite(idf) or idf < 0 or
+            !std.math.isFinite(config.k1) or config.k1 < 0 or !std.math.isFinite(config.b) or config.b < 0 or config.b > 1 or self.max_frequency != 1) return null;
+        const value = if (legacy) inverted.bm25ScoreWithIdf(1, self.min_norm, average, idf, config) else inverted.BM25TermScorer.init(average, idf, config).score(1, self.min_norm);
+        return if (std.math.isFinite(value)) value else null;
+    }
+    /// Evaluate the bounded integer frequency domain, rather than assuming
+    /// f32 arithmetic is monotone in frequency. For each fixed numerator the
+    /// score is monotone in norm, so the authenticated norm minimum suffices.
+    /// Large/escaped domains retain the ordinary conservative bound.
+    pub fn exactScoreCeiling(self: Summary, average: f32, config: inverted.BM25Config, idf: f32, legacy: bool) ?f32 {
+        if (!(average > 0) or !std.math.isFinite(average) or !std.math.isFinite(idf) or idf < 0 or
+            !std.math.isFinite(config.k1) or config.k1 < 0 or !std.math.isFinite(config.b) or config.b < 0 or config.b > 1 or self.max_frequency > 256) return null;
+        const scorer = inverted.BM25TermScorer.init(average, idf, config);
+        var upper: f32 = 0;
+        const count = @max(1, self.pair_count);
+        for (0..count) |i| {
+            const pair = if (self.pair_count == 0) Pair{ .frequency = self.max_frequency, .norm = self.min_norm } else self.pairs[i];
+            for (1..@as(usize, pair.frequency) + 1) |frequency| {
+                const value = if (legacy) inverted.bm25ScoreWithIdf(@intCast(frequency), pair.norm, average, idf, config) else scorer.score(@intCast(frequency), pair.norm);
+                if (!std.math.isFinite(value)) return null;
+                upper = @max(upper, value);
+            }
+        }
+        return upper;
+    }
     pub fn bound(self: Summary, average: f32, config: inverted.BM25Config) local.index.IndexSnapshot.TextTermSummary {
         const valid = std.math.isFinite(config.k1) and config.k1 >= 0 and std.math.isFinite(config.b) and config.b >= 0 and config.b <= 1 and std.math.isFinite(average) and average > 0;
         var upper: f32 = 0;
@@ -1371,4 +1400,35 @@ test "external lake text statistics durable deltas coalesce files and resume sig
     var old = try tree.Cursor.init(a, memory.store(), prior, "", null);
     defer old.deinit();
     try std.testing.expectEqual(@as(u64, 3), try decodeFrequency((try old.next()).?.value));
+}
+
+test "external lake global frontier exact frequency one ceilings cover canonical scorer arithmetic" {
+    const summary: Summary = .{ .frequency = 100, .max_frequency = 1, .min_norm = 3 };
+    for ([_]f32{ 0.125, 1, 100, 1000000 }) |average| for ([_]f32{ 0, 0.5, 1.2, 8 }) |k1| for ([_]f32{ 0, 0.75, 1 }) |b| for ([_]f32{ 0, 0.0001, 1, 100 }) |idf| for ([_]bool{ false, true }) |legacy| {
+        const config: inverted.BM25Config = .{ .k1 = k1, .b = b };
+        const bound_ = summary.fixedFrequencyScore(average, config, idf, legacy).?;
+        for ([_]u32{ 3, 4, 5, 255, 65535, std.math.maxInt(u32) }) |norm| {
+            const actual = if (legacy) inverted.bm25ScoreWithIdf(1, norm, average, idf, config) else inverted.BM25TermScorer.init(average, idf, config).score(1, norm);
+            try std.testing.expect(bound_ >= actual);
+        }
+    };
+    var uncertain = summary;
+    uncertain.max_frequency = 2;
+    try std.testing.expect(uncertain.fixedFrequencyScore(100, .{}, 1, false) == null);
+}
+
+test "external lake global frontier repeated frequency and phrase ceilings cover exact f32 scores" {
+    for ([_]u32{ 2, 3, 7, 31, 127, 256 }) |maximum| {
+        const summary: Summary = .{ .frequency = 100, .max_frequency = maximum, .min_norm = 3 };
+        for ([_]f32{ 0.125, 100, 1000000 }) |average| for ([_]f32{ 0, 1.2, 8 }) |k1| for ([_]f32{ 0, 0.75, 1 }) |b| for ([_]f32{ 0, 0.0001, 7, 100 }) |idf| for ([_]bool{ false, true }) |legacy| {
+            const config: inverted.BM25Config = .{ .k1 = k1, .b = b };
+            const ceiling = summary.exactScoreCeiling(average, config, idf, legacy).?;
+            for (1..@as(usize, maximum) + 1) |frequency| for ([_]u32{ 3, 4, 255, 65535, std.math.maxInt(u32) }) |norm| {
+                const actual = if (legacy) inverted.bm25ScoreWithIdf(@intCast(frequency), norm, average, idf, config) else inverted.BM25TermScorer.init(average, idf, config).score(@intCast(frequency), norm);
+                try std.testing.expect(ceiling >= actual);
+            };
+        };
+    }
+    const escaped: Summary = .{ .frequency = 100, .max_frequency = std.math.maxInt(u32), .min_norm = 3 };
+    try std.testing.expect(escaped.exactScoreCeiling(100, .{}, 1, false) == null);
 }

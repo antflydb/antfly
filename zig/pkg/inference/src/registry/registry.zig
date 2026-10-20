@@ -35,6 +35,7 @@ pub const pull_diagnostics = @import("pull_diagnostics.zig");
 pub const download = @import("download.zig");
 pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
+pub const embedding_gemma2_catalog = @import("embedding_gemma2_catalog.zig");
 pub const qwen3_reranker_catalog = @import("qwen3_reranker_catalog.zig");
 
 pub const ModelKind = enum {
@@ -70,6 +71,7 @@ test {
     _ = download;
     _ = qwen3vl_catalog;
     _ = qwen3_embedding_catalog;
+    _ = embedding_gemma2_catalog;
     _ = qwen3_reranker_catalog;
 }
 
@@ -517,7 +519,8 @@ pub const ModelRegistry = struct {
     }
 
     /// Pull a model from HuggingFace Hub, reporting progress to `progress_sink`
-    /// on the calling thread.
+    /// on the calling thread. Companion pulls recurse through this boundary,
+    /// so its error set must be explicit.
     pub fn pullWithProgress(
         self: *ModelRegistry,
         io: std.Io,
@@ -567,6 +570,41 @@ pub const ModelRegistry = struct {
             .lock = .exclusive,
         });
         defer download_lock.close(io);
+
+        // Immutable catalog pulls are idempotent. Do this before staging:
+        // even creating a hard link changes the live artifact's ctime and
+        // needlessly invalidates a loaded model's coherency signature.
+        if (tasks_csv == null and capabilities_csv == null) {
+            const cached = if (qwen3vl_catalog.findGenerationBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| blk: {
+                const descriptor = try qwen3vl_catalog.generationBundleManifestAlloc(self.allocator, bundle);
+                defer self.allocator.free(descriptor);
+                break :blk try download.installedPinnedBundleMatches(self.allocator, io, dest, .{
+                    .artifacts = &bundle.artifacts(),
+                    .generated = &.{.{ .path = download.bundle_descriptor_filename, .bytes = descriptor }},
+                }, hub_config, progress_sink);
+            } else if (qwen3vl_catalog.findGenerationSafetensorsBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{
+                    .artifacts = &bundle.artifacts(),
+                    .generated = &.{.{ .path = download.bundle_descriptor_filename, .bytes = qwen3vl_catalog.generation_safetensors_bundle_manifest }},
+                }, hub_config, progress_sink)
+            else if (qwen3vl_catalog.isRerankerBundleRef(ref.owner, ref.name, ref.variant))
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{
+                    .artifacts = &qwen3vl_catalog.rerankerArtifacts(),
+                    .generated = &.{.{ .path = download.bundle_descriptor_filename, .bytes = qwen3vl_catalog.reranker_bundle_manifest }},
+                }, hub_config, progress_sink)
+            else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{ .artifacts = bundle.artifacts() }, hub_config, progress_sink)
+            else if (embedding_gemma2_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{ .artifacts = bundle.artifacts() }, hub_config, progress_sink)
+            else if (qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle|
+                try download.installedPinnedBundleMatches(self.allocator, io, dest, .{ .artifacts = bundle.artifacts() }, hub_config, progress_sink)
+            else
+                false;
+            if (cached) {
+                try download.finishVerifiedManagedInstall(self.allocator, io, dest);
+                return;
+            }
+        }
 
         var transaction = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
         defer transaction.deinit(io);
@@ -618,6 +656,18 @@ pub const ModelRegistry = struct {
                 hub_config,
                 progress_sink,
             );
+        } else if (embedding_gemma2_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedEmbeddingGemma2Bundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
         } else if (qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
             try download.downloadPinnedQwen3RerankerBundle(
                 self.allocator,
@@ -644,6 +694,7 @@ pub const ModelRegistry = struct {
             );
         }
         try self.writePulledModelManifest(io, transaction.staging, tasks_csv, capabilities_csv);
+        try download.validateManagedDownloadLimits(self.allocator, io, transaction.staging, hub_config);
         try download.completeManagedDownload(self.allocator, io, transaction.staging);
 
         // Gemma4 QAT gguf checkpoints ship a sibling MTP assistant repo that

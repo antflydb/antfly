@@ -109,9 +109,10 @@ pub fn artifactEnrichmentLessThan(_: void, lhs: db_mod.types.EnrichmentConfig, r
 
 pub fn artifactEnrichmentKindRank(kind: db_mod.types.EnrichmentKind) u8 {
     return switch (kind) {
-        .asset => 0,
-        .chunk => 1,
-        .embedding => 2,
+        .group => 0,
+        .asset => 1,
+        .chunk => 2,
+        .embedding => 3,
     };
 }
 
@@ -140,13 +141,14 @@ pub fn validateArtifactEnrichmentConfigs(
     try validateArtifactEnrichmentConfigDefinitions(alloc, configs);
     for (configs) |cfg| {
         switch (cfg.kind) {
+            .group => {},
             .chunk => {
-                if (cfg.source_artifact_name.len > 0 and findArtifactEnrichmentConfig(configs, .asset, cfg.source_artifact_name) == null) {
+                if (cfg.source_artifact_name.len > 0 and findArtifactEnrichmentConfig(configs, .asset, cfg.source_artifact_name) == null and findArtifactEnrichmentConfig(configs, .group, cfg.source_artifact_name) == null) {
                     return error.InvalidEnrichmentConfig;
                 }
             },
             .embedding => {
-                if (cfg.source_artifact_name.len > 0 and findArtifactEnrichmentConfig(configs, .chunk, cfg.source_artifact_name) == null) {
+                if (cfg.source_artifact_name.len > 0 and findArtifactEnrichmentConfig(configs, .chunk, cfg.source_artifact_name) == null and findArtifactEnrichmentConfig(configs, .group, cfg.source_artifact_name) == null) {
                     return error.InvalidEnrichmentConfig;
                 }
             },
@@ -160,6 +162,7 @@ pub fn validateArtifactEnrichmentConfigs(
                 var current: []const u8 = cfg.source_artifact_name;
                 while (current.len > 0) {
                     if (std.mem.eql(u8, current, cfg.name)) return error.InvalidEnrichmentConfig;
+                    if (findArtifactEnrichmentConfig(configs, .group, current) != null) break;
                     const upstream = findArtifactEnrichmentConfig(configs, .asset, current) orelse
                         return error.InvalidEnrichmentConfig;
                     current = upstream.source_artifact_name;
@@ -168,6 +171,7 @@ pub fn validateArtifactEnrichmentConfigs(
                 }
             },
         }
+        if (cfg.prior_context) |context| if (!enrichment_config_validation.priorSharesGroup(configs, cfg.name, context.artifact)) return error.InvalidEnrichmentConfig;
     }
 }
 
@@ -191,7 +195,7 @@ pub fn findArtifactEnrichmentConfig(
     name: []const u8,
 ) ?db_mod.types.EnrichmentConfig {
     for (configs) |cfg| {
-        if (cfg.kind == kind and std.mem.eql(u8, cfg.name, name)) return cfg;
+        if ((cfg.kind == kind or (kind == .asset and cfg.kind == .group)) and std.mem.eql(u8, cfg.name, name)) return cfg;
     }
     return null;
 }
@@ -202,6 +206,8 @@ pub fn artifactEnrichmentConfigsEqual(
     b: db_mod.types.EnrichmentConfig,
 ) !bool {
     return a.kind == b.kind and
+        ((a.source == null and b.source == null) or (a.source != null and b.source != null and std.mem.eql(u8, &a.source.?.semanticDigest(), &b.source.?.semanticDigest()))) and
+        try optionalPriorContextsEqual(alloc, a.prior_context, b.prior_context) and
         std.mem.eql(u8, a.name, b.name) and
         std.mem.eql(u8, a.field, b.field) and
         std.mem.eql(u8, a.template, b.template) and
@@ -239,5 +245,14 @@ pub fn indexesJsonSource(indexes_json: []const u8) []const u8 {
 }
 
 pub fn isReservedIndexMetadataEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
+    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments") or std.mem.eql(u8, name, "_resolver_curation") or std.mem.eql(u8, name, "_resolver_namespaces");
+}
+
+fn optionalPriorContextsEqual(alloc: std.mem.Allocator, a: ?@import("../storage/db/group_sources.zig").PriorContext, b: ?@import("../storage/db/group_sources.zig").PriorContext) !bool {
+    if (a == null or b == null) return a == null and b == null;
+    const left = try std.json.Stringify.valueAlloc(alloc, a.?, .{});
+    defer alloc.free(left);
+    const right = try std.json.Stringify.valueAlloc(alloc, b.?, .{});
+    defer alloc.free(right);
+    return std.mem.eql(u8, left, right);
 }

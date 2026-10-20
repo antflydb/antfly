@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -27,6 +27,8 @@ class InferenceEmbedResponse:
         object_ (InferenceEmbedResponseObject): Object type, always "list"
         data (list[InferenceEmbeddingObject]): List of embedding objects
         model (str): Model used for embedding generation
+        backend (None | str | Unset): Execution backend reported for EmbeddingGemma 2 qualification. CUDA requests fail
+            if the resident text encoder cannot execute; this field does not describe preprocessing placement.
         model_identity (str | Unset): EmbeddingGemma 2 SHA256 identity of actual weights, tokenizer, processor and
             recipe. Dimensions and retrieval roles must also match index configuration.
         usage (InferenceEmbeddingUsage | Unset): Token usage information
@@ -38,6 +40,7 @@ class InferenceEmbedResponse:
     object_: InferenceEmbedResponseObject
     data: list[InferenceEmbeddingObject]
     model: str
+    backend: None | str | Unset = UNSET
     model_identity: str | Unset = UNSET
     usage: InferenceEmbeddingUsage | Unset = UNSET
     errors: list[InferenceEmbeddingItemError] | Unset = UNSET
@@ -53,6 +56,12 @@ class InferenceEmbedResponse:
             data.append(data_item)
 
         model = self.model
+
+        backend: None | str | Unset
+        if isinstance(self.backend, Unset):
+            backend = UNSET
+        else:
+            backend = self.backend
 
         model_identity = self.model_identity
 
@@ -80,6 +89,8 @@ class InferenceEmbedResponse:
                 "model": model,
             }
         )
+        if backend is not UNSET:
+            field_dict["backend"] = backend
         if model_identity is not UNSET:
             field_dict["model_identity"] = model_identity
         if usage is not UNSET:
@@ -110,6 +121,15 @@ class InferenceEmbedResponse:
 
         model = d.pop("model")
 
+        def _parse_backend(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        backend = _parse_backend(d.pop("backend", UNSET))
+
         model_identity = d.pop("model_identity", UNSET)
 
         _usage = d.pop("usage", UNSET)
@@ -139,6 +159,7 @@ class InferenceEmbedResponse:
             object_=object_,
             data=data,
             model=model,
+            backend=backend,
             model_identity=model_identity,
             usage=usage,
             errors=errors,

@@ -42,6 +42,8 @@ pub const Limits = struct {
     /// Native execution batches are independent of response/decision pages.
     execution_batch_rows: u32 = 4096,
     page_bytes: usize = 256 * 1024,
+    /// Native scans charge execution-sized logical row batches plus empty
+    /// nonterminal pulls. Worker and row-group fragmentation do not add credit.
     scan_pages: usize = 65_536,
     spill_bytes: u64 = 1024 * 1024 * 1024,
     spill_root: []const u8 = "/tmp",
@@ -535,7 +537,12 @@ pub const Context = struct {
     fn parameterDatum(self: Context, index: usize) !Datum {
         if (index >= self.parameters.len) return error.InvalidSqlParameters;
         if (self.binding.parameter_invocation) |invocation| if (invocation.frame) |frame| return frame.values[index];
-        return Datum.fromJson(self.parameters[index]);
+        const raw = Datum.fromJson(self.parameters[index]);
+        if (index < self.binding.parameter_descriptors.len) {
+            const actual = self.binding.parameter_descriptors[index];
+            if (actual.kind) |kind| return describe.coerceDatum(self.arena, raw, kind, actual.element_type);
+        }
+        return raw;
     }
 
     pub fn count(self: Context, input: ?ast.Value, default: usize) !usize {
@@ -654,16 +661,20 @@ pub const Context = struct {
                 // scalar program's floating domain (including REAL/NUMERIC
                 // comparisons in double precision), without narrowing the
                 // operand to the physical column width.
+                var comparison_operand: ?Json = null;
                 if (column.type == .number and comparison.value == .parameter) {
                     const datum = try self.parameterDatum(comparison.value.parameter - 1);
-                    if (datum.numeric != null) {
+                    if (datum.numeric != null or (datum.value == .float and !std.math.isFinite(datum.value.float))) {
                         output.complete = false;
                         return;
                     }
+                    // Frame values already carry their declared width. A REAL
+                    // stored cell must not narrow a declared float8 operand.
+                    comparison_operand = if (datum.sql_null) .null else try describe.coerceAlloc(self.arena, datum.value, column.type);
                 }
                 // Row identity has a separate native key boundary; never
                 // pretend it is a document property in a storage predicate.
-                const bound_value = try self.value(comparison.value, column);
+                const bound_value = comparison_operand orelse try self.value(comparison.value, column);
                 if (column.type == .json) {
                     output.complete = false;
                     return;
@@ -1146,9 +1157,12 @@ pub const Context = struct {
     /// The caller selects predicate/OFFSET/LIMIT survivors before calling this,
     /// so discarded rows never invoke projection providers.
     pub fn projectValuesBatch(self: Context, alloc: std.mem.Allocator, rows: []const catalog.Row, fields: []const []const u8, cells: []const []const Datum) ![]const []const Datum {
+        return self.projectValuesBatchDemand(alloc, rows, fields, cells, null);
+    }
+    pub fn projectValuesBatchDemand(self: Context, alloc: std.mem.Allocator, rows: []const catalog.Row, fields: []const []const u8, cells: []const []const Datum, needed: ?[]const bool) ![]const []const Datum {
         if (rows.len != cells.len) return error.InvalidSqlBackendResponse;
         const columns = try alloc.alloc(?[]const Datum, self.binding.scalars.projections.len);
-        for (self.binding.scalars.projections, columns) |optional, *values| values.* = if (optional) |*program|
+        for (self.binding.scalars.projections, columns, 0..) |optional, *values, index| values.* = if (needed != null and !needed.?[index]) null else if (optional) |*program|
             try @import("decision_eval.zig").evaluateBatchWithLimits(alloc, self.backend.decision_provider, program, cells, self.parameters, @import("decision_eval.zig").limitsFor(self.backend))
         else
             null;
@@ -1156,6 +1170,10 @@ pub const Context = struct {
         for (rows, output, 0..) |row, *values, row_index| {
             const projected = try alloc.alloc(Datum, fields.len);
             for (fields, self.binding.columns, projected, 0..) |field, column, *out, index| {
+                if (needed != null and !needed.?[index]) {
+                    out.* = .{};
+                    continue;
+                }
                 const input = if (index < columns.len and columns[index] != null) columns[index].?[row_index] else blk: {
                     const cell = try row.cell(field);
                     break :blk cell;
@@ -5919,4 +5937,47 @@ test "SQL native transport parameters retain arrays numeric JSON null and source
         }
     };
     for ([_]bool{ false, true }) |leased| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{leased});
+}
+
+test "SQL REAL pushed comparisons preserve declared float8 parameter operands" {
+    const Fixture = struct {
+        expected: f64,
+        sample: f64 = @as(f32, 0.1),
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .float32 }} };
+        }
+        fn scan(raw: *anyopaque, a: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), request.conditions.len);
+            try std.testing.expectEqual(self.expected, request.conditions[0].value.float);
+            const order = try @import("scalar.zig").compare(.{ .float = self.sample }, request.conditions[0].value);
+            if (order != (if (request.conditions[0].op == .gt) std.math.Order.gt else .eq)) return .{ .rows = &.{} };
+            const rows = try a.alloc(catalog.Row, 1);
+            var object: std.json.ObjectMap = .empty;
+            try object.put(a, "n", .{ .float = self.sample });
+            rows[0] = .{ .id = "one", .version = 0, .value = .{ .object = object } };
+            return .{ .rows = rows };
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnsupportedSqlExecution;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{ .expected = 0.10000000148 };
+    const backend: catalog.Backend = .{ .ptr = &fixture, .parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .float64 }}, .vtable = &.{ .resolve = Fixture.resolve, .scan = Fixture.scan, .mutate = Fixture.mutate, .checkpoint = Fixture.checkpoint } };
+    var compiled = try compiler.compile(a, "SELECT n FROM docs WHERE n > $1", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{.{ .float = 0.10000000148 }}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    // Declared REAL operands normalize to their own descriptor as well.
+    fixture.expected = @as(f32, 0.1);
+    var real_backend = backend;
+    real_backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .float32 }};
+    var equality = try compiler.compile(a, "SELECT n FROM docs WHERE n = $1", .{});
+    defer equality.deinit();
+    var real = try execute(a, real_backend, &equality, &.{.{ .float = 0.1 }}, .{});
+    defer real.deinit();
+    try std.testing.expectEqual(@as(usize, 1), real.output.rows.len);
 }

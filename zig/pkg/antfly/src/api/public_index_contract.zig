@@ -556,6 +556,8 @@ fn providerFieldValueMatches(field: []const u8, value: std.json.Value) bool {
 }
 
 fn enrichmentFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    if (std.mem.eql(u8, field, "source")) return groupedSourceMatches(value);
+    if (std.mem.eql(u8, field, "prior_context")) return priorContextMatches(value);
     if (std.mem.eql(u8, field, "expected_dims") or
         std.mem.eql(u8, field, "chunk_size") or
         std.mem.eql(u8, field, "chunk_overlap")) return isInteger(value);
@@ -585,7 +587,7 @@ fn graphResolverFieldValueMatches(field: []const u8, value: std.json.Value) bool
         }
         return true;
     }
-    if (std.mem.eql(u8, field, "scorer")) return value == .object;
+    if (std.mem.eql(u8, field, "scorer") or std.mem.eql(u8, field, "adjudicate") or std.mem.eql(u8, field, "suppress")) return value == .object;
     if (std.mem.eql(u8, field, "labels")) {
         if (value != .array) return false;
         for (value.array.items) |item| if (!isNonEmptyString(item)) return false;
@@ -791,6 +793,8 @@ pub fn isAllowedGraphResolverField(field: []const u8) bool {
         std.mem.eql(u8, field, "promote") or
         std.mem.eql(u8, field, "labels") or
         std.mem.eql(u8, field, "type_must_match") or
+        std.mem.eql(u8, field, "adjudicate") or
+        std.mem.eql(u8, field, "suppress") or
         std.mem.eql(u8, field, "scorer") or
         std.mem.eql(u8, field, "scorer_json") or
         std.mem.eql(u8, field, "candidate_search") or
@@ -812,6 +816,8 @@ pub fn isAllowedCreatedEnrichmentField(field: []const u8) bool {
         std.mem.eql(u8, field, "field") or
         std.mem.eql(u8, field, "template") or
         std.mem.eql(u8, field, "source_artifact_name") or
+        std.mem.eql(u8, field, "source") or
+        std.mem.eql(u8, field, "prior_context") or
         std.mem.eql(u8, field, "expected_dims") or
         std.mem.eql(u8, field, "vector_space") or
         std.mem.eql(u8, field, "chunk_size") or
@@ -857,4 +863,48 @@ fn isCommonField(field: []const u8) bool {
         std.mem.eql(u8, field, "description") or
         std.mem.eql(u8, field, "version") or
         std.mem.eql(u8, field, "enrichments");
+}
+
+fn groupedSourceMatches(value: std.json.Value) bool {
+    if (value != .object) return false;
+    inline for (.{ "group_by", "order_by", "field" }) |name| {
+        const field = value.object.get(name) orelse return false;
+        if (!isNonEmptyString(field) or field.string.len > 1024) return false;
+    }
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const field = entry.value_ptr.*;
+        if (std.mem.eql(u8, name, "group_by") or std.mem.eql(u8, name, "order_by") or std.mem.eql(u8, name, "field")) continue;
+        if (std.mem.eql(u8, name, "segment_by")) {
+            if (field != .null and (!isNonEmptyString(field) or field.string.len > 1024)) return false;
+            continue;
+        }
+        if (std.mem.eql(u8, name, "filter")) {
+            if (field != .null and field != .object) return false;
+            continue;
+        }
+        if (std.mem.eql(u8, name, "max_bytes") or std.mem.eql(u8, name, "max_members") or std.mem.eql(u8, name, "window_ordinals")) {
+            const max: i64 = if (std.mem.eql(u8, name, "max_bytes")) 4 * 1024 * 1024 else 4096;
+            if (field != .integer or field.integer <= 0 or field.integer > max) return false;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+fn priorContextMatches(value: std.json.Value) bool {
+    if (value != .object or !isNonEmptyString(value.object.get("artifact") orelse return false) or !isNonEmptyString(value.object.get("render") orelse return false)) return false;
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const field = entry.value_ptr.*;
+        if (std.mem.eql(u8, name, "artifact") or std.mem.eql(u8, name, "render")) {
+            if (!isNonEmptyString(field) or field.string.len > (if (std.mem.eql(u8, name, "artifact")) @as(usize, 256) else 65536)) return false;
+            continue;
+        }
+        const max: i64 = if (std.mem.eql(u8, name, "max_items")) 256 else if (std.mem.eql(u8, name, "max_bytes")) 1024 * 1024 else if (std.mem.eql(u8, name, "horizon_segments")) 128 else return false;
+        if (field != .integer or field.integer <= 0 or field.integer > max) return false;
+    }
+    return true;
 }

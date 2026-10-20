@@ -29,6 +29,48 @@ const Slot = struct { key: Key = undefined, age: u64 = 0, entry: ?Entry = null, 
 /// A ticket moves ownership without touching Metal's confined buffer refcount.
 /// Producers may borrow entries; only the model consumer imports device tensors.
 pub const Ticket = struct { slot: usize, entry: Entry };
+/// Preflight owns these tickets until all producers and model inputs drain.
+/// Only preflight mutates the set; workers borrow it read-only. Cache entries
+/// cannot be reclaimed between planning and consumption (including cancellation).
+pub const Pins = struct {
+    cache: ?*Cache,
+    tickets: [128]?Ticket = @splat(null),
+    keys: [128]Key = undefined,
+    // Valid only within this immutable borrowed-input scope, never a global
+    // shortcut around validating mutable/unverified sources on a new request.
+    bindings: [128]struct { input: [32]u8, clip: [32]u8 } = undefined,
+    binding_count: usize = 0,
+    pub fn binding(self: *const Pins, input: [32]u8) ?[32]u8 {
+        for (self.bindings[0..self.binding_count]) |value| if (std.mem.eql(u8, &input, &value.input)) return value.clip;
+        return null;
+    }
+    pub fn rememberBinding(self: *Pins, input: [32]u8, clip: [32]u8) void {
+        if (self.binding(input) != null or self.binding_count == self.bindings.len) return;
+        self.bindings[self.binding_count] = .{ .input = input, .clip = clip };
+        self.binding_count += 1;
+    }
+    pub fn get(self: *const Pins, key: Key) ?Ticket {
+        for (self.tickets, 0..) |ticket, index| if (ticket) |value| {
+            if (Cache.equal(self.keys[index], key)) return value;
+        };
+        return null;
+    }
+    pub fn pin(self: *Pins, key: Key) bool {
+        if (self.get(key) != null) return true;
+        const cache = self.cache orelse return false;
+        const ticket = cache.take(key) orelse return false;
+        self.tickets[ticket.slot] = ticket;
+        self.keys[ticket.slot] = key;
+        return true;
+    }
+    pub fn deinit(self: *Pins) void {
+        self.binding_count = 0;
+        for (&self.tickets) |*ticket| if (ticket.*) |value| {
+            self.cache.?.restore(value);
+            ticket.* = null;
+        };
+    }
+};
 pub const Cache = struct {
     allocator: std.mem.Allocator,
     session: Session,
@@ -268,7 +310,7 @@ test "embeddinggemma2 Metal video cache survives compute wrappers without interm
             self.disarms += 1;
         }
         fn classify(_: *anyopaque) @import("../execution_control.zig").Interruption {
-            return .process_required;
+            return .uninterruptible;
         }
     };
     var probe = Probe{};
@@ -319,4 +361,29 @@ test "embeddinggemma2 Metal video cache survives compute wrappers without interm
     cache.deinit();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 1), probe.disarms);
+}
+
+test "embeddinggemma2 video admission pins survive pressure and restore once after cancellation" {
+    const a = std.testing.allocator;
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    var marker: u8 = 0;
+    var cache = Cache{ .allocator = a, .session = testSession(&controller, &marker, 4096), .limit = 2048 };
+    defer cache.deinit();
+    const key = Key{ .clip = @splat(7), .picture = 3 };
+    const values: [512]f32 = @splat(0.75);
+    cache.storeCpu(key, &values, 1);
+    var pins = Pins{ .cache = &cache };
+    defer pins.deinit();
+    try std.testing.expect(pins.pin(key));
+    try std.testing.expect(pins.pin(key));
+    try std.testing.expectEqual(@as(usize, 1), cache.stats.hits);
+    cache.storeCpu(.{ .clip = @splat(8), .picture = 4 }, &values, 1);
+    try std.testing.expectEqual(@as(usize, 0), cache.stats.evicted);
+    try std.testing.expect(cache.take(key) == null);
+    try std.testing.expectEqualSlices(f32, &values, pins.get(key).?.entry.value.cpu);
+    try std.testing.expectEqual(@as(usize, 2048), controller.snapshot().host_scratch_bytes);
+    pins.deinit();
+    try std.testing.expect(pins.get(key) == null);
+    const restored = cache.take(key) orelse return error.TestUnexpectedResult;
+    cache.restore(restored);
 }

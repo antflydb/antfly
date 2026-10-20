@@ -49,6 +49,7 @@ pub fn create(ctx: Context) Suite {
     });
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     tests.root_module.addImport("antfly_decisions", ctx.graph.inference_mod.import_table.get("antfly_decisions").?);
+    tests.root_module.addImport("antfly_structured", ctx.graph.inference_mod.import_table.get("antfly_structured").?);
     ctx.graph.identities.addImports(tests.root_module);
     tests.root_module.addImport("build_options", ctx.graph.qualification_build_options_mod);
     tests.root_module.addImport("antfly-json", ctx.graph.json_mod);
@@ -79,9 +80,11 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     tests.root_module.addImport("antfly_media", ctx.graph.inference_mod.import_table.get("antfly_media").?);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("antfly_video", ctx.graph.inference_mod.import_table.get("antfly_video").?);
     tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);
+    tests.root_module.addImport("antfly_pdf", ctx.graph.inference_mod.import_table.get("antfly_pdf").?);
     tests.root_module.addImport("jinja", ctx.graph.jinja_mod);
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
@@ -98,6 +101,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("prometheus", ctx.graph.prometheus_mod);
     tests.root_module.addImport("structlog", ctx.graph.structlog_mod);
     tests.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
+    tests.root_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
     tests.root_module.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
     tests.root_module.addImport("inference_internal", tests.root_module);
     if (ctx.graph.inference_client_mod) |mod| {
@@ -107,6 +111,7 @@ pub fn create(ctx: Context) Suite {
         runtime_build.configureSystemBlas(b, tests.root_module, ctx.target, ctx.backend.blas_root);
     }
     runtime_build.configureMetal(b, tests.root_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
+    runtime_build.configureCudaVideo(b, tests.root_module, ctx.target, ctx.backend.enable_cuda, ctx.paths);
     tests.root_module.link_libc = ctx.backend.link_libc;
 
     // Keep the standalone server's CLI and configuration parsing covered too.
@@ -140,6 +145,44 @@ pub fn create(ctx: Context) Suite {
     }
     build_test_filters.addRuntimeControls(run_cli_tests, ctx.args orelse &.{});
     const run_tests = ctx.addRunArtifact(tests);
+    const evidence_module = b.createModule(.{
+        .root_source_file = ctx.path("src/pipelines/grammar.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    evidence_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
+    const evidence_tests = b.addTest(.{ .root_module = evidence_module, .filters = &.{ "canonical evidence", "gbnf", "json schema grammar" } });
+    const run_evidence_tests = ctx.addRunArtifact(evidence_tests);
+    run_tests.step.dependOn(&run_evidence_tests.step);
+    ctx.step("test-structured-token-evidence", "Check canonical finite-value token admission and masking").dependOn(&run_evidence_tests.step);
+    const structured_module = ctx.graph.inference_mod.import_table.get("antfly_structured").?;
+    const attribution_module = b.createModule(.{ .root_source_file = structured_module.root_source_file, .target = ctx.target, .optimize = ctx.optimize });
+    for (structured_module.import_table.keys(), structured_module.import_table.values()) |name, module| attribution_module.addImport(name, module);
+    const attribution_tests = b.addTest(.{ .root_module = attribution_module, .filters = &.{"gemma native"} });
+    const run_attribution_tests = ctx.addRunArtifact(attribution_tests);
+    ctx.step("test-structured-attribution", "Check real native finite-value evidence attribution").dependOn(&run_attribution_tests.step);
+    const token_bytes_step = ctx.step("test-token-bytes", "Check additive tokenizer bytes without sequence cleanup");
+    for ([_]*std.Build.Module{ ctx.graph.inference_tokenizer_mod, ctx.graph.inference_hf_tokenizer_mod }, 0..) |source, i| {
+        const root = if (i == 0) b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/tokenizer/src/sentencepiece.zig" })) else source.root_source_file;
+        const module = b.createModule(.{ .root_source_file = root, .target = ctx.target, .optimize = ctx.optimize });
+        for (source.import_table.keys(), source.import_table.values()) |name, dependency| module.addImport(name, dependency);
+        const token_tests = b.addTest(.{ .root_module = module, .filters = &.{"raw token bytes"} });
+        const run = ctx.addRunArtifact(token_tests);
+        token_bytes_step.dependOn(&run.step);
+        run_tests.step.dependOn(&run.step);
+    }
+    // Keep backend packaging covered even when CUDA implementation tests are
+    // excluded. A CPU/Metal test product must not retain a device image.
+    const artifact_module = b.createModule(.{
+        .root_source_file = ctx.path("src/ops/cuda/artifact.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    artifact_module.addImport("build_options", ctx.graph.qualification_build_options_mod);
+    const artifact_tests = b.addTest(.{ .root_module = artifact_module });
+    const run_artifact_tests = ctx.addRunArtifact(artifact_tests);
+    run_tests.step.dependOn(&run_artifact_tests.step);
+    ctx.step("test-cuda-artifact", "Check that CUDA device images match the enabled backend").dependOn(&run_artifact_tests.step);
     for (selected_test_filters) |filter| {
         run_tests.addArgs(&.{ "--test-filter", filter });
     }
@@ -176,6 +219,23 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_quant_kernel_metal_runtime_check_tests = checks.metal_runtime;
     const run_bge_m3_e2e_bench_tests = checks.bge_benchmark;
     const test_step = ctx.step("test", "Run unit tests");
+    const media_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/media/src/inference.zig" })),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    }) });
+    const media_step = ctx.step("test-video-media", "Run bounded media and NVDEC callback tests without a GPU");
+    media_step.dependOn(&ctx.addRunArtifact(media_tests).step);
+    if (ctx.target.result.os.tag == .linux) {
+        const callbacks = b.addExecutable(.{ .name = "video-decode-callback-tests", .root_module = b.createModule(.{
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+            .link_libc = true,
+        }) });
+        callbacks.root_module.addCSourceFile(.{ .file = ctx.path("tests/video_decode_test.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-UNDEBUG" } });
+        media_step.dependOn(&ctx.addRunArtifact(callbacks).step);
+    }
+    test_step.dependOn(media_step);
     ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites").dependOn(&run_tests.step);
     const cancellation_e2e_step = ctx.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");
     if (ctx.target.result.os.tag == .linux or ctx.target.result.os.tag == .macos) {
@@ -274,9 +334,12 @@ fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
         }),
         .filters = &.{"GLiNER25 fuzz"},
     });
+    tests.root_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
     tests.root_module.addImport("build_options", ctx.graph.build_options_mod);
     tests.root_module.addImport("antfly_platform", platform);
+    tests.root_module.addImport("antfly_runtime_abi", ctx.graph.runtime_abi_mod);
     tests.root_module.addImport("antfly_image", ctx.graph.image_mod);
+    tests.root_module.addImport("antfly_extracting", ctx.graph.extracting_mod);
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);
     tests.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
     tests.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);

@@ -355,10 +355,7 @@ pub fn registerLiteIndexResolvers(handle: *Handle, config_json: []const u8, roll
     if (resolvers != .array) return;
     for (resolvers.array.items) |item| {
         if (item != .object) continue;
-        var cfg = try std.json.parseFromValue(db_mod.ResolverConfig, arena, item, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        });
+        var cfg = try db_mod.ResolverConfig.parseValue(arena, item);
         // Config replay may include catalog metadata read back by a caller.
         // Curation is owned by the merge API and cannot be replaced inline.
         cfg.value.merges = &.{};
@@ -560,6 +557,18 @@ pub fn liteEnrichmentCatalogEntryJsonAlloc(alloc: Allocator, cfg: db_mod.types.E
         defer alloc.free(producer_json_json);
         try buf.appendSlice(alloc, ",\"producer_json\":");
         try buf.appendSlice(alloc, producer_json_json);
+    }
+    if (cfg.source) |source| {
+        const json = try std.json.Stringify.valueAlloc(alloc, source, .{});
+        defer alloc.free(json);
+        try buf.appendSlice(alloc, ",\"source\":");
+        try buf.appendSlice(alloc, json);
+    }
+    if (cfg.prior_context) |context| {
+        const json = try std.json.Stringify.valueAlloc(alloc, context, .{});
+        defer alloc.free(json);
+        try buf.appendSlice(alloc, ",\"prior_context\":");
+        try buf.appendSlice(alloc, json);
     }
     try buf.append(alloc, '}');
     return try buf.toOwnedSlice(alloc);
@@ -1066,6 +1075,7 @@ pub fn decodeBase64Alloc(alloc: Allocator, encoded: []const u8) ![]u8 {
 }
 
 pub fn parseEnrichmentKind(kind: []const u8) ?db_mod.types.EnrichmentKind {
+    if (std.mem.eql(u8, kind, "group")) return .group;
     if (std.mem.eql(u8, kind, "chunk")) return .chunk;
     if (std.mem.eql(u8, kind, "asset")) return .asset;
     if (std.mem.eql(u8, kind, "embedding")) return .embedding;
@@ -2303,6 +2313,8 @@ pub fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) callconv(
 }
 
 pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
+    @import("io_lifetime.zig").acquire();
+    errdefer @import("io_lifetime.zig").release();
     const alloc = std.heap.c_allocator;
     var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .prefer_existing_identity_namespace = true, .online_source_authority = .native });
     errdefer db.close();
@@ -2310,6 +2322,7 @@ pub fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
     errdefer alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
+        .io_lifetime_lease = true,
         .db = db,
         .embedded_path = try alloc.dupe(u8, path),
     };
@@ -2629,6 +2642,8 @@ pub fn openLiteHandleAllocWithSharedInference(
 ) !*Handle {
     if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
     var handle_owns_resources = false;
+    @import("io_lifetime.zig").acquire();
+    errdefer if (!handle_owns_resources) @import("io_lifetime.zig").release();
     // Each cached generation owns its storage pool. Retired cursors may keep
     // an older generation alive while the same index roots reopen in this one.
     var owned_runtime: ?db_mod.background_runtime.BackendRuntimeHandle = if (resolved.externally_locked and backend_runtime == null)
@@ -2714,6 +2729,7 @@ pub fn openLiteHandleAllocWithSharedInference(
     errdefer if (!handle_owns_resources) alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
+        .io_lifetime_lease = true,
         .db = db,
         .open_mode = resolved.open_mode,
         .owned_lite_backend = backend,
@@ -2804,6 +2820,8 @@ pub fn openDirectoryHandle(
 }
 
 pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOptions) !*Handle {
+    @import("io_lifetime.zig").acquire();
+    errdefer @import("io_lifetime.zig").release();
     const alloc = std.heap.c_allocator;
     var options = dbOpenOptionsFromResolved(resolved, false);
     options.identity_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 };
@@ -2814,6 +2832,7 @@ pub fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOpti
     errdefer alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
+        .io_lifetime_lease = true,
         .db = db,
         .open_mode = resolved.open_mode,
         .embedded_path = try alloc.dupe(u8, path),
@@ -4736,6 +4755,8 @@ pub fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) callconv(.c) capi.Error
 fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Value {
     const bytes = try std.json.Stringify.valueAlloc(a, database.pendingWorkStats(), .{});
     var value = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    const resolver_progress = try database.resolverReviewsJsonAlloc(a, "{\"operation\":\"progress\"}");
+    try value.object.put(a, "resolver_curation", try std.json.parseFromSliceLeaky(std.json.Value, a, resolver_progress, .{}));
     const debt = try database.listDerivedReplayDebt(a);
     defer {
         for (debt) |*item| item.deinit(a);
@@ -7278,8 +7299,13 @@ pub fn antfly_db_render_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name
         defer handle.alloc.free(minted);
         const effective_aliases = cfg.effectiveAliasesAlloc(handle.alloc) catch |err| return capi.mapError(err);
         defer handle.alloc.free(effective_aliases);
-        const key = resolver_lib.canonicalAliasKey(effective_aliases, minted) catch |err| return capi.mapError(err);
-        out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = cfg.effectiveGeneration() }) catch |err| return capi.mapError(err);
+        var policy_arena = std.heap.ArenaAllocator.init(handle.alloc);
+        defer policy_arena.deinit();
+        const redirects = resolver_lib.curation.RedirectIndex.init(policy_arena.allocator(), effective_aliases) catch |err| return capi.mapError(err);
+        const key = redirects.canonical(minted);
+        const policy = resolver_lib.curation.Index.init(policy_arena.allocator(), cfg.suppress_json, cfg.curation_json) catch |err| return capi.mapError(err);
+        const suppressed = ((policy.textReason(policy_arena.allocator(), parsed.value.text) catch |err| return capi.mapError(err)) != null) or policy.keySuppressed(minted) or policy.keySuppressed(key);
+        out.* = stringifyJson(.{ .minted_key = minted, .key = key, .table = cfg.table, .config_generation = cfg.effectiveGeneration(), .suppressed = suppressed }) catch |err| return capi.mapError(err);
         return .ok;
     }
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
@@ -7378,8 +7404,37 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
             break :extracted bytes;
         } else std.json.Stringify.valueAlloc(alloc, extraction.?, .{}) catch |err| return capi.mapError(err);
         defer alloc.free(extracted);
-        const resolution = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionAlloc(alloc, configs, cfg, extracted, @import("entity_sink.zig").candidateSource(handle), handle.database().resolution_embedder) catch |err| return capi.mapErrorContext(err, "resolving query mentions against canonical entities");
+        const candidates = @import("entity_sink.zig").candidateSource(handle);
+        const mention_embedder = handle.database().resolution_embedder;
+        const suspend_resolution = guard.connection != null and (cfg.adjudicate_json.len > 0 or cfg.name_embedding.len > 0);
+        if (suspend_resolution) guard.suspendQuery();
+        const computed = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionAlloc(alloc, configs, cfg, extracted, candidates, mention_embedder);
+        if (!guard.resumeQuery(handle_ptr)) {
+            if (computed) |bytes| alloc.free(bytes) else |_| {}
+            return capi.mapErrorContext(error.Busy, "query handle closed during resolution; retry");
+        }
+        if (guard.entry_error) |code| {
+            if (computed) |bytes| alloc.free(bytes) else |_| {}
+            return capi.ensureError(code, @src().fn_name);
+        }
+        handle = guard.handle;
+        const resolution = computed catch |err| return capi.mapErrorContext(err, "resolving query mentions against canonical entities");
         defer alloc.free(resolution);
+        if (suspend_resolution) {
+            const current = handle.database().listResolvers(alloc) catch |err| return capi.mapError(err);
+            defer {
+                for (current) |*entry| entry.deinit(alloc);
+                alloc.free(current);
+            }
+            var unchanged = current.len == configs.len;
+            if (unchanged) for (current, configs) |actual, captured| {
+                if (!actual.eql(captured)) {
+                    unchanged = false;
+                    break;
+                }
+            };
+            if (!unchanged) return capi.mapErrorContext(error.Busy, "resolver configuration changed during resolution; retry");
+        }
         var parsed_extraction = std.json.parseFromSlice(std.json.Value, alloc, extracted, .{}) catch |err| return capi.mapError(err);
         defer parsed_extraction.deinit();
         var parsed_resolution = std.json.parseFromSlice(std.json.Value, alloc, resolution, .{}) catch |err| return capi.mapError(err);
@@ -7396,40 +7451,299 @@ pub fn antfly_db_merge_resolver_keys_json(handle_ptr: ?*anyopaque, resolver_name
     if (comptime @import("../storage/engine_selection.zig").enabled)
         return @call(.auto, @extern(*const @TypeOf(antfly_db_merge_resolver_keys_json), .{ .name = "antfly_db_merge_resolver_keys_json" }), .{ handle_ptr, resolver_name, merge_json });
     capi.clearLastError();
-    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, "invalid or closed database handle");
-    defer guard.leave();
-    if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
-    const handle = guard.handle;
-    const Merge = struct { key: []const u8, target: []const u8 };
-    var parsed = std.json.parseFromSlice(Merge, handle.alloc, merge_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid resolver merge JSON");
+    var out: capi.Buffer = .{};
+    defer antfly_buffer_free(&out);
+    return executeResolverCurationWithWait(handle_ptr, resolver_name.bytes(), merge_json.bytes(), "merge", &out);
+}
+
+fn copyJsonBuffer(bytes: []const u8) !capi.Buffer {
+    const owned = try std.heap.c_allocator.dupe(u8, bytes);
+    return .{ .ptr = owned.ptr, .len = owned.len };
+}
+
+fn executeResolverCuration(handle: *Handle, name: []const u8, body: []const u8, action: []const u8, out: ?*capi.Buffer) capi.ErrorCode {
+    var parsed = std.json.parseFromSlice(std.json.Value, handle.alloc, body, .{}) catch |err| return capi.mapError(err);
     defer parsed.deinit();
-    const configs = handle.database().listResolvers(handle.alloc) catch |err| return capi.mapError(err);
-    defer {
-        for (configs) |*cfg| cfg.deinit(handle.alloc);
-        handle.alloc.free(configs);
+    if (parsed.value != .object or parsed.value.object.contains("action")) return capi.mapError(error.InvalidArgument);
+    const effective_action = if (std.mem.eql(u8, action, "suppressions") and !parsed.value.object.contains("add") and !parsed.value.object.contains("remove")) "suppress" else action;
+    parsed.value.object.put(parsed.arena.allocator(), "action", .{ .string = effective_action }) catch |err| return capi.mapError(err);
+    const request = std.json.Stringify.valueAlloc(handle.alloc, parsed.value, .{}) catch |err| return capi.mapError(err);
+    defer handle.alloc.free(request);
+    const result = handle.database().curateResolverJsonAlloc(handle.alloc, name, request) catch |err| return capi.mapErrorContext(err, "curating resolver identity");
+    defer handle.alloc.free(result);
+    if (out) |buffer| buffer.* = copyJsonBuffer(result) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+/// Commit while holding writer admission, then observe detached replay while
+/// releasing admission between polls. A timeout returns the accepted revision.
+fn executeResolverCurationWithWait(handle_ptr: ?*anyopaque, name: []const u8, body: []const u8, action: []const u8, out: *capi.Buffer) capi.ErrorCode {
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const input = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch |err| return capi.mapError(err);
+    const wait = if (input == .object) input.object.get("wait") else null;
+    const timeout: u64 = if (wait) |w| if (w == .object) if (w.object.get("timeout_ms")) |v| if (v == .integer and v.integer > 0 and v.integer <= 300000) @intCast(v.integer) else return capi.mapError(error.InvalidArgument) else 1000 else return capi.mapError(error.InvalidArgument) else 0;
+    {
+        const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
+        defer guard.leave();
+        if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
+        const code = executeResolverCuration(guard.handle, name, body, action, out);
+        if (code != .ok or timeout == 0) return code;
     }
-    for (configs) |cfg| {
-        if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
-        var aliases: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
-        defer aliases.deinit(handle.alloc);
-        const effective_aliases = cfg.effectiveAliasesAlloc(handle.alloc) catch |err| return capi.mapError(err);
-        defer handle.alloc.free(effective_aliases);
-        for (effective_aliases) |alias| {
-            if (std.mem.eql(u8, alias.key, parsed.value.key)) {
-                if (std.mem.eql(u8, alias.target, parsed.value.target)) return .ok;
-                return capi.mapErrorContext(error.InvalidArgument, "key already redirects; merge its canonical target instead");
+    return waitResolverCurationResponse(handle_ptr, timeout, out);
+}
+
+/// Observe accepted policy/review revisions without retaining writer admission.
+/// Each poll owns bounded scratch memory, even for a five-minute wait.
+fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *capi.Buffer) capi.ErrorCode {
+    if (timeout_ms == 0) return .ok;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var result = std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{}) catch return .ok;
+    const deadline = monotonicNowNs() +| timeout_ms * std.time.ns_per_ms;
+    while (monotonicNowNs() < deadline) {
+        var caught_up = true;
+        {
+            const guard = enterHandle(handle_ptr, .read) orelse return .ok;
+            defer guard.leave();
+            if (guard.entry_error != null) return .ok;
+            var iteration = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer iteration.deinit();
+            const scratch = iteration.allocator();
+            const root = guard.handle.parent_handle orelse guard.handle;
+            var singleton = [_]std.json.Value{result};
+            const rows = if (result.object.getPtr("results")) |items| if (items.* == .array) items.array.items else singleton[0..] else singleton[0..];
+            for (rows) |*row| {
+                if (row.* != .object) continue;
+                if (row.object.get("accepted")) |accepted| if (accepted == .bool and !accepted.bool) {
+                    caught_up = false;
+                    continue;
+                };
+                if (row.object.get("applied")) |observed| if (observed == .bool and observed.bool) continue;
+                const resolver_name = row.object.get("resolver") orelse continue;
+                if (resolver_name != .string) continue;
+                var database = guard.handle.database();
+                if (row.object.get("source_table")) |source| if (source == .string) {
+                    database = if (std.mem.eql(u8, source.string, "default")) &root.db else if (root.embedded_tables.get(source.string)) |table| &table.db else {
+                        caught_up = false;
+                        continue;
+                    };
+                };
+                const identities = database.listResolverIdentities(scratch) catch {
+                    caught_up = false;
+                    continue;
+                };
+                var done = false;
+                for (identities) |cfg| if (std.mem.eql(u8, cfg.name, resolver_name.string)) {
+                    done = @import("../storage/db/resolver_curation.zig").applied(database, cfg) catch false;
+                    if (row.object.get("revision")) |revision| if (revision == .integer and revision.integer >= 0) {
+                        done = done and cfg.curation_revision >= @as(u64, @intCast(revision.integer));
+                    };
+                    if (row.object.get("replay_sequence_kind")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "source_journal")) {
+                        if (row.object.get("replay_sequence")) |sequence| if (sequence == .integer and sequence.integer >= 0) {
+                            const stats = database.pendingWorkStats();
+                            const floor: u64 = @intCast(sequence.integer);
+                            done = done and stats.resolution.applied_sequence >= floor and (!cfg.promote or stats.promotion.applied_sequence >= floor);
+                        };
+                    };
+                    break;
+                };
+                caught_up = caught_up and done;
+                if (!done) continue;
+                row.object.put(a, "applied", .{ .bool = true }) catch return .ok;
+                const progress = std.json.Stringify.valueAlloc(a, database.pendingWorkStats(), .{}) catch return .ok;
+                row.object.put(a, "progress", std.json.parseFromSliceLeaky(std.json.Value, a, progress, .{}) catch return .ok) catch return .ok;
             }
+            if (!result.object.contains("results")) result = singleton[0];
         }
-        aliases.appendSlice(handle.alloc, cfg.merges) catch |err| return capi.mapError(err);
-        aliases.append(handle.alloc, .{ .key = parsed.value.key, .target = parsed.value.target }) catch |err| return capi.mapError(err);
-        var next = cfg;
-        next.merges = aliases.items;
-        next.merge_state_version = 1;
-        next.merge_generation = std.math.add(u64, cfg.effectiveGeneration(), 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow");
-        _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true }) catch |err| return capi.mapErrorContext(err, "merging resolver keys");
-        return .ok;
+        if (caught_up) {
+            result.object.put(a, "applied", .{ .bool = true }) catch return .ok;
+            const bytes = std.json.Stringify.valueAlloc(a, result, .{}) catch return .ok;
+            antfly_buffer_free(out);
+            out.* = copyJsonBuffer(bytes) catch |err| return capi.mapError(err);
+            return .ok;
+        }
+        handleLockIo().sleep(.fromMilliseconds(25), .awake) catch return .ok;
     }
-    return capi.mapErrorContext(error.NotFound, "resolver does not exist");
+    return .ok;
+}
+
+pub fn antfly_db_unmerge_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_unmerge_resolver_key_json), .{ .name = "antfly_db_unmerge_resolver_key_json" }), .{ handle_ptr, resolver_name, request_json, out_buf });
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    return executeResolverCurationWithWait(handle_ptr, resolver_name.bytes(), request_json.bytes(), "unmerge", out);
+}
+
+pub fn antfly_db_suppress_resolver_keys_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_suppress_resolver_keys_json), .{ .name = "antfly_db_suppress_resolver_keys_json" }), .{ handle_ptr, resolver_name, request_json, out_buf });
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    return executeResolverCurationWithWait(handle_ptr, resolver_name.bytes(), request_json.bytes(), "suppressions", out);
+}
+
+pub fn antfly_db_unsuppress_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_unsuppress_resolver_key_json), .{ .name = "antfly_db_unsuppress_resolver_key_json" }), .{ handle_ptr, resolver_name, request_json, out_buf });
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    return executeResolverCurationWithWait(handle_ptr, resolver_name.bytes(), request_json.bytes(), "unsuppress", out);
+}
+
+pub fn antfly_db_resolver_curation_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_resolver_curation_json), .{ .name = "antfly_db_resolver_curation_json" }), .{ handle_ptr, resolver_name, out_buf });
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
+    defer guard.leave();
+    if (guard.entry_error) |value| return capi.ensureError(value, @src().fn_name);
+    const bytes = guard.handle.database().resolverCurationJsonAlloc(guard.handle.alloc, resolver_name.bytes()) catch |err| return capi.mapError(err);
+    defer guard.handle.alloc.free(bytes);
+    out.* = copyJsonBuffer(bytes) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+/// Named entity operations share the same durable fanout and replay contract.
+fn entityAction(handle: ?*anyopaque, table: capi.Slice, key: capi.Slice, request: capi.Slice, out: ?*capi.Buffer, action: []const u8) capi.ErrorCode {
+    capi.clearLastError();
+    _ = resetOutBuffer(out) orelse return capi.mapError(error.InvalidArgument);
+    if (request.len > 4 * 1024 * 1024) return capi.mapError(error.ResolverCurationLimitExceeded);
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var value = std.json.parseFromSliceLeaky(std.json.Value, a, if (request.len == 0) "{}" else request.bytes(), .{}) catch |err| return capi.mapError(err);
+    if (value != .object) return capi.mapError(error.InvalidResolverCurationRequest);
+    if (value.object.get("action")) |existing| if (existing != .string or !std.mem.eql(u8, existing.string, action)) return capi.mapError(error.InvalidResolverCurationRequest);
+    value.object.put(a, "action", .{ .string = action }) catch |err| return capi.mapError(err);
+    const bytes = std.json.Stringify.valueAlloc(a, value, .{}) catch |err| return capi.mapError(err);
+    return antfly_db_curate_entity_json(handle, table, key, .fromSlice(bytes), out);
+}
+
+pub fn antfly_db_entity_merge_json(handle: ?*anyopaque, table: capi.Slice, key: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    return entityAction(handle, table, key, request, out, "merge");
+}
+
+pub fn antfly_db_entity_unmerge_json(handle: ?*anyopaque, table: capi.Slice, key: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    return entityAction(handle, table, key, request, out, "unmerge");
+}
+
+pub fn antfly_db_entity_suppress_json(handle: ?*anyopaque, table: capi.Slice, key: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    return entityAction(handle, table, key, request, out, "suppress");
+}
+
+pub fn antfly_db_entity_unsuppress_json(handle: ?*anyopaque, table: capi.Slice, key: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    return entityAction(handle, table, key, request, out, "unsuppress");
+}
+
+pub fn antfly_db_entity_redirects_json(handle: ?*anyopaque, table: capi.Slice, key: capi.Slice, request: capi.Slice, out: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    return entityAction(handle, table, key, request, out, "redirects");
+}
+
+/// Fan out an entity correction across every resolver namespace targeting the
+/// entity table. All plans are validated before the first resolver publication.
+pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.Slice, entity_key: capi.Slice, request_json: capi.Slice, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_curate_entity_json), .{ .name = "antfly_db_curate_entity_json" }), .{ handle_ptr, entity_table, entity_key, request_json, out_buf });
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
+    var admitted = true;
+    defer if (admitted) guard.leave();
+    if (guard.entry_error) |value| return capi.ensureError(value, @src().fn_name);
+    const handle = guard.handle.parent_handle orelse guard.handle;
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const curation = @import("../storage/db/resolver_curation.zig");
+    const pure = @import("antfly_resolver");
+    const Input = struct { action: enum { redirects, merge, unmerge, suppress, unsuppress }, into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, wait: ?pure.curation.Wait = null };
+    const input = std.json.parseFromSliceLeaky(Input, a, request_json.bytes(), .{}) catch |err| return capi.mapError(err);
+    const tables = @import("tables.zig");
+    tables.load(handle) catch |err| return capi.mapError(err);
+    _ = tables.get(handle, entity_table.bytes()) catch |err| return capi.mapError(err);
+    const Pending = struct { db: *db_mod.DB, source: []const u8, cfg: db_mod.ResolverConfig, request: pure.curation.Request };
+    var pending: std.ArrayListUnmanaged(Pending) = .empty;
+    var sources: std.ArrayListUnmanaged(struct { db: *db_mod.DB, name: []const u8 }) = .empty;
+    sources.append(a, .{ .db = &handle.db, .name = "default" }) catch |err| return capi.mapError(err);
+    var it = handle.embedded_tables.iterator();
+    while (it.next()) |entry| sources.append(a, .{ .db = &entry.value_ptr.*.db, .name = entry.key_ptr.* }) catch |err| return capi.mapError(err);
+    var results = std.json.Array.init(a);
+    for (sources.items) |source| {
+        const configs = source.db.core.index_manager.listResolverIdentities(a) catch |err| return capi.mapError(err);
+        for (configs) |cfg| {
+            if (!std.mem.eql(u8, cfg.table, entity_table.bytes()) or !curation.keyInNamespace(cfg.key_template, entity_key.bytes())) continue;
+            if (input.into) |target| if (!curation.keyInNamespace(cfg.key_template, target)) return capi.mapError(error.InvalidResolverCurationRequest);
+            if (input.action == .redirects) {
+                const state = pure.curation.parseState(a, cfg.curation_json) catch |err| return capi.mapError(err);
+                const aliases = cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err);
+                const scoped = pure.curation.entityState(a, state, aliases, entity_key.bytes()) catch |err| return capi.mapError(err);
+                const raw = std.json.Stringify.valueAlloc(a, .{ .source_table = source.name, .resolver = cfg.name, .revision = cfg.curation_revision, .redirects = scoped.redirects, .canonical_key = scoped.canonical_key, .curation = scoped.curation }, .{}) catch |err| return capi.mapError(err);
+                results.append(std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch |err| return capi.mapError(err)) catch |err| return capi.mapError(err);
+                continue;
+            }
+            const action: pure.curation.Action = switch (input.action) {
+                .merge => .merge,
+                .unmerge => .unmerge,
+                .suppress => .suppress,
+                .unsuppress => .unsuppress,
+                .redirects => unreachable,
+            };
+            const intent: pure.curation.Request = .{ .action = action, .key = entity_key.bytes(), .to = input.into, .replace = input.replace, .pin_distinct = input.pin_distinct, .wait = input.wait, .expected_revision = cfg.curation_revision };
+            const edit = pure.curation.plan(a, cfg.curation_json, cfg.merges, cfg.effectiveAliasesAlloc(a) catch |err| return capi.mapError(err), intent) catch |err| return capi.mapError(err);
+            var next = cfg;
+            next.merges = edit.merges;
+            next.curation_json = std.json.Stringify.valueAlloc(a, edit.state, .{}) catch |err| return capi.mapError(err);
+            next.validate() catch |err| return capi.mapError(err);
+            pending.append(a, .{ .db = source.db, .source = source.name, .cfg = cfg, .request = intent }) catch |err| return capi.mapError(err);
+        }
+    }
+    if (input.action != .redirects and pending.items.len == 0) return capi.mapError(error.ResolverNotFound);
+    var complete = true;
+    for (pending.items) |item| {
+        const bytes = std.json.Stringify.valueAlloc(a, item.request, .{}) catch |err| return capi.mapError(err);
+        const raw = curation.mutate(item.db, a, item.cfg.name, bytes) catch |err| {
+            complete = false;
+            const failed = std.json.Stringify.valueAlloc(a, .{ .source_table = item.source, .resolver = item.cfg.name, .accepted = false, .error_message = @errorName(err) }, .{}) catch |failure| return capi.mapError(failure);
+            results.append(std.json.parseFromSliceLeaky(std.json.Value, a, failed, .{}) catch |failure| return capi.mapError(failure)) catch |failure| return capi.mapError(failure);
+            continue;
+        };
+        var value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch |err| return capi.mapError(err);
+        value.object.put(a, "source_table", .{ .string = item.source }) catch |err| return capi.mapError(err);
+        results.append(value) catch |err| return capi.mapError(err);
+    }
+    const response = std.json.Stringify.valueAlloc(a, .{ .entity_table = entity_table.bytes(), .key = entity_key.bytes(), .atomicity = "resolver", .complete = complete, .results = std.json.Value{ .array = results } }, .{}) catch |err| return capi.mapError(err);
+    out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
+    admitted = false;
+    guard.leave();
+    return waitResolverCurationResponse(handle_ptr, if (input.wait) |wait| wait.timeout_ms else 0, out);
+}
+
+/// Bounded review page or revision-bound review decision; operation is part
+/// of the typed request and shares the serving owner's curation implementation.
+pub fn antfly_db_resolver_reviews_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_resolver_reviews_json), .{ .name = "antfly_db_resolver_reviews_json" }), .{ handle_ptr, request_json, out_buf });
+    capi.clearLastError();
+    const out = resetOutBuffer(out_buf) orelse return capi.mapError(error.InvalidArgument);
+    if (request_json.len > 4 * 1024 * 1024) return capi.mapError(error.ResolverCurationLimitExceeded);
+    const input = std.json.parseFromSlice(@import("../storage/db/resolver_curation.zig").ReviewRequest, std.heap.c_allocator, request_json.bytes(), .{}) catch |err| return capi.mapError(err);
+    defer input.deinit();
+    const guard = enterHandle(handle_ptr, if (input.value.operation == .review) .exclusive else .read) orelse return capi.mapError(error.InvalidArgument);
+    var admitted = true;
+    defer if (admitted) guard.leave();
+    if (guard.entry_error) |value| return capi.ensureError(value, @src().fn_name);
+    const bytes = guard.handle.database().resolverReviewsJsonAlloc(guard.handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
+    defer guard.handle.alloc.free(bytes);
+    out.* = copyJsonBuffer(bytes) catch |err| return capi.mapError(err);
+    if (input.value.operation != .review) return .ok;
+    admitted = false;
+    guard.leave();
+    return waitResolverCurationResponse(handle_ptr, if (input.value.wait) |wait| wait.timeout_ms else 0, out);
 }
 
 pub fn antfly_db_list_resolver_identities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
@@ -7447,10 +7761,12 @@ pub fn antfly_db_list_resolver_identities_json(handle_ptr: ?*anyopaque, out_buf:
         handle.alloc.free(identities);
     }
     // Identity management includes the durable redirects omitted from config JSON.
-    const Identity = struct { config: @import("../storage/db/catalog/resolver_catalog.zig").ResolverConfig, merges: []const @import("antfly_resolver").KeyAlias };
+    const Identity = struct { config: std.json.Value, merges: []const @import("antfly_resolver").KeyAlias };
     const result = handle.alloc.alloc(Identity, identities.len) catch |err| return capi.mapError(err);
     defer handle.alloc.free(result);
-    for (identities, result) |cfg, *identity| identity.* = .{ .config = cfg, .merges = cfg.merges };
+    var public_arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer public_arena.deinit();
+    for (identities, result) |cfg, *identity| identity.* = .{ .config = cfg.publicValue(public_arena.allocator()) catch |err| return capi.mapError(err), .merges = cfg.merges };
     out.* = stringifyJson(result) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -7479,11 +7795,10 @@ pub fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_n
     defer guard.leave();
     if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
     const handle = guard.handle;
-    const KeyMap = struct { key: []const u8, target: []const u8 };
-    const Request = struct { table: []const u8, key_template: []const u8, reset_merges: bool = false, key_map: ?[]const KeyMap = null, aliases: ?[]const @import("antfly_resolver").KeyAlias = null };
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid resolver namespace request");
-    defer parsed.deinit();
-    const request = parsed.value;
+    var arena = std.heap.ArenaAllocator.init(handle.alloc);
+    defer arena.deinit();
+    const curation = @import("../storage/db/resolver_curation.zig");
+    const request = std.json.parseFromSliceLeaky(curation.NamespaceRequest, arena.allocator(), request_json.bytes(), .{}) catch |err| return capi.mapErrorContext(err, "invalid resolver namespace request");
     if (request.key_map != null and request.aliases != null) return capi.mapErrorContext(error.InvalidArgument, "explicit aliases require reset_merges:true");
     if (request.reset_merges == (request.key_map != null)) return capi.mapErrorContext(error.InvalidArgument, "choose reset_merges:true or an explicit key_map, exclusively");
     const configs = handle.database().core.index_manager.listResolverIdentities(handle.alloc) catch |err| return capi.mapError(err);
@@ -7495,40 +7810,7 @@ pub fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, resolver_n
         if (!std.mem.eql(u8, cfg.name, resolver_name.bytes())) continue;
         // Validate the destination before publishing identity state.
         _ = @import("tables.zig").get(handle.parent_handle orelse handle, request.table) catch |err| return capi.mapErrorContext(if (err == error.UndefinedTable) error.NotFound else err, "resolver namespace destination table does not exist");
-        var next = cfg;
-        next.table = request.table;
-        next.key_template = request.key_template;
-        var aliases: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
-        defer aliases.deinit(handle.alloc);
-        var merges: std.ArrayList(@import("antfly_resolver").KeyAlias) = .empty;
-        defer merges.deinit(handle.alloc);
-        if (request.key_map) |mapping| {
-            for (mapping, 0..) |item, i| {
-                if (item.key.len == 0 or item.target.len == 0) return capi.mapErrorContext(error.InvalidArgument, "namespace mapping keys must be non-empty");
-                for (mapping[0..i]) |prior| if (std.mem.eql(u8, prior.key, item.key)) return capi.mapErrorContext(error.InvalidArgument, "duplicate source key in namespace mapping");
-            }
-            const Map = struct {
-                fn find(items: []const KeyMap, key: []const u8) ?[]const u8 {
-                    for (items) |item| if (std.mem.eql(u8, item.key, key)) return item.target;
-                    return null;
-                }
-            };
-            for (cfg.aliases) |alias| aliases.append(handle.alloc, .{
-                .key = Map.find(mapping, alias.key) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every inline alias endpoint"),
-                .target = Map.find(mapping, alias.target) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every inline alias endpoint"),
-            }) catch |err| return capi.mapError(err);
-            for (cfg.merges) |alias| merges.append(handle.alloc, .{
-                .key = Map.find(mapping, alias.key) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every durable merge endpoint"),
-                .target = Map.find(mapping, alias.target) orelse return capi.mapErrorContext(error.InvalidArgument, "namespace mapping must include every durable merge endpoint"),
-            }) catch |err| return capi.mapError(err);
-        }
-        next.aliases = request.aliases orelse aliases.items;
-        next.merges = merges.items;
-        next.merge_generation = if (merges.items.len > 0)
-            std.math.add(u64, cfg.effectiveGeneration(), 1) catch |err| return capi.mapErrorContext(err, "resolver generation overflow")
-        else
-            0;
-        next.merge_state_version = if (merges.items.len > 0) 1 else 0;
+        const next = curation.namespaceConfig(arena.allocator(), cfg, request) catch |err| return capi.mapErrorContext(err, "mapping every inline alias endpoint and resolver policy key into the destination namespace");
         _ = handle.database().upsertResolverWithResultOptions(next, .{ .drain_backfill = false, .wait_for_activity = true, .migrate_namespace = true }) catch |err| return capi.mapErrorContext(err, "updating resolver namespace atomically");
         return .ok;
     }
@@ -8696,6 +8978,17 @@ comptime {
         "antfly_db_render_resolver_key_json",
         "antfly_db_resolve_query_json",
         "antfly_db_merge_resolver_keys_json",
+        "antfly_db_unmerge_resolver_key_json",
+        "antfly_db_suppress_resolver_keys_json",
+        "antfly_db_unsuppress_resolver_key_json",
+        "antfly_db_resolver_curation_json",
+        "antfly_db_resolver_reviews_json",
+        "antfly_db_curate_entity_json",
+        "antfly_db_entity_merge_json",
+        "antfly_db_entity_unmerge_json",
+        "antfly_db_entity_suppress_json",
+        "antfly_db_entity_unsuppress_json",
+        "antfly_db_entity_redirects_json",
         "antfly_db_list_resolver_identities_json",
         "antfly_db_drop_resolver_identity",
         "antfly_db_set_resolver_namespace_json",

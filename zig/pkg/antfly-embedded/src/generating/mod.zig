@@ -453,6 +453,8 @@ const BackendState = struct {
                     }
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
+                provider.response_format_json = self.cfg.response_format_json;
+                provider.logprobs = self.cfg.logprobs;
                 provider.setMaxTokens(self.cfg.max_tokens);
                 if (self.cfg.provider == .openai) provider.setCompletionOptions(self.cfg.max_completion_tokens, if (self.cfg.reasoning_effort) |effort| @tagName(effort) else null);
                 provider.setMaxResponseBytes(self.max_response_bytes);
@@ -467,6 +469,8 @@ const BackendState = struct {
                     }
                 }
                 provider.setToolOptions(self.cfg.tools_json, self.cfg.tool_choice_json);
+                provider.response_format_json = self.cfg.response_format_json;
+                provider.logprobs = self.cfg.logprobs;
                 provider.setMaxTokens(self.cfg.max_tokens);
                 const response_limit = if (self.execution.max_response_bytes) |execution_limit|
                     if (self.max_response_bytes) |family_limit| @min(execution_limit, family_limit) else execution_limit
@@ -502,8 +506,11 @@ const BackendState = struct {
                 const has_tool_history = for (messages) |message| {
                     if (message.tool_calls != null or message.tool_call_id != null or message.role == .tool) break true;
                 } else false;
-                if (local.generate_json != null and (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or has_tool_history)) {
+                if (local.generate_json != null and (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null or has_tool_history)) {
                     const body = try inference.types.chatRequestJsonWithOptionsAlloc(alloc, model, messages, .termite_native, .{
+                        .response_format_json = self.cfg.response_format_json,
+                        .logprobs = self.cfg.logprobs,
+                        .top_logprobs = 64,
                         .tools_json = self.cfg.tools_json,
                         .tool_choice_json = self.cfg.tool_choice_json,
                         .max_tokens = self.cfg.max_tokens,
@@ -514,14 +521,14 @@ const BackendState = struct {
                         .presence_penalty = self.cfg.presence_penalty,
                         // Agent tool turns spend the bounded output budget on
                         // calls and answers, not optional private reasoning.
-                        .enable_thinking = if (self.cfg.tools_json != null or has_tool_history) false else null,
+                        .enable_thinking = if (self.cfg.tools_json != null or self.cfg.response_format_json != null or has_tool_history) false else null,
                     });
                     defer alloc.free(body);
                     const response = try local.generateJson(alloc, body, self.request_context);
                     defer alloc.free(response);
                     break :blk try antfly_provider.Provider.parseGenerationResponse(alloc, response, self.cfg.tools_json, self.cfg.tool_choice_json);
                 }
-                if (self.cfg.tools_json != null or self.cfg.tool_choice_json != null) return error.UnsupportedGeneratorProvider;
+                if (self.cfg.tools_json != null or self.cfg.tool_choice_json != null or self.cfg.response_format_json != null) return error.UnsupportedGeneratorProvider;
                 const options = try inference.GenerationOptions.fromMaxTokens(self.cfg.max_tokens);
                 const linked_context = self.request_context orelse self.execution.requestContext(
                     self.execution.io orelse self.io orelse std.Io.Threaded.global_single_threaded.io(),
@@ -593,10 +600,14 @@ const BackendState = struct {
             for (calls) |*call| call.deinit(alloc);
             if (calls.len > 0) alloc.free(calls);
         }
+        const proof = if (result.token_logprobs_json) |evidence| try alloc.dupe(u8, evidence) else null;
+        errdefer if (proof) |value| alloc.free(value);
         return .{
             .content = content,
             .usage = result.usage,
             .tool_calls = calls,
+            .tool_calls_synthesized = result.tool_calls_synthesized,
+            .token_logprobs_json = proof,
             .google_parts_json = if (result.google_parts_json) |parts| try alloc.dupe(u8, parts) else null,
             .allocator = alloc,
         };

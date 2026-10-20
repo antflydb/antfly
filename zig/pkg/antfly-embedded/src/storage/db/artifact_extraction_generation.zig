@@ -49,6 +49,13 @@ pub fn headKeyAlloc(alloc: std.mem.Allocator, document: []const u8, producer: []
 /// authoritative absence. Only a missing head permits physical-row fallback.
 /// Returned bytes borrow the pinned transaction; the input owns its head guard.
 pub fn captureInput(alloc: std.mem.Allocator, txn: anytype, logical: []const u8) !generations.Input {
+    // Only assets participate in named extraction generations. Resolution,
+    // summary, vector and control records retain their physical read contract;
+    // the shared reader below also selects chunk generations where applicable.
+    // Sending these families through the public ArtifactRef decoder rejects
+    // valid internal records (notably a resolver's own output precondition).
+    if (!keys.isAssetArtifactKey(logical) and !keys.isDocumentUnitArtifactRecordKey(logical))
+        return generations.captureInput(alloc, txn, logical);
     const ids = @import("artifact_ids.zig");
     var ref = (try ids.decodeArtifactRefAlloc(alloc, logical)) orelse return generations.captureInput(alloc, txn, logical);
     defer ref.deinit(alloc);

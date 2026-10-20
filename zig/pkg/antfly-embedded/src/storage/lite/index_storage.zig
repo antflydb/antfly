@@ -69,6 +69,7 @@ pub const Store = struct {
         .delete_file_absolute = deleteFileAbsolute,
         .delete_tree = deleteTree,
         .list_file_names_alloc = listFileNamesAlloc,
+        .list_directory_names_alloc = listDirectoryNamesAlloc,
         .sync_contents_absolute = syncContentsAbsolute,
         .sync_parent_absolute = syncParentAbsolute,
         .now_ns = nowNs,
@@ -413,6 +414,40 @@ fn deleteTreeLocked(self: *Store, path: []const u8) !void {
         if (!std.mem.eql(u8, record.key, directory)) try batch.add(record.key);
     }
     try batch.flush();
+}
+
+fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    const directory = if (std.mem.eql(u8, path, "/")) path else std.mem.trimEnd(u8, path, "/");
+    try validateIndexPath(self, directory);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const file = try snapshot.readFile();
+    const prefix = if (std.mem.eql(u8, directory, "/"))
+        try allocator.dupe(u8, "/")
+    else
+        try std.fmt.allocPrint(allocator, "{s}/", .{directory});
+    defer allocator.free(prefix);
+    var cursor = try file.indexCatalogCursor(snapshot.checkpoint, prefix);
+    defer cursor.deinit();
+    var names = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    while (try cursor.next()) |record| {
+        defer file.allocator.free(record.key);
+        const relative = record.key[prefix.len..];
+        const separator = std.mem.indexOfScalar(u8, relative, '/') orelse continue;
+        if (separator == 0) continue;
+        const name = relative[0..separator];
+        // The catalog cursor is ordered; every child directory is contiguous.
+        if (names.items.len != 0 and std.mem.eql(u8, names.items[names.items.len - 1], name)) continue;
+        const owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned);
+        try names.append(allocator, owned);
+    }
+    return try names.toOwnedSlice(allocator);
 }
 
 fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) ![][]u8 {

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const localGenerationStatusError = @import("local_failure.zig").localGenerationStatusError;
 const json = @import("antfly-json");
 const openapi = @import("antfly_generating_openapi");
 pub const apple_native = @import("antfly_apple_native");
@@ -89,15 +90,44 @@ pub const GenerationUsage = struct {
         if (value != .object) return null;
         return .{ .input_tokens = count(value, input) orelse return null, .output_tokens = count(value, output) orelse return null, .total_tokens = count(value, total) };
     }
-    fn count(value: std.json.Value, name: []const u8) ?u64 {
+    pub fn count(value: std.json.Value, name: []const u8) ?u64 {
+        if (value != .object) return null;
         const number = value.object.get(name) orelse return null;
-        return if (number == .integer and number.integer >= 0) @intCast(number.integer) else null;
+        return switch (number) {
+            .integer => |n| if (n >= 0) @intCast(n) else null,
+            // Lossless tool/schema parsing retains numeric JSON lexemes.
+            // Decode token counts without converting them through floating point.
+            .number_string => |n| std.fmt.parseInt(u64, n, 10) catch null,
+            else => null,
+        };
     }
 };
+
+test "provider registry gateway usage parses exact integer lexemes without inventing counts" {
+    const a = std.testing.allocator;
+    const body = "{\"input\":2,\"output\":1,\"total\":5}";
+    for ([_]bool{ true, false }) |parse_numbers| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{ .parse_numbers = parse_numbers });
+        defer parsed.deinit();
+        const usage = GenerationUsage.fromValue(parsed.value, "input", "output", "total").?;
+        try std.testing.expectEqual(@as(u64, 2), usage.input_tokens);
+        try std.testing.expectEqual(@as(u64, 1), usage.output_tokens);
+        try std.testing.expectEqual(@as(?u64, 5), usage.total_tokens);
+    }
+    for ([_][]const u8{ "null", "-1", "1.5", "1e2", "18446744073709551616", "\"2\"" }) |invalid| {
+        const body_json = try std.fmt.allocPrint(a, "{{\"input\":{s},\"output\":1}}", .{invalid});
+        defer a.free(body_json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, body_json, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(?GenerationUsage, null), GenerationUsage.fromValue(parsed.value, "input", "output", "total"));
+    }
+}
 
 pub const GenerateResult = struct {
     content: []const u8,
     tool_calls: []ToolCall = &.{},
+    tool_calls_synthesized: bool = false,
+    token_logprobs_json: ?[]const u8 = null,
     google_parts_json: ?[]const u8 = null,
     /// Opaque Responses output items, replayed only by Responses adapters.
     responses_output_json: ?[]const u8 = null,
@@ -106,6 +136,7 @@ pub const GenerateResult = struct {
 
     pub fn deinit(self: *GenerateResult) void {
         self.allocator.free(self.content);
+        if (self.token_logprobs_json) |evidence| self.allocator.free(evidence);
         if (self.responses_output_json) |items| self.allocator.free(items);
         if (self.google_parts_json) |parts| self.allocator.free(parts);
         for (self.tool_calls) |*tool_call| tool_call.deinit(self.allocator);
@@ -300,6 +331,8 @@ pub const GeneratorConfig = struct {
     credentials_path: ?[]const u8 = null,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
+    response_format_json: ?[]const u8 = null,
+    logprobs: bool = false,
     max_tokens: i64 = default_max_tokens,
     max_completion_tokens: ?i64 = null,
     reasoning_effort: ?OpenAIReasoningEffort = null,
@@ -309,30 +342,32 @@ pub const GeneratorConfig = struct {
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
 
+    pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !GeneratorConfig {
+        const value = try std.json.innerParse(std.json.Value, alloc, source, options);
+        return parseConfigFromValue(alloc, value) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.UnexpectedToken;
+    }
+
+    pub fn jsonParseFromValue(alloc: std.mem.Allocator, value: std.json.Value, _: std.json.ParseOptions) !GeneratorConfig {
+        return parseConfigFromValue(alloc, value) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: GeneratorConfig, writer: anytype) !void {
+        try writer.write(openApiFromConfig(self));
+    }
+
     pub fn clone(self: GeneratorConfig, alloc: std.mem.Allocator) !GeneratorConfig {
-        return .{
-            .rate_limit = self.rate_limit,
-            .provider = self.provider,
-            .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
-            .url = if (self.url.len > 0) try alloc.dupe(u8, self.url) else "",
-            .connection_id = if (self.connection_id) |id| try alloc.dupe(u8, id) else null,
-            .api_key = if (self.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
-            .capability_token = if (self.capability_token) |token| try alloc.dupe(u8, token) else null,
-            .capability_revision = if (self.capability_revision) |revision| try alloc.dupe(u8, revision) else null,
-            .project_id = if (self.project_id) |value| try alloc.dupe(u8, value) else null,
-            .location = if (self.location) |value| try alloc.dupe(u8, value) else null,
-            .credentials_path = if (self.credentials_path) |value| try alloc.dupe(u8, value) else null,
-            .tools_json = if (self.tools_json) |value| try alloc.dupe(u8, value) else null,
-            .tool_choice_json = if (self.tool_choice_json) |value| try alloc.dupe(u8, value) else null,
-            .max_tokens = self.max_tokens,
-            .max_completion_tokens = self.max_completion_tokens,
-            .reasoning_effort = self.reasoning_effort,
-            .temperature = self.temperature,
-            .top_p = self.top_p,
-            .top_k = self.top_k,
-            .frequency_penalty = self.frequency_penalty,
-            .presence_penalty = self.presence_penalty,
+        var result = self;
+        result.model = "";
+        result.url = "";
+        const strings = .{ "connection_id", "api_key", "capability_token", "capability_revision", "project_id", "location", "credentials_path", "tools_json", "tool_choice_json", "response_format_json" };
+        inline for (strings) |field| @field(result, field) = null;
+        errdefer result.deinit(alloc);
+        if (self.model.len > 0) result.model = try alloc.dupe(u8, self.model);
+        if (self.url.len > 0) result.url = try alloc.dupe(u8, self.url);
+        inline for (strings) |field| if (@field(self, field)) |value| {
+            @field(result, field) = try alloc.dupe(u8, value);
         };
+        return result;
     }
 
     pub fn deinit(self: *GeneratorConfig, alloc: std.mem.Allocator) void {
@@ -347,6 +382,7 @@ pub const GeneratorConfig = struct {
         if (self.credentials_path) |value| alloc.free(value);
         if (self.tools_json) |value| alloc.free(value);
         if (self.tool_choice_json) |value| alloc.free(value);
+        if (self.response_format_json) |value| alloc.free(value);
         self.* = undefined;
     }
 
@@ -1279,4 +1315,16 @@ test "generator explicit URL and api_url take precedence over defaults" {
         defer cfg.deinit(alloc);
         try std.testing.expectEqualStrings("http://custom/v1", cfg.url);
     }
+}
+
+test "generator config clone releases every owned field on allocation failure" {
+    const Exercise = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const config = GeneratorConfig{ .provider = .openai, .model = "model", .url = "https://endpoint", .api_key = "key", .connection_id = "connection", .capability_token = "lease", .capability_revision = "revision", .project_id = "project", .location = "region", .credentials_path = "credentials", .tools_json = "[]", .tool_choice_json = "auto", .response_format_json = "{}" };
+            var copy = try config.clone(a);
+            defer copy.deinit(a);
+            try std.testing.expectEqualStrings(config.response_format_json.?, copy.response_format_json.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
 }

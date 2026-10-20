@@ -47,16 +47,27 @@ components:
     DeciderConfig:
       type: object
       additionalProperties: false
-      required: [provider]
       properties:
         provider:
           type: string
           enum: [antfly, jev, openai]
         decision_method:
           type: string
-          enum: [typed, embedding_similarity]
+          enum: [typed, embedding_similarity, generated]
           default: typed
           description: Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
+        generator:
+          $ref: '../shared/generating.yaml#/components/schemas/GeneratorConfig'
+          description: Required with decision_method=generated. Provider configuration belongs here rather than in the outer typed-decider fields.
+        instructions:
+          type: string
+          maxLength: 65536
+        output:
+          $ref: '../shared/generating.yaml#/components/schemas/ConstrainedOutput'
+        probabilities:
+          $ref: '../shared/generating.yaml#/components/schemas/ConstrainedProbabilities'
+        batch:
+          $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGenerationBatch'
         model:
           type: string
           description: Required for Antfly and OpenAI; Jev defaults to jev-latest.

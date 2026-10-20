@@ -33,6 +33,7 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 const bert = @import("../models/bert.zig");
 const t5_mod = @import("../models/t5.zig");
 const gpt_mod = @import("../models/gpt.zig");
+const embedding_gemma2_model = @import("../models/embedding_gemma2.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const whisper_mod = @import("../models/whisper.zig");
 const florence_mod = @import("../models/florence.zig");
@@ -45,10 +46,11 @@ const boundary_resident = @import("../ops/gliner_boundary_resident.zig");
 const bert_arch = @import("bert.zig");
 const modern_bert_arch = @import("modern_bert.zig");
 const nomic_bert_arch = @import("nomic_bert.zig");
-const embedding_gemma2_arch = @import("embedding_gemma2.zig");
+const embedding_gemma2_reference = @import("embedding_gemma2_reference.zig");
 const layoutlmv3_arch = @import("layoutlmv3.zig");
 const t5_arch = @import("t5.zig");
 const gpt_arch = @import("gpt.zig");
+const embedding_gemma2_arch = @import("embedding_gemma2.zig");
 const deepseek_v4_arch = @import("deepseek_v4.zig");
 const whisper_arch = @import("whisper.zig");
 const clip_arch = @import("clip.zig");
@@ -96,6 +98,7 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     gemma4,
     gemma4_training,
     qwen3_embedding,
+    embedding_gemma2,
     qwen3_vl_generation,
 };
 const GpuHostedQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
@@ -1028,7 +1031,11 @@ fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []
         const owned_key = try allocator.dupe(u8, key);
         var key_owned = true;
         defer if (key_owned) allocator.free(owned_key);
-        if (shouldLazyLoadWeight(store.kind(), arch_config, key)) {
+        // CUDA transfers the resident inventory and closes this host session.
+        // EmbeddingGemma 2's CPU lazy weights must be materialized here so its
+        // encoder and media towers remain available after that handoff.
+        const cuda_embedding_gemma2_upload = retain_gliner_q8 and arch_config == .embedding_gemma2;
+        if (!cuda_embedding_gemma2_upload and shouldLazyLoadWeight(store.kind(), arch_config, key)) {
             if (lazy_weights.contains(key)) {
                 continue;
             }
@@ -1831,6 +1838,8 @@ fn createCudaSessionWithRequiredProfile(
     var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
     defer model_manifest.deinit();
     try model_manifest.requireRecognizedGlinerArchitecture();
+    if (model_manifest.embedding_style == .embedding_gemma2)
+        try cuda_compute_mod.preflightProfileDevice(.embedding_gemma2);
     if (model_manifest.gliner_boundary_bundle) |receipt| {
         // This CUDA profile consumes canonical FP32 boundary weights. A
         // reduced artifact needs its own qualified storage/compute profile;
@@ -2222,6 +2231,7 @@ fn cudaProfileForArch(
                 null,
             else => null,
         },
+        .embedding_gemma2 => .embedding_gemma2,
         else => null,
     };
 }
@@ -7543,6 +7553,13 @@ const BackendData = union {
 };
 
 const ArchSession = struct {
+    // Independent of the model execution lane: preparation can overlap model
+    // work. Session close follows worker shutdown, like the borrowed device.
+    video_coefficient_mutex: std.Io.Mutex = .init,
+    video_coefficients: ?@import("antfly_video").preparation.CoefficientCache = null,
+    video_coefficient_permit: ?@import("../backends/session.zig").RunPermit = null,
+    video_coefficient_device_permit: ?@import("../backends/session.zig").RunPermit = null,
+    video_coefficient_suspended: bool = false,
     allocator: std.mem.Allocator,
     arch_config: ArchConfig,
     boundary_identity: ?boundary_bundle.Identity = null,
@@ -7791,6 +7808,7 @@ const arch_vtable = Session.VTable{
     .runWithControl = &archRunWithControl,
     .runResident = &archRunResident,
     .runResidentTextEmbedding = &archRunResidentTextEmbedding,
+    .runResidentTextEmbeddingWithControl = &archRunResidentTextEmbeddingWithControl,
     .runResidentWithControl = &archRunResidentWithControl,
     .inputInfo = &archInputInfo,
     .outputInfo = &archOutputInfo,
@@ -7895,6 +7913,73 @@ fn parseBertRunInputs(inputs: []const Tensor) !BertRunInputs {
     };
 }
 
+fn parseEmbeddingGemma2Inputs(inputs: []const Tensor, cfg: embedding_gemma2_model.Config) !embedding_gemma2_reference.Request {
+    var ids: ?[]const i64 = null;
+    var embeddings: ?[]const f32 = null;
+    var mask: ?[]const i64 = null;
+    var shape: ?[2]usize = null;
+    for (inputs) |tensor| {
+        if (std.mem.eql(u8, tensor.name, "input_ids")) {
+            const matrix = try validateI64Matrix(tensor, shape);
+            ids = matrix.values;
+            shape = matrix.shape;
+        } else if (std.mem.eql(u8, tensor.name, "attention_mask")) {
+            const matrix = try validateI64Matrix(tensor, shape);
+            mask = matrix.values;
+            shape = matrix.shape;
+        } else if (std.mem.eql(u8, tensor.name, "inputs_embeds")) {
+            if (tensor.dtype != .f32 or tensor.shape.len != 3 or tensor.shape[0] <= 0 or tensor.shape[1] <= 0 or tensor.shape[2] != cfg.hidden_size or !tensor.isAlignedFor(f32))
+                return error.InvalidInputShape;
+            const matrix_shape = [2]usize{ @intCast(tensor.shape[0]), @intCast(tensor.shape[1]) };
+            if (shape) |expected| if (!std.mem.eql(usize, &matrix_shape, &expected)) return error.InvalidInputShape;
+            const tokens = std.math.mul(usize, matrix_shape[0], matrix_shape[1]) catch return error.InvalidInputShape;
+            const count = std.math.mul(usize, tokens, cfg.hidden_size) catch return error.InvalidInputShape;
+            const byte_count = std.math.mul(usize, count, @sizeOf(f32)) catch return error.InvalidInputShape;
+            if (tensor.data.len != byte_count) return error.InvalidInputShape;
+            embeddings = tensor.asFloat32();
+            shape = matrix_shape;
+        }
+    }
+    const resolved_shape = shape orelse return error.MissingInputs;
+    const attention_mask = mask orelse return error.MissingInputs;
+    const input: embedding_gemma2_reference.Input = if (embeddings) |values|
+        .{ .input_embeddings = values }
+    else if (ids) |values|
+        .{ .token_ids = values }
+    else
+        return error.MissingInputs;
+    const request = embedding_gemma2_reference.Request{
+        .input = input,
+        .attention_mask = attention_mask,
+        .batch = resolved_shape[0],
+        .sequence = resolved_shape[1],
+    };
+    try request.validate(cfg);
+    return request;
+}
+
+fn validateEmbeddingGemma2Output(values: []const f32, batch: usize, dimension: usize) !void {
+    if (batch == 0 or dimension == 0) return error.InvalidEmbeddingOutput;
+    const expected = std.math.mul(usize, batch, dimension) catch return error.InvalidEmbeddingOutput;
+    if (values.len != expected) return error.InvalidEmbeddingOutput;
+    for (0..batch) |row| {
+        var norm_squared: f32 = 0;
+        for (values[row * dimension ..][0..dimension]) |value| {
+            if (!std.math.isFinite(value)) return error.InvalidEmbeddingOutput;
+            norm_squared += value * value;
+        }
+        if (!std.math.isFinite(norm_squared) or norm_squared == 0) return error.InvalidEmbeddingOutput;
+    }
+}
+
+test "EmbeddingGemma2 output validation is batch exact and finite" {
+    try validateEmbeddingGemma2Output(&.{ 0.6, 0.8, 0.8, 0.6 }, 2, 2);
+    try std.testing.expectError(error.InvalidEmbeddingOutput, validateEmbeddingGemma2Output(&.{ 0.6, 0.8 }, 2, 2));
+    try std.testing.expectError(error.InvalidEmbeddingOutput, validateEmbeddingGemma2Output(&.{ 0.6, 0.8, 0, 0 }, 2, 2));
+    try std.testing.expectError(error.InvalidEmbeddingOutput, validateEmbeddingGemma2Output(&.{ 0.6, std.math.nan(f32) }, 1, 2));
+    try std.testing.expectError(error.InvalidEmbeddingOutput, validateEmbeddingGemma2Output(&.{}, std.math.maxInt(usize), 2));
+}
+
 test "BERT session inputs require matching aligned i64 matrices" {
     const allocator = std.testing.allocator;
     const shape = [_]i64{ 1, 2 };
@@ -7931,6 +8016,7 @@ fn archRunResident(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.A
         .bert, .modern_bert, .nomic_bert, .embedding_gemma2 => {},
         else => return null,
     }
+    if (self.arch_config == .embedding_gemma2 and self.backend_type == .cuda) return null;
     const bert_inputs = try parseBertRunInputs(inputs);
 
     const cb = try allocator.create(ops.ComputeBackend);
@@ -7990,9 +8076,76 @@ fn archRunResidentTextEmbedding(
     request: ResidentTextEmbeddingRequest,
     allocator: std.mem.Allocator,
 ) !?ResidentOutputs {
+    return archRunResidentTextEmbeddingImpl(ptr, inputs, request, allocator, null);
+}
+
+fn archRunResidentTextEmbeddingWithControl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    request: ResidentTextEmbeddingRequest,
+    allocator: std.mem.Allocator,
+    control: InferenceExecutionControl,
+) !?ResidentOutputs {
+    return archRunResidentTextEmbeddingImpl(ptr, inputs, request, allocator, control);
+}
+
+fn archRunResidentTextEmbeddingImpl(
+    ptr: *anyopaque,
+    inputs: []const Tensor,
+    request: ResidentTextEmbeddingRequest,
+    allocator: std.mem.Allocator,
+    control: ?InferenceExecutionControl,
+) !?ResidentOutputs {
+    if (control) |active| try active.check();
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
-    if (self.task == .classifier or self.task == .extractor or self.backend_type != .metal) return null;
+    if (self.task == .classifier or self.task == .extractor) return null;
     if (request.pooling != .mean) return null;
+    if (self.arch_config == .embedding_gemma2 and self.backend_type == .cuda) {
+        const cfg = self.arch_config.embedding_gemma2.resident orelse return error.UnsupportedEmbeddingGemma2Config;
+        const encoder_request = try parseEmbeddingGemma2Inputs(inputs, cfg);
+        const embedding = switch (self.backend_type) {
+            .cuda => if (comptime build_options.enable_cuda) try self.backend_data.cuda.compute.runEmbeddingGemma2(
+                allocator,
+                cfg,
+                switch (encoder_request.input) {
+                    .token_ids => |values| .{ .token_ids = values },
+                    .input_embeddings => |values| .{ .input_embeddings = values },
+                },
+                encoder_request.attention_mask,
+                encoder_request.batch,
+                encoder_request.sequence,
+                cfg.outputDim(),
+                control,
+            ) else return error.CudaNotEnabled,
+            .native => blk: {
+                var reference_cb = try makeComputeBackend(self, allocator, null);
+                defer reference_cb.deinit();
+                reference_cb.execution_control = control;
+                break :blk try embedding_gemma2_reference.forwardReference(&reference_cb, allocator, cfg, encoder_request, cfg.outputDim());
+            },
+            else => return null,
+        };
+        defer allocator.free(embedding);
+        try validateEmbeddingGemma2Output(embedding, encoder_request.batch, cfg.outputDim());
+        const cb = try allocator.create(ops.ComputeBackend);
+        errdefer allocator.destroy(cb);
+        cb.* = try makeComputeBackend(self, allocator, null);
+        errdefer cb.deinit();
+        const output_shape = [_]i32{ @intCast(encoder_request.batch), @intCast(cfg.outputDim()) };
+        const output = try cb.fromFloat32Shape(embedding, &output_shape);
+        errdefer cb.free(output);
+        const outputs = try allocator.alloc(ops.CT, 1);
+        errdefer allocator.free(outputs);
+        outputs[0] = output;
+        return .{
+            .outputs = outputs,
+            .backend = cb,
+            .allocator = allocator,
+            .backend_owner = cb,
+            .deinit_backend_owner = &deinitResidentComputeBackend,
+        };
+    }
+    if (self.backend_type != .metal) return null;
     const cfg = switch (self.arch_config) {
         .nomic_bert => |cfg| cfg,
         else => return null,
@@ -8111,6 +8264,15 @@ pub fn getGptConfig(session: Session) ?gpt_mod.Config {
     };
 }
 
+pub fn getEmbeddingGemma2ResidentConfig(session: Session) ?embedding_gemma2_model.Config {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return switch (self.arch_config) {
+        .embedding_gemma2 => |cfg| if (self.backend_type == .cuda) cfg.resident else null,
+        else => null,
+    };
+}
+
 /// Load GPT architecture metadata without opening a runtime session or weight
 /// backend. This is for artifact-backed whole-model runtimes that still need
 /// tokenizer/config shape information but must not keep a duplicate native
@@ -8178,6 +8340,15 @@ fn refineGptConfigFromManifestTensorMetadata(
     const all_names = try source.listNames(allocator);
     defer allocator.free(all_names);
     try refineGptConfigFromStore(allocator, store, all_names, config);
+}
+
+/// Arithmetic policy is frozen with the session identity, never re-read by queues.
+pub fn getEmbeddingGemma2CudaPolicy(session: Session) ?@import("../ops/cuda/embedding_gemma2_policy.zig").Policy {
+    if (comptime !build_options.enable_cuda) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .cuda or self.arch_config != .embedding_gemma2) return null;
+    return self.backend_data.cuda.compute.embedding_gemma2_policy;
 }
 
 pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
@@ -8438,11 +8609,23 @@ pub fn runFlorenceDecoderResident(
 }
 
 /// Get a ComputeBackend from an architecture session.
+fn bindCudaVideoAdmission(session: Session, cb: *const ops.ComputeBackend) !void {
+    if (comptime !build_options.enable_cuda) return;
+    if (cb.kind() != .cuda) return;
+    const compute: *cuda_compute_mod.CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    try compute.configureEmbeddingGemma2Admission(if (session.run_admission) |admission| .{
+        .controller = admission.controller,
+        .limits = admission.limits,
+        .check_live_memory = admission.check_live_memory,
+    } else null);
+}
+
 pub fn getComputeBackend(session: Session, allocator: std.mem.Allocator) !ops.ComputeBackend {
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     var cb = try makeComputeBackend(self, allocator, null);
     errdefer cb.deinit();
+    try bindCudaVideoAdmission(session, &cb);
     try cb.beginRequest();
     return cb;
 }
@@ -8457,7 +8640,29 @@ pub fn getEmbeddingGemma2Config(session: Session) ?embedding_gemma2_arch.Config 
 /// retained, and native destruction has the same interruption protection as
 /// compute construction. Busy providers keep their weights and return zero.
 pub fn reclaimEmbeddingGemma2VisionWeights(session: Session, control: InferenceExecutionControl) !usize {
-    return reclaimEmbeddingGemma2Weights(session, control, .vision);
+    const coefficients = try reclaimVideoPreparationCoefficients(session, control);
+    return coefficients + try reclaimEmbeddingGemma2Weights(session, control, .vision);
+}
+
+pub fn reclaimVideoPreparationCoefficients(session: Session, control: InferenceExecutionControl) !usize {
+    if (session.vtable != &arch_vtable) return 0;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const io = self.io orelse return 0;
+    try control.check();
+    self.video_coefficient_mutex.lockUncancelable(io);
+    defer self.video_coefficient_mutex.unlock(io);
+    if (self.video_coefficients) |*cache| {
+        if (self.video_coefficient_suspended) return 0;
+        // The native gate prevents racing producers from repopulating storage
+        // after its device lease is returned. Request pins remain admitted.
+        cache.disable();
+        if (self.video_coefficient_permit) |*permit| try permit.retainHostBytes(@import("antfly_video").preparation.CoefficientCache.host_budget);
+        if (self.video_coefficient_device_permit) |*permit| permit.deinit();
+        self.video_coefficient_device_permit = null;
+        self.video_coefficient_suspended = true;
+        return @import("antfly_video").preparation.CoefficientCache.device_budget;
+    }
+    return 0;
 }
 
 pub fn reclaimEmbeddingGemma2AudioWeights(session: Session, control: InferenceExecutionControl) !usize {
@@ -8485,12 +8690,37 @@ fn reclaimEmbeddingGemma2Weights(session: Session, control: InferenceExecutionCo
 /// Preparation owns its own queue and never borrows mutable provider execution
 /// state. The loaded session handle must remain alive through producer cleanup;
 /// callers guard native driver work before querying/retaining this device.
-pub fn videoPreparationContext(session: Session) !struct { io: ?std.Io, device: ?*anyopaque } {
+pub fn videoPreparationContext(session: Session, prepare: bool) !struct { io: ?std.Io, device: ?*anyopaque, coefficients: ?*const @import("antfly_video").preparation.CoefficientCache = null } {
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     if (self.backend_type != .metal) return .{ .io = self.io, .device = null };
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     const device = metal_runtime.termite_metal_video_preparation_device() orelse return error.MetalRuntimeUnavailable;
+    if (self.io) |io| {
+        self.video_coefficient_mutex.lockUncancelable(io);
+        defer self.video_coefficient_mutex.unlock(io);
+        if (self.video_coefficients == null and prepare) {
+            const Cache = @import("antfly_video").preparation.CoefficientCache;
+            var permit = session.admitRetainedMedia(Cache.host_budget, Cache.device_budget) catch return .{ .io = self.io, .device = device };
+            const cache = Cache.init(device, Cache.device_budget) catch {
+                permit.deinit();
+                return .{ .io = self.io, .device = device };
+            };
+            self.video_coefficients = cache;
+            self.video_coefficient_permit = permit;
+        }
+        if (self.video_coefficients != null and self.video_coefficient_suspended and prepare) {
+            const Cache = @import("antfly_video").preparation.CoefficientCache;
+            var permit = session.admitRetainedMedia(0, Cache.device_budget) catch return .{ .io = self.io, .device = device };
+            self.video_coefficients.?.enable(Cache.device_budget) catch {
+                permit.deinit();
+                return .{ .io = self.io, .device = device };
+            };
+            self.video_coefficient_device_permit = permit;
+            self.video_coefficient_suspended = false;
+        }
+        return .{ .io = self.io, .device = device, .coefficients = if (self.video_coefficients) |*cache| cache else null };
+    }
     return .{ .io = self.io, .device = device };
 }
 
@@ -9007,6 +9237,7 @@ pub fn getComputeBackendWithBudget(
     // unconditional request boundary here, before prompt-cache selection can
     // bypass KV-hook provisioning, so no graph or pinned-address ABI survives
     // from the preceding request.
+    try bindCudaVideoAdmission(session, &cb);
     try cb.beginRequest();
     return cb;
 }
@@ -9871,6 +10102,30 @@ fn archRunImpl(
         },
         .embedding_gemma2 => |cfg| {
             if (self.task != .generic) return error.UnsupportedArchitectureTask;
+            if (self.backend_type == .cuda) {
+                const resident = cfg.resident orelse return error.UnsupportedEmbeddingGemma2Config;
+                const request = try parseEmbeddingGemma2Inputs(inputs, resident);
+                const values = if (comptime build_options.enable_cuda) try self.backend_data.cuda.compute.runEmbeddingGemma2(
+                    allocator,
+                    resident,
+                    switch (request.input) {
+                        .token_ids => |ids| .{ .token_ids = ids },
+                        .input_embeddings => |embeddings| .{ .input_embeddings = embeddings },
+                    },
+                    request.attention_mask,
+                    request.batch,
+                    request.sequence,
+                    resident.outputDim(),
+                    control,
+                ) else return error.CudaNotEnabled;
+                defer allocator.free(values);
+                try validateEmbeddingGemma2Output(values, request.batch, resident.outputDim());
+                var tensor = try Tensor.initFloat32(allocator, "sentence_embedding", &.{ @intCast(request.batch), @intCast(resident.outputDim()) }, values);
+                errdefer tensor.deinit();
+                const outputs = try allocator.alloc(Tensor, 1);
+                outputs[0] = tensor;
+                return outputs;
+            }
             const bi = try parseBertRunInputs(inputs);
             const result_ct = try embedding_gemma2_arch.forwardCT(&cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len);
             defer cb.free(result_ct);
@@ -10969,6 +11224,7 @@ fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").S
         },
         .embedding_gemma2 => |cfg| blk: {
             if (input_seq > embedding_gemma2_arch.max_tokens) return error.InvalidEmbeddingInputLength;
+            if (self.backend_type == .cuda) output_seq = 1;
             // Live activations, expanded GQA, streamed PLE, and host/output
             // copies. Attention scores use fixed tiles, never tokens squared.
             workspace_bytes = try std.math.mul(usize, try std.math.mul(usize, batch, input_seq), 64 * 1024);
@@ -11144,6 +11400,11 @@ fn archOutputInfo(ptr: *anyopaque) []const TensorInfo {
         };
     }
     return switch (self.arch_config) {
+        .embedding_gemma2 => if (self.backend_type == .cuda) &.{
+            .{ .name = "sentence_embedding", .dtype = .f32, .shape = &.{ -1, 768 } },
+        } else &.{
+            .{ .name = "last_hidden_state", .dtype = .f32, .shape = &.{ -1, -1, 768 } },
+        },
         .clap => &.{
             .{ .name = "text_embeds", .dtype = .f32, .shape = &.{ -1, -1 } },
         },
@@ -11160,6 +11421,9 @@ fn archBackend(ptr: *anyopaque) BackendType {
 
 fn archClose(ptr: *anyopaque) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.video_coefficients) |*cache| cache.deinit();
+    if (self.video_coefficient_permit) |*permit| permit.deinit();
+    if (self.video_coefficient_device_permit) |*permit| permit.deinit();
     if (self.generation_workspace) |*workspace| workspace.borrowed.deinit();
     if (self.laya_trunk_cache) |cache| {
         cache.deinit();
@@ -12159,4 +12423,43 @@ test "unsupported families keep their gguf weight mapping" {
         "model.layers.0.self_attn.q_a_proj.weight",
         normalizeGgufGptWeightKey(.{ .family = .deepseek_v4 }, "blk.0.attn_q_a.weight", &buf).?,
     );
+}
+
+test "embeddinggemma2 coefficient cache relinquishes device credit before recovery and readmits before publication" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    const Cache = @import("antfly_video").preparation.CoefficientCache;
+    const device = metal_runtime.termite_metal_video_preparation_device() orelse return error.SkipZigTest;
+    var controller = runtime.tier.memory.AdmissionController{};
+    defer controller.deinit();
+    // This probe exercises only the independently owned preparation context;
+    // model weights and execution-provider fields are deliberately unused.
+    var self: ArchSession = undefined;
+    self.backend_type = .metal;
+    self.io = std.testing.io;
+    self.video_coefficient_mutex = .init;
+    self.video_coefficient_permit = null;
+    self.video_coefficient_device_permit = null;
+    self.video_coefficient_suspended = false;
+    self.video_coefficients = try Cache.init(device, Cache.device_budget);
+    defer if (self.video_coefficient_permit) |*permit| permit.deinit();
+    defer if (self.video_coefficient_device_permit) |*permit| permit.deinit();
+    defer self.video_coefficients.?.deinit();
+    const session = Session{ .ptr = &self, .vtable = &arch_vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024, .backend_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    self.video_coefficient_permit = try session.admitRetainedMedia(Cache.host_budget, Cache.device_budget);
+    try std.testing.expectEqual(@as(usize, Cache.device_budget), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, Cache.device_budget), try reclaimVideoPreparationCoefficients(session, .{}));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, Cache.host_budget), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), try reclaimVideoPreparationCoefficients(session, .{}));
+    var peer = try session.admitRetainedMedia(0, 120 * 1024 * 1024);
+    defer peer.deinit();
+    try std.testing.expect((try videoPreparationContext(session, true)).coefficients == null);
+    try std.testing.expect(self.video_coefficient_suspended);
+    try std.testing.expectEqual(@as(usize, 120 * 1024 * 1024), controller.snapshot().backend_scratch_bytes);
+    peer.deinit();
+    try std.testing.expect((try videoPreparationContext(session, true)).coefficients != null);
+    try std.testing.expect(!self.video_coefficient_suspended);
+    try std.testing.expectEqual(@as(usize, Cache.device_budget), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, Cache.device_budget), try reclaimVideoPreparationCoefficients(session, .{}));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
 }

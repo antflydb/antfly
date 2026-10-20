@@ -532,9 +532,7 @@ const CombinedControl = struct {
         }
         // A callback-only replacement loses the process interruption boundary
         // while private buffers are submitted or synchronously drained.
-        result.ptr = self;
-        result.check_fn = check;
-        return result;
+        return result.withCheckpoint(self, check);
     }
 };
 

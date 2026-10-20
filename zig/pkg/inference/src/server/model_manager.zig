@@ -2342,6 +2342,11 @@ const LegacyArtifactDigestCache = struct {
     var forbid_hashing_for_test: bool = false;
 
     fn digest(io: std.Io, artifact: managed_receipt.ValidatedArtifact) ![32]u8 {
+        return digestWithControl(io, artifact, .{});
+    }
+
+    fn digestWithControl(io: std.Io, artifact: managed_receipt.ValidatedArtifact, control: InferenceExecutionControl) ![32]u8 {
+        try control.check();
         const signature = try componentDependencySignature(io, &.{artifact.canonical_path});
         spinLock(&mutex);
         for (entries) |item| if (item) |entry| {
@@ -2373,6 +2378,7 @@ const LegacyArtifactDigestCache = struct {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         var buffer: [64 * 1024]u8 = undefined;
         while (true) {
+            try control.check();
             const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
                 error.EndOfStream => 0,
                 else => return err,
@@ -2427,7 +2433,13 @@ pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, ma
     return resolutionModelRevision(a, io, manifest);
 }
 
-const ChunkPlanningSnapshot = struct { digest: [32]u8, signature: [32]u8 };
+const ChunkPlanningSnapshot = struct {
+    digest: [32]u8,
+    signature: [32]u8,
+    // Evidence for the embedded tokenizer, separate from the stable public
+    // planning identity so unchanged models keep their existing chunk keys.
+    embedded_tokenizer_digest: ?[32]u8 = null,
+};
 fn chunkPlanningPaths(manifest: manifest_mod.ModelManifest, out: *[9][]const u8) []const []const u8 {
     var count: usize = 0;
     inline for (.{ "config_path", "tokenizer_json_path", "vocab_txt_path", "tokenizer_config_path", "special_tokens_map_path", "preprocessor_config_path", "processor_config_path" }) |name| if (@field(manifest, name)) |path| {
@@ -2441,6 +2453,11 @@ fn chunkPlanningPaths(manifest: manifest_mod.ModelManifest, out: *[9][]const u8)
     return out[0..count];
 }
 fn chunkPlanningSnapshot(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest, fallback: [32]u8) !ChunkPlanningSnapshot {
+    return chunkPlanningSnapshotWithControl(a, io, manifest, fallback, .{});
+}
+
+fn chunkPlanningSnapshotWithControl(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest, fallback: [32]u8, control: InferenceExecutionControl) !ChunkPlanningSnapshot {
+    try control.check();
     var storage: [9][]const u8 = undefined;
     const paths = chunkPlanningPaths(manifest, &storage);
     const signature = try componentDependencySignature(io, paths);
@@ -2450,10 +2467,24 @@ fn chunkPlanningSnapshot(a: std.mem.Allocator, io: std.Io, manifest: manifest_mo
     defer a.free(recipe);
     hash.update(recipe);
     if (manifest.tokenizer_json_path == null and manifest.vocab_txt_path == null) hash.update(&fallback);
+    var embedded_tokenizer_digest: ?[32]u8 = null;
     for (paths) |path| {
-        // GGUF may own its tokenizer. The fallback digest already pins that
-        // immutable artifact; never stream gigabytes of weights for planning.
-        if (manifest.gguf_path) |gguf| if (std.mem.eql(u8, path, gguf)) continue;
+        try control.check();
+        // Reuse the content verification performed during managed model load.
+        // After a metadata change, prove GGUF byte identity rather than trusting
+        // the loaded model's old fallback revision. Warm planning only stats.
+        if (manifest.gguf_path) |gguf| if (std.mem.eql(u8, path, gguf)) {
+            const canonical = try managed_receipt.resolveRegularFilePath(a, io, path);
+            defer a.free(canonical);
+            const stat = try std.Io.Dir.cwd().statFile(io, canonical, .{});
+            embedded_tokenizer_digest = try LegacyArtifactDigestCache.digestWithControl(io, .{
+                .path = std.fs.path.basename(path),
+                .canonical_path = canonical,
+                .size = stat.size,
+                .sha256 = null,
+            }, control);
+            continue;
+        };
         hash.update(std.fs.path.basename(path));
         hash.update(&.{0});
         var file = try std.Io.Dir.cwd().openFile(io, path, .{});
@@ -2461,6 +2492,7 @@ fn chunkPlanningSnapshot(a: std.mem.Allocator, io: std.Io, manifest: manifest_mo
         var file_hash = std.crypto.hash.sha2.Sha256.init(.{});
         var buffer: [64 * 1024]u8 = undefined;
         while (true) {
+            try control.check();
             const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
                 error.EndOfStream => 0,
                 else => return err,
@@ -2471,7 +2503,7 @@ fn chunkPlanningSnapshot(a: std.mem.Allocator, io: std.Io, manifest: manifest_mo
         hash.update(&file_hash.finalResult());
     }
     if (!std.mem.eql(u8, &signature, &try componentDependencySignature(io, paths))) return error.ModelArtifactsChanging;
-    return .{ .digest = hash.finalResult(), .signature = signature };
+    return .{ .digest = hash.finalResult(), .signature = signature, .embedded_tokenizer_digest = embedded_tokenizer_digest };
 }
 
 /// Tokenizer/processor-only ownership for planning. Never constructs a backend
@@ -2516,7 +2548,10 @@ pub const LoadedModel = struct {
     chunk_planning: ?ChunkPlanningSnapshot = null,
     resolution_revision: ?[32]u8 = null,
     embedding_identity: ?[64]u8 = null,
-    embedding_asset_signature: ?[32]u8 = null,
+    embedding_validation: ?@import("../models/embedding_gemma2_identity.zig").SnapshotValidation = null,
+    embedding_identity_mutex: std.atomic.Mutex = .unlocked,
+    chunk_planning_lane: execution_control_mod.ExecutionLane = .{},
+    embedding_execution_lane: execution_control_mod.ExecutionLane = .{},
     manifest: manifest_mod.ModelManifest,
     hf_tok: ?*hf_tokenizer.HfTokenizer,
     sp_tok: ?*sentencepiece.Processor,
@@ -2558,6 +2593,7 @@ pub const LoadedModel = struct {
     /// state within a loaded model. Keep one model-local lane while allowing
     /// independent models to overlap.
     target_inference_run_lock: std.atomic.Mutex = .unlocked,
+    embedding_cohort_scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{},
     /// CUDA boundary requests execute serially on this session. Queue before
     /// reserving their full device scratch ceiling, without holding a provider
     /// lock during admission/eviction. Every waiter retains a ModelHandle.
@@ -2601,23 +2637,79 @@ pub const LoadedModel = struct {
     retired: bool = false,
 
     pub fn chunkPlanningIdentity(self: *LoadedModel) ![32]u8 {
-        const snapshot = self.chunk_planning orelse return self.resolution_revision orelse error.InvalidEmbeddingIdentity;
+        return self.chunkPlanningIdentityWithControl(.{});
+    }
+
+    pub fn chunkPlanningIdentityWithControl(self: *LoadedModel, control: InferenceExecutionControl) ![32]u8 {
+        var active = control;
+        const io = self.executor_io orelse std.Options.debug_io;
+        if (active.io == null) active.io = io;
+        try active.lock(&self.embedding_identity_mutex);
+        const previous = self.chunk_planning;
+        self.embedding_identity_mutex.unlock();
+        var snapshot = previous orelse return self.resolution_revision orelse error.InvalidEmbeddingIdentity;
         var paths: [9][]const u8 = undefined;
-        const signature = try componentDependencySignature(self.executor_io orelse std.Options.debug_io, chunkPlanningPaths(self.manifest, &paths));
-        if (!std.mem.eql(u8, &signature, &snapshot.signature)) return error.ModelArtifactsChanging;
-        return snapshot.digest;
+        const signature = try componentDependencySignature(io, chunkPlanningPaths(self.manifest, &paths));
+        if (std.mem.eql(u8, &signature, &snapshot.signature)) return snapshot.digest;
+        const lease = try self.chunk_planning_lane.acquire(active);
+        defer lease.release();
+        // A preceding validator may already have refreshed this generation.
+        try active.lock(&self.embedding_identity_mutex);
+        snapshot = self.chunk_planning.?;
+        self.embedding_identity_mutex.unlock();
+        if (std.mem.eql(u8, &try componentDependencySignature(io, chunkPlanningPaths(self.manifest, &paths)), &snapshot.signature)) return snapshot.digest;
+        const current = chunkPlanningSnapshotWithControl(self.allocator, io, self.manifest, self.resolution_revision orelse snapshot.digest, active) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir, error.ModelArtifactsChanging => return error.ResourceTemporarilyUnavailable,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, &current.digest, &snapshot.digest) or
+            !std.meta.eql(current.embedded_tokenizer_digest, snapshot.embedded_tokenizer_digest))
+        {
+            self.model_manager.retireLoadedModel(self);
+            return error.ModelArtifactsChanging;
+        }
+        try active.lock(&self.embedding_identity_mutex);
+        self.chunk_planning = current;
+        self.embedding_identity_mutex.unlock();
+        return current.digest;
     }
 
     pub fn verifyEmbeddingIdentity(self: *const LoadedModel) !void {
-        const expected = self.embedding_asset_signature orelse return;
-        const actual = try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, self.executor_io orelse std.Options.debug_io, self.model_dir, self.manifest.safetensors_path.?);
-        if (!std.mem.eql(u8, &expected, &actual)) return error.ModelArtifactsChanging;
+        return self.verifyEmbeddingIdentityWithControl(.{});
+    }
+
+    pub fn verifyEmbeddingIdentityWithControl(self: *const LoadedModel, control: InferenceExecutionControl) !void {
+        const mutable = @constCast(self);
+        try control.check();
+        const validation = if (mutable.embedding_validation) |*value| value else return;
+        const identity = @import("../models/embedding_gemma2_identity.zig");
+        const snapshot = validation.refresh(self.allocator, self.executor_io orelse std.Options.debug_io, self.model_dir, self.manifest.safetensors_path.?, control) catch |err| {
+            // An unstable filesystem snapshot does not prove this loaded
+            // runtime is stale. Preserve it and retry publication instead of
+            // forcing a second resident session under backfill memory pressure.
+            switch (err) {
+                error.ModelArtifactsChanging, error.FileNotFound, error.NotDir => return error.ResourceTemporarilyUnavailable,
+                error.Cancelled, error.Canceled, error.Timeout => return err,
+                else => {
+                    self.model_manager.retireLoadedModel(mutable);
+                    return err;
+                },
+            }
+        };
+        const digest = identity.forBackend(snapshot.digest, self.session.backend());
+        if (self.embedding_identity) |loaded| if (std.mem.eql(u8, &loaded, &digest)) return;
+        // Active handles retain rejected assets until they unwind; later
+        // calls reload instead of reusing a permanently stale generation.
+        self.model_manager.retireLoadedModel(mutable);
+        return error.ModelArtifactsChanging;
     }
 
     pub fn getTokenizer(self: *LoadedModel) tokenizer_mod.Tokenizer {
-        if (self.hf_tok) |ht| return ht.tokenizer();
-        if (self.sp_tok) |sp| return sp.tokenizer();
-        unreachable;
+        var tokenizer = if (self.hf_tok) |ht| ht.tokenizer() else if (self.sp_tok) |sp| sp.tokenizer() else unreachable;
+        // Managed tokenizers are immutable for this loaded model generation.
+        // A pinned handle keeps both tokenizer and backend provider alive.
+        tokenizer.cache_identity = if (self.embedding_identity) |signature| std.hash.Wyhash.hash(0, &signature) else null;
+        return tokenizer;
     }
 
     pub fn getEmbeddingPrototypeCache(self: *LoadedModel, limits: runtime.tier.memory.Limits, control: InferenceExecutionControl) !*@import("../extractors/embedding_prototypes.zig").Cache {
@@ -3070,6 +3162,11 @@ pub const LoadedModel = struct {
                 session_factory.supportsResidentTextEncoder(self.session),
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
             .resident_text_encoder = resident_text_encoder,
+            .resident_embedding_gemma2 = self.manifest.embedding_style == .embedding_gemma2 and self.session.backend() == .cuda,
+            .allow_image = self.manifest.inputs.len == 0 or model_caps.modelAcceptsInput(&self.manifest, "image"),
+            .allow_video = self.manifest.embedding_style == .embedding_gemma2 and model_caps.modelAcceptsInput(&self.manifest, "video"),
+            .allow_audio = self.manifest.inputs.len == 0 or model_caps.modelAcceptsInput(&self.manifest, "audio"),
+            .strict_max_length = self.manifest.embedding_style == .embedding_gemma2,
             .preprocess_io = self.executor_io,
             // Last-token pooling reads the EOS position; guarantee exactly
             // one trailing EOS regardless of tokenizer.json snapshot age.
@@ -3088,6 +3185,7 @@ pub const LoadedModel = struct {
         self.bindEmbeddingPipelineAssetsLocked(&pipeline);
         pipeline.resident_projection_stats = &self.resident_projection_stats;
         pipeline.execution_lock = self.embeddingExecutionLock();
+        pipeline.execution_lane = if (self.manifest.embedding_style == .embedding_gemma2) &self.embedding_execution_lane else null;
         return pipeline;
     }
 
@@ -3814,6 +3912,7 @@ fn sessionRunAdmissionModelProfile(
         .hidden_size = manifest.hidden_size,
         .intermediate_size = manifest.intermediate_size,
         .attention_heads = manifest.num_attention_heads,
+        .embedding_gemma2_cuda = manifest.embedding_style == .embedding_gemma2 and backend_runtime.backend == .cuda,
         .qwen_dense_workspace = qwen_cfg != null,
         .query_width = if (qwen_cfg) |cfg| @as(usize, cfg.num_attention_heads) * cfg.headDim() else 0,
         .kv_width = if (qwen_cfg) |cfg| @as(usize, cfg.effectiveKVHeads()) * cfg.headDim() else 0,
@@ -3891,6 +3990,18 @@ pub const ModelHandle = struct {
 
     pub fn get(self: *const ModelHandle) *LoadedModel {
         return self.model orelse unreachable;
+    }
+
+    /// Create another lifetime pin for the exact same published generation.
+    /// This is used when admission metadata must remain borrowed for the whole
+    /// request while execution independently transfers a handle into recovery.
+    pub fn duplicate(self: *const ModelHandle) ModelHandle {
+        const model = self.model orelse unreachable;
+        self.manager.lockLoadedModels();
+        std.debug.assert(model.active_handles > 0);
+        model.active_handles += 1;
+        self.manager.unlockLoadedModels();
+        return .{ .manager = self.manager, .model = model };
     }
 
     pub fn pin(self: *ModelHandle) void {
@@ -7648,7 +7759,7 @@ pub const ModelManager = struct {
         var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
         errdefer man.deinit();
         const revision = try self.modelIdentityForManifest(model_dir, man);
-        const planning = try chunkPlanningSnapshot(self.allocator, io, man, revision);
+        const planning = try chunkPlanningSnapshotWithControl(self.allocator, io, man, revision, control);
         const kind = if (shouldPreferSentencePieceOverride(man, model_dir, self.allocator)) manifest_mod.TokenizerType.sentencepiece else man.tokenizer_type orelse return error.NoTokenizerFound;
         const plan = try tokenizerLoadAdmissionPlan(self.allocator, model_dir, &man, kind);
         var lease = try self.acquireTokenizerAdmission(plan);
@@ -7673,7 +7784,10 @@ pub const ModelManager = struct {
             },
         }
         const identity = if (man.embedding_style == .embedding_gemma2)
-            (try @import("../models/embedding_gemma2_identity.zig").snapshotCached(self.allocator, io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights, control)).digest
+            @import("../models/embedding_gemma2_identity.zig").forBackend(
+                (try @import("../models/embedding_gemma2_identity.zig").snapshotCached(self.allocator, io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights, control)).digest,
+                embeddingPlanningBackend(self.session_manager),
+            )
         else
             std.fmt.bytesToHex(revision, .lower);
         if (lease) |*active| try active.retain(plan.resident);
@@ -7715,11 +7829,11 @@ pub const ModelManager = struct {
         if (man.hasIncompleteColqwenBundle()) return error.IncompleteColqwenBundle;
         if (man.hasIncompleteClipclapGgufBundle()) return error.IncompleteClipclapGgufBundle;
         if (man.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
-        var eg2_backends: [2]backends.BackendType = undefined;
+        var eg2_backends: [3]backends.BackendType = undefined;
         if (man.embedding_style == .embedding_gemma2) {
             var count: usize = 0;
             for (sm.preferred_backends) |backend| {
-                if (backend != .native and backend != .metal) continue;
+                if (backend != .native and backend != .metal and backend != .cuda) continue;
                 var duplicate = false;
                 for (eg2_backends[0..count]) |existing| if (existing == backend) {
                     duplicate = true;
@@ -7966,13 +8080,14 @@ pub const ModelManager = struct {
         const model = try self.allocator.create(LoadedModel);
         var model_storage_owned = true;
         errdefer if (model_storage_owned) self.allocator.destroy(model);
+        const chunk_planning = try chunkPlanningSnapshotWithControl(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision, control orelse .{});
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
         if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
         model.* = .{
-            .chunk_planning = try chunkPlanningSnapshot(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision),
+            .chunk_planning = chunk_planning,
             .resolution_revision = resolution_revision,
-            .embedding_identity = if (embedding_snapshot) |snapshot| snapshot.digest else null,
-            .embedding_asset_signature = if (embedding_snapshot) |snapshot| snapshot.signature else null,
+            .embedding_identity = if (embedding_snapshot) |snapshot| eg2_identity.forBackend(snapshot.digest, session.backend()) else null,
+            .embedding_validation = if (embedding_snapshot) |snapshot| .{ .value = snapshot } else null,
             .manifest = man,
             .hf_tok = hf_tok,
             .sp_tok = sp_tok,
@@ -8001,6 +8116,7 @@ pub const ModelManager = struct {
             .resource_lease = loaded_session.resource_lease,
         };
         model.session.execution_gate = &model.target_inference_run_lock;
+        if (session_factory.getEmbeddingGemma2Config(model.session) != null) model.session.cohort_scheduler = &model.embedding_cohort_scheduler;
 
         // Keep publication behind the same cooperative boundary as expensive
         // construction. An abandoned manager task should release its fully
@@ -8756,22 +8872,30 @@ test "loaded model snapshot preserves TTL while ordinary inference release recor
     var inference = manager.acquireLoadedModel("model") orelse return error.MissingTestModel;
     defer inference.release();
     try std.testing.expectEqual(@as(usize, 2), model.active_handles);
+    var duplicate = inference.duplicate();
+    defer duplicate.release();
+    try std.testing.expect(duplicate.get() == inference.get());
+    try std.testing.expectEqual(@as(usize, 3), model.active_handles);
     const before_release = platform.time.monotonicNs();
     inference.release();
     const used_at = model.last_used_ns;
     try std.testing.expect(used_at >= before_release and used_at > 1);
+    try std.testing.expectEqual(@as(usize, 2), model.active_handles);
+    duplicate.release();
+    const duplicate_used_at = model.last_used_ns;
+    try std.testing.expect(duplicate_used_at >= used_at);
     try std.testing.expectEqual(@as(usize, 1), model.active_handles);
     observation.deinit();
-    try std.testing.expectEqual(used_at, model.last_used_ns);
+    try std.testing.expectEqual(duplicate_used_at, model.last_used_ns);
     try std.testing.expectEqual(@as(usize, 0), model.active_handles);
 
     manager.lockLoadedModels();
-    const not_yet = manager.takeLruModelLocked(used_at + std.time.ns_per_ms - 1, true, null);
+    const not_yet = manager.takeLruModelLocked(duplicate_used_at + std.time.ns_per_ms - 1, true, null);
     manager.unlockLoadedModels();
     defer if (not_yet) |removed| allocator.free(removed.key);
     try std.testing.expect(not_yet == null);
     manager.lockLoadedModels();
-    const expired = manager.takeLruModelLocked(used_at + std.time.ns_per_ms, true, null);
+    const expired = manager.takeLruModelLocked(duplicate_used_at + std.time.ns_per_ms, true, null);
     manager.unlockLoadedModels();
     defer if (expired) |removed| allocator.free(removed.key);
     try std.testing.expect(expired != null and expired.?.model == &model);
@@ -13987,4 +14111,191 @@ test "memory admission diagnostics retain pressure and recover after release" {
     // The last denial remains observable after recovery; its timestamp/count
     // distinguish it from the current request and survive DB snapshot refresh.
     try std.testing.expectEqual(denied.denied_count, manager.memoryAdmissionDiagnostic().denied_count);
+}
+
+/// Planning does not construct a device. Execution validates its actual identity
+/// after selection, including when a preferred accelerator falls back to CPU.
+fn embeddingPlanningBackend(manager: backends.SessionManager) backends.BackendType {
+    if (manager.required_backend) |backend| return backend;
+    for (manager.preferred_backends) |backend| {
+        if (!backend.available()) continue;
+        if (!manager.uninterruptibleBackendsAllowed() and backend.executionInterruption() == .uninterruptible) continue;
+        if (backend == .cuda or backend == .metal or backend == .native) return backend;
+    }
+    return .native;
+}
+
+test "embeddinggemma2 planning precision follows required backend before preferences" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    manager.preferred_backends = &.{ .cuda, .native };
+    try std.testing.expectEqual(if (backends.BackendType.cuda.available()) backends.BackendType.cuda else backends.BackendType.native, embeddingPlanningBackend(manager));
+    manager.required_backend = .metal;
+    try std.testing.expectEqual(backends.BackendType.metal, embeddingPlanningBackend(manager));
+    manager.required_backend = .native;
+    try std.testing.expectEqual(backends.BackendType.native, embeddingPlanningBackend(manager));
+}
+
+test "chunk planning survives metadata-only re-pulls and rejects changed tokenizer bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "original" });
+    const root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "tokenizer.json" });
+    defer a.free(path);
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .tokenizer_json_path = path };
+    const snapshot = try chunkPlanningSnapshot(a, io, manifest, @splat(0));
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    // Only planning metadata is exercised; no tokenizer/backend is loaded.
+    var model: LoadedModel = undefined;
+    model.allocator = a;
+    model.model_dir = root;
+    model.manifest = manifest;
+    model.executor_io = io;
+    model.chunk_planning = snapshot;
+    model.resolution_revision = @splat(0);
+    model.embedding_identity_mutex = .unlocked;
+    model.chunk_planning_lane = .{};
+    model.model_manager = &manager;
+    model.retired = false;
+    try std.Io.Dir.hardLink(tmp.dir, "tokenizer.json", tmp.dir, "linked.json", io, .{});
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
+    try tmp.dir.deleteFile(io, "linked.json");
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "changed!" });
+    // Some Linux filesystems give successive same-size writes identical
+    // mtime/ctime values within one clock tick. Exercise content revalidation
+    // with an observable generation change without sleeping or making warm
+    // planning reread tokenizer/model contents on every request.
+    var changed = try tmp.dir.openFile(io, "tokenizer.json", .{ .mode = .read_write });
+    defer changed.close(io);
+    const stat = try changed.stat(io);
+    try changed.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(stat.mtime.toNanoseconds() + std.time.ns_per_s) } });
+    try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
+}
+
+test "embedding identity validation without asset signatures remains cancellable and performs no discovery" {
+    var model: LoadedModel = undefined;
+    model.embedding_identity_mutex = .unlocked;
+    model.embedding_validation = null;
+    // Other fields deliberately have no valid allocator, paths or session:
+    // models without an asset signature must stay on the metadata-free path.
+    try model.verifyEmbeddingIdentityWithControl(.{});
+    try std.testing.expectError(error.Timeout, model.verifyEmbeddingIdentityWithControl(.{ .deadline_ns = 0 }));
+    try model.verifyEmbeddingIdentityWithControl(.{});
+}
+
+test "GGUF chunk planning verifies embedded tokenizer bytes while preserving unchanged identities" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Planning checks only identity; it must not construct a GGUF backend.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "original" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "model.gguf" });
+    defer a.free(path);
+    const config = try std.fs.path.join(a, &.{ root, "config.json" });
+    defer a.free(config);
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .gguf_path = path, .config_path = config };
+    const snapshot = try chunkPlanningSnapshot(a, io, manifest, @splat(9));
+    try std.testing.expect(snapshot.embedded_tokenizer_digest != null);
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    var model: LoadedModel = undefined;
+    model.allocator = a;
+    model.model_dir = root;
+    model.manifest = manifest;
+    model.executor_io = io;
+    model.chunk_planning = snapshot;
+    model.resolution_revision = @splat(9);
+    model.embedding_identity_mutex = .unlocked;
+    model.chunk_planning_lane = .{};
+    model.model_manager = &manager;
+    model.retired = false;
+
+    try std.Io.Dir.hardLink(tmp.dir, "model.gguf", tmp.dir, "linked.gguf", io, .{});
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
+    try tmp.dir.deleteFile(io, "linked.gguf");
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
+    // Neither warm calls nor a sidecar-only metadata change rehash weights.
+    LegacyArtifactDigestCache.forbid_hashing_for_test = true;
+    defer LegacyArtifactDigestCache.forbid_hashing_for_test = false;
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
+    try std.Io.Dir.hardLink(tmp.dir, "config.json", tmp.dir, "linked.json", io, .{});
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
+    LegacyArtifactDigestCache.forbid_hashing_for_test = false;
+    // Atomic replacement with identical bytes preserves the old public key.
+    try tmp.dir.writeFile(io, .{ .sub_path = "replacement.gguf", .data = "original" });
+    try std.Io.Dir.rename(tmp.dir, "replacement.gguf", tmp.dir, "model.gguf", io);
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
+    const validated = model.chunk_planning.?;
+    // Missing publication is transient and cannot advance validation evidence.
+    try std.Io.Dir.rename(tmp.dir, "model.gguf", tmp.dir, "missing.gguf", io);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, model.chunkPlanningIdentity());
+    try std.testing.expectEqualDeep(validated, model.chunk_planning.?);
+    try std.Io.Dir.rename(tmp.dir, "missing.gguf", tmp.dir, "model.gguf", io);
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
+    const before_change = model.chunk_planning.?;
+    // A same-size replacement must fail even though the old revision is fixed.
+    try tmp.dir.writeFile(io, .{ .sub_path = "replacement.gguf", .data = "changed!" });
+    try std.Io.Dir.rename(tmp.dir, "replacement.gguf", tmp.dir, "model.gguf", io);
+    try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
+    try std.testing.expectEqualDeep(before_change, model.chunk_planning.?);
+    // The same guarantee applies to in-place writes, without an inode change.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "original" });
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentity());
+    const before_write = model.chunk_planning.?;
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "changed!" });
+    try std.testing.expectError(error.ModelArtifactsChanging, model.chunkPlanningIdentity());
+    try std.testing.expectEqualDeep(before_write, model.chunk_planning.?);
+}
+
+test "GGUF chunk planning cancellation leaves revalidation retryable" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const payload = try a.alloc(u8, 256 * 1024);
+    defer a.free(payload);
+    @memset(payload, 1);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = payload });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "model.gguf" });
+    defer a.free(path);
+    const manifest = manifest_mod.ModelManifest{ .allocator = a, .gguf_path = path };
+    const snapshot = try chunkPlanningSnapshot(a, io, manifest, @splat(5));
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
+    defer manager.deinit();
+    var model: LoadedModel = undefined;
+    model.allocator = a;
+    model.model_dir = root;
+    model.manifest = manifest;
+    model.executor_io = io;
+    model.chunk_planning = snapshot;
+    model.resolution_revision = @splat(5);
+    model.embedding_identity_mutex = .unlocked;
+    model.chunk_planning_lane = .{};
+    model.model_manager = &manager;
+    model.retired = false;
+    try std.Io.Dir.hardLink(tmp.dir, "model.gguf", tmp.dir, "linked.gguf", io, .{});
+    const Probe = struct {
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks >= 9) return error.Cancelled;
+        }
+    };
+    var probe = Probe{};
+    try std.testing.expectError(error.Cancelled, model.chunkPlanningIdentityWithControl(.{ .io = io, .ptr = &probe, .check_fn = Probe.check }));
+    try std.testing.expectEqualDeep(snapshot, model.chunk_planning.?);
+    try std.testing.expectError(error.Timeout, model.chunkPlanningIdentityWithControl(.{ .deadline_ns = 0 }));
+    try std.testing.expectEqual(snapshot.digest, try model.chunkPlanningIdentityWithControl(.{ .io = io }));
 }

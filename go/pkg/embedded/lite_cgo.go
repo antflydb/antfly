@@ -733,6 +733,70 @@ func (db *DB) MergeResolverKeysJSON(resolver string, request []byte) error {
 	})
 }
 
+// UnmergeResolverKeyJSON undoes a redirect and can pin its former target distinct.
+func (db *DB) UnmergeResolverKeyJSON(resolver string, request []byte) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	input, cleanupInput := makeCStringSlice(request)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_unmerge_resolver_key_json((*C.antfly_db)(handle), name, input, out)
+	})
+}
+
+// SuppressResolverKeysJSON atomically updates runtime key and text suppressions.
+func (db *DB) SuppressResolverKeysJSON(resolver string, request []byte) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	input, cleanupInput := makeCStringSlice(request)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_suppress_resolver_keys_json((*C.antfly_db)(handle), name, input, out)
+	})
+}
+
+// UnsuppressResolverKeyJSON removes runtime suppression while preserving declarative rules.
+func (db *DB) UnsuppressResolverKeyJSON(resolver string, request []byte) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	input, cleanupInput := makeCStringSlice(request)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_unsuppress_resolver_key_json((*C.antfly_db)(handle), name, input, out)
+	})
+}
+
+// ResolverCurationJSON inspects one resolver, or every identity for an empty name.
+func (db *DB) ResolverCurationJSON(resolver string) ([]byte, error) {
+	name, cleanup := makeCStringSlice([]byte(resolver))
+	defer cleanup()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_resolver_curation_json((*C.antfly_db)(handle), name, out)
+	})
+}
+
+// ResolverReviewsJSON pages reviews or submits an artifact-bound decision.
+func (db *DB) ResolverReviewsJSON(request []byte) ([]byte, error) {
+	input, cleanup := makeCStringSlice(request)
+	defer cleanup()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_resolver_reviews_json((*C.antfly_db)(handle), input, out)
+	})
+}
+
+// CurateEntityJSON applies an entity correction to every matching resolver namespace.
+func (db *DB) CurateEntityJSON(table, key string, request []byte) ([]byte, error) {
+	target, cleanup := makeCStringSlice([]byte(table))
+	defer cleanup()
+	entity, cleanupKey := makeCStringSlice([]byte(key))
+	defer cleanupKey()
+	input, cleanupInput := makeCStringSlice(request)
+	defer cleanupInput()
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_curate_entity_json((*C.antfly_db)(handle), target, entity, input, out)
+	})
+}
+
 // ResolverIdentitiesJSON lists active and retired identities, including durable merges.
 func (db *DB) ResolverIdentitiesJSON() ([]byte, error) {
 	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {

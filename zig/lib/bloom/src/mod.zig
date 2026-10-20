@@ -117,6 +117,20 @@ fn maybeContainsHashesImpl(bytes: []const u8, bit_count_value: u32, hash_count_v
     if (bit_count_value == 0 or hash_count_value == 0) return false;
     const h2 = if (h2_in == 0) 0x9e3779b97f4a7c15 else h2_in;
     const bit_count: u64 = bit_count_value;
+    // Builders round to a power of two. Keep modulo for other persisted
+    // filters, but avoid division on the common path without changing bits.
+    if (std.math.isPowerOfTwo(bit_count_value)) {
+        const mask = bit_count - 1;
+        var h = h1;
+        var probe: u8 = 0;
+        while (probe < hash_count_value) : (probe += 1) {
+            const bit_index: usize = @intCast(h & mask);
+            const bit_mask: u8 = @as(u8, 1) << @intCast(bit_index % 8);
+            if ((bytes[bit_index / 8] & bit_mask) == 0) return false;
+            h +%= h2;
+        }
+        return true;
+    }
     var i: u8 = 0;
     while (i < hash_count_value) : (i += 1) {
         const bit_index: usize = @intCast((h1 +% (@as(u64, i) *% h2)) % bit_count);
@@ -156,6 +170,17 @@ pub const Builder = struct {
         if (self.bit_count == 0 or self.hash_count == 0) return;
         const h2 = if (h2_in == 0) 0x9e3779b97f4a7c15 else h2_in;
         const bit_count: u64 = self.bit_count;
+        if (std.math.isPowerOfTwo(self.bit_count)) {
+            const mask = bit_count - 1;
+            var h = h1;
+            var probe: u8 = 0;
+            while (probe < self.hash_count) : (probe += 1) {
+                const bit_index: usize = @intCast(h & mask);
+                self.bytes[bit_index / 8] |= @as(u8, 1) << @intCast(bit_index % 8);
+                h +%= h2;
+            }
+            return;
+        }
         var i: u8 = 0;
         while (i < self.hash_count) : (i += 1) {
             const bit_index: usize = @intCast((h1 +% (@as(u64, i) *% h2)) % bit_count);
@@ -269,4 +294,51 @@ test "bloom encodeInto reuses output buffer" {
     defer decoded.deinit(alloc);
     try std.testing.expect(decoded.maybeContainsHashes(hashBytes(0, "alpha"), hashBytes(1, "alpha")));
     try std.testing.expect(decoded.maybeContainsHashes(hashBytes(0, "beta"), hashBytes(1, "beta")));
+}
+
+// Compare against the persisted v1 mapping, including zero/even strides,
+// wrapping arithmetic, and non-power-of-two filters accepted by the decoder.
+test "power of two optimization preserves v1 bits and query results" {
+    const allocator = std.testing.allocator;
+    for ([_]u32{ 63, 64, 127, 128, 511, 512, 1024 }) |bits| {
+        for ([_]u8{ 1, 4, 7, 10, 16 }) |k| {
+            var builder = Builder{
+                .allocator = allocator,
+                .bytes = try allocator.alloc(u8, (bits + 7) / 8),
+                .bit_count = bits,
+                .hash_count = k,
+            };
+            defer builder.deinit();
+            @memset(builder.bytes, 0);
+            const expected = try allocator.alloc(u8, builder.bytes.len);
+            defer allocator.free(expected);
+            @memset(expected, 0);
+            const strides = [_]u64{ 0, 2, 0x123456789abcdef, std.math.maxInt(u64) };
+            for (strides) |stride| {
+                const h1 = std.math.maxInt(u64) - 3;
+                builder.addHashes(h1, stride);
+                const h2: u64 = if (stride == 0) 0x9e3779b97f4a7c15 else stride;
+                for (0..k) |i| {
+                    const bit = (h1 +% (@as(u64, @intCast(i)) *% h2)) % bits;
+                    expected[bit / 8] |= @as(u8, 1) << @intCast(bit % 8);
+                }
+            }
+            try std.testing.expectEqualSlices(u8, expected, builder.bytes);
+            const view = BorrowedFilter{ .bytes = builder.bytes, .bit_count = bits, .hash_count = k };
+            for (0..4096) |h1| {
+                for (strides) |stride| {
+                    const h2: u64 = if (stride == 0) 0x9e3779b97f4a7c15 else stride;
+                    var expected_hit = true;
+                    for (0..k) |i| {
+                        const bit = (@as(u64, @intCast(h1)) +% (@as(u64, @intCast(i)) *% h2)) % bits;
+                        if (expected[bit / 8] & (@as(u8, 1) << @intCast(bit % 8)) == 0) {
+                            expected_hit = false;
+                            break;
+                        }
+                    }
+                    try std.testing.expectEqual(expected_hit, view.maybeContainsHashes(h1, stride));
+                }
+            }
+        }
+    }
 }

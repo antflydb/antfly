@@ -182,6 +182,10 @@ pub const Config = struct {
         protected_bytes: usize = 256 * 1024 * 1024,
     };
     pub const LakeIndexConfig = struct {
+        /// Enable retention certificates only after qualifying the configured
+        /// provider's exact-version retention enforcement. Generation pinning
+        /// and ordinary complete auditing do not require this option.
+        cloud_generations: struct { qualified_retention: bool = false } = .{},
         /// Optional planning prefetch; required reads and publication proofs remain authoritative.
         navigation_warming: struct { enabled: bool = true } = .{},
         query_cursors: struct {
@@ -190,6 +194,9 @@ pub const Config = struct {
             max_native_retained_bytes: u64 = 64 * 1024 * 1024 * 1024,
         } = .{},
         text_cache: struct {
+            /// Maximum corpus admitted by one streaming ranking window.
+            admission_window_segments: u8 = 64,
+            admission_window_bytes: u64 = 32 * 1024 * 1024,
             max_seekable_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024,
             max_heap_bytes: usize = 256 * 1024 * 1024,
         } = .{},
@@ -3942,6 +3949,7 @@ fn parseLakeIndexConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.La
     defer parsed.deinit();
     const text = parsed.value.text_cache;
     if (text.max_seekable_artifact_bytes == 0 or text.max_seekable_artifact_bytes > 1024 * 1024 * 1024 * 1024 or text.max_heap_bytes == 0 or @as(u64, text.max_heap_bytes) > 64 * 1024 * 1024 * 1024) return error.InvalidConfig;
+    if (text.admission_window_segments == 0 or text.admission_window_segments > 64 or text.admission_window_bytes == 0 or text.admission_window_bytes > 32 * 1024 * 1024) return error.InvalidConfig;
     const cursors = parsed.value.query_cursors;
     if (cursors.retention_ms < 1000 or cursors.retention_ms > std.time.ms_per_hour or cursors.max_native_cuts == 0 or cursors.max_native_cuts > 4096 or cursors.max_native_retained_bytes == 0 or cursors.max_native_retained_bytes > 1024 * 1024 * 1024 * 1024) return error.InvalidConfig;
     const gc = parsed.value.artifact_gc;
@@ -3960,6 +3968,9 @@ test "external lake native artifact collection config validates bounded operator
         "{\"lake_indexes\":{\"artifact_gc\":{\"interval_ms\":0}}}",
         "{\"lake_indexes\":{\"artifact_gc\":{\"max_deleted\":0}}}",
         "{\"lake_indexes\":{\"artifact_gc\":{\"unknown\":1}}}",
+        "{\"lake_indexes\":{\"text_cache\":{\"admission_window_segments\":0}}}",
+        "{\"lake_indexes\":{\"text_cache\":{\"admission_window_segments\":65}}}",
+        "{\"lake_indexes\":{\"text_cache\":{\"admission_window_bytes\":0}}}",
         "{\"lake_indexes\":{\"unknown\":1}}",
     }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, invalid));
 }

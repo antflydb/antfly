@@ -160,7 +160,7 @@ kernel void horizontal(texture2d<float, access::read> yplane [[texture(0)]], tex
     uint index = (gid.y * p.tw + gid.x) * 3;
     out[index] = value.r; out[index + 1] = value.g; out[index + 2] = value.b;
 }
-// Software-decoded RGBA is staged once as tightly packed bytes. Alpha is ignored
+// RGB/RGBA is staged once with explicit channels and stride. Alpha is ignored
 // exactly as in the opaque JPEG CPU reference; no NV12 conversion is involved.
 kernel void horizontal_rgba(device const uchar *rgba [[buffer(4)]],
     device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]],
@@ -172,7 +172,7 @@ kernel void horizontal_rgba(device const uchar *rgba [[buffer(4)]],
     int3 sum = int3(1 << 21);
     for (uint i = 0; i < count; ++i) {
         uint2 xy = source_point(uint2(start + i, gid.y), p);
-        uint pos = (xy.y * p.sw + xy.x) * 4;
+        uint pos = xy.y * p.full + xy.x * p.bt709;
         sum += int3(rgba[pos], rgba[pos + 1], rgba[pos + 2]) * weights[offset + i];
     }
     uchar3 value = uchar3(clamp(sum >> 22, 0, 255));

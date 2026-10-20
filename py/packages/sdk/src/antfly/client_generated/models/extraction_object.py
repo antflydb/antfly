@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.extraction_object_probability_source import ExtractionObjectProbabilitySource
 from ..models.extraction_offset_unit import ExtractionOffsetUnit
 from ..types import UNSET, Unset
 
@@ -26,6 +27,11 @@ T = TypeVar("T", bound="ExtractionObject")
 class ExtractionObject:
     """
     Attributes:
+        model (str | Unset):
+        probability_source (ExtractionObjectProbabilitySource | Unset): Generated extraction confidence comes from
+            measured decoder evidence or explicit verdict-only assertions.
+        unaligned_mentions (int | Unset): Generated mention proposals dropped because they could not be aligned to the
+            source.
         id (str | Unset):
         offset_unit (ExtractionOffsetUnit | Unset): Half-open offsets into the immutable caller text. Version 2 defaults
             to utf8_bytes. No normalization, lowercasing or synthetic suffix is included in these coordinates.
@@ -40,6 +46,9 @@ class ExtractionObject:
         long_document (ExtractionLongDocumentMetadata | Unset):
     """
 
+    model: str | Unset = UNSET
+    probability_source: ExtractionObjectProbabilitySource | Unset = UNSET
+    unaligned_mentions: int | Unset = UNSET
     id: str | Unset = UNSET
     offset_unit: ExtractionOffsetUnit | Unset = UNSET
     entities: list[ExtractionEntity] | Unset = UNSET
@@ -52,6 +61,14 @@ class ExtractionObject:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        model = self.model
+
+        probability_source: str | Unset = UNSET
+        if not isinstance(self.probability_source, Unset):
+            probability_source = self.probability_source.value
+
+        unaligned_mentions = self.unaligned_mentions
+
         id = self.id
 
         offset_unit: str | Unset = UNSET
@@ -98,6 +115,12 @@ class ExtractionObject:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if model is not UNSET:
+            field_dict["model"] = model
+        if probability_source is not UNSET:
+            field_dict["probability_source"] = probability_source
+        if unaligned_mentions is not UNSET:
+            field_dict["unaligned_mentions"] = unaligned_mentions
         if id is not UNSET:
             field_dict["id"] = id
         if offset_unit is not UNSET:
@@ -130,6 +153,17 @@ class ExtractionObject:
         from ..models.extraction_solver_diagnostics import ExtractionSolverDiagnostics
 
         d = dict(src_dict)
+        model = d.pop("model", UNSET)
+
+        _probability_source = d.pop("probability_source", UNSET)
+        probability_source: ExtractionObjectProbabilitySource | Unset
+        if isinstance(_probability_source, Unset):
+            probability_source = UNSET
+        else:
+            probability_source = ExtractionObjectProbabilitySource(_probability_source)
+
+        unaligned_mentions = d.pop("unaligned_mentions", UNSET)
+
         id = d.pop("id", UNSET)
 
         _offset_unit = d.pop("offset_unit", UNSET)
@@ -195,6 +229,9 @@ class ExtractionObject:
             long_document = ExtractionLongDocumentMetadata.from_dict(_long_document)
 
         extraction_object = cls(
+            model=model,
+            probability_source=probability_source,
+            unaligned_mentions=unaligned_mentions,
             id=id,
             offset_unit=offset_unit,
             entities=entities,

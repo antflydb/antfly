@@ -58,12 +58,12 @@ pub const Stream = struct {
     const Pending = struct {
         prepared: coordinator_mod.Prepared,
         output: embedding.LiveResult,
-        permit: session_mod.RunPermit,
+        allocation: ?*embedding.LiveAllocation = null,
         acknowledged: bool = false,
         fn deinit(self: *Pending, a: std.mem.Allocator) void {
-            if (self.output.result) |result| a.free(result.vector);
+            if (self.output.result) |result| (if (self.allocation) |owner| owner.allocator() else a).free(result.vector);
             self.prepared.deinit();
-            self.permit.deinit();
+            if (self.allocation) |owner| owner.deinit();
             self.* = undefined;
         }
     };
@@ -75,7 +75,7 @@ pub const Stream = struct {
         if (!@import("../architectures/embedding_gemma2.zig").validDimension(options.dimensions)) return error.InvalidEmbeddingDimensions;
         _ = try @import("../architectures/embedding_gemma2.zig").taskPrefix(options.task_type);
         const context_bytes = try std.math.add(usize, @sizeOf(Stream), try std.math.add(usize, options.task_type.len, if (caption) |value| value.len else 0));
-        var context_permit = try session.admitHostPreprocess(context_bytes);
+        var context_permit = try embedding.admitHostPreprocess(session, context_bytes, effective);
         errdefer context_permit.deinit();
         const task = try a.dupe(u8, options.task_type);
         errdefer a.free(task);
@@ -95,15 +95,19 @@ pub const Stream = struct {
         while (true) {
             try self.control.check();
             if (self.pending == null) {
-                var permit = try self.session.admitHostPreprocess(512 * 1024 * 1024);
-                errdefer permit.deinit();
-                var prepared = (try self.coordinator.prepare()) orelse {
-                    permit.deinit();
+                if (!try self.coordinator.ready()) return;
+                const allocation = try embedding.LiveAllocation.create(embedding.workspaceBackingAllocator(self.session.backend()), self.session, self.control);
+                errdefer allocation.deinit();
+                var prepared = (self.coordinator.prepareAlloc(allocation.allocator()) catch |err| return allocation.failure(err)) orelse {
+                    allocation.deinit();
                     return;
                 };
                 errdefer prepared.deinit();
-                const output = try embedding.embedPreparedLiveCached(self.allocator, self.session, self.tokenizer, self.coordinator, &prepared, self.caption, self.options, self.lock, self.control, self.cache);
-                self.pending = .{ .prepared = prepared, .output = output, .permit = permit };
+                try allocation.trim();
+                const output = embedding.embedPreparedLiveCached(allocation.allocator(), self.session, self.tokenizer, self.coordinator, &prepared, self.caption, self.options, self.lock, self.control, self.cache) catch |err| return allocation.failure(err);
+                errdefer if (output.result) |result| allocation.allocator().free(result.vector);
+                try allocation.trim();
+                self.pending = .{ .prepared = prepared, .output = output, .allocation = allocation };
             }
             try self.deliverPending(context, accept);
             try self.commitPending();
@@ -201,7 +205,7 @@ test "embeddinggemma2 video streaming output acknowledgement survives cancellati
     try coordinator.append(&unit);
     const prepared = (try coordinator.prepare()).?;
     const vector = try a.dupe(f32, &.{ 0.6, 0.8 });
-    var stream = Stream{ .allocator = a, .session = undefined, .tokenizer = undefined, .coordinator = &coordinator, .caption = null, .options = .{}, .task = try a.dupe(u8, "RETRIEVAL_DOCUMENT"), .context_permit = .{ .session = undefined, .lease = null }, .lock = null, .control = .{}, .cache = null, .pending = .{ .prepared = prepared, .output = .{ .result = .{ .vector = vector, .input_tokens = 7 }, .source_start_ns = prepared.source_start_ns, .source_end_ns = prepared.source_end_ns, .policy = prepared.policy, .ordinal = prepared.ordinal, .epoch = prepared.window.epoch, .dash_timing = prepared.dash_timing, .hls_timing = prepared.hls_timing }, .permit = .{ .session = undefined, .lease = null } } };
+    var stream = Stream{ .allocator = a, .session = undefined, .tokenizer = undefined, .coordinator = &coordinator, .caption = null, .options = .{}, .task = try a.dupe(u8, "RETRIEVAL_DOCUMENT"), .context_permit = .{ .session = undefined, .lease = null }, .lock = null, .control = .{}, .cache = null, .pending = .{ .prepared = prepared, .output = .{ .result = .{ .vector = vector, .input_tokens = 7 }, .source_start_ns = prepared.source_start_ns, .source_end_ns = prepared.source_end_ns, .policy = prepared.policy, .ordinal = prepared.ordinal, .epoch = prepared.window.epoch, .dash_timing = prepared.dash_timing, .hls_timing = prepared.hls_timing } } };
     defer stream.deinit();
     try std.testing.expectError(error.UnacknowledgedLiveOutput, stream.commitPending());
     try std.testing.expectError(error.ConsumerFailure, stream.deliverPending(&gate, Gate.accept));
@@ -217,4 +221,21 @@ test "embeddinggemma2 video streaming output acknowledgement survives cancellati
     try std.testing.expect(stream.pending == null);
     try std.testing.expectEqual(@as(usize, 1), coordinator.ordinal);
     try std.testing.expectEqual(@as(usize, 1), stream.stats.windows);
+}
+
+test "embeddinggemma2 live idle drain needs no model admission or allocator" {
+    var coordinator = try coordinator_mod.Coordinator.init(std.testing.allocator, .{});
+    defer coordinator.deinit();
+    var stream: Stream = undefined;
+    stream.coordinator = &coordinator;
+    stream.control = .{};
+    stream.pending = null;
+    const Consumer = struct {
+        fn accept(_: *anyopaque, _: *Delivery) !void {
+            return error.UnexpectedDelivery;
+        }
+    };
+    var context: u8 = 0;
+    try stream.drain(&context, Consumer.accept);
+    try std.testing.expect(stream.pending == null);
 }

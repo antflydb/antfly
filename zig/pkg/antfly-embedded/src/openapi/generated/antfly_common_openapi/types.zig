@@ -724,9 +724,15 @@ pub const ConnectionKind = enum {
 };
 
 pub const DeciderConfig = struct {
-    provider: []const u8,
+    provider: ?[]const u8 = null,
     /// Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
     decision_method: ?[]const u8 = null,
+    /// Required with decision_method=generated. Provider configuration belongs here rather than in the outer typed-decider fields.
+    generator: ?antfly_generating_openapi.GeneratorConfig = null,
+    instructions: ?[]const u8 = null,
+    output: ?antfly_generating_openapi.ConstrainedOutput = null,
+    probabilities: ?antfly_generating_openapi.ConstrainedProbabilities = null,
+    batch: ?antfly_generating_openapi.ConstrainedGenerationBatch = null,
     /// Required for Antfly and OpenAI; Jev defaults to jev-latest.
     model: ?[]const u8 = null,
     /// Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
@@ -744,8 +750,13 @@ pub const DeciderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "provider", "provider", false },
+        .{ "provider", "provider", true },
         .{ "decision_method", "decision_method", true },
+        .{ "generator", "generator", false },
+        .{ "instructions", "instructions", true },
+        .{ "output", "output", false },
+        .{ "probabilities", "probabilities", false },
+        .{ "batch", "batch", false },
         .{ "model", "model", true },
         .{ "model_identity", "model_identity", true },
         .{ "embedding_options", "embedding_options", true },
@@ -767,11 +778,45 @@ pub const DeciderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("provider");
-        try jw.write(self.provider);
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
         if (self.decision_method) |value| {
             try jw.objectField("decision_method");
             try jw.write(value);
+        }
+        if (self.generator) |value| {
+            try jw.objectField("generator");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("generator");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("output");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.probabilities) |value| {
+            try jw.objectField("probabilities");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("probabilities");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.batch) |value| {
+            try jw.objectField("batch");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("batch");
+            try jw.write(@as(?u8, null));
         }
         if (self.model) |value| {
             try jw.objectField("model");
