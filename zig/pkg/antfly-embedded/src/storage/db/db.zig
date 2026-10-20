@@ -124821,6 +124821,29 @@ test "db prepared transaction effects required catalog eligibility rejects overs
     }
 }
 
+test "db prepared transaction effects required catalog attestation belongs to its validated store" {
+    const a = std.testing.allocator;
+    var first_directory = try TestDirectory.init("prepared-catalog-owner-a");
+    defer first_directory.cleanup();
+    var second_directory = try TestDirectory.init("prepared-catalog-owner-b");
+    defer second_directory.cleanup();
+    var first = try DB.open(a, first_directory.path(), .{ .start_optional_runtimes = false });
+    defer first.close();
+    var second = try DB.open(a, second_directory.path(), .{ .start_optional_runtimes = false });
+    defer second.close();
+    try first.enablePreparedTransactionProtocol();
+    // Equal numeric revisions and floors do not prove that another store has
+    // a validated version-5 envelope. Model rebinding before a loader succeeds.
+    try second.core.store.put(@import("catalog/resolver_catalog.zig").minimum_reader_key, "5");
+    try second.core.store.put(@import("artifact_inventory.zig").resolver_key, "{\"version\":4,\"resolvers\":[]}");
+    try std.testing.expectEqual(first.core.store.resolver_catalog_revision.read(), second.core.store.resolver_catalog_revision.read());
+    const manager = first.core.index_manager;
+    const original = manager.primary_store;
+    manager.primary_store = second.core.store;
+    defer manager.primary_store = original;
+    try std.testing.expect(!manager.hasPreparedCatalogAttestation(second.core.store));
+}
+
 test "db prepared transaction effects required begin gates legacy commit" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("required-prepare-db");
