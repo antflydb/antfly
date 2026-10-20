@@ -3851,9 +3851,9 @@ full-directory walk at each distinct expiration; it does not eliminate the lock
 or allocation cost of maintaining retained facts.
 
 Source-read adaptation now measures scalar and bounded batch provider costs on
-required reads. It samples 16-, 32- and 64-row classes, keeps a bounded decayed
+required reads. It samples power-of-two classes from two through 64 rows, keeps a bounded decayed
 history, periodically probes alternatives and may choose scalar reads. Learned
-byte limits clamp to size classes; allocator admission, document/byte budgets and
+byte limits round up to size classes to avoid boundary cliffs; allocator admission, document/byte budgets and
 scalar fallback retain their existing authority. Calibration does no duplicate I/O.
 
 The JSON adapter borrows plain selected ASCII strings using a vector-assisted

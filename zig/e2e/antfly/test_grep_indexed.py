@@ -1306,6 +1306,14 @@ def test_logical_scalable_work_profile(stateful_api):
                     if os.environ.get("ANTFLY_BENCH_VALUE_SOURCE_SCALAR") != "1":
                         assert profile["source_batches"] > 0, profile
                         assert profile["source_scalar_reads"] < count, profile
+                        if (
+                            not os.environ.get("ANTFLY_BENCH_VALUE_SOURCE_ROWS")
+                            and profile["batch_refusals"] == 0
+                        ):
+                            # The medium-source case must explore useful small
+                            # batches, rather than silently forcing scalar I/O
+                            # because its byte-derived cap is below 16 rows.
+                            assert profile["source_batches"] >= 8, profile
                     expected_projected = (
                         name != "tiny"
                         and os.environ.get("ANTFLY_BENCH_VALUE_SOURCE_FULL_DOM") != "1"

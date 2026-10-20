@@ -18925,9 +18925,9 @@ const ValueExecution = struct {
 /// output work. Every sample is a required read: no duplicate benchmark I/O.
 /// Byte limits and allocator admission remain authoritative over learned sizes.
 const SourceReadTuner = struct {
-    const sizes = [_]usize{ 16, 1, 32, 64 };
-    ns: [4]u64 = @splat(0),
-    rows: [4]usize = @splat(0),
+    const sizes = [_]usize{ 16, 1, 2, 4, 8, 32, 64 };
+    ns: [sizes.len]u64 = @splat(0),
+    rows: [sizes.len]usize = @splat(0),
     choice: usize = 0,
     exploring: bool = true,
     calls: usize = 0,
@@ -18935,11 +18935,13 @@ const SourceReadTuner = struct {
     max_rows: usize = 64,
     average_bytes: u64 = 1,
     fn allowedRows(self: *const @This()) usize {
-        const byte_rows = (256 * 1024) / @max(1, self.average_bytes);
+        const byte_rows = @max(1, (256 * 1024) / @max(1, self.average_bytes));
         var allowed: usize = 1;
-        // Keep storage windows aligned to a bounded size class, rather than
-        // oscillating through arbitrary row counts as average bytes change.
-        for ([_]usize{ 16, 32, 64 }) |size| if (size <= byte_rows and size <= self.max_rows) {
+        // Round the payload-derived row cap up to a size class. A few source
+        // bytes must not halve a useful 64-row batch, and medium documents
+        // must retain 2/4/8-row choices. Estimated payload stays below twice
+        // the target; the allocation budget remains the hard safety limit.
+        for ([_]usize{ 2, 4, 8, 16, 32, 64 }) |size| if (size / 2 < byte_rows and size <= self.max_rows) {
             allowed = size;
         };
         return allowed;
@@ -19003,7 +19005,7 @@ test "logical value source tuner learns scalar or batch cost and respects byte b
             tuner.observe(rows, rows * 4096, elapsed);
         }
         try std.testing.expectEqual(if (batch_wins) @as(usize, 64) else @as(usize, 1), SourceReadTuner.sizes[tuner.best()]);
-        tuner.average_bytes = 32 * 1024;
+        tuner.average_bytes = 1024 * 1024;
         try std.testing.expectEqual(@as(usize, 1), tuner.desired());
         const old_scalar_rows = tuner.rows[1];
         tuner.observe(1, 32 * 1024, 1000);
@@ -19013,6 +19015,16 @@ test "logical value source tuner learns scalar or batch cost and respects byte b
         tuner.max_rows = 16;
         try std.testing.expect(tuner.desired() <= 16);
     }
+    var medium: SourceReadTuner = .{};
+    for (0..512) |_| {
+        const rows = medium.desired();
+        medium.observe(rows, rows * 18 * 1024, 1000 + rows * 10);
+    }
+    try std.testing.expectEqual(@as(usize, 16), SourceReadTuner.sizes[medium.best()]);
+    medium.average_bytes = 96 * 1024;
+    try std.testing.expectEqual(@as(usize, 2), medium.allowedRows());
+    medium.average_bytes = 4126;
+    try std.testing.expectEqual(@as(usize, 64), medium.allowedRows());
 }
 
 const ValueSourceWindow = struct {
@@ -34267,4 +34279,9 @@ test "logical value batched reads preserve candidates budgets and scalar fallbac
         try std.testing.expectEqual(@as(u32, 2), try search_mod.countMatches(a, writer.snapshot(), query));
         try std.testing.expectEqual(@as(usize, 1), loader.batches);
     }
+}
+
+// Keep private fact tests reachable under a focused value-search filter.
+test {
+    _ = value_query.membership;
 }

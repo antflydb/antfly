@@ -230,7 +230,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const query_contract_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "api query contract", "local query contract", "decision functions worker transport" } });
     b.step("query-contract-test", "Run query parsing, worker transport and projection contracts").dependOn(&b.addRunArtifact(query_contract_tests).step);
 
-    const logical_field_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "logical value", "logical query", "projection checkpoint external storage" } });
+    const logical_field_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = selectTestFilters(b, &.{ "logical value", "logical query", "projection checkpoint external storage" }) });
     b.step("logical-field-query-test", "Verify logical query parsing, planning and original-value membership").dependOn(&b.addRunArtifact(logical_field_tests).step);
 
     const api_http_runtime_test_mod = b.createModule(.{
