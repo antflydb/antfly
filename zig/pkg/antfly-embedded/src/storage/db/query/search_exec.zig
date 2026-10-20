@@ -20534,10 +20534,22 @@ test "fuzzy phrase clauses highlight matched surface terms" {
 fn queryTextAnalyzer(analyzer: *const analysis_mod.Analyzer) *const analysis_mod.Analyzer {
     return if (analyzer == &analysis_mod.substring_analyzer)
         &analysis_mod.substring_query_analyzer
-    else if (analyzer == &analysis_mod.search_as_you_type_index_prefix_analyzer)
+    else if (analyzer == &analysis_mod.search_as_you_type_index_prefix_analyzer or analyzer == &analysis_mod.search_as_you_type_analyzer)
         &analysis_mod.simple_analyzer
     else
         analyzer;
+}
+
+test "logical query autocomplete aliases preserve whole query tokens" {
+    const a = std.testing.allocator;
+    // These are distinct named constants even though their filters agree.
+    // Both public names must use query analysis rather than index expansion.
+    for ([_]*const analysis_mod.Analyzer{ &analysis_mod.search_as_you_type_analyzer, &analysis_mod.search_as_you_type_index_prefix_analyzer }) |analyzer| {
+        const tokens = try queryTextAnalyzer(analyzer).analyze(a, "Distributed");
+        defer analysis_mod.Analyzer.freeTokens(a, tokens);
+        try std.testing.expectEqual(@as(usize, 1), tokens.len);
+        try std.testing.expectEqualStrings("distributed", tokens[0].term);
+    }
 }
 
 fn fieldUsesSubstringAnalyzer(
