@@ -47584,6 +47584,43 @@ components:
         explicit_disposition:
           type: object
           properties:
+            provenance:
+              type: object
+              properties:
+                principal:
+                  type: string
+                recorded_at:
+                  type: integer
+                evidence:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      span:
+                        type: object
+                        properties:
+                          start:
+                            type: integer
+                          end:
+                            type: integer
+                        required:
+                          - start
+                          - end
+                        additionalProperties: false
+                        nullable: true
+                    required:
+                      - id
+                    additionalProperties: false
+                forgotten:
+                  type: boolean
+              required:
+                - principal
+                - recorded_at
+                - evidence
+              additionalProperties: false
+              nullable: true
             lifecycle:
               type: string
               enum:
@@ -47648,16 +47685,6 @@ components:
           nullable: true
         config_generation:
           type: integer
-        embedding_generation:
-          type: integer
-        next_embedding_generation:
-          type: integer
-          nullable: true
-        next_embedding:
-          type: array
-          items:
-            type: number
-          nullable: true
       required:
         - assertion
         - owner
@@ -47985,6 +48012,43 @@ components:
                   explicit_disposition:
                     type: object
                     properties:
+                      provenance:
+                        type: object
+                        properties:
+                          principal:
+                            type: string
+                          recorded_at:
+                            type: integer
+                          evidence:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                id:
+                                  type: string
+                                span:
+                                  type: object
+                                  properties:
+                                    start:
+                                      type: integer
+                                    end:
+                                      type: integer
+                                  required:
+                                    - start
+                                    - end
+                                  additionalProperties: false
+                                  nullable: true
+                              required:
+                                - id
+                              additionalProperties: false
+                          forgotten:
+                            type: boolean
+                        required:
+                          - principal
+                          - recorded_at
+                          - evidence
+                        additionalProperties: false
+                        nullable: true
                       lifecycle:
                         type: string
                         enum:
@@ -48049,16 +48113,6 @@ components:
                     nullable: true
                   config_generation:
                     type: integer
-                  embedding_generation:
-                    type: integer
-                  next_embedding_generation:
-                    type: integer
-                    nullable: true
-                  next_embedding:
-                    type: array
-                    items:
-                      type: number
-                    nullable: true
                 required:
                   - assertion
                   - owner
@@ -48333,6 +48387,43 @@ components:
               explicit_disposition:
                 type: object
                 properties:
+                  provenance:
+                    type: object
+                    properties:
+                      principal:
+                        type: string
+                      recorded_at:
+                        type: integer
+                      evidence:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                            span:
+                              type: object
+                              properties:
+                                start:
+                                  type: integer
+                                end:
+                                  type: integer
+                              required:
+                                - start
+                                - end
+                              additionalProperties: false
+                              nullable: true
+                          required:
+                            - id
+                          additionalProperties: false
+                      forgotten:
+                        type: boolean
+                    required:
+                      - principal
+                      - recorded_at
+                      - evidence
+                    additionalProperties: false
+                    nullable: true
                   lifecycle:
                     type: string
                     enum:
@@ -48397,16 +48488,6 @@ components:
                 nullable: true
               config_generation:
                 type: integer
-              embedding_generation:
-                type: integer
-              next_embedding_generation:
-                type: integer
-                nullable: true
-              next_embedding:
-                type: array
-                items:
-                  type: number
-                nullable: true
             required:
               - assertion
               - owner

@@ -5455,7 +5455,9 @@ pub const ApiHttpServer = struct {
             if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
             context.admin = permissionsAllow(permissions, .table, logical, .admin);
         }
-        var publication: MemoryPublicationAuthority = .{ .server = self, .alloc = a, .executor = executor, .signature = signature, .payload = payload, .logical = logical, .table = table, .required = if (context.admin) .admin else .write };
+        var publication: MemoryPublicationAuthority = .{ .server = self, .alloc = a, .executor = executor, .signature = signature, .payload = payload, .logical = logical, .table = table, .required = if (pending) |item| if (module.memory.operationGrant(item) == .admin) .admin else .write else .admin };
+        context.grant_ptr = &publication;
+        context.require_grant_fn = MemoryPublicationAuthority.requireGrant;
         context.final_check_ptr = &publication;
         context.final_check_fn = MemoryPublicationAuthority.check;
         adapter.context = context;
@@ -21381,6 +21383,11 @@ pub const ApiHttpServer = struct {
         identity: ?*const ?AuthenticatedIdentity = null,
         request: ?*api_operation.RequestContext = null,
         required: usermgr.PermissionType = .write,
+        fn requireGrant(ptr: *anyopaque, grant: @import("memory.zig").memory.types.RequiredGrant) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (grant == .admin) self.required = .admin;
+            try check(ptr);
+        }
         fn check(ptr: *anyopaque) !void {
             const authority: *@This() = @ptrCast(@alignCast(ptr));
             const server = authority.server;
@@ -21441,7 +21448,7 @@ pub const ApiHttpServer = struct {
         request.native_service = .memory;
         request.row_policy_credential = &identity;
         request.principal = if (identity) |value| .{ .kind = .user, .subject = value.username } else null;
-        const required: usermgr.PermissionType = if (input.action == .create or input.action == .configure) .admin else if (module.memory.mutates(input.action)) .write else .read;
+        const required: usermgr.PermissionType = if (!module.memory.mutates(input.action)) .read else if (module.memory.actionGrant(input.action) == .admin or (input.action == .advance and input.id.len == 0)) .admin else .write;
         if (input.action == .create) {
             const config = try std.json.parseFromSliceLeaky(module.memory.types.Config, a, try std.json.Stringify.valueAlloc(a, input.body, .{}), .{ .ignore_unknown_fields = false });
             try config.validate();
@@ -21474,8 +21481,10 @@ pub const ApiHttpServer = struct {
             const mac = manager.destinationGrantMac(executor, grant_payload) catch break :blk "";
             break :blk try a.dupe(u8, &std.fmt.bytesToHex(mac, .lower));
         } else "";
-        var publication: MemoryPublicationAuthority = .{ .server = self, .alloc = a, .executor = executor, .signature = signature, .payload = grant_payload, .logical = logical, .table = table, .identity = &identity, .request = &request, .required = if (identity) |value| if (permissionsAllow(value.permissions, .table, table, .admin)) .admin else required else required };
+        var publication: MemoryPublicationAuthority = .{ .server = self, .alloc = a, .executor = executor, .signature = signature, .payload = grant_payload, .logical = logical, .table = table, .identity = &identity, .request = &request, .required = required };
         const context: module.memory.Context = .{
+            .grant_ptr = &publication,
+            .require_grant_fn = MemoryPublicationAuthority.requireGrant,
             .final_check_ptr = &publication,
             .final_check_fn = MemoryPublicationAuthority.check,
             .database = input.database,

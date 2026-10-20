@@ -49,10 +49,16 @@ pub const Context = struct {
     principal: []const u8,
     admin: bool = false,
     now_ms: i64,
+    grant_ptr: ?*anyopaque = null,
+    require_grant_fn: ?*const fn (*anyopaque, t.RequiredGrant) anyerror!void = null,
     final_check_ptr: ?*anyopaque = null,
     final_check_fn: ?*const fn (*anyopaque) anyerror!void = null,
     check_ptr: ?*anyopaque = null,
     check_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    pub fn requireGrant(self: Context, grant: t.RequiredGrant) !void {
+        if (grant == .admin and !self.admin) return error.Forbidden;
+        if (self.require_grant_fn) |call| try call(self.grant_ptr.?, grant);
+    }
     pub fn finish(self: Context) !void {
         try self.check();
         if (self.final_check_fn) |call| try call(self.final_check_ptr.?);
@@ -96,10 +102,13 @@ pub const Service = struct {
         }
         const fingerprint = try hash(a, .{ .action = action, .id = id, .body = body, .principal = self.context.principal });
         const receipt_key = if (idempotency_key.len > 0) try key(a, "operation", try hash(a, .{ self.context.principal, idempotency_key })) else "";
+        const required_grant = if (mutates(action)) try run.requiredGrant(action, id, body) else null;
+        if (required_grant) |grant| try self.context.requireGrant(grant);
         if (mutates(action)) {
             if (idempotency_key.len == 0 or idempotency_key.len > 256) return error.MemoryIdempotencyKeyRequired;
             if (try run.read(t.Operation, receipt_key)) |receipt| {
                 if (!eql(u8, receipt.request_hash, fingerprint)) return error.MemoryIdempotencyConflict;
+                try self.context.requireGrant(operationGrant(receipt));
                 try self.context.finish();
                 return try std.json.Stringify.valueAlloc(alloc, publicOperation(receipt), .{});
             }
@@ -112,6 +121,7 @@ pub const Service = struct {
             run.state.revision += 1;
         }
         var op: t.Operation = .{
+            .required_grant = required_grant,
             .execution_principal = self.context.execution_principal,
             .execution_signature = self.context.execution_signature,
             .id = if (receipt_key.len > 0) try hash(a, .{ self.context.principal, idempotency_key }) else "",
@@ -150,11 +160,12 @@ pub const Service = struct {
                 const replacement_model = try run.encode(config.models.embedder);
                 const rebuild = config.features.semantic_recall and (!run.state.config.features.semantic_recall or !eql(u8, previous_model, replacement_model));
                 config.embedding_generation = if (rebuild) config.generation else run.state.config.embedding_generation;
+                try run.configurationTransition(config, false);
                 if (rebuild) {
                     run.state.pending_config = config;
                     op.phase = .pending;
                     op.assertions_ready = false;
-                } else run.state.config = config;
+                } else try run.applyConfiguration(config);
                 op.config_generation = config.generation;
                 try run.put(try configKey(a, config.generation), config);
             },
@@ -180,7 +191,7 @@ pub const Service = struct {
                 const record = (try run.assertion(id)) orelse return error.MemoryNotFound;
                 try run.authorize(record.owner, record.assertion.visibility);
                 if (!try run.evidenceVisible(record)) return error.MemoryNotFound;
-                output = try run.encode(record);
+                output = try run.encode(try run.publicRecord(record));
             },
             .operation => {
                 const receipt = (try run.read(t.Operation, try key(a, "operation", id))) orelse return error.MemoryNotFound;
@@ -258,7 +269,35 @@ const Run = struct {
         return try parse(T, self.a, row.json);
     }
     fn requireAdmin(self: *Run) !void {
-        if (!self.service.context.admin and !eql(u8, self.state.owner, self.service.context.principal)) return error.Forbidden;
+        try self.service.context.requireGrant(.admin);
+    }
+    fn requiredGrant(self: *Run, action: Action, id: []const u8, body: []const u8) !t.RequiredGrant {
+        if (action == .advance) {
+            if (id.len == 0) return .admin;
+            const pending = (try self.read(t.Operation, try key(self.a, "operation", id))) orelse return error.MemoryNotFound;
+            return operationGrant(pending);
+        }
+        if (action == .forget) {
+            const request = try parse(t.Forget, self.a, body);
+            if (request.all or request.source_ids.len > 0) return .admin;
+        }
+        return actionGrant(action);
+    }
+    fn publicRecord(self: *Run, value: t.StoredAssertion) !t.StoredAssertion {
+        var record = value;
+        if (record.explicit_disposition) |baseline| if (baseline.provenance) |provenance| {
+            if (provenance.forgotten or (provenance.evidence.len > 0 and !try self.supportVisible(provenance.evidence, &.{}, 0))) {
+                var redacted = baseline;
+                var attribution = provenance;
+                attribution.forgotten = true;
+                attribution.evidence = &.{};
+                redacted.provenance = attribution;
+                redacted.reason = null;
+                record.explicit_disposition = redacted;
+                record.reason = null;
+            }
+        };
+        return record;
     }
     fn authorize(self: *Run, owner: []const u8, visibility: t.Visibility) !void {
         if (visibility == .private and !eql(u8, owner, self.service.context.principal) and !self.service.context.admin) return error.Forbidden;
@@ -331,6 +370,7 @@ const Run = struct {
     fn evidenceVisibleTime(self: *Run, record: t.StoredAssertion, known: ?i64, valid: ?i64, depth: u8) anyerror!bool {
         if (depth >= 32) return error.MemoryWorkLimit;
         if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-assertion", record.assertion.id)) != null) return false;
+        if (!try self.identityVisible(record.assertion)) return false;
         if (try self.supportVisibleTime(record.assertion.evidence, record.assertion.depends_on, known, valid, depth)) return true;
         for (record.assertion.support_sets) |support| if (try self.supportVisibleTime(support.evidence, support.depends_on, known, valid, depth)) return true;
         return false;
@@ -425,10 +465,7 @@ const Run = struct {
             op.inputs = inputs.items;
         }
     }
-    fn validateAssertion(self: *Run, claim: t.Assertion) anyerror!void {
-        try t.validateId(claim.id);
-        try t.validateId(claim.subject);
-        try t.validateId(claim.predicate);
+    fn validateOntology(self: *Run, claim: t.Assertion) !void {
         if (try self.read(t.EntityRecord, try key(self.a, "entity", claim.subject))) |subject| {
             try self.authorize(subject.owner, subject.entity.visibility);
             if (claim.visibility == .team and subject.entity.visibility == .private) return error.MemoryVisibilityConflict;
@@ -447,6 +484,12 @@ const Run = struct {
                 if (claim.visibility == .team and object.entity.visibility == .private) return error.MemoryVisibilityConflict;
             }
         };
+    }
+    fn validateAssertion(self: *Run, claim: t.Assertion) anyerror!void {
+        try t.validateId(claim.id);
+        try t.validateId(claim.subject);
+        try t.validateId(claim.predicate);
+        try self.validateOntology(claim);
         if (claim.value.len == 0 or claim.statement.len == 0 or claim.statement.len > t.max_text_bytes or !std.unicode.utf8ValidateSlice(claim.statement)) return error.InvalidMemoryAssertion;
         if (claim.evidence.len == 0 or claim.evidence.len > t.max_items or claim.depends_on.len > t.max_items) return error.InvalidMemoryAssertion;
         if (claim.valid_from != null and claim.valid_to != null and claim.valid_from.? >= claim.valid_to.?) return error.InvalidMemoryAssertion;
@@ -485,6 +528,7 @@ const Run = struct {
             try self.validateAssertion(branch);
         }
         if (claim.embedding) |vector| {
+            if (!self.state.config.features.semantic_recall) return error.MemoryCapabilityUnavailable;
             const model = self.state.config.models.embedder orelse return error.MemoryModelRequired;
             if (vector.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
             if (claim.embedding_model == null or !eql(u8, try self.encode(claim.embedding_model.?), try self.encode(model))) return error.MemoryEmbeddingMismatch;
@@ -540,7 +584,10 @@ const Run = struct {
                     claim.reconciliation_reason = decision.reason;
                 }
             }
-            const record: t.StoredAssertion = .{ .assertion = claim, .input_hash = input_hash, .asserted_valid_to = claim.valid_to, .owner = self.service.context.principal, .recorded_from = self.service.context.now_ms, .revision = self.state.revision, .config_generation = self.state.config.generation, .embedding_generation = self.state.config.embedding_generation };
+            if (claim.embedding) |embedding| try self.putVector(self.state.config, claim, embedding);
+            claim.embedding = null;
+            claim.embedding_model = null;
+            const record: t.StoredAssertion = .{ .assertion = claim, .input_hash = input_hash, .asserted_valid_to = claim.valid_to, .owner = self.service.context.principal, .recorded_from = self.service.context.now_ms, .revision = self.state.revision, .config_generation = self.state.config.generation };
             try self.putAssertion(record);
             if (claim.kind == .summary or claim.kind == .procedural) try self.put(try dependencyKey(self.a, "entity", claim.subject, claim.id), .{ .child = claim.id });
             for (claim.evidence) |ref| try self.put(try dependencyKey(self.a, "evidence", ref.id, claim.id), .{ .child = claim.id });
@@ -562,7 +609,9 @@ const Run = struct {
                     if (old.assertion.valid_to == null or old.assertion.valid_to.? > start) old.assertion.valid_to = start;
                 }
                 old.recorded_to = self.service.context.now_ms;
+                old.reason = claim.reconciliation_reason;
                 old.explicit_disposition = explicitDisposition(old);
+                old.explicit_disposition.?.provenance = .{ .principal = self.service.context.principal, .recorded_at = self.service.context.now_ms, .evidence = claim.evidence };
                 old.revision = self.state.revision;
                 try self.putAssertion(old);
                 try self.invalidate("assertion", previous);
@@ -659,6 +708,7 @@ const Run = struct {
                 for (page.rows) |row| {
                     const entry = try parse(struct { child: []const u8 }, self.a, row.json);
                     const seed = (try self.assertion(entry.child)) orelse continue;
+                    if (!names.contains(seed.assertion.subject) and !(self.objectTyped(seed.assertion.predicate) and names.contains(seed.assertion.value))) continue;
                     for (try self.canonicalGroup(seed.assertion, seed.owner)) |record| {
                         try affected.put(self.a, record.assertion.id, record);
                         if (affected.count() > t.max_items) return error.MemoryWorkLimit;
@@ -668,6 +718,9 @@ const Run = struct {
                 if (cursor == null) break;
             }
         }
+        try self.rebuildBeliefs(&affected);
+    }
+    fn rebuildBeliefs(self: *Run, affected: *std.StringHashMapUnmanaged(t.StoredAssertion)) !void {
         var values = affected.valueIterator();
         while (values.next()) |value| {
             var record = value.*;
@@ -699,7 +752,47 @@ const Run = struct {
         values = affected.valueIterator();
         while (values.next()) |value| if (try self.assertion(value.assertion.id)) |record| try self.reconcile(record);
     }
+    fn identityVisible(self: *Run, claim: t.Assertion) anyerror!bool {
+        if (try self.canonical(claim.subject) == null) return false;
+        for (self.state.config.predicates) |predicate| if (eql(u8, predicate.name, claim.predicate)) {
+            if (predicate.subject_type != null and try self.read(t.EntityRecord, try key(self.a, "entity", claim.subject)) == null) return false;
+            if (predicate.object_type != null) {
+                if (try self.read(t.EntityRecord, try key(self.a, "entity", claim.value)) == null or try self.canonical(claim.value) == null) return false;
+            }
+        };
+        return true;
+    }
+    // Semantic configuration changes are atomic and bounded independently of
+    // vector backfills. A rejection leaves the old ontology and beliefs intact.
+    fn configurationTransition(self: *Run, replacement: t.Config, publish: bool) !void {
+        const previous = self.state.config;
+        if (eql(u8, try self.encode(.{ previous.predicates, previous.source_rules, previous.features.reconciliation, previous.ontology_version, previous.policy_version }), try self.encode(.{ replacement.predicates, replacement.source_rules, replacement.features.reconciliation, replacement.ontology_version, replacement.policy_version }))) return;
+        self.state.config = replacement;
+        defer self.state.config = previous;
+        var affected: std.StringHashMapUnmanaged(t.StoredAssertion) = .empty;
+        var after: ?[]const u8 = null;
+        while (true) {
+            try self.service.context.check();
+            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", after, 64);
+            for (page.rows) |row| {
+                const record = try parse(t.StoredAssertion, self.a, row.json);
+                if (!try self.retained(record, 0)) continue;
+                if (affected.count() >= t.max_items) return error.MemoryWorkLimit;
+                try self.validateOntology(record.assertion);
+                try affected.put(self.a, record.assertion.id, record);
+            }
+            after = page.next;
+            if (after == null) break;
+        }
+        if (publish) try self.rebuildBeliefs(&affected);
+    }
+    fn applyConfiguration(self: *Run, replacement: t.Config) !void {
+        try self.configurationTransition(replacement, true);
+        if (replacement.retention_ms != self.state.config.retention_ms) self.state.next_expiry_at = self.service.context.now_ms;
+        self.state.config = replacement;
+    }
     fn canonical(self: *Run, id: []const u8) !?[]const u8 {
+        if (try self.read(bool, try key(self.a, "forgotten-entity", id)) != null) return null;
         const input = try self.read(t.EntityRecord, try key(self.a, "entity", id));
         if (input) |record| {
             self.authorize(record.owner, record.entity.visibility) catch return null;
@@ -776,6 +869,7 @@ const Run = struct {
     }
     fn entity(self: *Run, value: t.Entity) !void {
         try t.validateId(value.id);
+        if (try self.read(bool, try key(self.a, "forgotten-entity", value.id)) != null) return error.MemoryForgotten;
         try t.validateId(value.name);
         if (!try self.supportVisible(value.evidence, &.{}, 0)) return error.MemoryEvidenceRequired;
         for (value.evidence) |ref| {
@@ -800,13 +894,13 @@ const Run = struct {
         try self.put(path, .{ .entity = value, .owner = self.service.context.principal });
     }
     fn putAssertion(self: *Run, value: t.StoredAssertion) !void {
-        var record = value;
+        var record = try self.publicRecord(value);
         record.recorded_at = self.service.context.now_ms;
         try self.put(try key(self.a, "assertion", record.assertion.id), record);
         try self.put(try historyKey(self.a, record.assertion.id, self.state.revision), record);
         try self.put(try groupKey(self.a, record.assertion, record.owner), .{ .id = record.assertion.id });
         try self.put(try dependencyKey(self.a, "identity", record.assertion.subject, record.assertion.id), .{ .child = record.assertion.id });
-        if (self.objectTyped(record.assertion.predicate)) try self.put(try dependencyKey(self.a, "identity", record.assertion.value, record.assertion.id), .{ .child = record.assertion.id });
+        try self.put(try dependencyKey(self.a, "identity", record.assertion.value, record.assertion.id), .{ .child = record.assertion.id });
     }
     // Include the transaction's own writes: reconciliation within an import
     // must have the same semantics as the same observations committed singly.
@@ -909,10 +1003,13 @@ const Run = struct {
         try self.authorize(record.owner, .private);
         if (record.revision != request.expected_revision) return error.MemoryRevisionConflict;
         if (request.reason.len == 0 or request.reason.len > t.max_text_bytes) return error.InvalidMemoryRequest;
+        if (request.evidence.len > t.max_items) return error.MemoryInputTooLarge;
         for (request.evidence) |ref| {
             const source = (try self.evidence(ref.id)) orelse return error.MemoryEvidenceRequired;
             try self.authorize(source.owner, source.evidence.visibility);
-            if (source.forgotten) return error.MemoryForgotten;
+            if (!try self.supportVisible(&.{ref}, &.{}, 0)) return error.MemoryForgotten;
+            if (record.assertion.visibility == .team and source.evidence.visibility == .private) return error.MemoryVisibilityConflict;
+            if (ref.span) |span| if (span.start >= span.end or span.end > source.evidence.text.len or !std.unicode.utf8ValidateSlice(source.evidence.text[span.start..span.end])) return error.InvalidMemorySpan;
         }
         record.lifecycle = request.lifecycle;
         if (request.lifecycle == .active) {
@@ -926,6 +1023,7 @@ const Run = struct {
         record.revision = self.state.revision;
         if (request.lifecycle == .retracted) record.recorded_to = self.service.context.now_ms;
         record.explicit_disposition = explicitDisposition(record);
+        record.explicit_disposition.?.provenance = .{ .principal = self.service.context.principal, .recorded_at = self.service.context.now_ms, .evidence = request.evidence };
         try self.putAssertion(record);
         if (self.state.config.features.reconciliation == .deterministic and record.lifecycle == .active) try self.reconcile(record);
         try self.invalidate("assertion", request.id);
@@ -977,6 +1075,7 @@ const Run = struct {
         if (id.len == 0) return self.maintenance();
         const path = try key(self.a, "operation", id);
         var pending = (try self.read(t.Operation, path)) orelse return error.MemoryNotFound;
+        try self.service.context.requireGrant(operationGrant(pending));
         if (!eql(u8, pending.owner, self.service.context.principal) and !self.service.context.admin) return error.Forbidden;
         if (pending.phase == .succeeded or pending.phase == .cancelled) return;
         if (pending.phase == .failed) return error.MemoryRetryExhausted;
@@ -988,7 +1087,10 @@ const Run = struct {
             self.reindex(path, &pending, receipt) catch |err| {
                 if (err != error.MemoryExternalVectorRequired) pending.attempts += 1;
                 try self.processingFailure(path, &pending, receipt, err);
-                if (pending.phase == .failed) self.state.pending_config = null;
+                if (pending.phase == .failed) {
+                    self.state.pending_config = null;
+                    try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
+                }
             };
             return;
         }
@@ -1091,22 +1193,30 @@ const Run = struct {
         for (generated.entities) |value| try self.entity(value);
         try self.assertions(generated.assertions, true);
     }
+    const VectorProjection = struct { assertion_id: []const u8, generation: u64, model: t.Model, statement_hash: []const u8, embedding: []const f32 };
+    fn vectorKey(self: *Run, generation: u64, id: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "vector/{d:0>20}/{s}", .{ generation, try hash(self.a, id) });
+    }
+    fn putVector(self: *Run, config: t.Config, claim: t.Assertion, embedding: []const f32) !void {
+        const model = config.models.embedder orelse return error.MemoryModelRequired;
+        if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
+        for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
+        try self.put(try self.vectorKey(config.embedding_generation, claim.id), VectorProjection{ .assertion_id = claim.id, .generation = config.embedding_generation, .model = model, .statement_hash = try hash(self.a, claim.statement), .embedding = embedding });
+    }
+    fn vectorFor(self: *Run, config: t.Config, claim: t.Assertion) !?[]const f32 {
+        const projection = (try self.read(VectorProjection, try self.vectorKey(config.embedding_generation, claim.id))) orelse return null;
+        if (projection.generation != config.embedding_generation or !eql(u8, projection.assertion_id, claim.id) or !eql(u8, projection.statement_hash, try hash(self.a, claim.statement)) or !eql(u8, try self.encode(projection.model), try self.encode(config.models.embedder))) return error.MemoryEmbeddingMismatch;
+        return projection.embedding;
+    }
     fn stageEmbeddings(self: *Run, request: t.EmbeddingBatch) !void {
         try self.requireAdmin();
         const config = self.state.pending_config orelse return error.MemoryConfigurationChanged;
         if (request.generation != config.embedding_generation or config.models.embedder == null or !eql(u8, try self.encode(request.model), try self.encode(config.models.embedder.?))) return error.MemoryEmbeddingMismatch;
         if (request.items.len == 0 or request.items.len > 64) return error.InvalidMemoryRequest;
         for (request.items) |item| {
-            var record = (try self.assertion(item.id)) orelse return error.MemoryNotFound;
-            if (item.embedding.len != request.model.dimensions.?) return error.MemoryEmbeddingMismatch;
-            for (item.embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
-            if (record.next_embedding_generation == self.state.config.embedding_generation) {
-                record.assertion.embedding = record.next_embedding;
-                record.embedding_generation = record.next_embedding_generation.?;
-            }
-            record.next_embedding = item.embedding;
-            record.next_embedding_generation = request.generation;
-            try self.put(try key(self.a, "assertion", item.id), record);
+            const record = (try self.assertion(item.id)) orelse return error.MemoryNotFound;
+            if (!try self.retained(record, 0)) return error.MemoryNotFound;
+            try self.putVector(config, record.assertion, item.embedding);
         }
     }
     fn reindex(self: *Run, path: []const u8, pending: *t.Operation, receipt: *t.Operation) !void {
@@ -1115,31 +1225,29 @@ const Run = struct {
         if (config.generation != pending.config_generation) return error.MemoryConfigurationChanged;
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", pending.cursor, 8);
         for (page.rows) |row| {
-            var record = try parse(t.StoredAssertion, self.a, row.json);
-            if (!try self.evidenceVisible(record)) continue;
-            const external = eql(u8, config.models.embedder.?.provider, "external");
-            if (external and record.next_embedding_generation != config.embedding_generation) return error.MemoryExternalVectorRequired;
-            const embedding = if (external) record.next_embedding.? else try self.service.backend.embed.?(self.service.backend.ptr, self.a, config.models.embedder.?, record.assertion.statement);
-            if (record.next_embedding_generation == self.state.config.embedding_generation) {
-                record.assertion.embedding = record.next_embedding;
-                record.embedding_generation = record.next_embedding_generation.?;
+            const record = try parse(t.StoredAssertion, self.a, row.json);
+            if (!try self.retained(record, 0)) continue;
+            if (eql(u8, config.models.embedder.?.provider, "external")) {
+                if (try self.vectorFor(config, record.assertion) == null) return error.MemoryExternalVectorRequired;
+            } else {
+                const embedding = try self.service.backend.embed.?(self.service.backend.ptr, self.a, config.models.embedder.?, record.assertion.statement);
+                try self.putVector(config, record.assertion, embedding);
             }
-            record.next_embedding = embedding;
-            record.next_embedding_generation = config.embedding_generation;
-            try self.put(row.key, record);
+        }
+        // Do not mutate the pending receipt or serving state before all
+        // projections for this page, including final belief cutover, succeed.
+        if (page.next == null) {
+            try self.applyConfiguration(config);
+            self.state.pending_config = null;
+            try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
+            pending.phase = .succeeded;
+            pending.assertions_ready = true;
+            try self.remove(try key(self.a, "pending", pending.id));
         }
         pending.cursor = page.next;
         pending.attempts = 0;
         pending.error_code = null;
         pending.next_retry_at = null;
-        if (page.next == null) {
-            if (config.retention_ms != self.state.config.retention_ms) self.state.next_expiry_at = self.service.context.now_ms;
-            self.state.config = config;
-            self.state.pending_config = null;
-            pending.phase = .succeeded;
-            pending.assertions_ready = true;
-            try self.remove(try key(self.a, "pending", pending.id));
-        }
         receipt.phase = pending.phase;
         receipt.assertions_ready = pending.assertions_ready;
         try self.put(path, pending.*);
@@ -1186,7 +1294,16 @@ const Run = struct {
                     }
                 } else if (std.mem.startsWith(u8, row.key, "entity/")) {
                     const stored = try parse(struct { entity: t.Entity, owner: []const u8 }, self.a, row.json);
-                    if (try self.read(bool, "forgotten-all") != null or !try self.supportVisible(stored.entity.evidence, &.{}, 0)) try self.remove(row.key);
+                    if (try self.read(bool, "forgotten-all") != null or !try self.supportVisible(stored.entity.evidence, &.{}, 0)) {
+                        try self.put(try key(self.a, "forgotten-entity", stored.entity.id), true);
+                        try self.remove(row.key);
+                    }
+                } else if (std.mem.startsWith(u8, row.key, "vector/")) {
+                    const projection = try parse(VectorProjection, self.a, row.json);
+                    const record = try self.assertion(projection.assertion_id);
+                    const serving = self.state.config.features.semantic_recall and projection.generation == self.state.config.embedding_generation;
+                    const staging = if (self.state.pending_config) |pending| projection.generation == pending.embedding_generation else false;
+                    if ((!serving and !staging) or record == null or !try self.retained(record.?, 0)) try self.remove(row.key);
                 } else if (std.mem.startsWith(u8, row.key, "outcome/")) {
                     const stored = try parse(struct { outcome: t.Outcome, owner: []const u8, recorded_at: i64 }, self.a, row.json);
                     var remove_outcome = try self.read(bool, "forgotten-all") != null;
@@ -1197,7 +1314,7 @@ const Run = struct {
                     if (remove_outcome) try self.remove(row.key);
                 } else if (std.mem.startsWith(u8, row.key, "assertion/") or std.mem.startsWith(u8, row.key, "history/")) {
                     const record = try parse(t.StoredAssertion, self.a, row.json);
-                    if (!try self.retained(record, 0)) try self.remove(row.key);
+                    if (!try self.retained(record, 0)) try self.remove(row.key) else try self.put(row.key, try self.publicRecord(record));
                 }
             }
             if (page.next) |cursor| try self.put("cleanup", .{ .cursor = cursor }) else try self.remove("cleanup");
@@ -1229,7 +1346,7 @@ const Run = struct {
         for (page.rows) |row| {
             const value = try parse(t.StoredAssertion, self.a, row.json);
             try self.authorize(value.owner, value.assertion.visibility);
-            try records.append(self.a, value);
+            try records.append(self.a, try self.publicRecord(value));
         }
         return self.encode(.{ .items = records.items, .next_cursor = try self.encodeCursor(prefix, page.next), .complete = page.next == null, .revision = self.state.revision });
     }
@@ -1267,7 +1384,7 @@ const Run = struct {
             if (request.kind) |v| if (claim.kind != v) continue;
             if (request.environment) |v| if (claim.environment != null and !eql(u8, v, claim.environment.?)) continue;
             if (request.task) |v| if (claim.task != null and !eql(u8, v, claim.task.?)) continue;
-            try items.append(self.a, record);
+            try items.append(self.a, try self.publicRecord(record));
             if (page.next == null) {
                 more = false;
                 break;
@@ -1283,6 +1400,7 @@ const Run = struct {
         var scanned: usize = 0;
         var vector = request.embedding;
         if (vector) |supplied| {
+            if (!self.state.config.features.semantic_recall) return error.MemoryCapabilityUnavailable;
             const model = self.state.config.models.embedder orelse return error.MemoryModelRequired;
             if (request.embedding_model == null or !eql(u8, try self.encode(request.embedding_model.?), try self.encode(model)) or supplied.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
             for (supplied) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
@@ -1316,7 +1434,7 @@ const Run = struct {
                 if (request.task) |value| if (claim.task != null and !eql(u8, value, claim.task.?)) continue;
                 if (request.kind) |value| if (value != claim.kind) continue;
                 var score = lexical(request.query, claim.statement);
-                const compatible_embedding = if (record.next_embedding_generation == self.state.config.embedding_generation) record.next_embedding else if (record.embedding_generation == self.state.config.embedding_generation) claim.embedding else null;
+                const compatible_embedding = if (vector != null) try self.vectorFor(self.state.config, claim) else null;
                 if (vector) |query_vector| if (compatible_embedding) |embedding| {
                     score += try cosine(query_vector, embedding);
                 };
@@ -1327,7 +1445,7 @@ const Run = struct {
                 record.assertion.depends_on = support.depends_on;
                 record.assertion.support_sets = &.{};
                 record.assertion.embedding = null;
-                record.next_embedding = null;
+                record = try self.publicRecord(record);
                 try hits.append(self.a, .{ .memory = record, .score = score, .historical = historical, .citations = support.evidence });
             }
             after = page.next;
@@ -1434,6 +1552,15 @@ fn relationsMatch(request: t.Recall, claim: t.Assertion) bool {
         return values.len > 0;
     }
     return request.target_id == null;
+}
+pub fn actionGrant(action: Action) t.RequiredGrant {
+    return switch (action) {
+        .create, .configure, .curate_entity, .stage_embeddings => .admin,
+        else => .write,
+    };
+}
+pub fn operationGrant(operation: t.Operation) t.RequiredGrant {
+    return operation.required_grant orelse actionGrant(std.meta.stringToEnum(Action, operation.action) orelse return .admin);
 }
 fn publicOperation(input: t.Operation) t.OperationStatus {
     var result: t.OperationStatus = undefined;

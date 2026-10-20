@@ -62,6 +62,13 @@ rebuilds the separate groups without erasing explicit retractions or supersessio
 Missing forgotten replacements never authorize revival. Subject and typed-object
 reverse indexes bound the affected set; one atomic curation admits at most 256
 assertions, rejecting a larger operation without changing identity or facts.
+Ontology and reconciliation-policy transitions validate retained assertions and
+rebuild their belief projection in the configuration transaction. Raw subject and
+value reverse indexes exist independently of whether the current ontology types
+a value, so enabling object typing does not lose old facts during later merges.
+These semantic transitions admit at most 256 retained assertions; larger or
+incompatible changes reject atomically before publishing a configuration or
+starting a vector build. Vector-only changes use bounded asynchronous backfill.
 Typed links connect evidence, decisions, rationale, rejected
 alternatives, episodes and procedures. Alias/name matches never authorize a
 canonical identity merge. Explicit distinct IDs must remain distinct.
@@ -70,6 +77,15 @@ policy-derived interval closure, so source replay cannot overwrite current
 lifecycle and an authorized explicit restoration can recover original bounds.
 Retraction, TTL expiry and forgetting never implicitly revive superseded guidance;
 restoration requires an explicit correction or newly admitted assertion.
+Correction dispositions retain the authenticated principal, recorded time and
+validated evidence separately from the fact's own support. A team-visible
+correction cannot cite private evidence. Forgotten or expired correction support
+redacts its reason and provenance references from point reads, history, enumeration
+and recall, and physical cleanup scrubs those payloads. The lifecycle decision
+survives that redaction; losing justification never implicitly reactivates a fact.
+Entity cleanup retains a durable identity tombstone. A retired entity ID cannot
+become an untyped raw ID or be reused for a different entity after its payload is
+removed; typed identity dependencies remain fenced through cleanup and restart.
 
 Mutations require per-principal idempotency keys and fingerprint the action,
 resource ID and exact request body. A conflicting reuse fails. Durable managed
@@ -169,6 +185,13 @@ serving generation or reused after cancellation. An immutable generation snapsho
 binds every staged vector to its exact model, so a later model cannot inherit
 staging left by a failed transition. Publication switches the configuration
 only when the build completes; old and new vector spaces never share scores.
+Vectors are generation-keyed projections of immutable assertion text, stored
+separately from assertion revisions and lifecycle history. Both current and
+`known_at` reads resolve the serving generation's vector using assertion ID and
+statement hash; reindexing covers all retained assertions, including historical
+and retracted facts. It does not rewrite recorded knowledge time. Bounded cleanup
+reclaims retired or failed vector generations and forgotten assertion vectors,
+while retaining serving and pending generations.
 Model failures and schema/grounding rejection retain bounded retry status and
 publish no partial generated output. Recovery replays committed receipts.
 
@@ -177,6 +200,11 @@ current range leader schedules mutation work. A durable signed execution binding
 contains a credential principal, not a password, bearer token or Codex model
 session credential. Current grants and row restrictions are rechecked before
 execution; unsupported background credentials are rejected at feature admission.
+Each durable operation records the permission required at admission. The space
+owner field is attribution, not an enduring grant. Deferred configure, entity
+curation and vector staging require current admin authority; advancing a receipt
+cannot downgrade that requirement to write. The same requirement is rechecked
+before model calls, publication and idempotent receipt replay.
 Foreground access and durable execution grants are rechecked before publication
 and before returning read results. Producer paths requesting background processing
 must use a qualified revocable Basic/API-key execution identity; ordinary external

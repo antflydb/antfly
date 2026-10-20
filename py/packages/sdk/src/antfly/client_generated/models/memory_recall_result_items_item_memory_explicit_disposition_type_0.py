@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
 from ..models.memory_recall_result_items_item_memory_explicit_disposition_type_0_lifecycle import (
     MemoryRecallResultItemsItemMemoryExplicitDispositionType0Lifecycle,
 )
+from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.memory_recall_result_items_item_memory_explicit_disposition_type_0_provenance_type_0 import (
+        MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0,
+    )
+
 
 T = TypeVar("T", bound="MemoryRecallResultItemsItemMemoryExplicitDispositionType0")
 
@@ -22,6 +29,7 @@ class MemoryRecallResultItemsItemMemoryExplicitDispositionType0:
         recorded_to (int | None):
         conflicts_with (list[str]):
         reason (None | str):
+        provenance (MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0 | None | Unset):
     """
 
     lifecycle: MemoryRecallResultItemsItemMemoryExplicitDispositionType0Lifecycle
@@ -30,8 +38,13 @@ class MemoryRecallResultItemsItemMemoryExplicitDispositionType0:
     recorded_to: int | None
     conflicts_with: list[str]
     reason: None | str
+    provenance: MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0 | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.memory_recall_result_items_item_memory_explicit_disposition_type_0_provenance_type_0 import (
+            MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0,
+        )
+
         lifecycle = self.lifecycle.value
 
         valid_to: int | None
@@ -48,6 +61,14 @@ class MemoryRecallResultItemsItemMemoryExplicitDispositionType0:
         reason: None | str
         reason = self.reason
 
+        provenance: dict[str, Any] | None | Unset
+        if isinstance(self.provenance, Unset):
+            provenance = UNSET
+        elif isinstance(self.provenance, MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0):
+            provenance = self.provenance.to_dict()
+        else:
+            provenance = self.provenance
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -60,11 +81,17 @@ class MemoryRecallResultItemsItemMemoryExplicitDispositionType0:
                 "reason": reason,
             }
         )
+        if provenance is not UNSET:
+            field_dict["provenance"] = provenance
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.memory_recall_result_items_item_memory_explicit_disposition_type_0_provenance_type_0 import (
+            MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0,
+        )
+
         d = dict(src_dict)
         lifecycle = MemoryRecallResultItemsItemMemoryExplicitDispositionType0Lifecycle(d.pop("lifecycle"))
 
@@ -98,6 +125,27 @@ class MemoryRecallResultItemsItemMemoryExplicitDispositionType0:
 
         reason = _parse_reason(d.pop("reason"))
 
+        def _parse_provenance(
+            data: object,
+        ) -> MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0 | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                provenance_type_0 = MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0.from_dict(
+                    data
+                )
+
+                return provenance_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0 | None | Unset, data)
+
+        provenance = _parse_provenance(d.pop("provenance", UNSET))
+
         memory_recall_result_items_item_memory_explicit_disposition_type_0 = cls(
             lifecycle=lifecycle,
             valid_to=valid_to,
@@ -105,6 +153,7 @@ class MemoryRecallResultItemsItemMemoryExplicitDispositionType0:
             recorded_to=recorded_to,
             conflicts_with=conflicts_with,
             reason=reason,
+            provenance=provenance,
         )
 
         return memory_recall_result_items_item_memory_explicit_disposition_type_0

@@ -37,9 +37,6 @@ class MemoryRecordPageItemsItem:
         conflicts_with (list[str] | Unset):
         recorded_to (int | None | Unset):
         superseded_by (None | str | Unset):
-        embedding_generation (int | Unset):
-        next_embedding_generation (int | None | Unset):
-        next_embedding (list[float] | None | Unset):
     """
 
     assertion: MemoryRecordPageItemsItemAssertion
@@ -57,9 +54,6 @@ class MemoryRecordPageItemsItem:
     conflicts_with: list[str] | Unset = UNSET
     recorded_to: int | None | Unset = UNSET
     superseded_by: None | str | Unset = UNSET
-    embedding_generation: int | Unset = UNSET
-    next_embedding_generation: int | None | Unset = UNSET
-    next_embedding: list[float] | None | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.memory_record_page_items_item_explicit_disposition_type_0 import (
@@ -122,23 +116,6 @@ class MemoryRecordPageItemsItem:
         else:
             superseded_by = self.superseded_by
 
-        embedding_generation = self.embedding_generation
-
-        next_embedding_generation: int | None | Unset
-        if isinstance(self.next_embedding_generation, Unset):
-            next_embedding_generation = UNSET
-        else:
-            next_embedding_generation = self.next_embedding_generation
-
-        next_embedding: list[float] | None | Unset
-        if isinstance(self.next_embedding, Unset):
-            next_embedding = UNSET
-        elif isinstance(self.next_embedding, list):
-            next_embedding = self.next_embedding
-
-        else:
-            next_embedding = self.next_embedding
-
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -170,12 +147,6 @@ class MemoryRecordPageItemsItem:
             field_dict["recorded_to"] = recorded_to
         if superseded_by is not UNSET:
             field_dict["superseded_by"] = superseded_by
-        if embedding_generation is not UNSET:
-            field_dict["embedding_generation"] = embedding_generation
-        if next_embedding_generation is not UNSET:
-            field_dict["next_embedding_generation"] = next_embedding_generation
-        if next_embedding is not UNSET:
-            field_dict["next_embedding"] = next_embedding
 
         return field_dict
 
@@ -267,34 +238,6 @@ class MemoryRecordPageItemsItem:
 
         superseded_by = _parse_superseded_by(d.pop("superseded_by", UNSET))
 
-        embedding_generation = d.pop("embedding_generation", UNSET)
-
-        def _parse_next_embedding_generation(data: object) -> int | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(int | None | Unset, data)
-
-        next_embedding_generation = _parse_next_embedding_generation(d.pop("next_embedding_generation", UNSET))
-
-        def _parse_next_embedding(data: object) -> list[float] | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            try:
-                if not isinstance(data, list):
-                    raise TypeError()
-                next_embedding_type_0 = cast(list[float], data)
-
-                return next_embedding_type_0
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return cast(list[float] | None | Unset, data)
-
-        next_embedding = _parse_next_embedding(d.pop("next_embedding", UNSET))
-
         memory_record_page_items_item = cls(
             assertion=assertion,
             owner=owner,
@@ -311,9 +254,6 @@ class MemoryRecordPageItemsItem:
             conflicts_with=conflicts_with,
             recorded_to=recorded_to,
             superseded_by=superseded_by,
-            embedding_generation=embedding_generation,
-            next_embedding_generation=next_embedding_generation,
-            next_embedding=next_embedding,
         )
 
         return memory_record_page_items_item

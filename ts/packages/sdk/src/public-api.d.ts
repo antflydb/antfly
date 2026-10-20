@@ -23012,6 +23012,18 @@ export interface components {
             input_hash?: string;
             asserted_valid_to?: number | null;
             explicit_disposition?: {
+                provenance?: {
+                    principal: string;
+                    recorded_at: number;
+                    evidence: {
+                        id: string;
+                        span?: {
+                            start: number;
+                            end: number;
+                        } | null;
+                    }[];
+                    forgotten?: boolean;
+                } | null;
                 /** @enum {string} */
                 lifecycle: "active" | "disputed" | "superseded" | "retracted";
                 valid_to: number | null;
@@ -23032,9 +23044,6 @@ export interface components {
             recorded_to?: number | null;
             superseded_by?: string | null;
             config_generation: number;
-            embedding_generation?: number;
-            next_embedding_generation?: number | null;
-            next_embedding?: number[] | null;
         };
         MemoryEntity: {
             /** @enum {string} */
@@ -23135,6 +23144,18 @@ export interface components {
                     input_hash?: string;
                     asserted_valid_to?: number | null;
                     explicit_disposition?: {
+                        provenance?: {
+                            principal: string;
+                            recorded_at: number;
+                            evidence: {
+                                id: string;
+                                span?: {
+                                    start: number;
+                                    end: number;
+                                } | null;
+                            }[];
+                            forgotten?: boolean;
+                        } | null;
                         /** @enum {string} */
                         lifecycle: "active" | "disputed" | "superseded" | "retracted";
                         valid_to: number | null;
@@ -23155,9 +23176,6 @@ export interface components {
                     recorded_to?: number | null;
                     superseded_by?: string | null;
                     config_generation: number;
-                    embedding_generation?: number;
-                    next_embedding_generation?: number | null;
-                    next_embedding?: number[] | null;
                 };
                 score: number;
                 historical: boolean;
@@ -23240,6 +23258,18 @@ export interface components {
                 input_hash?: string;
                 asserted_valid_to?: number | null;
                 explicit_disposition?: {
+                    provenance?: {
+                        principal: string;
+                        recorded_at: number;
+                        evidence: {
+                            id: string;
+                            span?: {
+                                start: number;
+                                end: number;
+                            } | null;
+                        }[];
+                        forgotten?: boolean;
+                    } | null;
                     /** @enum {string} */
                     lifecycle: "active" | "disputed" | "superseded" | "retracted";
                     valid_to: number | null;
@@ -23260,9 +23290,6 @@ export interface components {
                 recorded_to?: number | null;
                 superseded_by?: string | null;
                 config_generation: number;
-                embedding_generation?: number;
-                next_embedding_generation?: number | null;
-                next_embedding?: number[] | null;
             }[];
             next_cursor: string | null;
             complete: boolean;

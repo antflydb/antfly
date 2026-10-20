@@ -211,7 +211,14 @@ pub const State = struct {
 pub const StoredEvidence = struct { context_only: bool = false, evidence: Evidence, owner: []const u8, recorded_at: i64, revision: u64, forgotten: bool = false };
 /// Explicit human/producer decisions are the baseline for identity-policy
 /// projection. Rebuilding canonical groups never erases these decisions.
+pub const CorrectionProvenance = struct {
+    principal: []const u8,
+    recorded_at: i64,
+    evidence: []const EvidenceRef,
+    forgotten: bool = false,
+};
 pub const ExplicitDisposition = struct {
+    provenance: ?CorrectionProvenance = null,
     lifecycle: Lifecycle,
     valid_to: ?i64,
     superseded_by: ?[]const u8,
@@ -235,12 +242,11 @@ pub const StoredAssertion = struct {
     recorded_to: ?i64 = null,
     superseded_by: ?[]const u8 = null,
     config_generation: u64,
-    embedding_generation: u64 = 1,
-    next_embedding_generation: ?u64 = null,
-    next_embedding: ?[]const f32 = null,
 };
 pub const Stage = enum { pending, running, succeeded, failed, cancelled };
+pub const RequiredGrant = enum { write, admin };
 pub const Operation = struct {
+    required_grant: ?RequiredGrant = null,
     execution_principal: []const u8 = "",
     execution_signature: []const u8 = "",
     id: []const u8,

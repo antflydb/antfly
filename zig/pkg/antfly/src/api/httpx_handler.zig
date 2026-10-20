@@ -17815,6 +17815,32 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     defer raw_document.deinit(a);
     try std.testing.expectEqual(@as(u16, 403), raw_document.status);
     try std.testing.expect(std.mem.indexOf(u8, raw_document.body, "Production uses Terraform") == null);
+    // Deferred configuration retains its original admin requirement after a
+    // creator is downgraded to read/write. Both ingress and policy must agree.
+    var auth_arena = std.heap.ArenaAllocator.init(a);
+    defer auth_arena.deinit();
+    const aa = auth_arena.allocator();
+    var inspected = try api.executeMemoryService("team", .{ .action = .inspect }, null, .{});
+    defer inspected.deinit(a);
+    const inspection = try std.json.parseFromSliceLeaky(@import("memory.zig").memory.types.Inspection, aa, inspected.body, .{});
+    const config: @import("memory.zig").memory.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = .{ .provider = "external", .model = "new-space", .revision = "v2", .dimensions = 2 } } };
+    const config_body = try std.json.Stringify.valueAlloc(aa, .{ .expected_revision = inspection.state.revision, .config = config }, .{});
+    var configuring = try api.executeMemoryService("team", .{ .action = .configure, .body = try std.json.parseFromSliceLeaky(std.json.Value, aa, config_body, .{}), .idempotency_key = "configure-external" }, null, .{});
+    defer configuring.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), configuring.status);
+    const pending = try std.json.parseFromSliceLeaky(@import("memory.zig").memory.types.OperationStatus, aa, configuring.body, .{});
+    const downgraded_permissions = [_]usermgr.Permission{
+        .{ .resource_type = .table, .resource = @constCast("memory_team"), .type = .read },
+        .{ .resource_type = .table, .resource = @constCast("memory_team"), .type = .write },
+    };
+    const downgraded: AuthenticatedIdentity = .{ .username = @constCast("local"), .permissions = @constCast(&downgraded_permissions) };
+    var revoked_advance = try api.executeMemoryService("team", .{ .action = .advance, .id = pending.id, .idempotency_key = "revoked-admin-advance" }, downgraded, .{});
+    defer revoked_advance.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), revoked_advance.status);
+    var still_serving = try api.executeMemoryService("team", .{ .action = .inspect }, null, .{});
+    defer still_serving.deinit(a);
+    const after = try std.json.parseFromSliceLeaky(@import("memory.zig").memory.types.Inspection, aa, still_serving.body, .{});
+    try std.testing.expect(!after.state.config.features.semantic_recall and after.state.pending_config != null);
     var forget_arena = std.heap.ArenaAllocator.init(a);
     defer forget_arena.deinit();
     var forgotten = try api.executeMemoryService("team", .{ .action = .forget, .body = try std.json.parseFromSliceLeaky(std.json.Value, forget_arena.allocator(), "{\"evidence_ids\":[\"e1\"]}", .{}), .idempotency_key = "forget" }, null, .{});

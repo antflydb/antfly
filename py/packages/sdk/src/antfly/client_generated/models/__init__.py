@@ -1259,6 +1259,15 @@ from .memory_recall_result_items_item_memory_explicit_disposition_type_0 import 
 from .memory_recall_result_items_item_memory_explicit_disposition_type_0_lifecycle import (
     MemoryRecallResultItemsItemMemoryExplicitDispositionType0Lifecycle,
 )
+from .memory_recall_result_items_item_memory_explicit_disposition_type_0_provenance_type_0 import (
+    MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0,
+)
+from .memory_recall_result_items_item_memory_explicit_disposition_type_0_provenance_type_0_evidence_item import (
+    MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0EvidenceItem,
+)
+from .memory_recall_result_items_item_memory_explicit_disposition_type_0_provenance_type_0_evidence_item_span_type_0 import (
+    MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0EvidenceItemSpanType0,
+)
 from .memory_recall_result_items_item_memory_lifecycle import MemoryRecallResultItemsItemMemoryLifecycle
 from .memory_recall_result_retrieval import MemoryRecallResultRetrieval
 from .memory_record import MemoryRecord
@@ -1278,6 +1287,15 @@ from .memory_record_assertion_support_sets_item_evidence_item_span_type_0 import
 from .memory_record_assertion_visibility import MemoryRecordAssertionVisibility
 from .memory_record_explicit_disposition_type_0 import MemoryRecordExplicitDispositionType0
 from .memory_record_explicit_disposition_type_0_lifecycle import MemoryRecordExplicitDispositionType0Lifecycle
+from .memory_record_explicit_disposition_type_0_provenance_type_0 import (
+    MemoryRecordExplicitDispositionType0ProvenanceType0,
+)
+from .memory_record_explicit_disposition_type_0_provenance_type_0_evidence_item import (
+    MemoryRecordExplicitDispositionType0ProvenanceType0EvidenceItem,
+)
+from .memory_record_explicit_disposition_type_0_provenance_type_0_evidence_item_span_type_0 import (
+    MemoryRecordExplicitDispositionType0ProvenanceType0EvidenceItemSpanType0,
+)
 from .memory_record_lifecycle import MemoryRecordLifecycle
 from .memory_record_page import MemoryRecordPage
 from .memory_record_page_items_item import MemoryRecordPageItemsItem
@@ -1304,6 +1322,15 @@ from .memory_record_page_items_item_assertion_visibility import MemoryRecordPage
 from .memory_record_page_items_item_explicit_disposition_type_0 import MemoryRecordPageItemsItemExplicitDispositionType0
 from .memory_record_page_items_item_explicit_disposition_type_0_lifecycle import (
     MemoryRecordPageItemsItemExplicitDispositionType0Lifecycle,
+)
+from .memory_record_page_items_item_explicit_disposition_type_0_provenance_type_0 import (
+    MemoryRecordPageItemsItemExplicitDispositionType0ProvenanceType0,
+)
+from .memory_record_page_items_item_explicit_disposition_type_0_provenance_type_0_evidence_item import (
+    MemoryRecordPageItemsItemExplicitDispositionType0ProvenanceType0EvidenceItem,
+)
+from .memory_record_page_items_item_explicit_disposition_type_0_provenance_type_0_evidence_item_span_type_0 import (
+    MemoryRecordPageItemsItemExplicitDispositionType0ProvenanceType0EvidenceItemSpanType0,
 )
 from .memory_record_page_items_item_lifecycle import MemoryRecordPageItemsItemLifecycle
 from .memory_result import MemoryResult
@@ -3051,6 +3078,9 @@ __all__ = (
     "MemoryRecallResultItemsItemMemoryAssertionVisibility",
     "MemoryRecallResultItemsItemMemoryExplicitDispositionType0",
     "MemoryRecallResultItemsItemMemoryExplicitDispositionType0Lifecycle",
+    "MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0",
+    "MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0EvidenceItem",
+    "MemoryRecallResultItemsItemMemoryExplicitDispositionType0ProvenanceType0EvidenceItemSpanType0",
     "MemoryRecallResultItemsItemMemoryLifecycle",
     "MemoryRecallResultRetrieval",
     "MemoryRecord",
@@ -3068,6 +3098,9 @@ __all__ = (
     "MemoryRecordAssertionVisibility",
     "MemoryRecordExplicitDispositionType0",
     "MemoryRecordExplicitDispositionType0Lifecycle",
+    "MemoryRecordExplicitDispositionType0ProvenanceType0",
+    "MemoryRecordExplicitDispositionType0ProvenanceType0EvidenceItem",
+    "MemoryRecordExplicitDispositionType0ProvenanceType0EvidenceItemSpanType0",
     "MemoryRecordLifecycle",
     "MemoryRecordPage",
     "MemoryRecordPageItemsItem",
@@ -3085,6 +3118,9 @@ __all__ = (
     "MemoryRecordPageItemsItemAssertionVisibility",
     "MemoryRecordPageItemsItemExplicitDispositionType0",
     "MemoryRecordPageItemsItemExplicitDispositionType0Lifecycle",
+    "MemoryRecordPageItemsItemExplicitDispositionType0ProvenanceType0",
+    "MemoryRecordPageItemsItemExplicitDispositionType0ProvenanceType0EvidenceItem",
+    "MemoryRecordPageItemsItemExplicitDispositionType0ProvenanceType0EvidenceItemSpanType0",
     "MemoryRecordPageItemsItemLifecycle",
     "MemoryResult",
     "MemorySpaceConfig",

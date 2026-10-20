@@ -32746,9 +32746,6 @@ pub const MemoryRecord = struct {
     recorded_to: OpenApiOptionalNullable(i64) = .absent,
     superseded_by: OpenApiOptionalNullable([]const u8) = .absent,
     config_generation: i64,
-    embedding_generation: ?i64 = null,
-    next_embedding_generation: OpenApiOptionalNullable(i64) = .absent,
-    next_embedding: OpenApiOptionalNullable([]const f64) = .absent,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -32767,9 +32764,6 @@ pub const MemoryRecord = struct {
         .{ "recorded_to", "recorded_to", false },
         .{ "superseded_by", "superseded_by", false },
         .{ "config_generation", "config_generation", false },
-        .{ "embedding_generation", "embedding_generation", true },
-        .{ "next_embedding_generation", "next_embedding_generation", false },
-        .{ "next_embedding", "next_embedding", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -32867,32 +32861,6 @@ pub const MemoryRecord = struct {
         }
         try jw.objectField("config_generation");
         try jw.write(self.config_generation);
-        if (self.embedding_generation) |value| {
-            try jw.objectField("embedding_generation");
-            try jw.write(value);
-        }
-        switch (self.next_embedding_generation) {
-            .absent => {},
-            .null_value => {
-                try jw.objectField("next_embedding_generation");
-                try jw.write(@as(?u8, null));
-            },
-            .value => |value| {
-                try jw.objectField("next_embedding_generation");
-                try jw.write(value);
-            },
-        }
-        switch (self.next_embedding) {
-            .absent => {},
-            .null_value => {
-                try jw.objectField("next_embedding");
-                try jw.write(@as(?u8, null));
-            },
-            .value => |value| {
-                try jw.objectField("next_embedding");
-                try jw.write(value);
-            },
-        }
         try jw.endObject();
     }
 };
