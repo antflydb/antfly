@@ -144,7 +144,7 @@ pub fn same(a: *const ast.Expr, b: *const ast.Expr) bool {
         },
         .call => |x| blk: {
             const y = b.value.call;
-            if (!std.ascii.eqlIgnoreCase(x.name, y.name) or x.star != y.star or x.collect_limit != y.collect_limit or x.distinct != y.distinct or x.args.len != y.args.len) break :blk false;
+            if (!std.ascii.eqlIgnoreCase(x.name, y.name) or x.star != y.star or x.collect_limit != y.collect_limit or x.collect_suffix != y.collect_suffix or x.distinct != y.distinct or x.args.len != y.args.len) break :blk false;
             for (x.args, y.args) |left, right| if (!same(left, right)) break :blk false;
             break :blk true;
         },

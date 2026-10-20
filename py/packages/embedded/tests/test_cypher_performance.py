@@ -4297,13 +4297,16 @@ def test_wide_grouped_projection_retains_only_its_window(graph_db):
     ]
 
 
-def _populate_payload_graph(db, count, payload_bytes):
+def _populate_payload_graph(db, count, payload_bytes, *, unique=False):
     db.sql("CREATE TABLE payloads (score BIGINT,payload TEXT)")
-    payload = "x" * payload_bytes
+    payload = "x" * (payload_bytes - 12 if unique else payload_bytes)
     for start in range(0, count, 50):
         db.sql(
             "INSERT INTO payloads (_id,score,payload) VALUES "
-            + ",".join(f"('n{i}',{i},'{payload}')" for i in range(start, min(start + 50, count)))
+            + ",".join(
+                (f"('n{i}',{i},'{i:012d}{payload}')" if unique else f"('n{i}',{i},'{payload}')")
+                for i in range(start, min(start + 50, count))
+            )
         )
     db.graph_catalog_json(
         {
@@ -4587,3 +4590,63 @@ def test_distinct_entity_keys_discard_properties_needed_by_siblings(graph_db):
         )
         assert int(result["rows"][0][0]["value"]) == 3000
         assert result["rows"][0][1]["value"] == "x" * 4092
+
+
+def test_grouped_results_share_payloads_and_retire_reducers(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092, unique=True)
+    result = db.cypher_json(
+        "payloads",
+        {
+            "query": "MATCH(n:W) RETURN n.score,min(n.payload) AS p ORDER BY p",
+            "limits": {"memory_bytes": 40 << 20},
+        },
+    )
+    assert [int(row[0]["value"]) for row in result["rows"]] == list(range(3000))
+    assert all(
+        len(row[1]["value"]) == 4092 and row[1]["value"].startswith(f"{i:012d}") for i, row in enumerate(result["rows"])
+    )
+    for forwarding in ("", "WITH n AS m,p "):
+        entity = "m" if forwarding else "n"
+        count = 1500 if forwarding else 3000
+        predicate = "WHERE n.score<1500 " if forwarding else ""
+        result = db.cypher_json(
+            "payloads",
+            {
+                "query": "MATCH(n:W) "
+                + predicate
+                + "WITH n,min(n.payload) AS p "
+                + forwarding
+                + f"RETURN {entity}.score,size(p) ORDER BY {entity}.score",
+                "limits": {"memory_bytes": (24 if forwarding else 40) << 20},
+            },
+        )
+        assert [[int(cell["value"]) for cell in row] for row in result["rows"]] == [[i, 4092] for i in range(count)]
+
+
+def test_suffix_collection_retains_only_demanded_payloads(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092, unique=True)
+    for tail in (
+        "RETURN last(collect(n.payload))",
+        "RETURN collect(n.payload)[-1]",
+        "RETURN collect(n.payload)[-2..]",
+        "RETURN head(collect(n.payload)),last(collect(n.payload))",
+        "WITH collect(n.payload) AS xs WITH xs AS ys RETURN last(ys)",
+    ):
+        result = db.cypher_json(
+            "payloads",
+            {"query": "MATCH(n:W) " + tail, "limits": {"memory_bytes": 8 << 20}},
+        )
+        for cell in result["rows"][0]:
+            values = cell["value"] if cell["type"] == "list" else [cell]
+            assert all(len(value["value"]) == 4092 for value in values)
+    result = db.cypher_json(
+        "payloads",
+        {
+            "query": "MATCH(n:W) RETURN count(DISTINCT n),last(collect(DISTINCT n)).score",
+            "limits": {"memory_bytes": 8 << 20},
+        },
+    )
+    assert int(result["rows"][0][0]["value"]) == 3000
+    assert 0 <= int(result["rows"][0][1]["value"]) < 3000

@@ -56,6 +56,7 @@ pub const Function = struct {
     star: bool = false,
     /// Physical retention demand; the parser never sets this field.
     collect_limit: ?usize = null,
+    collect_suffix: usize = 0,
 };
 pub const Procedure = struct { name: []const u8, args: []const *const Expr, yields: []const Yield, predicate: ?*const Expr = null };
 pub const Branch = struct { condition: *const Expr, value: *const Expr };

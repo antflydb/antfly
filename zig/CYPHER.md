@@ -1880,8 +1880,14 @@ than entire source rows. Final expressions use compiled key-slot lookups with
 lexical and ORDER BY alias-shadowing guards. A free-variable walk retains only
 additional source bindings required behind those guards (including map selector
 variables); unproved pattern dependencies conservatively retain their source.
-Entity-valued keys keep their complete observed entity. Aggregate-only input
-payloads are released with their producer pages.
+Entity-valued keys always keep their complete graph identity. Forwarded entity
+bindings retain only properties proved live in later projections; sibling
+aggregate inputs do not become grouping payloads. Demands follow transparent
+WITH aliases and merge for aliases sharing a physical key slot. Full-value
+escapes, opaque captures, DISTINCT forwarding, writes and opaque authorization
+projection callbacks conservatively keep complete observed content. Labels and
+relationship physical attributes remain intact. Aggregate-only input payloads
+are released with their producer pages.
 
 General grouped projection constructs its source/alias environment once. Proved finite
 SKIP/LIMIT windows use the existing stable TopK selector, with per-group scratch
@@ -1889,19 +1895,28 @@ for projection and ordering and independent ownership for selected rows. Every
 group still evaluates its projection and predicates, including losing candidates
 and LIMIT 0, so selection cannot suppress arithmetic errors. Unknown or invalid
 window expressions retain their original late evaluation order.
-Retained sort entries share immutable allocations between projected cells and
-ordering keys, including nested payloads. The clone memo belongs to one entry's
-ownership transfer and never survives source recycling. Allocation identity,
+Retained sort entries and unbounded grouped projections share immutable
+allocations between projected cells and ordering keys, including nested payloads.
+Each completed group releases its reducer arenas after its surviving projection
+has acquired ownership, including filtered and duplicate groups. Error cleanup
+can revisit released states without freeing their payloads twice. The clone memo
+belongs to one entry's ownership transfer and never survives source recycling. Allocation identity,
 rather than Cypher equality, preserves numeric representations and entity
 snapshots; cached subtree heights enforce the same value-depth limit.
 
-Proved HEAD, nonnegative literal index, and bounded prefix-slice consumers of
-COLLECT retain only their required prefix. Compatible demands use the largest
-prefix and follow transparent WITH aliases. Every input argument still evaluates,
+Proved HEAD/LAST, literal indices, and bounded front/back slice consumers of
+COLLECT retain only their required windows. Compatible demands combine the
+largest front and back windows and follow transparent WITH aliases. A weighted
+ring of independently owned suffix runs handles arbitrary-precision bag counts
+without expansion; eviction promptly releases obsolete payloads. Finalization
+removes front/back overlap for short inputs before evaluating the original
+consumer expressions. DISTINCT suffixes keep complete equality membership but
+own only the demanded payload window, preserving first-seen order. Every input
+argument still evaluates,
 including after the prefix fills and for an empty prefix. NULL exclusion,
 first-seen DISTINCT order, weighted multiplicity and lazy branches retain their
-ordinary semantics. A full consumer, unknown/negative bound, scope barrier or
-mixed cardinality/prefix alias demand conservatively retains the complete list.
+ordinary semantics. A full consumer, unknown/unbounded window, scope barrier or
+mixed cardinality/window alias demand conservatively retains the complete list.
 
 Compatible repeatable DISTINCT arguments also share a collision-checked value
 store across different reducers (for example COUNT and COLLECT). Ordinary row

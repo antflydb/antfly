@@ -3109,7 +3109,13 @@ test "exact floating summaries and total-axis bags retain aggregate values and a
     try check("MATCH p=(a:Document {id:'a'})-[:CITES*0..1]->(b) RETURN min(2.0*length(p)),max(length(p)/2.0),avg(length(p)/2.0)>0.33 AND avg(length(p)/2.0)<0.34", "[[0,0.5,true]]");
     try check("MATCH p=(a:Document {id:'a'})-[xs:CITES*0..1]->()-[ys:CITES*0..1]->(b) RETURN min(size(xs)+size(ys)),max(size(xs)+size(ys)),min(size(xs)-size(ys)),max(size(xs)-size(ys))", "[[0,2,-1,1]]");
     const Campaign = struct {
-        fn run(a: std.mem.Allocator) !void {
+        fn run(allocator: std.mem.Allocator) !void {
+            // Failure positions must not depend on arena remapping into
+            // adjacent allocations freed by earlier group finalization.
+            var vtable = allocator.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = allocator.ptr, .vtable = &vtable };
             var diagnostic: c.Diagnostic = .{};
             var compiled = try c.compile(a, "MATCH p=(a:Document {id:'a'})-[xs:CITES*0..1]->()-[ys:CITES*0..1]->(b) WITH size(xs) AS x,size(ys) AS y RETURN min(x+y),max(0.5*(x+y))", .{}, &diagnostic);
             defer compiled.deinit();
@@ -3555,4 +3561,80 @@ test "lazy bounded collect preserves intermediate value depth limits" {
             try std.testing.expectEqual(@as(i64, 0), value.integer);
         }
     }
+}
+
+test "collection suffix demands preserve order overlap DISTINCT aliases and lazy errors" {
+    try check("UNWIND [null,3,1,2] AS x RETURN last(collect(x)),collect(x)[-1],collect(x)[-2..],collect(x)[-3..-1]", "[[2,2,[1,2],[3,1]]]");
+    try check("UNWIND [3,1,2,3] AS x RETURN head(collect(x)),last(collect(x)),collect(x)[0..2],collect(x)[-2..],collect(x)[-8]", "[[3,3,[3,1],[2,3],null]]");
+    try check("UNWIND [3,1] AS x RETURN collect(x)[0..4],collect(x)[-4..],collect(x)[-3..-1]", "[[[3,1],[3,1],[3]]]");
+    try check("UNWIND [] AS x RETURN last(collect(x)),collect(x)[-1],collect(x)[-2..]", "[[null,null,[]]]");
+    try check("UNWIND [1,2,1,null] AS x RETURN last(collect(DISTINCT x)),collect(DISTINCT x)[-2..],count(DISTINCT x)", "[[2,[1,2],2]]");
+    try check("UNWIND [1,2,1] AS x RETURN count(DISTINCT x),last(collect(DISTINCT x)),collect(DISTINCT x)[0..1]", "[[2,2,[1]]]");
+    try check("UNWIND [1,2,1] AS x RETURN last(collect(x)),collect(x),size(collect(x))", "[[1,[1,2,1],3]]");
+    try check("UNWIND [1,2,3] AS x WITH collect(x) AS xs WITH xs AS ys RETURN head(ys),last(ys),ys[-2..]", "[[1,3,[2,3]]]");
+    try check("UNWIND [1,2,3] AS x WITH collect(x) AS xs RETURN last(xs),size(xs),xs", "[[3,3,[1,2,3]]]");
+    try check("UNWIND [1,2] AS x RETURN CASE WHEN true THEN last(collect(x)) ELSE last(collect(1/0)) END", "[[2]]");
+    try check("MATCH(n:Document) RETURN count(DISTINCT n),last(collect(DISTINCT n)).title", "[[3,\"Gamma\"]]");
+    try check("MATCH(n:Document) RETURN last(collect(DISTINCT [n]))[0].title,count(DISTINCT [n])", "[[\"Gamma\",3]]");
+    try check("UNWIND [1,2] AS x RETURN x%2 AS k,last(collect(x)) AS last ORDER BY k", "[[0,2],[1,1]]");
+    try check("UNWIND [1,2] AS g UNWIND [g,g,g+1] AS x RETURN g,CASE WHEN true THEN last(collect(DISTINCT [EXISTS { WITH x UNWIND CASE WHEN x%2=0 THEN [1] ELSE [] END AS y RETURN y }])) ELSE null END AS v ORDER BY g", "[[1,[true]],[2,[false]]]");
+    for ([_][]const u8{
+        "UNWIND [0,1] AS x RETURN last(collect(1/(1-x)))",
+        "UNWIND [0,1] AS x RETURN collect(1/(1-x))[-1]",
+        "UNWIND [0,1] AS x WITH collect(1/(1-x)) AS xs RETURN xs[-2..]",
+        "UNWIND [0,1] AS x RETURN CASE WHEN true THEN last(collect(1/(1-x))) ELSE 0 END",
+    }) |text| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "grouped entity retention follows property demand without changing identities or escapes" {
+    try check("MATCH(n:Document) WITH n AS a,n AS b,min(n.title) AS p RETURN a.rank,b.title,size(p) ORDER BY a.rank", "[[1,\"Alpha\",5],[2,\"Beta\",4],[3,\"Gamma\",5]]");
+    try check("MATCH(n:Document) WITH n,min(n.title) AS p RETURN n.rank,size(p) ORDER BY n.rank", "[[1,5],[2,4],[3,5]]");
+    try check("MATCH(n:Document) WITH n,min(n.rank) AS r WITH n AS m,r RETURN m.title,r ORDER BY r", "[[\"Alpha\",1],[\"Beta\",2],[\"Gamma\",3]]");
+    try check("MATCH(n:Document) WITH n,count(*) AS c WHERE n.rank=2 RETURN n.title,c", "[[\"Beta\",1]]");
+    try check("MATCH(n) WITH n,count(*) AS c RETURN n.rank,c ORDER BY n.rank", "[[1,1],[2,1],[3,1],[null,1]]");
+    try check("MATCH(n) WITH n,count(*) AS c RETURN count(*)", "[[4]]");
+    try check("MATCH(n:Document) WITH n,count(*) AS c RETURN properties(n).title,c ORDER BY n.rank", "[[\"Alpha\",1],[\"Beta\",1],[\"Gamma\",1]]");
+    try check("MATCH(n:Document) WITH n,count(*) AS c MATCH(n:Document {rank:2}) RETURN n.title,c", "[[\"Beta\",1]]");
+    try check("MATCH(n:Document) WITH n,count(*) AS c RETURN [n IN [1,2]|n+1],n.title ORDER BY n.title", "[[[2,3],\"Alpha\"],[[2,3],\"Beta\"],[[2,3],\"Gamma\"]]");
+    const Authorize = struct {
+        fn project(_: *anyopaque, _: std.mem.Allocator, node: *const v.Node) !?*const v.Node {
+            return if ((v.Value{ .node = node }).property("title") == .null) null else node;
+        }
+    };
+    var fixture: Fixture = .{};
+    var backend = fixture.backend();
+    var callbacks = backend.vtable.*;
+    callbacks.project_node = Authorize.project;
+    backend.vtable = &callbacks;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH(n:Document) WITH n,count(*) AS c RETURN n.rank,c", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+}
+
+test "group finalization and rolling suffix ownership release every allocation failure" {
+    const Campaign = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var vtable = allocator.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = allocator.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "MATCH(n:Document) UNWIND range(1,6) AS i WITH n,collect(DISTINCT n.title+toString(i))[-5..] AS p RETURN n.rank,p ORDER BY p", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 3), result.rows.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }

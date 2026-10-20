@@ -43,6 +43,7 @@ fn hashValue(hasher: *std.hash.Wyhash, value: anytype) void {
         hashValue(hasher, value.distinct);
         hashValue(hasher, value.star);
         hashValue(hasher, value.collect_limit);
+        hashValue(hasher, value.collect_suffix);
         return;
     }
     switch (@typeInfo(T)) {
@@ -139,38 +140,64 @@ fn cardinality(expression: *const ast.Expr) ?*const ast.Expr {
     if (!std.ascii.eqlIgnoreCase(aggregate.name, "collect") or aggregate.star or aggregate.args.len != 1) return null;
     return input;
 }
-/// A proved bounded prefix is independent of input cardinality. Unknown,
-/// negative and parameterized indices retain the complete collection.
-pub const Prefix = struct { input: *const ast.Expr, limit: usize };
+/// Consumers request bounded front/back windows. Their original expressions
+/// remain unchanged: a deduplicated front+back representation preserves every
+/// proved positive/negative index and bounded slice.
+pub const Bounds = struct {
+    prefix: usize = 0,
+    suffix: usize = 0,
+    pub fn merge(left: @This(), right: @This()) @This() {
+        return .{ .prefix = @max(left.prefix, right.prefix), .suffix = @max(left.suffix, right.suffix) };
+    }
+};
+pub const CollectionDemand = struct { input: *const ast.Expr, bounds: Bounds };
 fn nonnegative(expression: *const ast.Expr) ?usize {
     if (expression.value != .literal or expression.value.literal != .integer) return null;
     return std.math.cast(usize, expression.value.literal.integer);
 }
-pub fn prefixConsumer(expression: *const ast.Expr) ?Prefix {
+fn negativeMagnitude(expression: *const ast.Expr) ?usize {
+    if (expression.value == .literal and expression.value.literal == .integer and expression.value.literal.integer < 0)
+        return std.math.cast(usize, -@as(i128, expression.value.literal.integer));
+    if (expression.value == .unary and expression.value.unary.op == .negative) {
+        const magnitude = nonnegative(expression.value.unary.operand) orelse return null;
+        if (magnitude != 0) return magnitude;
+    }
+    return null;
+}
+pub fn collectionConsumer(expression: *const ast.Expr) ?CollectionDemand {
     return switch (expression.value) {
-        .call => |call| if (std.ascii.eqlIgnoreCase(call.name, "head") and !call.star and !call.distinct and call.args.len == 1) .{ .input = call.args[0], .limit = 1 } else null,
-        .index => |index| .{ .input = index.base, .limit = std.math.add(usize, nonnegative(index.index) orelse return null, 1) catch return null },
+        .call => |call| blk: {
+            if (call.star or call.distinct or call.args.len != 1) break :blk null;
+            if (std.ascii.eqlIgnoreCase(call.name, "head")) break :blk .{ .input = call.args[0], .bounds = .{ .prefix = 1 } };
+            if (std.ascii.eqlIgnoreCase(call.name, "last")) break :blk .{ .input = call.args[0], .bounds = .{ .suffix = 1 } };
+            break :blk null;
+        },
+        .index => |index| if (negativeMagnitude(index.index)) |tail| .{ .input = index.base, .bounds = .{ .suffix = tail } } else .{ .input = index.base, .bounds = .{ .prefix = std.math.add(usize, nonnegative(index.index) orelse return null, 1) catch return null } },
         .slice => |slice| blk: {
+            if (slice.start) |start| if (negativeMagnitude(start)) |tail| {
+                if (slice.end) |end| _ = negativeMagnitude(end) orelse return null;
+                break :blk .{ .input = slice.base, .bounds = .{ .suffix = tail } };
+            };
             if (slice.start) |start| _ = nonnegative(start) orelse return null;
-            break :blk .{ .input = slice.base, .limit = nonnegative(slice.end orelse return null) orelse return null };
+            break :blk .{ .input = slice.base, .bounds = .{ .prefix = nonnegative(slice.end orelse return null) orelse return null } };
         },
         else => null,
     };
 }
-const Prefixes = struct {
+const CollectionDemands = struct {
     a: A,
     index: Index = .{},
-    limits: std.ArrayList(?usize) = .empty,
-    fn record(self: *@This(), expression: *const ast.Expr, limit: ?usize) !void {
+    limits: std.ArrayList(?Bounds) = .empty,
+    fn record(self: *@This(), expression: *const ast.Expr, limit: ?Bounds) !void {
         const slot = try self.index.intern(self.a, expression, self.limits.items.len);
         if (slot == self.limits.items.len) return self.limits.append(self.a, limit);
-        self.limits.items[slot] = if (self.limits.items[slot] != null and limit != null) @max(self.limits.items[slot].?, limit.?) else null;
+        self.limits.items[slot] = if (self.limits.items[slot] != null and limit != null) self.limits.items[slot].?.merge(limit.?) else null;
     }
     fn gather(self: *@This(), value: anytype) anyerror!void {
         const T = @TypeOf(value);
         if (T == *const ast.Expr) {
-            if (prefixConsumer(value)) |prefix| if (prefix.input.value == .call and std.ascii.eqlIgnoreCase(prefix.input.value.call.name, "collect")) {
-                try self.record(prefix.input, prefix.limit);
+            if (collectionConsumer(value)) |prefix| if (prefix.input.value == .call and std.ascii.eqlIgnoreCase(prefix.input.value.call.name, "collect")) {
+                try self.record(prefix.input, prefix.bounds);
                 return;
             };
             if (value.value == .call and std.ascii.eqlIgnoreCase(value.value.call.name, "collect")) return self.record(value, null);
@@ -226,7 +253,7 @@ const Cardinality = struct {
             else => {},
         }
     }
-    fn lower(self: *@This(), value: anytype, full: ?*const Index, prefixes: ?*const Prefixes) anyerror!@TypeOf(value) {
+    fn lower(self: *@This(), value: anytype, full: ?*const Index, prefixes: ?*const CollectionDemands) anyerror!@TypeOf(value) {
         const T = @TypeOf(value);
         if (T == *const ast.Expr) {
             var expression = if (self.rewrites) |rewrites| rewrites.get(value) orelse value.* else value.*;
@@ -238,7 +265,8 @@ const Cardinality = struct {
             }
             if (expression.value == .call and std.ascii.eqlIgnoreCase(expression.value.call.name, "collect")) {
                 if (prefixes) |plan| if (plan.index.find(value)) |slot| if (plan.limits.items[slot]) |limit| {
-                    expression.value.call.collect_limit = if (expression.value.call.collect_limit) |existing| @min(existing, limit) else limit;
+                    expression.value.call.collect_limit = if (expression.value.call.collect_limit) |existing| @min(existing, limit.prefix) else limit.prefix;
+                    expression.value.call.collect_suffix = if (value.value.call.collect_limit != null) @min(expression.value.call.collect_suffix, limit.suffix) else limit.suffix;
                 };
             }
             const nested = expression.value == .exists or expression.value == .pattern_comprehension;
@@ -263,7 +291,7 @@ const Cardinality = struct {
             },
             .@"struct" => |info| {
                 var collections: Index = .{};
-                var bounded: Prefixes = .{ .a = self.a };
+                var bounded: CollectionDemands = .{ .a = self.a };
                 const scope = if (T == ast.Projection) scope: {
                     try self.fullCollections(value, &collections);
                     break :scope &collections;
@@ -386,7 +414,7 @@ test "prefix planning combines consumers preserves full escapes and leaves publi
     const lowered = try lowerCardinality(a, compiled.query);
     var calls: Calls = .{};
     for (lowered.clauses[1].operation.project.value.items) |item| {
-        const input = prefixConsumer(item.expression).?.input;
+        const input = collectionConsumer(item.expression).?.input;
         try std.testing.expectEqual(@as(?usize, 3), input.value.call.collect_limit);
         try calls.append(a, input);
     }
@@ -394,7 +422,7 @@ test "prefix planning combines consumers preserves full escapes and leaves publi
     try std.testing.expect(compiled.query.clauses[1].operation.project.value.items[0].expression.value.call.args[0].value.call.collect_limit == null);
     for ([_][]const u8{
         "UNWIND [1] AS x RETURN head(collect(x)),collect(x)",
-        "UNWIND [1] AS x RETURN head(collect(x)),collect(x)[-1]",
+        "UNWIND [1] AS x RETURN head(collect(x)),collect(x)[..-1]",
         "UNWIND [1] AS x WITH collect(x) AS xs RETURN head(xs),size(xs)",
         "UNWIND [1] AS x WITH collect(x) AS xs RETURN head(xs),xs",
     }) |text| {

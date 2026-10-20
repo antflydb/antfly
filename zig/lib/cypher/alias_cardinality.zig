@@ -19,11 +19,12 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const expressions = @import("expressions.zig");
 const Index = @import("reduction.zig").Index;
+const Bounds = @import("reduction.zig").Bounds;
 const A = std.mem.Allocator;
 pub const Rewrites = std.AutoHashMapUnmanaged(*const ast.Expr, ast.Expr);
 const Names = std.StringHashMapUnmanaged(usize);
-const Candidate = struct { expression: *const ast.Expr, valid: bool = true, prefix: ?usize = null, uses: std.ArrayList(*const ast.Expr) = .empty };
-const Cohort = struct { members: std.ArrayList(usize) = .empty, full: bool = false, prefix: ?usize = null };
+const Candidate = struct { expression: *const ast.Expr, valid: bool = true, window: ?Bounds = null, uses: std.ArrayList(*const ast.Expr) = .empty };
+const Cohort = struct { members: std.ArrayList(usize) = .empty, full: bool = false, window: ?Bounds = null };
 const Flow = struct {
     a: A,
     source: []const u8,
@@ -59,15 +60,15 @@ const Flow = struct {
                     return self.scan(value, projection.names, locals, index);
                 };
             };
-            if (@import("reduction.zig").prefixConsumer(value)) |prefix| {
+            if (@import("reduction.zig").collectionConsumer(value)) |prefix| {
                 if (prefix.input.value == .variable) {
                     if (lookup(names, prefix.input.value.variable, locals)) |id| {
-                        self.candidates.items[id].prefix = @max(self.candidates.items[id].prefix orelse 0, prefix.limit);
+                        self.candidates.items[id].window = (self.candidates.items[id].window orelse Bounds{}).merge(prefix.bounds);
                         return;
                     }
                 } else if (index != null and prefix.input.value == .call and std.ascii.eqlIgnoreCase(prefix.input.value.call.name, "collect")) {
                     const slot = try self.cohort(index.?, prefix.input);
-                    self.cohorts.items[slot].prefix = @max(self.cohorts.items[slot].prefix orelse 0, prefix.limit);
+                    self.cohorts.items[slot].window = (self.cohorts.items[slot].window orelse Bounds{}).merge(prefix.bounds);
                     return self.scan(prefix.input.value.call.args, names, locals, index);
                 }
             }
@@ -187,19 +188,22 @@ const Flow = struct {
         for (self.cohorts.items) |cohort_| {
             var allowed = !cohort_.full;
             var used = false;
-            var prefix = cohort_.prefix;
+            var prefix = cohort_.window;
             for (cohort_.members.items) |id| {
-                if (self.candidates.items[id].prefix) |limit| prefix = @max(prefix orelse 0, limit);
+                if (self.candidates.items[id].window) |limit| prefix = (prefix orelse Bounds{}).merge(limit);
                 allowed = allowed and self.candidates.items[id].valid;
                 used = used or self.candidates.items[id].uses.items.len != 0;
             }
-            // Mixing cardinality and prefix demands needs both count and
+            // Mixing cardinality and window demands needs both count and
             // payload state; keep the complete list until that demand exists.
             if (!allowed or (used and prefix != null) or (!used and prefix == null)) continue;
             for (cohort_.members.items) |id| {
                 const original = self.candidates.items[id].expression;
                 var count = original.*;
-                if (prefix) |limit| count.value.call.collect_limit = limit else count.value.call.name = "count";
+                if (prefix) |limit| {
+                    count.value.call.collect_limit = limit.prefix;
+                    count.value.call.collect_suffix = limit.suffix;
+                } else count.value.call.name = "count";
                 try rewrites.put(self.a, original, count);
                 for (self.candidates.items[id].uses.items) |use| {
                     var scalar = use.*;
