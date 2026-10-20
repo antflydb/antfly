@@ -1,0 +1,26 @@
+--- a/zig/pkg/antfly-embedded/src/storage/lsm/table_file.zig
++++ b/zig/pkg/antfly-embedded/src/storage/lsm/table_file.zig
+@@ -3264,0 +3265,11 @@
++// Experimental single-input-hash derivation, paired with ABLOOM3 only.
++fn experimentalBloomHashPair(h1: u64) [2]u64 {
++    var h2 = h1;
++    h2 ^= h2 >> 30;
++    h2 *%= 0xbf58476d1ce4e5b9;
++    h2 ^= h2 >> 27;
++    h2 *%= 0x94d049bb133111eb;
++    h2 ^= h2 >> 31;
++    return .{ h1, h2 };
++}
++
+@@ -3266,4 +3277 @@
+-    return .{
+-        hashEntryWithSeed(0x243f6a8885a308d3, namespace_name, key),
+-        hashEntryWithSeed(0x13198a2e03707344, namespace_name, key),
+-    };
++    return experimentalBloomHashPair(hashEntryWithSeed(0x243f6a8885a308d3, namespace_name, key));
+@@ -3278,4 +3286 @@
+-    return .{
+-        hashEntryWithSeed(0x452821e638d01377, namespace_name, prefix),
+-        hashEntryWithSeed(0xbe5466cf34e90c6c, namespace_name, prefix),
+-    };
++    return experimentalBloomHashPair(hashEntryWithSeed(0x452821e638d01377, namespace_name, prefix));

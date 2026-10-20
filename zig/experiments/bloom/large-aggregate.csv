@@ -1,0 +1,13 @@
+kind,cache,workload,samples,median_ns,min_ns,max_ns,bloom_negatives
+baseline,off,warm_read_hits,3,7918.7,7097.54,9310.64,0
+baseline,off,warm_read_misses,3,258.27,239.18,265.64,2999994
+baseline,on,warm_read_hits,3,2570.85,2396.74,2659.47,0
+baseline,on,warm_read_misses,3,439.49,411.62,452.35,2999994
+optimized,off,warm_read_hits,3,7318.47,7048.45,9170.16,0
+optimized,off,warm_read_misses,3,263.39,259.23,286.0,2999994
+optimized,on,warm_read_hits,3,2440.98,2430.91,3082.27,0
+optimized,on,warm_read_misses,3,430.53,419.67,485.35,2999994
+split,off,warm_read_hits,3,7841.37,6951.52,9577.52,0
+split,off,warm_read_misses,3,247.62,211.55,273.87,2999994
+split,on,warm_read_hits,3,2998.48,2229.1,3186.76,0
+split,on,warm_read_misses,3,437.85,380.93,492.91,2999994

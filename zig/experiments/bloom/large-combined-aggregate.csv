@@ -1,0 +1,9 @@
+kind,cache,workload,samples,median_ns,min_ns,max_ns,bloom_negatives
+baseline,off,warm_read_hits,6,7726.945,7097.54,9310.64,0
+baseline,off,warm_read_misses,6,261.955,239.18,308.65,2999994
+baseline,on,warm_read_hits,6,2800.585,2396.74,3091.79,0
+baseline,on,warm_read_misses,6,457.95500000000004,411.62,493.55,2999994
+split,off,warm_read_hits,6,7368.785,6951.52,9577.52,0
+split,off,warm_read_misses,6,232.34,211.55,273.87,2999994
+split,on,warm_read_hits,6,2712.2799999999997,2229.1,3186.76,0
+split,on,warm_read_misses,6,433.995,380.93,492.91,2999994

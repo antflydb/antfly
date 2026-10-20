@@ -1,0 +1,7 @@
+Base commit: 70fb8dd0ba9b5fd2f6477dd2bc8d91adf4148b3a
+Branch: perf/blocked-bloom-experiment
+Compiler: Zig 0.17.0, ReleaseFast
+OS: macOS 27.0.1, arm64
+Timing: CLOCK_MONOTONIC, nanoseconds
+Host was concurrently running unrelated builds and tests.
+See each CSV for within-run timing ranges; use medians across runs.

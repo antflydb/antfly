@@ -28,6 +28,7 @@ const bench_namespace: backend_types.Namespace = .{ .name = "docs" };
 
 const Config = struct {
     samples: usize = 3,
+    in_range_misses: bool = false,
     keys: usize = 20_000,
     value_size: usize = 128,
     hit_repeats: usize = 5,
@@ -445,7 +446,7 @@ pub fn main(init: std.process.Init) !void {
     defer keys.deinit(alloc);
     const hit_keys = try shuffledKeys(alloc, keys.keys);
     defer alloc.free(hit_keys);
-    const misses = try makeKeys(alloc, "miss", cfg.keys);
+    const misses = if (cfg.in_range_misses) try makeInRangeMisses(alloc, keys.keys) else try makeKeys(alloc, "miss", cfg.keys);
     defer misses.deinit(alloc);
     const miss_keys = try shuffledKeys(alloc, misses.keys);
     defer alloc.free(miss_keys);
@@ -468,8 +469,9 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     try out.print(
-        "lsm backend bench samples={d} keys={d} value_size={d} hit_repeats={d} miss_repeats={d} short_scan_len={d} short_scan_repeats={d} full_scan_repeats={d} reopen_repeats={d} mixed_repeats={d} concurrent_read_threads={d} concurrent_read_keys={d} concurrent_read_repeats={d} storage={s} cache={s}\n",
+        "lsm backend bench in_range_misses={any} samples={d} keys={d} value_size={d} hit_repeats={d} miss_repeats={d} short_scan_len={d} short_scan_repeats={d} full_scan_repeats={d} reopen_repeats={d} mixed_repeats={d} concurrent_read_threads={d} concurrent_read_keys={d} concurrent_read_repeats={d} storage={s} cache={s}\n",
         .{
+            cfg.in_range_misses,
             cfg.samples,
             cfg.keys,
             cfg.value_size,
@@ -1060,7 +1062,9 @@ fn parseArgs(alloc: Allocator, proc_args: std.process.Args) !Config {
     _ = args.next();
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--samples")) {
+        if (std.mem.eql(u8, arg, "--in-range-misses")) {
+            cfg.in_range_misses = true;
+        } else if (std.mem.eql(u8, arg, "--samples")) {
             cfg.samples = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--keys")) {
             cfg.keys = try parseNextUsize(&args, arg);
@@ -1131,6 +1135,20 @@ fn parseNextUsize(args: *std.process.Args.Iterator, flag: []const u8) !usize {
         std.debug.print("invalid value for {s}: {s}\n", .{ flag, value });
         return error.InvalidArgument;
     };
+}
+
+// Missing suffixes fall between adjacent sorted document keys, so almost
+// every probe reaches Bloom filtering rather than stopping at the run bounds.
+fn makeInRangeMisses(allocator: Allocator, keys: []const []u8) !KeySet {
+    const misses = try allocator.alloc([]u8, keys.len);
+    errdefer allocator.free(misses);
+    var initialized: usize = 0;
+    errdefer for (misses[0..initialized]) |key| allocator.free(key);
+    for (keys, 0..) |key, i| {
+        misses[i] = try std.fmt.allocPrint(allocator, "{s}:missing", .{key});
+        initialized += 1;
+    }
+    return .{ .keys = misses };
 }
 
 fn makeKeys(allocator: Allocator, prefix: []const u8, count: usize) !KeySet {

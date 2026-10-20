@@ -1,0 +1,12 @@
+/bench
+/bench-0.17
+/lsm-baseline
+/lsm-optimized
+/*.o
+/results-initial.csv
+/results-zig017-1.csv
+/__pycache__/
+
+/lsm-split
+
+/lsm-onehash
