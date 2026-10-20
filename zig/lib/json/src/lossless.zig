@@ -22,28 +22,49 @@ const V = std.json.Value;
 
 pub fn parse(a: A, raw: []const u8) !std.json.Parsed(V) {
     var parsed = try std.json.parseFromSlice(V, a, raw, .{ .parse_numbers = false, .allocate = .alloc_always });
-    normalizeIntegers(&parsed.value);
+    errdefer parsed.deinit();
+    try normalizeIntegers(parsed.arena.allocator(), &parsed.value);
     return parsed;
 }
 
 /// All allocations belong to the caller's arena, including error-path scratch.
 pub fn parseLeaky(a: A, raw: []const u8) !V {
     var value = try std.json.parseFromSliceLeaky(V, a, raw, .{ .parse_numbers = false, .allocate = .alloc_always });
-    normalizeIntegers(&value);
+    try normalizeIntegers(a, &value);
     return value;
 }
 
-fn normalizeIntegers(value: *V) void {
-    switch (value.*) {
-        .number_string => |raw| {
-            if (std.mem.indexOfAny(u8, raw, ".eE") == null) {
-                if (std.fmt.parseInt(i64, raw, 10)) |integer| value.* = .{ .integer = integer } else |_| {}
-            }
-        },
-        .object => for (value.object.values()) |*child| normalizeIntegers(child),
-        .array => for (value.array.items) |*child| normalizeIntegers(child),
-        else => {},
+// Walk with heap-backed slices rather than recursion: JSON itself can nest
+// much deeper than a constrained schema, including in ignored reply fields.
+fn normalizeIntegers(a: A, value: *V) !void {
+    var root = [_]V{value.*};
+    var current: []V = &root;
+    var parents: std.ArrayList([]V) = .empty;
+    defer parents.deinit(a);
+    while (true) {
+        if (current.len == 0) {
+            current = parents.pop() orelse break;
+            continue;
+        }
+        const node = &current[0];
+        current = current[1..];
+        const children: []V = switch (node.*) {
+            .object => node.object.values(),
+            .array => node.array.items,
+            .number_string => |raw| blk: {
+                if (std.mem.indexOfAny(u8, raw, ".eE") == null) {
+                    if (std.fmt.parseInt(i64, raw, 10)) |integer| node.* = .{ .integer = integer } else |_| {}
+                }
+                break :blk &.{};
+            },
+            else => &.{},
+        };
+        if (children.len != 0) {
+            if (current.len != 0) try parents.append(a, current);
+            current = children;
+        }
     }
+    value.* = root[0];
 }
 
 test "lossless JSON retains decimals exponents and large integers through serialization" {
@@ -66,4 +87,18 @@ fn allocationSweep(a: A) !void {
 
 test "lossless JSON releases every failed owned parse" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationSweep, .{});
+}
+
+test "lossless JSON normalization handles deep untrusted nesting without call stack growth" {
+    const a = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(a);
+    try raw.appendNTimes(a, '[', 6000);
+    try raw.appendSlice(a, "1e-400");
+    try raw.appendNTimes(a, ']', 6000);
+    var parsed = try parse(a, raw.items);
+    defer parsed.deinit();
+    var value = parsed.value;
+    for (0..6000) |_| value = value.array.items[0];
+    try std.testing.expectEqualStrings("1e-400", value.number_string);
 }
