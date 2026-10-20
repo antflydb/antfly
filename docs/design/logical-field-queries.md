@@ -271,7 +271,7 @@ cold-storage or platform-parity qualification.
 
 Named `search_as_you_type` roots index complete Unicode word tokens with lowercase normalization. The bounded 2–20 character edge-prefix representation is an accelerator, not the root dictionary. Root prefix expansion remains available for one-character words, long prefixes, and full tokens beyond the accelerator window. Query analysis never expands edge n-grams. Generated shorthand mappings retain their independently verified shingle and prefix companions.
 
-Indexes created with earlier development builds of this PR used the prefix-only analyzer for named roots. Reindex those affected named representations before relying on long-token completeness; changing query normalization cannot recreate terms omitted at indexing time. This is a development-index migration, not a claim that existing prefix-only segments contain full tokens.
+Indexes built with the prior prefix-only named analyzer, including earlier development builds of this PR, require reindexing before relying on long-token completeness. Changing query/index normalization cannot recreate terms omitted from existing segments. The corrected named analyzer indexes complete root words; its former edge-prefix terms belong to the separate prefix accelerator.
 
 ### Bounded verification dataflow
 
@@ -318,3 +318,11 @@ window peak; it does not claim simultaneous process memory. Legacy components
 make the merged metric version zero rather than suggesting complete coverage.
 These counters make batching and projection observable through actual HTTP
 requests, rather than relying only on callback fixtures.
+
+[Scalable verification qualification](../../zig/pkg/antfly-grep/bench/results/logical-scalable-validation.json)
+records native/HTTP checks, the reproducible optimized baseline, per-run CPU,
+first-result latency, throughput, memory and batching/projection/window controls.
+It retains the initial observations and benchmark-settling correction. Linux uses
+a native ARM64 VM with a two-CPU quota; its selected-string control remains mixed.
+These are warm-cache observations, not independent physical Linux or cold-storage
+qualification.

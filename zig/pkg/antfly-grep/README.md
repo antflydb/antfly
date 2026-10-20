@@ -3750,3 +3750,86 @@ Evidence: [macOS namespace](bench/results/namespace-macos.json),
 [macOS native encoding control](bench/results/namespace-encoding-macos.json),
 [Linux native encoding control](bench/results/namespace-encoding-linux.json),
 [Linux nine-round repeat](bench/results/namespace-encoding-linux-repeat.json).
+
+### Scaling original-value verification
+
+Named autocomplete roots now retain whole lowercase Unicode words. The separate
+2–20 character prefix accelerator does not limit root-token length. Real-server
+regressions cover one-character words, 20/21-character prefixes, complete long
+words and near misses. Named representations built with the prior prefix-only
+analyzer, including earlier development builds of this PR, need reindexing to
+recreate omitted root terms.
+
+Retained predicate membership uses a byte-budgeted hash directory with hot/cold
+queues instead of a fixed 128-entry array. The old directory reproduced zero
+hits in a second sequential pass over 129 small entries despite using only
+54,180 bytes. Native stress checks now reuse all 129 and 4,096 entries; the latter
+peaks at 2,318,360 charged bytes. Directory capacity, immutable facts, retired
+pins and builders share the existing 16 MiB limit. This remains memory-only;
+authorization, snapshot admission and response hydration still do work.
+
+Indexed verification uses the existing source multi-read callback in adaptive
+windows, with an 8 MiB allocation ceiling and a conservative allocator-headroom
+check. Small sources retain the standard parser. Larger sources use a compiled
+field-path projection that validates all JSON while decoding only selected
+strings and path structure. It preserves array boundaries, duplicate-key
+rejection and matcher behavior. Unused deep structures use iterative validation;
+unsupported selected depth falls back to the ordinary parser. Refused windows
+shrink or use scalar reads, and speculative reads consume shared work budgets.
+Full-document caches never hold sparse projections.
+
+The opt-in HTTP benchmark records nine trials for tiny sources, large selected
+strings and large unused escaped arrays, checking exact results and verification
+counts in every trial. It records first-result latency, server-process CPU,
+throughput, sampled RSS/physical footprint and read/parse/window telemetry.
+
+```sh
+mkdir -p output
+ANTFLY_BIN=/path/to/optimized/antfly \
+ANTFLY_LOGICAL_SCALABLE_REPORT=output/logical-scalable.json \
+uv run --project zig/e2e/antfly pytest -q \
+  zig/e2e/antfly/test_grep_indexed.py -k logical_scalable_work_profile
+```
+
+Process environment controls `ANTFLY_BENCH_VALUE_SOURCE_SCALAR=1` and
+`ANTFLY_BENCH_VALUE_SOURCE_FULL_DOM=1` disable batching and projection independently
+for attribution. `ANTFLY_BENCH_VALUE_SOURCE_ROWS=2..64` holds window size fixed.
+These are internal benchmark controls, not public query or CLI options. The
+[design](../../../docs/design/logical-field-queries.md) specifies ownership,
+admission and profile-metric coverage.
+
+The [scalable verification report](bench/results/logical-scalable-validation.json)
+pins the implementation, compiler, both optimized server binaries, driver, baseline
+patch and every trial. Protocol 3 records process-CPU quiescence before timing,
+with elapsed-time and Linux CPU-tick tolerance. Earlier observations and the
+initial overly strict Linux settling failure are retained separately.
+
+Shared-host macOS, nine trials per workload, preserved optimized baseline versus
+the updated binary (the baseline already includes the initial cache/root fixes):
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| Tiny sources | 7.46 ms | 6.57 ms |
+| Large selected strings | 20.12 ms | 19.71 ms |
+| Large unused escaped arrays | 53.08 ms | 48.16 ms |
+
+Native ARM64 Linux in a two-CPU Docker VM uses within-binary attribution,
+not a historical Linux baseline:
+
+| Workload | Batching/projection disabled | Default |
+| --- | ---: | ---: |
+| Tiny sources | 11.83 ms | 9.42 ms |
+| Large selected strings | 26.23 ms | 28.36 ms |
+| Large unused escaped arrays | 67.66 ms | 48.77 ms |
+
+The Linux selected-string case is slower under the default than under the
+scalar and fixed-window controls; those controls and all initial observations
+remain in the report. The small macOS selected-string difference is comparable
+to variation across repeats. Process CPU and RSS are mixed, rather than uniform
+gains. The default source windows peak below 0.5 MiB in these corpora; that
+measures individual windows, not process RSS. Independent physical Linux, cold
+storage and larger production workloads remain unqualified.
+
+Profiles identify JSON decoding/validation as the main cost of these indexed
+workloads. This change extends no regex/JIT path; it makes no additional
+ripgrep/PCRE2 compatibility or local-search throughput claim.
