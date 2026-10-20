@@ -534,6 +534,66 @@ pub const GetNamespaceRelationalConstraintStatusPathParams = struct {
     table_name: []const u8,
 };
 
+/// listCurationProposals
+pub const NamespaceListCurationProposalsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+pub const NamespaceListCurationProposalsParams = struct {
+    state: ?[]const u8 = null,
+    action: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// proposeCuration
+pub const NamespaceProposeCurationPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for namespaceProposeCuration.
+pub fn parseNamespaceProposeCurationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getCurationProposal
+pub const NamespaceGetCurationProposalPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// acceptCurationProposal
+pub const NamespaceAcceptCurationProposalPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// Parse the JSON request body for namespaceAcceptCurationProposal.
+pub fn parseNamespaceAcceptCurationProposalBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalDecisionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalDecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// rejectCurationProposal
+pub const NamespaceRejectCurationProposalPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// Parse the JSON request body for namespaceRejectCurationProposal.
+pub fn parseNamespaceRejectCurationProposalBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalDecisionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalDecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Retrieve a document by key from an explicit namespace table
 pub const LookupNamespaceTableDocumentPathParams = struct {
     /// Database name
@@ -561,6 +621,19 @@ pub const NamespaceListEntityResolverStatePathParams = struct {
     key: []const u8,
 };
 
+/// pinEntitiesDistinct
+pub const NamespacePinEntitiesDistinctPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for namespacePinEntitiesDistinct.
+pub fn parseNamespacePinEntitiesDistinctBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntityDistinctRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntityDistinctRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// merge entity
 pub const NamespaceMergeEntityPathParams = struct {
     database_name: []const u8,
@@ -583,8 +656,8 @@ pub const NamespaceSuppressEntityPathParams = struct {
 };
 
 /// Parse the JSON request body for namespaceSuppressEntity.
-pub fn parseNamespaceSuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
-    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseNamespaceSuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntitySuppressRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntitySuppressRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// unmerge entity
@@ -1338,6 +1411,56 @@ pub const GetRelationalConstraintStatusPathParams = struct {
     table_name: []const u8,
 };
 
+/// listCurationProposals
+pub const ListCurationProposalsPathParams = struct {
+    table_name: []const u8,
+};
+
+pub const ListCurationProposalsParams = struct {
+    state: ?[]const u8 = null,
+    action: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// proposeCuration
+pub const ProposeCurationPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for proposeCuration.
+pub fn parseProposeCurationBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getCurationProposal
+pub const GetCurationProposalPathParams = struct {
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// acceptCurationProposal
+pub const AcceptCurationProposalPathParams = struct {
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// Parse the JSON request body for acceptCurationProposal.
+pub fn parseAcceptCurationProposalBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalDecisionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalDecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// rejectCurationProposal
+pub const RejectCurationProposalPathParams = struct {
+    table_name: []const u8,
+    proposal_id: []const u8,
+};
+
+/// Parse the JSON request body for rejectCurationProposal.
+pub fn parseRejectCurationProposalBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.CurationProposalDecisionRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.CurationProposalDecisionRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Adopt stored write destinations with the current credential
 pub const ReauthorizeTableDestinationsPathParams = struct {
     /// Name of the table whose stored destinations should be adopted
@@ -1414,6 +1537,17 @@ pub const ListEntityResolverStatePathParams = struct {
     key: []const u8,
 };
 
+/// pinEntitiesDistinct
+pub const PinEntitiesDistinctPathParams = struct {
+    table_name: []const u8,
+    key: []const u8,
+};
+
+/// Parse the JSON request body for pinEntitiesDistinct.
+pub fn parsePinEntitiesDistinctBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntityDistinctRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntityDistinctRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// merge entity
 pub const MergeEntityPathParams = struct {
     table_name: []const u8,
@@ -1432,8 +1566,8 @@ pub const SuppressEntityPathParams = struct {
 };
 
 /// Parse the JSON request body for suppressEntity.
-pub fn parseSuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.ResolverUnmergeRequest) {
-    return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseSuppressEntityBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_resolvers_openapi.EntitySuppressRequest) {
+    return std.json.parseFromSlice(antfly_resolvers_openapi.EntitySuppressRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// unmerge entity
@@ -2093,8 +2227,14 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire", .operation_id = "retireNamespaceRelationalConstraints", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry", .operation_id = "retryNamespaceRelationalConstraints", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status", .operation_id = "getNamespaceRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals", .operation_id = "namespaceListCurationProposals", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals", .operation_id = "namespaceProposeCuration", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}", .operation_id = "namespaceGetCurationProposal", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept", .operation_id = "namespaceAcceptCurationProposal", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject", .operation_id = "namespaceRejectCurationProposal", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}", .operation_id = "lookupNamespaceTableDocument", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects", .operation_id = "namespaceListEntityResolverState", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct", .operation_id = "namespacePinEntitiesDistinct", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge", .operation_id = "namespaceMergeEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress", .operation_id = "namespaceSuppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unmerge", .operation_id = "namespaceUnmergeEntity", .request_body = .buffered, .streaming_response = false },
@@ -2176,6 +2316,11 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/constraints/retire", .operation_id = "retireRelationalConstraints", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/constraints/retry", .operation_id = "retryRelationalConstraints", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/constraints/status", .operation_id = "getRelationalConstraintStatus", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/curation/proposals", .operation_id = "listCurationProposals", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/curation/proposals", .operation_id = "proposeCuration", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/curation/proposals/{proposalId}", .operation_id = "getCurationProposal", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/curation/proposals/{proposalId}:accept", .operation_id = "acceptCurationProposal", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/curation/proposals/{proposalId}:reject", .operation_id = "rejectCurationProposal", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/destination-authorization", .operation_id = "reauthorizeTableDestinations", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey", .request_body = .none, .streaming_response = false },
@@ -2183,6 +2328,7 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/entities/{key}/redirects", .operation_id = "listEntityResolverState", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:distinct", .operation_id = "pinEntitiesDistinct", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:merge", .operation_id = "mergeEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:suppress", .operation_id = "suppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:unmerge", .operation_id = "unmergeEntity", .request_body = .buffered, .streaming_response = false },
@@ -2314,8 +2460,14 @@ pub const routes = [_]Route{
 //   fn retireNamespaceRelationalConstraints(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn retryNamespaceRelationalConstraints(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn getNamespaceRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn namespaceListCurationProposals(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, params: NamespaceListCurationProposalsParams) !httpx.Response
+//   fn namespaceProposeCuration(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn namespaceGetCurationProposal(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response
+//   fn namespaceAcceptCurationProposal(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response
+//   fn namespaceRejectCurationProposal(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !httpx.Response
 //   fn lookupNamespaceTableDocument(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !httpx.Response
 //   fn namespaceListEntityResolverState(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn namespacePinEntitiesDistinct(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn namespaceMergeEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn namespaceSuppressEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn namespaceUnmergeEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
@@ -2397,6 +2549,11 @@ pub const routes = [_]Route{
 //   fn retireRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn retryRelationalConstraints(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getRelationalConstraintStatus(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listCurationProposals(self: *Impl, ctx: *httpx.Context, table_name: []const u8, params: ListCurationProposalsParams) !httpx.Response
+//   fn proposeCuration(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getCurationProposal(self: *Impl, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response
+//   fn acceptCurationProposal(self: *Impl, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response
+//   fn rejectCurationProposal(self: *Impl, ctx: *httpx.Context, table_name: []const u8, proposal_id: []const u8) !httpx.Response
 //   fn reauthorizeTableDestinations(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
@@ -2404,6 +2561,7 @@ pub const routes = [_]Route{
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn listEntityResolverState(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn pinEntitiesDistinct(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn mergeEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn suppressEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn unmergeEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response

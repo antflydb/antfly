@@ -120,7 +120,11 @@ const std = @import("std");
 /// including empty default-deny epochs and implicit USING write checks.
 /// Version 60 carries purpose-bound SQL RLS read/normalization capabilities
 /// and per-mutation command provenance through private prepare/journal bytes.
-pub const current_version: u16 = 60;
+/// Version 63 includes main's curation provenance, cascade dispositions,
+/// proposal queues and proposal-owned source-correction fences. Main's v37
+/// resolver floor cannot be reused: this branch already assigned that profile
+/// to earlier SQL catalog support that does not decode these resolver fields.
+pub const current_version: u16 = 63;
 pub const sql_row_policy_intent_version: u16 = 60;
 pub const sql_deferred_check_validation_version: u16 = 59;
 pub const initial_fk_checks_catalog_version: u16 = 59;
@@ -140,11 +144,11 @@ pub const index_publication_admission_version: u16 = 38;
 pub const checks_catalog_identity_version: u16 = 37;
 /// Decoder floor for occupancy-capable reconciliation and name admission.
 pub const constraint_occupancy_version: u16 = 36;
-pub const resolver_namespaces_version: u16 = 35;
+pub const resolver_namespaces_version: u16 = 63;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
-    return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null;
+    return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;

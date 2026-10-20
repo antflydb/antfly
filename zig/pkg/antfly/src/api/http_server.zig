@@ -14,6 +14,7 @@
 // limitations.
 
 const std = @import("std");
+const index_metadata = @import("antfly_local_sources").api_index_metadata;
 const join_planning = @import("join_planning.zig");
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const system_catalog_routes = @import("../system_catalog/routes.zig");
@@ -27619,11 +27620,25 @@ fn parseArtifactReprocessJobId(encoded_job_id: []const u8) !u64 {
     return std.fmt.parseUnsigned(u64, encoded_job_id, 10);
 }
 
-pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_common.Method, path: []const u8) !?RequiredPermission {
+/// HTTP methods as seen by RBAC. This is deliberately separate from the
+/// transport method enum so every routed verb, including HEAD and PATCH, needs
+/// an explicit permission decision in each `switch` below. A verb that is not
+/// routed on a path should fail closed rather than inherit another verb's
+/// "no permission required" arm.
+pub const AuthorizationMethod = enum { GET, HEAD, POST, PUT, PATCH, DELETE };
+
+fn isReadMethod(method: AuthorizationMethod) bool {
+    return switch (method) {
+        .GET, .HEAD => true,
+        .POST, .PUT, .PATCH, .DELETE => false,
+    };
+}
+
+pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: AuthorizationMethod, path: []const u8) !?RequiredPermission {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     if (try system_catalog_routes.parseAlloc(arena.allocator(), path)) |route| {
-        if (route.kind == .table and route.name == null and method == .GET) return null;
+        if (route.kind == .table and route.name == null and isReadMethod(method)) return null;
         const resource_type: usermgr.ResourceType = switch (route.kind) {
             .query_source, .view => .table,
             .database => .database,
@@ -27634,7 +27649,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         const resolver_route = if (route.kind == .table) @import("resolvers.zig").matchSuffix(route.suffix) else null;
         const resolver_read = if (resolver_route) |r| @import("resolvers.zig").readOnly(r.op) else false;
         const resolver_write = if (resolver_route) |r| r.op != .namespace else false;
-        const permission: usermgr.PermissionType = if (method == .GET or resolver_read or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (resolver_write or (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate")))) .write else .admin;
+        const permission: usermgr.PermissionType = if (isReadMethod(method) or resolver_read or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (resolver_write or (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate")))) .write else .admin;
         return .{ .resource_type = resource_type, .resource = try system_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
     }
 
@@ -27644,14 +27659,15 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         .permission_type = .write,
     };
     if (std.mem.eql(u8, path, routes.Routes.tables)) return switch (method) {
-        .GET, .POST, .PUT, .DELETE => null,
+        .GET, .HEAD, .POST, .PUT, .DELETE => null,
+        .PATCH => .{ .resource_type = .table, .resource = "*", .permission_type = .admin },
     };
     if (std.mem.startsWith(u8, path, "/tables/")) {
         const remainder = path["/tables/".len..];
         if (std.mem.indexOfScalar(u8, remainder, '/')) |separator| {
             const suffix = remainder[separator + 1 ..];
             if (std.mem.eql(u8, suffix, "lake/catalog") or std.mem.eql(u8, suffix, "lake/changes") or std.mem.eql(u8, suffix, "lake/maintenance") or std.mem.eql(u8, suffix, "lake/commits") or std.mem.startsWith(u8, suffix, "lake/commits/")) {
-                if (method == .GET or method == .POST) return try tablePermission(alloc, remainder[0..separator], if (method == .GET) .read else .admin);
+                if (isReadMethod(method) or method == .POST) return try tablePermission(alloc, remainder[0..separator], if (isReadMethod(method)) .read else .admin);
             }
         }
     }
@@ -27665,100 +27681,143 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (routes.Routes.matchRelationalConstraintRecovery(path)) |recovery| return try tablePermission(alloc, recovery.table_name, .admin);
     if (routes.Routes.matchTableIndexMaintenance(path)) |maintenance| return try tablePermission(alloc, maintenance.table_name, .admin);
     if (routes.Routes.matchTableDocumentArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
+        .PATCH => .admin,
         .POST, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableDocumentArtifact(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
+        .PATCH => .admin,
         .POST, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableDocumentArtifactReprocess(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactReprocessJobs(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactReprocessJob(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
+        .PATCH => .admin,
         .POST, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactReprocessJobAdvance(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactReprocessJobCancel(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactReprocess(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactRepair(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableStorageMigration(path)) |table| return try tablePermission(alloc, table.table_name, .admin);
     if (routes.Routes.matchTableStorageMigrationJob(path)) |job| return try tablePermission(alloc, job.table_name, .admin);
     if (routes.Routes.matchTableArtifactRepairRun(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableRepairJobs(path) orelse routes.Routes.matchTableRepairControlJobs(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableRepairJob(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
+        .PATCH => .admin,
         .POST, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableRepairJobAdvance(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableRepairJobCancel(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
-        .POST => .admin,
-        .GET, .PUT, .DELETE => return null,
+        .POST, .PATCH => .admin,
+        .GET, .HEAD, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
+        .PATCH => .admin,
         .POST, .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableArtifactEnrichment(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
-        .PUT, .DELETE => .admin,
-        .GET, .POST => return null,
+        .PUT, .PATCH, .DELETE => .admin,
+        .GET, .HEAD, .POST => return null,
     });
     if (routes.Routes.matchTablePath(path)) |table_path| {
         return try tablePermission(alloc, table_path.table_name, switch (method) {
-            .GET => .read,
-            .POST, .PUT, .DELETE => .admin,
+            .GET, .HEAD => .read,
+            .POST, .PUT, .PATCH, .DELETE => .admin,
         });
     }
     if (routes.Routes.matchTableBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
     if (routes.Routes.matchTableMerge(path)) |merge| return try tablePermission(alloc, merge.table_name, .write);
     if (routes.Routes.matchTableSchema(path)) |schema| return try tablePermission(alloc, schema.table_name, .admin);
-    if (@import("resolvers.zig").matchTablePath(path)) |r| return try tablePermission(alloc, r.table_name, if (method == .GET or @import("resolvers.zig").readOnly(r.op)) .read else if (r.op == .namespace) .admin else .write);
+    if (@import("resolvers.zig").matchTablePath(path)) |r| return try tablePermission(alloc, r.table_name, if (isReadMethod(method) or @import("resolvers.zig").readOnly(r.op)) .read else if (r.op == .namespace) .admin else .write);
     if (routes.Routes.matchTableGraphMetricAction(path)) |metric_action| return switch (method) {
-        .POST => try tablePermission(alloc, metric_action.table_name, .admin),
-        .GET, .PUT, .DELETE => null,
+        .POST, .PATCH => try tablePermission(alloc, metric_action.table_name, .admin),
+        .GET, .HEAD, .PUT, .DELETE => null,
     };
     if (routes.Routes.matchTableIndexes(path)) |indexes| return try tablePermission(alloc, indexes.table_name, switch (method) {
-        .GET => .read,
-        .POST => .admin,
+        .GET, .HEAD => .read,
+        .POST, .PATCH => .admin,
         .PUT, .DELETE => return null,
     });
     if (routes.Routes.matchTableIndex(path)) |index| return try tablePermission(alloc, index.table_name, switch (method) {
-        .GET => .read,
+        .GET, .HEAD => .read,
         .DELETE => .admin,
-        .POST => .admin,
+        .POST, .PATCH => .admin,
         .PUT => return null,
     });
     if (routes.Routes.matchTableBackup(path)) |table_backup| return try tablePermission(alloc, table_backup.table_name, .admin);
     if (routes.Routes.matchTableRestore(path)) |table_restore| return try tablePermission(alloc, table_restore.table_name, .admin);
     if (tableNameForGraphPath(path)) |table_name| return try tablePermission(alloc, table_name, .read);
     return null;
+}
+
+test "PATCH fails closed and HEAD mirrors GET table permissions" {
+    const alloc = std.testing.allocator;
+    const paths = [_][]const u8{
+        "/tables/docs",
+        "/tables/docs/schema",
+        "/tables/docs/indexes",
+        "/tables/docs/indexes/title",
+        "/tables/docs/artifacts",
+        "/tables/docs/repair/jobs",
+        "/tables/docs/repair/jobs/42",
+        "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1",
+        "/databases/analytics/namespaces/public/tables/docs/schema",
+    };
+    for (paths) |path| {
+        const patch = (try requiredPermissionForRequest(alloc, .PATCH, path)) orelse {
+            std.debug.print("PATCH {s} required no permission\n", .{path});
+            return error.TestUnexpectedResult;
+        };
+        defer patch.deinit(alloc);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, patch.permission_type);
+
+        const get = try requiredPermissionForRequest(alloc, .GET, path);
+        defer if (get) |required| required.deinit(alloc);
+        const head = try requiredPermissionForRequest(alloc, .HEAD, path);
+        defer if (head) |required| required.deinit(alloc);
+        try std.testing.expectEqual(get == null, head == null);
+        if (get) |get_required| {
+            try std.testing.expectEqualStrings(get_required.resource, head.?.resource);
+            try std.testing.expectEqual(get_required.permission_type, head.?.permission_type);
+        }
+    }
+
+    const tables_patch = (try requiredPermissionForRequest(alloc, .PATCH, routes.Routes.tables)).?;
+    defer tables_patch.deinit(alloc);
+    try std.testing.expectEqualStrings("*", tables_patch.resource);
+    try std.testing.expectEqual(usermgr.PermissionType.admin, tables_patch.permission_type);
 }
 
 test "destination authorization adoption requires source table admin" {
@@ -28234,7 +28293,7 @@ fn graphResolverValueDestinationsAllowed(
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 if (!(try graphResolverValueDestinationsAllowed(authenticated_identity, entry.value_ptr.*))) return false;
             }
         },
@@ -28501,7 +28560,7 @@ test "document artifact routes declare read and admin permissions" {
         try std.testing.expectEqualStrings("docs", required.resource);
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
-    inline for (.{ http_common.Method.GET, http_common.Method.POST }) |method| {
+    inline for (.{ AuthorizationMethod.GET, AuthorizationMethod.POST }) |method| {
         const required = (try requiredPermissionForRequest(std.testing.allocator, method, "/tables/docs/storage/migrations/job")).?;
         defer required.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("docs", required.resource);
@@ -58328,6 +58387,30 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/race\",\"to\":\"concept/target\"}", 409);
     try std.testing.expectEqual(@as(u64, 0), source.commits);
     source.destination_cut_changed = false;
+    {
+        // Creating a proposal is queue-only, but establishes destination-owned
+        // judgments. Source-only edits cannot bypass that authority before the
+        // first entity action has materialized a namespace policy.
+        var queued = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/queued\"}", "", .{});
+        defer queued.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), queued.status);
+        try std.testing.expect(std.mem.indexOf(u8, source.tables[1].indexes_json, "_resolver_namespaces") == null);
+        const before_guard = source.commits;
+        for ([_]StatusSource{ source.iface(), source.narrowIface() }) |iface| {
+            source.forbid_snapshot = false;
+            server.source = iface;
+            try Run.call(&server, .suppress, "source", "concepts", "", "{\"keys\":[\"concept/queued\"]}", 409);
+        }
+        try std.testing.expectEqual(before_guard, source.commits);
+        // Remove only this isolated fixture's queue; the legacy-path checks
+        // below start from their original empty destination catalog.
+        if (source.owned[1]) |bytes| alloc.free(bytes);
+        source.owned[1] = null;
+        source.tables[1].indexes_json = "{}";
+        source.commits = 0;
+        source.forbid_snapshot = true;
+        server.source = source.narrowIface();
+    }
     try Run.call(&server, .list, "source", "", "", "", 200);
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
@@ -58523,6 +58606,135 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try std.testing.expect(std.mem.indexOf(u8, timed_out.body, "\"changed\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, timed_out.body, "\"applied\":false") != null);
     try Run.call(&server, .get, "source", "concepts", "", "", 200);
+    // Entity proposals share the destination CAS, preserving evidence and
+    // terminal history while queue-only edits leave policy revisions alone.
+    {
+        const before = source.commits;
+        var created = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"merge\",\"key\":\"concept/review-a\",\"into\":\"concept/review-b\",\"actor\":\"judge\",\"evidence\":{\"resolvers\":[{\"invalid\":true}]}}", "", .{});
+        defer created.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), created.status);
+        try std.testing.expectEqual(before + 1, source.commits);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, created.body, .{});
+        defer parsed.deinit();
+        const proposal_id = parsed.value.object.get("id").?.string;
+        const before_retry = source.commits;
+        try Run.call(&server, .proposal_create, "entities", "", "", "{\"action\":\"merge\",\"key\":\"concept/review-a\",\"into\":\"concept/review-b\"}", 200);
+        try std.testing.expectEqual(before_retry, source.commits);
+        var accepted = try resources.handle(&server, alloc, .proposal_accept, "entities", "", proposal_id, "{\"actor\":\"curator\",\"reason\":\"confirmed\"}", "", .{});
+        defer accepted.deinit(alloc);
+        if (accepted.status != 202) std.debug.print("proposal accept {d}: {s}\n", .{ accepted.status, accepted.body });
+        try std.testing.expectEqual(@as(u16, 202), accepted.status);
+        try std.testing.expectEqual(before_retry + 1, source.commits);
+        try std.testing.expect(std.mem.indexOf(u8, accepted.body, "\"state\":\"accepted\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source.tables[1].indexes_json, "\"origin\":\"review\"") != null);
+        try Run.call(&server, .entity_suppress, "entities", "", "concept/review-b", "{}", 400);
+        var cascade = try resources.handle(&server, alloc, .entity_suppress, "entities", "", "concept/review-b", "{\"absorbed\":\"suppress\",\"actor\":\"user\"}", "", .{});
+        defer cascade.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), cascade.status);
+        try std.testing.expect(std.mem.indexOf(u8, cascade.body, "\"disposition\":\"suppress\"") != null);
+        const before_terminal = source.commits;
+        var retried = try resources.handle(&server, alloc, .proposal_accept, "entities", "", proposal_id, "{}", "", .{});
+        defer retried.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), retried.status);
+        const retry_result = try std.json.parseFromSlice(std.json.Value, alloc, retried.body, .{});
+        defer retry_result.deinit();
+        try std.testing.expect(!retry_result.value.object.get("changed").?.bool);
+        try std.testing.expect(!retry_result.value.object.get("applied").?.bool);
+        try std.testing.expectEqual(@as(usize, 1), retry_result.value.object.get("results").?.array.items.len);
+        // The retry observes today's policy after a subsequent cascade. It
+        // must not restore the accepted proposal's now-removed redirect.
+        try std.testing.expect(std.mem.indexOf(u8, source.tables[1].indexes_json, "\"cascade_from\":\"concept/review-b\"") != null);
+        // Terminal observation keeps only compact identities across 32 MiB
+        // of paged schemas, using the same 16 MiB budget as direct curation.
+        server.source = source.narrowIface();
+        source.forbid_snapshot = true;
+        source.stress_pages = 64;
+        var bounded_retry = try resources.handle(&server, budget.allocator(), .proposal_accept, "entities", "", proposal_id, "{}", "", .{});
+        try std.testing.expectEqual(@as(u16, 202), bounded_retry.status);
+        const bounded_replay = try std.json.parseFromSlice(std.json.Value, alloc, bounded_retry.body, .{});
+        defer bounded_replay.deinit();
+        try std.testing.expectEqual(@as(usize, 64), bounded_replay.value.object.get("results").?.array.items.len);
+        bounded_retry.deinit(budget.allocator());
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        source.stress_pages = 0;
+        source.forbid_snapshot = false;
+        server.source = source.iface();
+        source.expire_wait = true;
+        var waited = try resources.handle(&server, alloc, .proposal_accept, "entities", "", proposal_id, "{\"wait\":{\"timeout_ms\":100}}", "", .{});
+        defer waited.deinit(alloc);
+        source.expire_wait = false;
+        try std.testing.expectEqual(@as(u16, 202), waited.status);
+        try std.testing.expect(std.mem.indexOf(u8, waited.body, "DeadlineExceeded") != null);
+        try Run.call(&server, .proposal_accept, "entities", "", proposal_id, "{\"wait\":{\"timeout_ms\":0}}", 400);
+        try std.testing.expectEqual(before_terminal, source.commits);
+        try Run.call(&server, .proposal_reject, "entities", "", proposal_id, "{}", 409);
+        var denied_proposal = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/forbidden\"}", "", .{ .principal = .{ .kind = .user, .subject = "limited" }, .table_write_authorization = .{ .ptr = &authority_context, .allows = Denied.allows } });
+        defer denied_proposal.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 403), denied_proposal.status);
+        try std.testing.expectEqual(before_terminal, source.commits);
+        var screened = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/screened\"}", "", .{});
+        defer screened.deinit(alloc);
+        const screening = try std.json.parseFromSlice(std.json.Value, alloc, screened.body, .{});
+        defer screening.deinit();
+        const screen_id = screening.value.object.get("id").?.string;
+        const before_reject = source.commits;
+        var rejected = try resources.handle(&server, alloc, .proposal_reject, "entities", "", screen_id, "{\"reason\":\"specific project term\"}", "", .{});
+        defer rejected.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), rejected.status);
+        const rejection = try std.json.parseFromSlice(std.json.Value, alloc, rejected.body, .{});
+        defer rejection.deinit();
+        try std.testing.expectEqualStrings("rejected", rejection.value.object.get("proposal").?.object.get("state").?.string);
+        try std.testing.expect(rejection.value.object.get("changed").?.bool);
+        try std.testing.expect(rejection.value.object.get("complete").?.bool);
+        try std.testing.expect(rejection.value.object.get("applied").?.bool);
+        try std.testing.expectEqual(@as(usize, 0), rejection.value.object.get("results").?.array.items.len);
+        try std.testing.expectEqual(before_reject + 1, source.commits);
+        var reject_retry = try resources.handle(&server, alloc, .proposal_reject, "entities", "", screen_id, "{}", "", .{});
+        defer reject_retry.deinit(alloc);
+        const reject_receipt = try std.json.parseFromSlice(std.json.Value, alloc, reject_retry.body, .{});
+        defer reject_receipt.deinit();
+        try std.testing.expectEqual(@as(u16, 200), reject_retry.status);
+        try std.testing.expect(!reject_receipt.value.object.get("changed").?.bool);
+        try std.testing.expect(reject_receipt.value.object.get("applied").?.bool);
+        try std.testing.expectEqualStrings("specific project term", reject_receipt.value.object.get("proposal").?.object.get("decided").?.object.get("reason").?.string);
+        try std.testing.expectEqual(before_reject + 1, source.commits);
+        // A pinned rejection has policy replay even when the retry body
+        // omits pin_distinct. Its durable decision, not this body, owns that.
+        var pin_created = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"merge\",\"key\":\"concept/pin-a\",\"into\":\"concept/pin-b\"}", "", .{});
+        defer pin_created.deinit(alloc);
+        const pin_record = try std.json.parseFromSlice(std.json.Value, alloc, pin_created.body, .{});
+        defer pin_record.deinit();
+        const pin_id = pin_record.value.object.get("id").?.string;
+        try Run.call(&server, .proposal_reject, "entities", "", pin_id, "{\"pin_distinct\":true}", 202);
+        const before_pin_retry = source.commits;
+        var pin_retry = try resources.handle(&server, alloc, .proposal_reject, "entities", "", pin_id, "{}", "", .{});
+        defer pin_retry.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), pin_retry.status);
+        const pin_receipt = try std.json.parseFromSlice(std.json.Value, alloc, pin_retry.body, .{});
+        defer pin_receipt.deinit();
+        try std.testing.expectEqualStrings("rejected", pin_receipt.value.object.get("proposal").?.object.get("state").?.string);
+        try std.testing.expect(!pin_receipt.value.object.get("applied").?.bool);
+        try std.testing.expectEqual(@as(usize, 1), pin_receipt.value.object.get("results").?.array.items.len);
+        try std.testing.expectEqual(before_pin_retry, source.commits);
+        var repeated = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/screened\"}", "", .{});
+        defer repeated.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, repeated.body, "\"state\":\"rejected\"") != null);
+        var proposed_direct = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/direct\"}", "", .{});
+        defer proposed_direct.deinit(alloc);
+        const direct = try std.json.parseFromSlice(std.json.Value, alloc, proposed_direct.body, .{});
+        defer direct.deinit();
+        const direct_id = direct.value.object.get("id").?.string;
+        try Run.call(&server, .entity_suppress, "entities", "", "concept/direct", "{\"actor\":\"user\"}", 202);
+        var superseded = try resources.handle(&server, alloc, .proposal, "entities", "", direct_id, "", "", .{});
+        defer superseded.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, superseded.body, "\"state\":\"superseded\"") != null);
+        var listed = try resources.handle(&server, alloc, .proposals, "entities", "", "", "", "state=all&limit=1", .{});
+        defer listed.deinit(alloc);
+        const page = try std.json.parseFromSlice(std.json.Value, alloc, listed.body, .{});
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.value.object.get("proposals").?.array.items.len);
+        try std.testing.expect(page.value.object.get("next_cursor").? != .null);
+    }
     const retired = (try indexes_api.removeIndexFromTableIndexesJson(alloc, source.tables[0].indexes_json, "knowledge")).?;
     defer alloc.free(retired);
     _ = try Source.replace(&source, source.tables[0], blk: {
@@ -58780,4 +58992,16 @@ test "external lake read refresh hints coalesce without superseding active publi
     try std.testing.expect(server.index_installation_queue.items[0].generation != generation);
     try std.testing.expectEqual(@as(u8, 0), server.index_installation_queue.items[0].failures);
     try std.testing.expectEqual(@as(u64, 0), server.index_installation_queue.items[0].retry_after_ns);
+}
+
+test "resolver curation HTTP destination checks ignore opaque control metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const payload = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"_curation_proposals":{"resolvers":"invalid evidence"},"_resolver_curation":{"resolvers":[{"table":"protected"}]},"_resolver_namespaces":{"resolvers":false}}
+    , .{});
+    try std.testing.expect(try graphResolverValueDestinationsAllowed(null, payload));
+    const actual = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"graph\":{\"resolvers\":false}}", .{});
+    try std.testing.expectError(error.InvalidCreateTableRequest, graphResolverValueDestinationsAllowed(null, actual));
 }

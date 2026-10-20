@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const std = @import("std");
+pub const index_metadata = @import("index_metadata.zig");
 pub const db_mod = @import("../storage/db/selected_root.zig").db;
 pub const managed_embedder = @import("../inference/managed_embedder.zig");
 pub const document_content_hash = @import("../storage/db/document_content_hash.zig");
@@ -89,7 +90,7 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 try collectArtifactEnrichmentsFromValueWithOptions(alloc, entry.value_ptr.*, embedding_options, out);
             }
         },
@@ -245,7 +246,7 @@ pub fn indexesJsonSource(indexes_json: []const u8) []const u8 {
 }
 
 pub fn isReservedIndexMetadataEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments") or std.mem.eql(u8, name, "_resolver_curation") or std.mem.eql(u8, name, "_resolver_namespaces");
+    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments") or index_metadata.isOpaqueEntry(name);
 }
 
 fn optionalPriorContextsEqual(alloc: std.mem.Allocator, a: ?@import("../storage/db/group_sources.zig").PriorContext, b: ?@import("../storage/db/group_sources.zig").PriorContext) !bool {

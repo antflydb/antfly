@@ -230,6 +230,23 @@ from .created_provider_config import CreatedProviderConfig
 from .created_relational_index import CreatedRelationalIndex
 from .created_relational_index_type import CreatedRelationalIndexType
 from .credentials import Credentials
+from .curation_origin import CurationOrigin
+from .curation_origin_origin import CurationOriginOrigin
+from .curation_proposal import CurationProposal
+from .curation_proposal_action import CurationProposalAction
+from .curation_proposal_decision_request import CurationProposalDecisionRequest
+from .curation_proposal_decision_result import CurationProposalDecisionResult
+from .curation_proposal_decision_result_atomicity import CurationProposalDecisionResultAtomicity
+from .curation_proposal_decision_result_results_item import CurationProposalDecisionResultResultsItem
+from .curation_proposal_evidence_type_0 import CurationProposalEvidenceType0
+from .curation_proposal_options import CurationProposalOptions
+from .curation_proposal_options_absorbed import CurationProposalOptionsAbsorbed
+from .curation_proposal_page import CurationProposalPage
+from .curation_proposal_request import CurationProposalRequest
+from .curation_proposal_request_action import CurationProposalRequestAction
+from .curation_proposal_request_evidence_type_0 import CurationProposalRequestEvidenceType0
+from .curation_proposal_state import CurationProposalState
+from .curation_suppression_entry import CurationSuppressionEntry
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .database_catalog_record import DatabaseCatalogRecord
@@ -347,8 +364,15 @@ from .enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStall
 from .entity_curation_result import EntityCurationResult
 from .entity_curation_result_atomicity import EntityCurationResultAtomicity
 from .entity_curation_result_results_item import EntityCurationResultResultsItem
+from .entity_curation_result_results_item_absorbed_item import EntityCurationResultResultsItemAbsorbedItem
+from .entity_curation_result_results_item_absorbed_item_disposition import (
+    EntityCurationResultResultsItemAbsorbedItemDisposition,
+)
 from .entity_curation_result_results_item_curation import EntityCurationResultResultsItemCuration
+from .entity_distinct_request import EntityDistinctRequest
 from .entity_merge_request import EntityMergeRequest
+from .entity_suppress_request import EntitySuppressRequest
+from .entity_suppress_request_absorbed import EntitySuppressRequestAbsorbed
 from .error import Error
 from .eval_config import EvalConfig
 from .eval_options import EvalOptions
@@ -1411,6 +1435,7 @@ from .row_filter_entry_filter import RowFilterEntryFilter
 from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
+from .runtime_resolver_suppression import RuntimeResolverSuppression
 from .saved_query_source import SavedQuerySource
 from .scan_keys_request import ScanKeysRequest
 from .scoped_row_filter import ScopedRowFilter
@@ -1879,6 +1904,23 @@ __all__ = (
     "CreateUserRequest",
     "CreateUserRequestMetadataType0",
     "Credentials",
+    "CurationOrigin",
+    "CurationOriginOrigin",
+    "CurationProposal",
+    "CurationProposalAction",
+    "CurationProposalDecisionRequest",
+    "CurationProposalDecisionResult",
+    "CurationProposalDecisionResultAtomicity",
+    "CurationProposalDecisionResultResultsItem",
+    "CurationProposalEvidenceType0",
+    "CurationProposalOptions",
+    "CurationProposalOptionsAbsorbed",
+    "CurationProposalPage",
+    "CurationProposalRequest",
+    "CurationProposalRequestAction",
+    "CurationProposalRequestEvidenceType0",
+    "CurationProposalState",
+    "CurationSuppressionEntry",
     "DatabaseCatalogRecord",
     "DataShapeDecl",
     "DataShapeKind",
@@ -1994,8 +2036,13 @@ __all__ = (
     "EntityCurationResult",
     "EntityCurationResultAtomicity",
     "EntityCurationResultResultsItem",
+    "EntityCurationResultResultsItemAbsorbedItem",
+    "EntityCurationResultResultsItemAbsorbedItemDisposition",
     "EntityCurationResultResultsItemCuration",
+    "EntityDistinctRequest",
     "EntityMergeRequest",
+    "EntitySuppressRequest",
+    "EntitySuppressRequestAbsorbed",
     "Error",
     "EvalConfig",
     "EvalOptions",
@@ -3046,6 +3093,7 @@ __all__ = (
     "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
+    "RuntimeResolverSuppression",
     "SavedQuerySource",
     "ScanKeysRequest",
     "ScopedRowFilter",

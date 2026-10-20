@@ -223,6 +223,13 @@ pub const CreateNamespaceTableResponse = union(enum) {
     }
 };
 
+pub const NamespaceListCurationProposalsParams = struct {
+    state: ?[]const u8 = null,
+    action: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
 pub const LookupNamespaceTableDocumentParams = struct {
     /// Comma-separated list of fields to include in the response.
     fields: ?[]const u8 = null,
@@ -400,6 +407,13 @@ pub const CreateTableResponse = union(enum) {
         };
         return .{ .arena = arena, .value = value };
     }
+};
+
+pub const ListCurationProposalsParams = struct {
+    state: ?[]const u8 = null,
+    action: ?[]const u8 = null,
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
 };
 
 pub const LookupKeyParams = struct {
@@ -1897,6 +1911,133 @@ pub const Client = struct {
         return ApiResponse(types.RelationalConstraintStatus).fromResponse(self.allocator, &resp);
     }
 
+    /// listCurationProposals
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals
+    pub fn namespaceListCurationProposals(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, params: NamespaceListCurationProposalsParams) !ApiResponse(types.CurationProposalPage) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/curation/proposals", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.state) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "state=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.action) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "action=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// proposeCuration
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals
+    pub fn namespaceProposeCuration(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.CurationProposalRequest) !ApiResponse(types.CurationProposal) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/curation/proposals", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposal).fromResponse(self.allocator, &resp);
+    }
+
+    /// getCurationProposal
+    /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}
+    pub fn namespaceGetCurationProposal(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8) !ApiResponse(types.CurationProposal) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/curation/proposals/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposal).fromResponse(self.allocator, &resp);
+    }
+
+    /// acceptCurationProposal
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept
+    pub fn namespaceAcceptCurationProposal(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8, body: types.CurationProposalDecisionRequest) !ApiResponse(types.CurationProposalDecisionResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/curation/proposals/{s}:accept", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalDecisionResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// rejectCurationProposal
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject
+    pub fn namespaceRejectCurationProposal(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, proposal_id: []const u8, body: types.CurationProposalDecisionRequest) !ApiResponse(types.CurationProposalDecisionResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/curation/proposals/{s}:reject", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalDecisionResult).fromResponse(self.allocator, &resp);
+    }
+
     /// Retrieve a document by key from an explicit namespace table
     /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}
     pub fn lookupNamespaceTableDocument(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
@@ -1955,6 +2096,25 @@ pub const Client = struct {
         return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
     }
 
+    /// pinEntitiesDistinct
+    /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct
+    pub fn namespacePinEntitiesDistinct(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, body: types.EntityDistinctRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/entities/{s}:distinct", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
     /// merge entity
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge
     pub fn namespaceMergeEntity(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, body: types.EntityMergeRequest) !ApiResponse(types.EntityCurationResult) {
@@ -1976,7 +2136,7 @@ pub const Client = struct {
 
     /// suppress entity
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress
-    pub fn namespaceSuppressEntity(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, body: types.ResolverUnmergeRequest) !ApiResponse(types.EntityCurationResult) {
+    pub fn namespaceSuppressEntity(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, body: types.EntitySuppressRequest) !ApiResponse(types.EntityCurationResult) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
@@ -3294,6 +3454,113 @@ pub const Client = struct {
         return ApiResponse(types.RelationalConstraintStatus).fromResponse(self.allocator, &resp);
     }
 
+    /// listCurationProposals
+    /// GET /db/v1/tables/{tableName}/curation/proposals
+    pub fn listCurationProposals(self: *@This(), table_name: []const u8, params: ListCurationProposalsParams) !ApiResponse(types.CurationProposalPage) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/curation/proposals", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.state) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "state=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.action) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "action=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// proposeCuration
+    /// POST /db/v1/tables/{tableName}/curation/proposals
+    pub fn proposeCuration(self: *@This(), table_name: []const u8, body: types.CurationProposalRequest) !ApiResponse(types.CurationProposal) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/curation/proposals", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposal).fromResponse(self.allocator, &resp);
+    }
+
+    /// getCurationProposal
+    /// GET /db/v1/tables/{tableName}/curation/proposals/{proposalId}
+    pub fn getCurationProposal(self: *@This(), table_name: []const u8, proposal_id: []const u8) !ApiResponse(types.CurationProposal) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/curation/proposals/{s}", .{ self.base_url, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposal).fromResponse(self.allocator, &resp);
+    }
+
+    /// acceptCurationProposal
+    /// POST /db/v1/tables/{tableName}/curation/proposals/{proposalId}:accept
+    pub fn acceptCurationProposal(self: *@This(), table_name: []const u8, proposal_id: []const u8, body: types.CurationProposalDecisionRequest) !ApiResponse(types.CurationProposalDecisionResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/curation/proposals/{s}:accept", .{ self.base_url, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalDecisionResult).fromResponse(self.allocator, &resp);
+    }
+
+    /// rejectCurationProposal
+    /// POST /db/v1/tables/{tableName}/curation/proposals/{proposalId}:reject
+    pub fn rejectCurationProposal(self: *@This(), table_name: []const u8, proposal_id: []const u8, body: types.CurationProposalDecisionRequest) !ApiResponse(types.CurationProposalDecisionResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_proposal_id = try httpx.PercentEncoding.encode(self.allocator, proposal_id);
+        defer self.allocator.free(encoded_proposal_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/curation/proposals/{s}:reject", .{ self.base_url, encoded_table_name, encoded_proposal_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.CurationProposalDecisionResult).fromResponse(self.allocator, &resp);
+    }
+
     /// Adopt stored write destinations with the current credential
     /// POST /db/v1/tables/{tableName}/destination-authorization
     pub fn reauthorizeTableDestinations(self: *@This(), table_name: []const u8) !ApiResponse(std.json.Value) {
@@ -3447,6 +3714,21 @@ pub const Client = struct {
         return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
     }
 
+    /// pinEntitiesDistinct
+    /// POST /db/v1/tables/{tableName}/entities/{key}:distinct
+    pub fn pinEntitiesDistinct(self: *@This(), table_name: []const u8, key: []const u8, body: types.EntityDistinctRequest) !ApiResponse(types.EntityCurationResult) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/entities/{s}:distinct", .{ self.base_url, encoded_table_name, encoded_key });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.EntityCurationResult).fromResponse(self.allocator, &resp);
+    }
+
     /// merge entity
     /// POST /db/v1/tables/{tableName}/entities/{key}:merge
     pub fn mergeEntity(self: *@This(), table_name: []const u8, key: []const u8, body: types.EntityMergeRequest) !ApiResponse(types.EntityCurationResult) {
@@ -3464,7 +3746,7 @@ pub const Client = struct {
 
     /// suppress entity
     /// POST /db/v1/tables/{tableName}/entities/{key}:suppress
-    pub fn suppressEntity(self: *@This(), table_name: []const u8, key: []const u8, body: types.ResolverUnmergeRequest) !ApiResponse(types.EntityCurationResult) {
+    pub fn suppressEntity(self: *@This(), table_name: []const u8, key: []const u8, body: types.EntitySuppressRequest) !ApiResponse(types.EntityCurationResult) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);

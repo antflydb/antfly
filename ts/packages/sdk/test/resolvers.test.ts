@@ -57,3 +57,49 @@ it("uses the same resolver resource inside an explicit namespace", async () => {
     "https://antfly.test/db/v1/databases/app/namespaces/private/tables/notes/resolvers"
   );
 });
+
+it("supports absorbed suppression and scoped proposal acceptance while replay is pending", async () => {
+  const calls: Request[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: Request) => {
+      calls.push(input);
+      return Response.json(
+        {
+          entity_table: "entities",
+          key: "concept/noise",
+          complete: true,
+          atomicity: "namespace",
+          results: [],
+          applied: false,
+          proposal: {
+            id: "proposal/one",
+            action: "suppress",
+            key: "concept/noise",
+            state: "accepted",
+            origin: {},
+          },
+        },
+        { status: 202 }
+      );
+    })
+  );
+  const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+  await client.entities.suppress("entities", "concept/noise", {
+    absorbed: "suppress",
+    actor: "curator",
+  });
+  expect(await calls[0].json()).toEqual({ absorbed: "suppress", actor: "curator" });
+  const result = await client.namespaceCurationProposals.accept(
+    "app",
+    "private",
+    "entities",
+    "proposal/one",
+    { actor: "curator" }
+  );
+  expect(result.applied).toBe(false);
+  expect(result.proposal?.state).toBe("accepted");
+  expect(calls[1].url).toContain(
+    "/databases/app/namespaces/private/tables/entities/curation/proposals/proposal%2Fone:accept"
+  );
+});
