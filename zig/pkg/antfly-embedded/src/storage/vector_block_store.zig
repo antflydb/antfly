@@ -211,6 +211,26 @@ pub const StagedBlock = struct {
     score_precision: vector_manifest.ScorePrecision,
 };
 
+/// A projection consumes one vector space within an artifact family. Names
+/// alone are insufficient after dimension changes, or when consumers share a
+/// family with different dimensions. Coverage hashes are opaque manifest keys;
+/// legacy name-only certificates miss this domain and are rebuilt naturally.
+pub const ArtifactScope = struct {
+    name_hash: u64,
+    dimensions: u32,
+
+    pub fn coverageHash(self: ArtifactScope) u64 {
+        var bytes: [12]u8 = undefined;
+        std.mem.writeInt(u64, bytes[0..8], self.name_hash, .little);
+        std.mem.writeInt(u32, bytes[8..12], self.dimensions, .little);
+        return std.hash.Wyhash.hash(0x6166766264696d31, &bytes);
+    }
+
+    pub fn lessThan(_: void, lhs: ArtifactScope, rhs: ArtifactScope) bool {
+        return lhs.coverageHash() < rhs.coverageHash();
+    }
+};
+
 pub const BaseBuildOptions = struct {
     // Keep both construction phases comfortably below the governed builder
     // slice on memory-constrained nodes. Small per-shard buffers prevent the
@@ -224,10 +244,10 @@ pub const BaseBuildOptions = struct {
     // still inspect score precision to distinguish authoritative completion
     // from deliberately bounded-only projections.
     encoding: vector_block.Encoding = .float16,
-    /// Sorted, unique hashes of configured embedding artifact names. The
+    /// Configured artifact families and dimensions, sorted by coverageHash. The
     /// shared base stores each payload once while publishing an independent
     /// exact cardinality/membership certificate for every logical scope.
-    artifact_scope_hashes: []const u64 = &.{},
+    artifact_scopes: []const ArtifactScope = &.{},
 };
 
 pub const BaseBuildStats = struct {
@@ -632,14 +652,16 @@ pub const Store = struct {
             return error.InvalidVectorBlockBuildOptions;
         }
         var previous_scope: ?u64 = null;
-        for (options.artifact_scope_hashes) |scope_hash| {
+        for (options.artifact_scopes) |scope| {
+            if (scope.dimensions == 0) return error.InvalidVectorBlockBuildOptions;
+            const scope_hash = scope.coverageHash();
             if (previous_scope) |previous| if (scope_hash <= previous) return error.InvalidVectorBlockBuildOptions;
             previous_scope = scope_hash;
         }
-        const coverages = try self.alloc.alloc(vector_manifest.Coverage, options.artifact_scope_hashes.len);
+        const coverages = try self.alloc.alloc(vector_manifest.Coverage, options.artifact_scopes.len);
         defer self.alloc.free(coverages);
-        for (coverages, options.artifact_scope_hashes) |*coverage, scope_hash| coverage.* = .{
-            .scope_hash = scope_hash,
+        for (coverages, options.artifact_scopes) |*coverage, scope| coverage.* = .{
+            .scope_hash = scope.coverageHash(),
             .vector_count = 0,
             .key_hash_xor = 0,
             .key_hash_sum = 0,
@@ -1481,18 +1503,23 @@ pub const Store = struct {
             return error.InvalidVectorBlockBuildOptions;
         }
         var previous_scope: ?u64 = null;
-        for (options.artifact_scope_hashes) |scope_hash| {
+        for (options.artifact_scopes) |scope| {
+            if (scope.dimensions == 0) return error.InvalidVectorBlockBuildOptions;
+            const scope_hash = scope.coverageHash();
             if (previous_scope) |previous| if (scope_hash <= previous) return error.InvalidVectorBlockBuildOptions;
             previous_scope = scope_hash;
         }
-        const coverages = try self.alloc.alloc(vector_manifest.Coverage, options.artifact_scope_hashes.len);
+        const coverages = try self.alloc.alloc(vector_manifest.Coverage, options.artifact_scopes.len);
         errdefer self.alloc.free(coverages);
-        for (coverages, options.artifact_scope_hashes) |*coverage, scope_hash| coverage.* = .{
-            .scope_hash = scope_hash,
+        for (coverages, options.artifact_scopes) |*coverage, scope| coverage.* = .{
+            .scope_hash = scope.coverageHash(),
             .vector_count = 0,
             .key_hash_xor = 0,
             .key_hash_sum = 0,
         };
+        var scope_names = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer scope_names.deinit(self.alloc);
+        for (options.artifact_scopes) |scope| try scope_names.put(self.alloc, scope.name_hash, {});
         const buffers = try self.alloc.alloc(std.ArrayListUnmanaged(u8), options.shard_count);
         defer self.alloc.free(buffers);
         for (buffers) |*buffer| buffer.* = .empty;
@@ -1533,6 +1560,7 @@ pub const Store = struct {
             encoding: vector_block.Encoding,
             stats: *BaseBuildStats,
             coverages: []vector_manifest.Coverage,
+            scope_names: *const std.AutoHashMapUnmanaged(u64, void),
 
             fn coverageIndex(ctx: *const @This(), scope_hash: u64) ?usize {
                 var lo: usize = 0;
@@ -1621,16 +1649,22 @@ pub const Store = struct {
                 // an archive of every historical embedding artifact. Reject
                 // inactive scopes before decoding or spooling their payloads;
                 // multiple indexes sharing one scope still store it once.
-                const scope_hash = internal_keys.embeddingArtifactScopeHash(key) orelse return .@"continue";
-                const coverage_index = ctx.coverageIndex(scope_hash) orelse return .@"continue";
+                const name_hash = internal_keys.embeddingArtifactScopeHash(key) orelse return .@"continue";
+                if (!ctx.scope_names.contains(name_hash)) return .@"continue";
+                const dims = if (ctx.encoding == .artifact_reference)
+                    (try @import("artifact_payload.zig").Reference.decode(value)).dims
+                else dims: {
+                    const header = try artifact_codec.decodeHeader(value);
+                    if (header.kind != .dense_embedding) return .@"continue";
+                    break :dims try artifact_codec.decodeDenseEmbeddingDims(value);
+                };
+                if (dims == 0) return error.InvalidVectorDimensions;
+                const scope: ArtifactScope = .{ .name_hash = name_hash, .dimensions = dims };
+                const coverage_index = ctx.coverageIndex(scope.coverageHash()) orelse return .@"continue";
                 if (ctx.encoding == .artifact_reference) {
                     try ctx.appendVectorRecord(key, value, &.{}, coverage_index);
                     return .@"continue";
                 }
-                const header = try artifact_codec.decodeHeader(value);
-                if (header.kind != .dense_embedding) return .@"continue";
-                const dims = try artifact_codec.decodeDenseEmbeddingDims(value);
-                if (dims == 0) return error.InvalidVectorDimensions;
                 if (try artifact_codec.denseEmbeddingVectorView(value)) |vector| {
                     try ctx.appendVectorRecord(key, value, vector, coverage_index);
                 } else {
@@ -1653,6 +1687,7 @@ pub const Store = struct {
             .encoding = options.encoding,
             .stats = &stats,
             .coverages = coverages,
+            .scope_names = &scope_names,
         };
         try doc_store.scanReadTxnWithContext(txn, "", "", .{ .physical_payloads = options.encoding == .artifact_reference }, &scan_context, ScanContext.scan);
         for (0..options.shard_count) |shard| {
@@ -2564,7 +2599,7 @@ pub const Opened = struct {
             );
             defer output.deinit();
             while (try merge.next()) |latest| {
-                if (latest.isLive()) noteCoverage(coverages, latest.key);
+                if (latest.isLive()) noteCoverage(coverages, latest.key, latest.dimensions());
                 switch (latest.payload) {
                     .wal_vector => try latest.appendTo(&output.writer.page, self.store.alloc, &scratch),
                     .block_vector, .tombstone => try latest.appendLiveBlockVectorTo(&output.writer.page, encoding),
@@ -2765,7 +2800,7 @@ pub const Opened = struct {
             defer merge.deinit();
             while (try merge.next()) |latest| {
                 if (latest.isLive()) {
-                    noteCoverage(coverages, latest.key);
+                    noteCoverage(coverages, latest.key, latest.dimensions());
                     try spool.append(latest);
                 }
             }
@@ -4439,6 +4474,14 @@ const CompactionRecord = struct {
         };
     }
 
+    fn dimensions(self: CompactionRecord) u32 {
+        return switch (self.payload) {
+            .tombstone => unreachable,
+            .block_vector => |value| value.dims,
+            .wal_vector => |value| value.dims,
+        };
+    }
+
     fn isLive(self: CompactionRecord) bool {
         return switch (self.payload) {
             .tombstone => false,
@@ -4821,8 +4864,10 @@ fn stagedDescriptor(staged: StagedBlock) vector_manifest.Segment {
     };
 }
 
-fn noteCoverage(coverages: []vector_manifest.Coverage, key: []const u8) void {
-    const scope_hash = internal_keys.embeddingArtifactScopeHash(key) orelse return;
+fn noteCoverage(coverages: []vector_manifest.Coverage, key: []const u8, dimensions: u32) void {
+    const name_hash = internal_keys.embeddingArtifactScopeHash(key) orelse return;
+    const scope: ArtifactScope = .{ .name_hash = name_hash, .dimensions = dimensions };
+    const scope_hash = scope.coverageHash();
     const key_hash = vector_block.keyHash(key);
     for (coverages) |*coverage| {
         if (coverage.scope_hash < scope_hash) continue;
@@ -5819,12 +5864,13 @@ test "vector block store shared manifest declares a new scope without changing o
     var memory = lsm_backend.MemoryStorage.init(alloc);
     defer memory.deinit();
     const root = "/vector-block-declare-scope";
-    const scope_a: u64 = 11;
-    const scope_b: u64 = 29;
+    const artifact_a: ArtifactScope = .{ .name_hash = 11, .dimensions = 2 };
+    const scope_a = artifact_a.coverageHash();
+    const scope_b = std.math.maxInt(u64);
     var store = try Store.open(alloc, memory.storage(), root);
     defer store.deinit();
 
-    try store.publishEmptyBase(1, 7, .{ .artifact_scope_hashes = &.{scope_a} });
+    try store.publishEmptyBase(1, 7, .{ .artifact_scopes = &.{artifact_a} });
     try store.appendBatch(try store.nextBatchId(), &.{.{
         .kind = .upsert,
         .key = "artifact-a",
@@ -6458,12 +6504,13 @@ test "vector block store bulk builder stages bounded shared shards" {
     defer memory.deinit();
     var store = try Store.open(alloc, memory.storage(), "/vector-block-builder");
     defer store.deinit();
-    const embedding_v1_scope = internal_keys.embeddingArtifactScopeHashForName("embedding-v1");
+    const embedding_v1: ArtifactScope = .{ .name_hash = internal_keys.embeddingArtifactScopeHashForName("embedding-v1"), .dimensions = 3 };
+    const embedding_v1_scope = embedding_v1.coverageHash();
     const stats = try store.buildBaseFromArtifacts(&primary, 1, 9, .{
         .shard_count = 4,
         .spool_buffer_bytes = 32,
         .encoding = .float16,
-        .artifact_scope_hashes = &.{embedding_v1_scope},
+        .artifact_scopes = &.{embedding_v1},
     });
     try std.testing.expectEqual(@as(u64, 2), stats.vectors);
     try std.testing.expectEqual(@as(u64, 24), stats.vector_bytes);
@@ -6479,7 +6526,7 @@ test "vector block store bulk builder stages bounded shared shards" {
         .shard_count = 8,
         .spool_buffer_bytes = 32,
         .encoding = .float16,
-        .artifact_scope_hashes = &.{embedding_v1_scope},
+        .artifact_scopes = &.{embedding_v1},
     });
     for (0..8) |shard| {
         if (shard < 4) {
@@ -6740,4 +6787,70 @@ test "storage.vector_block_store adaptive read cost and available work gate help
     try std.testing.expectEqual(@as(usize, 1), adaptiveReadWorkers(1, 100000));
     try std.testing.expectEqual(@as(usize, 1), adaptiveReadWorkers(2, 8000));
     try std.testing.expectEqual(@as(usize, 8), adaptiveReadWorkers(30, 50000));
+}
+
+test "vector block scopes separate dimensions through rebuild and compaction" {
+    const alloc = std.testing.allocator;
+    var backend = @import("mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    var primary = try @import("docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer primary.close();
+    const old_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "old", "shared");
+    defer alloc.free(old_key);
+    const new_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "new", "shared");
+    defer alloc.free(new_key);
+    const old_payload = try artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 1, 0, 0 });
+    defer alloc.free(old_payload);
+    const new_payload = try artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 0, 1, 0, 0 });
+    defer alloc.free(new_payload);
+    const old_scope: ArtifactScope = .{ .name_hash = internal_keys.embeddingArtifactScopeHashForName("shared"), .dimensions = 3 };
+    const new_scope: ArtifactScope = .{ .name_hash = old_scope.name_hash, .dimensions = 4 };
+    var scopes = [_]ArtifactScope{ old_scope, new_scope };
+    std.mem.sortUnstable(ArtifactScope, &scopes, {}, ArtifactScope.lessThan);
+    for ([_]Encoding{ .float16, .float32, .artifact_reference }) |encoding| {
+        if (encoding == .artifact_reference) {
+            const old_ref = try @import("artifact_payload.zig").Reference.forArtifact(old_key, old_payload);
+            const new_ref = try @import("artifact_payload.zig").Reference.forArtifact(new_key, new_payload);
+            try primary.put(old_key, &old_ref.encode());
+            try primary.put(new_key, &new_ref.encode());
+        } else {
+            try primary.put(old_key, old_payload);
+            try primary.put(new_key, new_payload);
+        }
+        var memory = lsm_backend.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        var writer = try Store.open(alloc, memory.storage(), "/dimension-scopes");
+        defer writer.deinit();
+        const stats = try writer.buildBaseFromArtifacts(&primary, 1, 1, .{ .shard_count = 2, .encoding = encoding, .artifact_scopes = &.{new_scope} });
+        try std.testing.expectEqual(@as(u64, 1), stats.vectors);
+        {
+            var opened = try Store.openWithBlocks(alloc, memory.storage(), "/dimension-scopes");
+            defer opened.deinit();
+            try std.testing.expectEqual(@as(u64, 1), opened.baseOnlyCoverage(new_scope.coverageHash()).?.vector_count);
+            try std.testing.expect((try opened.get(old_key, 1, null)) == .missing);
+        }
+        // Distinct indexes can consume both vector spaces from the same family.
+        const both = try writer.buildBaseFromArtifacts(&primary, 2, 2, .{ .shard_count = 2, .encoding = encoding, .artifact_scopes = &scopes });
+        try std.testing.expectEqual(@as(u64, 2), both.vectors);
+        for ([_]u32{ 2, 4 }, 0..) |shards, round| {
+            const sequence: u64 = 3 + round;
+            if (encoding == .artifact_reference) {
+                const payload = if (round == 0) new_payload else old_payload;
+                const reference = try @import("artifact_payload.zig").Reference.forArtifact(old_key, payload);
+                try writer.appendBatch(try writer.nextBatchId(), &.{.{ .kind = .upsert, .key = old_key, .source_sequence = sequence, .revision = sequence, .reference = .{ .dims = reference.dims, .digest = reference.digest } }}, sequence, .{});
+            } else try writer.appendBatch(try writer.nextBatchId(), &.{.{ .kind = .upsert, .key = old_key, .source_sequence = sequence, .revision = sequence, .vector = if (round == 0) &.{ 0, 1, 0, 0 } else &.{ 1, 0, 0 } }}, sequence, .{});
+            {
+                var opened = try Store.openWithBlocks(alloc, memory.storage(), "/dimension-scopes");
+                defer opened.deinit();
+                try std.testing.expect(try opened.compactDeltasToBaseWithShardCount(shards, 64));
+            }
+            // Reopen the writer after compaction publishes a new CURRENT.
+            writer.deinit();
+            writer = try Store.open(alloc, memory.storage(), "/dimension-scopes");
+            var compacted = try Store.openWithBlocks(alloc, memory.storage(), "/dimension-scopes");
+            defer compacted.deinit();
+            try std.testing.expectEqual(@as(u64, if (round == 0) 0 else 1), compacted.baseOnlyCoverage(old_scope.coverageHash()).?.vector_count);
+            try std.testing.expectEqual(@as(u64, if (round == 0) 2 else 1), compacted.baseOnlyCoverage(new_scope.coverageHash()).?.vector_count);
+        }
+    }
 }

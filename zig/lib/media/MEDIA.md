@@ -377,7 +377,11 @@ assembly; long clips fall back to sparse header reads when the cache fills.
 Original source ranges remain authoritative for decoder validation and playback.
 
 The inference consumer may retain two current immutable windows for a masked
-backbone batch plus one next-window preparation wave. All readers and selections
+backbone batch plus one next-window preparation wave. Compatible ready frames
+can share vision/projector calls across windows, with independent sampling and
+cache identities. Whole-window batching learns completed serial/paired throughput
+within admission limits. Validation starts after immutable slots/plans are pinned,
+so it can overlap both vision and backbone work. All readers and selections
 stay in stable slots until completed execution and worker join. Independent
 window identity, sample selection, output ordering and continuation semantics
 remain unchanged by batching.
@@ -692,12 +696,18 @@ Cancellation drains or cancels both owned frame slots before freeing views.
 and `ANTFLY_EMBEDDINGGEMMA2_DISABLE_TILED_FFN=1` also disables that candidate.
 `ANTFLY_EMBEDDINGGEMMA2_DISABLE_COMPACT_CACHE=1` bypasses retained mask metadata.
 
-Metal vision retains up to two admitted activation layouts per model. Each uses
-bounded 512-row FFN tiles, snapshots immutable norm coefficients and reuses
+Metal vision retains up to two admitted activation capacities per model. Each uses
+FFN tiles up to 2048 rows, shares immutable norm coefficients and reuses
 separate norm, residual, alternating hidden and prepared-head ranges. Activation
 storage is capped at 256 MiB per layout; normalization coefficients and tensor-view
 metadata are admitted separately. Layout replacement occurs only with no active
 or submitted frame, and vision pressure releases all retained layouts.
+Shared-cache or device-allocation pressure can narrow tiles to 512 rows without
+reducing cohort capacity. Smaller logical shapes repack disjoint activation and
+FFN ranges within the retained allocation, recovering wider tiles when they fit.
+All ranges are validated before publication, with no allocation, upload or
+admission growth. Repacking requires no active or submitted frame; the full
+physical capacity remains charged until reclamation.
 
 Packed QKV is normalized directly from its projection strides: Q/K retain their
 2D RoPE and Q scale; V uses unweighted RMSNorm without rotation. FFNs stream
@@ -752,10 +762,11 @@ the existing frame ownership and release boundaries. Slot replacement and model
 unload invalidate all cached shapes.
 
 Metal vision cohort selection and request admission share one execution plan:
-8192 patch rows and a 256 MiB activation-layout ceiling, including 512-row FFN
-tiles. Four full-size 2304-patch images therefore execute as three images plus
-one; 2520-patch geometries fit two per cohort. The request reserves bounded
-transient execution and all retained projected outputs; model-owned layouts and
+8192 patch rows and a 256 MiB activation-layout ceiling. Cohort capacity is
+calculated with 512-row FFN scratch; execution uses wider tiles up to 2048 rows
+when they fit the admitted allocation. Four full-size 2304-patch images execute
+as three images plus one; 2520-patch geometries fit two per cohort. The request
+reserves bounded transient execution and all retained projected outputs; model-owned layouts and
 coefficients retain independent cache leases. Prepared execution is required
 under this estimate. If a capability or cache admission declines, partial work
 is drained and a separate conservative fallback supplement is admitted before
@@ -885,3 +896,77 @@ maximum token bounds. Compact phase reductions preserve explicit workspace
 policy. Live encoder admission can shrink a ready cohort without discarding
 its prepared inputs. Later pressure preserves completed vectors and indexes;
 the broker retries only failed items after prepared owners drain.
+
+Immutable published `stream.Snapshot` storage supports independent retained
+owners. Each consumer releases its reader leases before its snapshot reference;
+the final release frees storage and its admission token. Readers keep independent
+mutable source counters. `source.Range.borrow_at` optionally lends a contiguous
+immutable extent under the ordinary read/retention/admission limits, with
+`read_at` as the cross-extent fallback. Provider storage must outlive all leases.
+
+Published `live_mp4.Segment.packetSlice` owners retain immutable encoded storage
+and identity while copying only a bounded packet index. The original segment can
+be destroyed first; each slice releases its own metadata and snapshot reference.
+The coordinator accounts shared payload bytes once across retained slices. Model
+streaming uses these slices to validate long publications incrementally instead
+of retaining only their first few windows' selected pictures.
+
+HTTP adapters distinguish their stable source `control` from a transient
+`request_control`. The latter also reaches HTTP watchdog cancellation but is
+never copied into retained segment snapshots. Live readers expose
+`swapReadControl` for a scoped ingestion producer; callers restore the prior
+checkpoint only after that producer joins. This permits bounded read/model
+overlap without allowing a request-local callback to escape into a window.
+
+Strict video validation may lend completed pixels through independently retained
+frame pins. Their shared byte bound includes outputs held across delivery retries;
+encoded snapshot eviction cannot invalidate them. Window pins retain their own
+interval's candidates rather than the entire lookahead horizon. Optional capture pressure does
+not relax validation or deny its serial decoder fallback. Live model consumers
+preview only sealed windows, batch ready rows without a fill delay, and keep
+transport acknowledgement separate from ordered output acknowledgement/commit.
+A single admitted successor may prepare during backbone execution. A scoped
+validation worker can advance available input during vision preparation and
+backbone execution while the model reads its immutable prepared windows. Coordinator ownership transfers back before output
+delivery/commit; retries retain the encoded input and exact packet cursor.
+Cancellation joins these workers before releasing sources, controls or frame pins.
+Prepared-ahead and ordinary rows can batch together; pressure preserves their
+prepared successors for serial retry. Allocators shared by threaded transport
+and validation must support concurrent allocation; custom readers without scoped
+read controls retain the synchronous path.
+Settled phase residency returns its live-memory credit only within the same
+kernel pressure epoch. Credits from older epochs cannot augment a new sample;
+long-lived stream contexts retain shared quota without accumulating false pressure
+as completed phases release their allocations.
+
+Live validation owns an appendable packet/span probe rather than rebuilding the
+retained prefix for each packet quantum. Prepared consumers still own immutable
+metadata snapshots. Probe growth is admitted before allocation, retains encoded
+snapshot owners, and resets on eviction or failed append; transport publication
+and output acknowledgement boundaries remain transactional.
+
+Live video validation can retain exact model-prepared frame inputs under a
+versioned preparation policy; raw pixels and prepared inputs share one bounded
+cache with immutable window pins. The inference stream installs and restores
+its policy, while generic media callers retain the raw-pixel default. Admitted
+video producers prepare ahead of the model execution queue; completed windows
+can compose independently within a cohort. Admission follows the immutable input
+path: prepared patches need upload/vision storage, raw pixels also need conversion,
+and only decoder misses retain decoder storage. Qualified Metal rows compose into
+one persistent final input, preserving caller order through a pooled-result
+permutation rather than copying composed rows. Singleton and cohort consumers
+share bounded ready-frame batching with a reserved pending share per source.
+Only shared decoder continuations impose producer ordering; validated inputs and
+independent sources can publish ahead. Ready geometry-compatible host and device
+frames share tower calls while unfinished preparations remain pending.
+Uncontended ready Metal waves keep warm bindings; queued execution peers and
+idle/reclaim boundaries still release the provider. Metal vision arenas reuse
+admitted capacity across smaller batches and share immutable normalization
+coefficients. Patch gathering, projection and positioning share one input frame;
+owned staging and source buffers survive its completion or cancellation. CPU
+queues transfer patch ownership, cohorts pack directly into tensor storage, and
+host views avoid copied readbacks while protecting shared/immutable storage.
+Partial CPU batches execute before the consumer waits for another source. Persistent
+projection outputs provide retained frame views without stage escape copies.
+See `../video/VIDEO.md` for ownership, policy matching,
+scratch admission and fallback behavior.

@@ -5197,6 +5197,9 @@ pub const vtable_impl = ComputeBackend.VTable{
     .gqaPagedAttention = &gqaPagedAttentionOp,
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
+    .fromBorrowedFloat32Shape = &fromBorrowedFloat32ShapeOp,
+    .hostFloat32Read = &hostFloat32ReadOp,
+    .hostFloat32Write = &hostFloat32WriteOp,
     .fromInt32Shape = &fromInt32ShapeOp,
     .fromConstantBytes = &fromConstantBytesOp,
     .convertDType = &convertDTypeOp,
@@ -42098,6 +42101,26 @@ fn maskedBceWithLogitsBackwardOp(ctx: *anyopaque, request: *const ops.MaskedBceW
     return self.withLogicalShape(result, request.logits_shape);
 }
 
+fn fromBorrowedFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) !CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const result = try self.makeBuf(@constCast(data), false);
+    errdefer freeTensor(self, result);
+    var logical: [8]i64 = undefined;
+    if (shape.len == 0 or shape.len > logical.len) return error.InvalidTensorShape;
+    for (shape, logical[0..shape.len]) |dim, *dest| dest.* = dim;
+    return self.withLogicalShape(result, logical[0..shape.len]);
+}
+fn hostFloat32ReadOp(_: *anyopaque, tensor: CT) !?[]const f32 {
+    const buf = toBuf(tensor);
+    if (buf.view_strides != null or buf.source_tensor != null or buf.quantized_storage != null or buf.data.len == 0) return null;
+    return try getDataChecked(tensor);
+}
+fn hostFloat32WriteOp(ctx: *anyopaque, tensor: CT) !?[]f32 {
+    const buf = toBuf(tensor);
+    if (!buf.owned or buf.tensor_refs != 1 or buf.retained_parent != null or buf.lazy_entry != null or buf.weight_handle_name != null or (buf.shared_data_refcount != null and buf.shared_data_refcount.?.* != 1)) return null;
+    return if (try hostFloat32ReadOp(ctx, tensor)) |data| @constCast(data) else null;
+}
+
 fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const owned = try self.allocator.dupe(f32, data);
@@ -54350,4 +54373,30 @@ test "embeddinggemma2 canonical CPU panels own typed grouped weights without den
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{false});
     try Case.run(std.testing.allocator, true);
+}
+
+test "embeddinggemma2 video host borrows avoid copies and writable views reject shared ownership" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var values = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const borrowed = try cb.fromBorrowedFloat32Shape(&values, &.{ 2, 3 });
+    try std.testing.expectEqual(values[0..].ptr, (try cb.hostFloat32Read(borrowed)).?.ptr);
+    try std.testing.expectEqual(@as(?[]f32, null), try cb.hostFloat32Write(borrowed));
+    try std.testing.expectError(error.InvalidShape, cb.fromBorrowedFloat32Shape(&values, &.{ 3, 3 }));
+    cb.free(borrowed); // Borrowed stack storage remains caller owned.
+    try std.testing.expectEqual(@as(f32, 6), values[5]);
+    const output = (try cb.allocUninitF32Shape(&.{ 2, 3 })).?;
+    const target = (try cb.hostFloat32Write(output)).?;
+    @memcpy(target, &values);
+    const view = try cb.sliceRows2D(a, output, 1, 1, 3);
+    try std.testing.expectEqual(@as(?[]f32, null), try cb.hostFloat32Write(output));
+    try std.testing.expectEqual(@as(?[]f32, null), try cb.hostFloat32Write(view));
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, (try cb.hostFloat32Read(view)).?);
+    cb.free(output); // The retained row still owns the parent allocation.
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, (try cb.hostFloat32Read(view)).?);
+    cb.free(view);
 }

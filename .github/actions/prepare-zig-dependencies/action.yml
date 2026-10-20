@@ -18,9 +18,16 @@ runs:
         export_environment_variables: false
     - shell: bash
       env:
+        ACTION_ROOT: ${{ github.action_path }}
         MIRROR_ONLY: ${{ inputs.mirror-only }}
         ANTFLY_ZIG_MIRROR_TOKEN: ${{ steps.mirror.outputs.access_token }}
       run: |
-        args=()
+        helper="$ACTION_ROOT/../../../scripts/ci/prepare_zig_dependencies.py"
+        manifest="$GITHUB_WORKSPACE/scripts/ci/zig-dependencies.json"
+        # Old release branches have the same pinned packages but no inventory.
+        if [[ ! -f "$manifest" ]]; then
+          manifest="$ACTION_ROOT/../../../scripts/ci/zig-dependencies.json"
+        fi
+        args=(--root "$GITHUB_WORKSPACE/zig" --manifest "$manifest")
         if [[ "$MIRROR_ONLY" == 'true' ]]; then args+=(--mirror-only); fi
-        python3 scripts/ci/prepare_zig_dependencies.py "${args[@]}"
+        python3 "$helper" "${args[@]}"

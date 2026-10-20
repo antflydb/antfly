@@ -4842,9 +4842,7 @@ pub fn runFromIterator(
             },
             .memory_limit_bytes = process_memory_limit_bytes,
         });
-        const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
-        defer alloc.free(security_json);
-        try storage_kernel_context.configureRemoteContentSecurity(security_json);
+        try storage_kernel_context.configureRemoteContent(remote_content);
         try storage_kernel_context.configureSecrets(&secret_store);
         const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, if (loaded_config) |*cfg| cfg else null, .standalone, data_dir);
         defer alloc.free(retained_setup);

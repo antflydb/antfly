@@ -1817,7 +1817,7 @@ pub fn remoteContentSecurityJsonAlloc(
     remote_content: ?*const scraping.RemoteContentConfig,
 ) ![]u8 {
     const configured = remote_content orelse return try alloc.dupe(u8, "");
-    var snapshot = configured.acquire();
+    var snapshot = try configured.acquire();
     defer snapshot.deinit();
     const security = snapshot.config.security orelse scraping.ContentSecurityConfig{};
     return try std.json.Stringify.valueAlloc(alloc, security, .{});
