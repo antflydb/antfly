@@ -184,14 +184,14 @@ pub const RemoteContentConfig = struct {
     pub const RemoteContentRuntime = struct {
         context: *anyopaque,
         acquire_fn: *const fn (*anyopaque) ?Snapshot,
-        health_fn: *const fn (*anyopaque) RuntimeHealth,
+        health_fn: ?*const fn (*anyopaque) RuntimeHealth = null,
 
         pub fn acquire(self: RemoteContentRuntime) ?Snapshot {
             return self.acquire_fn(self.context);
         }
 
-        pub fn health(self: RemoteContentRuntime) RuntimeHealth {
-            return self.health_fn(self.context);
+        pub fn health(self: RemoteContentRuntime) ?RuntimeHealth {
+            return if (self.health_fn) |health_fn| health_fn(self.context) else null;
         }
     };
 
