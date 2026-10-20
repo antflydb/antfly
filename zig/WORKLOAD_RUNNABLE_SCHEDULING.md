@@ -19,6 +19,22 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Replicated required PREPARE and seal (2026-10-19)
+
+Required PREPARE now checks the original mode before staging and under apply.
+Final seal validates precomputed output and atomically publishes its immutable
+frame, backlog accounting and ordered receipt. Restart and old-entry replay do
+not regenerate output or rewrite sealed intents; resolution retains the original
+mode across weaker acknowledgements. Pure-seal validation rejects unrelated batch
+controls. Native ABI is 39, engine descriptor 26, Raft protocol 24, storage owner
+ABI 101 and file floor 6.
+
+Seven native targets and 25 package consumer checks pass at
+`629a03a2594ff9a6329a7452c77a350d111aee80`. Required proposals remain gated until
+real adapters/providers, funded producers, scoped receipt binding, large-frame
+transport and coordinated migration are qualified. See the implementation ledger
+for the exact receipt and remaining scope.
+
 ## Replicated required BEGIN (2026-10-19)
 
 The new required-BEGIN command preserves preparation mode through internal batch

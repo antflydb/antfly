@@ -16,18 +16,17 @@ branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `fc9bea9f20194754644605d796c00beeb1f325d0`.
-Native ABI 38 and engine descriptor 25 fence the replicated required-BEGIN
-implementation; storage owner ABI remains 101 and required-preparation file floor
-6. Commit `da2faa3a1c8eceb3e413567944293acdd6f03133` preserves the agreed mode
-through internal encoding, Raft decoding and ordered apply, committing the
-requirement and apply receipt atomically. Replay uses durable progress before
-fresh admission. Seven focused native targets and 25 ReleaseSafe package consumer
-checks pass at verification source `0964f20fb0187ae1708bcaa859afeaa83ff13a05`.
-Required proposals remain rejected before any barrier or entry until
-coordinated migration and real producer/provider readiness are established.
-Required transport and PREPARE/seal integration, distributed fault/restart checks
-and the broader scheduler design remain open. The retained pgwire fix preserves
-completion authority through held-cursor COMMIT.
+Native ABI 39 and engine descriptor 26 fence required PREPARE and final seal;
+storage owner ABI remains 101 and permanent file floor 6. Commit
+`629a03a2594ff9a6329a7452c77a350d111aee80` preserves the BEGIN mode through
+replicated intent staging and atomically seals accepted output with its ordered
+receipt. Reopen, immutable retry and weaker-acknowledgement resolution are covered
+by seven focused native targets and 25 package consumer checks. Raft protocol 24
+selects the required command format; production proposals remain gated pending
+real transport/provider readiness, funded producers, exact scoped receipt binding
+and coordinated migration. Distributed fault/restart qualification, large-frame
+transport and the broader scheduler design remain open. Held-cursor COMMIT retains
+its protected completion authority.
 
 The full goal remains safe, bounded execution sharing across many connections
 by default, with fair scheduling and bounded waiting, preserving session

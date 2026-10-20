@@ -4,6 +4,51 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Replicated required PREPARE and final seal (2026-10-19)
+
+Commit `629a03a2594ff9a6329a7452c77a350d111aee80` adds distinct
+`prepare_required_v1` and `seal_required_v1` internal commands. Required PREPARE
+checks the durable BEGIN mode before preparation and again under apply before
+publishing intents and its ordered receipt. Replicated transforms must already
+be expanded. A final seal carries immutable precomputed effect bytes; apply
+validates their transaction, intent revision/digest, schema, catalog and mode,
+then commits the accepted frame, backlog accounting and ordered receipt together.
+It invokes no producer. Different output cannot replace the first accepted frame.
+Identical retries preserve its grant while advancing a new receipt.
+
+Already-applied PREPARE and seal entries return from their durable receipts before
+fresh admission or attempts to rewrite frozen intents. Seals survive reopen and
+are consumed by ordinary resolution even when its acknowledgement level is
+weaker than the original mode. Effect sidecars retire while the agreed mode stays
+in the existing terminal record. Stale frames and mode conflicts cannot advance
+ordered progress. Nonreplicated required commands refuse the legacy fallback.
+
+A final seal permits only its transaction, staging scope, timestamp and
+acknowledgement fields. Other batch controls fail closed in encoding, decoding
+and apply, including newly added controls with nondefault values. Decoded frame
+ownership is explicit and released on every parse/allocation failure. The inline
+base64 command is bounded by the existing 64 MiB request envelope; the durable
+codec's full 64 MiB frame limit still needs a large-payload transport path.
+
+Native ABI is 39 and engine descriptor 26; storage owner ABI remains 101 and
+permanent file floor remains 6. PREPARE/seal select Raft protocol 24. The existing
+proposal gate also covers both commands, before any barrier or entry. Decoder
+support is not coordinated migration or real producer/provider readiness.
+
+The seven-target `native-required-raft-seal-v3-verified.json` receipt covers actual
+encoding, ordered apply, persistent reopen, immutable retries, weaker-acknowledgement
+resolution, malformed/pure-command checks and exhaustive allocation failures,
+plus existing required-storage, coordinator, fanout, checkpoint and native ownership
+regressions. The immutable source package passes 25 ReleaseSafe consumer checks.
+Full Linux qualification remains waived; these are focused checks.
+
+Next are required HTTP/local adapters and real capability/status/seal providers,
+funded predecision producers, exact scoped route/participant receipt binding,
+large-frame transport, all-member catalog/import/downgrade migration and actual
+distributed fault/restart tests. Production proposals and activation stay gated.
+Completion resource bundles, replay/output credit and the remaining original
+scheduler design remain open.
+
 ## Replicated required BEGIN (2026-10-19)
 
 Commit `da2faa3a1c8eceb3e413567944293acdd6f03133` carries preparation mode
