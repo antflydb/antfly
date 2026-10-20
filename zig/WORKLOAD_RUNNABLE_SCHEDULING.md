@@ -19,6 +19,21 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Held-cursor completion after the main merge (2026-10-19)
+
+Internal `completion_drain` authority follows a retained pgwire page through both
+its delivery worker and runnable CPU admission. COMMIT can therefore materialize
+an existing held cursor while ordinary execution is saturated, even though the
+retained statement text is SELECT. Fresh queries and mixed statements still use
+ordinary capacity. The real HTTP/pgwire/H2 integration and imported-executor routing
+regression pass against commit `737098cfd7e24b7265c5e586676ada70f20adf7e`.
+The fixture funds the default worker-stack floors and installs both runtime and SQL
+memory parents from the same storage manager, as production does. Remaining storage
+credit is exhausted during the test; no lane ceiling is reduced. Native ABI is 34
+and storage owner ABI is 101 after merging main; the delivery fix changes no ABI.
+See `native-main-merge-v2-verified.json` in the implementation ledger's receipt
+directory for the 16-target scope and unchanged exported-package proof.
+
 ## Read execution lanes
 
 The operation classes remain query/write/inference/background/control. Read

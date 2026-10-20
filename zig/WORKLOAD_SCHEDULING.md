@@ -15,6 +15,12 @@ Original source baseline: `e4d707de5634a8d758c606b4432037e1a1682052` on
 branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
+The current merge includes `origin/main` at `a8e47ce4cc6af28b166ae26c62cd78ea848c869e`.
+Native ABI 34 combines upstream inference/CUDA changes with the existing bounded
+owners; storage owner ABI remains 101. The subsequent pgwire fix preserves
+completion authority through immutable page delivery during held-cursor COMMIT.
+The 16 focused native targets pass, including real socket overload coverage;
+this does not activate distributed required preparation or qualify the full design.
 
 The full goal remains safe, bounded execution sharing across many connections
 by default, with fair scheduling and bounded waiting, preserving session

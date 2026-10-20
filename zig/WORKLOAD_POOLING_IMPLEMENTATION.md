@@ -6,36 +6,55 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 
 ## Current verification status (2026-10-19)
 
-The full design remains in progress. Explicit local activation of the required
-prepared-transaction file format is implemented, building on durable effect
-sealing, accepted-plan materialization/recovery and serving catalog leases.
-`DB.enablePreparedTransactionProtocol()` permanently raises both the reader floor
-and resolver catalog envelope to version 5 before DB-owned required BEGIN can
-create a record. Native ABI is 33; storage owner ABI is 101. The generated error
-identity table includes the new errors and prior preparation errors.
+The full design remains in progress. The branch now contains `origin/main` at
+`a8e47ce4cc6af28b166ae26c62cd78ea848c869e`, merged in
+`332fd12e2ffa05213e3455be09b8051fa56e116a` after checkpoint
+`b004e8700c07e96a63b906af4366a3f48f29d8d4`. Native ABI is 34;
+storage owner ABI remains 101. The native ABI fences the combined inference
+callback dispatch and CUDA ownership layout. No prepared-effects wire activation
+is implied by this merge.
 
-Activation refuses existing unfenced requirement/frame metadata and ordered
-catalog authority, which require coordinated migration. The existing atomic
-upgrade refreshes local inventory, publishes its in-memory generation after
-commit, and updates any temporary replacement's permanent baseline. Commit,
-abort, catalog rewrites, replacement cancellation and restart must retain this
-floor. Idempotent activation remains legal with newly required transactions.
+Commit `737098cfd7e24b7265c5e586676ada70f20adf7e` preserves internal
+completion authority while pgwire COMMIT drains an existing held cursor's immutable
+page. Both delivery worker selection and runnable CPU admission use control capacity;
+the original statement remains SELECT. Fresh SELECT and mixed statements retain
+ordinary execution admission. The integration fixture now funds the default guarded
+worker-stack floor and shares one runtime and storage parent across DB, server and
+SQL memory banks. It still exhausts every remaining storage credit.
 
-The scoped native checks cover 65 custom cases, 28 owner/client boundary tests
-and 156 build steps. Separate catalog checks exercise 13 current-reader cases
-and 14 previous-reader cases, including rejection of both version-5 fences by
-the unchanged previous reader source. This is a reader compatibility proof,
-not full old-binary qualification. The fetched package passes 25 ReleaseSafe
-compile checks. Exact current inputs and source delta are recorded in
-`native-prepared-file-gate-v2-verified.json`.
+All 16 focused native targets pass on that source: 166 build steps succeed, reusing
+cached results where inputs are unchanged. The real mixed HTTP/pgwire/H2 scenario
+covers held-cursor completion under foreground worker, preparation and storage
+saturation. The imported-executor routing regression and six CUDA physical-credit
+mock cases pass; these are not real-GPU qualification. The dedicated SQL budget
+owner target has 12 passing standard tests on unchanged sources. Generated error
+and source catalogs are current. The frozen public package from merge commit
+`332fd12e2ffa05213e3455be09b8051fa56e116a` passes 25 ReleaseSafe compile checks;
+4,480 exported source files still match the current branch exactly. License policy
+and packaging checks pass 11 and seven tests respectively. Source hashes, actual
+exit statuses and archive identity are recorded in `native-main-merge-v2-verified.json`
+under the receipt directory below. Build-step and cached-test counts do not describe
+a fresh full-suite run.
 
-This is explicit local file eligibility. Distributed capability negotiation,
-ordered-catalog/import migration, final sealing by every participant before the
-global decision, eligible predecision producers, future replay/output credit,
-minimum completion RAM/CPU/I/O bundles, whole-node/per-tenant policy and the
-remaining original scheduler work remain open. Normal distributed BEGIN and
-PREPARE have not activated required preparation. Full Linux qualification remains
-waived. Earlier receipts retain their named source and ABI scope.
+Explicit local activation of the required prepared-transaction file format remains
+implemented through `DB.enablePreparedTransactionProtocol()`: it permanently raises
+the reader floor and resolver catalog envelope to version 5 before DB-owned required
+BEGIN can create a record. It refuses unfenced requirement/frame metadata and ordered
+catalog authority. Commit, abort, catalog rewrites, replacement cancellation and
+restart must retain the floor. Earlier `native-prepared-file-gate-v2-verified.json`
+retains its ABI-33 source scope, including the current/previous reader-source checks;
+that receipt is not an ABI-34 or full old-binary qualification claim.
+
+The next gate is bounding the eligibility check before normal activation: required
+BEGIN currently parses the full resolver catalog under apply. A cached attestation
+must remain coherent with durable publication, replacement and restart, preserving
+original admission failures. Distributed capability negotiation, strict versioned
+BEGIN/PREPARE/final-seal envelopes, ordered-catalog/import migration and final sealing
+by every participant before the global decision remain open. So do eligible
+predecision producers, future replay/output credit, minimum completion RAM/CPU/I/O
+bundles, whole-node/per-tenant policy and the remaining original scheduler work.
+Normal distributed BEGIN and PREPARE have not activated required preparation.
+Full Linux qualification remains waived. Earlier receipts retain their named scope.
 
 Historical receipts below retain their named source and ABI identities. The
 service-telemetry receipt covers coherent native/API snapshots, opaque reads and
