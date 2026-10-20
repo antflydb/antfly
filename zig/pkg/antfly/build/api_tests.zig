@@ -2065,6 +2065,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_api_session_maintenance_tests = b.addTest(.{
         .root_module = api_session_maintenance_test_mod,
         .filters = &.{
+            "SQL prepared completion",
+            "httpx stable transaction commit durably hands off recovery before acknowledgement",
             "durable session mutations publish only after persistence succeeds",
             "durable SQL LOCAL DEFAULT preserves committed setting across restart and savepoint",
             "durable transaction sessions retain terminal commit coordinator handoff",
