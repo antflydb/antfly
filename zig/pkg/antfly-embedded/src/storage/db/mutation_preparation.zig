@@ -1302,7 +1302,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer inline_embedding_cleanup.deinit(alloc);
 
                 const document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution = if (S.ownerField(self, "enrichment_runtime").*) |runtime|
-                    if (precompute_mode == .all and enrichment_runtime_mod.PrecommitDocumentExecution.useful(generated)) try enrichment_runtime_mod.PrecommitDocumentExecution.create(runtime, generated, (try extracted[i].logicalJson()).?) else null
+                    if (precompute_mode == .all and enrichment_runtime_mod.PrecommitDocumentExecution.useful(generated)) try enrichment_runtime_mod.PrecommitDocumentExecution.createWithAllocator(runtime, alloc, generated, (try extracted[i].logicalJson()).?) else null
                 else
                     null;
                 defer if (document_execution) |execution| execution.destroy();

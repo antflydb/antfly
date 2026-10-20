@@ -8317,6 +8317,9 @@ test "enrichment runtime graph indexed keys survive rollback bulk append and tra
 /// authoritative node admission can force one bounded serial drain/retry.
 const SharedPdfWindowScheduler = struct {
     runtime: *EnrichmentRuntime,
+    /// Invocation-local coordinator metadata. Independently granted native
+    /// buffers use runtime.alloc as raw backing rather than charging twice.
+    metadata_alloc: ?Allocator = null,
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
     sequence: u64,
     current: usize = 0,
@@ -8390,19 +8393,23 @@ const SharedPdfWindowScheduler = struct {
         return .{ .runtime = runtime, .requests = requests, .sequence = sequence };
     }
 
+    fn metadataAllocator(self: *const @This()) Allocator {
+        return self.metadata_alloc orelse self.runtime.alloc;
+    }
+
     pub fn deinit(self: *@This()) void {
         if (self.spool_root) |root| {
             if (self.spool_dirty and self.precommit == null) self.cleanupSpool() catch |err|
                 std.log.warn("shared PDF result cleanup failed: {s}", .{@errorName(err)});
-            self.runtime.alloc.free(root);
+            self.metadataAllocator().free(root);
         }
-        if (self.spool_attempt_key) |key| self.runtime.alloc.free(key);
+        if (self.spool_attempt_key) |key| self.metadataAllocator().free(key);
         if (self.consumers) |consumers| {
             for (consumers) |*consumer| {
-                if (consumer.owned_config) consumer.config.deinit(self.runtime.alloc);
-                consumer.plans.deinit(self.runtime.alloc);
+                if (consumer.owned_config) consumer.config.deinit(self.metadataAllocator());
+                consumer.plans.deinit(self.metadataAllocator());
             }
-            self.runtime.alloc.free(consumers);
+            self.metadataAllocator().free(consumers);
         }
     }
 
@@ -8416,7 +8423,7 @@ const SharedPdfWindowScheduler = struct {
 
     fn ensureConsumers(self: *@This()) !void {
         if (self.consumers != null) return;
-        const consumers = try self.runtime.alloc.alloc(Consumer, self.requests.len);
+        const consumers = try self.metadataAllocator().alloc(Consumer, self.requests.len);
         @memset(consumers, .{});
         self.consumers = consumers;
     }
@@ -8452,7 +8459,7 @@ const SharedPdfWindowScheduler = struct {
     }
 
     fn cleanupSpool(self: *@This()) !void {
-        try clearPrivateStorePrefix(self.runtime, self.runtime.alloc, &self.runtime.store, self.spool_root.?);
+        try clearPrivateStorePrefix(self.runtime, self.metadataAllocator(), &self.runtime.store, self.spool_root.?);
         // Keep the registry row until every result row has been removed. A
         // crash or failed fence at any intermediate point is recoverable.
         try storePutPrivateBatchWithRetry(self.runtime, &self.runtime.store, &.{}, &.{self.spool_attempt_key.?});
@@ -8473,22 +8480,22 @@ const SharedPdfWindowScheduler = struct {
         if (self.precommit != null) return;
         if (request.kind != .dense_embedding or request.embedding_input != .pdf_page_images) return;
         const embedder = self.runtime.config.dense_embedder orelse return;
-        const indexes = try self.runtime.index_manager.denseIndexesForEmbedding(self.runtime.alloc, requestEmbeddingName(request), request.expected_dims);
+        const indexes = try self.runtime.index_manager.denseIndexesForEmbedding(self.metadataAllocator(), requestEmbeddingName(request), request.expected_dims);
         defer {
-            for (indexes) |name| self.runtime.alloc.free(name);
-            self.runtime.alloc.free(indexes);
+            for (indexes) |name| self.metadataAllocator().free(name);
+            self.metadataAllocator().free(indexes);
         }
         if (indexes.len == 0) return;
-        const source_url = try extractSourceText(self.runtime.alloc, self.runtime.config, raw, request) orelse return;
-        defer self.runtime.alloc.free(source_url);
+        const source_url = try extractSourceText(self.metadataAllocator(), self.runtime.config, raw, request) orelse return;
+        defer self.metadataAllocator().free(source_url);
         consumer.source_identity = PreparedDocumentSourceCache.sourceIdentity(source_url);
-        const execution_lease = try embedder.resolvePartLease(self.runtime.alloc, requestEmbeddingName(request));
+        const execution_lease = try embedder.resolvePartLease(self.metadataAllocator(), requestEmbeddingName(request));
         const caps = execution_lease.capabilities.?;
         consumer.execution_lease = execution_lease;
         const raster = embedder.supportsRasterItems() and caps.borrowed_rasters;
         if (!caps.supports(.{ .image = true }) or (!raster and !caps.acceptsMimeType("image/png")) or caps.result_cardinality != .one_per_item)
             return error.UnsupportedEmbeddingProvider;
-        const policy = try enrichment_types.parseExecutionPolicyJson(self.runtime.alloc, request.execution_json);
+        const policy = try enrichment_types.parseExecutionPolicyJson(self.metadataAllocator(), request.execution_json);
         consumer.max_items = @min(@min(policy.batch_items orelse caps.batch.preferred_items, caps.batch.max_items), generated_ocr_absolute_batch_max_items);
         consumer.max_items = try embedder.withPartLease(execution_lease).partBatchLimit(requestEmbeddingName(request), request.expected_dims, consumer.max_items);
         if (consumer.max_items == 0)
@@ -8497,7 +8504,7 @@ const SharedPdfWindowScheduler = struct {
         consumer.max_pages = effectivePdfMaxDocumentPages(policy.max_document_pages, generatedPdfMaxDocumentPages());
         consumer.capabilities = caps;
         applyDocumentExtractionRuntimePolicy(&consumer.config);
-        try consumer.plans.resize(self.runtime.alloc, consumer.max_items + 1);
+        try consumer.plans.resize(self.metadataAllocator(), consumer.max_items + 1);
         for (1..consumer.plans.items.len) |count| consumer.plans.items[count] = try embedder.withPartLease(execution_lease).partInvocationMemoryForMime(
             requestEmbeddingName(request),
             count,
@@ -8533,7 +8540,7 @@ const SharedPdfWindowScheduler = struct {
         fn cancel(slot: *?*@This()) void {
             const self = slot.* orelse return;
             slot.* = null;
-            const alloc = self.jobs.scheduler.runtime.alloc;
+            const alloc = self.jobs.scheduler.metadataAllocator();
             if (self.jobs.scheduler.active_work == self) self.jobs.scheduler.active_work = null;
             self.jobs.deinit(); // cancel and join before releasing borrowed PNGs
             self.png.deinit();
@@ -8565,7 +8572,7 @@ const SharedPdfWindowScheduler = struct {
         } });
         if (self.current + 1 >= self.requests.len) return null;
         try self.ensureConsumers();
-        const work = try self.runtime.alloc.create(WindowWork);
+        const work = try self.metadataAllocator().create(WindowWork);
         work.* = .{ .jobs = .{ .scheduler = self } };
         var owned: ?*WindowWork = work;
         errdefer WindowWork.cancel(&owned);
@@ -8624,7 +8631,7 @@ const SharedPdfWindowScheduler = struct {
                         (consumer.config.content_type.len > 0 and !std.mem.eql(u8, source.content_type, consumer.config.content_type))) continue;
                 }
                 var pending_mask: ?[]bool = null;
-                defer if (pending_mask) |mask| self.runtime.alloc.free(mask);
+                defer if (pending_mask) |mask| self.metadataAllocator().free(mask);
                 const media = if (rendered == .raster and !consumer.transform.raster) blk: {
                     const demand = self.pendingPngPages(consumer, index, request, source_sha, rendered, text_source) catch |err| {
                         if (err == error.OutOfMemory or err == error.DocumentExtractionWorkingSetTooLarge) continue;
@@ -8817,8 +8824,8 @@ const SharedPdfWindowScheduler = struct {
                 else => return err,
             };
             if (self.count >= @min(self.jobs.len, self.lane.?.concurrentCapacity())) try self.retireOne();
-            const job = try runtime.alloc.create(Job);
-            errdefer runtime.alloc.destroy(job);
+            const job = try self.scheduler.metadataAllocator().create(Job);
+            errdefer self.scheduler.metadataAllocator().destroy(job);
             var invocation = try self.admit(consumer, required +| runtime_document_replay_segment_memory_bytes);
             errdefer invocation.deinit();
             job.* = .{
@@ -8912,9 +8919,9 @@ const SharedPdfWindowScheduler = struct {
             // replay path owns retry; do not enqueue another speculative call.
             if (!consumer.enabled) return error.DocumentExtractionWorkingSetTooLarge;
             if (consumer.err) |err| return err;
-            const job = try runtime.alloc.create(Job);
+            const job = try self.scheduler.metadataAllocator().create(Job);
             var owns_job = true;
-            errdefer if (owns_job) runtime.alloc.destroy(job);
+            errdefer if (owns_job) self.scheduler.metadataAllocator().destroy(job);
             job.* = .{
                 .embedder = provider.withPartLease(consumer.execution_lease orelse .{ .capabilities = consumer.capabilities }),
                 .consumer = consumer,
@@ -9024,7 +9031,7 @@ const SharedPdfWindowScheduler = struct {
             defer {
                 setActiveFailureFingerprint(runtime, fingerprint);
                 runtime.retry_error_has_request_identity = retry_identity;
-                job.deinit(runtime.alloc);
+                job.deinit(self.scheduler.metadataAllocator());
                 slot.* = null;
                 self.count -= 1;
             }
@@ -9116,14 +9123,14 @@ const SharedPdfWindowScheduler = struct {
             };
             for (self.jobs) |entry| if (entry) |job| {
                 if (job.future) |*future| future.await(self.lane.?.io());
-                job.deinit(self.scheduler.runtime.alloc);
+                job.deinit(self.scheduler.metadataAllocator());
             };
             if (self.lane) |*lane| lane.release();
         }
     };
 
     fn prepareTextConsumer(self: *@This(), consumer: *Consumer, request: enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !void {
-        const alloc = self.runtime.alloc;
+        const alloc = self.metadataAllocator();
         var outer = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
         defer outer.deinit(alloc);
         if (outer.type != .document_extraction) return;
@@ -9179,7 +9186,7 @@ const SharedPdfWindowScheduler = struct {
         // The ordinary precommit path owns force-reprocess and unchanged-source
         // checks. Speculation must not clean replay attempts or skip that path.
         if (self.precommit != null) return false;
-        const alloc = self.runtime.alloc;
+        const alloc = self.metadataAllocator();
         const artifact = requestArtifactName(request);
         const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact);
         defer alloc.free(state_key);
@@ -9203,9 +9210,9 @@ const SharedPdfWindowScheduler = struct {
 
     fn ensureSpool(self: *@This()) !void {
         if (self.spool_root == null) {
-            const root = try internal_keys.sharedPdfConsumerRootPrefixAlloc(self.runtime.alloc, self.requests[self.current].doc_key);
-            errdefer self.runtime.alloc.free(root);
-            self.spool_attempt_key = try internal_keys.sharedPdfConsumerAttemptKeyAlloc(self.runtime.alloc, self.requests[self.current].doc_key);
+            const root = try internal_keys.sharedPdfConsumerRootPrefixAlloc(self.metadataAllocator(), self.requests[self.current].doc_key);
+            errdefer self.metadataAllocator().free(root);
+            self.spool_attempt_key = try internal_keys.sharedPdfConsumerAttemptKeyAlloc(self.metadataAllocator(), self.requests[self.current].doc_key);
             self.spool_root = root;
         }
     }
@@ -9223,18 +9230,18 @@ const SharedPdfWindowScheduler = struct {
         if (config.routes.len != 0 or config.route_preset != .mixed_files) return false;
         for (self.requests, 0..) |request, index| {
             if (index == self.current or request.kind != .asset or self.completed(index)) continue;
-            var outer = asset_producer_mod.parseProducerConfig(self.runtime.alloc, request.producer_json) catch continue;
-            defer outer.deinit(self.runtime.alloc);
+            var outer = asset_producer_mod.parseProducerConfig(self.metadataAllocator(), request.producer_json) catch continue;
+            defer outer.deinit(self.metadataAllocator());
             if (outer.type != .document_extraction) continue;
-            var other = document_extraction_mod.parseConfig(self.runtime.alloc, outer.config_json) catch continue;
-            defer other.deinit(self.runtime.alloc);
+            var other = document_extraction_mod.parseConfig(self.metadataAllocator(), outer.config_json) catch continue;
+            defer other.deinit(self.metadataAllocator());
             applyDocumentExtractionRuntimePolicy(&other);
-            try document_extraction_mod.applySourceMetadataFromJson(self.runtime.alloc, &other, raw);
+            try document_extraction_mod.applySourceMetadataFromJson(self.metadataAllocator(), &other, raw);
             if (other.routes.len != 0 or other.route_preset != .mixed_files or
                 !std.mem.eql(u8, config.credentials, other.credentials) or
                 !std.meta.eql(config.pdf_decode_limits, other.pdf_decode_limits)) continue;
-            const url = try extractAssetSourceValue(self.runtime.alloc, self.runtime.config, raw, request) orelse continue;
-            defer self.runtime.alloc.free(url);
+            const url = try extractAssetSourceValue(self.metadataAllocator(), self.runtime.config, raw, request) orelse continue;
+            defer self.metadataAllocator().free(url);
             if (std.mem.eql(u8, source_url, url)) return true;
         }
         return false;
@@ -9590,12 +9597,12 @@ const SharedPdfWindowScheduler = struct {
     fn pendingPngPages(self: *@This(), consumer: *Consumer, index: usize, request: enrichment_types.GeneratedEnrichmentRequest, source_sha: []const u8, window: PdfEmbeddingRenderedWindow, text_source: ?TextSource) ![]bool {
         if (!consumer.text) return self.pendingEmbeddingPages(consumer, request, source_sha, window);
         const source = text_source orelse return error.InvalidPdfRenderWindow;
-        const pending = try self.runtime.alloc.alloc(bool, source.indices.len);
-        errdefer self.runtime.alloc.free(pending);
+        const pending = try self.metadataAllocator().alloc(bool, source.indices.len);
+        errdefer self.metadataAllocator().free(pending);
         for (source.indices, pending) |unit_index, *needed| {
             const unit = source.units[unit_index];
-            const key = try self.textKey(self.runtime.alloc, index, unit.page_number orelse return error.InvalidPdfRenderWindow);
-            defer self.runtime.alloc.free(key);
+            const key = try self.textKey(self.metadataAllocator(), index, unit.page_number orelse return error.InvalidPdfRenderWindow);
+            defer self.metadataAllocator().free(key);
             needed.* = !try self.textStageExists(key);
         }
         return pending;
@@ -9607,15 +9614,15 @@ const SharedPdfWindowScheduler = struct {
         const pixel_cap = consumer.capabilities.renderPixelLimit(consumer.transform.raster);
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
         const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
-        const stage_id = try std.fmt.allocPrint(runtime.alloc, "epoch-{d}:sequence-{d}:source-{x}", .{
+        const stage_id = try std.fmt.allocPrint(self.metadataAllocator(), "epoch-{d}:sequence-{d}:source-{x}", .{
             if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0, request.sequence, generation_hash,
         });
-        defer runtime.alloc.free(stage_id);
+        defer self.metadataAllocator().free(stage_id);
         const total = switch (window) {
             inline else => |batch| batch.results.len,
         };
-        const pending = try runtime.alloc.alloc(bool, total);
-        errdefer runtime.alloc.free(pending);
+        const pending = try self.metadataAllocator().alloc(bool, total);
+        errdefer self.metadataAllocator().free(pending);
         {
             var txn: ?backend_erased.ReadTxn = runtime.store.beginRead() catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -9627,14 +9634,14 @@ const SharedPdfWindowScheduler = struct {
                     inline else => |batch| batch.results[i].page_number,
                 };
                 const hash = pdfPageEmbeddingSourceHash(source_sha, page, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
-                const unit_id = try std.fmt.allocPrint(runtime.alloc, "page:{d:0>6}", .{page});
-                defer runtime.alloc.free(unit_id);
-                const page_key = try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, request.doc_key, requestArtifactName(request), unit_id);
-                defer runtime.alloc.free(page_key);
+                const unit_id = try std.fmt.allocPrint(self.metadataAllocator(), "page:{d:0>6}", .{page});
+                defer self.metadataAllocator().free(unit_id);
+                const page_key = try internal_keys.documentUnitArtifactKeyAlloc(self.metadataAllocator(), request.doc_key, requestArtifactName(request), unit_id);
+                defer self.metadataAllocator().free(page_key);
                 const final_key = try embeddingArtifactKey(runtime, page_key, embedding_name);
-                defer runtime.alloc.free(final_key);
-                const stage_key = try pdfPageEmbeddingStageKeyAlloc(runtime.alloc, request.doc_key, requestArtifactName(request), embedding_name, stage_id, unit_id);
-                defer runtime.alloc.free(stage_key);
+                defer self.metadataAllocator().free(final_key);
+                const stage_key = try pdfPageEmbeddingStageKeyAlloc(self.metadataAllocator(), request.doc_key, requestArtifactName(request), embedding_name, stage_id, unit_id);
+                defer self.metadataAllocator().free(stage_key);
                 const read = if (txn) |*value| value else null;
                 needed.* = !try shouldSkipEmbeddingArtifactInTxn(runtime, read, final_key, hash) and !try shouldSkipEmbeddingArtifactInTxn(runtime, read, stage_key, hash);
             }
@@ -9649,27 +9656,27 @@ const SharedPdfWindowScheduler = struct {
         const pixel_cap = consumer.capabilities.renderPixelLimit(consumer.transform.raster);
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
         const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
-        const stage_id = try std.fmt.allocPrint(runtime.alloc, "epoch-{d}:sequence-{d}:source-{x}", .{
+        const stage_id = try std.fmt.allocPrint(self.metadataAllocator(), "epoch-{d}:sequence-{d}:source-{x}", .{
             if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0, request.sequence, generation_hash,
         });
-        defer runtime.alloc.free(stage_id);
+        defer self.metadataAllocator().free(stage_id);
         const total = switch (window) {
             inline else => |batch| batch.results.len,
         };
         const owned_pending = if (pending_mask == null) try self.pendingEmbeddingPages(consumer, request, source_sha, window) else null;
-        defer if (owned_pending) |mask| runtime.alloc.free(mask);
+        defer if (owned_pending) |mask| self.metadataAllocator().free(mask);
         const pending = pending_mask orelse owned_pending.?;
         // Compact descriptors, never page buffers. Cache hits must not split
         // compatible pending pages into singleton provider invocations.
         const rendered: PdfEmbeddingRenderedWindow = switch (window) {
             inline else => |batch, tag| blk: {
                 var compact = batch;
-                compact.results = try compactPendingPdfResults(runtime.alloc, batch.results, pending);
+                compact.results = try compactPendingPdfResults(self.metadataAllocator(), batch.results, pending);
                 break :blk @unionInit(PdfEmbeddingRenderedWindow, @tagName(tag), compact);
             },
         };
         defer switch (rendered) {
-            inline else => |batch| runtime.alloc.free(batch.results),
+            inline else => |batch| self.metadataAllocator().free(batch.results),
         };
         const pending_count = switch (rendered) {
             inline else => |batch| batch.results.len,
@@ -10375,8 +10382,32 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     const resources = runtime.config.resource_manager orelse manager.resource_manager.?;
     const before = resources.sliceStats(.document_extraction_working_set).used_bytes;
     {
-        const execution = try PrecommitDocumentExecution.create(&runtime, requests[0..3], "{}");
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)].hard_limit_bytes = 1;
+        var denied_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .identity_allocator = alloc });
+        defer denied_manager.deinit(alloc);
+        var backing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        var denied = resource_manager_mod.BudgetedAllocator.init(&denied_manager, .relational_preparation_working_set, backing.allocator(), 1);
+        defer denied.deinit();
+        try std.testing.expectError(error.OutOfMemory, PrecommitDocumentExecution.createWithAllocator(&runtime, denied.allocator(), requests[0..3], "{}"));
+        try std.testing.expect(denied.denied());
+        try std.testing.expectEqual(@as(usize, 0), backing.alloc_index);
+        try std.testing.expectEqual(@as(usize, 0), denied.live_bytes);
+    }
+    var preparation_budget = resource_manager_mod.BudgetedAllocator.init(resources, .relational_preparation_working_set, alloc, 1);
+    defer preparation_budget.deinit();
+    {
+        var failing = std.testing.FailingAllocator.init(preparation_budget.allocator(), .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, PrecommitDocumentExecution.createWithAllocator(&runtime, failing.allocator(), requests[0..3], "{}"));
+        try std.testing.expectEqual(@as(usize, 0), preparation_budget.live_bytes);
+        failing.fail_index = std.math.maxInt(usize);
+        const execution = try PrecommitDocumentExecution.createWithAllocator(&runtime, failing.allocator(), requests[0..3], "{}");
         defer execution.destroy();
+        try std.testing.expect(preparation_budget.live_bytes >= @sizeOf(PrecommitDocumentExecution));
+        failing.fail_index = failing.alloc_index;
+        try std.testing.expectError(error.OutOfMemory, execution.scheduler.ensureConsumers());
+        try std.testing.expect(execution.scheduler.consumers == null);
+        failing.fail_index = std.math.maxInt(usize);
         execution.validateSource(source.fingerprint);
         try execution.scheduler.ensureConsumers();
         for (1..3) |i| {
@@ -10411,6 +10442,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         harness.text_calls = 0;
     }
     try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), preparation_budget.live_bytes);
     {
         const execution = try PrecommitDocumentExecution.create(&runtime, requests[0..2], "{}");
         defer execution.destroy();
@@ -14899,8 +14931,9 @@ test "shared PDF precommit cache yields to larger render windows and downloads" 
         budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
             .hard_limit_bytes = if (aggregate_pressure) 0 else 64 * 1024,
         };
-        var manager = resource_manager_mod.ResourceManager.init(.{
+        var manager = try resource_manager_mod.metadata_fixture.init(.{
             .budgets = budgets,
+            .identity_allocator = alloc,
             .memory_budget = .{ .hard_limit_bytes = if (aggregate_pressure) 64 * 1024 else 0 },
         });
         defer manager.deinit(alloc);
@@ -14981,6 +15014,7 @@ test "shared PDF precommit cache reclamation skips locked borrowers and preserve
 /// Only typed page results survive a window. Public artifact publication stays
 /// in DB's existing atomic batch, and optional staging is strictly bounded.
 pub const PrecommitDocumentExecution = struct {
+    owner_alloc: Allocator,
     runtime: EnrichmentRuntime,
     scheduler: SharedPdfWindowScheduler,
     results: PrecommitResultCache = .{},
@@ -14997,13 +15031,20 @@ pub const PrecommitDocumentExecution = struct {
     }
 
     pub fn create(parent: *EnrichmentRuntime, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !*@This() {
+        return createWithAllocator(parent, parent.alloc, requests, raw);
+    }
+
+    /// Borrow the original preparation allocator through every physical join.
+    /// It owns invocation and coordinator metadata; separately granted native
+    /// windows/results retain raw backing and their existing resource ledger.
+    pub fn createWithAllocator(parent: *EnrichmentRuntime, alloc: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !*@This() {
         if (builtin.os.tag == .freestanding) return error.UnsupportedPrecommitDocumentExecution;
-        const alloc = parent.alloc;
         const self = try alloc.create(@This());
         errdefer alloc.destroy(self);
         self.* = .{
+            .owner_alloc = alloc,
             .runtime = .{
-                .alloc = alloc,
+                .alloc = parent.alloc,
                 .backend_runtime = parent.backend_runtime,
                 .io_impl = parent.io_impl,
                 .clock = parent.clock,
@@ -15024,8 +15065,9 @@ pub const PrecommitDocumentExecution = struct {
         };
         errdefer self.runtime.ownership.deinit(alloc);
         const manager = parent.config.resource_manager orelse parent.index_manager.resource_manager;
-        try self.results.init(alloc, manager);
+        try self.results.init(parent.alloc, manager);
         self.scheduler = SharedPdfWindowScheduler.init(&self.runtime, requests, 0);
+        self.scheduler.metadata_alloc = alloc;
         self.scheduler.precommit = self;
         self.scheduler.raw_doc = raw;
         self.runtime.shared_pdf_windows = &self.scheduler;
@@ -15085,8 +15127,8 @@ pub const PrecommitDocumentExecution = struct {
         clearPublishedGeneratedArtifacts(&self.runtime);
         clearIsolatedFailedIndexes(&self.runtime);
         self.runtime.inference_recovery.deinit(alloc);
-        if (builtin.os.tag != .freestanding) self.runtime.ownership.deinit(alloc);
-        alloc.destroy(self);
+        if (builtin.os.tag != .freestanding) self.runtime.ownership.deinit(self.owner_alloc);
+        self.owner_alloc.destroy(self);
     }
 };
 

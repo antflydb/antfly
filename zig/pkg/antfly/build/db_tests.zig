@@ -31,6 +31,19 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const producer_funding_filters = [_][]const u8{
+        "shared PDF",
+        "db document extraction skips stable unit local rewrites while replaying full text from stored artifacts",
+    };
+    const producer_funding_tests = b.addTest(.{
+        .name = "precommit-producer-funding-tests",
+        .root_module = antfly_test_mod,
+        .filters = &producer_funding_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-precommit-producer-funding-test", "Verify caller-funded producer planning and independently admitted PDF window ownership")
+        .dependOn(&addCuratedTestRunArtifact(b, producer_funding_tests, &producer_funding_filters).step);
     const row_preparation_filters = [_][]const u8{
         "prepared relational",
         "relational durable preparation",
