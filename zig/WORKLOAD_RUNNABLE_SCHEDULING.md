@@ -19,6 +19,53 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Funded cold Raft owner opening (2026-10-20)
+
+Source `e83e2d9a1b090aac7ad0f597cdba30b6a1968746` gives cold committed-Raft
+owner opening an independently admitted background execution. The existing
+bounded request queue retains its exact committed descriptors and durable retry
+behavior. Each attempt has its own 30-second native deadline, including
+scheduler waiting, shutdown cancellation and checked retained descriptor memory.
+It waits on ordinary background capacity instead of spending protected health or
+cleanup capacity.
+
+A separately reserved worker drains atomic lease releases and retired-owner
+close debt while the opening worker waits for admission. The data runtime
+reserves two bounded node workers for this source, rather than adding any worker
+per connection or per group. Failed partial startup signals and joins the first
+task before returning; shutdown wakes and joins both tasks before the hosting
+worker and scheduler leases are released. Retrying opens never abandons physical
+work when its logical attempt expires.
+
+Native cancellation predicates check lifetime without parking or reacquiring CPU
+under a storage lock. Admission is checked before registry access and cold
+opening. A physically completed open is registered even if its attempt expired
+during native I/O, so durable replay can reuse it on retry instead of repeatedly
+closing and reopening the same database. The expired attempt still returns its
+original rejection and retains execution through physical return. This is not a
+claim that every native-open I/O operation is interruptible.
+
+`native-owner-control-funding-v6-verified.json` records runtime pass/scheduler
+and routing-bridge checks plus analysis of the actual cold-open controller,
+partial-startup rollback, resident status adapter and compiled/legacy production
+startup profiles. Twelve focused runtime cases pass without skips or leaks.
+Controller and rollback checks are analyzed, not claimed full linked runtime
+qualified. The new public package has 4483 matching sources and passes 25
+ReleaseSafe consumer steps. The startup profiles exposed an existing
+compile-time branch-limit failure in boundary field lookup; replacing its linear
+reflection search with the built-in field check fixes that without changing
+callback ABI. Error generation and the storage control catalog pass. Native ABI
+43, owner ABI 103, engine descriptor 28, API kernel 53, file floor 7 and Raft
+protocol 25 remain unchanged. Full Linux qualification remains waived.
+
+This funds historical committed-Raft opens. Online cold-owner preparation for
+required transaction status and original required mutation producers is still
+incomplete; historical owners remain excluded from that status provider.
+Required BEGIN/PREPARE/seal providers, fresh route authority, transport and
+migration/activation work, completion resource bundles and the remaining broader
+scheduler scope remain open. The full storage-owner archive runtime remains
+unqualified and required distributed mutation remains disabled.
+
 ## Bounded production metadata routing (2026-10-20)
 
 Source `d906d4039744dd5fc0fa7649143e7a6bf88ae340` replaces the production

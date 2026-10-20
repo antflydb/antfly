@@ -24,19 +24,18 @@ cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
 
-Source `d906d4039744dd5fc0fa7649143e7a6bf88ae340` adds coherent bounded
-production batch routing. Original admission and deadlines cover retained
-metadata capture, selected report reads, caller-owned allocation, C delivery and
-route selection. Missing derived indexes are rejected without request-path
-repair. The provider now advertises bounded batch capture; legacy scalar route
-callbacks remain unqualified. Selection uses committed group facts rather than
-runtime-only diagnostics. Six focused build targets and 25 public-package
-consumer steps pass; complete storage-owner archive runtime qualification
-remains unrun, and full Linux qualification remains waived. Required mutation
-providers, funded original producers, cold-owner preparation, fresh route
-authority, large-frame transport and coordinated migration still gate
-activation. The broader scheduler design and distributed fault/restart
-qualification remain open.
+Source `e83e2d9a1b090aac7ad0f597cdba30b6a1968746` adds independently funded
+background cold Raft opens and a separate bounded release/close worker. Ordinary
+execution waiting therefore leaves health, cleanup and lease-release progress
+available. Attempts keep finite deadlines and descriptor accounting through
+physical return. Coherent bounded batch routing remains implemented. Twelve
+focused runtime cases, actual controller/status and both startup-profile
+analysis checks, and 25 public-package consumer steps pass. Full linked
+storage-owner runtime remains unqualified and full Linux qualification remains
+waived. Online cold-owner preparation and original required mutation producers,
+required BEGIN/PREPARE/seal providers, fresh route authority, transport and
+migration/activation still gate delivery. The broader scheduler design and
+distributed fault/restart qualification remain open.
 
 The full goal remains safe, bounded execution sharing across many connections
 by default, with fair scheduling and bounded waiting, preserving session
