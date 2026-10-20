@@ -4359,8 +4359,8 @@ test "embeddinggemma2 video Apple sparse continuation seeks beyond dependency bo
     var captured = CaptureSparse{};
     const sink = video.apple.Sink{ .context = &captured, .accept = CaptureSparse.accept };
     try std.testing.expectEqual(@as(usize, 1), try owner.decodeTo(&.{0}, sink));
-    try std.testing.expectEqual(@as(usize, 1), try owner.decodeTo(&.{9000}, sink));
-    try std.testing.expectEqual(@as(usize, 2), captured.count);
+    try std.testing.expectEqual(@as(usize, 3), try owner.decodeTo(&.{ 2, 9000 }, sink));
+    try std.testing.expectEqual(@as(usize, 3), captured.count);
     try std.testing.expectEqual(@as(usize, 9000), captured.last);
 }
 

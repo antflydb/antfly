@@ -38491,7 +38491,7 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
         for (expected.result.?.vector, actual.result.?.vector) |left, right| max_error = @max(max_error, @abs(left - right));
     }
     try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
-    std.debug.print("streamed live pretrained ts={} parts={} encrypted={} metal={} windows={d} callbacks={d} early={d} prefix={d} requests={d} prefetched={d} overlaps={d} max_error={d:.9}\n", .{ ts, parts, encrypted, metal, capture.count, capture.calls, capture.early, acknowledged_prefix, transport.requests, stream.stats.prefetched_fragments, stream.stats.overlapped_fragments, max_error });
+    std.debug.print("streamed live pretrained ts={} parts={} encrypted={} metal={} windows={d} callbacks={d} early={d} prefix={d} requests={d} prefetched={d} overlaps={d} validation_overlap_packets={d} max_error={d:.9}\n", .{ ts, parts, encrypted, metal, capture.count, capture.calls, capture.early, acknowledged_prefix, transport.requests, stream.stats.prefetched_fragments, stream.stats.overlapped_fragments, stream.stats.overlapped_validation_packets, max_error });
     if (!ts and !parts and !encrypted) {
         // A backlog is available immediately: qualify native cohorts and one
         // preparation wave ahead, including captions and an unacknowledged
@@ -38547,17 +38547,17 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
         const caption = "A short scene.";
         var cohort_stream = try StreamAPI.init(a, loaded.session, loaded.getTokenizer(), &cohort_flow, caption, cohort_options, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
         defer cohort_stream.deinit();
-        var ended = Ended{};
+        var ended_reader = Ended{};
         var captured = CohortCapture{};
         defer for (captured.outputs) |output| if (output) |value| a.free(value.result.?.vector);
         const cohort_started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
-        try std.testing.expectError(error.ConsumerFailure, cohort_stream.process(&ended, &captured, CohortCapture.accept));
+        try std.testing.expectError(error.ConsumerFailure, cohort_stream.process(&ended_reader, &captured, CohortCapture.accept));
         try std.testing.expect(cohort_stream.queued != null);
-        try std.testing.expectEqual(@as(usize, 0), ended.calls);
-        _ = try cohort_stream.process(&ended, &captured, CohortCapture.accept);
+        try std.testing.expectEqual(@as(usize, 0), ended_reader.calls);
+        _ = try cohort_stream.process(&ended_reader, &captured, CohortCapture.accept);
         const cohort_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - cohort_started;
         try std.testing.expectEqual(@as(usize, 6), captured.count);
-        try std.testing.expect(cohort_stream.stats.native_batches > 0);
+        try std.testing.expectEqual(@as(usize, 3), cohort_stream.stats.native_batches);
         try std.testing.expect(telemetry.validated_frames.load(.acquire) > 0);
         var cohort_error: f32 = 0;
         const serial_started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
@@ -38570,6 +38570,66 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, 
         try std.testing.expect(cohort_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
         const serial_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - serial_started;
         std.debug.print("sealed live cohorts metal={} batches={d} ahead={d} validated_frames={d} callbacks={d} max_error={d:.9} completed_ns={d} serial_ns={d}\n", .{ metal, cohort_stream.stats.native_batches, cohort_stream.stats.prepared_ahead, telemetry.validated_frames.load(.acquire), captured.calls, cohort_error, cohort_ns, serial_ns });
+        // One publication exceeds the cache horizon. Its packet slices must
+        // reuse later validated frames and advance validation during backbone
+        // execution, with the same captioned vectors as independent windows.
+        var publication = try stream_media.live_mp4.Ingest.init(a, "whole-publication", bytes[0..797], .{});
+        defer publication.deinit();
+        try publication.push(bytes[797..]);
+        const PublicationReader = struct {
+            unit: ?stream_media.live_mp4.Segment,
+            control: ?stream_media.source.Control = null,
+            pub fn swapReadControl(self: *@This(), control: ?stream_media.source.Control) ?stream_media.source.Control {
+                const previous = self.control;
+                self.control = control;
+                return previous;
+            }
+            pub fn ended(self: *@This()) bool {
+                return self.unit == null;
+            }
+            pub fn streamNext(self: *@This(), raw: *anyopaque, accept: *const fn (*anyopaque, *stream_media.http_stream.FragmentDelivery) anyerror!void) !?struct { resource_complete: bool } {
+                if (self.unit == null) return null;
+                try self.control.?.check();
+                var delivery = stream_media.http_stream.FragmentDelivery{ .segment = self.unit };
+                defer self.unit = delivery.segment;
+                try accept(raw, &delivery);
+                return .{ .resource_complete = true };
+            }
+        };
+        var published_reader = PublicationReader{ .unit = try publication.finishSegment() };
+        defer if (published_reader.unit) |*unit| unit.deinit();
+        const PublishedCapture = struct {
+            telemetry: *@import("antfly_video").decoding.Telemetry,
+            outputs: [6]?stream_embedding.LiveResult = @splat(null),
+            count: usize = 0,
+            fn accept(raw: *anyopaque, delivery: *StreamDelivery) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try std.testing.expectEqual(self.count, delivery.value.ordinal);
+                std.debug.print("whole publication window={d} validated={d}\n", .{ self.count, self.telemetry.validated_frames.load(.acquire) });
+                self.outputs[self.count] = try delivery.copy(std.testing.allocator);
+                self.count += 1;
+            }
+        };
+        var published_telemetry = @import("antfly_video").decoding.Telemetry{};
+        var published = PublishedCapture{ .telemetry = &published_telemetry };
+        defer for (published.outputs) |output| if (output) |value| a.free(value.result.?.vector);
+        var published_flow = try stream_coordinator.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .max_frames = 1 });
+        defer published_flow.deinit();
+        var published_stream = try StreamAPI.init(a, loaded.session, loaded.getTokenizer(), &published_flow, caption, .{ .video_decoder = .{ .telemetry = &published_telemetry } }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+        defer published_stream.deinit();
+        const published_start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        _ = try published_stream.process(&published_reader, &published, PublishedCapture.accept);
+        const published_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - published_start;
+        try std.testing.expectEqual(@as(usize, 6), published.count);
+        try std.testing.expect(published_stream.stats.overlapped_validation_packets > 0);
+        try std.testing.expectEqual(@as(usize, 6), published_telemetry.validated_frames.load(.acquire));
+        var published_error: f32 = 0;
+        for (published.outputs, captured.outputs) |actual, expected| {
+            try std.testing.expectEqual(expected.?.result.?.input_tokens, actual.?.result.?.input_tokens);
+            for (actual.?.result.?.vector, expected.?.result.?.vector) |left, right| published_error = @max(published_error, @abs(left - right));
+        }
+        try std.testing.expect(published_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
+        std.debug.print("whole publication metal={} windows={d} batches={d} validation_overlap_packets={d} validated_frames={d} max_error={d:.9} completed_ns={d}\n", .{ metal, published.count, published_stream.stats.native_batches, published_stream.stats.overlapped_validation_packets, published_telemetry.validated_frames.load(.acquire), published_error, published_ns });
     }
 }
 

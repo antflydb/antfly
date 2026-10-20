@@ -840,13 +840,19 @@ so retention rebasing cannot alias another picture or stream.
 Strict live validation can retain completed native-depth/chroma pictures for
 preparation, avoiding a second reconstruction of selected frames. Four current
 or near-future sampling windows share a 64 MiB pixel bound, including outstanding
-pins; media admission charges every retained allocation. Targets use rational
+pins; media admission charges every retained allocation. Each prepared window
+pins only candidates inside its own interval. Replacement releases superseded
+unpinned candidates before allocating new pixels, so a full cache can replace
+provisional B-picture candidates without increasing its byte bound. Targets use rational
 presentation times and stable packet IDs, so B-picture reorder and VFR do not
 publish a provisional candidate under another picture's identity. A failed append
 clears unpublished candidates; prepared pins remain independent of coordinator
 retention and destruction. Capture scratch or cache admission denial is a miss.
 Partial hits preserve preparation slots and decode only missing selections.
 Separate colour planes and explicitly forced Apple decoding use the decoder path.
+A 32-picture reorder tail shares that same byte budget: predictive pictures
+reconstructed beyond the four-window horizon remain available when preceding
+B pictures complete and the sampling cursor advances. It never expands admission.
 Set `max_validated_frame_bytes=0` to disable this optional reuse.
 
 A live stream retains an admitted decoder owner while a GOP grows, including
@@ -855,7 +861,13 @@ state. Retention eviction, configuration/period transitions and failed inference
 reset that owner. Rewinding selections retain the existing replay fallback.
 For sparse forward windows, portable decoders verify a later independent reset
 before discarding references, with a 32-packet hysteresis; unfinished field or
-partition assemblies prevent a restart. Eligible Apple continuations recreate
+partition assemblies prevent a restart. A sparse selection spanning several GOPs
+executes bounded runs in decode order, maps callbacks back to original slots
+(including duplicates), and limits aggregate reconstruction across the request.
+Selections crossed by field assembly are delivered during that same traversal;
+independent colour planes retain their combined three-lane span policy.
+Apple continuations likewise execute each verified planned run rather than
+submitting the gap between the first and last selection. Eligible Apple continuations recreate
 their decoder at a verified IDR when it saves more than 32 packets or avoids the
 dependency limit. Configuration epochs keep their own parameter context.
 
@@ -865,10 +877,32 @@ wait. One following sealed window can prepare while the current backbone runs.
 Previewed snapshots keep stable reader/selection addresses and independent pixel
 pins. Output acknowledgement and commit stay ordered; a rejected callback retains
 both its exact vector and any later computed row. Commit rebases against current
-preroll after earlier acknowledgements evict units. Speculative pressure falls
-back to serial execution, and all preparation workers join before return.
+preroll after earlier acknowledgements evict units or validation extends the
+immutable prefix. Prepared-ahead rows batch with ordinary rows using retained
+inspection plans. Speculative pressure falls back to serial execution while
+retaining prepared successors; all preparation workers join before return.
 Statistics distinguish native batches, prepared successors and validated-frame
 hits from transport overlap; none of these counters measures GPU utilization.
+
+Published units are consumed as metadata-only packet slices sharing their
+encoded snapshot and identity. Validation advances at most 64 packets per slice
+and stays within four sampling windows; a long publication is handed off and
+consumed incrementally, so windows beyond its initial four can reuse validated
+pictures too. Snapshot bytes count once across retained slices; packet metadata
+and pinned pixels remain independently admitted. Field/partition assembly and
+parameter state persist across these boundaries. Optional pressure still falls
+back to selected-frame decoding.
+
+After current model inputs are prepared, a scoped worker exclusively owns the
+coordinator while validating available input alongside backbone execution. It
+never waits for network input or fills an unbounded backlog. It yields at an
+eight-packet validation quantum when the backbone completes, preserving the DPB
+rather than cancelling reconstruction midway through a picture. The caller joins
+before preparing more windows, delivering callbacks or committing output; current
+model slots read independent immutable windows. Failed speculative append retains
+the original input and packet cursor for synchronous retry. Configuration changes
+wait for ordered draining of the preceding epoch. `overlapped_validation_packets`
+counts reconstruction submitted in this stage, not GPU utilization or saved time.
 
 HLS/DASH HTTP reads and framing use a producer with two queued fragments while
 model execution and delivery callbacks remain on the caller thread. The queue

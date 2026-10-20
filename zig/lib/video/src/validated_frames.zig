@@ -19,6 +19,7 @@ const std = @import("std");
 const media = @import("antfly_media");
 const h264 = @import("h264.zig");
 const capacity = 128;
+const spill_capacity = 32;
 const Budget = struct {
     allocator: std.mem.Allocator,
     references: std.atomic.Value(usize) = .init(1),
@@ -54,7 +55,7 @@ const Entry = struct {
     }
 };
 pub const View = struct {
-    entries: [capacity]?*Entry = @splat(null),
+    entries: [capacity + spill_capacity]?*Entry = @splat(null),
     pub fn deinit(self: *View) void {
         for (&self.entries) |*entry| if (entry.*) |owner| owner.release();
         self.* = .{};
@@ -79,6 +80,10 @@ pub const Cache = struct {
     pool: ?*media.admission.Pool,
     budget: *Budget,
     targets: [capacity]Target = undefined,
+    /// Predictive pictures can decode before B pictures in earlier windows.
+    /// Preserve a bounded reorder tail until the sampling horizon advances.
+    spill: [spill_capacity]?*Entry = @splat(null),
+    horizon: i128 = 0,
     count: usize = 0,
     base: usize = 0,
     scale: u32 = 1,
@@ -93,6 +98,11 @@ pub const Cache = struct {
     }
     pub fn clear(self: *Cache) void {
         for (self.targets[0..self.count]) |target| if (target.entry) |entry| entry.release();
+        for (&self.spill) |*slot| {
+            if (slot.*) |entry| entry.release();
+            slot.* = null;
+        }
+        self.horizon = 0;
         self.count = 0;
     }
     pub fn deinit(self: *Cache) void {
@@ -119,15 +129,52 @@ pub const Cache = struct {
                     if (target.entry) |previous| previous.release();
                     target.entry = owner.retain();
                 };
+                self.horizon = @max(self.horizon, target.end);
                 self.targets[self.count] = target;
                 self.count += 1;
             }
         }
+        var spill_count: usize = 0;
+        for (old.entries) |entry| if (entry) |owner| {
+            if (@as(i128, owner.frame.pts) * std.time.ns_per_s < self.horizon * scale) continue;
+            if (spill_count == self.spill.len) break;
+            var duplicate = false;
+            for (self.spill[0..spill_count]) |existing| if (existing.?.packet == owner.packet) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            self.spill[spill_count] = owner.retain();
+            spill_count += 1;
+        };
     }
     pub fn pin(self: *const Cache) View {
         var view = View{};
         for (self.targets[0..self.count], 0..) |target, i| if (target.entry) |entry| {
             view.entries[i] = entry.retain();
+        };
+        for (self.spill, capacity..) |entry, i| if (entry) |owner| {
+            view.entries[i] = owner.retain();
+        };
+        return view;
+    }
+    /// A prepared window retains only its own picture candidates. Keeping all
+    /// four horizons pinned would prevent consumed windows releasing byte quota
+    /// while later validation fills the next horizon.
+    pub fn pinWindow(self: *const Cache, start: i64, end: i64) View {
+        var view = View{};
+        var count: usize = 0;
+        for (self.targets[0..self.count]) |target| if (target.entry) |entry| {
+            const pts = @as(i128, entry.frame.pts) * std.time.ns_per_s;
+            if (pts < @as(i128, start) * self.scale or pts >= @as(i128, end) * self.scale) continue;
+            view.entries[count] = entry.retain();
+            count += 1;
+        };
+        for (self.spill) |entry| if (entry) |owner| {
+            const pts = @as(i128, owner.frame.pts) * std.time.ns_per_s;
+            if (pts < @as(i128, start) * self.scale or pts >= @as(i128, end) * self.scale) continue;
+            view.entries[count] = owner.retain();
+            count += 1;
         };
         return view;
     }
@@ -141,6 +188,12 @@ pub const Cache = struct {
         if (picture.independent_plane != null) return false;
         const packet = std.math.add(usize, self.base, picture.first_packet) catch return false;
         for (self.targets[0..self.count]) |target| if (target.prefers(packet, picture.pts, self.scale)) return true;
+        if (self.count != 0 and @as(i128, picture.pts) * std.time.ns_per_s >= self.horizon * self.scale) {
+            for (self.spill) |entry| if (entry) |owner| {
+                if (owner.packet == packet) return false;
+            };
+            for (self.spill) |entry| if (entry == null) return true;
+        }
         return false;
     }
     fn accept(raw: *anyopaque, picture: h264.Picture, frame: *const h264.Frame) void {
@@ -151,6 +204,15 @@ pub const Cache = struct {
     }
     fn capture(self: *Cache, picture: h264.Picture, frame: *const h264.Frame) !void {
         const bytes = try std.math.add(usize, frame.nv12.len, @sizeOf(Entry));
+        const packet = try std.math.add(usize, self.base, picture.first_packet);
+        // Retire superseded provisional candidates before requesting replacement
+        // storage. External pins keep their bytes charged and immutable.
+        for (self.targets[0..self.count]) |*target| if (target.prefers(packet, frame.pts, self.scale)) {
+            if (target.entry) |previous| previous.release();
+            target.entry = null;
+        };
+        const future = self.count != 0 and @as(i128, frame.pts) * std.time.ns_per_s >= self.horizon * self.scale;
+        const spill_slot = if (future) std.mem.indexOfScalar(?*Entry, &self.spill, null) orelse return error.ResourceLimitExceeded else null;
         const used = self.budget.used.load(.acquire);
         if (bytes > self.budget.limit -| used) return error.ResourceLimitExceeded;
         var reservation = if (self.pool) |pool| try pool.acquire(.{ .host_bytes = bytes }) else media.admission.Token{};
@@ -170,6 +232,7 @@ pub const Cache = struct {
             if (target.entry) |previous| previous.release();
             target.entry = entry.retain();
         };
+        if (spill_slot) |slot| self.spill[slot] = entry.retain();
         self.hits += 1;
     }
 };
@@ -196,4 +259,42 @@ test "live coordinator frame cache pressure preserves pinned native depth pixels
     observer.accept(observer.context, picture, &frame);
     try std.testing.expectEqual(@as(usize, 1), cache.declined);
     try std.testing.expectEqualSlices(u8, &pixels, pins.get(100).?.nv12);
+}
+
+test "live coordinator cache replaces unpinned reordered candidates at its byte limit" {
+    const a = std.testing.allocator;
+    var pixels = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    var frame = h264.Frame{ .allocator = a, .nv12 = &pixels, .width = 2, .height = 2, .pts = 1, .duration = 1, .timescale = 1, .full_range = true, .color = .{}, .decode_high_water = 0, .decoded_packets = 1, .payload_bytes = 1 };
+    var cache = try Cache.init(a, null, @sizeOf(Entry) + pixels.len);
+    defer cache.deinit();
+    cache.configure(0, 2 * std.time.ns_per_s, 2 * std.time.ns_per_s, 2 * std.time.ns_per_s, 1, 0, 1);
+    const observer = cache.observer();
+    var picture = h264.Picture{ .first_packet = 1, .pts = 1, .duration = 1, .width = 2, .height = 2, .bit_depth = 8, .chroma_format = 1 };
+    observer.accept(observer.context, picture, &frame);
+    picture.first_packet = 0;
+    picture.pts = 0;
+    frame.pts = 0;
+    observer.accept(observer.context, picture, &frame);
+    var pin = cache.pin();
+    defer pin.deinit();
+    try std.testing.expect(pin.get(0) != null);
+    try std.testing.expectEqual(@as(usize, 0), cache.declined);
+}
+
+test "live coordinator cache preserves predictive pictures beyond four windows until reorder drains" {
+    const a = std.testing.allocator;
+    var pixels = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    const frame = h264.Frame{ .allocator = a, .nv12 = &pixels, .width = 2, .height = 2, .pts = 4, .duration = 1, .timescale = 1, .full_range = true, .color = .{}, .decode_high_water = 0, .decoded_packets = 1, .payload_bytes = 1 };
+    var cache = try Cache.init(a, null, 4096);
+    defer cache.deinit();
+    cache.configure(0, std.time.ns_per_s, std.time.ns_per_s, std.time.ns_per_s, 1, 0, 1);
+    const picture = h264.Picture{ .first_packet = 40, .pts = 4, .duration = 1, .width = 2, .height = 2, .bit_depth = 8, .chroma_format = 1 };
+    const observer = cache.observer();
+    try std.testing.expect(observer.wants(observer.context, picture));
+    observer.accept(observer.context, picture, &frame);
+    cache.configure(0, std.time.ns_per_s, std.time.ns_per_s, std.time.ns_per_s, 1, 0, 1);
+    cache.configure(2 * std.time.ns_per_s, std.time.ns_per_s, std.time.ns_per_s, std.time.ns_per_s, 1, 0, 1);
+    var pin = cache.pinWindow(4 * std.time.ns_per_s, 5 * std.time.ns_per_s);
+    defer pin.deinit();
+    try std.testing.expectEqualSlices(u8, &pixels, pin.get(40).?.nv12);
 }

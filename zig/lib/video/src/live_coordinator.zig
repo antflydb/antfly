@@ -143,6 +143,15 @@ pub const Coordinator = struct {
     fn charge(unit: media.live_mp4.Segment) !usize {
         return std.math.add(usize, unit.backing.bytes.len, try std.math.mul(usize, unit.reader.packets.len, @sizeOf(media.mp4.Packet)));
     }
+    fn retainedCharge(self: *const Coordinator, unit: media.live_mp4.Segment, count: usize) !usize {
+        for (self.units[0..count]) |old| if (old.backing == unit.backing) return std.math.mul(usize, unit.reader.packets.len, @sizeOf(media.mp4.Packet));
+        return charge(unit);
+    }
+    fn releaseCharge(self: *const Coordinator, unit: media.live_mp4.Segment, index: usize, count: usize) !usize {
+        // Charge the payload on the final retained reference only.
+        for (self.units[index + 1 .. count]) |later| if (later.backing == unit.backing) return std.math.mul(usize, unit.reader.packets.len, @sizeOf(media.mp4.Packet));
+        return charge(unit);
+    }
     fn sameEpoch(self: *const Coordinator, unit: media.live_mp4.Segment) bool {
         if (self.count == 0) return true;
         const first = self.units[0];
@@ -190,7 +199,7 @@ pub const Coordinator = struct {
         const value = unit.* orelse return error.EmptyVideo;
         if (!self.sameEpoch(value)) return error.LiveEpochChanged;
         if (self.count >= self.options.window.max_units) return error.ResourceLimitExceeded;
-        const bytes = try charge(value);
+        const bytes = try self.retainedCharge(value, self.count);
         if (bytes > self.options.max_retained_bytes -| self.retained_bytes) return error.ResourceLimitExceeded;
         var start = self.start_ns;
         var tail = self.tail_ns;
@@ -243,8 +252,8 @@ pub const Coordinator = struct {
         const keep = if (self.epoch_committed and self.start_ns.? >= (sealed orelse 0)) try self.retentionKeep(view.reader, logical, self.start_ns.?, self.count + 1) else 0;
         var released: usize = 0;
         var removed_packets: usize = 0;
-        for (self.units[0..keep]) |old| {
-            released = try std.math.add(usize, released, try charge(old));
+        for (self.units[0..keep], 0..) |old, removed_index| {
+            released = try std.math.add(usize, released, try self.releaseCharge(old, removed_index, self.count + 1));
             removed_packets = try std.math.add(usize, removed_packets, old.reader.packets.len);
         }
         const next_packet_base = try std.math.add(usize, self.packet_base, removed_packets);
@@ -339,7 +348,7 @@ pub const Coordinator = struct {
             }
         }
         if (logical != null) self.stats.metadata_snapshots += 1;
-        return .{ .window = window, .logical = logical, .frames = if (self.frame_cache) |*cache| cache.pin() else .{}, .policy = .{ .start_ns = start, .end_ns = end, .step_ns = self.options.step_ns, .max_frames = self.options.max_frames }, .source_start_ns = start, .source_end_ns = end, .has_pictures = eligible, .ordinal = try std.math.add(usize, self.ordinal, offset), .packet_base = self.packet_base, .generation = self.generation, .dash_timing = self.units[0].dash_timing, .hls_timing = self.units[0].hls_timing };
+        return .{ .window = window, .logical = logical, .frames = if (self.frame_cache) |*cache| cache.pinWindow(start, end) else .{}, .policy = .{ .start_ns = start, .end_ns = end, .step_ns = self.options.step_ns, .max_frames = self.options.max_frames }, .source_start_ns = start, .source_end_ns = end, .has_pictures = eligible, .ordinal = try std.math.add(usize, self.ordinal, offset), .packet_base = self.packet_base, .generation = self.generation, .dash_timing = self.units[0].dash_timing, .hls_timing = self.units[0].hls_timing };
     }
     /// Latest independently decoded preroll at/before a presentation cursor.
     /// All payload probes are fallible and run before retention state changes.
@@ -398,10 +407,15 @@ pub const Coordinator = struct {
         }
         return keep;
     }
+    fn unitsPacketCount(self: *const Coordinator) usize {
+        var count: usize = 0;
+        for (self.units[0..self.count]) |unit| count += unit.reader.packets.len;
+        return count;
+    }
     pub fn commit(self: *Coordinator, prepared: *const Prepared) !void {
         try self.options.window.stream.control.check();
         if (prepared.ordinal != self.ordinal or self.start_ns == null or prepared.source_start_ns != self.start_ns.? or self.count == 0 or prepared.window.epoch != self.units[0].epoch) return error.InvalidLiveWindowCommit;
-        if (prepared.packet_base != self.packet_base) {
+        if (prepared.packet_base != self.packet_base or prepared.window.reader.packets.len != self.unitsPacketCount()) {
             // A cohort holds older immutable snapshots. Rebase commit against
             // current retained units after preceding acknowledgements evicted
             // preroll, without changing the delivered vector or its identity.
@@ -421,8 +435,8 @@ pub const Coordinator = struct {
         const keep = try self.retentionKeep(prepared.window.reader, prepared.logical, next_start, self.count);
         var released: usize = 0;
         var removed_packets: usize = 0;
-        for (self.units[0..keep]) |unit| {
-            released = try std.math.add(usize, released, try charge(unit));
+        for (self.units[0..keep], 0..) |unit, removed_index| {
+            released = try std.math.add(usize, released, try self.releaseCharge(unit, removed_index, self.count));
             removed_packets = try std.math.add(usize, removed_packets, unit.reader.packets.len);
         }
         const next_base = try std.math.add(usize, self.logical_base, removed_packets);
@@ -1303,8 +1317,58 @@ test "live coordinator sparse retained decoder restarts inside dependency bound"
     var expected = Capture{};
     _ = try core.decodeSelected(&reader, &.{0}, &expected, Capture.accept);
     var actual = Capture{};
-    const stats = try core.decodeSelected(&reader, &.{9000}, &actual, Capture.accept);
-    try std.testing.expectEqual(@as(usize, 1), actual.count);
-    try std.testing.expectEqual(@as(usize, 1), stats.decoded_packets);
+    const stats = try core.decodeSelected(&reader, &.{ 9000, 2, 9000 }, &actual, Capture.accept);
+    try std.testing.expectEqual(@as(usize, 3), actual.count);
+    try std.testing.expectEqual(@as(usize, 3), stats.decoded_packets);
     try std.testing.expectEqualSlices(u8, &expected.hash, &actual.hash);
+}
+
+test "live coordinator prepared commit canonicalizes a growing immutable prefix" {
+    const a = std.testing.allocator;
+    var ingest = try media.live_mp4.Ingest.init(a, "growing-preview", fixture[0..797], .{});
+    defer ingest.deinit();
+    var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s });
+    defer flow.deinit();
+    var first = try part(&ingest, 797, 20811);
+    defer if (first) |*unit| unit.deinit();
+    try flow.append(&first);
+    var prepared = (try flow.prepare()).?;
+    defer prepared.deinit();
+    var second = try part(&ingest, 20811, 42992);
+    defer if (second) |*unit| unit.deinit();
+    try flow.append(&second);
+    try std.testing.expectEqual(prepared.packet_base, flow.packet_base);
+    try std.testing.expect(prepared.window.reader.packets.len < flow.unitsPacketCount());
+    try flow.commit(&prepared);
+    try std.testing.expectEqual(@as(usize, 1), flow.ordinal);
+    var next = (try flow.prepare()).?;
+    defer next.deinit();
+    try flow.commit(&next);
+}
+
+test "live coordinator packet slices share payload charge and preserve every window" {
+    const a = std.testing.allocator;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 8 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var ingest = try media.live_mp4.Ingest.init(a, "slice-windows", fixture[0..797], .{ .stream = .{ .admission_pool = &pool } });
+    defer ingest.deinit();
+    var original = (try part(&ingest, 797, 20811)).?;
+    defer original.deinit();
+    var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s / 2, .window = .{ .stream = .{ .admission_pool = &pool } } });
+    defer flow.deinit();
+    const split = original.reader.packets.len / 2;
+    var first: ?media.live_mp4.Segment = try original.packetSlice(a, 0, split);
+    defer if (first) |*unit| unit.deinit();
+    var second: ?media.live_mp4.Segment = try original.packetSlice(a, split, original.reader.packets.len);
+    defer if (second) |*unit| unit.deinit();
+    try flow.append(&first);
+    try flow.append(&second);
+    try std.testing.expectEqual(original.backing.bytes.len + original.reader.packets.len * @sizeOf(media.mp4.Packet), flow.retained_bytes);
+    try flow.finish();
+    while (try flow.prepare()) |value| {
+        var prepared = value;
+        defer prepared.deinit();
+        try flow.commit(&prepared);
+    }
+    try std.testing.expect(flow.ordinal >= 4);
 }

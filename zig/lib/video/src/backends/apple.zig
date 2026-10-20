@@ -307,6 +307,60 @@ pub const Continuation = struct {
     /// All submissions and callbacks drain before the scoped control returns.
     pub fn decodeToControlled(self: *Continuation, indexes: []const usize, sink: Sink, control: media.source.Control) !usize {
         if (!supported or indexes.len == 0 or indexes.len > self.slots.len) return error.InvalidPacketIndex;
+        try control.check();
+        var planning_reader = self.capture.reader.*;
+        const PlanningControl = struct {
+            original: media.source.Control,
+            current: media.source.Control,
+            fn check(raw: ?*const anyopaque) !void {
+                const checks: *const @This() = @ptrCast(@alignCast(raw.?));
+                try checks.original.check();
+                try checks.current.check();
+            }
+        };
+        var checks = PlanningControl{ .original = planning_reader.input.control, .current = control };
+        var planning_source = planning_reader.input.*;
+        planning_source.control = .{ .context = &checks, .check_fn = PlanningControl.check };
+        planning_reader.input = &planning_source;
+        var unique: [32]usize = undefined;
+        var count: usize = 0;
+        for (indexes) |index| {
+            if (index < self.next_packet or index >= self.capture.reader.packets.len) return error.InvalidPacketIndex;
+            if (std.mem.indexOfScalar(usize, unique[0..count], index) != null) return error.DuplicateFrameSelection;
+            unique[count] = index;
+            count += 1;
+        }
+        std.mem.sort(usize, unique[0..count], {}, std.sort.asc(usize));
+        var nearby = true;
+        for (unique[1..count], unique[0 .. count - 1]) |next, previous| if (next - previous > 32) {
+            nearby = false;
+            break;
+        };
+        const first = unique[0];
+        const last = unique[count - 1];
+        // Keep the common warm-window route free of repeated IDR probing. The
+        // inner submission still enforces the complete dependency envelope.
+        if (nearby and (self.next_packet != 0 and first <= self.next_packet +| 32 and last - self.next_packet < self.options.max_decode_packets or self.next_packet == 0 and first == 0)) return self.decodeRun(indexes, sink, control);
+        // The planner retains verified restart payloads and bounds aggregate
+        // submissions. Execute every run instead of widening the first run to
+        // the final selection across arbitrarily large holes.
+        var plan = try decode_plan.create(self.allocator, &planning_reader, unique[0..count], .{ .mode = .verified_idr, .max_run_packets = self.options.max_decode_packets, .max_decode_packets = self.options.max_decode_packets, .merge_gap_packets = 32 });
+        defer plan.deinit();
+        var submitted: usize = 0;
+        for (plan.runs) |run| {
+            var n: usize = 0;
+            for (indexes) |index| if (index >= run.first and index <= run.last) {
+                unique[n] = index;
+                n += 1;
+            };
+            const limit = self.options.max_decode_packets;
+            self.options.max_decode_packets = limit - submitted;
+            defer self.options.max_decode_packets = limit;
+            submitted += try self.decodeRun(unique[0..n], sink, control);
+        }
+        return submitted;
+    }
+    fn decodeRun(self: *Continuation, indexes: []const usize, sink: Sink, control: media.source.Control) !usize {
         var reader_view = self.capture.reader.*;
         const Controls = struct {
             original: media.source.Control,

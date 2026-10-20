@@ -77,17 +77,46 @@ pub const Segment = struct {
     epoch: usize,
     identity: []u8,
     identity_reservation: admission.Token,
+    /// Packet slices borrow the original identity through their snapshot ref.
+    owns_identity: bool = true,
     /// DASH presentation mapping; packet timestamps remain in the native track
     /// clock. Period transitions expose a new decoder epoch independently.
     dash_timing: ?@import("hls.zig").DashTiming = null,
     samples_digest: ?SamplesDigest = null,
     hls_timing: ?HlsTiming = null,
+    /// Own only packet metadata; immutable encoded bytes/configuration and
+    /// identity remain in the shared snapshot. No remux or payload copy.
+    pub fn packetSlice(self: *const Segment, a: std.mem.Allocator, begin: usize, end: usize) !Segment {
+        if (begin >= end or end > self.reader.packets.len) return error.InvalidPacketIndex;
+        // Published readers refer directly to this immutable snapshot. Reject
+        // foreign readers rather than borrowing separately allocated metadata.
+        for ([_][]const u8{ self.reader.track.avcc, self.reader.track.color_info }) |bytes| {
+            if (bytes.len == 0) continue;
+            const base = @intFromPtr(self.backing.bytes.ptr);
+            const address = @intFromPtr(bytes.ptr);
+            if (address < base or address - base > self.backing.bytes.len or bytes.len > self.backing.bytes.len - (address - base)) return error.InvalidVideoReaderSelection;
+        }
+        var reservation = if (self.reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.mul(usize, end - begin, @sizeOf(mp4.Packet)) }) else admission.Token{};
+        errdefer reservation.deinit();
+        const packets = try a.dupe(mp4.Packet, self.reader.packets[begin..end]);
+        var result = self.*;
+        result.reader.allocator = a;
+        result.reader.packets = packets;
+        result.reader.metadata = .{ .bytes = &.{}, .source = null };
+        result.reader.index_reservation = reservation;
+        result.owns_identity = false;
+        result.identity_reservation = .{};
+        self.backing.retain();
+        return result;
+    }
     pub fn deinit(self: *Segment) void {
         // Retained window/decoder owners can outlive the segment. Keep the
         // source identity and its admission alive with that same backing.
-        std.debug.assert(self.backing.owned_identity == null);
-        self.backing.owned_identity = self.identity;
-        self.backing.identity_reservation = self.identity_reservation;
+        if (self.owns_identity) {
+            std.debug.assert(self.backing.owned_identity == null);
+            self.backing.owned_identity = self.identity;
+            self.backing.identity_reservation = self.identity_reservation;
+        }
         self.reader.deinit();
         self.backing.deinit();
         self.* = undefined;
@@ -616,4 +645,23 @@ test "live MP4 reconfiguration accepts new SPS and geometry at an explicit epoch
     try std.testing.expect(!std.mem.eql(u8, &previous_hash, &Identity.from(second.reader.track).config));
     try std.testing.expectEqual(@as(usize, 1), second.epoch);
     try std.testing.expectEqualSlices(u8, first.backing.bytes[@intCast(first.reader.packets[0].offset)..][0..lease.bytes.len], lease.bytes);
+}
+
+test "live MP4 packet slice outlives original identity and metadata leases" {
+    const a = std.testing.allocator;
+    var pool = admission.Pool{ .limits = .{ .host_bytes = 4 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    const bytes = @embedFile("../testdata/fragmented.mp4");
+    var ingest = try Ingest.init(a, "slice-owner", bytes[0..797], .{ .stream = .{ .admission_pool = &pool } });
+    defer ingest.deinit();
+    try ingest.push(bytes[797..11206]);
+    var original = try ingest.finishSegment();
+    var slice = try original.packetSlice(a, 0, 1);
+    defer slice.deinit();
+    original.deinit();
+    try std.testing.expectEqualStrings("slice-owner/segment/0", slice.backing.input.identity);
+    var lease = try slice.reader.readPacket(0);
+    defer lease.deinit();
+    try std.testing.expect(lease.bytes.len > 0);
+    try std.testing.expect(slice.reader.track.avcc.len > 0);
 }

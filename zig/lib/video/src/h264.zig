@@ -1367,17 +1367,90 @@ pub const Incremental = struct {
     pub fn decodeSelectedWithConfigurations(self: *Incremental, reader: *media.mp4.Reader, indexes: []const usize, callback_context: *anyopaque, callback: SelectionCallback, configurations: ?@import("h264_dynamic.zig").Context) !Statistics {
         if (!self.valid) return error.UnsupportedIncrementalConfiguration;
         if (indexes.len == 0) return error.InvalidPacketIndex;
+        if (indexes.len > self.options.max_dependency_packets) return error.ResourceLimitExceeded;
+        // Independent colour planes publish only after all three prediction
+        // lanes complete. Preserve their combined span/slot envelope.
+        if (self.cfg.?.separate_planes) {
+            var last: usize = 0;
+            for (indexes) |index| last = @max(last, index);
+            return self.decodeRun(reader, indexes, last, callback_context, callback, configurations);
+        }
+        const a = self.budget.allocator();
+        var order_storage: [64]usize = undefined;
+        const order = if (indexes.len <= order_storage.len) order_storage[0..indexes.len] else try a.alloc(usize, indexes.len);
+        defer if (indexes.len > order_storage.len) a.free(order);
+        for (order, 0..) |*slot, i| slot.* = i;
+        std.mem.sort(usize, order, indexes, struct {
+            fn less(values: []const usize, left: usize, right: usize) bool {
+                return values[left] < values[right];
+            }
+        }.less);
+        var selected_storage: [64]usize = undefined;
+        const selected = if (indexes.len <= selected_storage.len) selected_storage[0..indexes.len] else try a.alloc(usize, indexes.len);
+        defer if (indexes.len > selected_storage.len) a.free(selected);
+        for (order, selected) |slot, *index| {
+            index.* = indexes[slot];
+            if (index.* >= reader.packets.len or index.* < self.cursor()) return error.InvalidPacketIndex;
+        }
+        var delivered_storage: [64]bool = undefined;
+        const delivered = if (indexes.len <= delivered_storage.len) delivered_storage[0..indexes.len] else try a.alloc(bool, indexes.len);
+        defer if (indexes.len > delivered_storage.len) a.free(delivered);
+        @memset(delivered, false);
+        const Forward = struct {
+            slots: []const usize,
+            delivered: []bool,
+            context: *anyopaque,
+            callback: SelectionCallback,
+            fn accept(raw: *anyopaque, slot: usize, frame: *const Frame) !void {
+                const forward: *@This() = @ptrCast(@alignCast(raw));
+                try forward.callback(forward.context, forward.slots[slot], frame);
+                forward.delivered[slot] = true;
+            }
+        };
+        var stats = Statistics{ .decoded_packets = 0, .payload_bytes = 0, .decode_high_water = 0 };
+        const limit = self.options.max_dependency_packets;
+        defer self.options.max_dependency_packets = limit;
+        errdefer self.valid = false;
+        var begin: usize = 0;
+        while (begin < selected.len) {
+            if (delivered[begin]) {
+                begin += 1;
+                continue;
+            }
+            try reader.input.control.check();
+            var end = begin + 1;
+            // Keep nearby requests in one warm run. A large hole or a full
+            // dependency envelope needs its own verified restart, not decoding
+            // all intervening pictures. Pending field/partition assembly is
+            // retained and checked by decodeRun before any reset.
+            while (end < selected.len and selected[end] - selected[end - 1] <= 32 and selected[end] - selected[begin] < @max(1, limit / 2)) : (end += 1) {}
+            if (stats.decoded_packets >= limit) return error.ResourceLimitExceeded;
+            self.options.max_dependency_packets = limit - stats.decoded_packets;
+            // Assembly may extend beyond this run (for example a PAFF mate
+            // after unrelated pictures). Keep every remaining selection visible
+            // so those pictures are delivered once during the same traversal.
+            var forward = Forward{ .slots = order[begin..], .delivered = delivered[begin..], .context = callback_context, .callback = callback };
+            const part = try self.decodeRun(reader, selected[begin..], selected[end - 1], &forward, Forward.accept, configurations);
+            stats.decoded_packets = try std.math.add(usize, stats.decoded_packets, part.decoded_packets);
+            stats.payload_bytes = try std.math.add(u64, stats.payload_bytes, part.payload_bytes);
+            stats.decode_high_water = @max(stats.decode_high_water, part.decode_high_water);
+            begin = end;
+        }
+        return stats;
+    }
+    fn decodeRun(self: *Incremental, reader: *media.mp4.Reader, indexes: []const usize, run_last: usize, callback_context: *anyopaque, callback: SelectionCallback, configurations: ?@import("h264_dynamic.zig").Context) !Statistics {
+        if (!self.valid) return error.UnsupportedIncrementalConfiguration;
+        if (indexes.len == 0) return error.InvalidPacketIndex;
         var first = reader.packets.len;
-        var last: usize = 0;
+        const last = run_last;
         for (indexes) |index| {
             if (index >= reader.packets.len or index < self.cursor()) return error.InvalidPacketIndex;
             first = @min(first, index);
-            last = @max(last, index);
         }
         errdefer self.valid = false;
         // A warm DPB is useful only while it is cheaper than an independently
         // verified restart. Never discard an unfinished field/partition pair.
-        if (!self.hasPending() and first > self.cursor() +| 32) {
+        if (!self.hasPending() and (first > self.cursor() +| 32 or last - self.cursor() >= self.options.max_dependency_packets)) {
             var restart = first;
             var probes: usize = 0;
             while (restart > self.cursor() and probes < self.options.max_dependency_packets) : (restart -= 1) {

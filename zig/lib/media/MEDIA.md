@@ -893,6 +893,13 @@ mutable source counters. `source.Range.borrow_at` optionally lends a contiguous
 immutable extent under the ordinary read/retention/admission limits, with
 `read_at` as the cross-extent fallback. Provider storage must outlive all leases.
 
+Published `live_mp4.Segment.packetSlice` owners retain immutable encoded storage
+and identity while copying only a bounded packet index. The original segment can
+be destroyed first; each slice releases its own metadata and snapshot reference.
+The coordinator accounts shared payload bytes once across retained slices. Model
+streaming uses these slices to validate long publications incrementally instead
+of retaining only their first few windows' selected pictures.
+
 HTTP adapters distinguish their stable source `control` from a transient
 `request_control`. The latter also reaches HTTP watchdog cancellation but is
 never copied into retained segment snapshots. Live readers expose
@@ -902,12 +909,20 @@ overlap without allowing a request-local callback to escape into a window.
 
 Strict video validation may lend completed pixels through independently retained
 frame pins. Their shared byte bound includes outputs held across delivery retries;
-encoded snapshot eviction cannot invalidate them. Optional capture pressure does
+encoded snapshot eviction cannot invalidate them. Window pins retain their own
+interval's candidates rather than the entire lookahead horizon. Optional capture pressure does
 not relax validation or deny its serial decoder fallback. Live model consumers
 preview only sealed windows, batch ready rows without a fill delay, and keep
 transport acknowledgement separate from ordered output acknowledgement/commit.
-A single admitted successor may prepare during backbone execution. Cancellation
-joins that preparation work before releasing its source, controls or frame pins.
+A single admitted successor may prepare during backbone execution. A scoped
+validation worker can also advance available input while the model reads its
+immutable prepared windows. Coordinator ownership transfers back before output
+delivery/commit; retries retain the encoded input and exact packet cursor.
+Cancellation joins these workers before releasing sources, controls or frame pins.
+Prepared-ahead and ordinary rows can batch together; pressure preserves their
+prepared successors for serial retry. Allocators shared by threaded transport
+and validation must support concurrent allocation; custom readers without scoped
+read controls retain the synchronous path.
 Settled phase residency returns its live-memory credit only within the same
 kernel pressure epoch. Credits from older epochs cannot augment a new sample;
 long-lived stream contexts retain shared quota without accumulating false pressure
