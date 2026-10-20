@@ -3038,6 +3038,27 @@ Version 7 columnar records still read correctly, and a mixed-version reduction
 upgrades once through the bounded streaming merge. Oversized records retain the
 existing spill/radix fallback and SQL limits.
 
+Native record reductions now run direct kernels for COUNT, integer SUM, booleans
+and typed extrema. Fixed cohorts allocate only their output record; checked i128
+intermediates preserve exact SUM results. Floating transitions,
+generic scalars and exact NUMERIC keep the shared typed merge semantics with a
+reclaimable per-slot workspace. Exact finalization also reclaims scratch through
+the enclosing memory budgets rather than retaining it in the output arena.
+
+Changed-key updates retain two monotone child cursors and their absent-key
+lookahead across mutation batches. Values own their bytes until tree application;
+batches stop at 1,024 edits or 512 KiB plus one indivisible record. Bulk-built pages
+retain their size class and balance bulk splits, avoiding amplification from
+splitting a 256 KiB page into ordinary 32 KiB pages on a small edit. Ordinary
+packing and unrelated-tail retention keep their existing locality policy.
+
+Native generation navigation no longer holds its descriptor lock across storage
+reads. An immutable single-flight cache owns verified page bytes, with 4 MiB
+residency, 128 entries and up to four loaders within 8 MiB active allocation.
+Tree cursors, read quotas and cancellation belong to the operation; every warm
+hit and waiter checks current authority. Equal misses share work while disjoint
+misses overlap. The cache retains no request-scoped loader or cancellation data.
+
 Incremental group differences zip routing intervals across fence changes and
 height changes. Shared child identities skip even when a new minimum or a split
 changes parent boundaries. The 12,000-key regression requires fewer than twelve

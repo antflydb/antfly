@@ -117,8 +117,9 @@ pub fn row(a: A, value: View, recipe: Recipe, slots: []const u16, outputs: ?[]co
 }
 fn merged(a: A, left: ?[]const u8, right: ?[]const u8, recipe: Recipe, left_layout: u8, right_layout: u8, layout: *const record.Layout) !?[]const u8 {
     if (left == null and right == null) return null;
-    if (left == null and right_layout == 2) return right;
-    if (right == null and left_layout == 2) return left;
+    if (left == null and right_layout == 2) return try a.dupe(u8, right.?);
+    if (right == null and left_layout == 2) return try a.dupe(u8, left.?);
+    if (left != null and right != null and left_layout == 2 and right_layout == 2) return try record.merge(a, left.?, right.?, layout);
     const l = if (left) |bytes| try view(a, bytes, recipe, left_layout, layout) else null;
     const r = if (right) |bytes| try view(a, bytes, recipe, right_layout, layout) else null;
     const states = try a.alloc(operators.Aggregate, recipe.inputs.len);
@@ -263,23 +264,39 @@ fn incremental(a: A, backing: tree.Store, recipe: Recipe, left: Index, right: In
             return std.mem.lessThan(u8, l.key, r.key);
         }
     }.less);
+    if (edits.len == 0) return prior.parent;
+    const Lookup = struct {
+        cursor: tree.Cursor,
+        pending: ?tree.Cursor.Record = null,
+        fn at(self: *@This(), key: []const u8) !?[]const u8 {
+            // Keep a lookahead that may be a later edited key. Discarding an
+            // absent point's successor would lose its value on the next seek.
+            if (self.pending == null or std.mem.order(u8, self.pending.?.key, key) == .lt) {
+                try self.cursor.seekForward(key);
+                self.pending = try self.cursor.next();
+            }
+            return if (self.pending) |entry| if (std.mem.eql(u8, entry.key, key)) entry.value else null else null;
+        }
+    };
+    const ca = local.sql_memory_budget.reclaimingAllocator(a);
+    var lc: Lookup = .{ .cursor = try tree.Cursor.init(ca, backing, left.page, edits[0].key, null) };
+    defer lc.cursor.deinit();
+    var rc: Lookup = .{ .cursor = try tree.Cursor.init(ca, backing, right.page, edits[0].key, null) };
+    defer rc.cursor.deinit();
     var root = prior.parent.page;
     var offset: usize = 0;
     while (offset < edits.len) {
-        var scratch = std.heap.ArenaAllocator.init(a);
+        var scratch = std.heap.ArenaAllocator.init(ca);
         defer scratch.deinit();
-        const end = @min(edits.len, offset + 32);
-        for (edits[offset..end]) |*edit| {
-            var lc = try tree.Cursor.init(scratch.allocator(), backing, left.page, edit.key, null);
-            defer lc.deinit();
-            var rc = try tree.Cursor.init(scratch.allocator(), backing, right.page, edit.key, null);
-            defer rc.deinit();
-            const l = try lc.next();
-            const r = try rc.next();
-            const lv = if (l != null and std.mem.eql(u8, l.?.key, edit.key)) l.?.value else null;
-            const rv = if (r != null and std.mem.eql(u8, r.?.key, edit.key)) r.?.value else null;
-            const value = try merged(scratch.allocator(), lv, rv, recipe, left.layout, right.layout, layout);
-            edit.value = if (value) |v| try scratch.allocator().dupe(u8, v) else null;
+        var end = offset;
+        var bytes: usize = 0;
+        while (end < edits.len and end - offset < 1024) {
+            const edit = &edits[end];
+            const value = try merged(scratch.allocator(), try lc.at(edit.key), try rc.at(edit.key), recipe, left.layout, right.layout, layout);
+            edit.value = value;
+            bytes +|= edit.key.len +| if (value) |v| v.len else 0;
+            end += 1;
+            if (bytes >= 512 * 1024) break;
         }
         root = try tree.apply(a, backing, root, edits[offset..end]);
         offset = end;
@@ -335,4 +352,59 @@ test "external lake aggregate interval differences skip retained pages across fe
     try differencesRange(a, cache.store(), first_leaf, root, root_page.entries[0].key, root_page.entries[1].key, &visitor);
     try std.testing.expectEqual(@as(usize, 0), visitor.count);
     try std.testing.expect(memory.reads - before <= 1);
+}
+
+test "external lake aggregate incremental batches retain absent-key successors and exact old snapshots" {
+    const a = std.testing.allocator;
+    var memory: tree.testing.MemoryStore = .{ .alloc = a };
+    defer memory.deinit();
+    const backing = memory.store();
+    const recipe: Recipe = .{ .keys = &.{.{ .path = "k", .type = .integer, .nullable = false }}, .inputs = &.{.{ .spec = .{ .kind = .count }, .column = null }} };
+    const layout = try record.Layout.init(a, recipe);
+    defer layout.deinit(a);
+    var roots: [5]Index = undefined;
+    for (&roots, 0..) |*root, version| {
+        var builder: tree.SortedBuilder = .{ .alloc = a, .store = backing };
+        defer builder.deinit();
+        var workspace = std.heap.ArenaAllocator.init(a);
+        defer workspace.deinit();
+        const total: usize = if (version < 3) 4096 else 4352;
+        for (0..total) |i| {
+            if (version == 3 and i % 2 == 0) continue;
+            if (version == 4 and i < 4096 and i % 4 == 0) continue;
+            _ = workspace.reset(.free_all);
+            const out = workspace.allocator();
+            var state = try operators.Aggregate.initTyped(out, .count, null, null);
+            const count: usize = if (version == 2) 2 else if (version == 3) 3 else 1;
+            for (0..count) |_| try state.update(local.sql_scalar.Datum.json(.{ .integer = 1 }));
+            const value = try record.encodeWithLayout(out, .{ .keys = &.{local.sql_scalar.Datum.json(.{ .integer = @intCast(i) })}, .aggregates = &.{}, .typed_states = &.{state}, .ordinal = 0 }, layout);
+            try builder.add(&directory.key(i), value);
+        }
+        root.* = .{ .domain = backing.domain, .layout = 2, .page = try builder.finish() };
+    }
+    var metrics: Metrics = .{};
+    const changed = (try incremental(a, backing, recipe, roots[3], roots[4], .{ .parent = roots[2], .left = roots[0], .right = roots[1] }, &metrics, &layout)).?;
+    try std.testing.expectEqual(@as(usize, 4352), metrics.changed_groups);
+    try std.testing.expectEqual(@as(u64, 3328), changed.count());
+    var cursor = try tree.Cursor.init(a, backing, changed.page, "", null);
+    defer cursor.deinit();
+    for (0..4352) |i| {
+        if (i < 4096 and i % 4 == 0) continue;
+        const entry = (try cursor.next()).?;
+        try std.testing.expectEqualSlices(u8, &directory.key(i), entry.key);
+        const value = try record.View.init(entry.value, &layout);
+        const count: i64 = if (i % 2 == 1) 4 else 1;
+        try std.testing.expectEqual(count, (try value.finish(a, 0, recipe.inputs[0].spec)).value.integer);
+    }
+    try std.testing.expect(try cursor.next() == null);
+    var old = try tree.Cursor.init(a, backing, roots[2].page, "", null);
+    defer old.deinit();
+    var old_count: usize = 0;
+    while (try old.next()) |entry| {
+        const value = try record.View.init(entry.value, &layout);
+        try std.testing.expectEqual(@as(i64, 2), (try value.finish(a, 0, recipe.inputs[0].spec)).value.integer);
+        old_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4096), old_count);
+    std.debug.print("aggregate incremental batches: changed={} retained_groups={}\n", .{ metrics.changed_groups, changed.count() });
 }

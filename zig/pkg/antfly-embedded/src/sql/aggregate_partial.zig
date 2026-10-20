@@ -81,7 +81,7 @@ pub fn finishPhysical(a: A, block: @import("spill.zig").ColumnarBlock, row: usiz
     }
     // Variable coefficients, extrema and floating validation preserve the
     // established exact semantics and immutable cache ownership.
-    var scratch = std.heap.ArenaAllocator.init(a);
+    var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
     defer scratch.deinit();
     const state = try readPhysical(scratch.allocator(), block, row, column, spec);
     return operators.cloneDatum(a, try state.finish());
@@ -207,7 +207,7 @@ pub fn finishPhysicalCells(a: A, cells: [physical_width]Datum, spec: operators.A
         if (cells[6].sql_null or cells[6].value != .bool) return error.InvalidSqlSpill;
         return if (count == 0) .{} else cells[6];
     }
-    var scratch = std.heap.ArenaAllocator.init(a);
+    var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
     defer scratch.deinit();
     // This reducer is privately decoded in scratch, so finalization can memoize
     // in place. Borrowed cached reducers still use finishBorrowed above.
@@ -487,7 +487,7 @@ pub fn decodeFixed(a: A, value: Datum, spec: operators.AggregateSpec) !?Fixed {
 
 pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggregate {
     if (value.sql_null or value.patterns != null or value.value != .string) return error.InvalidSqlSpill;
-    var scratch = std.heap.ArenaAllocator.init(a);
+    var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
     defer scratch.deinit();
     const sql_floating = spec.input_element == .float32 or spec.input_element == .float64;
     var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.value.string, .sql_floating = sql_floating };

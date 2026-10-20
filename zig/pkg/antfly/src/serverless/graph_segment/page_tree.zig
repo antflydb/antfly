@@ -361,13 +361,26 @@ fn encode(alloc: Allocator, store: Store, entries: []const Entry, height: u8, ag
 /// Pack toward half-full pages, allowing one indivisible record above the
 /// target. Split boundaries depend only on ordered records, not process state.
 fn pack(alloc: Allocator, store: Store, entries: []const Entry, height: u8, out: *Children) !void {
+    return packAt(alloc, store, entries, height, out, target_page_bytes);
+}
+fn packingTarget(bytes: usize) usize {
+    return if (bytes > target_page_bytes) bulk_target_page_bytes else target_page_bytes;
+}
+/// Preserve the size class of bulk-built pages on local edits. Balance a split
+/// across its outputs so a nearly full page does not create a tiny tail that
+/// immediately makes occupancy repair rewrite another bulk sibling.
+fn packAt(alloc: Allocator, store: Store, entries: []const Entry, height: u8, out: *Children, target: usize) !void {
+    var payload: usize = 0;
+    for (entries) |entry| payload += entry.size();
+    const pages = @max(1, std.math.divCeil(usize, payload, target - header_bytes) catch unreachable);
+    const balanced = if (target == target_page_bytes) target else header_bytes + (std.math.divCeil(usize, payload, pages) catch unreachable);
     var begin: usize = 0;
     while (begin < entries.len) {
         var end = begin;
         var bytes: usize = header_bytes;
         while (end < entries.len) : (end += 1) {
             const size = entries[end].size();
-            if (end - begin >= (if (height == 0) @as(usize, 1) else 2) and bytes + size > target_page_bytes) break;
+            if (end - begin >= (if (height == 0) @as(usize, 1) else 2) and bytes + size > balanced) break;
             bytes += size;
         }
         var aggregate: []u8 = undefined;
@@ -412,13 +425,14 @@ fn rebalance(alloc: Allocator, store: Store, children: *Children) !void {
         defer freeChildren(alloc, &replacement);
         // Their combined payload fits: merge without unnecessarily splitting
         // it back at the soft target. Otherwise redistribute via pack.
-        if (left.bytes.len + right.bytes.len - header_bytes <= target_page_bytes) {
+        const target = @max(packingTarget(left.bytes.len), packingTarget(right.bytes.len));
+        if (left.bytes.len + right.bytes.len - header_bytes <= target) {
             var aggregate: []u8 = undefined;
             const ref = try save(alloc, store, entries, a.ref.height, &aggregate);
             defer alloc.free(aggregate);
             try appendChild(alloc, &replacement, entries[0].key, ref, aggregate);
         } else {
-            try pack(alloc, store, entries, a.ref.height, &replacement);
+            try packAt(alloc, store, entries, a.ref.height, &replacement, target);
         }
         try children.ensureUnusedCapacity(alloc, replacement.items.len);
         a.deinit(alloc);
@@ -462,7 +476,7 @@ fn edit(alloc: Allocator, store: Store, prior: Ref, changes: []const Mutation, o
                 return;
             }
         }
-        return pack(alloc, store, entries.items, 0, out);
+        return packAt(alloc, store, entries.items, 0, out, packingTarget(prior.bytes));
     }
     var children: Children = .empty;
     defer freeChildren(alloc, &children);
@@ -495,7 +509,7 @@ fn edit(alloc: Allocator, store: Store, prior: Ref, changes: []const Mutation, o
     if (repair_occupancy) try rebalance(alloc, store, &children);
     const entries = try childEntries(alloc, children.items);
     defer alloc.free(entries);
-    try pack(alloc, store, entries, prior.height, out);
+    try packAt(alloc, store, entries, prior.height, out, packingTarget(prior.bytes));
 }
 
 /// Mutations must have strictly increasing, unique keys. Validate the entire
@@ -601,7 +615,7 @@ fn retainPage(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8
             next += 1;
         };
         if (next != keys.len) return error.InvalidGraphPage;
-        return pack(alloc, store, entries.items, 0, out);
+        return packAt(alloc, store, entries.items, 0, out, packingTarget(ref.bytes));
     }
     var children: Children = .empty;
     defer freeChildren(alloc, &children);

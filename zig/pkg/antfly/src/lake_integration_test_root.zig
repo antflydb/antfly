@@ -60,6 +60,7 @@ test {
     _ = @import("api/lake_index_text_query.zig");
     _ = @import("api/lake_index_text_best_first.zig");
     _ = @import("api/lake_index_text_compaction.zig");
+    _ = @import("api/lake_index_text_statistics.zig");
     _ = @import("api/lake_query_metrics.zig");
     _ = @import("api/lake_index_search_filter.zig");
     _ = @import("metadata/lake_index_lifecycle.zig");

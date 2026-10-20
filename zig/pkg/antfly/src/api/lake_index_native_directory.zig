@@ -29,6 +29,7 @@ pub const Access = struct {
     domain: [32]u8,
     token: Token,
     cached: ?artifacts.CachedRead = null,
+    navigation: ?*Navigation = null,
     reads: u64 = 512 * 1024 * 1024,
     writes: u64 = 512 * 1024 * 1024,
     work: ?*u64 = null,
@@ -37,13 +38,14 @@ pub const Access = struct {
         self.* = .{ .store = store, .domain = domain, .token = token, .cached = cached };
     }
     pub fn backing(self: *Access) tree.Store {
-        self.pages = .{ .domain = self.domain, .attempt = if (self.store.upload_scope) |scope| scope.attempt else @splat(0), .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = self.work orelse &self.writes, .read_cache = if (self.cached != null) .{ .ptr = self, .read = readPage } else null };
+        self.pages = .{ .domain = self.domain, .attempt = if (self.store.upload_scope) |scope| scope.attempt else @splat(0), .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = self.work orelse &self.writes, .read_cache = if (self.cached != null or self.navigation != null) .{ .ptr = self, .read = readPage } else null };
         return self.pages.store();
     }
     fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, len: usize, _: [32]u8, token: Token, remaining: *u64) ![]u8 {
         const self: *Access = @ptrCast(@alignCast(raw));
         if (offset != 0 or len != ref.byte_len) return error.InvalidNativeLakeFiles;
         try stores.chargeReadBudget(remaining, ref.byte_len);
+        if (self.navigation) |navigation| return navigation.readPage(a, store.*, ref, token, self.cached);
         return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
     }
 };
@@ -56,19 +58,24 @@ pub fn key(ordinal: usize) [8]u8 {
 /// file descriptors are additionally bound to the exact generation directory.
 /// No request authority is retained: callers check their live context first.
 pub const Navigation = struct {
+    const Cache = local.serverless_query_lake_decoded_cache.Cache;
+    const RawPage = struct { bytes: []const u8 };
     allocator: A = std.heap.page_allocator,
     mutex: std.atomic.Mutex = .unlocked,
-    access: Access = undefined,
-    pages: ?tree.Cache = null,
-    generation: ?tree.Ref = null,
-    domain: [32]u8 = @splat(0),
-    descriptors: [32]?files.File = @splat(null),
+    pages: ?*Cache = null,
+    descriptors: [32]?struct { root: tree.Ref, domain: [32]u8, file: files.File } = @splat(null),
     next_file: usize = 0,
     chunk_descriptors: [64]?struct { root: tree.Ref, domain: [32]u8, ordinal: usize, ref: artifacts.ChunkRef } = @splat(null),
     next_chunk: usize = 0,
     pub fn deinit(self: *Navigation) void {
-        if (self.pages) |*pages| pages.deinit();
-        self.clearFiles();
+        if (self.pages) |pages| {
+            pages.deinit();
+            self.allocator.destroy(pages);
+        }
+        for (&self.descriptors) |*entry| if (entry.*) |value| {
+            self.allocator.free(value.file.path);
+            entry.* = null;
+        };
         for (&self.chunk_descriptors) |*entry| if (entry.*) |value| {
             self.allocator.free(value.ref.artifact_id);
             self.allocator.free(value.ref.checksum);
@@ -76,54 +83,101 @@ pub const Navigation = struct {
         };
         self.pages = null;
     }
-    /// Pooled readers release request authority while retaining immutable data.
-    pub fn detach(self: *Navigation) void {
-        if (self.pages == null) return;
-        self.access.cached = null;
-        self.access.token = .none;
-        self.access.pages.cancellation = .none;
-        self.access.pages.read_cache = null;
+    /// Cached items contain only immutable bytes. Operation-owned access bridges
+    /// carry all authority, so there is no request context to detach here.
+    pub fn detach(_: *Navigation) void {}
+    fn pageCache(self: *Navigation) !*Cache {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.pages == null) {
+            const pages = try self.allocator.create(Cache);
+            pages.* = .{ .a = self.allocator, .max_bytes = 4 * 1024 * 1024, .max_entries = 128, .max_loading_bytes = 8 * 1024 * 1024, .max_loaders = 4 };
+            self.pages = pages;
+        }
+        return self.pages.?;
     }
-    fn clearFiles(self: *Navigation) void {
-        for (&self.descriptors) |*entry| if (entry.*) |file| {
-            self.allocator.free(file.path);
-            entry.* = null;
+    fn readPage(self: *Navigation, a: A, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: Token, cached: ?artifacts.CachedRead) ![]u8 {
+        const Check = struct {
+            token: Token,
+            parent: local.serverless_query_lake_read_context.Context,
+            fn check(raw: *anyopaque) !void {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                try value.token.check();
+                try value.parent.ensureActive();
+            }
         };
+        var check: Check = .{ .token = token, .parent = if (cached) |value| value.context else .{} };
+        try Check.check(&check);
+        var context = check.parent;
+        context.checkpoint = .{ .ptr = &check, .check = Check.check };
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("native-navigation-page-v1");
+        hash.update(ref.artifact_id);
+        hash.update(ref.checksum);
+        var size: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size, ref.byte_len, .little);
+        hash.update(&size);
+        const Loader = struct {
+            store: stores.ArtifactStore,
+            ref: local.serverless_manifest_artifact_ref.ArtifactRef,
+            token: Token,
+            cached: ?artifacts.CachedRead,
+            fn load(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
+                const loader: *@This() = @ptrCast(@alignCast(raw));
+                const out = item.arena.allocator();
+                const page = try out.create(RawPage);
+                page.* = .{ .bytes = try artifacts.readArtifact(out, loader.store, .{ .artifact_id = loader.ref.artifact_id, .checksum = loader.ref.checksum, .byte_len = loader.ref.byte_len }, loader.token, loader.cached) };
+                item.payload = .{ .extension = page };
+            }
+        };
+        var loader: Loader = .{ .store = store, .ref = ref, .token = token, .cached = cached };
+        const pages = try self.pageCache();
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        const lease = pages.acquire(digest, 2 * tree.max_page_bytes, context, .{ .ptr = &loader, .load = Loader.load }) catch |err| {
+            // A synchronous caller cannot join an I/O flight. Optional cache
+            // pressure never prevents an independently admitted required read.
+            if (err != error.SqlMemoryLimitExceeded) return err;
+            try Check.check(&check);
+            return artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
+        };
+        defer lease.release();
+        try Check.check(&check);
+        const page: *const RawPage = @ptrCast(@alignCast(lease.item.payload.extension));
+        return a.dupe(u8, page.bytes);
     }
-    fn backing(self: *Navigation, store: stores.ArtifactStore, domain: [32]u8, token: Token, cached: ?artifacts.CachedRead) tree.Store {
-        self.access.init(store, domain, token, cached);
-        const underlying = self.access.backing();
-        if (self.pages == null) self.pages = .{ .alloc = self.allocator, .underlying = underlying, .max_bytes = 4 * 1024 * 1024 };
-        self.pages.?.underlying = underlying;
-        return self.pages.?.store();
+    fn backing(self: *Navigation, access: *Access, store: stores.ArtifactStore, domain: [32]u8, token: Token, cached: ?artifacts.CachedRead) tree.Store {
+        access.init(store, domain, token, cached);
+        access.navigation = self;
+        return access.backing();
     }
     pub fn lookup(self: *Navigation, root: files.Root, store: stores.ArtifactStore, path: []const u8, token: Token, cached: ?artifacts.CachedRead) !?files.File {
         try token.check();
         if (cached) |value| try value.context.ensureActive();
         if (root.directory == null) return root.find(path);
-        @import("antfly_platform").sync.lockYielding(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.generation == null or !self.generation.?.eql(root.directory.?) or !std.mem.eql(u8, &self.domain, &root.domain)) {
-            self.clearFiles();
-            self.generation = root.directory;
-            self.domain = root.domain;
+        {
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            for (self.descriptors) |entry| if (entry) |value| if (value.root.eql(root.directory.?) and std.mem.eql(u8, &value.domain, &root.domain) and std.mem.eql(u8, value.file.path, path)) {
+                var result = value.file;
+                result.path = path;
+                return result;
+            };
         }
-        for (self.descriptors) |entry| if (entry) |file| if (std.mem.eql(u8, file.path, path)) {
-            var result = file;
-            result.path = path;
-            return result;
-        };
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        var cursor = try tree.Cursor.init(arena.allocator(), self.backing(store, root.domain, token, cached), root.directory, path, null);
+        var access: Access = undefined;
+        var cursor = try tree.Cursor.init(arena.allocator(), self.backing(&access, store, root.domain, token, cached), root.directory, path, null);
         defer cursor.deinit();
         const row = (try cursor.next()) orelse return null;
         if (!std.mem.eql(u8, row.key, path)) return null;
         var file = try decodeFile(arena.allocator(), row.key, row.value, root.domain);
         file.path = try self.allocator.dupe(u8, path);
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
         const slot = self.next_file % self.descriptors.len;
-        if (self.descriptors[slot]) |old| self.allocator.free(old.path);
-        self.descriptors[slot] = file;
+        if (self.descriptors[slot]) |old| self.allocator.free(old.file.path);
+        self.descriptors[slot] = .{ .root = root.directory.?, .domain = root.domain, .file = file };
         self.next_file +%= 1;
         file.path = path;
         return file;
@@ -141,27 +195,30 @@ pub const Navigation = struct {
             @memcpy(result, file.chunks[first..][0..count]);
             return result;
         }
-        @import("antfly_platform").sync.lockYielding(&self.mutex);
-        defer self.mutex.unlock();
-        if (count <= self.chunk_descriptors.len) {
-            const hits = for (result, first..) |*ref, ordinal| {
-                const found = for (self.chunk_descriptors) |entry| {
-                    if (entry) |value| if (value.root.eql(file.chunk_root.?) and value.ordinal == ordinal and std.mem.eql(u8, &value.domain, &root.domain)) break value.ref;
-                } else break false;
-                if (found.byte_len != @min(files.chunk_bytes, file.bytes - @as(u64, @intCast(ordinal)) * files.chunk_bytes)) return error.InvalidNativeLakeFiles;
-                ref.* = found;
-            } else true;
-            if (hits) {
-                // Cache entries are private; operation-owned IDs survive later
-                // cache eviction and concurrent payload prefetch.
-                for (result) |*ref| {
-                    ref.artifact_id = try a.dupe(u8, ref.artifact_id);
-                    ref.checksum = try a.dupe(u8, ref.checksum);
+        {
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (count <= self.chunk_descriptors.len) {
+                const hits = for (result, first..) |*ref, ordinal| {
+                    const found = for (self.chunk_descriptors) |entry| {
+                        if (entry) |value| if (value.root.eql(file.chunk_root.?) and value.ordinal == ordinal and std.mem.eql(u8, &value.domain, &root.domain)) break value.ref;
+                    } else break false;
+                    if (found.byte_len != @min(files.chunk_bytes, file.bytes - @as(u64, @intCast(ordinal)) * files.chunk_bytes)) return error.InvalidNativeLakeFiles;
+                    ref.* = found;
+                } else true;
+                if (hits) {
+                    // Cache entries are private; operation-owned IDs survive later
+                    // cache eviction and concurrent payload prefetch.
+                    for (result) |*ref| {
+                        ref.artifact_id = try a.dupe(u8, ref.artifact_id);
+                        ref.checksum = try a.dupe(u8, ref.checksum);
+                    }
+                    return result;
                 }
-                return result;
             }
         }
-        var cursor = try tree.Cursor.init(a, self.backing(store, root.domain, token, cached), file.chunk_root, &key(first), null);
+        var access: Access = undefined;
+        var cursor = try tree.Cursor.init(a, self.backing(&access, store, root.domain, token, cached), file.chunk_root, &key(first), null);
         defer cursor.deinit();
         for (result, first..) |*ref, ordinal| {
             const row = (try cursor.next()) orelse return error.InvalidNativeLakeFiles;
@@ -172,6 +229,8 @@ pub const Navigation = struct {
                 const id = try self.allocator.dupe(u8, ref.artifact_id);
                 errdefer self.allocator.free(id);
                 const checksum = try self.allocator.dupe(u8, ref.checksum);
+                @import("antfly_platform").sync.lockYielding(&self.mutex);
+                defer self.mutex.unlock();
                 const slot = self.next_chunk % self.chunk_descriptors.len;
                 if (self.chunk_descriptors[slot]) |old| {
                     self.allocator.free(old.ref.artifact_id);
@@ -557,7 +616,13 @@ test "external lake paged native generations retain chunk prefixes without repea
     try std.testing.expectEqual(length + 1, try overlay.storage().treeBytes(a, candidate_path));
 }
 
-fn navigationFaultScenario(a: A, source: stores.ArtifactStore, root: files.Root, offset: u64) !void {
+fn navigationFaultScenario(backing: A, source: stores.ArtifactStore, root: files.Root, offset: u64) !void {
+    // Arena growth must have the same allocation count for every injected run;
+    // the backing allocator may otherwise resize in place depending on address.
+    var vtable = backing.vtable.*;
+    vtable.resize = A.noResize;
+    vtable.remap = A.noRemap;
+    const a: A = .{ .ptr = backing.ptr, .vtable = &vtable };
     var reader: files.Reader = .{ .root = root, .prefix = "/fault", .store = source, .context = .{}, .scratch = a, .navigation = .{ .allocator = a }, .max_block_bytes = 1024 * 1024 };
     defer reader.deinit();
     const bytes = try reader.storage().readFileRangeAlloc(a, "/fault/run", offset, 1);
@@ -566,4 +631,110 @@ fn navigationFaultScenario(a: A, source: stores.ArtifactStore, root: files.Root,
     var store = source;
     const erased = try applyChanges(a, &store, root, &.{.{ .path = "run", .file = null }}, .none, null);
     try std.testing.expect(erased.directory == null);
+}
+
+test "external lake native navigation overlaps cold pages shares flights and checks warm authority" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = try local.common_test_directory.TestDirectory.init("native-navigation-flights");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var original = fs.artifactStore();
+    original.upload_scope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const paths = [_][]const u8{ "first", "second" };
+    var roots: [2]files.Root = undefined;
+    for (&roots, paths) |*root, path| root.* = try persist(a, arena.allocator(), &original, .{ .domain = @splat(7), .files = &.{.{ .path = path, .bytes = 0 }} }, null, .none, null);
+    const Worker = struct {
+        var active: *@This() = undefined;
+        original: stores.ArtifactStore,
+        navigation: *Navigation,
+        cache: *local.serverless_query_lake_serving_cache.Cache,
+        gate: std.Io.Event = .unset,
+        entered: std.Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        canceled: std.atomic.Value(bool) = .init(false),
+        fn read(_: *anyopaque, alloc: A, id: []const u8, length: usize, token: Token) ![]u8 {
+            const self = active;
+            if (self.calls.fetchAdd(1, .acq_rel) + 1 == 2) self.entered.set(std.testing.io);
+            try self.gate.wait(std.testing.io);
+            return self.original.getRangeAllocWithCancellationUsingAllocator(alloc, id, 0, length, token);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.canceled.load(.acquire)) return error.DeadlineExceeded;
+        }
+        fn options(self: *@This(), cancelable: bool) artifacts.CachedRead {
+            return .{ .cache = self.cache, .scope = @splat(9), .context = .{ .io = std.testing.io, .checkpoint = if (cancelable) .{ .ptr = self, .check = check } else null } };
+        }
+        fn run(self: *@This(), store: stores.ArtifactStore, root: files.Root, path: []const u8, cancelable: bool) anyerror!void {
+            const file = (try self.navigation.lookup(root, store, path, .none, self.options(cancelable))).?;
+            try std.testing.expectEqualStrings(path, file.path);
+            try std.testing.expectEqual(@as(u64, 0), file.bytes);
+        }
+    };
+    var navigation: Navigation = .{ .allocator = a };
+    defer navigation.deinit();
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    var worker: Worker = .{ .original = original, .navigation = &navigation, .cache = &cache };
+    Worker.active = &worker;
+    var vtable = original.vtable.*;
+    vtable.get_bounded_alloc_with_cancellation = Worker.read;
+    var store = original;
+    store.vtable = &vtable;
+    var left = try io.concurrent(Worker.run, .{ &worker, store, roots[0], paths[0], false });
+    defer {
+        worker.gate.set(io);
+        left.await(io) catch {};
+    }
+    var right = try io.concurrent(Worker.run, .{ &worker, store, roots[1], paths[1], false });
+    defer {
+        worker.gate.set(io);
+        right.await(io) catch {};
+    }
+    try worker.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+    var same = try io.concurrent(Worker.run, .{ &worker, store, roots[0], paths[0], false });
+    defer {
+        worker.gate.set(io);
+        same.await(io) catch {};
+    }
+    var canceled = try io.concurrent(Worker.run, .{ &worker, store, roots[0], paths[0], true });
+    defer {
+        worker.gate.set(io);
+        canceled.await(io) catch {};
+    }
+    const pages = try navigation.pageCache();
+    var joined = false;
+    for (0..5000) |_| {
+        @import("antfly_platform").sync.lockYielding(&pages.mutex);
+        var count: usize = 0;
+        var flights = pages.flights.valueIterator();
+        while (flights.next()) |flight| count += flight.*.refs;
+        const ready = pages.flights.count() == 2 and count == 4;
+        const admitted = pages.loading_bytes;
+        pages.mutex.unlock();
+        if (ready) {
+            try std.testing.expect(admitted <= pages.max_loading_bytes);
+            joined = true;
+            break;
+        }
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(joined);
+    worker.canceled.store(true, .release);
+    try std.testing.expectError(error.DeadlineExceeded, canceled.await(io));
+    worker.gate.set(io);
+    try left.await(io);
+    try right.await(io);
+    try same.await(io);
+    try std.testing.expectEqual(@as(usize, 2), worker.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pages.loading_bytes);
+    try std.testing.expect(pages.bytes <= pages.max_bytes);
+    try std.testing.expectError(error.DeadlineExceeded, worker.run(store, roots[0], paths[0], true));
+    try worker.run(store, roots[0], paths[0], false);
+    try std.testing.expectEqual(@as(usize, 2), worker.calls.load(.acquire));
+    std.debug.print("native navigation cold pages: overlapping=2 shared_readers=3 provider_reads={}\n", .{worker.calls.load(.acquire)});
 }

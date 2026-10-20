@@ -1367,7 +1367,14 @@ not an exact ordered predicate index. The internal frontier charges the real
 payload work to the statement's scan limits.
 
 Native generation readers own a bounded navigation cache independently of the
-payload cache. File and chunk descriptors are fenced by directory identity and namespace;
+payload cache. Operation-owned tree access carries cancellation and read quotas;
+only immutable verified page bytes and descriptors survive a call. A 4 MiB,
+128-entry page cache shares identical cold misses and admits up to four loaders
+within 8 MiB of active memory. Independent misses overlap without holding the
+descriptor mutex across I/O. Every hit and flight waiter checks its own current
+authority; a canceled producer does not cancel healthy readers. Synchronous
+callers without an I/O executor can issue an independently admitted read rather
+than wait on a flight. File and chunk descriptors are fenced by directory identity and namespace;
 adjacent chunks use one tree cursor, and warm payload reads require no additional
 artifact navigation reads. Producers reuse the same navigation within checkpoint
 publication. Attempt-local descriptor origins authenticate retained file names
@@ -1475,6 +1482,23 @@ reuse the existing native scalar codec; this adds no public columnar interchange
 format. Selecting one counter allocates no column descriptors or reducers for
 other slots. The decoder admits a bounded batch by actual record/key bytes and
 key descriptor cost, while legacy records retain their wider descriptor bound.
+
+Native-to-native reductions merge COUNT, integer SUM, booleans and typed extrema
+directly from their fixed fields. Integer transitions keep the checked i128
+intermediate, and floating, generic scalar and exact NUMERIC reducers use the
+shared merge semantics in one reclaimable per-slot workspace. Fixed cohorts need
+one output allocation, independent of slot count. NUMERIC finalization reclaims
+its temporary coefficients before the next result while retaining the owned
+exact result and accounting for both under the request budget.
+
+Changed group keys use two monotone cursors across the current children. A
+missing key preserves the cursor's successor, and batch values own their bytes
+before either cursor advances. Copy-on-write batches stop at 1,024 edits or
+512 KiB of keys and values (plus one indivisible record). Bulk-built pages retain
+their bulk size class on edits, with balanced bulk splits; ordinary pages retain
+their existing packing target. Small occupancy repair does not grow toward the
+hard page cap or rewrite unrelated short tails.
+
 
 An unordered source prefix is explicitly authorized by SQL when ORDER BY is
 absent. Proven LIMIT/OFFSET consumption bounds cap record gathering, decoding and

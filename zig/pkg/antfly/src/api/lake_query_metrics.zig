@@ -200,25 +200,30 @@ test "external lake slow composed profiles isolate interleaved requests and neve
     metrics.retainSlow(slower);
     metrics.retainSlow(second);
     try std.testing.expectEqual(@as(u64, 2000 * std.time.ns_per_ms), metrics.snapshot().slowest_composed.?.duration(.composed_total));
-    var buffer: [16384]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    try append(&writer, local.serverless_query_lake_serving_cache.Cache.Stats{}, @as(?local.serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats, null), metrics.snapshot());
-    const text = writer.buffered();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const writer = &output.writer;
+    try append(writer, local.serverless_query_lake_serving_cache.Cache.Stats{}, @as(?local.serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats, null), metrics.snapshot());
+    const text = output.written();
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_slowest_composed_total_nanoseconds 2000000000") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_slowest_composed_native_leaf_nanoseconds 800000000") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_slowest_composed_composition_nanoseconds 1100000000") != null);
 }
 
 test "external lake metrics expose fallback and disk write reasons without paths" {
-    var buffer: [16384]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const writer = &output.writer;
     var metrics: Metrics = .{};
     metrics.recordNavigation(.{ .queries = 1, .admitted_segments = 2, .pruned_ranges = 7 });
     metrics.record(.hydration, @import("antfly_platform").time.monotonicNs());
     inline for (.{ Phase.composed_total, .composed_definition, .composed_leaf, .composed_native_leaf, .composed_cursor }) |phase|
         metrics.record(phase, @import("antfly_platform").time.monotonicNs());
-    try append(&writer, local.serverless_query_lake_serving_cache.Cache.Stats{ .disk_unavailable = "ConcurrencyUnavailable", .disk_hits = 7 }, @as(?local.serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats, .{ .write_errors = 2, .last_write_error = "NoSpaceLeft", .drops_queue = 3 }), metrics.snapshot());
-    const text = writer.buffered();
+    try append(writer, local.serverless_query_lake_serving_cache.Cache.Stats{ .disk_unavailable = "ConcurrencyUnavailable", .disk_hits = 7 }, @as(?local.serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats, .{ .write_errors = 2, .last_write_error = "NoSpaceLeft", .drops_queue = 3 }), metrics.snapshot());
+    const text = output.written();
+    inline for (.{ "text_directory", "text_inventory", "text_opening", "text_term_plan", "text_navigation", "text_postings", "text_cursor", "cursor_retention", "result_delivery" }) |phase| {
+        try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_" ++ phase ++ "_calls_total 0") != null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_cache_disk_init_attempts_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_cache_disk_init_failures_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "reason=\"ConcurrencyUnavailable\"") != null);
