@@ -18,12 +18,26 @@ implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `d227ec2811235d618b8e50d86ab4b1472b207cc4`
 (merge commit `b81563cddd6bd86941e40ebcdf2b1bf805113605`).
 
-Native ABI 44, storage-owner ABI 107, engine descriptor 29, required preparation
+Native ABI 44, storage-owner ABI 108, engine descriptor 29, required preparation
 file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
+
+Source `248aa89954b727b4675491ed2826239ae4b1ff7c` carries original completion
+execution through ordinary native ACK and ACK-many, including both local worker
+adapters. Funded scratch, controlled record/membership reads and atomic staging
+preserve exact failures without partial acknowledgement. Apply/store-gate
+contention returns retry debt to the existing owner. Native absence after cleanup
+remains a no-op; retained coordinator self-ACK still follows durable response
+recording. Mixed-version scalar fallback requires an explicit typed unsupported
+HTTP response, rather than an error name that could be original rejection.
+Runtime-failure ABI 66 adds InvalidParticipant at 0x1000E with all old numbers
+preserved. The focused 94-step native run, direct WAL scenarios and 25-step
+immutable-package ReleaseSafe consumer pass. The full linked archive and source
+cold-open runtime remain unqualified; required preparation providers and funded
+original producers remain unwired.
 
 Source `b24235bc0854ba92ac66706438466c185634f799` carries original admission through
 typed ordinary native PREPARE, borrowing every intent field. Validation and
@@ -33,7 +47,7 @@ Controlled validation avoids an uncontrolled schema-mode apply wait and rejects
 policy transitions without trying to finalize them. Actual native contention,
 original-error, schema/transform, private-plan and restart regressions pass with
 94/94 focused build steps and 25/25 immutable-package ReleaseSafe consumer steps.
-Explicit acknowledgement still needs original execution propagation. Required
+Required
 providers, funded producers and authenticated hidden PREPARE/completion remain
 open; neither required mode nor the full design is activated by this change.
 
@@ -44,7 +58,7 @@ later indexed commit pipeline also bounds admission with retained CPU. Original
 visibility lending resumes only after service holders retire. Actual full-text
 commit and retry, pre-holder lending/canceled reentry, restart and original error
 identity checks pass alongside the coordinator and packaged-source checks.
-Storage-owner ABI 107 and runtime-failure ABI 65 preserve the new
+Storage-owner ABI 108 and runtime-failure ABI 66 preserve the new
 completion-pending identity. Controlled hidden completion and required preparation
 remain closed pending their authenticated native Plan, provider and producer work.
 

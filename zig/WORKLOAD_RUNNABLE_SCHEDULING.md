@@ -19,6 +19,64 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Original execution through native acknowledgements (2026-10-20)
+
+Source `248aa89954b727b4675491ed2826239ae4b1ff7c` carries ordinary single and batched acknowledgements
+through the existing context-aware batch interface and a typed synchronous owner
+operation. Both local and hosted-local workers preserve the original completion
+borrow and its deadline independently of expired foreground admission. The
+source checks original authority before owner access, rejects additional mutation
+fields and compares supplied route and leased namespace identities. Native C
+validates the checked borrowed participant slice and actual public owner. Hidden
+acknowledgement remains closed pending authenticated native Plan support.
+
+Controlled DB acknowledgement keeps its original replication admission before
+local holders, refuses contended apply ownership, and uses funded preparation
+scratch for transaction-manager data. Original lifetime reaches transaction
+record reads, membership validation, legacy-sidecar migration, staged metadata
+and every pre-commit write. The retained store serialization gate uses try-lock
+instead of waiting for another producer's CPU. The enlisted subset commits as
+one batch; invalid members or original failures cannot publish partial ACKs.
+Callback-originated missing-shaped and backpressure errors retain their exact
+cause. True native absence remains a no-op after cleanup. Accepted durability
+has no later caller checkpoint or response allocation. Existing resolution and
+response-registry rules still defer retained coordinator self-ACK until response
+recording; explicit ACK does not reverse a durable decision.
+
+ACK-many fallback now consumes typed capability evidence from a definite HTTP
+response. Executor/control errors with matching names remain errors. This keeps
+mixed-version scalar fallback, preserves uncertain-delivery debt and prevents an
+original rejection from becoming a successful alternate mutation. The caller's
+borrow and resource owner remain the same through fallback.
+
+Storage-owner ABI is 108; runtime-failure ABI is 66. Native ABI 44, API ABI 54, engine descriptor 29,
+required reader floor 10, data-Raft protocol 28 and
+metadata protocol 36 remain unchanged; no new persistent format is introduced.
+InvalidParticipant now has a stable identity at 0x1000E rather than collapsing
+to StorageKernelFailure; all existing numeric identities retain their values.
+
+`native-controlled-ack-verified.json` binds 5260 native/schema hashes
+to 94/94 passing build steps: 110 coordinator cases, 46 companions, 16 native
+protocol/owner cases and three DB regressions. Tests cover original failure
+injection with no partial acknowledgement, native held-apply and store-gate
+refusal, quota denial before backing allocation, membership and duplicate ACKs,
+coordinator self-ACK deferral, restart, and completion after foreground expiry.
+Remote checks distinguish explicit unsupported responses, original errors and
+unknown delivery while keeping health capacity available. The fixture permits
+legitimate bounded retry debt from independent default index workers without
+requiring global lock quiescence. Four persistent WAL scenarios also pass a
+direct run; unnamed import sentinels are counted separately. The immutable
+package contains 4544 matching public sources and passes all 25 ReleaseSafe
+consumer steps. Actual source controller and both startup profiles have semantic
+analysis only; full linked archive/cold-source runtime remain unqualified. Full
+Linux qualification remains waived.
+
+The full design remains incomplete. Required capability/BEGIN/PREPARE/seal
+providers must derive readiness from observed durable migration/catalog/namespace
+state and independently funded producers. Authenticated native hidden-owner
+operations, fresh route authority, deeper large-frame/backend cooperation,
+completion resource bundles and broader scheduler/fault work remain open.
+
 ## Original admission through native transaction PREPARE (2026-10-20)
 
 Source `b24235bc0854ba92ac66706438466c185634f799` registers context-aware ordinary native PREPARE.
