@@ -160,11 +160,17 @@ pub fn requireScope(alloc: Allocator, txn: anytype, expected: ?Digest, allow_imp
 /// Once a validated receipt is durable, neither stale workers nor an already
 /// captured private routing view may change its claims/checkpoint underneath it.
 pub fn requireMutableScope(alloc: Allocator, txn: anytype, expected: ?Digest) !void {
+    return requireMutableScopeWithPlan(alloc, txn, expected, null);
+}
+
+pub fn requireMutableScopeWithPlan(alloc: Allocator, txn: anytype, expected: ?Digest, plan: ?[16]u8) !void {
+    if (expected == null and plan != null) return error.RestoreStagingScopeChanged;
     try requireScope(alloc, txn, expected, false);
     if (expected == null) return;
     var progress = try Progress.decode(alloc, (try optional(txn)) orelse return error.RestoreStagingScopeChanged);
     defer progress.deinit();
     if (progress.value.phase != .imported) return error.RestoreStagingScopeChanged;
+    if (plan) |original| if (!std.mem.eql(u8, &original, &progress.value.scope.plan_id)) return error.RestoreStagingScopeChanged;
 }
 
 /// Internal PreparedRow import admission, consumed under the DB apply fence.

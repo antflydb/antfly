@@ -24133,19 +24133,23 @@ pub const DB = struct {
     }
 
     pub fn beginTransactionWithAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !transactions_mod.TxnId {
-        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, null, controls);
+        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, null, null, controls);
     }
 
     pub fn beginTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) !transactions_mod.TxnId {
         if (comptime storage_engine.enabled) return storage_engine.call("beginTransactionScoped", .{ self, txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope });
-        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, null);
+        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, null, null);
     }
 
     pub fn beginTransactionScopedWithAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !transactions_mod.TxnId {
-        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, controls);
+        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, null, controls);
     }
 
-    fn beginTransactionScopedInternal(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !transactions_mod.TxnId {
+    pub fn beginTransactionScopedWithPlanAndAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, plan: ?[16]u8, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !transactions_mod.TxnId {
+        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, plan, controls);
+    }
+
+    fn beginTransactionScopedInternal(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, plan: ?[16]u8, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !transactions_mod.TxnId {
         if (controls) |original| try original.lifetime.check();
         const admission = @import("mutation_admission.zig");
         var replication_mutation = try admission.acquireBeginReplicationMutationShared(self, controls);
@@ -24163,7 +24167,7 @@ pub const DB = struct {
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            try @import("restore_staging.zig").requireMutableScope(self.alloc, &read, scope);
+            try @import("restore_staging.zig").requireMutableScopeWithPlan(self.alloc, &read, scope, plan);
         }
         var begin_admission: admission.IntentCollection = .{};
         const read_control = begin_admission.bindPreDecisionBeforeMutation(retained_controls, self.core.apply_mutex.io, null);

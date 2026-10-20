@@ -4091,6 +4091,55 @@ fn storageOwnerBatchJsonImpl(owner: ?*anyopaque, request: *const kernel_owner_ab
     return .ok;
 }
 
+/// No JSON parsing or response allocation occurs after BEGIN becomes durable.
+/// The original boundary may lend CPU before replication ownership; DB BEGIN
+/// strips that boundary while policy/apply holders are retained.
+pub fn storageOwnerTransactionBeginWithAdmission(owner: ?*anyopaque, request: *const kernel_owner_abi.TransactionBeginRequest) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const read = @import("antfly_local_sources").common_read_admission;
+    const raw = request.port orelse return .invalid_argument;
+    if (@intFromPtr(raw) % @alignOf(read.Port) != 0) return .invalid_argument;
+    const control: *const read.Port = @ptrCast(@alignCast(raw));
+    control.checkpoint() catch |err| return storageOwnerStatusFromError(err);
+    if (request.retain_terminal > 1 or request.has_scope > 1 or !std.mem.allEqual(u8, &request._reserved, 0) or
+        (request.has_scope == 0 and (!std.mem.allEqual(u8, &request.scope, 0) or !std.mem.allEqual(u8, &request.plan_id, 0))) or
+        (request.has_scope == 1 and std.mem.allEqual(u8, &request.plan_id, 0))) return .invalid_argument;
+    if ((request.table_name.len != 0 and request.table_name.ptr == null) or std.math.cast(usize, request.table_name.len) == null) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    const table = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const count = std.math.cast(usize, request.participants_len) orelse return .invalid_argument;
+    const raw_participants = request.participants orelse return .invalid_argument;
+    const participants = @import("antfly_local_sources").api_transaction_begin_admission.Port.read(raw_participants) catch |err| return if (err == error.UnsupportedVersion) .invalid_abi else .invalid_argument;
+    if (count == 0 or participants.len != count) return .invalid_argument;
+    const validator = @import("../storage/transaction_participant_admission.zig");
+    const resources = @import("antfly_local_sources").storage_resource_manager;
+    const workspace_bytes = validator.workingSetBytes(count, table.len) catch return .invalid_argument;
+    // Fund one known, finite backing buffer before allocating it. Retirement
+    // may defer accounting under ledger contention, but physical work and free
+    // always finish before that original credit is returned.
+    var credit = if (handle.db.core.index_manager.resource_manager) |manager| manager.reserveConstructionWithAdmission(.relational_preparation_working_set, workspace_bytes, control.*) catch |err| return storageOwnerStatusFromError(err) else @as(?resources.ConstructionCredit, null);
+    defer if (credit) |*funded| funded.retire();
+    control.checkpoint() catch |err| return storageOwnerStatusFromError(err);
+    const workspace = handle.alloc.alloc(u8, workspace_bytes) catch |err| return storageOwnerStatusFromError(err);
+    defer handle.alloc.free(workspace);
+    var fixed = std.heap.FixedBufferAllocator.init(workspace);
+    const scratch = fixed.allocator();
+    const local = @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroupScoped(scratch, table, handle.storage_owner_group_id, if (request.has_scope == 1) request.scope else null, if (request.has_scope == 1) request.plan_id else null) catch |err| return storageOwnerStatusFromError(err);
+    const coordinator = validator.validateWithAdmission(scratch, participants, local, control.*) catch |err| return storageOwnerStatusFromError(err);
+    const Check = struct {
+        fn lifetime(ptr: *const anyopaque) !void {
+            const original: *const read.Port = @ptrCast(@alignCast(ptr));
+            try original.checkLifetime();
+        }
+    };
+    const wait = control.executionWaitAfterLifetime() catch |err| return storageOwnerStatusFromError(err);
+    const local_only = [_][]const u8{local};
+    _ = handle.db.beginTransactionScopedWithPlanAndAdmissionControls(request.txn_id.bytes, request.begin_timestamp, request.created_at_ns, if (coordinator) participants else &local_only, coordinator, request.retain_terminal == 1, if (request.has_scope == 1) request.scope else null, if (request.has_scope == 1) request.plan_id else null, .{ .lifetime = .{ .context = control, .check_fn = Check.lifetime }, .execution_wait = wait }) catch |err| return storageOwnerStatusFromError(err);
+    // Success is authoritative after durable BEGIN; do not recheck a caller
+    // that may have expired during the physical WAL completion.
+    return .ok;
+}
+
 pub fn storageOwnerReplicatedBatchJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,

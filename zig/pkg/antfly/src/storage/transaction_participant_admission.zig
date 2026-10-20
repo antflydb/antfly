@@ -19,11 +19,16 @@ const contract = sources.api_local_transaction_contract;
 const runtime = @import("antfly_runtime_abi");
 
 const State = struct {
-    original: ?runtime.runnable_abi.Borrowed,
+    original: ?runtime.runnable_abi.Borrowed = null,
+    admission: ?sources.common_read_admission.Port = null,
     failure: ?anyerror = null,
     fn check(self: *@This()) !void {
         if (self.failure) |cause| return cause;
         if (self.original) |original| original.checkLifetime() catch |cause| {
+            self.failure = cause;
+            return cause;
+        };
+        if (self.admission) |original| original.checkpoint() catch |cause| {
             self.failure = cause;
             return cause;
         };
@@ -127,19 +132,41 @@ const Index = struct {
 /// rescan participant bytes. No new limit, owner, deadline or CPU loan is added.
 pub fn validate(allocator: std.mem.Allocator, participants: []const []const u8, local: []const u8, original: ?runtime.runnable_abi.Borrowed) !bool {
     var state: State = .{ .original = original };
+    return validateState(allocator, participants, local, &state);
+}
+
+/// Full fixed-buffer capacity for the local locator and every geometrically
+/// grown hash table, including abandoned earlier tables in that buffer. String
+/// payloads stay borrowed. Checked arithmetic refuses impossible demand before
+/// any physical backing allocation or transaction mutation.
+pub fn workingSetBytes(participant_count: usize, table_name_bytes: usize) !usize {
+    var capacity: usize = 8;
+    while (capacity - capacity / 4 < participant_count) capacity = try std.math.mul(usize, capacity, 2);
+    const slots = try std.math.mul(usize, try std.math.mul(usize, capacity, 2), @sizeOf(?Key));
+    const locator = try std.math.add(usize, try std.math.mul(usize, table_name_bytes, 2), 512);
+    return std.math.add(usize, slots, locator);
+}
+
+/// Pre-holder validation; this port may yield original CPU between bounded work.
+pub fn validateWithAdmission(allocator: std.mem.Allocator, participants: []const []const u8, local: []const u8, original: sources.common_read_admission.Port) !bool {
+    var state: State = .{ .admission = original };
+    return validateState(allocator, participants, local, &state);
+}
+
+fn validateState(allocator: std.mem.Allocator, participants: []const []const u8, local: []const u8, state: *State) !bool {
     try state.check();
     if (participants.len == 0) return error.InvalidBatchRequest;
-    const payload: sources.common_read_admission.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.checkpoint } };
+    const payload: sources.common_read_admission.Payload = .{ .ptr = state, .vtable = &.{ .checkpoint = State.checkpoint } };
     const control = sources.common_read_admission.Port.init(&payload);
     var seen: Index = .{};
     defer seen.deinit(allocator);
     var local_present = false;
     for (participants) |participant| {
         try state.check();
-        const parsed = if (original != null) try contract.parseParticipantRefWithAdmission(participant, control) else contract.parseParticipantRef(participant);
+        const parsed = if (state.original != null or state.admission != null) try contract.parseParticipantRefWithAdmission(participant, control) else contract.parseParticipantRef(participant);
         if (parsed == null) return error.InvalidBatchRequest;
         const key: Key = .{ .bytes = participant, .hash = try state.hash(participant) };
-        if (try seen.insert(allocator, key, &state)) return error.InvalidBatchRequest;
+        if (try seen.insert(allocator, key, state)) return error.InvalidBatchRequest;
         if (try state.equal(participant, local)) local_present = true;
     }
     if (!local_present) return error.InvalidBatchRequest;

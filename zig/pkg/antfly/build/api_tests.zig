@@ -3356,6 +3356,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     online_owner_source_run.addArg("--require-no-skips");
     b.step("antfly-online-owner-preparation-source-test", "Exercise actual source scheduling, pending admission and controlled descriptor confirmation")
         .dependOn(&online_owner_source_run.step);
+    const native_begin_source_check = b.addTest(.{
+        .root_module = owner_preflight_context_root,
+        .filters = &.{"controlled native BEGIN source"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-native-begin-source-check", "Analyze actual controlled native BEGIN owner acquisition")
+        .dependOn(&native_begin_source_check.step);
+
     const owner_control_funding_check = b.addTest(.{
         .name = "owner-control-funding-check",
         .root_module = owner_preflight_context_root,

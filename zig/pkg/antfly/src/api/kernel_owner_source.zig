@@ -6243,22 +6243,56 @@ pub const ProvisionedKernelOwnerSource = struct {
         participants: []const []const u8,
         context: @import("antfly_local_sources").api_distributed_txn_contract.PreDecisionContext,
     ) !?void {
-        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
         const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
-        try active.ensureActive();
-        if (context.restore_staging_scope == null and context.restore_staging_plan_id != null) return error.RestoreStagingScopeChanged;
-        try self.applyTransactionGroupLocalWithContext(alloc, group_id, table_name, .{
-            .restore_staging_scope = context.restore_staging_scope,
-            .restore_staging_plan_id = context.restore_staging_plan_id,
-            .transaction = .{ .begin = .{
-                .txn_id = txn_id,
-                .begin_timestamp = begin_timestamp,
-                .created_at_ns = platform_time.realtimeNs(),
-                .topology_epoch = topology_epoch,
-                .retain_terminal = retain_terminal,
-                .participants = participants,
-            } },
-        }, active);
+        try original.checkOriginal(active, context.execution_runnable);
+        if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
+        if (!context.requiresAwareCallback()) return txnBeginGroupLocal(ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants);
+        if ((context.restore_staging_scope == null) != (context.restore_staging_plan_id == null)) return error.RestoreStagingScopeChanged;
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var receiver = if (context.deadline_io) |borrow| try borrow.receive() else null;
+        const io = if (receiver) |*received| received.io() else if (self.context_runtime) |runtime| runtime.io() orelse return error.BackendRuntimeIoUnavailable else return error.BackendRuntimeIoUnavailable;
+        const Controls = struct {
+            require_checked_reentry: bool = true,
+            context: request_operation.RequestContext,
+            route: ?metadata_api.CatalogRouteFence,
+            execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+            fn check(value: @This()) !void {
+                try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(value.context, value.execution_runnable);
+                if (value.route) |fence| try @import("../storage/hot_standby/owner_preflight_admission.zig").checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
+                if (value.execution_runnable) |borrow| {
+                    const status = borrow.checkpoint(borrow.context);
+                    if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+                }
+            }
+        };
+        const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
+        const admission = @import("antfly_local_sources").common_read_admission;
+        var budget: Budget = .{ .controls = .{ .context = active, .route = context.route_fence, .execution_runnable = context.execution_runnable }, .io = io };
+        var adapter: admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = admission.Port.init(&payload);
+        if (context.route_fence) |fence| {
+            if (fence.topology_epoch != topology_epoch) return error.TopologyChanged;
+            try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
+        }
+        const controls: ReadControls = .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true };
+        var lease = if (context.restore_staging_scope) |scope| block: {
+            var descriptor = try self.resolveRestoreDescriptorWithRunnable(alloc, group_id, table_name, scope, context.restore_staging_plan_id, .mutate, active, context.execution_runnable);
+            defer descriptor.deinit(alloc);
+            const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
+            defer alloc.free(path);
+            break :block try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor.view(), false, .resident, controls);
+        } else try self.acquireWithControls(group_id, table_name, controls);
+        defer lease.deinit();
+        if (context.route_fence) |fence| {
+            const identity = fence.route.identity_namespace;
+            if (identity.table_id != lease.entry.identity.table_id or identity.shard_id != lease.entry.identity.shard_id or identity.range_id != lease.entry.identity.range_id) return error.TopologyChanged;
+        }
+        try control.checkpoint();
+        try lease.owner().transactionBeginWithAdmission(alloc, table_name, txn_id, begin_timestamp, platform_time.realtimeNs(), participants, retain_terminal, context.restore_staging_scope, context.restore_staging_plan_id, &control);
+        // Durable BEGIN remains a successful contact even if the caller expires
+        // during its physical completion. Later phases retain their own checks.
         return {};
     }
 
@@ -8966,4 +9000,25 @@ test "online owner preparation admission yields to active historical apply witho
     }, .shared, .resident, .{ .online_preparation = true }));
     try std.testing.expect(!entry.retired and !entry.closing and entry.active_users == 1);
     try std.testing.expect(source.context.handle == null);
+}
+
+test "controlled native BEGIN source rejects original execution before owner or allocator access" {
+    const runtime = @import("antfly_runtime_abi");
+    const Reject = struct {
+        fn stop(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return runtime.error_abi.statusFromError(error.Canceled);
+        }
+        fn forbidden(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            @panic("rejected BEGIN cannot transfer CPU");
+        }
+    };
+    var marker: u8 = 0;
+    var source: ProvisionedKernelOwnerSource = undefined;
+    const borrow: runtime.runnable_abi.Borrowed = .{ .context = &marker, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .checkpoint = Reject.stop, .check_lifetime = Reject.stop, .park = Reject.forbidden, .enter = Reject.forbidden };
+    try std.testing.expectError(error.Canceled, source.writeSource().txnBeginGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", @splat(1), 2, 3, false, &.{}, .{ .execution_runnable = borrow }));
+}
+
+test "controlled native BEGIN source carries real typed operation through production ownership" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    _ = source.writeSource().txnBeginGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", @splat(1), 2, 3, false, &.{}, .{ .deadline_ns = 10 }) catch {};
 }

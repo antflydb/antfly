@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 104;
+pub const abi_version: u32 = 105;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1552,6 +1552,26 @@ pub const MaintenanceResult = extern struct {
     maintenance_score: u64 = 0,
     next_wake_delay_ns: u64 = 0,
 };
+
+/// Synchronous pre-decision BEGIN. Participant bytes and the original read
+/// admission port remain borrowed until the durable operation returns.
+pub const TransactionBeginRequest = extern struct {
+    version: u32 = abi_version,
+    retain_terminal: u8 = 0,
+    has_scope: u8 = 0,
+    _reserved: [2]u8 = @splat(0),
+    table_name: BorrowedBytes = .{},
+    txn_id: TxnId = .{},
+    begin_timestamp: u64 = 0,
+    created_at_ns: u64 = 0,
+    /// Checked api/transaction_begin_admission.Port, synchronously borrowed.
+    participants: ?*const anyopaque = null,
+    participants_len: u64 = 0,
+    scope: [32]u8 = @splat(0),
+    plan_id: [16]u8 = @splat(0),
+    port: ?*const anyopaque = null,
+};
+pub extern fn antfly_storage_owner_transaction_begin_with_admission(owner: ?*anyopaque, request: *const TransactionBeginRequest) callconv(.c) Status;
 
 pub const TransactionStatusRequest = extern struct {
     version: u32 = abi_version,

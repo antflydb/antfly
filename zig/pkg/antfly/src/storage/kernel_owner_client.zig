@@ -522,6 +522,19 @@ pub const Owner = struct {
         return abi.antfly_storage_owner_batch_json(self.handle, &request, &response.buffer);
     }
 
+    pub fn transactionBeginWithAdmission(self: *Owner, _: std.mem.Allocator, table: []const u8, txn_id: [16]u8, timestamp: u64, created_at: u64, participants: []const []const u8, retain_terminal: bool, scope: ?[32]u8, plan: ?[16]u8, port: *const @import("antfly_local_sources").common_read_admission.Port) !void {
+        try port.checkpoint();
+        if ((scope == null) != (plan == null)) return error.RestoreStagingScopeChanged;
+        const arrays = @import("antfly_local_sources").api_transaction_begin_admission;
+        const participant_payload: arrays.Payload = .{ .participants = participants };
+        const participant_port = arrays.Port.init(&participant_payload);
+        var trace: @import("antfly_local_sources").common_read_admission.RejectionTrace = .{};
+        const original = trace.bind(port.*).?;
+        const status = abi.antfly_storage_owner_transaction_begin_with_admission(self.handle, &.{ .table_name = .fromSlice(table), .txn_id = .{ .bytes = txn_id }, .begin_timestamp = timestamp, .created_at_ns = created_at, .participants = &participant_port, .participants_len = participants.len, .retain_terminal = @intFromBool(retain_terminal), .has_scope = @intFromBool(scope != null), .scope = scope orelse @splat(0), .plan_id = plan orelse @splat(0), .port = &original });
+        if (trace.failure) |cause| return cause;
+        try statusToError(status);
+    }
+
     pub fn replicatedBatchJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_replicated_batch_json(

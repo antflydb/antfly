@@ -828,3 +828,4 @@ pub const sql_read_requirements = @import("sql/read_requirements.zig");
 pub const storage_db_native_query_reuse = @import("storage/db/native_query_reuse.zig");
 
 pub const api_batch_execution_admission = @import("api/batch_execution_admission.zig");
+pub const api_transaction_begin_admission = @import("api/transaction_begin_admission.zig");

@@ -494,3 +494,253 @@ fn assertPreparationOwnerStatus(db: *db_mod.DB, txn_id: [16]u8) !void {
     try std.testing.expectEqual(abi.Status.invalid_abi, owner.storageOwnerTransactionPreparationStatus(null, &invalid, &result));
     try std.testing.expectEqualDeep(abi.TransactionPreparationStatusResult{}, result);
 }
+
+comptime {
+    @export(&@import("capi/server_owner.zig").storageOwnerTransactionBeginWithAdmission, .{ .name = "antfly_storage_owner_transaction_begin_with_admission" });
+}
+
+test "required replicated begin typed owner preserves original admission and durable contact" {
+    const a = std.testing.allocator;
+    const abi = @import("kernel_owner_abi");
+    const owner = @import("capi/server_owner.zig");
+    const admission = sources.common_read_admission;
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Canceled,
+        parked: bool = false,
+        loans: usize = 0,
+        resumes: usize = 0,
+        exclusive: ?*?Barrier.ExclusiveLease = null,
+        resume_failure: ?anyerror = null,
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ordinal = self.calls;
+            self.calls += 1;
+            if (ordinal == self.fail_at) return self.cause;
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.parked) return error.InvalidRunnableTransition;
+            try lifetime(raw);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const exclusive = self.exclusive orelse return error.UnexpectedCpuLoan;
+            try std.testing.expect(!self.parked);
+            self.parked = true;
+            self.loans += 1;
+            exclusive.*.?.release();
+            exclusive.* = null;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.parked);
+            self.parked = false;
+            self.resumes += 1;
+            if (self.resume_failure) |cause| return cause;
+        }
+        fn payload(self: *@This()) admission.Payload {
+            return .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .check_lifetime = lifetime }, .execution_wait = .{ .ptr = self, .begin = begin, .end = end } };
+        }
+    };
+    var directory = try sources.common_test_directory.TestDirectory.init("controlled-typed-begin");
+    defer directory.cleanup();
+    const id: [16]u8 = @splat(0x81);
+    {
+        var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        var handle: sources.capi_handles.Handle = .{ .alloc = a, .db = db, .storage_owner_table_name = @constCast("docs"), .storage_owner_group_id = 7 };
+        const registry = sources.capi_handles.handleRegistry();
+        const registered = try registry.register(&handle);
+        defer {
+            _, const index = registry.beginClose(registered).?;
+            registry.finishClose(index);
+        }
+        var client: @import("storage/kernel_owner_client.zig").Owner = .{ .handle = registered };
+        var control: Control = .{};
+        const payload = control.payload();
+        const port = admission.Port.init(&payload);
+        const participants = [_][]const u8{"table2:00000004:docs:7"};
+        try client.transactionBeginWithAdmission(a, "docs", id, 10, 20, &participants, true, null, null, &port);
+        const checkpoints = control.calls;
+        try std.testing.expect(checkpoints > 5);
+        try std.testing.expectEqual(@as(usize, 0), control.loans);
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try manager.getTransactionStatus(id));
+        const rejected_id: [16]u8 = @splat(0x82);
+        for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.DeadlineExceeded, error.MemoryLimitExceeded }, 0..) |cause, cause_index| {
+            for (0..checkpoints) |ordinal| {
+                control = .{ .fail_at = ordinal, .cause = cause };
+                var attempt_id: [16]u8 = @splat(0x84);
+                std.mem.writeInt(u64, attempt_id[0..8], @intCast(ordinal), .little);
+                attempt_id[8] = @intCast(cause_index);
+                const result = client.transactionBeginWithAdmission(a, "docs", attempt_id, 11, 21, &participants, true, null, null, &port);
+                if (control.calls > ordinal) {
+                    try std.testing.expectError(cause, result);
+                    try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(attempt_id));
+                } else {
+                    // Ledger warming can remove an allocation checkpoint. An
+                    // uninjected attempt must remain an authoritative contact.
+                    try result;
+                    try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try manager.getTransactionStatus(attempt_id));
+                }
+                try std.testing.expect(db.core.tryLockApplyExclusive());
+                db.core.unlockApplyExclusive();
+            }
+        }
+        // Policy/apply ownership suppresses CPU loans even while admission is
+        // rejected behind another writer. Original lifetime remains observable.
+        db.core.lockApplyExclusive();
+        control = .{ .fail_at = 0 };
+        const canceled = client.transactionBeginWithAdmission(a, "docs", rejected_id, 11, 21, &participants, true, null, null, &port);
+        control = .{};
+        const blocked = client.transactionBeginWithAdmission(a, "docs", rejected_id, 11, 21, &participants, true, null, null, &port);
+        db.core.unlockApplyExclusive();
+        try std.testing.expectError(error.Canceled, canceled);
+        try std.testing.expectError(error.Backpressured, blocked);
+        try std.testing.expectEqual(@as(usize, 0), control.loans);
+        // Before those holders exist, the real native BEGIN mirror gate lends
+        // original CPU and resumes through the same caller boundary.
+        var barrier: Barrier = .{};
+        var exclusive: ?Barrier.ExclusiveLease = barrier.acquireExclusive();
+        defer if (exclusive) |*held| held.release();
+        handle.db.local_execution.replication_async_metadata_mirror = .{ .publisher = undefined, .mutation_barrier = &barrier };
+        defer handle.db.local_execution.replication_async_metadata_mirror = null;
+        control = .{ .exclusive = &exclusive };
+        try client.transactionBeginWithAdmission(a, "docs", @splat(0x83), 12, 22, &participants, true, null, null, &port);
+        try std.testing.expectEqual(@as(usize, 1), control.loans);
+        try std.testing.expectEqual(@as(usize, 1), control.resumes);
+        try std.testing.expect(!control.parked and exclusive == null);
+        exclusive = barrier.acquireExclusive();
+        control = .{ .exclusive = &exclusive, .resume_failure = error.Canceled };
+        try std.testing.expectError(error.Canceled, client.transactionBeginWithAdmission(a, "docs", rejected_id, 13, 23, &participants, true, null, null, &port));
+        try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(rejected_id));
+        try std.testing.expect(!control.parked and exclusive == null);
+        control = .{ .fail_at = 0 };
+        const request_: abi.TransactionBeginRequest = .{ .port = &port };
+        try std.testing.expectEqual(abi.Status.canceled, owner.storageOwnerTransactionBeginWithAdmission(null, &request_));
+    }
+    var reopened = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer reopened.close();
+    var manager = try reopened.core.initTxnManager();
+    defer manager.deinit();
+    try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try manager.getTransactionStatus(id));
+    try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try manager.getTransactionStatus(@splat(0x83)));
+    try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(@splat(0x82)));
+}
+
+test "required replicated begin typed hidden owner checks the actual restore plan before durability" {
+    const a = std.testing.allocator;
+    const staging = sources.storage_db_restore_staging;
+    var directory = try sources.common_test_directory.TestDirectory.init("typed-begin-hidden-plan");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 }, .start_optional_runtimes = false });
+    defer db.close();
+    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 9, .shard_id = 10, .range_id = 10 }, .target_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 }, .target_schema_digest = @splat(4) };
+    const progress: staging.Progress = .{ .scope = scope, .phase = .imported, .rows_complete = true, .artifacts_complete = true, .source_generation_proofs_complete = true };
+    const bytes = try progress.encode(a);
+    defer a.free(bytes);
+    try db.core.store.put(staging.key, bytes);
+    var handle: sources.capi_handles.Handle = .{ .alloc = a, .db = db, .storage_owner_table_name = @constCast("docs"), .storage_owner_group_id = 7 };
+    const registry = sources.capi_handles.handleRegistry();
+    const registered = try registry.register(&handle);
+    defer {
+        _, const index = registry.beginClose(registered).?;
+        registry.finishClose(index);
+    }
+    var client: @import("storage/kernel_owner_client.zig").Owner = .{ .handle = registered };
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    const admission = sources.common_read_admission;
+    const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check } };
+    const port = admission.Port.init(&payload);
+    const wrong_plan: [16]u8 = @splat(2);
+    const wrong_locator = try sources.api_local_transaction_contract.participantIdForGroupScoped(a, "docs", 7, scope.digest(), wrong_plan);
+    defer a.free(wrong_locator);
+    const id: [16]u8 = @splat(0x91);
+    try std.testing.expectError(error.RestoreStagingScopeChanged, client.transactionBeginWithAdmission(a, "docs", id, 1, 2, &.{wrong_locator}, true, scope.digest(), wrong_plan, &port));
+    var manager = try db.core.initTxnManager();
+    defer manager.deinit();
+    try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(id));
+    const locator = try sources.api_local_transaction_contract.participantIdForGroupScoped(a, "docs", 7, scope.digest(), scope.plan_id);
+    defer a.free(locator);
+    try client.transactionBeginWithAdmission(a, "docs", id, 1, 2, &.{locator}, true, scope.digest(), scope.plan_id, &port);
+    try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try manager.getTransactionStatus(id));
+}
+
+test "required replicated begin participant workspace covers geometric growth and long scoped names" {
+    const a = std.testing.allocator;
+    const validator = @import("storage/transaction_participant_admission.zig");
+    const contract = sources.api_local_transaction_contract;
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    const admission = sources.common_read_admission;
+    const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check } };
+    const port = admission.Port.init(&payload);
+    const name: [8193]u8 = @splat('x');
+    for ([_]usize{ 1, 7, 65, 257 }) |count| for ([_]bool{ false, true }) |hidden| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const setup = arena.allocator();
+        const participants = try setup.alloc([]const u8, count);
+        for (participants, 1..) |*participant, group| participant.* = try contract.participantIdForGroupScoped(setup, &name, group, if (hidden) @as([32]u8, @splat(1)) else null, if (hidden) @as([16]u8, @splat(2)) else null);
+        const bytes = try validator.workingSetBytes(count, name.len);
+        const workspace = try a.alloc(u8, bytes);
+        defer a.free(workspace);
+        var fixed = std.heap.FixedBufferAllocator.init(workspace);
+        const scratch = fixed.allocator();
+        const local = try contract.participantIdForGroupScoped(scratch, &name, 1, if (hidden) @as([32]u8, @splat(1)) else null, if (hidden) @as([16]u8, @splat(2)) else null);
+        try std.testing.expect(try validator.validateWithAdmission(scratch, participants, local, port));
+        try std.testing.expect(fixed.end_index <= workspace.len);
+    };
+}
+
+test "required replicated begin native workspace denies quota before backing allocation" {
+    const a = std.testing.allocator;
+    const resources = sources.storage_resource_manager;
+    var options: resources.Options = .{ .identity_allocator = a };
+    options.budgets[@backingInt(resources.Slice.relational_preparation_working_set)].hard_limit_bytes = 1;
+    var quota = try resources.metadata_fixture.init(options);
+    defer quota.deinit(a);
+    var directory = try sources.common_test_directory.TestDirectory.init("typed-begin-quota");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const previous = db.core.index_manager.resource_manager;
+    db.core.index_manager.resource_manager = &quota;
+    defer db.core.index_manager.resource_manager = previous;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var handle: sources.capi_handles.Handle = .{ .alloc = failing.allocator(), .db = db, .storage_owner_table_name = @constCast("docs"), .storage_owner_group_id = 7 };
+    const registry = sources.capi_handles.handleRegistry();
+    const registered = try registry.register(&handle);
+    defer {
+        _, const index = registry.beginClose(registered).?;
+        registry.finishClose(index);
+    }
+    var client: @import("storage/kernel_owner_client.zig").Owner = .{ .handle = registered };
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    const admission = sources.common_read_admission;
+    const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check } };
+    const port = admission.Port.init(&payload);
+    const id: [16]u8 = @splat(0x92);
+    const arrays = sources.api_transaction_begin_admission;
+    const bad_array: arrays.Port = .{ .contract = @import("antfly_runtime_abi").native_abi.TypeContract.of(u8), .payload = &marker };
+    const bad_request: @import("kernel_owner_abi").TransactionBeginRequest = .{ .table_name = .fromSlice("docs"), .txn_id = .{ .bytes = id }, .participants = &bad_array, .participants_len = 1, .port = &port };
+    try std.testing.expectEqual(@import("kernel_owner_abi").Status.invalid_abi, @import("capi/server_owner.zig").storageOwnerTransactionBeginWithAdmission(registered, &bad_request));
+    try std.testing.expectError(error.ResourceBudgetExceeded, client.transactionBeginWithAdmission(failing.allocator(), "docs", id, 1, 2, &.{"table2:00000004:docs:7"}, true, null, null, &port));
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u64, 0), quota.sliceStats(.relational_preparation_working_set).used_bytes);
+    var manager = try db.core.initTxnManager();
+    defer manager.deinit();
+    try std.testing.expectError(error.TxnNotFound, manager.getTransactionStatus(id));
+}
