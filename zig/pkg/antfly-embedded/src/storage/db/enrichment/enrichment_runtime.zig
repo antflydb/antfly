@@ -32285,7 +32285,6 @@ fn extractAssetSourceValue(
         else => blk: {
             const rendered = try std.json.Stringify.valueAlloc(alloc, source, .{});
             errdefer alloc.free(rendered);
-            errdefer alloc.free(rendered);
             try document_extraction_mod.validateInlineSourceSize(config.remote_content, rendered);
             break :blk rendered;
         },
