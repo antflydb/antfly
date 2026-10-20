@@ -12,7 +12,7 @@ import {
   validateIndexMaintenanceResponse,
 } from "./index-maintenance.js";
 import { InferenceCapacityError, isTransientCapacityError } from "./inference-client.js";
-import type { paths } from "./public-api.js";
+import type { components, paths } from "./public-api.js";
 import { parseSSEFrames } from "./sse.js";
 import type {
   AntflyAuth,
@@ -1805,7 +1805,7 @@ export class AntflyClient {
     /**
      * Get table details and status
      */
-    get: async (tableName: string) => {
+    get: async (tableName: string): Promise<Table | undefined> => {
       const { data, error } = await this.client.GET("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
       });
@@ -2530,6 +2530,633 @@ export class AntflyClient {
       );
     return validateIndexMaintenanceResponse(data, groups);
   }
+
+  resolvers = {
+    list: async (tableName: string, options?: { signal?: AbortSignal }) => {
+      const { data, error } = await this.client.GET("/db/v1/tables/{tableName}/resolvers", {
+        signal: options?.signal,
+        params: { path: { tableName } },
+      });
+      if (error) throw new Error(`listResolvers: ${error.error}`);
+      if (!data) throw new Error("listResolvers: empty response");
+      return data;
+    },
+    get: async (tableName: string, resolverName: string, options?: { signal?: AbortSignal }) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}",
+        { signal: options?.signal, params: { path: { tableName, resolverName } } }
+      );
+      if (error) throw new Error(`getResolver: ${error.error}`);
+      if (!data) throw new Error("getResolver: empty response");
+      return data;
+    },
+    drop: async (tableName: string, resolverName: string, options?: { signal?: AbortSignal }) => {
+      const { data, error } = await this.client.DELETE(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}",
+        { signal: options?.signal, params: { path: { tableName, resolverName } } }
+      );
+      if (error) throw new Error(`dropResolverIdentity: ${error.error}`);
+      if (!data) throw new Error("dropResolverIdentity: empty response");
+      return data;
+    },
+    render: async (
+      tableName: string,
+      resolverName: string,
+      body: components["schemas"]["ResolverRenderRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}:render",
+        { signal: options?.signal, params: { path: { tableName, resolverName } }, body }
+      );
+      if (error) throw new Error(`renderResolverKey: ${error.error}`);
+      if (!data) throw new Error("renderResolverKey: empty response");
+      return data;
+    },
+    resolve: async (
+      tableName: string,
+      resolverName: string,
+      body: components["schemas"]["ResolverResolveRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}:resolve",
+        { signal: options?.signal, params: { path: { tableName, resolverName } }, body }
+      );
+      if (error) throw new Error(`resolveResolverQuery: ${error.error}`);
+      if (!data) throw new Error("resolveResolverQuery: empty response");
+      return data;
+    },
+    namespace: async (
+      tableName: string,
+      resolverName: string,
+      body: components["schemas"]["ResolverNamespaceRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}:namespace",
+        { signal: options?.signal, params: { path: { tableName, resolverName } }, body }
+      );
+      if (error) throw new Error(`setResolverNamespace: ${error.error}`);
+      if (!data) throw new Error("setResolverNamespace: empty response");
+      return data;
+    },
+    redirects: async (
+      tableName: string,
+      resolverName: string,
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}/redirects",
+        { signal: options?.signal, params: { path: { tableName, resolverName } } }
+      );
+      if (error) throw new Error(`listResolverRedirects: ${error.error}`);
+      if (!data) throw new Error("listResolverRedirects: empty response");
+      return data;
+    },
+    merge: async (
+      tableName: string,
+      resolverName: string,
+      body: components["schemas"]["ResolverMergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}/redirects",
+        { signal: options?.signal, params: { path: { tableName, resolverName } }, body }
+      );
+      if (error) throw new Error(`mergeResolverKeys: ${error.error}`);
+      if (!data) throw new Error("mergeResolverKeys: empty response");
+      return data;
+    },
+    unmerge: async (
+      tableName: string,
+      resolverName: string,
+      key: string,
+      body: components["schemas"]["ResolverUnmergeRequest"],
+      query?: { pin_distinct?: boolean },
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.DELETE(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}/redirects/{key}",
+        { signal: options?.signal, params: { path: { tableName, resolverName, key }, query }, body }
+      );
+      if (error) throw new Error(`unmergeResolverKey: ${error.error}`);
+      if (!data) throw new Error("unmergeResolverKey: empty response");
+      return data;
+    },
+    suppressions: async (
+      tableName: string,
+      resolverName: string,
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}/suppressions",
+        { signal: options?.signal, params: { path: { tableName, resolverName } } }
+      );
+      if (error) throw new Error(`listResolverSuppressions: ${error.error}`);
+      if (!data) throw new Error("listResolverSuppressions: empty response");
+      return data;
+    },
+    suppress: async (
+      tableName: string,
+      resolverName: string,
+      body: components["schemas"]["ResolverSuppressionRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}/suppressions",
+        { signal: options?.signal, params: { path: { tableName, resolverName } }, body }
+      );
+      if (error) throw new Error(`suppressResolverKeys: ${error.error}`);
+      if (!data) throw new Error("suppressResolverKeys: empty response");
+      return data;
+    },
+    unsuppress: async (
+      tableName: string,
+      resolverName: string,
+      key: string,
+      body: components["schemas"]["ResolverUnmergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.DELETE(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}",
+        { signal: options?.signal, params: { path: { tableName, resolverName, key } }, body }
+      );
+      if (error) throw new Error(`unsuppressResolverKey: ${error.error}`);
+      if (!data) throw new Error("unsuppressResolverKey: empty response");
+      return data;
+    },
+    reviews: async (
+      tableName: string,
+      resolverName: string,
+      query?: { cursor?: string; limit?: number },
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}/reviews",
+        { signal: options?.signal, params: { path: { tableName, resolverName }, query } }
+      );
+      if (error) throw new Error(`listResolverReviews: ${error.error}`);
+      if (!data) throw new Error("listResolverReviews: empty response");
+      return data;
+    },
+    review: async (
+      tableName: string,
+      resolverName: string,
+      reviewId: string,
+      body: components["schemas"]["ResolverReviewDecision"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}",
+        { signal: options?.signal, params: { path: { tableName, resolverName, reviewId } }, body }
+      );
+      if (error) throw new Error(`reviewResolverMention: ${error.error}`);
+      if (!data) throw new Error("reviewResolverMention: empty response");
+      return data;
+    },
+  };
+
+  entities = {
+    state: async (tableName: string, key: string, options?: { signal?: AbortSignal }) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/tables/{tableName}/entities/{key}/redirects",
+        { signal: options?.signal, params: { path: { tableName, key } } }
+      );
+      if (error) throw new Error(`listEntityResolverState: ${error.error}`);
+      if (!data) throw new Error("listEntityResolverState: empty response");
+      return data;
+    },
+    merge: async (
+      tableName: string,
+      key: string,
+      body: components["schemas"]["EntityMergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/entities/{key}:merge",
+        { signal: options?.signal, params: { path: { tableName, key } }, body }
+      );
+      if (error) throw new Error(`mergeEntity: ${error.error}`);
+      if (!data) throw new Error("mergeEntity: empty response");
+      return data;
+    },
+    unmerge: async (
+      tableName: string,
+      key: string,
+      body: components["schemas"]["ResolverUnmergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/entities/{key}:unmerge",
+        { signal: options?.signal, params: { path: { tableName, key } }, body }
+      );
+      if (error) throw new Error(`unmergeEntity: ${error.error}`);
+      if (!data) throw new Error("unmergeEntity: empty response");
+      return data;
+    },
+    suppress: async (
+      tableName: string,
+      key: string,
+      body: components["schemas"]["ResolverUnmergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/entities/{key}:suppress",
+        { signal: options?.signal, params: { path: { tableName, key } }, body }
+      );
+      if (error) throw new Error(`suppressEntity: ${error.error}`);
+      if (!data) throw new Error("suppressEntity: empty response");
+      return data;
+    },
+    unsuppress: async (
+      tableName: string,
+      key: string,
+      body: components["schemas"]["ResolverUnmergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/entities/{key}:unsuppress",
+        { signal: options?.signal, params: { path: { tableName, key } }, body }
+      );
+      if (error) throw new Error(`unsuppressEntity: ${error.error}`);
+      if (!data) throw new Error("unsuppressEntity: empty response");
+      return data;
+    },
+  };
+
+  namespaceResolvers = {
+    list: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers",
+        { signal: options?.signal, params: { path: { databaseName, namespaceName, tableName } } }
+      );
+      if (error) throw new Error(`listResolvers: ${error.error}`);
+      if (!data) throw new Error("listResolvers: empty response");
+      return data;
+    },
+    get: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName } },
+        }
+      );
+      if (error) throw new Error(`getResolver: ${error.error}`);
+      if (!data) throw new Error("getResolver: empty response");
+      return data;
+    },
+    drop: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.DELETE(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName } },
+        }
+      );
+      if (error) throw new Error(`dropResolverIdentity: ${error.error}`);
+      if (!data) throw new Error("dropResolverIdentity: empty response");
+      return data;
+    },
+    render: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      body: components["schemas"]["ResolverRenderRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:render",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName } },
+          body,
+        }
+      );
+      if (error) throw new Error(`renderResolverKey: ${error.error}`);
+      if (!data) throw new Error("renderResolverKey: empty response");
+      return data;
+    },
+    resolve: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      body: components["schemas"]["ResolverResolveRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:resolve",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName } },
+          body,
+        }
+      );
+      if (error) throw new Error(`resolveResolverQuery: ${error.error}`);
+      if (!data) throw new Error("resolveResolverQuery: empty response");
+      return data;
+    },
+    namespace: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      body: components["schemas"]["ResolverNamespaceRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}:namespace",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName } },
+          body,
+        }
+      );
+      if (error) throw new Error(`setResolverNamespace: ${error.error}`);
+      if (!data) throw new Error("setResolverNamespace: empty response");
+      return data;
+    },
+    redirects: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName } },
+        }
+      );
+      if (error) throw new Error(`listResolverRedirects: ${error.error}`);
+      if (!data) throw new Error("listResolverRedirects: empty response");
+      return data;
+    },
+    merge: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      body: components["schemas"]["ResolverMergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName } },
+          body,
+        }
+      );
+      if (error) throw new Error(`mergeResolverKeys: ${error.error}`);
+      if (!data) throw new Error("mergeResolverKeys: empty response");
+      return data;
+    },
+    unmerge: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      key: string,
+      body: components["schemas"]["ResolverUnmergeRequest"],
+      query?: { pin_distinct?: boolean },
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.DELETE(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/redirects/{key}",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName, key }, query },
+          body,
+        }
+      );
+      if (error) throw new Error(`unmergeResolverKey: ${error.error}`);
+      if (!data) throw new Error("unmergeResolverKey: empty response");
+      return data;
+    },
+    suppressions: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName } },
+        }
+      );
+      if (error) throw new Error(`listResolverSuppressions: ${error.error}`);
+      if (!data) throw new Error("listResolverSuppressions: empty response");
+      return data;
+    },
+    suppress: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      body: components["schemas"]["ResolverSuppressionRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName } },
+          body,
+        }
+      );
+      if (error) throw new Error(`suppressResolverKeys: ${error.error}`);
+      if (!data) throw new Error("suppressResolverKeys: empty response");
+      return data;
+    },
+    unsuppress: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      key: string,
+      body: components["schemas"]["ResolverUnmergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.DELETE(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/suppressions/{key}",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName, key } },
+          body,
+        }
+      );
+      if (error) throw new Error(`unsuppressResolverKey: ${error.error}`);
+      if (!data) throw new Error("unsuppressResolverKey: empty response");
+      return data;
+    },
+    reviews: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      query?: { cursor?: string; limit?: number },
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName }, query },
+        }
+      );
+      if (error) throw new Error(`listResolverReviews: ${error.error}`);
+      if (!data) throw new Error("listResolverReviews: empty response");
+      return data;
+    },
+    review: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      resolverName: string,
+      reviewId: string,
+      body: components["schemas"]["ResolverReviewDecision"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers/{resolverName}/reviews/{reviewId}",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, resolverName, reviewId } },
+          body,
+        }
+      );
+      if (error) throw new Error(`reviewResolverMention: ${error.error}`);
+      if (!data) throw new Error("reviewResolverMention: empty response");
+      return data;
+    },
+  };
+
+  namespaceEntities = {
+    state: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      key: string,
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}/redirects",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, key } },
+        }
+      );
+      if (error) throw new Error(`listEntityResolverState: ${error.error}`);
+      if (!data) throw new Error("listEntityResolverState: empty response");
+      return data;
+    },
+    merge: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      key: string,
+      body: components["schemas"]["EntityMergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:merge",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, key } },
+          body,
+        }
+      );
+      if (error) throw new Error(`mergeEntity: ${error.error}`);
+      if (!data) throw new Error("mergeEntity: empty response");
+      return data;
+    },
+    unmerge: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      key: string,
+      body: components["schemas"]["ResolverUnmergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unmerge",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, key } },
+          body,
+        }
+      );
+      if (error) throw new Error(`unmergeEntity: ${error.error}`);
+      if (!data) throw new Error("unmergeEntity: empty response");
+      return data;
+    },
+    suppress: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      key: string,
+      body: components["schemas"]["ResolverUnmergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, key } },
+          body,
+        }
+      );
+      if (error) throw new Error(`suppressEntity: ${error.error}`);
+      if (!data) throw new Error("suppressEntity: empty response");
+      return data;
+    },
+    unsuppress: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      key: string,
+      body: components["schemas"]["ResolverUnmergeRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unsuppress",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, key } },
+          body,
+        }
+      );
+      if (error) throw new Error(`unsuppressEntity: ${error.error}`);
+      if (!data) throw new Error("unsuppressEntity: empty response");
+      return data;
+    },
+  };
 
   indexes: IndexOperations = {
     retry: (tableName, indexName, request, options) =>

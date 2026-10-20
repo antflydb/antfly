@@ -971,3 +971,253 @@ def test_system_catalog_exact_star_grant_is_not_global(auth_api):
     api.delete("/tables/%2A")
     api.delete("/tables/other")
     api.delete("/tables/%21")
+
+
+def test_resolver_entity_state_requires_source_scopes_on_api_keys(auth_api: AuthApi):
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    destination = "curation_entities"
+    sources = ["curation_notes", "curation_memory"]
+    auth_api.create_table(destination)
+    graph = {
+        "type": "graph",
+        "source": {
+            "artifact": "kg",
+            "format": "extraction_graph",
+            "mention_edge_type": "mentions",
+        },
+        "artifact": {
+            "name": "kg",
+            "kind": "asset",
+            "source": {"type": "field", "value": "kg"},
+            "content_type": "application/json",
+        },
+        "edge_types": [{"name": "mentions"}],
+        "resolvers": [
+            {
+                "name": "concepts",
+                "table": destination,
+                "promote": False,
+                "source_artifact": "kg",
+                "resolution_artifact": "resolved",
+                "key_template": "concept/{{uslug _entity.text}}",
+            }
+        ],
+    }
+    for source in sources:
+        auth_api.create_table(
+            source, {"num_shards": 1, "indexes": {"knowledge": graph}}
+        )
+        auth_api.post(
+            f"/tables/{source}/resolvers/concepts/suppressions",
+            {
+                "keys": ["concept/noise", "concept/private"],
+                "texts": ["private source text"],
+            },
+        )
+    # The owner has broad access; the key's narrower scopes must survive fanout.
+    auth_api.post(
+        "/auth/v1/users/curator",
+        {
+            "password": "password123",
+            "initial_policies": [
+                {"resource": "*", "resource_type": "table", "type": "read"}
+            ],
+        },
+    )
+    keys = []
+    for resources in ([destination], [destination, *sources]):
+        keys.append(
+            auth_api.post(
+                "/auth/v1/users/curator/api-keys",
+                {
+                    "name": f"curation-{len(resources)}",
+                    "permissions": [
+                        {"resource": table, "resource_type": "table", "type": "read"}
+                        for table in resources
+                    ],
+                },
+            )["encoded"]
+        )
+    suffix = f"/tables/{destination}/entities/concept%2Fnoise/redirects"
+    for prefix in ("", "/databases/default/namespaces/public"):
+        auth_api.s.headers["Authorization"] = f"Bearer {keys[0]}"
+        denied = auth_api.s.get(f"{auth_api.url}{prefix}{suffix}", timeout=30)
+        assert denied.status_code == 403, denied.text
+        assert "private source text" not in denied.text
+        auth_api.s.headers["Authorization"] = f"Bearer {keys[1]}"
+        allowed = auth_api.get(prefix + suffix)
+        assert allowed["complete"] and len(allowed["results"]) == 2, allowed
+        for row in allowed["results"]:
+            assert row["curation"]["suppress"]["keys"] == ["concept/noise"]
+            assert row["curation"]["suppress"]["texts"] == []
+        assert "private source text" not in str(allowed)
+        assert "concept/private" not in str(allowed)
+
+
+@pytest.mark.parametrize("candidate_search", ["exact_key", "prefix"])
+def test_resolver_query_enforces_destination_scopes_and_row_filters(
+    auth_api: AuthApi, candidate_search
+):
+    api = auth_api
+    admin = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    api.s.headers["Authorization"] = admin
+    api.create_table("resolver_entities")
+    api.batch_write(
+        "resolver_entities",
+        {
+            "inserts": {
+                "concept/alpha": {
+                    "entity_type": "concept",
+                    "canonical_name": "CONFIDENTIAL_ENTITY",
+                    "tier": "private",
+                },
+                "concept/beta": {
+                    "entity_type": "concept",
+                    "canonical_name": "Public entity",
+                    "tier": "public",
+                },
+            },
+            "sync_level": "full_index",
+        },
+    )
+    graph = {
+        "type": "graph",
+        "source": {
+            "artifact": "kg",
+            "format": "extraction_graph",
+            "mention_edge_type": "mentions",
+        },
+        "artifact": {
+            "name": "kg",
+            "kind": "asset",
+            "source": {"type": "field", "value": "kg"},
+            "content_type": "application/json",
+        },
+        "edge_types": [{"name": "mentions"}],
+        "resolvers": [
+            {
+                "name": "concepts",
+                "table": "resolver_entities",
+                "promote": False,
+                "source_artifact": "kg",
+                "resolution_artifact": "resolved",
+                "key_template": "concept/{{uslug _entity.text}}",
+                "candidate_search": candidate_search,
+                "scorer": {
+                    "comparisons": [],
+                    "combine": {"bias": 5},
+                    "decision": {"match": 0.9, "review": 0.6},
+                },
+            }
+        ],
+    }
+    api.create_table(
+        "resolver_notes", {"num_shards": 1, "indexes": {"knowledge": graph}}
+    )
+    api.post(
+        "/auth/v1/users/query_reader",
+        {
+            "password": "password123",
+            "initial_policies": [
+                {"resource": "*", "resource_type": "table", "type": "read"},
+            ],
+        },
+    )
+    restricted = api.post(
+        "/auth/v1/users/query_reader/api-keys",
+        {
+            "name": "source only",
+            "permissions": [
+                {
+                    "resource": "resolver_notes",
+                    "resource_type": "table",
+                    "type": "read",
+                },
+            ],
+        },
+    )["encoded"]
+    allowed = api.post(
+        "/auth/v1/users/query_reader/api-keys",
+        {
+            "name": "source and destination",
+            "permissions": [
+                {"resource": table, "resource_type": "table", "type": "read"}
+                for table in ("resolver_notes", "resolver_entities")
+            ],
+        },
+    )["encoded"]
+
+    def resolve(prefix, text):
+        return api.s.post(
+            api.url + prefix + "/tables/resolver_notes/resolvers/concepts:resolve",
+            json={
+                "extraction": {
+                    "entities": [{"id": "a", "text": text, "label": "concept"}]
+                },
+            },
+            timeout=30,
+        )
+
+    for prefix in ("", "/databases/default/namespaces/public"):
+        api.s.headers["Authorization"] = f"Bearer {restricted}"
+        denied = resolve(prefix, "Alpha")
+        assert denied.status_code == 403, denied.text
+        assert "CONFIDENTIAL_ENTITY" not in denied.text
+        api.s.headers["Authorization"] = f"Bearer {allowed}"
+        visible = resolve(prefix, "Alpha")
+        assert visible.status_code == 200, visible.text
+        assert "CONFIDENTIAL_ENTITY" in visible.text
+    api.s.headers["Authorization"] = admin
+    api.put(
+        "/auth/v1/users/query_reader/row-filters/resolver_entities",
+        {"term": {"tier": "public"}},
+    )
+    api.s.headers["Authorization"] = f"Bearer {allowed}"
+    hidden = api.s.get(
+        api.url + lookup_key_path("resolver_entities", "concept/alpha"), timeout=30
+    )
+    assert hidden.status_code == 404, hidden.text
+    for prefix in ("", "/databases/default/namespaces/public"):
+        filtered = resolve(prefix, "Alpha")
+        assert filtered.status_code == 200, filtered.text
+        assert "CONFIDENTIAL_ENTITY" not in filtered.text
+        public = resolve(prefix, "Beta")
+        assert public.status_code == 200, public.text
+        assert (
+            public.json()["resolution"]["entities"][0]["canonical_name"]
+            == "Public entity"
+        )
+    # A readable tombstone cannot grant access to a different survivor table.
+    api.s.headers["Authorization"] = admin
+    api.create_table("private_survivors")
+    api.batch_write(
+        "private_survivors",
+        {
+            "inserts": {
+                "concept/hidden": {
+                    "entity_type": "concept",
+                    "canonical_name": "CONFIDENTIAL_SURVIVOR",
+                }
+            },
+            "sync_level": "full_index",
+        },
+    )
+    api.batch_write(
+        "resolver_entities",
+        {
+            "inserts": {
+                "concept/redirect": {
+                    "entity_type": "concept",
+                    "canonical_name": "Redirect",
+                    "tier": "public",
+                    "merged_into": "concept/hidden",
+                    "merged_into_table": "private_survivors",
+                }
+            },
+            "sync_level": "full_index",
+        },
+    )
+    api.s.headers["Authorization"] = f"Bearer {allowed}"
+    denied = resolve("", "Redirect")
+    assert denied.status_code == 403, denied.text
+    assert "CONFIDENTIAL_SURVIVOR" not in denied.text

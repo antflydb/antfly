@@ -5,6 +5,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.generated_decide_request import GeneratedDecideRequest
 from ...models.inference_decide_request import InferenceDecideRequest
 from ...models.inference_decide_response import InferenceDecideResponse
 from ...models.inference_error import InferenceError
@@ -14,7 +15,7 @@ from ...types import Response
 
 def _get_kwargs(
     *,
-    body: InferenceDecideRequest,
+    body: GeneratedDecideRequest | InferenceDecideRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -23,7 +24,10 @@ def _get_kwargs(
         "url": "/ai/v1/decisions",
     }
 
-    _kwargs["json"] = body.to_dict()
+    if isinstance(body, InferenceDecideRequest):
+        _kwargs["json"] = body.to_dict()
+    else:
+        _kwargs["json"] = body.to_dict()
 
     headers["Content-Type"] = "application/json"
 
@@ -84,7 +88,7 @@ def _build_response(
 def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: InferenceDecideRequest,
+    body: GeneratedDecideRequest | InferenceDecideRequest,
 ) -> Response[InferenceDecideResponse | InferenceError | InferenceTransientCapacityError]:
     """Answer named decision questions
 
@@ -93,10 +97,8 @@ def sync_detailed(
     probabilities from raw cosine similarities.
 
     Args:
-        body (InferenceDecideRequest): Supply exactly one of input (single text) or inputs (Antfly
-            batch extension). Question names must be unique. Single text and named question arrays
-            follow OpenAI Decisions conventions; local models support text input and string choice
-            values. Request bodies are bounded at 16 MiB.
+        body (GeneratedDecideRequest | InferenceDecideRequest): A trained decider request or a
+            constrained generator request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -120,7 +122,7 @@ def sync_detailed(
 def sync(
     *,
     client: AuthenticatedClient | Client,
-    body: InferenceDecideRequest,
+    body: GeneratedDecideRequest | InferenceDecideRequest,
 ) -> InferenceDecideResponse | InferenceError | InferenceTransientCapacityError | None:
     """Answer named decision questions
 
@@ -129,10 +131,8 @@ def sync(
     probabilities from raw cosine similarities.
 
     Args:
-        body (InferenceDecideRequest): Supply exactly one of input (single text) or inputs (Antfly
-            batch extension). Question names must be unique. Single text and named question arrays
-            follow OpenAI Decisions conventions; local models support text input and string choice
-            values. Request bodies are bounded at 16 MiB.
+        body (GeneratedDecideRequest | InferenceDecideRequest): A trained decider request or a
+            constrained generator request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -151,7 +151,7 @@ def sync(
 async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
-    body: InferenceDecideRequest,
+    body: GeneratedDecideRequest | InferenceDecideRequest,
 ) -> Response[InferenceDecideResponse | InferenceError | InferenceTransientCapacityError]:
     """Answer named decision questions
 
@@ -160,10 +160,8 @@ async def asyncio_detailed(
     probabilities from raw cosine similarities.
 
     Args:
-        body (InferenceDecideRequest): Supply exactly one of input (single text) or inputs (Antfly
-            batch extension). Question names must be unique. Single text and named question arrays
-            follow OpenAI Decisions conventions; local models support text input and string choice
-            values. Request bodies are bounded at 16 MiB.
+        body (GeneratedDecideRequest | InferenceDecideRequest): A trained decider request or a
+            constrained generator request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -185,7 +183,7 @@ async def asyncio_detailed(
 async def asyncio(
     *,
     client: AuthenticatedClient | Client,
-    body: InferenceDecideRequest,
+    body: GeneratedDecideRequest | InferenceDecideRequest,
 ) -> InferenceDecideResponse | InferenceError | InferenceTransientCapacityError | None:
     """Answer named decision questions
 
@@ -194,10 +192,8 @@ async def asyncio(
     probabilities from raw cosine similarities.
 
     Args:
-        body (InferenceDecideRequest): Supply exactly one of input (single text) or inputs (Antfly
-            batch extension). Question names must be unique. Single text and named question arrays
-            follow OpenAI Decisions conventions; local models support text input and string choice
-            values. Request bodies are bounded at 16 MiB.
+        body (GeneratedDecideRequest | InferenceDecideRequest): A trained decider request or a
+            constrained generator request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

@@ -42,7 +42,28 @@ pub fn producerJsonValuesEqual(alloc: Allocator, lhs: []const u8, rhs: []const u
 /// function is intentionally shared by API admission and local provisioning.
 pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void {
     if (cfg.name.len == 0) return error.InvalidEnrichmentConfig;
-    const consumes_asset_artifact = cfg.kind == .asset and cfg.source_artifact_name.len > 0;
+    if (cfg.kind == .group) {
+        const source = cfg.source orelse return error.InvalidEnrichmentConfig;
+        try source.validate();
+        if (cfg.field.len != 0 or cfg.template.len != 0 or cfg.source_artifact_name.len != 0 or cfg.producer_json.len != 0 or cfg.prior_context != null or cfg.neighbor_context != null or cfg.expected_dims != 0 or cfg.chunk_size != 0 or cfg.chunker_json.len != 0) return error.InvalidEnrichmentConfig;
+        if (source.filter != .null) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const normalized = try @import("../group_sources.zig").normalizedFilter(arena.allocator(), source.filter);
+            var filter = try @import("../query/graph_exec.zig").PreparedPatternFilter.initValue(alloc, normalized);
+            filter.deinit();
+        }
+        return;
+    }
+    if (cfg.source != null) return error.InvalidEnrichmentConfig;
+    if (cfg.prior_context) |context| {
+        try context.validate();
+        if (cfg.kind != .asset or cfg.source_artifact_name.len == 0) return error.InvalidEnrichmentConfig;
+        var producer = try asset_producer.parseProducerConfig(alloc, cfg.producer_json);
+        defer producer.deinit(alloc);
+        if (!producerConsumesPromptText(producer.type)) return error.InvalidEnrichmentConfig;
+    }
+    const consumes_asset_artifact = cfg.source_artifact_name.len > 0;
     if (cfg.field.len == 0 and cfg.template.len == 0 and !consumes_asset_artifact)
         return error.InvalidEnrichmentConfig;
     if (cfg.execution) |execution| {
@@ -60,6 +81,7 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
     if (cfg.neighbor_context != null and cfg.kind != .asset)
         return error.InvalidEnrichmentConfig;
     switch (cfg.kind) {
+        .group => unreachable,
         .chunk => if (cfg.chunk_size == 0 and cfg.chunker_json.len == 0)
             return error.InvalidEnrichmentConfig,
         .embedding => {},
@@ -138,6 +160,18 @@ pub fn validateAssetProducerConfig(alloc: Allocator, raw: []const u8) !void {
     if (producer.type == .decision) {
         const specification = try @import("../../../functions/materialization.zig").parse(alloc, producer.config_json);
         defer specification.deinit();
+        return;
+    }
+    if (producer.type == .generator) {
+        var config = try @import("../../../generating/producer_config.zig").parse(alloc, producer.config_json);
+        defer config.deinit(alloc);
+        if (config.output_schema != null and config.generator.provider != .antfly) _ = try @import("antfly_structured").hostedCapabilities(config.generator).select(config.output, null);
+        return;
+    }
+    if (producer.type == .extractor and try @import("antfly_structured").extraction.isGenerated(alloc, producer.config_json)) {
+        var config = try @import("antfly_structured").extraction.parse(alloc, producer.config_json);
+        defer config.deinit();
+        if (config.value.generator.provider != .antfly) _ = try @import("antfly_structured").hostedCapabilities(config.value.generator).select(config.value.output, config.value.probabilities);
         return;
     }
     if (producer.type != .document_extraction) return;
@@ -291,4 +325,45 @@ test "producer JSON equality ignores object key order" {
         "{\"provider\":\"antfly\",\"model\":\"embed-v1\"}",
         "{\"provider\":\"antfly\",\"model\":\"embed-v2\"}",
     ));
+}
+
+/// A reader that ignores the constraint/context contract could publish valid
+/// looking artifacts with weaker semantics. Fence it before storing the catalog.
+pub fn requiredReaderVersion(alloc: Allocator, cfg: @import("../catalog/enrichment_catalog.zig").EnrichmentConfig) !u32 {
+    const catalog = @import("../catalog/resolver_catalog.zig");
+    if (cfg.group_source_json.len > 0 or cfg.prior_context_json.len > 0) return catalog.grouped_sources_reader_version;
+    if (cfg.kind != .asset or cfg.producer_json.len == 0) return 1;
+    var producer = try asset_producer.parseProducerConfig(alloc, cfg.producer_json);
+    defer producer.deinit(alloc);
+    if (producer.type == .generator) {
+        var config = try @import("../../../generating/producer_config.zig").parse(alloc, producer.config_json);
+        defer config.deinit(alloc);
+        if (config.output_schema != null) return catalog.generated_producers_reader_version;
+    } else if (producer.type == .extractor) {
+        if (try @import("antfly_structured").extraction.isGenerated(alloc, producer.config_json)) return catalog.generated_producers_reader_version;
+    } else if (producer.type == .decision) {
+        const spec = try @import("../../../functions/materialization.zig").parse(alloc, producer.config_json);
+        defer spec.deinit();
+        if (spec.value.decider.decision_method == .generated) return catalog.generated_producers_reader_version;
+    }
+    return 1;
+}
+
+pub fn priorSharesGroup(configs: anytype, name: []const u8, prior: []const u8) bool {
+    const current_root = groupRoot(configs, name) orelse return false;
+    const prior_root = groupRoot(configs, prior) orelse return false;
+    return std.mem.eql(u8, current_root, prior_root);
+}
+fn groupRoot(configs: anytype, name: []const u8) ?[]const u8 {
+    var current = name;
+    for (0..configs.len + 1) |_| {
+        const entry = for (configs) |cfg| {
+            if (std.mem.eql(u8, cfg.name, current)) break cfg;
+        } else return null;
+        const is_group = if (@hasField(@TypeOf(entry), "group_source_json")) entry.group_source_json.len > 0 else entry.kind == .group;
+        if (is_group) return entry.name;
+        current = entry.source_artifact_name;
+        if (current.len == 0) return null;
+    }
+    return null;
 }

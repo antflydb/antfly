@@ -39,7 +39,7 @@ pub const RawDescriptor = struct {
 /// Private graph objects preserve ownership/contender bytes, unlike public
 /// portable graph exports. Their descriptor must never re-encode the value.
 pub fn graphDescriptor(alloc: std.mem.Allocator, reader: anytype, object_size: u64, position: pages.SnapshotPosition, effect_protocol: u16) !?RawDescriptor {
-    if (effect_protocol != 15) return error.OnlineMergeArtifactTailsUnsupported;
+    if (effect_protocol < 15) return error.OnlineMergeArtifactTailsUnsupported;
     const item = (try @import("source_artifact_batch.zig").descriptor(alloc, reader, object_size, .{
         .object = position.object,
         .offset = position.offset,

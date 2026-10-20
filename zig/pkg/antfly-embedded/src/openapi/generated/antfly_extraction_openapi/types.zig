@@ -697,6 +697,76 @@ pub const ExtractionInput = struct {
     }
 };
 
+/// A trained extractor request or a constrained generator request.
+pub const ExtractionInputRequest = union(enum) {
+    generated_extraction_request: *GeneratedExtractionRequest,
+    extraction_request: *ExtractionRequest,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectStringEquals(object: std.json.ObjectMap, comptime key: []const u8, comptime expected: []const u8) bool {
+        const value = object.get(key) orelse return false;
+        return value == .string and std.mem.eql(u8, value.string, expected);
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "inputs",
+            "method",
+            "generator",
+            "schema",
+            "entity_definitions",
+            "instructions",
+            "output",
+            "probabilities",
+            "batch",
+            "options",
+        }) and
+            objectStringEquals(source.object, "method", "generated"))
+        {
+            if (try parseStructuralVariant(GeneratedExtractionRequest, allocator, source, options)) |parsed| return .{ .generated_extraction_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "model",
+            "schema_version",
+            "inputs",
+            "schema",
+            "options",
+        })) {
+            if (try parseStructuralVariant(ExtractionRequest, allocator, source, options)) |parsed| return .{ .extraction_request = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .generated_extraction_request => |v| try jw.write(v.*),
+            .extraction_request => |v| try jw.write(v.*),
+        }
+    }
+};
+
 pub const ExtractionJointConstraint = std.json.Value;
 
 pub const ExtractionJointConstraintAcyclicRelation = struct {
@@ -1294,6 +1364,11 @@ pub const ExtractionLongDocumentOptions = struct {
 };
 
 pub const ExtractionObject = struct {
+    model: ?[]const u8 = null,
+    /// Generated extraction confidence comes from measured decoder evidence or explicit verdict-only assertions.
+    probability_source: ?[]const u8 = null,
+    /// Generated mention proposals dropped because they could not be aligned to the source.
+    unaligned_mentions: ?i64 = null,
     id: ?[]const u8 = null,
     offset_unit: ?std.json.Value = null,
     entities: ?[]const ExtractionEntity = null,
@@ -1308,6 +1383,9 @@ pub const ExtractionObject = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "probability_source", "probability_source", true },
+        .{ "unaligned_mentions", "unaligned_mentions", true },
         .{ "id", "id", true },
         .{ "offset_unit", "offset_unit", true },
         .{ "entities", "entities", true },
@@ -1329,6 +1407,18 @@ pub const ExtractionObject = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.probability_source) |value| {
+            try jw.objectField("probability_source");
+            try jw.write(value);
+        }
+        if (self.unaligned_mentions) |value| {
+            try jw.objectField("unaligned_mentions");
+            try jw.write(value);
+        }
         if (self.id) |value| {
             try jw.objectField("id");
             try jw.write(value);
@@ -2146,6 +2236,194 @@ pub const ExtractionToken = struct {
         try jw.write(self.text);
         if (self.box) |value| {
             try jw.objectField("box");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GeneratedExtractionInput = struct {
+    id: ?[]const u8 = null,
+    content: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "id", "id", true },
+        .{ "content", "content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
+};
+
+pub const GeneratedExtractionRequest = struct {
+    inputs: []const GeneratedExtractionInput,
+    method: []const u8,
+    generator: antfly_generating_openapi.GeneratorConfig,
+    schema: ExtractionSchema,
+    entity_definitions: ?std.json.ArrayHashMap([]const u8) = null,
+    instructions: ?[]const u8 = null,
+    output: ?antfly_generating_openapi.ConstrainedOutput = null,
+    probabilities: ?antfly_generating_openapi.ConstrainedProbabilities = null,
+    batch: ?antfly_generating_openapi.ConstrainedGenerationBatch = null,
+    options: ?ExtractionOptions = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "inputs", "inputs", false },
+        .{ "method", "method", false },
+        .{ "generator", "generator", false },
+        .{ "schema", "schema", false },
+        .{ "entity_definitions", "entity_definitions", true },
+        .{ "instructions", "instructions", true },
+        .{ "output", "output", false },
+        .{ "probabilities", "probabilities", false },
+        .{ "batch", "batch", false },
+        .{ "options", "options", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("inputs");
+        try jw.write(self.inputs);
+        try jw.objectField("method");
+        try jw.write(self.method);
+        try jw.objectField("generator");
+        try jw.write(self.generator);
+        try jw.objectField("schema");
+        try jw.write(self.schema);
+        if (self.entity_definitions) |value| {
+            try jw.objectField("entity_definitions");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("output");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.probabilities) |value| {
+            try jw.objectField("probabilities");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("probabilities");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.batch) |value| {
+            try jw.objectField("batch");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("batch");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.options) |value| {
+            try jw.objectField("options");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GeneratedExtractorConfig = struct {
+    method: []const u8,
+    generator: antfly_generating_openapi.GeneratorConfig,
+    schema: ExtractionSchema,
+    entity_definitions: ?std.json.ArrayHashMap([]const u8) = null,
+    instructions: ?[]const u8 = null,
+    output: ?antfly_generating_openapi.ConstrainedOutput = null,
+    probabilities: ?antfly_generating_openapi.ConstrainedProbabilities = null,
+    batch: ?antfly_generating_openapi.ConstrainedGenerationBatch = null,
+    options: ?ExtractionOptions = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "method", "method", false },
+        .{ "generator", "generator", false },
+        .{ "schema", "schema", false },
+        .{ "entity_definitions", "entity_definitions", true },
+        .{ "instructions", "instructions", true },
+        .{ "output", "output", false },
+        .{ "probabilities", "probabilities", false },
+        .{ "batch", "batch", false },
+        .{ "options", "options", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("method");
+        try jw.write(self.method);
+        try jw.objectField("generator");
+        try jw.write(self.generator);
+        try jw.objectField("schema");
+        try jw.write(self.schema);
+        if (self.entity_definitions) |value| {
+            try jw.objectField("entity_definitions");
+            try jw.write(value);
+        }
+        if (self.instructions) |value| {
+            try jw.objectField("instructions");
+            try jw.write(value);
+        }
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("output");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.probabilities) |value| {
+            try jw.objectField("probabilities");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("probabilities");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.batch) |value| {
+            try jw.objectField("batch");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("batch");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.options) |value| {
+            try jw.objectField("options");
             try jw.write(value);
         }
         try jw.endObject();

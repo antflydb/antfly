@@ -32,7 +32,8 @@ const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const BoundedAllocator = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
 
 pub const semantics_version = 1;
-pub const Mode = enum { reject, windowed };
+const shared_windows = @import("antfly_extracting").text_processing.windows;
+pub const Mode = shared_windows.Mode;
 pub const RecordIdentity = enum { occurrence, semantic };
 pub const Descriptor = struct {
     version: u32 = semantics_version,
@@ -101,16 +102,7 @@ pub const PlanOptions = struct {
     other_record_identity: RecordIdentity = .occurrence,
     control: ?Control = null,
 };
-pub const Window = struct {
-    index: usize,
-    bytes: boundary.Offsets,
-    words: boundary.Offsets,
-    owned_words: boundary.Offsets,
-    synthetic_terminal_word: bool,
-    pub fn weight(self: Window) usize {
-        return self.owned_words.end - self.owned_words.start;
-    }
-};
+pub const Window = shared_windows.Window;
 pub const Identity = struct {
     plan_fingerprint: [32]u8,
     schema_fingerprint: [32]u8,
@@ -220,46 +212,17 @@ fn planOwned(owner: *Owner, text: []const u8, schema_fingerprint: [32]u8, option
         .max_words = options.max_document_words,
         .control = options.control,
     });
-    if (text.len > options.max_window_scan_bytes) return error.LongDocumentWorkLimitExceeded;
-    var scanned = text.len;
-    const terminal = try processor.terminalWordAdded(a, text, options.word_splitter);
-    try check(options.control);
-    const full_count = try std.math.add(usize, ranges.len, @intFromBool(terminal));
-    var windows = std.ArrayListUnmanaged(Window).empty;
-    if (full_count <= options.max_window_body_words) {
-        try windows.append(a, .{ .index = 0, .bytes = .{ .start = 0, .end = text.len }, .words = .{ .start = 0, .end = ranges.len }, .owned_words = .{ .start = 0, .end = ranges.len }, .synthetic_terminal_word = terminal });
-    } else {
-        if (options.mode == .reject) return error.LongDocumentWindowingRequired;
-        var start: usize = 0;
-        while (start < ranges.len) {
-            try check(options.control);
-            if (windows.items.len >= options.max_windows) return error.LongDocumentWindowLimitExceeded;
-            var end = @min(ranges.len, start + options.max_window_body_words);
-            var bytes = boundary.Offsets{ .start = if (start == 0) 0 else ranges[start].start, .end = if (end == ranges.len) text.len else ranges[end - 1].end };
-            if (bytes.end - bytes.start > options.max_window_scan_bytes - scanned) return error.LongDocumentWorkLimitExceeded;
-            scanned += bytes.end - bytes.start;
-            var extra = try processor.terminalWordAdded(a, text[bytes.start..bytes.end], options.word_splitter);
-            if (end - start + @intFromBool(extra) > options.max_window_body_words) {
-                end -= 1;
-                if (end == start) return error.InvalidLongDocumentLimits;
-                bytes.end = ranges[end - 1].end;
-                if (bytes.end - bytes.start > options.max_window_scan_bytes - scanned) return error.LongDocumentWorkLimitExceeded;
-                scanned += bytes.end - bytes.start;
-                extra = try processor.terminalWordAdded(a, text[bytes.start..bytes.end], options.word_splitter);
-            }
-            if (end - start + @intFromBool(extra) > options.max_window_body_words) return error.InvalidLongDocumentLimits;
-            try windows.append(a, .{ .index = windows.items.len, .bytes = bytes, .words = .{ .start = start, .end = end }, .owned_words = undefined, .synthetic_terminal_word = extra });
-            if (end == ranges.len) break;
-            if (end - start <= options.overlap_words) return error.InvalidLongDocumentLimits;
-            start = end - options.overlap_words;
-        }
-        var owned_start: usize = 0;
-        for (windows.items, 0..) |*window, i| {
-            const owned_end = if (i + 1 == windows.items.len) ranges.len else (window.words.end + windows.items[i + 1].words.start) / 2;
-            window.owned_words = .{ .start = owned_start, .end = owned_end };
-            owned_start = owned_end;
-        }
-    }
+    const planned_windows = try shared_windows.planWindows(a, text, ranges, .{
+        .mode = options.mode,
+        .word_splitter = options.word_splitter,
+        .max_window_body_words = options.max_window_body_words,
+        .overlap_words = options.overlap_words,
+        .max_document_bytes = options.max_document_bytes,
+        .max_document_words = options.max_document_words,
+        .max_windows = options.max_windows,
+        .max_window_scan_bytes = options.max_window_scan_bytes,
+        .control = if (options.control) |*control| .{ .ptr = control, .check_fn = windowCheckpoint } else null,
+    });
     const copied = try a.dupe(u8, text);
     const offsets = try boundary.OffsetMap.init(a, copied, options.max_document_bytes);
     try check(options.control);
@@ -272,7 +235,7 @@ fn planOwned(owner: *Owner, text: []const u8, schema_fingerprint: [32]u8, option
     hashNumber(&hash, @backingInt(options.word_splitter));
     hashNumber(&hash, @backingInt(options.mode));
     hashNumber(&hash, @backingInt(options.other_record_identity));
-    for (windows.items) |window| {
+    for (planned_windows) |window| {
         hashNumber(&hash, window.bytes.start);
         hashNumber(&hash, window.bytes.end);
         hashNumber(&hash, window.owned_words.start);
@@ -280,7 +243,7 @@ fn planOwned(owner: *Owner, text: []const u8, schema_fingerprint: [32]u8, option
     }
     var fingerprint: [32]u8 = undefined;
     hash.final(&fingerprint);
-    return .{ .owner = owner, .text = copied, .words = ranges, .windows = try windows.toOwnedSlice(a), .offsets = offsets, .schema_fingerprint = schema_fingerprint, .inference_fingerprint = options.inference_fingerprint, .fingerprint = fingerprint, .descriptor = .{ .mode = options.mode, .other_record_identity = options.other_record_identity } };
+    return .{ .owner = owner, .text = copied, .words = ranges, .windows = planned_windows, .offsets = offsets, .schema_fingerprint = schema_fingerprint, .inference_fingerprint = options.inference_fingerprint, .fingerprint = fingerprint, .descriptor = .{ .mode = options.mode, .other_record_identity = options.other_record_identity } };
 }
 
 pub const MergeOptions = struct {
@@ -1689,4 +1652,9 @@ test "gliner boundary long document terminal allocation retains declared memory 
     const observed = owner.terminal orelse return error.MissingTerminalAllocationFailure;
     try std.testing.expectEqual(.declared_limit, observed.kind);
     try std.testing.expectEqual(error.MemoryBudgetExceeded, owner.allocationError(actual));
+}
+
+fn windowCheckpoint(ptr: *const anyopaque) !void {
+    const control: *const Control = @ptrCast(@alignCast(ptr));
+    try control.check();
 }

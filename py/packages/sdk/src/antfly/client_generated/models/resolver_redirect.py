@@ -6,34 +6,51 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="EnrichmentConfigProducer")
+T = TypeVar("T", bound="ResolverRedirect")
 
 
 @_attrs_define
-class EnrichmentConfigProducer:
-    """Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use
-    type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig.
-    Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version
-    or specification to rebuild through the enrichment lifecycle.
-
+class ResolverRedirect:
+    """
+    Attributes:
+        key (str):
+        target (str):
     """
 
+    key: str
+    target: str
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        key = self.key
+
+        target = self.target
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
+        field_dict.update(
+            {
+                "key": key,
+                "target": target,
+            }
+        )
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        enrichment_config_producer = cls()
+        key = d.pop("key")
 
-        enrichment_config_producer.additional_properties = d
-        return enrichment_config_producer
+        target = d.pop("target")
+
+        resolver_redirect = cls(
+            key=key,
+            target=target,
+        )
+
+        resolver_redirect.additional_properties = d
+        return resolver_redirect
 
     @property
     def additional_keys(self) -> list[str]:

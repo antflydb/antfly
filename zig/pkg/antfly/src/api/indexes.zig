@@ -81,6 +81,7 @@ pub fn addIndexToTableIndexesJsonWithIo(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
+    if ((std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces"))) return error.InvalidCreateIndexRequest;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
@@ -122,7 +123,7 @@ pub fn addIndexToTableIndexesJsonWithIo(
     try out.append(alloc, ':');
     try out.appendSlice(alloc, stored_config);
     try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    return try @import("antfly_local_sources").storage_db_resolver_curation.retainRetiredMetadata(alloc, current_indexes_json, out.items);
 }
 
 fn storedIndexConfigForMutationAlloc(
@@ -194,6 +195,7 @@ pub fn removeIndexFromTableIndexesJson(
     current_indexes_json: []const u8,
     index_name: []const u8,
 ) !?[]u8 {
+    if ((std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces"))) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
 
@@ -221,7 +223,7 @@ pub fn removeIndexFromTableIndexesJson(
     }
 
     try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    return try @import("antfly_local_sources").storage_db_resolver_curation.retainRetiredMetadata(alloc, current_indexes_json, out.items);
 }
 
 pub fn addEnrichmentToTableIndexesJson(
@@ -11011,4 +11013,16 @@ test "artifact enrichment list does not expose internal JSON or producer credent
     try std.testing.expect(std.mem.indexOf(u8, listed, "producer_json") == null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "chunker_json") == null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "\"chunker\":{") != null);
+}
+
+test "resolver curation HTTP hides destination namespace metadata from index resources" {
+    const a = std.testing.allocator;
+    const source = "{\"default\":{\"type\":\"full_text\"},\"_resolver_curation\":{\"identities\":[]},\"_resolver_namespaces\":{\"version\":1,\"namespaces\":[]}}";
+    const configs = try encodeIndexConfigMap(a, source);
+    defer a.free(configs);
+    try std.testing.expect(std.mem.indexOf(u8, configs, "_resolver_") == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, configs, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+    try std.testing.expect(parsed.value.object.contains("default"));
 }

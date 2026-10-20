@@ -8268,6 +8268,18 @@ pub const ProvisionedTableWriteSource = struct {
     /// deliberately bypasses this gate. The resource check keeps the ordinary
     /// proposal path allocation-free and avoids touching the writer cache until
     /// the node is actually under hard replay/backlog pressure.
+    pub fn preflightGroupedSourceWriteAdmission(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.BatchRequest) !void {
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            _ = (try local_source.preflightGroupedSourceBatchGroupLocal(alloc, group_id, table_name, req)) orelse return error.StorageKernelOwnerUnavailable;
+            return;
+        }
+        if (self.local_write_owner) |owner| return owner.preflightGroupedSourceWriteAdmission(alloc, group_id, table_name, req);
+        var lease = (try self.leaseCachedGroupWriter(alloc, group_id, table_name)) orelse return error.StorageKernelOwnerUnavailable;
+        defer lease.deinit(alloc);
+        try physical_local_write.validateGroupedSourceBatch(alloc, lease.db, req.writes, req.deletes, req.transforms);
+    }
+
     pub fn preflightDenseRepairWriteAdmission(
         self: *ProvisionedTableWriteSource,
         group_id: u64,
@@ -20084,6 +20096,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
                 .drop_table = dropTable,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
+                .resolver_operation_group_local = resolverOperationGroupLocal,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
                 .commit_batch = commitBatch,
@@ -20169,6 +20182,38 @@ pub const ProvisionedTableWriteSource = struct {
         };
         defer db.close();
         return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, &db, body);
+    }
+
+    fn resolverOperationGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return try local_source.resolverOperationGroupLocal(alloc, group_id, table_name, body);
+        }
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
+            defer cached.deinit(alloc);
+            return try cached.db.resolverReviewsJsonAlloc(alloc, body);
+        }
+
+        var db = openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror) catch |err| switch (err) {
+            error.FileNotFound => return error.UnknownGroup,
+            else => return err,
+        };
+        defer db.close();
+        return try db.resolverReviewsJsonAlloc(alloc, body);
     }
 
     fn graphMetricAction(
@@ -25515,6 +25560,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .graph_metric_action = graphMetricAction,
                 .graph_metric_action_with_cancellation = graphMetricActionWithCancellation,
                 .graph_metric_maintenance_group_local = graphMetricMaintenanceGroupLocal,
+                .resolver_operation_group_local = resolverOperationGroupLocal,
                 .accept_committed_index_mutation = acceptCommittedIndexMutation,
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
@@ -25577,6 +25623,26 @@ pub const HostedProvisionedTableWriteSource = struct {
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
         defer cached.deinit(hosted_cache.write_cache.alloc);
         return try runGraphMetricMaintenanceOrActionJsonAlloc(alloc, cached.db, body);
+    }
+
+    fn resolverOperationGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (comptime control_only_storage_sources) {
+            const local_source = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
+            return try local_source.resolverOperationGroupLocal(alloc, group_id, table_name, body);
+        }
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        return try cached.db.resolverReviewsJsonAlloc(alloc, body);
     }
 
     fn graphMetricActionForRoute(
@@ -32426,6 +32492,7 @@ fn validateTableBatchAgainstSchemaJson(
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
     if (writes.len == 0 and deletes.len == 0 and transforms.len == 0) return;
+    if (comptime !control_only_storage_sources) try physical_local_write.validateGroupedSourceBatch(alloc, db, writes, deletes, transforms);
     const raw_schema_json = schema_json orelse return;
     if (raw_schema_json.len == 0) return;
 
@@ -32448,9 +32515,12 @@ fn validateTransactionAgainstCatalogSchema(
     deletes: []const []const u8,
     transforms: []const db_mod.types.DocumentTransform,
 ) !void {
-    if (try transactionUsesDurableContract(alloc, db, txn_id)) return;
     const batch_writes = try transactionWritesToBatchWrites(alloc, writes);
     defer alloc.free(batch_writes);
+    if (try transactionUsesDurableContract(alloc, db, txn_id)) {
+        if (comptime !control_only_storage_sources) try physical_local_write.validateGroupedSourceBatch(alloc, db, batch_writes, deletes, transforms);
+        return;
+    }
     try validateTableBatchAgainstCatalogSchema(alloc, catalog, db, table_name, batch_writes, deletes, transforms);
 }
 

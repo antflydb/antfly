@@ -40,7 +40,8 @@ comptime {
     if (@typeInfo(publication.Command).@"struct".field_names.len != 18 or
         @typeInfo(publication.Source).@"struct".field_names.len != 5 or
         @typeInfo(publication.ArtifactSource).@"struct".field_names.len != 4 or
-        @typeInfo(publication.Mutation).@"struct".field_names.len != 4)
+        @typeInfo(publication.Mutation).@"struct".field_names.len != 4 or
+        @typeInfo(publication.CompletionPage).@"struct".field_names.len != 6)
         @compileError("update compact publication transport projection");
 }
 
@@ -225,7 +226,7 @@ pub fn encodeAlloc(alloc: Allocator, command: publication.Command) ![]u8 {
         writer.write(&page.before);
         writer.write(&page.after);
     }
-    writer.byte(@intFromBool(command.completion != null));
+    writer.byte(if (command.completion) |page| if (page.group_producers) @as(u8, 2) else @as(u8, 1) else @as(u8, 0));
     if (command.completion) |page| {
         writer.blob(page.document_key);
         writer.writeU32(page.visits);
@@ -426,9 +427,10 @@ fn decode(alloc: Allocator, bytes: []const u8, owns_bytes: bool) !Decoded {
         1 => .{ .document_key = try cursor.blob(), .chunk_name = try cursor.blob(), .visits = try cursor.readU32(), .bytes = try cursor.readU32(), .before = (try cursor.take(32))[0..32].*, .after = (try cursor.take(32))[0..32].* },
         else => return error.InvalidBatchRequest,
     };
-    const completion: ?publication.CompletionPage = switch (try cursor.byte()) {
+    const completion_kind = try cursor.byte();
+    const completion: ?publication.CompletionPage = switch (completion_kind) {
         0 => null,
-        1 => .{ .document_key = try cursor.blob(), .visits = try cursor.readU32(), .bytes = try cursor.readU32(), .before = (try cursor.take(32))[0..32].*, .after = (try cursor.take(32))[0..32].* },
+        1, 2 => .{ .group_producers = completion_kind == 2, .document_key = try cursor.blob(), .visits = try cursor.readU32(), .bytes = try cursor.readU32(), .before = (try cursor.take(32))[0..32].*, .after = (try cursor.take(32))[0..32].* },
         else => return error.InvalidBatchRequest,
     };
     if (cursor.pos != cursor.bytes.len) return error.InvalidBatchRequest;
