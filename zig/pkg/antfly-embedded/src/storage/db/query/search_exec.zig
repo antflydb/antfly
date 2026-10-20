@@ -18671,7 +18671,7 @@ const ValueExecution = struct {
         slots: [64]u6,
         count: usize,
     };
-    const Cohort = struct { known: roaring.RoaringBitmap, members: u64 = 0 };
+    const Cohort = struct { known: roaring.RoaringBitmap, members: u64 = 0, literal_group: ?usize = null };
     a: Allocator,
     snapshot: *const index_mod.IndexSnapshot,
     req: types.SearchRequest,
@@ -18703,6 +18703,7 @@ const ValueExecution = struct {
         for (self.cohorts.items) |*cohort| {
             cohort.known.deinit();
             cohort.known = roaring.RoaringBitmap.init(self.a);
+            cohort.literal_group = null;
         }
         self.literals_checked = false;
     }
@@ -18742,6 +18743,8 @@ const ValueExecution = struct {
                 set.deinit();
                 continue;
             };
+            const cohort = &self.cohorts.items[first.cohort.?];
+            if (@popCount(cohort.members) == n) cohort.literal_group = self.literal_groups.items.len - 1;
         }
     }
     fn evaluateLeaf(self: *@This(), slot: usize, doc: std.json.Value, done: *u64, positives: *u64) !void {
@@ -18775,6 +18778,24 @@ const ValueExecution = struct {
     fn matchSource(self: *@This(), producer: *ValueProducer, global: u32, doc: std.json.Value) !bool {
         if (!self.streamsPredicates(producer)) return producer.matcher.document(doc);
         const cohort = &self.cohorts.items[producer.cohort.?];
+        // A wholly literal cohort retains the original single-automaton path:
+        // no generic per-leaf dispatch, coverage probes or sibling polling.
+        if (cohort.literal_group) |index| {
+            const group = &self.literal_groups.items[index];
+            if (group.set.document(doc, producer.matcher.spec.field)) |bits| {
+                try cohort.known.add(global);
+                var remaining = bits;
+                while (remaining != 0) {
+                    const slot = group.slots[@intCast(@ctz(remaining))];
+                    try self.producers.items[slot].matched.add(global);
+                    remaining &= remaining - 1;
+                }
+                return producer.matched.contains(global);
+            } else |_| {
+                // Preserve the required leaf's early-return behavior on a
+                // source traversal limit, using individual matchers below.
+            }
+        }
         const required = cohort.members;
         var done: u64 = 0;
         var positives: u64 = 0;
@@ -18788,7 +18809,8 @@ const ValueExecution = struct {
         }
         try self.evaluateLeaf(producer.slot, doc, &done, &positives);
         for (self.producers.items, 0..) |leaf, i| {
-            if (required & (@as(u64, 1) << @intCast(i)) == 0) continue;
+            const bit = @as(u64, 1) << @intCast(i);
+            if (required & bit == 0 or done & bit != 0) continue;
             // Preserve indexed selectivity: a sibling with its own candidate
             // constraint runs through that iterator rather than expanding work
             // to this leaf's broader source domain.
@@ -18874,14 +18896,13 @@ const ValueProducer = struct {
     exact_keyword: bool = false,
     slot: usize = 0,
     cohort: ?usize = null,
-    fn covered(self: *@This(), global: u32) bool {
-        if (!self.owner.streamsPredicates(self)) return false;
-        return self.owner.cohorts.items[self.cohort.?].known.contains(global);
-    }
     fn produce(raw: *anyopaque, a: Allocator, offset: u32, count: u32, incoming: ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const owner = self.owner;
         owner.prepareLiterals();
+        // Plan/coverage ownership is stable for this producer invocation.
+        const stream_membership = owner.streamsPredicates(self);
+        const coverage = if (stream_membership) &owner.cohorts.items[self.cohort.?].known else null;
         const control = @import("../../../search/query.zig").ExecutionControl{ .cancellation = owner.req.cancellation, .deadline_ns = owner.req.execution_deadline_ns, .pattern_programs = owner.req.text_pattern_programs, .pattern_cache = owner.req.text_pattern_membership };
         try control.check();
         var result = roaring.RoaringBitmap.init(a);
@@ -18967,7 +18988,7 @@ const ValueProducer = struct {
             if (local >= count) return error.InvalidArgument;
             if (deleted) |*tombstones| if (tombstones.contains(local)) continue;
             const global = offset + local;
-            if (self.visited.contains(global) or self.covered(global)) {
+            if (self.visited.contains(global) or (if (coverage) |known| known.contains(global) else false)) {
                 const yes = self.matched.contains(global);
                 if (yes) try result.add(local);
                 // Fusion can establish this leaf while another leaf is being
@@ -18995,7 +19016,7 @@ const ValueProducer = struct {
                 const stored = try owner.load.?(owner.load_ctx, scratch.allocator(), id);
                 if (stored) |bytes| {
                     try value_query.Work.charge(&work.bytes, bytes.len, owner.req.value_search_execution.max_bytes);
-                    const shared = if (!owner.streamsPredicates(self)) try work.sources.remember(owner.a, owner.load_ctx, id, bytes) else null;
+                    const shared = if (!stream_membership) try work.sources.remember(owner.a, owner.load_ctx, id, bytes) else null;
                     if (shared) |doc| {
                         matched = try owner.matchSource(self, global, doc);
                     } else {
@@ -19009,7 +19030,7 @@ const ValueProducer = struct {
                 if (matched) try facts.matched.add(local);
                 changed = true;
             }
-            if (!self.covered(global)) try self.visited.add(global);
+            if (!(if (coverage) |known| known.contains(global) else false)) try self.visited.add(global);
             if (matched) {
                 try self.matched.add(global);
                 try result.add(local);
@@ -33811,6 +33832,13 @@ test "logical value fusion preserves per-leaf scores and constrained retained fa
     try std.testing.expectEqual(@as(usize, 4), loader.calls);
 
     try std.testing.expectEqual(@as(usize, 0), execution.local_work.sources.budget.live);
+
+    loader.calls = 0;
+    var literals_only: ValueExecution = .{ .a = a, .snapshot = writer.snapshot(), .req = .{ .value_search_execution = .{ .allow_scan = true, .max_documents = 4 } }, .load_ctx = &loader, .load = Loader.load };
+    defer literals_only.deinit();
+    const literal_query = try textQueryToSearchQueryWithValues(arena.allocator(), .{ .bool_query = .{ .should = source.bool_query.should[0..3] } }, .{}, null, &literals_only);
+    try std.testing.expectEqual(@as(u32, 3), try search_mod.countMatches(a, writer.snapshot(), literal_query));
+    try std.testing.expectEqual(@as(usize, 4), loader.calls);
 
     // A speculative sibling that exceeds its work budget is unknown, not a
     // cached negative or an error for the demanded literal. Its own request
