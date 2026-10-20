@@ -87,6 +87,11 @@ model revision or preprocessing contract and remains `model_contract_unknown`.
 Retired resolver identities retain historical state without executing it and
 do not contribute active dependencies.
 
+Prior-context render templates use the same inspection rules as source
+templates. Their named retained artifacts are inspected as single values,
+arrays, or `items` envelopes using the execution path's collection selection.
+Unsupported helpers remain uninspectable even when no prior artifact exists.
+
 Simple field paths, simple substitutions and static `media`, `remoteMedia`,
 `remoteText` and `remotePDF` URL arguments are analyzed without execution.
 Unsupported helper syntax, composed locators and custom loaders are reported as
@@ -131,6 +136,12 @@ origin under its connection and egress policy. Connection requirements bind
 the source connection/credential reference or object-storage scheme/bucket.
 Retrieval requirements separately bind archive/page semantics. Neither the CLI
 nor the library performs arbitrary-URL requests.
+
+PostgreSQL replication sources require connection evidence bound to the complete
+source configuration, including its DSN, source table, publication and slot.
+DSNs remain opaque, including libpq keyword strings and secret references;
+preflight neither resolves credentials nor probes PostgreSQL. The trusted
+caller must attest durable access and the privileges required for replication.
 
 Embedding requirements bind the canonical complete source definition, including
 model configuration, input/preprocessing/template, dimensions and vector-space

@@ -165,7 +165,7 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
                 var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
                 defer inspector.deinit();
                 try inspector.metadataJson(manifest.indexes_json);
-                try inspector.metadataJson(manifest.replication_sources_json);
+                try inspector.replicationSourcesJson(manifest.replication_sources_json);
                 for (manifest.shards) |shard| {
                     try options.cancellation.check();
                     const canonical_path = try backups_api.shardSnapshotRelPath(allocator, manifest.backup_id, shard.group_id);
@@ -2354,7 +2354,7 @@ test "backup preflight native multishard scans later shards and table producers"
         .description = "",
         .schema_json = "{}",
         .read_schema_json = "",
-        .replication_sources_json = "[]",
+        .replication_sources_json = "[{\"type\":\"postgres\",\"dsn\":\"${secret:replication.pg}\",\"postgres_table\":\"public.documents\"}]",
         .indexes_json = "{\"enrichments\":[{\"name\":\"pdf\",\"kind\":\"asset\",\"field\":\"media\",\"producer\":{\"type\":\"reader\"}}]}",
         .shards = &shards,
     };
@@ -2375,6 +2375,8 @@ test "backup preflight native multishard scans later shards and table producers"
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("documents").?.integer);
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("shards").?.integer);
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"connection\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "replication.pg") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"document_id\":\"z\"") != null);
 }
 

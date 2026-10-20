@@ -290,7 +290,8 @@ fn modelBackedProducer(producer: Value) bool {
     return str(get(config, "model")).len > 0 or eq(provider, "antfly") or eq(provider, "openai") or eq(provider, "vertex") or eq(provider, "apple");
 }
 
-const Selector = struct { field: []const u8, template: []const u8, artifact: []const u8, locator: bool, model_chunk: bool, dynamic: bool };
+const SourceInput = enum { text, locator, model_chunk, prior_context };
+const Selector = struct { field: []const u8, template: []const u8, artifact: []const u8, input: SourceInput, dynamic: bool };
 pub const Inspector = struct {
     allocator: Allocator,
     report: *Report,
@@ -331,7 +332,9 @@ pub const Inspector = struct {
                         const json = try staging.tableIndexesJsonFromPortableMetadata(self.allocator, e.value, null);
                         defer self.allocator.free(json);
                         try self.metadataJson(json);
-                    } else if (std.mem.endsWith(u8, e.key, ":enrichments") or std.mem.endsWith(u8, e.key, ":resolvers") or std.mem.endsWith(u8, e.key, ":replication_sources")) try self.metadataJson(e.value);
+                    } else if (std.mem.endsWith(u8, e.key, ":replication_sources")) {
+                        try self.replicationSourcesJson(e.value);
+                    } else if (std.mem.endsWith(u8, e.key, ":enrichments") or std.mem.endsWith(u8, e.key, ":resolvers")) try self.metadataJson(e.value);
                 }
             },
             .document_batch => {
@@ -403,6 +406,37 @@ pub const Inspector = struct {
         try self.config(parsed.value, 0, "");
     }
 
+    pub fn replicationSourcesJson(self: *@This(), bytes: []const u8) !void {
+        if (bytes.len > self.options.max_metadata_bytes) return error.PreflightLimitExceeded;
+        var parsed = try std.json.parseFromSlice(Value, self.allocator, bytes, .{});
+        defer parsed.deinit();
+        try self.replicationSources(parsed.value);
+    }
+
+    fn replicationSources(self: *@This(), value: Value) !void {
+        if (value != .array) return error.InvalidBackupRequest;
+        const parsed = try std.json.parseFromValue([]const @import("antfly_metadata_openapi").ReplicationSource, self.allocator, value, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        for (parsed.value, value.array.items) |source, raw| {
+            try self.options.cancellation.check();
+            // DSNs may be libpq keyword strings or secret references. Keep
+            // them opaque and require destination evidence for the complete
+            // source scope, including table, publication and slot privileges.
+            // Never resolve credentials or claim to have probed connectivity.
+            const identity = try canonical.canonicalJsonValueAlloc(self.allocator, raw);
+            defer self.allocator.free(identity);
+            const kind: Kind = if (eq(source.type, "postgres") and source.dsn.len > 0 and source.postgres_table.len > 0) .connection else .source_unresolved;
+            try self.report.add(self.options, kind, identity, "", "replication_source", 0);
+        }
+    }
+
+    fn priorContext(self: *@This(), value: Value) !void {
+        const parsed = try std.json.parseFromValue(@import("../db/group_sources.zig").PriorContext, self.allocator, value, .{});
+        defer parsed.deinit();
+        try parsed.value.validate();
+        try self.selector("prior_context.render", parsed.value.render, parsed.value.artifact, .prior_context, false);
+    }
+
     fn config(self: *@This(), value: Value, depth: usize, catalog_name: []const u8) anyerror!void {
         if (depth > 32) return error.PreflightLimitExceeded;
         if (value == .array) {
@@ -437,6 +471,14 @@ pub const Inspector = struct {
         // Only executable catalog positions enter this walker. Document values
         // are examined later solely through these source selectors.
         const kind = str(get(value, "kind"));
+        const prior_json = str(get(value, "prior_context_json"));
+        if (eq(kind, "asset")) {
+            if (prior_json.len > 0) {
+                var parsed = try std.json.parseFromSlice(Value, self.allocator, prior_json, .{});
+                defer parsed.deinit();
+                try self.priorContext(parsed.value);
+            } else if (get(value, "prior_context") != .null) try self.priorContext(get(value, "prior_context"));
+        }
         const typ = str(get(value, "type"));
         const producer_json = str(get(value, "producer_json"));
         var producer_parsed: ?std.json.Parsed(Value) = null;
@@ -472,7 +514,7 @@ pub const Inspector = struct {
         if (!known) try self.report.add(self.options, .dynamic_loader, "producer", "", field, 0);
         if (is_definition and (field.len > 0 or template.len > 0 or artifact.len > 0)) {
             const locator_mode = eq(producer_type, "reader") or eq(producer_type, "transcriber") or eq(producer_type, "document_extraction") or eq(str(get(value, "embedding_input")), "pdf_page_images") or eq(str(get(value, "input")), "pdf_page_images") or eq(str(get(value, "embedding_input")), "image") or eq(str(get(value, "embedding_input")), "audio") or eq(str(get(value, "embedding_input")), "video") or get(value, "transcriber") != .null;
-            try self.selector(field, template, artifact, locator_mode, model_chunk, !known or (field.len > 0 and !simplePath(field)));
+            try self.selector(field, template, artifact, if (model_chunk) .model_chunk else if (locator_mode) .locator else .text, !known or (field.len > 0 and !simplePath(field)));
         }
         if (is_embedding) {
             const name = if (str(get(value, "name")).len > 0) str(get(value, "name")) else catalog_name;
@@ -523,6 +565,8 @@ pub const Inspector = struct {
                     defer self.allocator.free(binding);
                     try self.report.add(self.options, .connection, binding, "", key, 0);
                 }
+            } else if (eq(key, "replication_sources") and v == .array) {
+                try self.replicationSources(v);
             } else if (eq(key, "loader") or eq(key, "custom_loader")) {
                 try self.report.add(self.options, .dynamic_loader, key, "", key, 0);
             } else if (eq(key, "config_json") or eq(key, "producer_json") or eq(key, "chunker_json")) {
@@ -566,9 +610,9 @@ pub const Inspector = struct {
         return false;
     }
 
-    fn selector(self: *@This(), field: []const u8, template: []const u8, artifact: []const u8, locator_mode: bool, model_chunk: bool, dynamic: bool) !void {
+    fn selector(self: *@This(), field: []const u8, template: []const u8, artifact: []const u8, input: SourceInput, dynamic: bool) !void {
         if (self.definitions.items.len >= self.options.max_definitions or field.len + template.len + artifact.len > self.options.max_metadata_bytes -| self.definition_bytes) return error.PreflightLimitExceeded;
-        for (self.definitions.items) |prior| if (eq(prior.field, field) and eq(prior.template, template) and eq(prior.artifact, artifact) and prior.locator == locator_mode and prior.model_chunk == model_chunk and prior.dynamic == dynamic) return;
+        for (self.definitions.items) |prior| if (eq(prior.field, field) and eq(prior.template, template) and eq(prior.artifact, artifact) and prior.input == input and prior.dynamic == dynamic) return;
         const a = self.allocator;
         const f = try a.dupe(u8, field);
         errdefer a.free(f);
@@ -576,11 +620,11 @@ pub const Inspector = struct {
         errdefer a.free(t);
         const ar = try a.dupe(u8, artifact);
         errdefer a.free(ar);
-        try self.definitions.append(a, .{ .field = f, .template = t, .artifact = ar, .locator = locator_mode, .model_chunk = model_chunk, .dynamic = dynamic });
+        try self.definitions.append(a, .{ .field = f, .template = t, .artifact = ar, .input = input, .dynamic = dynamic });
         self.definition_bytes += field.len + template.len + artifact.len;
         // Empty tables still carry a future-ingestion dependency.
         if (dynamic) try self.report.add(self.options, .dynamic_loader, "loader", "", field, 0);
-        if (template.len > 0) try self.templateSources(template, .null, "", field, locator_mode, true);
+        if (template.len > 0) try self.templateSources(template, .null, "", field, input == .locator, true);
     }
 
     pub fn document(self: *@This(), id: []const u8, bytes: []const u8, artifact: []const u8) !void {
@@ -590,7 +634,11 @@ pub const Inspector = struct {
             error.OutOfMemory => return err,
             else => {
                 if (artifact.len > 0) {
-                    for (self.definitions.items) |s| if (eq(s.artifact, artifact)) try self.consumeValue(.{ .string = bytes }, id, s.field, s.locator, 0);
+                    for (self.definitions.items) |s| if (eq(s.artifact, artifact)) {
+                        if (s.input == .prior_context) {
+                            try self.report.add(self.options, .source_unresolved, "prior_context_artifact", id, s.field, 0);
+                        } else try self.consumeValue(.{ .string = bytes }, id, s.field, s.input == .locator, 0);
+                    };
                     return;
                 }
                 return err;
@@ -604,17 +652,20 @@ pub const Inspector = struct {
                 continue;
             }
             if (s.template.len > 0) {
-                try self.templateSources(s.template, parsed.value, id, s.field, s.locator, false);
+                const root = if (s.input == .prior_context) @import("../db/group_prior_context.zig").artifactCollection(parsed.value) else parsed.value;
+                if (s.input == .prior_context and root == .array) {
+                    for (root.array.items) |item| try self.templateSources(s.template, item, id, s.field, false, false);
+                } else try self.templateSources(s.template, root, id, s.field, s.input == .locator, false);
             } else if (artifact.len > 0 and eq(s.field, "text")) {
                 // Reuse runtime chunk payload selection, including historical
                 // _source_field provenance, instead of guessing stored layouts.
                 if (try @import("../../chunking/chunk.zig").artifactTextAlloc(self.allocator, bytes, s.field)) |text| {
                     defer self.allocator.free(text);
-                    try self.consumeValue(.{ .string = text }, id, s.field, s.locator, 0);
+                    try self.consumeValue(.{ .string = text }, id, s.field, s.input == .locator, 0);
                 }
             } else {
                 const selected = if (s.field.len == 0) parsed.value else try self.selectedField(parsed.value, s.field, id);
-                if (s.model_chunk) try self.modelChunkSource(selected, id, s.field) else try self.consumeValue(selected, id, s.field, s.locator, 0);
+                if (s.input == .model_chunk) try self.modelChunkSource(selected, id, s.field) else try self.consumeValue(selected, id, s.field, s.input == .locator, 0);
             }
         }
     }
@@ -816,6 +867,120 @@ fn count(report: Report, kind: Kind) u64 {
         n += r.count;
     };
     return n;
+}
+
+test "backup preflight replication sources require exact destination connection evidence" {
+    const a = std.testing.allocator;
+    const bytes = "[{\"type\":\"postgres\",\"dsn\":\"postgresql://user:TOPSECRET@db.example/database\",\"postgres_table\":\"public.documents\",\"slot_name\":\"source_slot\"}]";
+    var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.replicationSourcesJson(bytes);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .connection));
+    const json = try report.jsonAlloc("{\"version\":1,\"configuration_id\":\"empty-destination\"}");
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"unknown\"") != null);
+    for ([_][]const u8{ "TOPSECRET", "db.example", "public.documents", "source_slot" }) |private| try std.testing.expect(std.mem.indexOf(u8, json, private) == null);
+    const original = report.requirements.items[0].sha256;
+    var caps = [_]Capability{.{ .requirement_sha256 = &original, .supported = false }};
+    const destination: Destination = .{ .version = 1, .configuration_id = "postgres-access", .requirements = &caps };
+    try std.testing.expectEqual(Verdict.blocked, evaluate(&report.requirements.items[0], destination).verdict);
+    caps[0].supported = true;
+    try std.testing.expectEqual(Verdict.compatible, evaluate(&report.requirements.items[0], destination).verdict);
+    const evidence = try std.json.Stringify.valueAlloc(a, destination, .{});
+    defer a.free(evidence);
+    const verified = try report.jsonAlloc(evidence);
+    defer a.free(verified);
+    try std.testing.expect(std.mem.indexOf(u8, verified, "\"compatibility\":{\"verdict\":\"compatible\"") != null);
+    // Preserve libpq keyword DSNs and unresolved secret references without
+    // opening a connection or resolving any credential. Scope changes require
+    // new evidence, even when the credential reference is identical.
+    try inspector.metadataJson(
+        \\{"replication_sources":[{"type":"postgres","dsn":"${secret:pg.dsn}","postgres_table":"public.other"},{"type":"postgres","dsn":"host=db.example dbname=app user=replicator","postgres_table":"public.documents"}]}
+    );
+    try std.testing.expectEqual(@as(u64, 3), count(report, .connection));
+    for (report.requirements.items[1..]) |*r| try std.testing.expectEqual(Verdict.unknown, evaluate(r, destination).verdict);
+    try inspector.replicationSourcesJson("[{\"type\":\"future-source\",\"dsn\":\"opaque\",\"postgres_table\":\"rows\"}]");
+    try std.testing.expect(!report.analysis_complete);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_unresolved));
+}
+
+test "backup preflight prior context static fetches cannot be certified by model evidence" {
+    const a = std.testing.allocator;
+    const producer = "{\"type\":\"generator\",\"config\":{\"generator\":{\"provider\":\"openai\",\"model\":\"gpt-4.1\",\"api_key\":\"fixture\"}}}";
+    const prior: @import("../db/group_sources.zig").PriorContext = .{ .artifact = "claims", .render = "{{remoteText url=\"http://localhost/private\"}}" };
+    try @import("../db/enrichment/config_validation.zig").validatePublicConfig(a, .{ .name = "claims", .kind = .asset, .source_artifact_name = "turns", .producer_json = producer, .prior_context = prior });
+    const prior_json = try std.json.Stringify.valueAlloc(a, prior, .{});
+    defer a.free(prior_json);
+    const metadata = try @import("../db/catalog/enrichment_catalog.zig").serializeCatalog(a, &.{.{ .name = "claims", .kind = .asset, .source_field = "", .source_artifact_name = "turns", .producer_json = producer, .prior_context_json = prior_json }});
+    defer a.free(metadata);
+    var report: Report = .{ .allocator = a, .scan_complete = true, .counts_complete = true };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(metadata);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .source_local));
+    const caps = try a.alloc(Capability, report.requirements.items.len);
+    defer a.free(caps);
+    for (report.requirements.items, caps) |*r, *cap| cap.* = .{ .requirement_sha256 = &r.sha256, .supported = true, .future_ingestion = true, .model_revision_verified = true };
+    const evidence = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "model-and-api-key", .requirements = caps }, .{});
+    defer a.free(evidence);
+    const json = try report.jsonAlloc(evidence);
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "localhost") == null);
+}
+
+test "backup preflight prior context selects runtime artifact items and rejects unknown helpers" {
+    const a = std.testing.allocator;
+    const public =
+        \\[{"kind":"asset","source_artifact_name":"turns","producer":{"type":"generator","config":{"provider":"apple"}},"prior_context":{"artifact":"claims","render":"{{remoteText url=source}}"}}]
+    ;
+    const frozen =
+        \\[{"name":"claims","kind":"asset","source_field":"","source_artifact_name":"turns","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"apple\"}}","prior_context_json":"{\"artifact\":\"claims\",\"render\":\"{{remoteText url=source}}\"}"}]
+    ;
+    for ([_][]const u8{ public, frozen }) |metadata| {
+        var report: Report = .{ .allocator = a };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.metadataJson(metadata);
+        // Only the named prior artifact is a source, never unrelated document
+        // values or artifact fields outside the runtime's selected items.
+        try inspector.document("unrelated", "{\"source\":\"file:///private/unrelated\"}", "other");
+        try std.testing.expectEqual(@as(u64, 0), count(report, .source_local));
+        for ([_][]const u8{
+            "{\"source\":\"file:///private/a\"}",
+            "[{\"source\":\"file:///private/b\"}]",
+            "{\"items\":[{\"source\":\"file:///private/c\"}],\"source\":\"file:///private/not-selected\"}",
+        }) |artifact| try inspector.document("previous-unit", artifact, "claims");
+        try std.testing.expectEqual(@as(u64, 3), count(report, .source_local));
+        try std.testing.expect(report.analysis_complete);
+        try inspector.document("invalid", "invalid-json", "claims");
+        try std.testing.expect(!report.analysis_complete);
+    }
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{ .max_definitions = 1 } };
+    defer inspector.deinit();
+    try inspector.metadataJson("{\"kind\":\"asset\",\"prior_context\":{\"artifact\":\"claims\",\"render\":\"{{customLoader source}}\"}}");
+    try std.testing.expect(!report.analysis_complete);
+    try std.testing.expectEqual(@as(u64, 1), count(report, .dynamic_loader));
+    try std.testing.expectError(error.PreflightLimitExceeded, inspector.metadataJson(public));
+}
+
+test "backup preflight context property names remain valid index catalog names" {
+    const a = std.testing.allocator;
+    var report: Report = .{ .allocator = a };
+    defer report.deinit();
+    var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+    defer inspector.deinit();
+    try inspector.metadataJson(
+        \\{"prior_context":{"type":"embeddings","dimension":3,"embedder":{"model":"exact-model"}},"replication_sources":{"type":"embeddings","dimension":3,"embedder":{"model":"exact-model"}}}
+    );
+    try std.testing.expectEqual(@as(u64, 2), count(report, .model));
+    try std.testing.expect(report.analysis_complete);
 }
 
 test "backup preflight resolver frozen policies and referenced embeddings require evidence" {
