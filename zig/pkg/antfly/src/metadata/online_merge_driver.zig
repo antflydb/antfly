@@ -329,7 +329,7 @@ fn Adapter(comptime Service: type) type {
             const alloc = owned.arena.allocator();
             var proposed = batch;
             if (proposed.merge_checkpoint) |*checkpoint_value| if (checkpoint_value.page_source) |source_identity| if (source_identity.artifact_catalog) |binding| {
-                if (binding.effect_protocol == 15 and checkpoint_value.page_source_catalogs == null) {
+                if (binding.effect_protocol >= 15 and checkpoint_value.page_source_catalogs == null) {
                     const catalogs = try self.fetch(@import("antfly_local_sources").storage_db_artifact_inventory.Catalogs, owned, state, .source_catalog);
                     if (!std.mem.eql(u8, &catalogs.digest(), &binding.digest)) return error.OnlineMergeArtifactCatalogChanged;
                     checkpoint_value.page_source_catalogs = catalogs;
@@ -414,7 +414,7 @@ fn Adapter(comptime Service: type) type {
         fn prepared(self: *Self, owned: Owned, state: online.State, operation_kind: @FieldType(io_contract.Request, "operation")) !void {
             var prepared_operation = operation_kind;
             if (prepared_operation == .checkpoint) if (prepared_operation.checkpoint.page_source) |source_identity| if (source_identity.artifact_catalog) |binding| {
-                if (binding.effect_protocol == 15) {
+                if (binding.effect_protocol >= 15) {
                     const catalogs = try self.fetch(@import("antfly_local_sources").storage_db_artifact_inventory.Catalogs, owned, state, .source_catalog);
                     if (!std.mem.eql(u8, &catalogs.digest(), &binding.digest)) return error.OnlineMergeArtifactCatalogChanged;
                     prepared_operation.checkpoint.page_source_catalogs = catalogs;

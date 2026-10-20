@@ -1214,11 +1214,15 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     while (scan_entry) |kv| : (scan_entry = try nextPortableDataEntry(&cursor, try cursor.next(), out.stats)) {
         try out.cancellation.check();
         if (isPortableMetadataKey(kv.key)) continue;
-        if (source_copy != null and @import("db/online_graph_artifacts.zig").isKey(kv.key)) {
+        if (source_copy != null and (@import("db/online_graph_artifacts.zig").isKey(kv.key) or @import("db/group_source_transfer.zig").isKey(kv.key))) {
             const owner = (try internal_keys.decodeDocumentComponentAlloc(alloc, kv.key)) orelse return error.InvalidGraphTransfer;
             defer alloc.free(owner);
             if (source_range) |range| if (!range.contains(owner)) continue;
-            try @import("db/online_graph_artifacts.zig").validate(kv.key, kv.value);
+            if (@import("db/group_source_transfer.zig").isKey(kv.key)) {
+                var group_arena = std.heap.ArenaAllocator.init(alloc);
+                defer group_arena.deinit();
+                try @import("db/group_source_transfer.zig").validate(group_arena.allocator(), kv.key, kv.value);
+            } else try @import("db/online_graph_artifacts.zig").validate(kv.key, kv.value);
             const source_batch = @import("db/source_artifact_batch.zig");
             if (kv.key.len > source_batch.max_key_bytes or kv.value.len +| kv.key.len +| 12 > source_batch.max_bytes)
                 return error.ResourceLimitExceeded;
@@ -1753,7 +1757,7 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
     // Destination facts must be rebuilt from imported physical records, never
     // copied from a source's potentially partial maintenance certificate.
     if (@import("artifact_footprint.zig").isKey(key)) return false;
-    return std.mem.eql(u8, key, cohort_proof_key) or std.mem.eql(u8, key, source_copy_proof_key) or
+    return @import("db/group_source_index.zig").isRevisionClockKey(key) or (key.len == 20 and std.mem.startsWith(u8, key, @import("db/group_source_state.zig").lease_clock_prefix)) or std.mem.eql(u8, key, @import("db/group_source_mutations.zig").table_identity_key) or std.mem.eql(u8, key, cohort_proof_key) or std.mem.eql(u8, key, source_copy_proof_key) or
         std.mem.startsWith(u8, key, source_generation_admission_prefix) or
         std.mem.eql(u8, key, source_integrity_key) or std.mem.eql(u8, key, source_integrity_catalog_key) or std.mem.eql(u8, key, source_integrity_activation_key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:schema") or
@@ -1767,7 +1771,9 @@ pub fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
         std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers") or
         std.mem.eql(u8, key, resolver_catalog.minimum_reader_key) or
-        std.mem.eql(u8, key, resolver_catalog.merge_catalog_key);
+        std.mem.eql(u8, key, resolver_catalog.merge_catalog_key) or
+        std.mem.eql(u8, key, @import("db/promotion_runtime.zig").source_identity_key) or
+        std.mem.startsWith(u8, key, @import("db/resolver_curation.zig").drop_marker_prefix);
 }
 
 /// True only for durable keys that a validated portable import may create.
@@ -4575,7 +4581,14 @@ fn validateMetadataEntries(
 ) !void {
     for (entries) |entry| {
         if (!isPortableMetadataKey(entry.key)) return error.InvalidMetadataBatch;
-        if (std.mem.eql(u8, entry.key, source_copy_proof_key)) {
+        if (@import("db/group_source_index.zig").isRevisionClockKey(entry.key)) {
+            @import("db/group_source_index.zig").validateRevisionClock(entry.key, entry.value) catch return error.InvalidMetadataBatch;
+        } else if (entry.key.len == 20 and std.mem.startsWith(u8, entry.key, @import("db/group_source_state.zig").lease_clock_prefix)) {
+            if (entry.value.len < 37 or entry.value.len > 64 or !std.mem.eql(u8, entry.value[0..4], "GSC1") or !std.mem.eql(u8, entry.value[entry.value.len - 32 ..], &@import("db/group_source_queue.zig").checksum(entry.key, entry.value[4 .. entry.value.len - 32]))) return error.InvalidMetadataBatch;
+            _ = std.fmt.parseInt(u64, entry.value[4 .. entry.value.len - 32], 10) catch return error.InvalidMetadataBatch;
+        } else if (std.mem.eql(u8, entry.key, @import("db/group_source_mutations.zig").table_identity_key)) {
+            if (entry.value.len != 48 or std.mem.readInt(u128, entry.value[0..16], .big) == 0 or !std.mem.eql(u8, entry.value[16..], &@import("db/group_sources.zig").digest(entry.value[0..16]))) return error.InvalidMetadataBatch;
+        } else if (std.mem.eql(u8, entry.key, source_copy_proof_key)) {
             const expected = archive.source_copy orelse return error.SourceCopyRestoreUnsupported;
             if (archive.saw_source_copy or !std.mem.eql(u8, entry.value, &try expected.encode())) return error.BackupIntegrityFailure;
             archive.saw_source_copy = true;

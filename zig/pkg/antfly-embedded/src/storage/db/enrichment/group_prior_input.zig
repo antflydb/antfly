@@ -1,0 +1,116 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Prior context is a bounded causal dependency. The target unit's epoch is
+//! advanced only by original source events inside the configured horizon.
+//! Inheriting prior producers' transitive proofs would defeat that bound and
+//! eventually make every new segment depend on the entire conversation.
+const std = @import("std");
+const groups = @import("../group_sources.zig");
+const state = @import("../group_source_state.zig");
+const identity = @import("../group_source_identity.zig");
+const prior = @import("../group_prior_context.zig");
+const context = @import("../artifact_producer_context.zig");
+const keys = @import("../../internal_keys.zig");
+const requests = @import("enrichment_types.zig");
+const Store = @import("../../docstore.zig").DocStore;
+const A = std.mem.Allocator;
+pub const Input = struct {
+    arena: std.heap.ArenaAllocator,
+    text: []const u8,
+    fingerprint: groups.Digest,
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+pub fn capture(a: A, store: *Store, request: requests.GeneratedEnrichmentRequest, raw: []const u8, token: ?*context.Token, renderer: prior.Renderer) !Input {
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    const config = try std.json.parseFromSliceLeaky(groups.PriorContext, owned, request.prior_context_json, .{});
+    try config.validate();
+    const source = try std.json.parseFromSliceLeaky(std.json.Value, owned, raw, .{});
+    if (source != .object) return error.GroupedSourceCorrupt;
+    const group_key = (source.object.get("_group_identity") orelse source.object.get("_group_key")) orelse return error.GroupedSourceCorrupt;
+    const segment = (source.object.get("_segment_identity") orelse source.object.get("_segment_key")) orelse return error.GroupedSourceCorrupt;
+    const ordinal = source.object.get("_ordinal_start") orelse return error.GroupedSourceCorrupt;
+    if (group_key != .string or segment != .string or ordinal != .integer) return error.GroupedSourceCorrupt;
+    const table = identity.tableOf(request.doc_key) orelse return error.GroupedSourceCorrupt;
+    const group = state.Group{ .definition = .{ .table_incarnation = table, .configuration = request.group_configuration }, .key = group_key.string };
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    if (try state.nextPending(owned, &read, group)) |pending| {
+        if (!std.mem.eql(u8, pending.partition.segment, segment.string) and prior.Position.before(.{ .ordinal = pending.ordinal, .segment = pending.partition.segment }, .{ .ordinal = ordinal.integer, .segment = segment.string })) return error.ArtifactPublicationPending;
+    }
+    const epoch_key = try identity.unitHorizonEpochKey(owned, request.doc_key, config.horizon_segments);
+    const epoch = read.getLeased(epoch_key) catch |err| if (err == error.NotFound) null else return err;
+    if (token) |value| try value.observe(epoch_key, epoch, try @import("../artifact_publication.zig").artifactRevision(&read, value.namespace, epoch_key));
+    const prefix = try state.directoryPrefix(owned, group);
+    // Include every tie at the current ordinal; select() applies segment-key
+    // tie breaking after the bounded snapshot read.
+    const upper = try state.directoryOrdinalBound(owned, group, ordinal.integer, true);
+    var cursor = try read.openPhysicalCursorAdapter();
+    defer cursor.close();
+    var row = try cursor.seekAtOrBefore(upper);
+    var candidates: std.ArrayList(prior.Item) = .empty;
+    var segments: std.AutoHashMapUnmanaged(groups.Digest, void) = .empty;
+    var visits: usize = 0;
+    var decoded_bytes: usize = 0;
+    const current = prior.Position{ .ordinal = ordinal.integer, .segment = segment.string };
+    while (row) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+        if (visits == 1024) return error.GroupedPriorContextLimitExceeded;
+        visits += 1;
+        const directory = try state.directoryEntry(owned, &read, group, entry.key);
+        const position = prior.Position{ .ordinal = directory.snapshot.ordinal, .segment = directory.partition.segment };
+        if (prior.Position.before(position, current) and !std.mem.eql(u8, position.segment, current.segment)) {
+            const segment_hash = groups.digest(position.segment);
+            if (!segments.contains(segment_hash)) {
+                if (segments.count() == config.horizon_segments) break;
+                try segments.put(owned, segment_hash, {});
+            }
+            var unit_index = directory.snapshot.units.len;
+            while (unit_index > 0) {
+                unit_index -= 1;
+                const unit = directory.snapshot.units[unit_index];
+                const selected = try keys.artifactNamedPrefixAlloc(owned, unit, "asset", config.artifact);
+                const artifact = read.getLeased(selected) catch |err| if (err == error.NotFound) {
+                    continue;
+                } else return err;
+                decoded_bytes += artifact.len;
+                if (decoded_bytes > 4 * 1024 * 1024) return error.GroupedPriorContextLimitExceeded;
+                // Check current acceptance in this snapshot, but keep the
+                // bounded epoch as the persistent causal guard (see above).
+                if (token != null) {
+                    var proof = (try @import("../artifact_producer_provenance.zig").readCurrentForArtifact(owned, &read, selected, artifact)) orelse return error.ArtifactPublicationPending;
+                    proof.deinit();
+                }
+                const value = try std.json.parseFromSliceLeaky(std.json.Value, owned, artifact, .{});
+                const collection = if (value == .object) value.object.get("items") orelse value else value;
+                const items: []const std.json.Value = if (collection == .array) collection.array.items else (&collection)[0..1];
+                var item_index = items.len;
+                var taken: usize = 0;
+                while (item_index > 0 and taken < config.max_items and candidates.items.len < @as(usize, config.max_items) * config.horizon_segments) : (taken += 1) {
+                    item_index -= 1;
+                    try candidates.append(owned, .{ .group = group.key, .position = position, .unit = groups.digest(unit), .unit_ordinal = @intCast(unit_index), .ordinal = @intCast(item_index), .fingerprint = groups.digest(artifact), .value = items[item_index] });
+                }
+            }
+        }
+        row = try cursor.prev();
+    }
+    const selected = try prior.select(owned, config, group.key, current, candidates.items, renderer);
+    return .{ .arena = arena, .text = selected.text, .fingerprint = selected.fingerprint };
+}

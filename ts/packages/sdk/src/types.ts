@@ -735,3 +735,46 @@ export function readAfterWrite(receipt: ReadReceipt, waitMs = 5000): ReadRequire
     wait_ms: waitMs,
   };
 }
+
+export type EntityCurationResult = components["schemas"]["EntityCurationResult"];
+
+export type EntityMergeRequest = components["schemas"]["EntityMergeRequest"];
+
+export type GraphResolverSuppressionConfig =
+  components["schemas"]["GraphResolverSuppressionConfig"];
+
+export type ResolverCurationState = components["schemas"]["ResolverCurationState"];
+
+export type ResolverList = components["schemas"]["ResolverList"];
+
+export type ResolverMergeRequest = components["schemas"]["ResolverMergeRequest"];
+
+export type ResolverMutationResult = components["schemas"]["ResolverMutationResult"];
+
+export type ResolverNamespaceRequest = components["schemas"]["ResolverNamespaceRequest"];
+
+export type ResolverRedirectList = components["schemas"]["ResolverRedirectList"];
+
+export type ResolverRenderRequest = components["schemas"]["ResolverRenderRequest"];
+
+export type ResolverRenderResponse = components["schemas"]["ResolverRenderResponse"];
+
+export type ResolverResolveRequest = components["schemas"]["ResolverResolveRequest"];
+
+export type ResolverResolveResponse = components["schemas"]["ResolverResolveResponse"];
+
+export type ResolverResolvedEntity = components["schemas"]["ResolverResolvedEntity"];
+
+export type ResolverReviewDecision = components["schemas"]["ResolverReviewDecision"];
+
+export type ResolverReviewPage = components["schemas"]["ResolverReviewPage"];
+
+export type ResolverSummary = components["schemas"]["ResolverSummary"];
+
+export type ResolverSuppressionList = components["schemas"]["ResolverSuppressionList"];
+
+export type ResolverSuppressionRequest = components["schemas"]["ResolverSuppressionRequest"];
+
+export type ResolverUnmergeRequest = components["schemas"]["ResolverUnmergeRequest"];
+
+export type ResolverWait = components["schemas"]["ResolverWait"];

@@ -339,7 +339,9 @@ pub fn parseSpeculationCalibration(raw: []const u8) ?SpeculationCalibration {
     return null;
 }
 
+pub const token_logprobs = @import("token_logprobs.zig");
 pub const GenerationConfig = struct {
+    token_observer: ?token_logprobs.Observer = null,
     max_tokens: i32 = 256,
     temperature: f32 = 0,
     top_p: f32 = 0,
@@ -784,6 +786,7 @@ fn emitCompletedProjectionDelta(
 }
 
 const StreamingTextState = struct {
+    token_table: ?*const grammar_mod.TokenByteTable = null,
     emitted_text: []u8,
     canonical: ?Gemma4Projection = null,
     /// Set from the model contract, independently of tokenizer resolution.
@@ -1191,7 +1194,7 @@ fn emitDecodedDeltaForTokenizer(
     defer allocator.free(decoded_ids);
     for (projected_ids, 0..) |token_id, idx| decoded_ids[idx] = @intCast(token_id);
 
-    const decoded_text = try tokenizer.decode(allocator, decoded_ids);
+    const decoded_text = if (state.token_table) |table| try table.decodeTokens(allocator, decoded_ids) else try tokenizer.decode(allocator, decoded_ids);
     defer allocator.free(decoded_text);
 
     const prefix_len = std.mem.indexOfDiff(u8, state.emitted_text, decoded_text) orelse @min(state.emitted_text.len, decoded_text.len);
@@ -3496,6 +3499,31 @@ pub const NativeGenerationPipeline = struct {
         if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        const vocab_size = self.gpt_config.vocab_size;
+        // Admit the grammar and finite vocabulary before prompt encoding, KV
+        // allocation, or prefill. Unsupported values consume no model run.
+        var json_grammar: ?grammar_mod.JsonGrammar = null;
+        var gbnf_grammar: ?grammar_mod.GbnfGrammar = null;
+        if (config.grammar) |g| {
+            if (std.mem.eql(u8, g, "json")) {
+                json_grammar = grammar_mod.JsonGrammar.init();
+            } else {
+                gbnf_grammar = grammar_mod.GbnfGrammar.parse(allocator, g) catch null;
+            }
+        }
+        defer if (gbnf_grammar) |*gg| gg.deinit();
+
+        const has_any_grammar = json_grammar != null or gbnf_grammar != null;
+        var token_table: ?grammar_mod.TokenByteTable = if (has_any_grammar)
+            try grammar_mod.TokenByteTable.init(allocator, self.tokenizer, vocab_size)
+        else
+            null;
+        defer if (token_table) |*tt| tt.deinit(allocator);
+        if (config.token_observer != null) {
+            if (!has_any_grammar or token_table == null) return error.TokenEvidenceRequiresGrammar;
+            if (gbnf_grammar) |*gg| try gg.admitTokenEvidence(if (token_table) |*tt| tt else return error.TokenEvidenceRequiresGrammar);
+        }
+
         // Coordinated requests report occupancy under the step mutex instead.
         const ocr_profile_start = if (self.cb.kind() == .metal and self.execution_lock == null and
             platform.env.getenvBoolDefault("ANTFLY_GEMMA4_OCR_PROFILE", false)) self.cb.debugTimingSnapshot().provider else null;
@@ -4157,7 +4185,6 @@ pub const NativeGenerationPipeline = struct {
             try decode_runtime.compactKvCache(.{ .target_ratio = ratio });
         }
 
-        const vocab_size = self.gpt_config.vocab_size;
         var finish_reason: []const u8 = "length";
         var tokens_generated: usize = 0;
         var speculative_stats = SpeculativeDecodeStats{};
@@ -4221,6 +4248,7 @@ pub const NativeGenerationPipeline = struct {
             null;
         defer if (owned_thought_header) |ids| allocator.free(ids);
         var streaming_text = StreamingTextState{
+            .token_table = if (token_table) |*table| table else null,
             .emitted_text = if (stream_enabled) try allocator.dupe(u8, "") else &.{},
             .canonical = if (owned_thought_header) |header|
                 if (header.len > 1 and header[0] == channel_start.?)
@@ -4242,25 +4270,6 @@ pub const NativeGenerationPipeline = struct {
         var penalty_state = SamplingPenaltyState.init(hasSamplingPenalties(config));
         defer penalty_state.deinit(allocator);
         try penalty_state.seedFromHistory(allocator, token_ids[0..seq_len]);
-
-        // Grammar-constrained decoding: initialize JSON FSM or GBNF grammar.
-        var json_grammar: ?grammar_mod.JsonGrammar = null;
-        var gbnf_grammar: ?grammar_mod.GbnfGrammar = null;
-        if (config.grammar) |g| {
-            if (std.mem.eql(u8, g, "json")) {
-                json_grammar = grammar_mod.JsonGrammar.init();
-            } else {
-                gbnf_grammar = grammar_mod.GbnfGrammar.parse(allocator, g) catch null;
-            }
-        }
-        defer if (gbnf_grammar) |*gg| gg.deinit();
-
-        const has_any_grammar = json_grammar != null or gbnf_grammar != null;
-        var token_table: ?grammar_mod.TokenByteTable = if (has_any_grammar)
-            grammar_mod.TokenByteTable.init(allocator, self.tokenizer, vocab_size) catch null
-        else
-            null;
-        defer if (token_table) |*tt| tt.deinit(allocator);
 
         // Pending token readback consumes the prefill result itself, keeps the
         // token resident, and launches the next decode graph before waiting
@@ -4927,7 +4936,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        const text = try self.tokenizer.decode(allocator, text_gen_ids);
+        const text = if (token_table) |*table| try table.decodeTokens(allocator, text_gen_ids) else try self.tokenizer.decode(allocator, text_gen_ids);
         errdefer allocator.free(text);
         const reasoning_text = if (reasoning_gen_token_ids.len > 0) blk: {
             const reasoning_ids = try allocator.alloc(i32, reasoning_gen_token_ids.len);
@@ -9908,6 +9917,7 @@ pub const NativeGenerationPipeline = struct {
         gbnf_grammar: ?*grammar_mod.GbnfGrammar,
     ) !SampleOutcome {
         const has_grammar = json_grammar.* != null or gbnf_grammar != null;
+        if (config.token_observer != null and !has_grammar) return error.TokenEvidenceRequiresGrammar;
         const suppress_token_ids = self.gpt_config.suppressTokenIds();
         const needs_mutable_logits = has_grammar or suppress_token_ids.len > 0;
         const working_logits = if (needs_mutable_logits)
@@ -9922,8 +9932,16 @@ pub const NativeGenerationPipeline = struct {
         applySuppressTokenMask(working_logits, suppress_token_ids);
 
         const next_token = sample(working_logits, config, penalty_state, self.allocator);
+        if (config.token_observer) |observer| {
+            // Evidence is the finite grammar-constrained model distribution,
+            // before temperature/top-k sampling (including at temperature 0).
+            // The sampler applies penalties on its own copy; mirror those
+            // adjustments for the observed decoder scores after sampling.
+            if (hasSamplingPenalties(config) and !penalty_state.isEmpty()) applyRepetitionPenalties(working_logits, penalty_state, config);
+            try observer.record(observer.ptr, token_table orelse return error.TokenEvidenceRequiresGrammar, working_logits, @intCast(next_token));
+        }
         const grammar_complete = if (has_grammar)
-            try self.advanceGrammarWithToken(next_token, json_grammar, gbnf_grammar)
+            try self.advanceGrammarWithToken(next_token, token_table, json_grammar, gbnf_grammar)
         else
             false;
 
@@ -10097,12 +10115,12 @@ pub const NativeGenerationPipeline = struct {
     fn advanceGrammarWithToken(
         self: *NativeGenerationPipeline,
         token_id: usize,
+        token_table: ?*const grammar_mod.TokenByteTable,
         json_grammar: *?grammar_mod.JsonGrammar,
         gbnf_grammar: ?*grammar_mod.GbnfGrammar,
     ) !bool {
-        const token_id_arr = [1]i32{@intCast(token_id)};
-        const token_bytes = self.tokenizer.decode(self.allocator, &token_id_arr) catch return false;
-        defer self.allocator.free(token_bytes);
+        const token_bytes = if (token_table) |table| table.getTokenBytes(token_id) else try self.tokenizer.tokenBytes(self.allocator, @intCast(token_id));
+        defer if (token_table == null) self.allocator.free(token_bytes);
 
         if (json_grammar.* != null) json_grammar.*.?.advance(token_bytes);
         if (gbnf_grammar) |gg| gg.advance(token_bytes);
@@ -15759,4 +15777,33 @@ test "Gemma4 MTP activation replacement invalidates cached target pairing" {
     try std.testing.expectEqual(@as(?u32, null), state.cached_target_choice);
     try std.testing.expect(!state.cached_choice_matches_activation);
     try std.testing.expect(!state.residentReady());
+}
+
+test "raw token bytes keep grammar streaming aligned with the constrained output" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        fn decode(_: *anyopaque, alloc: std.mem.Allocator, _: []const i32) anyerror![]u8 {
+            return alloc.dupe(u8, "x1"); // A sequence decoder may clean token boundaries.
+        }
+        fn emit(ptr: *anyopaque, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.bytes.appendSlice(std.testing.allocator, bytes) catch return false;
+            return true;
+        }
+    };
+    const offsets = [_]u32{ 0, 1 };
+    const lengths = [_]u16{ 1, 2 };
+    const table = grammar_mod.TokenByteTable{ .byte_data = @constCast("x 1"), .token_offsets = @constCast(&offsets), .token_lengths = @constCast(&lengths) };
+    var vtable: tokenizer_mod.Tokenizer.VTable = undefined;
+    vtable.decode = Fixture.decode;
+    var fixture = Fixture{};
+    defer fixture.bytes.deinit(a);
+    const tokenizer = tokenizer_mod.Tokenizer{ .ptr = &fixture, .vtable = &vtable };
+    var state = StreamingTextState{ .emitted_text = try a.dupe(u8, ""), .token_table = &table };
+    defer a.free(state.emitted_text);
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(tokenizer, a, &.{0}, &state, Fixture.emit, &fixture));
+    try std.testing.expect(try emitDecodedDeltaForTokenizer(tokenizer, a, &.{ 0, 1 }, &state, Fixture.emit, &fixture));
+    try std.testing.expectEqualStrings("x 1", fixture.bytes.items);
+    try std.testing.expectEqualStrings("x 1", state.emitted_text);
 }

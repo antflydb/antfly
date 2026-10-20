@@ -1069,7 +1069,8 @@ fn metadataDataBearingStoreRouterGroupNodeIds(ptr: *anyopaque, alloc: std.mem.Al
     return out;
 }
 
-fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.Allocator, group_ids: []const u64, policy: api_table_router.RoutePolicy, _: api_table_router.RouteBudget) !?[]api_table_router.GroupRoute {
+fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.Allocator, group_ids: []const u64, policy: api_table_router.RoutePolicy, budget: api_table_router.RouteBudget) !?[]api_table_router.GroupRoute {
+    try budget.check();
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     // Metadata nodes never own data replicas, so both policies use the same
     // remote ordering: the comparator prefers a leader and otherwise returns
@@ -1077,6 +1078,7 @@ fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.All
     _ = policy;
     var snapshot = try loadMetadataRoutingSnapshot(svc, svc.alloc);
     defer snapshot.deinit(svc, svc.alloc);
+    try budget.check();
     const local_node_id = svc.raft.host.http_host.host.cfg.local_node_id;
 
     const GroupNodeKey = struct { group_id: u64, node_id: u64 };
@@ -1090,14 +1092,18 @@ fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.All
     var requested_groups = std.AutoHashMapUnmanaged(u64, void).empty;
     defer requested_groups.deinit(alloc);
     try requested_groups.ensureTotalCapacity(alloc, @intCast(group_ids.len));
-    for (group_ids) |group_id| requested_groups.putAssumeCapacity(group_id, {});
+    for (group_ids, 0..) |group_id, i| {
+        if (i % 64 == 0) try budget.check();
+        requested_groups.putAssumeCapacity(group_id, {});
+    }
 
     // Build readability once. In particular, a draining source remains
     // readable only until another serving replica exists for that group.
     var serving_by_group = std.AutoHashMapUnmanaged(u64, ServingSummary).empty;
     defer serving_by_group.deinit(alloc);
     try serving_by_group.ensureTotalCapacity(alloc, @intCast(group_ids.len));
-    for (snapshot.placements) |intent| {
+    for (snapshot.placements, 0..) |intent, i| {
+        if (i % 64 == 0) try budget.check();
         if (intent.serving_state != .serving or !requested_groups.contains(intent.record.group_id)) continue;
         const entry = serving_by_group.getOrPutAssumeCapacity(intent.record.group_id);
         if (!entry.found_existing) {
@@ -1110,7 +1116,8 @@ fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.All
     var readable_replicas = std.AutoHashMapUnmanaged(GroupNodeKey, void).empty;
     defer readable_replicas.deinit(alloc);
     try readable_replicas.ensureTotalCapacity(alloc, @intCast(snapshot.placements.len));
-    for (snapshot.placements) |intent| {
+    for (snapshot.placements, 0..) |intent, i| {
+        if (i % 64 == 0) try budget.check();
         if (!requested_groups.contains(intent.record.group_id)) continue;
         const readable = switch (intent.serving_state) {
             .serving => true,
@@ -1132,11 +1139,13 @@ fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.All
     var candidates = std.AutoHashMapUnmanaged(GroupNodeKey, CandidateState).empty;
     defer candidates.deinit(alloc);
     try candidates.ensureTotalCapacity(alloc, @intCast(snapshot.placements.len));
-    for (snapshot.stores) |store| {
+    for (snapshot.stores, 0..) |store, i| {
+        if (i % 64 == 0) try budget.check();
         if ((svc.local_data_owner and store.node_id == local_node_id) or store.api_url.len == 0 or
             !store.live or !std.mem.eql(u8, store.health_class, "healthy")) continue;
 
-        for (store.group_statuses) |status| {
+        for (store.group_statuses, 0..) |status, j| {
+            if (j % 64 == 0) try budget.check();
             const key = GroupNodeKey{ .group_id = status.group_id, .node_id = store.node_id };
             if (!requested_groups.contains(status.group_id) or !readable_replicas.contains(key)) continue;
             const entry = candidates.getOrPutAssumeCapacity(key);
@@ -1151,7 +1160,8 @@ fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.All
             state.candidate.disk_bytes = @max(state.candidate.disk_bytes, status.disk_bytes);
             state.candidate.updated_at_millis = @max(state.candidate.updated_at_millis, status.updated_at_millis);
         }
-        for (store.runtime_statuses) |status| {
+        for (store.runtime_statuses, 0..) |status, j| {
+            if (j % 64 == 0) try budget.check();
             const key = GroupNodeKey{ .group_id = status.group_id, .node_id = store.node_id };
             if (!requested_groups.contains(status.group_id) or !readable_replicas.contains(key)) continue;
             const entry = candidates.getOrPutAssumeCapacity(key);
@@ -1174,7 +1184,10 @@ fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.All
     defer best_by_group.deinit(alloc);
     try best_by_group.ensureTotalCapacity(alloc, @intCast(group_ids.len));
     var candidate_iterator = candidates.iterator();
+    var candidate_visits: usize = 0;
     while (candidate_iterator.next()) |entry| {
+        if (candidate_visits % 64 == 0) try budget.check();
+        candidate_visits += 1;
         const candidate = entry.value_ptr.*;
         if (!candidate.has_data and !candidate.candidate.local_leader) continue;
         const best = best_by_group.getOrPutAssumeCapacity(entry.key_ptr.group_id);
@@ -1189,6 +1202,7 @@ fn metadataDataBearingStoreRouterGroupRoutes(ptr: *anyopaque, alloc: std.mem.All
         alloc.free(routes);
     }
     for (group_ids, 0..) |group_id, index| {
+        if (index % 64 == 0) try budget.check();
         const best = best_by_group.get(group_id) orelse {
             for (routes[0..initialized]) |*route| route.deinit(alloc);
             alloc.free(routes);
