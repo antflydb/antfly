@@ -106,6 +106,7 @@ pub const ExternalIoConnection = types.ExternalIoConnection;
 pub const ExternalIoProtocol = types.ExternalIoProtocol;
 pub const FailedOperation = types.FailedOperation;
 pub const FieldCapability = types.FieldCapability;
+pub const FieldRepresentation = types.FieldRepresentation;
 pub const FieldStatistics = types.FieldStatistics;
 pub const ForeignColumn = types.ForeignColumn;
 pub const ForeignSource = types.ForeignSource;

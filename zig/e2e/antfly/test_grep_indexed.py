@@ -683,9 +683,21 @@ def test_logical_keyword_and_autocomplete_use_source_fields(stateful_api):
             assert result["profile"]["value_search"]["documents"] == 0
             assert result["profile"]["value_search"]["bytes"] == 0
     capabilities = stateful_api.get(f"/tables/{table}")["field_capabilities"]
-    title = [cap for cap in capabilities if cap.get("logical_field") == "title"]
-    assert any("autocomplete" in cap.get("value_operations", []) for cap in title)
-    assert any("equals" in cap.get("value_operations", []) for cap in title)
+    title = [cap for cap in capabilities if cap.get("field") == "title"]
+    assert len(title) == 1, capabilities
+    assert title[0]["kind"] == "source"
+    assert {"autocomplete", "equals"} <= set(title[0]["value_operations"])
+    assert {"text", "keyword", "search_as_you_type"} <= {
+        rep["type"] for rep in title[0]["representations"]
+    }
+    assert all(
+        "logical_field" not in cap and "emitted_name" not in cap for cap in capabilities
+    )
+    identity = next(cap for cap in capabilities if cap.get("field") == "_id")
+    assert identity["kind"] == "reserved" and identity["value_operations"] == []
+    score = next(cap for cap in capabilities if cap.get("field") == "_score")
+    assert score["kind"] == "computed" and score["sort_requires_scoring"] is True
+    assert score["value_operations"] == [] and score["representations"] == []
 
 
 def test_logical_sort_uses_keyword_companion_at_public_boundary(stateful_api):
@@ -736,6 +748,13 @@ def test_logical_sort_uses_keyword_companion_at_public_boundary(stateful_api):
         "b",
         "a",
     ]
+    capabilities = stateful_api.get(f"/tables/{table}")["field_capabilities"]
+    title = next(cap for cap in capabilities if cap.get("field") == "title")
+    assert title["sortable"] is True, title
+    assert any(
+        rep.get("field") == "title.keyword" and rep["sortable"]
+        for rep in title["representations"]
+    ), title
 
 
 def test_logical_named_autocomplete_keeps_declared_source_associations(stateful_api):
@@ -802,11 +821,11 @@ def test_logical_named_autocomplete_keeps_declared_source_associations(stateful_
         ] == expected
     capabilities = stateful_api.get(f"/tables/{table}")["field_capabilities"]
     assert any(
-        cap.get("logical_field") == "title"
+        cap.get("field") == "title"
         and "autocomplete" in cap.get("value_operations", [])
         for cap in capabilities
     )
-    assert not any(cap.get("logical_field") == "title.suggest" for cap in capabilities)
+    assert not any(cap.get("field") == "title.suggest" for cap in capabilities)
 
 
 def test_logical_verification_reuses_sources_and_retained_predicate_facts(stateful_api):

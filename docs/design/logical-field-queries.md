@@ -188,9 +188,33 @@ same runtime representation resolver should serve queries, capabilities, sort,
 and aggregation planning. Coverage/readiness must be distinguished from declared
 support. Schema identity is necessary before clients cache this information.
 
-Observed physical fields with unknown source associations leave `logical_field`
-and logical operations absent. They must not invent a JSON source path from an
-emitted field name. Declared named search-as-you-type roots retain their configured
+The public capability response has one entry per proven logical `field`, with
+`kind`, `value_operations`, `sortable`, `sort_lifecycle_state`,
+`sort_requires_scoring`, and nested `representations`. Source entries group all
+schema-associated concrete views. Each representation carries its concrete
+`field`, type, analyzer, schema/provenance, index-relative query modes, missing/null
+policy, and coverage/readiness diagnostics. The duplicate public `logical_field`
+and `emitted_name` properties are removed. Queries continue to use `field`.
+
+Observed physical fields with unknown source associations use `kind: unassociated`,
+leave the outer `field` absent, and retain concrete names only inside
+`representations`. Pattern-only dynamic mappings use `kind: template`. These
+entries advertise no original-value operations. They must not invent a JSON
+source path from an emitted field name. `_id` uses `kind: reserved`; `_score` uses
+`kind: computed`, has no stored index representation, and sets
+`sort_requires_scoring: true`. Reserved/computed entries do not pretend to be JSON
+source strings. Logical sort availability uses the same runtime doc-value resolver
+as executable queries; ambiguous companions remain unsupported. Autocomplete is
+advertised only when the shared root resolver identifies one compatible root.
+
+The immutable definition cache owns the runtime schema used for resolution and
+precomputed public groups under its existing byte budget. Observed coverage merges
+remain conservative within each representation. Public grouping uses a hash index
+and moves owned representation metadata rather than cloning it again; normal
+status reads reuse cached groups. This changes the capability response contract:
+SDKs and callers consuming flat type/analyzer/query-mode properties must read
+`representations` instead. Query expressions and physical-field escape hatches
+retain their contracts. Declared named search-as-you-type roots retain their configured
 analyzers; shorthand mappings may additionally resolve declared generated shingle
 representations. Conflicting roots are rejected rather than selected arbitrarily.
 

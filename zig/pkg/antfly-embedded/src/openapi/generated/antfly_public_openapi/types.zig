@@ -4517,24 +4517,76 @@ pub const FailedOperation = struct {
     }
 };
 
-/// Public field capability derived from Antfly schema mappings and observed dynamic field metadata.
+/// One public logical field with its supported value operations and nested concrete representations. Queries name field; Antfly resolves compatible representations. Unknown source associations remain explicit diagnostics.
 pub const FieldCapability = struct {
+    /// Public source or reserved/computed field accepted by queries. Absent for pattern-only templates and unassociated index representations.
+    field: ?[]const u8 = null,
+    /// Field origin. Unassociated entries do not assert a document source path.
+    kind: []const u8,
+    /// Supported original-value operations on field. Availability does not attest index coverage or authorize scans. Case sensitivity, execution policy and work budgets apply. Reserved/computed/template/unassociated entries do not advertise original-document value operations.
+    value_operations: []const []const u8,
+    /// Whether field resolves to one compatible sortable representation. Cold declared fields validate coverage on first exact-sort use; callers do not route through representation names.
+    sortable: bool,
+    /// Conservative cached lifecycle for the representation selected by the query resolver. Ambiguous or unavailable routing is unsupported.
+    sort_lifecycle_state: []const u8,
+    /// True for query-computed score ordering, which requires a score-bearing query. This does not authorize ordering a non-scoring query by _score.
+    sort_requires_scoring: bool,
+    /// Concrete representations with analyzer, type, legacy query modes and readiness diagnostics. Multiple representations never require clients to reproduce Antfly routing.
+    representations: []const FieldRepresentation,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "field", "field", true },
+        .{ "kind", "kind", false },
+        .{ "value_operations", "value_operations", false },
+        .{ "sortable", "sortable", false },
+        .{ "sort_lifecycle_state", "sort_lifecycle_state", false },
+        .{ "sort_requires_scoring", "sort_requires_scoring", false },
+        .{ "representations", "representations", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("value_operations");
+        try jw.write(self.value_operations);
+        try jw.objectField("sortable");
+        try jw.write(self.sortable);
+        try jw.objectField("sort_lifecycle_state");
+        try jw.write(self.sort_lifecycle_state);
+        try jw.objectField("sort_requires_scoring");
+        try jw.write(self.sort_requires_scoring);
+        try jw.objectField("representations");
+        try jw.write(self.representations);
+        try jw.endObject();
+    }
+};
+
+/// Concrete index or reserved-field representation. Diagnostic targets and index-relative query modes are scoped to this representation.
+pub const FieldRepresentation = struct {
     /// Mapping or dynamic-template name, when applicable.
     name: ?[]const u8 = null,
-    /// Concrete query field path when known. Pattern-only dynamic templates may omit this.
+    /// Concrete representation target for diagnostics and advanced index-relative queries. Pattern-only templates may omit this.
     field: ?[]const u8 = null,
-    /// Original source field accepted by logical value operations. Physical emitted names remain diagnostic/advanced query targets.
-    logical_field: ?[]const u8 = null,
-    /// Logical operations supported for this string source. Availability does not attest index coverage or authorize scans. Value operations verify original values; case_sensitive defaults to true, false uses Unicode simple folding without normalization. Execution policy and budgets apply.
-    value_operations: ?[]const []const u8 = null,
     /// Dynamic-template path_match pattern, when applicable.
     path_pattern: ?[]const u8 = null,
     /// Dynamic-template match pattern, when applicable.
     field_pattern: ?[]const u8 = null,
     /// Dynamic-template match_mapping_type, when applicable.
     match_mapping_type: ?[]const u8 = null,
-    /// Physical emitted field name for schema-derived text fields, when different from the logical path.
-    emitted_name: ?[]const u8 = null,
     /// Document schema that produced this capability, when applicable.
     document_schema: ?[]const u8 = null,
     type: AntflyType,
@@ -4554,17 +4606,18 @@ pub const FieldCapability = struct {
     index_sort_position: ?i64 = null,
     /// Sort direction in the table index_sort tuple when this field participates.
     index_sort_order: ?[]const u8 = null,
+    /// Observed or declared doc-value coverage; declaration alone does not establish complete coverage.
+    doc_value_coverage: []const u8,
+    /// Cached execution/readiness state of this representation. Capability inspection does not initiate coverage scans.
+    queryability_state: []const u8,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", true },
         .{ "field", "field", true },
-        .{ "logical_field", "logical_field", true },
-        .{ "value_operations", "value_operations", true },
         .{ "path_pattern", "path_pattern", true },
         .{ "field_pattern", "field_pattern", true },
         .{ "match_mapping_type", "match_mapping_type", true },
-        .{ "emitted_name", "emitted_name", true },
         .{ "document_schema", "document_schema", true },
         .{ "type", "type", false },
         .{ "query_modes", "query_modes", false },
@@ -4575,6 +4628,8 @@ pub const FieldCapability = struct {
         .{ "analyzer", "analyzer", true },
         .{ "index_sort_position", "index_sort_position", true },
         .{ "index_sort_order", "index_sort_order", true },
+        .{ "doc_value_coverage", "doc_value_coverage", false },
+        .{ "queryability_state", "queryability_state", false },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -4595,14 +4650,6 @@ pub const FieldCapability = struct {
             try jw.objectField("field");
             try jw.write(value);
         }
-        if (self.logical_field) |value| {
-            try jw.objectField("logical_field");
-            try jw.write(value);
-        }
-        if (self.value_operations) |value| {
-            try jw.objectField("value_operations");
-            try jw.write(value);
-        }
         if (self.path_pattern) |value| {
             try jw.objectField("path_pattern");
             try jw.write(value);
@@ -4613,10 +4660,6 @@ pub const FieldCapability = struct {
         }
         if (self.match_mapping_type) |value| {
             try jw.objectField("match_mapping_type");
-            try jw.write(value);
-        }
-        if (self.emitted_name) |value| {
-            try jw.objectField("emitted_name");
             try jw.write(value);
         }
         if (self.document_schema) |value| {
@@ -4647,6 +4690,10 @@ pub const FieldCapability = struct {
             try jw.objectField("index_sort_order");
             try jw.write(value);
         }
+        try jw.objectField("doc_value_coverage");
+        try jw.write(self.doc_value_coverage);
+        try jw.objectField("queryability_state");
+        try jw.write(self.queryability_state);
         try jw.endObject();
     }
 };
@@ -15403,7 +15450,7 @@ pub const Table = struct {
     migration: ?TableMigration = null,
     /// PostgreSQL CDC replication sources configured for this table.
     replication_sources: ?[]const ReplicationSource = null,
-    /// Effective runtime field capabilities for this table. Clients can use this to discover concrete field variants and their supported query modes, such as full_text, exact, range, geo, and autocomplete. Public exact field sort is supported only for `_id` or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
+    /// Effective logical-field capabilities for this table. Queries use each entry's field; concrete types, analyzers and index-relative query modes are nested under representations. Declared sortable fields validate coverage on first use. Computed _score ordering requires a score-bearing query.
     field_capabilities: ?[]const FieldCapability = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -16307,7 +16354,7 @@ pub const TableStatus = struct {
     migration: ?TableMigration = null,
     /// PostgreSQL CDC replication sources configured for this table.
     replication_sources: ?[]const ReplicationSource = null,
-    /// Effective runtime field capabilities for this table. Clients can use this to discover concrete field variants and their supported query modes, such as full_text, exact, range, geo, and autocomplete. Public exact field sort is supported only for `_id` or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
+    /// Effective logical-field capabilities for this table. Queries use each entry's field; concrete types, analyzers and index-relative query modes are nested under representations. Declared sortable fields validate coverage on first use. Computed _score ordering requires a score-bearing query.
     field_capabilities: ?[]const FieldCapability = null,
     /// Immutable physical table identity, preserved by catalog renames.
     table_id: ?[]const u8 = null,

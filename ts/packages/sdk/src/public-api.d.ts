@@ -7882,29 +7882,50 @@ export interface components {
              */
             replication_sources?: components["schemas"]["ReplicationSource"][];
         };
-        /** @description Public field capability derived from Antfly schema mappings and observed dynamic field metadata. */
+        /**
+         * @description One public logical field with its supported value operations and nested
+         *     concrete representations. Queries name field; Antfly resolves compatible
+         *     representations. Unknown source associations remain explicit diagnostics.
+         */
         FieldCapability: {
+            /** @description Public source or reserved/computed field accepted by queries. Absent for pattern-only templates and unassociated index representations. */
+            field?: string;
+            /**
+             * @description Field origin. Unassociated entries do not assert a document source path.
+             * @enum {string}
+             */
+            kind: "source" | "reserved" | "computed" | "template" | "unassociated";
+            /**
+             * @description Supported original-value operations on field. Availability does not
+             *     attest index coverage or authorize scans. Case sensitivity, execution
+             *     policy and work budgets apply. Reserved/computed/template/unassociated
+             *     entries do not advertise original-document value operations.
+             */
+            value_operations: ("equals" | "contains" | "matches" | "autocomplete")[];
+            /** @description Whether field resolves to one compatible sortable representation. Cold declared fields validate coverage on first exact-sort use; callers do not route through representation names. */
+            sortable: boolean;
+            /**
+             * @description Conservative cached lifecycle for the representation selected by the query resolver. Ambiguous or unavailable routing is unsupported.
+             * @enum {string}
+             */
+            sort_lifecycle_state: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";
+            /** @description True for query-computed score ordering, which requires a score-bearing query. This does not authorize ordering a non-scoring query by _score. */
+            sort_requires_scoring: boolean;
+            /** @description Concrete representations with analyzer, type, legacy query modes and readiness diagnostics. Multiple representations never require clients to reproduce Antfly routing. */
+            representations: components["schemas"]["FieldRepresentation"][];
+        };
+        /** @description Concrete index or reserved-field representation. Diagnostic targets and index-relative query modes are scoped to this representation. */
+        FieldRepresentation: {
             /** @description Mapping or dynamic-template name, when applicable. */
             name?: string;
-            /** @description Concrete query field path when known. Pattern-only dynamic templates may omit this. */
+            /** @description Concrete representation target for diagnostics and advanced index-relative queries. Pattern-only templates may omit this. */
             field?: string;
-            /** @description Original source field accepted by logical value operations. Physical emitted names remain diagnostic/advanced query targets. */
-            logical_field?: string;
-            /**
-             * @description Logical operations supported for this string source. Availability does
-             *     not attest index coverage or authorize scans. Value operations verify
-             *     original values; case_sensitive defaults to true, false uses Unicode
-             *     simple folding without normalization. Execution policy and budgets apply.
-             */
-            value_operations?: ("equals" | "contains" | "matches" | "autocomplete")[];
             /** @description Dynamic-template path_match pattern, when applicable. */
             path_pattern?: string;
             /** @description Dynamic-template match pattern, when applicable. */
             field_pattern?: string;
             /** @description Dynamic-template match_mapping_type, when applicable. */
             match_mapping_type?: string;
-            /** @description Physical emitted field name for schema-derived text fields, when different from the logical path. */
-            emitted_name?: string;
             /** @description Document schema that produced this capability, when applicable. */
             document_schema?: string;
             type: components["schemas"]["AntflyType"];
@@ -7941,6 +7962,10 @@ export interface components {
              * @enum {string}
              */
             index_sort_order?: "asc" | "desc";
+            /** @description Observed or declared doc-value coverage; declaration alone does not establish complete coverage. */
+            doc_value_coverage: string;
+            /** @description Cached execution/readiness state of this representation. Capability inspection does not initiate coverage scans. */
+            queryability_state: string;
         };
         /** @enum {string} */
         AntflyType: "search_as_you_type" | "substring" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
@@ -7964,10 +7989,10 @@ export interface components {
             /** @description PostgreSQL CDC replication sources configured for this table. */
             replication_sources?: components["schemas"]["ReplicationSource"][];
             /**
-             * @description Effective runtime field capabilities for this table. Clients can use this to discover
-             *     concrete field variants and their supported query modes, such as full_text, exact,
-             *     range, geo, and autocomplete. Public exact field sort is supported only for `_id`
-             *     or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
+             * @description Effective logical-field capabilities for this table. Queries use each
+             *     entry's field; concrete types, analyzers and index-relative query modes
+             *     are nested under representations. Declared sortable fields validate
+             *     coverage on first use. Computed _score ordering requires a score-bearing query.
              */
             field_capabilities?: components["schemas"]["FieldCapability"][];
         };

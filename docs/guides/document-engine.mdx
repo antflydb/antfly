@@ -132,9 +132,13 @@ Index candidates are verified before counts, ordering and pagination. Unindexed
 fallback requires `value_search_execution.allow_scan`; defaults cap verification
 at 100,000 documents and 64 MiB per shard request. Exhaustion is an error, never
 a successful partial answer. `profile.value_search` explains selected candidate
-fields, fallback reasons and actual verification work. Capabilities expose
-`logical_field` and `value_operations`; these describe semantics, not current
-coverage or permission to scan.
+fields, fallback reasons and actual verification work. Each capability entry
+names one public `field` and its `value_operations`. Concrete types, analyzers,
+index-relative query modes, and coverage live in nested `representations`.
+Operations describe semantics rather than permission to scan. `kind` distinguishes
+source, reserved, computed, template, and unassociated entries. `_score` is computed
+and sorting it requires a score-bearing query. Unknown source associations never
+invent a document field from an indexed name.
 
 Sorting and aggregations can name a logical text source when it has one
 unambiguous raw keyword representation with compatible doc values. Explicit

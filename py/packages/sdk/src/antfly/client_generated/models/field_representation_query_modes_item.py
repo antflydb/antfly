@@ -1,7 +1,7 @@
 from enum import StrEnum
 
 
-class FieldCapabilityQueryModesItem(StrEnum):
+class FieldRepresentationQueryModesItem(StrEnum):
     AUTOCOMPLETE = "autocomplete"
     EXACT = "exact"
     FULL_TEXT = "full_text"
