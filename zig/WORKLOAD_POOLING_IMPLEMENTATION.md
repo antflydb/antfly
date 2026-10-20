@@ -4,6 +4,70 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Typed owner and RPC status delivery (2026-10-19)
+
+Source `d56003bd208e325e09d0c81e1370ec50efd46389` distinguishes an absent
+transaction record from a failed status read. Required status never treats an error named
+`TxnNotFound` as absence or permission to begin. Known decisions retain actual
+saved status, mode and binding. Both coordinator abort confirmations and
+ambiguous commit recovery preserve that distinction.
+
+The additive storage-owner C operation resets its result before validation and
+reads the actual retained native record under the existing shared apply fence.
+It distinguishes a missing record from every original read rejection. Because
+the C status enum cannot enumerate arbitrary original controls, the Zig client
+retains a caller-side rejection trace before translating status. Native ABI is
+43 and storage-owner ABI is 102; engine descriptor 28, API kernel 53, file floor
+7 and Raft protocol 25 remain unchanged.
+
+The private existing transaction-status route accepts a fixed 112-byte ATPS
+query and returns a fixed 200-byte ATPR reply. Both are versioned and
+checksummed. The reply correlates transaction ID, group, hidden scope and plan
+before saved binding validation. The client bounds response buffering,
+authenticates with the existing service principal and forwards the bounded
+server status budget with its client response reserve. Old JSON status remains
+available to legacy callers; required workers refuse legacy, stripped or
+mismatched replies.
+
+The owner source requires original deadline/admission and borrows existing node
+or request I/O. It borrows an already resident owner of the exact physical
+identity/generation, validates hidden bootstrap scope/plan and certifies quorum
+before the snapshot, then revalidates retained authority and physical generation
+afterward. Acquisition fails immediately on registry contention or a required
+open/transition. Atomic deferred release cannot join a concurrent cold open or
+create a temporary executor. The independent release worker must already be
+running. Cold owners must be prepared by an independent funded control path.
+Public descriptor capture carries original read admission.
+
+Production metadata routing currently ignores its budget argument. A new
+capability for bounded capture defaults false, and the hosted required-status worker
+refuses that path until a provider qualifies capture, allocation, traversal and
+waiting under the original budget/admission. The local worker and the private
+RPC delivery primitives are wired. No required mutation capability is enabled.
+
+`native-typed-status-v12-verified.json` records six focused runtime targets and
+the owner-adapter analysis check (six runtime targets passed; owner analysis:
+54/54 steps succeeded). Selected runtime cases cover explicit absence, all wire
+identity fields, corrupt/truncated and legacy replies, original failures at
+every codec checkpoint, authenticated RPC, local dispatch and unavailable
+routing. The persistent bound-Raft test exercises the actual production C entry
+in both modes on pending and committed records before/after reopen, and
+validates original caller rejection traces at every checkpoint. Owner residency,
+nonblocking release and unbounded-quorum refusal regressions are analyzed
+without the full storage archive; their full linked runtime suite remains
+unqualified. The immutable public package has 4,483 exact exported sources and
+passes 25 ReleaseSafe consumer steps. Runtime inputs are hashed. The final
+owner-only readiness gate and fixture correction pass a separate analysis check;
+all other runtime source inputs match committed source. Both receipts record the
+build's pre-commit HEAD. Full Linux qualification remains waived.
+
+Remaining work includes bounded production routing, independently funded cold
+owner preparation, required BEGIN/PREPARE/seal providers and funded original
+producers, fresh route authority, coordinated all-member/import/downgrade and
+legacy-session migration, large-frame transport and distributed fault/restart
+qualification. Completion resource bundles and broader scheduler scope remain
+open. Earlier ledger sections describe prior implementation stages.
+
 ## Binding-aware coordinator status (2026-10-19)
 
 Commit `141e2a2f824c518a7081444fd0e55fe6ce402c08` adds typed status evidence

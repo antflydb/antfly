@@ -19,6 +19,27 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Typed owner and RPC recovery status (2026-10-19)
+
+Source `d56003bd208e325e09d0c81e1370ec50efd46389` adds explicit successful
+absence, actual saved native status through an additive C operation, and
+versioned fixed-size private status RPCs. Original read failures cannot become
+absence. Both local and hosted worker callbacks correlate the original
+transaction/group/hidden identity, and required status rejects legacy replies.
+Original admission and deadlines cover owner reads; status only borrows existing
+residency and releases through the atomic queue, without opening owners or
+creating executors. Quorum and physical owner authority are checked around the
+retained native snapshot.
+
+Native ABI 43 and storage-owner ABI 102 fence the changes; engine descriptor 28,
+API kernel 53, file floor 7 and Raft protocol 25 are unchanged. Six native
+runtime targets, the owner analysis check and 25 immutable public consumer steps
+pass. Full owner-archive runtime qualification remains unrun. Production hosted
+status refuses existing unbounded routing providers until bounded capture is
+qualified. Required mutation providers, funded original producers/cold-owner
+preparation and coordinated migration remain required before activation. See the
+implementation ledger for evidence and remaining design scope.
+
 ## Bound recovery status (2026-10-19)
 
 Required coordinator status checks now verify the actual saved mode and binding

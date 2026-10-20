@@ -16,23 +16,26 @@ branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `fc9bea9f20194754644605d796c00beeb1f325d0`.
-Native ABI 42, engine descriptor 28, file floor 7 and Raft protocol 25 fence
-persistent bindings, original cohort handoff and bound recovery status; storage
-owner ABI remains 101. New stable SQL/HTTP sessions retain their complete routed
-cohort before BEGIN. Required coordinator status checks compare actual saved
-mode and binding against that original cohort, including ambiguous commit and
-both abort confirmations. Missing proof cannot authorize follower commit; a
-mismatched bound observation cannot authorize follower commit or cleanup. Required
-status never falls back to legacy status. Legacy terminal aborts remain final.
 
-Final source `85e2ca05fac9ced3552bf1960ad40cb702f325b0` passes six focused
-native targets and 25 public-package consumer checks, including original
-cohorts, actual SQL/HTTP handoffs, persistent bound apply and fenced status
-reads that preserve original admission errors. Production required proposals
-remain gated pending actual owner/quorum and RPC status delivery, required
-adapters/providers, fresh route authority, funded producers, large-frame
-transport and coordinated migration. The broader scheduler design and
-distributed fault/restart qualification remain open.
+Native ABI 43, storage-owner ABI 102, engine descriptor 28, file floor 7 and
+Raft protocol 25 fence persistent binding, original cohort handoff and typed
+recovery status. New stable SQL/HTTP sessions retain their original routed
+cohort before BEGIN. Required status compares actual saved mode and binding and
+represents successful absence explicitly; read errors cannot authorize a fresh
+BEGIN or follower cleanup. Legacy terminal aborts remain final.
+
+Source `d56003bd208e325e09d0c81e1370ec50efd46389` adds native owner status and
+fixed-size private RPC delivery. Read admission/deadlines and quorum/owner
+checks surround the snapshot. Status borrows existing residency and releases
+without blocking on owner transitions. Existing production routing ignores
+budgets, so hosted required status refuses that path until bounded capture is
+qualified. Six native runtime targets, the owner analysis check and 25
+public-package consumer checks pass; full owner archive runtime qualification
+remains unrun and full Linux qualification remains waived. Required mutation
+providers, funded original producers and cold-owner preparation, fresh route
+authority, large-frame transport and coordinated migration still gate
+activation. The broader scheduler design and distributed fault/restart
+qualification remain open.
 
 The full goal remains safe, bounded execution sharing across many connections
 by default, with fair scheduling and bounded waiting, preserving session
