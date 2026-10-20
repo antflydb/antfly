@@ -26,6 +26,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_input_test;
     _ = @import("antfly_local_sources").storage_db_entity_alias_curation;
     _ = @import("antfly_local_sources").storage_db_group_prior_context;
+    _ = @import("antfly_local_sources").storage_db_group_prior_scan;
     _ = @import("antfly_local_sources").storage_db_group_source_baseline;
     _ = @import("antfly_local_sources").storage_db_group_source_bytes;
     _ = @import("antfly_local_sources").storage_db_group_source_debt;
