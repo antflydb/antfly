@@ -259,7 +259,10 @@ pub fn leafReferences(a: A, store: stores.ArtifactStore, artifact: Ref, cancella
     const root = try loadValidatedRoot(scratch.allocator(), store, artifact, cancellation);
     const refs = try a.alloc(ChunkRef, if (artifact.metadata_version == 6) 0 else root.blocks.len);
     for (refs, root.blocks[0..refs.len]) |*ref, block| ref.* = .{ .artifact_id = try a.dupe(u8, block.artifact.artifact_id), .checksum = try a.dupe(u8, block.artifact.checksum), .byte_len = block.artifact.byte_len };
-    return .{ .blocks = refs, .key_index = root.key_index };
+    // Embedded navigation has no external GC edge. Do not return its borrowed
+    // page bytes after releasing the temporary metadata owner.
+    const external_index = if (root.key_index) |index| (if (index.inline_page.len == 0) index else null) else null;
+    return .{ .blocks = refs, .key_index = external_index };
 }
 pub fn descendantsAlloc(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation) ![]const ChunkRef {
     return (try leafReferences(a, store, artifact, cancellation)).blocks;
