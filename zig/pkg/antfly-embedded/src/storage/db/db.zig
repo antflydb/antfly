@@ -42212,6 +42212,7 @@ pub const DB = struct {
         if (try self.composedRequestTouchesChunkBackedMemberModeArm(alloc, req)) return null;
         return try db_query_search.resolveStructuredDocFilterForComposedAlloc(alloc, req, .{
             .load_stored = loadStoredSearchDocumentCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42232,6 +42233,7 @@ pub const DB = struct {
         if (try self.composedRequestTouchesChunkBackedMemberModeArm(alloc, req)) return null;
         return try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, req, .{
             .load_stored = loadStoredSearchDocumentCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42481,6 +42483,8 @@ pub const DB = struct {
             a: Allocator,
             req: types.SearchRequest,
             tree: *values.Tree,
+            projection: ?@import("../../search/value_source.zig").Plan = null,
+            projection_attempted: bool = false,
             allowed: ?*const std.StringHashMapUnmanaged(void) = null,
             ids: std.ArrayListUnmanaged([]const u8) = .empty,
             local_work: values.Work = .{},
@@ -42492,11 +42496,26 @@ pub const DB = struct {
                 if (value_scan.req.cancellation) |token| try token.check();
                 const work = value_scan.req.value_search_work orelse &value_scan.local_work;
                 try values.Work.charge(&work.documents, 1, value_scan.req.value_search_execution.max_documents);
-                const bytes = (try value_scan.db.loadStoredSearchDocumentProbe(value_scan.a, owned.id)) orelse return;
-                defer value_scan.a.free(bytes);
+                var scratch = std.heap.ArenaAllocator.init(@import("../../sql/memory_budget.zig").reclaimingAllocator(value_scan.a));
+                defer scratch.deinit();
+                const read_start = if (value_scan.req.profile) platform_time.monotonicNs() else 0;
+                const stored = try value_scan.db.loadStoredSearchDocumentProbe(scratch.allocator(), owned.id);
+                if (value_scan.req.profile) {
+                    _ = work.source_read_ns.fetchAdd(platform_time.monotonicNs() - read_start, .monotonic);
+                    _ = work.source_scalar_reads.fetchAdd(1, .monotonic);
+                }
+                const bytes = stored orelse return;
                 try values.Work.charge(&work.bytes, bytes.len, value_scan.req.value_search_execution.max_bytes);
-                var parsed = try std.json.parseFromSlice(std.json.Value, value_scan.a, bytes, .{ .allocate = .alloc_if_needed });
-                defer parsed.deinit();
+                if (bytes.len >= 1024 and !value_scan.projection_attempted) {
+                    value_scan.projection_attempted = true;
+                    value_scan.projection = value_scan.tree.sourcePlan(value_scan.a) catch null;
+                }
+                const parse_start = if (value_scan.req.profile) platform_time.monotonicNs() else 0;
+                const parsed = try @import("../../search/value_source.zig").parse(scratch.allocator(), bytes, if (value_scan.projection) |*plan| plan else null);
+                if (value_scan.req.profile) {
+                    _ = work.source_parse_ns.fetchAdd(platform_time.monotonicNs() - parse_start, .monotonic);
+                    if (parsed.projected) _ = work.projected_sources.fetchAdd(1, .monotonic);
+                }
                 if (!try value_scan.tree.matches(parsed.value)) return;
                 const id = try value_scan.a.dupe(u8, owned.id);
                 errdefer value_scan.a.free(id);
@@ -42508,6 +42527,7 @@ pub const DB = struct {
         for (req.filter_doc_ids) |id| try allowed.put(alloc, id, {});
         var value_scan = Scan{ .db = self, .a = alloc, .req = req, .tree = &tree, .allowed = if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0) &allowed else null };
         defer value_scan.local_work.deinit(alloc);
+        defer if (value_scan.projection) |*plan| plan.deinit();
         tree.bindWork(req.value_search_work orelse &value_scan.local_work, req.value_search_execution);
         defer {
             for (value_scan.ids.items) |id| alloc.free(id);
@@ -42614,6 +42634,7 @@ pub const DB = struct {
         else
             try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
                 .load_stored = loadStoredSearchDocumentCallback,
+                .load_many_stored_values = loadStoredSearchDocumentManyCallback,
                 .ctx = self,
                 .text_index_entry = textIndexEntryCallback,
                 .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -42648,6 +42669,7 @@ pub const DB = struct {
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .is_expired_key = isNonvisibleStoredSearchKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -43968,6 +43990,7 @@ pub const DB = struct {
     fn searchRequestWithDynamicStructuredDocFilterAlloc(self: *DB, req: types.SearchRequest) !?AlgebraicDocFilterRequest {
         var resolved = (try db_query_search.resolveStructuredDocFilterForComposedAlloc(self.alloc, req, .{
             .load_stored = loadStoredSearchDocumentCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,

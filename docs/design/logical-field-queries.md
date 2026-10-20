@@ -154,9 +154,9 @@ Every request still passes authorization, retained-cut validation/expiry, source
 read admission, projection readiness, and its own candidate constraints. A changed
 query or cut misses. Partial failed segment evaluations are never published.
 Concurrent builders may discard one another's cached subsets without changing
-results. LRU eviction, expiry and allocator refusal always fall back to exact
-verification. Storage is bounded to 128 directory entries / 16 MiB of admitted allocations,
-with a 2 MiB entry ceiling; nothing is written to disk. Exact-clone storage bounds
+results. Queue eviction, expiry and allocator refusal always fall back to exact
+verification. Storage is bounded to 16 MiB of admitted allocations, including the dynamically sized hash directory,
+with a 2 MiB entry ceiling; nothing is written to disk. The directory has no fixed entry-count cliff. Newly admitted facts enter a probationary queue; successful reuse promotes them to a protected queue. Pressure evicts unpinned probationary entries first, preventing a one-shot scan from replacing a warm working set. Hash lookups and queue updates take constant expected time. Expiry walks entries only when the earliest recorded deadline has passed. Exact-clone storage bounds
 are checked before eviction. Oversized predicates cannot evict valid entries.
 Readers pin immutable facts with reference-counted leases; expiry and eviction
 release only directory ownership. Pinned retired entries continue consuming the
@@ -265,3 +265,10 @@ policy, both named autocomplete aliases, immutable pins across eviction/expiry,
 non-destructive admission under pin pressure, and allocation-bounded selective
 intersection. These shared-host Debug measurements are not a production memory,
 cold-storage or platform-parity qualification.
+
+
+### Named autocomplete root completeness
+
+Named `search_as_you_type` roots index complete Unicode word tokens with lowercase normalization. The bounded 2–20 character edge-prefix representation is an accelerator, not the root dictionary. Root prefix expansion remains available for one-character words, long prefixes, and full tokens beyond the accelerator window. Query analysis never expands edge n-grams. Generated shorthand mappings retain their independently verified shingle and prefix companions.
+
+Indexes created with earlier development builds of this PR used the prefix-only analyzer for named roots. Reindex those affected named representations before relying on long-token completeness; changing query normalization cannot recreate terms omitted at indexing time. This is a development-index migration, not a claim that existing prefix-only segments contain full tokens.

@@ -51,6 +51,13 @@ pub const Work = struct {
     bytes: std.atomic.Value(u64) = .init(0),
     regex_work: std.atomic.Value(u64) = .init(0),
 
+    source_read_ns: std.atomic.Value(u64) = .init(0),
+    source_parse_ns: std.atomic.Value(u64) = .init(0),
+    source_batches: std.atomic.Value(u64) = .init(0),
+    source_scalar_reads: std.atomic.Value(u64) = .init(0),
+    projected_sources: std.atomic.Value(u64) = .init(0),
+    batch_refusals: std.atomic.Value(u64) = .init(0),
+    batch_peak_bytes: std.atomic.Value(usize) = .init(0),
     sources: Sources = .{},
     prepared_leaves: std.atomic.Value(u32) = .init(0),
 
@@ -81,7 +88,7 @@ pub const Work = struct {
     }
     pub fn profileAlloc(self: *Work, a: A) !?[]u8 {
         if (self.plans.items.len == 0) return null;
-        return try std.json.Stringify.valueAlloc(a, .{ .documents = self.documents.load(.monotonic), .bytes = self.bytes.load(.monotonic), .plans = self.plans.items }, .{});
+        return try std.json.Stringify.valueAlloc(a, .{ .documents = self.documents.load(.monotonic), .bytes = self.bytes.load(.monotonic), .plans = self.plans.items, .verification_metrics_version = @as(u32, 1), .source_read_us = self.source_read_ns.load(.monotonic) / 1000, .source_parse_us = self.source_parse_ns.load(.monotonic) / 1000, .source_batches = self.source_batches.load(.monotonic), .source_scalar_reads = self.source_scalar_reads.load(.monotonic), .projected_sources = self.projected_sources.load(.monotonic), .batch_refusals = self.batch_refusals.load(.monotonic), .batch_peak_bytes = self.batch_peak_bytes.load(.monotonic) }, .{});
     }
 
     pub fn charge(counter: *std.atomic.Value(u64), amount: u64, maximum: u64) !void {
@@ -99,6 +106,7 @@ pub const Work = struct {
 pub const Sources = struct {
     const Entry = std.json.Parsed(std.json.Value);
     enabled: std.atomic.Value(bool) = .init(false),
+    populated: std.atomic.Value(bool) = .init(false),
     budget: @import("../sql/memory_budget.zig") = .{ .backing = undefined, .limit = 8 * 1024 * 1024 },
     initialized: bool = false,
     context: ?*anyopaque = null,
@@ -108,7 +116,7 @@ pub const Sources = struct {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
     }
     pub fn get(self: *Sources, context: ?*anyopaque, id: []const u8) ?std.json.Value {
-        if (!self.enabled.load(.acquire)) return null;
+        if (!self.enabled.load(.acquire) or !self.populated.load(.acquire)) return null;
         self.lock();
         defer self.mutex.unlock();
         if (!self.initialized or self.context != context) return null;
@@ -140,6 +148,7 @@ pub const Sources = struct {
             parsed.deinit();
             return null;
         };
+        self.populated.store(true, .release);
         return parsed.value;
     }
     fn deinit(self: *Sources) void {
@@ -313,6 +322,27 @@ pub const Tree = union(enum) {
         for (queries, out) |query, *child| child.* = try prepare(a, query);
         return out;
     }
+    pub fn sourcePlan(self: *Tree, a: A) !@import("value_source.zig").Plan {
+        var fields: [64][]const u8 = undefined;
+        var count: usize = 0;
+        try self.collectFields(&fields, &count);
+        return @import("value_source.zig").Plan.init(a, fields[0..count]);
+    }
+    fn collectFields(self: *Tree, fields: *[64][]const u8, count: *usize) anyerror!void {
+        switch (self.*) {
+            .leaf => |matcher| {
+                if (count.* == fields.len) return error.ProjectionTooLarge;
+                fields[count.*] = matcher.spec.field;
+                count.* += 1;
+            },
+            .boolean => |b| {
+                for (b.must) |*child| try child.collectFields(fields, count);
+                for (b.should) |*child| try child.collectFields(fields, count);
+                for (b.must_not) |*child| try child.collectFields(fields, count);
+            },
+            else => {},
+        }
+    }
     pub fn bindWork(self: *Tree, work: *Work, policy: Policy) void {
         switch (self.*) {
             .leaf => |matcher| {
@@ -352,10 +382,30 @@ pub fn mergeProfilesAlloc(a: A, results: anytype) !?[]u8 {
     var plans = std.ArrayListUnmanaged(std.json.Value).empty;
     var documents: u64 = 0;
     var bytes: u64 = 0;
+    const Counters = struct {
+        source_read_us: u64 = 0,
+        source_parse_us: u64 = 0,
+        source_batches: u64 = 0,
+        source_scalar_reads: u64 = 0,
+        projected_sources: u64 = 0,
+        batch_refusals: u64 = 0,
+        batch_peak_bytes: u64 = 0,
+    };
+    var counters: Counters = .{};
+    var metrics_complete = true;
     var present = false;
     for (results) |result| if (result.value_search_profile_json) |json| {
         const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
         const object = parsed.value.object;
+        const version = object.get("verification_metrics_version");
+        metrics_complete = metrics_complete and version != null and version.? == .integer and version.?.integer == 1;
+        inline for (comptime std.meta.fieldNames(Counters)) |name| if (object.get(name)) |value| {
+            if (value != .integer or value.integer < 0) return error.InvalidRemoteResponse;
+            const amount: u64 = @intCast(value.integer);
+            @field(counters, name) = if (comptime std.mem.eql(u8, name, "batch_peak_bytes")) @max(@field(counters, name), amount) else try std.math.add(u64, @field(counters, name), amount);
+        } else {
+            metrics_complete = false;
+        };
         const doc_count = object.get("documents") orelse return error.InvalidRemoteResponse;
         const byte_count = object.get("bytes") orelse return error.InvalidRemoteResponse;
         const physical_plans = object.get("plans") orelse return error.InvalidRemoteResponse;
@@ -366,5 +416,23 @@ pub fn mergeProfilesAlloc(a: A, results: anytype) !?[]u8 {
         present = true;
     };
     if (!present) return null;
-    return try std.json.Stringify.valueAlloc(a, .{ .documents = documents, .bytes = bytes, .plans = plans.items }, .{});
+    return try std.json.Stringify.valueAlloc(a, .{ .documents = documents, .bytes = bytes, .plans = plans.items, .verification_metrics_version = @as(u32, if (metrics_complete) 1 else 0), .source_read_us = counters.source_read_us, .source_parse_us = counters.source_parse_us, .source_batches = counters.source_batches, .source_scalar_reads = counters.source_scalar_reads, .projected_sources = counters.projected_sources, .batch_refusals = counters.batch_refusals, .batch_peak_bytes = counters.batch_peak_bytes }, .{});
+}
+
+test "logical value verification telemetry survives shard merging and marks legacy coverage" {
+    const a = std.testing.allocator;
+    const Row = struct { value_search_profile_json: ?[]const u8 };
+    const current = "{\"documents\":2,\"bytes\":10,\"plans\":[],\"verification_metrics_version\":1,\"source_read_us\":7,\"source_parse_us\":3,\"source_batches\":1,\"source_scalar_reads\":0,\"projected_sources\":2,\"batch_refusals\":0,\"batch_peak_bytes\":4096}";
+    const legacy = "{\"documents\":2,\"bytes\":10,\"plans\":[]}";
+    for ([_][]const u8{ current, legacy }, 0..) |second, i| {
+        const merged = (try mergeProfilesAlloc(a, &[_]Row{ .{ .value_search_profile_json = current }, .{ .value_search_profile_json = second } })).?;
+        defer a.free(merged);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, merged, .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try std.testing.expectEqual(@as(i64, 4), object.get("documents").?.integer);
+        try std.testing.expectEqual(@as(i64, if (i == 0) 1 else 0), object.get("verification_metrics_version").?.integer);
+        try std.testing.expectEqual(@as(i64, if (i == 0) 14 else 7), object.get("source_read_us").?.integer);
+        try std.testing.expectEqual(@as(i64, 4096), object.get("batch_peak_bytes").?.integer);
+    }
 }

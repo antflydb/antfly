@@ -772,6 +772,8 @@ def test_logical_named_autocomplete_keeps_declared_source_associations(stateful_
         inserts={
             "a": {"title": "Distributed Systems"},
             "b": {"title": "Dinosaur Bones"},
+            "long": {"title": "abcdefghijklmnopqrstuvwxyzzebra"},
+            "short": {"title": "x"},
         },
         sync_level="full_index",
     )
@@ -782,6 +784,22 @@ def test_logical_named_autocomplete_keeps_declared_source_associations(stateful_
     )
     assert response.status_code == 200, response.text
     assert [h["_id"] for h in response.json()["responses"][0]["hits"]["hits"]] == ["a"]
+    for text, expected in [
+        ("abcdefghijklmnopqrst", ["long"]),
+        ("abcdefghijklmnopqrstu", ["long"]),
+        ("abcdefghijklmnopqrstuvwxyzzebra", ["long"]),
+        ("abcdefghijklmnopqrstuvwxyzzdog", []),
+        ("x", ["short"]),
+    ]:
+        response = requests.post(
+            stateful_api.url + f"/tables/{table}/query",
+            json={"query": {"autocomplete": text, "field": "title"}},
+            timeout=60,
+        )
+        assert response.status_code == 200, response.text
+        assert [
+            h["_id"] for h in response.json()["responses"][0]["hits"]["hits"]
+        ] == expected
     capabilities = stateful_api.get(f"/tables/{table}")["field_capabilities"]
     assert any(
         cap.get("logical_field") == "title"
@@ -1097,6 +1115,271 @@ def test_logical_mixed_work_profile(stateful_api):
                 "source_bytes": n
                 * len(json.dumps({"title": title}, separators=(",", ":")).encode()),
                 "corpus_sha256": corpus.hexdigest(),
+                "records": records,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def logical_process_reader(pid):
+    """Low-overhead process CPU/RSS sampling; neither value is a query quota."""
+    import platform
+
+    if platform.system() == "Darwin":
+        import ctypes
+
+        class Info(ctypes.Structure):
+            # SDK sys/resource.h rusage_info_v2: UUID then eighteen uint64s.
+            _fields_ = [("uuid", ctypes.c_ubyte * 16), ("values", ctypes.c_uint64 * 18)]
+
+        class Timebase(ctypes.Structure):
+            _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+        system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        system.mach_timebase_info.argtypes = [ctypes.POINTER(Timebase)]
+        system.mach_timebase_info.restype = ctypes.c_int
+        timebase = Timebase()
+        assert system.mach_timebase_info(ctypes.byref(timebase)) == 0
+        assert timebase.denom != 0
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        lib.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        lib.proc_pid_rusage.restype = ctypes.c_int
+
+        def read():
+            value = Info()
+            if lib.proc_pid_rusage(pid, 2, ctypes.byref(value)) != 0:
+                raise OSError(ctypes.get_errno(), "proc_pid_rusage")
+            return {
+                "cpu_ns": (value.values[0] + value.values[1])
+                * timebase.numer
+                // timebase.denom,
+                "rss_bytes": value.values[6],
+                "footprint_bytes": value.values[7],
+            }
+
+        return read
+    if platform.system() == "Linux":
+        ticks = os.sysconf("SC_CLK_TCK")
+        page_size = os.sysconf("SC_PAGESIZE")
+        path = Path(f"/proc/{pid}/stat")
+
+        def read():
+            fields = path.read_text().rsplit(") ", 1)[1].split()
+            return {
+                "cpu_ns": (int(fields[11]) + int(fields[12])) * 1000000000 // ticks,
+                "rss_bytes": int(fields[21]) * page_size,
+                "footprint_bytes": None,
+            }
+
+        return read
+    pytest.skip("process qualification requires macOS or Linux")
+
+
+def test_logical_scalable_work_profile(stateful_api):
+    """Opt-in optimized-build comparison with cold predicate membership."""
+    import hashlib
+    import platform
+    import statistics
+
+    destination = os.environ.get("ANTFLY_LOGICAL_SCALABLE_REPORT")
+    if not destination:
+        pytest.skip("set ANTFLY_LOGICAL_SCALABLE_REPORT to record cold verification")
+    import threading
+
+    assert stateful_api._server is not None, (
+        "qualification requires a local child server"
+    )
+    pid = stateful_api._server.proc.pid
+    read_process = logical_process_reader(pid)
+    records = []
+    for name, count, title, extra in [
+        ("tiny", 4096, "needle alpha beta", {}),
+        ("selected_large", 4096, "needle alpha beta " + "x" * 4096, {}),
+        ("unselected_arrays", 1024, "needle alpha beta", {"unused": ["\n" * 16] * 512}),
+    ]:
+        table = f"logical_scalable_{name}_{time.time_ns()}"
+        stateful_api.create_table(table)
+        documents = {f"{i:06}": {"title": title, **extra} for i in range(count)}
+        corpus = json.dumps(documents, sort_keys=True, separators=(",", ":")).encode()
+        for offset in range(0, count, 128):
+            keys = list(documents)[offset : offset + 128]
+            stateful_api.batch_write(
+                table, inserts={k: documents[k] for k in keys}, sync_level="full_index"
+            )
+        query = {
+            "query": {
+                "bool": {
+                    "should": [
+                        *[
+                            {"contains": text, "field": "title"}
+                            for text in ("needle", "alpha", "beta")
+                        ],
+                        {"matches": "z[e]bra", "field": "title"},
+                        {"equals": "missing", "field": "other"},
+                    ]
+                }
+            },
+            "count": True,
+            "limit": 1,
+            "fields": [],
+            "profile": True,
+            "value_search_execution": {
+                "allow_scan": True,
+                "max_documents": count,
+                "max_bytes": 256 * 1024 * 1024,
+                "max_regex_work": 1000000000,
+            },
+        }
+        runs = []
+        initial_process = read_process()
+        samples = [initial_process]
+        sampling_errors = []
+        stop = threading.Event()
+
+        def watch():
+            while not stop.wait(0.005):
+                try:
+                    samples.append(read_process())
+                except OSError as error:
+                    sampling_errors.append(str(error))
+                    return
+
+        watcher = threading.Thread(target=watch)
+        watcher.start()
+        try:
+            for trial in range(9):
+                cpu_before = read_process()["cpu_ns"]
+                started = time.perf_counter_ns()
+                with requests.post(
+                    stateful_api.url + f"/tables/{table}/query",
+                    json=query,
+                    timeout=90,
+                    stream=True,
+                ) as response:
+                    response.raw.decode_content = True
+                    first = response.raw.read(1)
+                    first_byte_ms = (time.perf_counter_ns() - started) / 1000000
+                    body = first + response.raw.read()
+                    elapsed = (time.perf_counter_ns() - started) / 1000000
+                    assert response.status_code == 200, body
+                result = json.loads(body)["responses"][0]
+                first_result_ms = (time.perf_counter_ns() - started) / 1000000
+                assert result["hits"]["total"]["value"] == count, result
+                profile = result["profile"]["value_search"]
+                assert profile["documents"] == count, profile
+                if profile.get("verification_metrics_version") == 1:
+                    if os.environ.get("ANTFLY_BENCH_VALUE_SOURCE_SCALAR") != "1":
+                        assert profile["source_batches"] > 0, profile
+                        assert profile["source_scalar_reads"] < count, profile
+                    expected_projected = (
+                        name != "tiny"
+                        and os.environ.get("ANTFLY_BENCH_VALUE_SOURCE_FULL_DOM") != "1"
+                    )
+                    assert profile["projected_sources"] == (
+                        count if expected_projected else 0
+                    ), profile
+                cpu_after = read_process()["cpu_ns"]
+                runs.append(
+                    {
+                        "trial": trial,
+                        "http_ms": elapsed,
+                        "first_byte_ms": first_byte_ms,
+                        "first_result_ms": first_result_ms,
+                        "cpu_ms": (cpu_after - cpu_before) / 1000000,
+                        "profile": profile,
+                    }
+                )
+        finally:
+            stop.set()
+            watcher.join()
+        assert not sampling_errors, sampling_errors
+        final_process = read_process()
+        samples.append(final_process)
+        sample_path = os.environ.get("ANTFLY_LOGICAL_SAMPLE")
+        if sample_path and name == "unselected_arrays":
+            sample_log = Path(sample_path).with_suffix(".log")
+            with sample_log.open("w") as log:
+                sampler = subprocess.Popen(
+                    [
+                        "/usr/bin/sample",
+                        str(pid),
+                        "5",
+                        "1",
+                        "-mayDie",
+                        "-file",
+                        sample_path,
+                    ],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+                deadline = time.monotonic() + 45
+                while sampler.poll() is None and time.monotonic() < deadline:
+                    response = requests.post(
+                        stateful_api.url + f"/tables/{table}/query",
+                        json=query,
+                        timeout=90,
+                    )
+                    assert response.status_code == 200, response.text
+                assert sampler.wait(timeout=15) == 0, sample_log.read_text()
+        records.append(
+            {
+                "name": name,
+                "documents": count,
+                "corpus_sha256": hashlib.sha256(corpus).hexdigest(),
+                "median_http_ms": statistics.median(r["http_ms"] for r in runs),
+                "median_first_result_ms": statistics.median(
+                    r["first_result_ms"] for r in runs
+                ),
+                "mean_process_cpu_ms": sum(r["cpu_ms"] for r in runs) / len(runs),
+                "verified_mib_per_second": runs[0]["profile"]["bytes"]
+                / (1024 * 1024)
+                / (statistics.median(r["http_ms"] for r in runs) / 1000),
+                "process_initial": initial_process,
+                "process_final": final_process,
+                "sampled_rss_peak_bytes": max(
+                    sample["rss_bytes"] for sample in samples
+                ),
+                "sampled_footprint_peak_bytes": max(
+                    (
+                        sample["footprint_bytes"]
+                        for sample in samples
+                        if sample["footprint_bytes"] is not None
+                    ),
+                    default=None,
+                ),
+                "memory_samples": samples,
+                "runs": runs,
+            }
+        )
+    binary = Path(os.environ["ANTFLY_BIN"])
+    digest = hashlib.sha256()
+    with binary.open("rb") as artifact:
+        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+            digest.update(chunk)
+    Path(destination).write_text(
+        json.dumps(
+            {
+                "platform": platform.platform(),
+                "machine": platform.machine(),
+                "logical_cpus": os.cpu_count(),
+                "cpu_affinity": sorted(os.sched_getaffinity(0))
+                if hasattr(os, "sched_getaffinity")
+                else None,
+                "cgroup_cpu_max": Path("/sys/fs/cgroup/cpu.max").read_text().strip()
+                if Path("/sys/fs/cgroup/cpu.max").is_file()
+                else None,
+                "controls": {
+                    name: os.environ.get(name)
+                    for name in (
+                        "ANTFLY_BENCH_VALUE_SOURCE_SCALAR",
+                        "ANTFLY_BENCH_VALUE_SOURCE_FULL_DOM",
+                        "ANTFLY_BENCH_VALUE_SOURCE_ROWS",
+                    )
+                },
+                "binary_sha256": digest.hexdigest(),
+                "scope": "ReleaseFast server; fresh predicate membership per request, warm filesystem caches; shared host; HTTP includes profiling; exact-count first result requires the complete response; process CPU includes background work; RSS/physical footprint sampled every 5 ms, not an allocation bound",
                 "records": records,
             },
             indent=2,

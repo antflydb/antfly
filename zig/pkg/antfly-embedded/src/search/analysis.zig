@@ -1768,7 +1768,14 @@ pub const search_as_you_type_root_prefix_analyzer = Analyzer{
     .filters = &.{ .lowercase, .stop_words, .stemmer, .{ .edge_ngram = .{ .min = search_as_you_type_min_prefix_length, .max = search_as_you_type_max_prefix_length } } },
 };
 
-pub const search_as_you_type_analyzer = search_as_you_type_index_prefix_analyzer;
+/// Named roots retain complete normalized words. Prefix dictionaries are
+/// accelerators with a bounded window, never the sole source of root terms.
+/// Prefix expansion of this root stays correct for one-character and arbitrarily
+/// long tokens; generated mappings keep their separate shingle/prefix fields.
+pub const search_as_you_type_analyzer = Analyzer{
+    .tokenizer = .unicode_words,
+    .filters = &.{.lowercase},
+};
 
 pub const substring_min_query_length: u8 = 2;
 pub const substring_max_query_length: u8 = 32;
@@ -2463,4 +2470,13 @@ test "languageAnalyzer works for all languages" {
         // Should produce at least one token for any language
         try std.testing.expect(tokens.len >= 1);
     }
+}
+
+test "logical query named autocomplete roots retain complete short and long words" {
+    const a = std.testing.allocator;
+    const tokens = try search_as_you_type_analyzer.analyze(a, "X abcdefghijklmnopqrstuvwxyzzebra");
+    defer Analyzer.freeTokens(a, tokens);
+    try std.testing.expectEqual(@as(usize, 2), tokens.len);
+    try std.testing.expectEqualStrings("x", tokens[0].term);
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrstuvwxyzzebra", tokens[1].term);
 }
