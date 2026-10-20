@@ -18,8 +18,11 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
+import struct
 import subprocess
+import zlib
 from pathlib import Path
 
 import requests
@@ -37,6 +40,123 @@ class SeededLiteServer(StandaloneAntflyServer):
         if not destination.exists():
             shutil.copy2(self.seed, destination)
         super()._start_process(truncate_logs=truncate_logs)
+
+
+def write_binary_schema_archive(path: Path):
+    """A valid released ASCH v11 schema, with no public JSON contract."""
+
+    def u32(value):
+        return struct.pack("<I", value)
+
+    def string(value):
+        return u32(len(value)) + value
+
+    schema = (
+        b"ASCH"
+        + u32(11)
+        + u32(1)
+        + string(b"doc")
+        + struct.pack("<Q", 1_000_000_000)
+        + string(b"_timestamp")
+        + b"\0"
+        + u32(0) * 3
+    )
+    entries = [
+        (b"\0\0__metadata__:schema", schema),
+        (b"\0\0__metadata__:schema_v1", schema),
+    ]
+    metadata = u32(len(entries)) + b"".join(
+        string(key) + string(value) for key, value in entries
+    )
+    header = bytearray(64)
+    header[:8] = b"ANTFLYB\n"
+    struct.pack_into("<IIq", header, 8, 1, 0, 0)
+    struct.pack_into("<II", header, 40, 1, 1)
+    struct.pack_into("<I", header, 48, zlib.crc32(header[:48]))
+    blocks = [
+        (2, b"{}"),
+        (3, string(b"default") + u32(0) + string(b"") + string(b"")),
+        (24, metadata),
+        (240, struct.pack("<IQQQQ", 0, 0, 0, 0, 0)),
+        (255, struct.pack("<IIQQ", 1, 1, 0, 0)),
+    ]
+
+    def block(kind, payload):
+        framed = struct.pack("<BBI", kind, 0, len(payload)) + payload
+        return framed + u32(zlib.crc32(framed))
+
+    path.write_bytes(
+        header + b"".join(block(kind, payload) for kind, payload in blocks)
+    )
+
+
+def test_binary_schema_adoption_refuses_transfer_and_allows_embedded_repair(tmp_path):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    archive = tmp_path / "typed.afb"
+    seed = tmp_path / "typed.aflite"
+    write_binary_schema_archive(archive)
+    subprocess.run(
+        [binary, "lite", "restore", str(archive), "--out", str(seed)],
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+    refused = subprocess.run(
+        [
+            binary,
+            "standalone",
+            "--storage-engine",
+            "lite",
+            "--storage-path",
+            str(seed),
+            "--data-dir",
+            str(tmp_path / "refused"),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--health",
+            "false",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert refused.returncode != 0, refused.stdout
+    assert "binary-only schema" in refused.stderr, refused.stderr
+    schema = {
+        "version": 2,
+        "default_type": "doc",
+        "ttl": {"duration": "1h"},
+        "document_schemas": {
+            "doc": {"schema": {"type": "object", "additionalProperties": True}}
+        },
+    }
+    public = tmp_path / "schema.json"
+    public.write_text(json.dumps(schema))
+    # This must still be permitted after refusal: no adoption alias or owner
+    # marker may have escaped from the failed transfer.
+    subprocess.run(
+        [binary, "lite", "schema", "set", str(seed), "--file", str(public)],
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    server = SeededLiteServer(binary, seed)
+    failed = True
+    try:
+        response = requests.get(server.api_url + "/tables/default", timeout=30)
+        assert response.ok, response.text
+        assert response.json()["schema"] == schema
+        response = requests.post(
+            server.api_url + "/tables/default/batch",
+            json={"inserts": {"repaired": {"body": "portable"}}, "sync_level": "write"},
+            timeout=30,
+        )
+        assert response.ok, response.text
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
 
 
 def test_lite_schema_migration_and_document_survive_file_only_handoff(tmp_path):

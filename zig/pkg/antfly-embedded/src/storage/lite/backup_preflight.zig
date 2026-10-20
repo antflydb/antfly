@@ -710,15 +710,43 @@ pub const Inspector = struct {
 fn isLocalHost(host: []const u8) bool {
     if (host.len == 0) return false;
     if (host[0] == '[' and host[host.len - 1] == ']') {
-        const address = std.Io.net.Ip6Address.parse(host[1 .. host.len - 1], 0) catch return true;
+        const literal = host[1 .. host.len - 1];
+        // Normalize mixed dotted/hex notation without resolving the address.
+        // The pinned std parser only accepts dotted tails after ::ffff:.
+        var hexadecimal: [64]u8 = undefined;
+        const hex = if (std.mem.indexOfScalar(u8, literal, '.') != null) blk: {
+            const colon = std.mem.lastIndexOfScalar(u8, literal, ':') orelse return true;
+            const ip4 = std.Io.net.Ip4Address.parse(literal[colon + 1 ..], 0) catch return true;
+            break :blk std.fmt.bufPrint(&hexadecimal, "{s}{x}:{x}", .{
+                literal[0 .. colon + 1],
+                std.mem.readInt(u16, ip4.bytes[0..2], .big),
+                std.mem.readInt(u16, ip4.bytes[2..4], .big),
+            }) catch return true;
+        } else literal;
+        // The same parser special-cases ::ffff: as dotted IPv4 only. Expand
+        // that prefix so hexadecimal mapped addresses use its general parser.
+        var expanded: [64]u8 = undefined;
+        const input = if (std.ascii.startsWithIgnoreCase(hex, "::ffff:"))
+            std.fmt.bufPrint(&expanded, "0:0:0:0:0:ffff:{s}", .{hex[7..]}) catch return true
+        else
+            hex;
+        const address = std.Io.net.Ip6Address.parse(input, 0) catch return true;
         const b = address.bytes;
-        if ((std.mem.allEqual(u8, b[0..15], 0) and b[15] <= 1) or b[0] & 0xfe == 0xfc or (b[0] == 0xfe and b[1] & 0xc0 == 0x80) or (std.mem.allEqual(u8, b[0..10], 0) and b[10] == 255 and b[11] == 255)) return true;
+        // Classify mapped IPv4 by its actual address, not by the IPv6 prefix.
+        if (std.mem.allEqual(u8, b[0..10], 0) and b[10] == 255 and b[11] == 255)
+            return isLocalIpv4(b[12], b[13]);
+        // Return for public literals too: they must not fall through to the
+        // single-label hostname rule below.
+        return (std.mem.allEqual(u8, b[0..15], 0) and b[15] <= 1) or b[0] & 0xfe == 0xfc or (b[0] == 0xfe and b[1] & 0xc0 == 0x80);
     }
-    if (eq(host, "localhost") or std.mem.endsWith(u8, host, ".localhost") or std.mem.endsWith(u8, host, ".local") or eq(host, "[::1]") or eq(host, "[::]") or std.mem.indexOf(u8, host, "::ffff:") != null) return true;
-    if (std.mem.startsWith(u8, host, "[fc") or std.mem.startsWith(u8, host, "[fd") or std.mem.startsWith(u8, host, "[fe80:")) return true;
+    if (eq(host, "localhost") or std.mem.endsWith(u8, host, ".localhost") or std.mem.endsWith(u8, host, ".local")) return true;
     var octets = std.mem.splitScalar(u8, host, '.');
     const first = std.fmt.parseUnsigned(u16, octets.next() orelse return false, 10) catch return std.mem.indexOfScalar(u8, host, '.') == null;
     const second = std.fmt.parseUnsigned(u16, octets.next() orelse return true, 10) catch return false;
+    return isLocalIpv4(first, second);
+}
+
+fn isLocalIpv4(first: u16, second: u16) bool {
     return first == 127 or first == 0 or first == 10 or (first == 169 and second == 254) or (first == 192 and second == 168) or (first == 172 and second >= 16 and second <= 31);
 }
 
@@ -728,6 +756,46 @@ fn count(report: Report, kind: Kind) u64 {
         n += r.count;
     };
     return n;
+}
+
+test "backup preflight IP literals retain public and local scope" {
+    const a = std.testing.allocator;
+    for ([_]struct { url: []const u8, local: bool }{
+        .{ .url = "https://[2606:4700:4700::1111]/file.txt", .local = false },
+        .{ .url = "https://[2606:4700:4700:0:0:0:0:1111]/file.txt", .local = false },
+        .{ .url = "https://[::ffff:808:808]/file.txt", .local = false },
+        .{ .url = "https://[::ffff:8.8.8.8]/file.txt", .local = false },
+        .{ .url = "https://[0:0:0:0:0:ffff:8.8.8.8]/file.txt", .local = false },
+        .{ .url = "https://[64:ff9b::8.8.8.8]/file.txt", .local = false },
+        .{ .url = "https://8.8.8.8/file.txt", .local = false },
+        .{ .url = "https://[::]/file.txt", .local = true },
+        .{ .url = "https://[::1]/file.txt", .local = true },
+        .{ .url = "https://[fc00::1]/file.txt", .local = true },
+        .{ .url = "https://[fe80::1]/file.txt", .local = true },
+        .{ .url = "https://[::ffff:127.0.0.1]/file.txt", .local = true },
+        .{ .url = "https://[0:0:0:0:0:ffff:192.168.1.1]/file.txt", .local = true },
+        .{ .url = "https://[0:0:0:0:0:ffff:c0a8:101]/file.txt", .local = true },
+        .{ .url = "https://192.168.1.1/file.txt", .local = true },
+        .{ .url = "https://localhost/file.txt", .local = true },
+    }) |case| {
+        var report: Report = .{ .allocator = a, .scan_complete = true };
+        defer report.deinit();
+        var inspector: Inspector = .{ .allocator = a, .report = &report, .options = .{} };
+        defer inspector.deinit();
+        try inspector.locator(case.url, "", "");
+        try std.testing.expectEqual(@as(u64, if (case.local) 1 else 0), count(report, .source_local));
+        try std.testing.expectEqual(@as(u64, 1), count(report, .source_external));
+        var capabilities: std.ArrayListUnmanaged(Capability) = .empty;
+        defer capabilities.deinit(a);
+        for (report.requirements.items) |*requirement| try capabilities.append(a, .{ .requirement_sha256 = &requirement.sha256, .supported = true });
+        const destination = try std.json.Stringify.valueAlloc(a, Destination{ .version = 1, .configuration_id = "verified", .requirements = capabilities.items }, .{});
+        defer a.free(destination);
+        const json = try report.jsonAlloc(destination);
+        defer a.free(json);
+        var parsed = try std.json.parseFromSlice(Value, a, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(if (case.local) "blocked" else "compatible", parsed.value.object.get("compatibility").?.object.get("verdict").?.string);
+    }
 }
 
 test "backup preflight embedded inference identity retains model requirements without a media locator" {

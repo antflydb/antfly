@@ -168,6 +168,13 @@ Native dense, sparse, graph and algebraic indexes, resolver catalogs, and
 additional embedded tables are rejected before adoption. Stored embeddings
 alone do not imply a supported ANN index.
 
+Adoption requires the public JSON contract for an existing schema and verifies
+that it matches the stored runtime schema. A binary-only schema written through
+native `DB.setSchema()` is rejected before ownership transfers. While the file
+is still embedded-owned, publish the intended public schema at a newer version
+through `setSchemaJson()` or `lite schema set`, then retry adoption. The runtime
+schema cannot be inverted into a public contract without losing semantics.
+
 Once adopted, the standalone catalog owns schema, index, enrichment, resolver
 and table definitions. Embedded clients can still read, search and edit
 documents offline, but definition changes must go through the standalone API.

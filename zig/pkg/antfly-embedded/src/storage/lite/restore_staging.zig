@@ -770,7 +770,30 @@ pub fn embeddedTableDefinition(
         error.NotFound => null,
         else => return err,
     };
-    if (schema) |value| definition.schema_json = try alloc.dupe(u8, value);
+    const runtime_schema = @import("../schema.zig");
+    const encoded = txn.get(runtime_schema.schema_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    // A missing public contract is not an absent schema. Native setSchema()
+    // deliberately stores only the lowered runtime representation; there is no
+    // lossless inverse for its validation and indexing semantics. Refuse the
+    // transfer while the embedded owner can still publish an explicit contract.
+    if (encoded != null and schema == null) {
+        std.log.err("embedded Lite adoption cannot transfer a binary-only schema; publish the intended public schema with setSchemaJson (or lite schema set) at a newer version before serving the file", .{});
+        return error.UnsupportedEmbeddedLiteSchema;
+    }
+    if (schema) |value| {
+        const bytes = encoded orelse return error.InvalidEmbeddedLiteSchema;
+        const stored = try runtime_schema.deserializeSchema(alloc, bytes);
+        defer runtime_schema.freeSchema(alloc, stored);
+        var public = try tables_api.parseValidatedTableSchema(alloc, value);
+        defer public.deinit(alloc);
+        const derived = try tables_api.deriveRuntimeTableSchema(alloc, public);
+        defer runtime_schema.freeSchema(alloc, derived);
+        if (!try runtime_schema.schemasEqualForPublicBinding(alloc, stored, derived)) return error.InvalidEmbeddedLiteSchema;
+        definition.schema_json = try alloc.dupe(u8, value);
+    }
     const indexes = txn.get("\x00\x00__metadata__:indexes") catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
@@ -2658,6 +2681,38 @@ test "backup preflight relational rows use archived schema for active media fiel
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "row:late") != null);
+}
+
+test "lite restore staging refuses binary-only or mismatched schemas before ownership transfer" {
+    @import("antfly_test_error_logs").expectErrorLogs(1);
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/typed-schema.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var lite = try LiteDb.create(a, path, true);
+    defer lite.close();
+    try lite.db.setSchema(.{ .version = 1, .ttl_duration_ns = 1_000_000_000 });
+    try std.testing.expectError(error.UnsupportedEmbeddedLiteSchema, embeddedTableDefinition(a, lite.backend.native_runtime_store.?));
+    try lite.backend.requireEmbeddedCatalogOwnership();
+    try std.testing.expect(!lite.backend.hasStandaloneRootAdoption());
+    try std.testing.expect(!try lite.backend.isStandaloneArtifact());
+
+    // Refusal leaves the supported repair path available to the embedded owner.
+    const public = "{\"version\":2,\"default_type\":\"doc\",\"ttl_duration\":\"1s\"}";
+    try lite.db.setSchemaJson(a, public);
+    var definition = try embeddedTableDefinition(a, lite.backend.native_runtime_store.?);
+    defer definition.deinit(a);
+    try std.testing.expectEqualStrings(public, definition.schema_json.?);
+    {
+        var write = try lite.backend.native_runtime_store.?.beginWrite();
+        errdefer write.abort();
+        try write.put("\x00\x00__metadata__:schema_json", "{\"version\":3}");
+        try write.commit();
+    }
+    try std.testing.expectError(error.InvalidEmbeddedLiteSchema, embeddedTableDefinition(a, lite.backend.native_runtime_store.?));
+    try lite.backend.requireEmbeddedCatalogOwnership();
+    try std.testing.expect(!lite.backend.hasStandaloneRootAdoption());
 }
 
 test "lite restore staging standalone adoption preserves full text incarnation and rejects unsupported catalogs" {
