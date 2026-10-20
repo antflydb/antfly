@@ -60,7 +60,13 @@ fn concurrentStatuses(io: std.Io, alloc: Allocator, worker: anytype) !StatusResp
         .pointer => |pointer| pointer.child,
         else => @TypeOf(worker),
     };
-    var donor = try io.concurrent(Worker.run, .{ worker, io_contract.Side.donor });
+    var donor = io.concurrent(Worker.run, .{ worker, io_contract.Side.donor }) catch {
+        // Inline runtimes and a saturated general lane retain the previous
+        // bounded serial path; lack of a spare task is not new merge debt.
+        var source_response = try worker.run(.donor);
+        errdefer source_response.deinit(alloc);
+        return .{ .donor = source_response, .receiver = try worker.run(.receiver) };
+    };
     var receiver = worker.run(.receiver) catch |err| {
         if (donor.cancel(io)) |response| {
             var discarded = response;
@@ -100,6 +106,33 @@ test "online merge status probes overlap and join both error paths" {
             try std.testing.expectEqualStrings("receiver", responses.receiver.body);
         }
         try std.testing.expectEqual(@as(u32, 2), worker.entered.load(.acquire));
+    }
+}
+
+test "online merge status probes preserve inline progress when concurrency is unavailable" {
+    var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    defer unavailable.deinit();
+    const Worker = struct {
+        calls: u32 = 0,
+        fail: ?io_contract.Side,
+        fn run(self: *@This(), side: io_contract.Side) !api.QueryResponse {
+            try std.testing.expectEqual(if (self.calls == 0) io_contract.Side.donor else .receiver, side);
+            self.calls += 1;
+            if (self.fail == side) return error.Timeout;
+            return .{ .body = try std.testing.allocator.dupe(u8, @tagName(side)) };
+        }
+    };
+    for ([_]?io_contract.Side{ null, .donor, .receiver }) |fail| {
+        var worker: Worker = .{ .fail = fail };
+        if (fail != null) {
+            try std.testing.expectError(error.Timeout, concurrentStatuses(unavailable.io(), std.testing.allocator, &worker));
+        } else {
+            var responses = try concurrentStatuses(unavailable.io(), std.testing.allocator, &worker);
+            defer responses.deinit(std.testing.allocator);
+            try std.testing.expectEqualStrings("donor", responses.donor.body);
+            try std.testing.expectEqualStrings("receiver", responses.receiver.body);
+        }
+        try std.testing.expectEqual(@as(u32, if (fail == .donor) 1 else 2), worker.calls);
     }
 }
 
