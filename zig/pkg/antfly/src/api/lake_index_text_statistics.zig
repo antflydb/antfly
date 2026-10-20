@@ -1057,6 +1057,7 @@ test "external lake text statistics spill sorted deltas and reuse untouched page
     defer update.deinit();
     try update.add(backing.store(), removed, -1);
     const changed = (try update.finish(backing.store(), global)).?;
+    std.debug.print("text statistics single-term update: written_bytes={}\n", .{backing.written_bytes - written});
     // A one-term change rewrites its path, not the entire vocabulary.
     try std.testing.expect(backing.written_bytes - written < tree.bulk_target_page_bytes * 2);
     try std.testing.expectEqual(global.records, changed.records);
