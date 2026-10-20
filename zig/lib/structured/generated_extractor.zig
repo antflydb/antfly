@@ -222,12 +222,27 @@ pub const Validation = struct {
     }
 };
 
-pub fn materialize(a: A, config: Config, texts: []const []const u8, planned: Plan, generated: c.Result) ![]?V {
+/// Every source document has one typed outcome, even when its input spans
+/// multiple windows. Keep execution failures with their owning document so
+/// every consumer uses the same error attribution and successful siblings.
+pub const Outcome = union(enum) {
+    value: V,
+    failure: anyerror,
+
+    pub fn get(self: Outcome) !V {
+        return switch (self) {
+            .value => |value| value,
+            .failure => |err| err,
+        };
+    }
+};
+
+pub fn materialize(a: A, config: Config, texts: []const []const u8, planned: Plan, generated: c.Result) ![]Outcome {
     return materializeWithControl(a, config, texts, planned, generated, null);
 }
-pub fn materializeWithControl(a: A, config: Config, texts: []const []const u8, planned: Plan, generated: c.Result, control: ?extraction_text.Checkpoint) ![]?V {
+pub fn materializeWithControl(a: A, config: Config, texts: []const []const u8, planned: Plan, generated: c.Result, control: ?extraction_text.Checkpoint) ![]Outcome {
     const result = try a.alloc(?V, texts.len);
-    const failed = try a.alloc(bool, texts.len);
+    const failures = try a.alloc(?anyerror, texts.len);
     const unaligned = try a.alloc(usize, texts.len);
     const entity_indices = try a.alloc(std.StringHashMapUnmanaged(usize), texts.len);
     const relation_indices = try a.alloc(std.StringHashMapUnmanaged(usize), texts.len);
@@ -237,7 +252,7 @@ pub fn materializeWithControl(a: A, config: Config, texts: []const []const u8, p
         relations.* = .empty;
         map.* = if (config.options.offset_unit == .unicode_codepoints) try OffsetMap.init(a, text, 1024 * 1024) else null;
     }
-    @memset(failed, false);
+    @memset(failures, null);
     @memset(unaligned, 0);
     for (result) |*output| {
         output.* = c.object();
@@ -248,7 +263,10 @@ pub fn materializeWithControl(a: A, config: Config, texts: []const []const u8, p
         if (control) |checkpoint| try checkpoint.check();
         const document = window.document;
         const raw = value orelse {
-            failed[document] = true;
+            if (failures[document] == null) failures[document] = if (window_index < generated.failures.len)
+                generated.failures[window_index] orelse error.InvalidConstrainedOutput
+            else
+                error.InvalidConstrainedOutput;
             continue;
         };
         const entities = raw.object.get("entities").?.array.items;
@@ -263,7 +281,7 @@ pub fn materializeWithControl(a: A, config: Config, texts: []const []const u8, p
         const aligned = alignment.find(a, texts[document][window.start..window.end], forms.items, .{ .max_steps = 10000000, .max_mentions = 4096, .control = control }) catch |err| switch (err) {
             error.OutOfMemory, error.Cancelled, error.Canceled, error.Timeout => return err,
             else => {
-                failed[document] = true;
+                if (failures[document] == null) failures[document] = err;
                 continue :windows_loop;
             },
         };
@@ -282,7 +300,7 @@ pub fn materializeWithControl(a: A, config: Config, texts: []const []const u8, p
                 const found = entity_indices[document].get(identity);
                 const index_out = found orelse blk: {
                     if (output_entities.array.items.len >= 4096) {
-                        failed[document] = true;
+                        failures[document] = failures[document] orelse error.GeneratedExtractionLimitExceeded;
                         continue :windows_loop;
                     }
                     var mention = c.object();
@@ -334,7 +352,7 @@ pub fn materializeWithControl(a: A, config: Config, texts: []const []const u8, p
                     continue;
                 }
                 if (relations.array.items.len >= 4096) {
-                    failed[document] = true;
+                    failures[document] = failures[document] orelse error.GeneratedExtractionLimitExceeded;
                     continue :windows_loop;
                 }
                 var edge = c.object();
@@ -351,8 +369,10 @@ pub fn materializeWithControl(a: A, config: Config, texts: []const []const u8, p
             };
         }
     }
+    const outcomes = try a.alloc(Outcome, texts.len);
     for (result, 0..) |*output, i| {
-        if (failed[i]) {
+        if (failures[i]) |err| {
+            outcomes[i] = .{ .failure = err };
             output.* = null;
             continue;
         }
@@ -371,9 +391,33 @@ pub fn materializeWithControl(a: A, config: Config, texts: []const []const u8, p
         try c.put(a, &output.*.?, "unaligned_mentions", .{ .integer = @intCast(unaligned[i]) });
         try c.put(a, &output.*.?, "probability_source", .{ .string = if (config.probabilities == .verdict_only) "verdict" else "token_logprobs" });
         try c.put(a, &output.*.?, "model", .{ .string = config.generator.model });
+        outcomes[i] = .{ .value = output.*.? };
     }
-    return result;
+    return outcomes;
 }
+/// Encode the public all-or-error extraction response from the same typed
+/// document outcomes used by embedded producers. No transport may replace a
+/// failed window's cause with a generic output-validation error.
+pub fn responseValue(a: A, model: []const u8, inputs: []const V, outcomes: []const Outcome, execution: c.Result) !V {
+    if (inputs.len != outcomes.len) return error.InvalidGeneratedExtractorConfig;
+    var data = try c.array(a, &.{});
+    for (outcomes, inputs) |outcome, input| {
+        var result = try outcome.get();
+        if (input.object.get("id")) |id| try c.put(a, &result, "id", id);
+        try data.array.append(result);
+    }
+    var response = c.object();
+    try c.put(a, &response, "object", .{ .string = "extraction" });
+    try c.put(a, &response, "schema_version", .{ .integer = 2 });
+    try c.put(a, &response, "model", .{ .string = model });
+    try c.put(a, &response, "data", data);
+    var usage = c.object();
+    try c.put(a, &usage, "input_tokens", .{ .integer = @intCast(execution.input_tokens) });
+    try c.put(a, &usage, "output_tokens", .{ .integer = @intCast(execution.output_tokens) });
+    try c.put(a, &response, "usage", usage);
+    return response;
+}
+
 fn offset(map: ?OffsetMap, index: usize) !usize {
     return if (map) |value| (try value.convert(.{ .start = index, .end = index }, .unicode_codepoints)).start else index;
 }
@@ -421,10 +465,65 @@ test "asset producer runtime generated extraction aligns repeated Unicode mentio
     @memset(token_evidence, null);
     const text = "Éva met Éva.";
     const output = try materialize(a, config.value, &.{text}, .{ .windows = try a.dupe(Window, &.{ .{ .document = 0, .start = 0, .end = text.len }, .{ .document = 0, .start = 0, .end = text.len } }), .inputs = try a.dupe([]const u8, &.{ text, text }) }, .{ .values = values, .token_evidence = token_evidence });
-    const entities = output[0].?.object.get("entities").?.array.items;
+    const entities = (try output[0].get()).object.get("entities").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), entities.len);
     try std.testing.expectEqual(@as(i64, 0), entities[0].object.get("start").?.integer);
     try std.testing.expectEqual(@as(i64, 9), entities[1].object.get("start").?.integer);
     try std.testing.expectEqualStrings("Éva", entities[1].object.get("text").?.string);
-    try std.testing.expectEqual(@as(i64, 2), output[0].?.object.get("unaligned_mentions").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), (try output[0].get()).object.get("unaligned_mentions").?.integer);
+}
+
+test "generated extraction attributes typed window failures and preserves successful documents" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try parse(a,
+        \\{"method":"generated","generator":{"provider":"antfly","model":"fixture"},"schema":{"entities":["person"]},"probabilities":"verdict_only"}
+    );
+    defer config.deinit();
+    const Fake = struct {
+        fn invoke(_: *anyopaque, alloc: A, request: c.Invocation) !c.Reply {
+            return switch (request.items[0].id) {
+                0 => error.GenerationCapacityUnavailable,
+                1 => error.Timeout,
+                2 => error.UnsupportedConstrainedProbabilities,
+                else => .{ .value = try std.json.parseFromSliceLeaky(V, alloc,
+                    \\{"items":[{"item":3,"value":{"entities":[{"label":"person","text":"Alice","present":true}],"relations":[]}}]}
+                , .{}) },
+            };
+        }
+    };
+    var dummy: u8 = 0;
+    // Capacity and unsupported vocabulary occur at different windows of the
+    // same document. First failure follows source order, not document index.
+    const texts = [_][]const u8{ "Alice", "Alice", "Alice" };
+    const windows = [_]Window{
+        .{ .document = 0, .start = 0, .end = 5 },
+        .{ .document = 0, .start = 0, .end = 5 },
+        .{ .document = 1, .start = 0, .end = 5 },
+        .{ .document = 2, .start = 0, .end = 5 },
+    };
+    const planned = Plan{ .windows = try a.dupe(Window, &windows), .inputs = try a.dupe([]const u8, &.{ "Alice", "Alice", "Alice", "Alice" }) };
+    // Timeout ends a request by contract; exercise it independently below.
+    const values = try std.json.parseFromSliceLeaky(V, a, "{\"entities\":[],\"relations\":[]}", .{});
+    const generated = c.Result{ .values = try a.dupe(?V, &.{ null, null, null, values }), .failures = try a.dupe(?anyerror, &.{ error.GenerationCapacityUnavailable, error.Timeout, error.UnsupportedConstrainedProbabilities, null }), .token_evidence = try a.dupe(?c.TokenEvidence, &.{ null, null, null, null }) };
+    const outcomes = try materialize(a, config.value, &texts, planned, generated);
+    try std.testing.expectError(error.GenerationCapacityUnavailable, outcomes[0].get());
+    try std.testing.expectError(error.UnsupportedConstrainedProbabilities, outcomes[1].get());
+    _ = try outcomes[2].get();
+    const successful_inputs = try std.json.parseFromSliceLeaky(V, a, "[{\"content\":\"Alice\",\"id\":\"stable-id\"}]", .{});
+    var usage = generated;
+    usage.input_tokens = 42;
+    usage.output_tokens = 7;
+    const response = try responseValue(a, "fixture", successful_inputs.array.items, outcomes[2..], usage);
+    try std.testing.expectEqualStrings("extraction", response.object.get("object").?.string);
+    try std.testing.expectEqual(@as(i64, 2), response.object.get("schema_version").?.integer);
+    try std.testing.expectEqualStrings("stable-id", response.object.get("data").?.array.items[0].object.get("id").?.string);
+    try std.testing.expectEqual(@as(i64, 42), response.object.get("usage").?.object.get("input_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), response.object.get("usage").?.object.get("output_tokens").?.integer);
+    const timed_out = try c.execute(a, .{ .ptr = &dummy, .invoke = Fake.invoke }, .grammar, try outputSchema(a, config.value), "", .{ .max_items_per_call = 1 }, planned.inputs);
+    const timed_out_outcomes = try materialize(a, config.value, &texts, planned, timed_out);
+    try std.testing.expectError(error.GenerationCapacityUnavailable, timed_out_outcomes[0].get());
+    try std.testing.expectError(error.Timeout, timed_out_outcomes[1].get());
+    try std.testing.expectError(error.Timeout, timed_out_outcomes[2].get());
 }

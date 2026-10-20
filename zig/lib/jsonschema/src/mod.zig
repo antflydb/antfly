@@ -318,6 +318,11 @@ const RuntimeValidationContext = struct {
     alloc: std.mem.Allocator,
     root_property: ?*const DocumentProperty = null,
     active_root_ref_values: std.ArrayListUnmanaged(usize) = .empty,
+    field_policy: enum { document, json_value } = .document,
+
+    fn ignoreField(self: *const RuntimeValidationContext, name: []const u8) bool {
+        return self.field_policy == .document and shouldIgnoreSchemaValidationField(name);
+    }
 
     pub fn deinit(self: *RuntimeValidationContext) void {
         self.active_root_ref_values.deinit(self.alloc);
@@ -407,6 +412,7 @@ pub fn validateJsonSchemaValue(
     var validation_context = RuntimeValidationContext{
         .alloc = alloc,
         .root_property = root_property,
+        .field_policy = .json_value,
     };
     defer validation_context.deinit();
 
@@ -2394,7 +2400,8 @@ fn validateDocumentFieldValueWithContext(
         }
     }
 
-    if (property.properties.len > 0 or
+    if (property.min_properties != null or property.max_properties != null or
+        property.properties.len > 0 or
         property.pattern_properties.len > 0 or
         property.required_fields.len > 0 or
         property.additional_properties_allowed != null or
@@ -2409,7 +2416,7 @@ fn validateDocumentFieldValueWithContext(
             .object => |object| object,
             else => return error.InvalidBatchRequest,
         };
-        try validateObjectCardinality(object, property.min_properties, property.max_properties);
+        try validateObjectCardinality(context, object, property.min_properties, property.max_properties);
         try validateRequiredFieldsPresent(object, property.required_fields);
         if (property.property_names) |property_names| try validatePropertyNames(context, object, property_names.*, enforce_types);
         try validateDependentRequired(object, property.dependent_required);
@@ -2419,7 +2426,7 @@ fn validateDocumentFieldValueWithContext(
         try collectComposedObjectFieldCoverage(context, property, object, enforce_types, &composition_evaluated_fields, false);
         var it = object.iterator();
         while (it.next()) |entry| {
-            if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
+            if (context.ignoreField(entry.key_ptr.*)) continue;
             if (findDocumentProperty(property.properties, entry.key_ptr.*)) |child_property| {
                 try validateDocumentFieldValueWithContext(context, child_property, entry.value_ptr, enforce_types);
                 continue;
@@ -2625,13 +2632,13 @@ fn validateRequiredFieldsPresent(object: json.ObjectMap, required_fields: []cons
     }
 }
 
-fn validateObjectCardinality(object: json.ObjectMap, min_properties: ?u64, max_properties: ?u64) !void {
+fn validateObjectCardinality(context: *RuntimeValidationContext, object: json.ObjectMap, min_properties: ?u64, max_properties: ?u64) !void {
     if (min_properties == null and max_properties == null) return;
 
     var count: u64 = 0;
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
+        if (context.ignoreField(entry.key_ptr.*)) continue;
         count += 1;
     }
 
@@ -2677,7 +2684,7 @@ fn validatePropertyNames(
 ) anyerror!void {
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
+        if (context.ignoreField(entry.key_ptr.*)) continue;
         const key_value: json.Value = .{ .string = entry.key_ptr.* };
         try validateDocumentFieldValueWithContext(context, property_names, &key_value, enforce_types);
     }
@@ -2731,14 +2738,14 @@ fn schemaMatchesValue(
 }
 
 fn markAllObjectFieldsEvaluated(
-    alloc: std.mem.Allocator,
+    context: *RuntimeValidationContext,
     object: json.ObjectMap,
     evaluated_fields: *std.StringHashMapUnmanaged(void),
 ) anyerror!void {
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
-        try evaluated_fields.put(alloc, entry.key_ptr.*, {});
+        if (context.ignoreField(entry.key_ptr.*)) continue;
+        try evaluated_fields.put(context.alloc, entry.key_ptr.*, {});
     }
 }
 
@@ -2761,7 +2768,7 @@ fn markDirectObjectFieldCoverage(
 
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
+        if (context.ignoreField(entry.key_ptr.*)) continue;
         if (findDocumentProperty(property.properties, entry.key_ptr.*) != null) {
             try evaluated_fields.put(context.alloc, entry.key_ptr.*, {});
             continue;
@@ -2777,7 +2784,7 @@ fn markDirectObjectFieldCoverage(
         defer remaining.deinit(context.alloc);
         var object_it = object.iterator();
         while (object_it.next()) |entry| {
-            if (shouldIgnoreSchemaValidationField(entry.key_ptr.*)) continue;
+            if (context.ignoreField(entry.key_ptr.*)) continue;
             if (evaluated_fields.contains(entry.key_ptr.*)) continue;
             if (property.additional_properties_schema) |schema| {
                 try validateDocumentFieldValueWithContext(context, schema.*, entry.value_ptr, enforce_types);
@@ -2847,11 +2854,11 @@ fn collectComposedObjectFieldCoverage(
     if (!include_local_unevaluated) return;
 
     if (property.unevaluated_properties_schema != null) {
-        try markAllObjectFieldsEvaluated(context.alloc, object, evaluated_fields);
+        try markAllObjectFieldsEvaluated(context, object, evaluated_fields);
         return;
     }
     if (property.unevaluated_properties_allowed) |allowed| {
-        if (allowed) try markAllObjectFieldsEvaluated(context.alloc, object, evaluated_fields);
+        if (allowed) try markAllObjectFieldsEvaluated(context, object, evaluated_fields);
     }
 }
 
@@ -3915,4 +3922,37 @@ test "validate generic json schema rejects integer mismatch" {
             \\{"count":2.5}
         ),
     );
+}
+
+test "generic json schema validates underscore fields through nested and composed values" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"type":"object","properties":{"_count":{"type":"integer"},"nested":{"type":"array","items":{"type":"object","properties":{"_flag":{"type":"boolean"}},"required":["_flag"],"additionalProperties":false}}},"required":["_count"],"additionalProperties":false}
+    ;
+    try validateJsonSchemaJson(a, schema, "{\"_count\":1,\"nested\":[{\"_flag\":true}]}");
+    for ([_][]const u8{
+        "{\"_count\":\"invalid\"}",
+        "{\"_count\":1,\"_unexpected\":true}",
+        "{\"_count\":1,\"nested\":[{\"_flag\":1}]}",
+        "{\"_count\":1,\"nested\":[{\"_flag\":true,\"_unexpected\":false}]}",
+    }) |raw| try std.testing.expectError(error.InvalidBatchRequest, validateJsonSchemaJson(a, schema, raw));
+    const composed =
+        \\{"type":"object","allOf":[{"properties":{"_count":{"type":"integer"}}}],"unevaluatedProperties":false}
+    ;
+    try validateJsonSchemaJson(a, composed, "{\"_count\":1}");
+    try std.testing.expectError(error.InvalidBatchRequest, validateJsonSchemaJson(a, composed, "{\"_count\":\"invalid\"}"));
+    try std.testing.expectError(error.InvalidBatchRequest, validateJsonSchemaJson(a, composed, "{\"_other\":1}"));
+    try std.testing.expectError(error.InvalidBatchRequest, validateJsonSchemaJson(a, "{\"type\":\"object\",\"propertyNames\":{\"pattern\":\"^[a-z]+$\"}}", "{\"_other\":1}"));
+    try validateJsonSchemaJson(a, "{\"type\":\"object\",\"minProperties\":1,\"maxProperties\":1}", "{\"_count\":1}");
+    try std.testing.expectError(error.InvalidBatchRequest, validateJsonSchemaJson(a, "{\"type\":\"object\",\"maxProperties\":0}", "{\"_count\":1}"));
+}
+
+test "document validation retains its explicit metadata field policy" {
+    const a = std.testing.allocator;
+    var schema = try parseSchema(a,
+        \\{"default_type":"doc","enforce_types":true,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"count":{"type":"integer"}},"required":["count"],"additionalProperties":false,"maxProperties":1}}}}
+    );
+    defer schema.deinit(a);
+    try validateWritesAgainstSchema(a, schema, &.{.{ .value = "{\"count\":1,\"_metadata\":{\"source\":\"test\"}}" }});
+    try std.testing.expectError(error.InvalidBatchRequest, validateWritesAgainstSchema(a, schema, &.{.{ .value = "{\"count\":1,\"unexpected\":true}" }}));
 }

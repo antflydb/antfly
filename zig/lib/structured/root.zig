@@ -539,3 +539,37 @@ test "constrained OpenAI dialect admission rejects optional properties and retai
     const duplicate = try std.json.parseFromSliceLeaky(Json, a, "[\"a\",\"a\"]", .{});
     if (schema_validator.validateJsonSchemaValue(a, unique, duplicate)) |_| return error.TestExpectedError else |_| {}
 }
+
+test "constrained values repair invalid underscore fields before semantic access" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fake = struct {
+        calls: usize = 0,
+        validations: usize = 0,
+        fn invoke(ptr: *anyopaque, alloc: Allocator, request: Invocation) !Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) return .{ .value = try std.json.parseFromSliceLeaky(Json, alloc,
+                \\{"items":[{"item":0,"value":{"_count":"invalid","_unexpected":true}}]}
+            , .{}) };
+            try std.testing.expect(request.validation_error != null);
+            return .{ .value = try std.json.parseFromSliceLeaky(Json, alloc,
+                \\{"items":[{"item":0,"value":{"_count":2}}]}
+            , .{}) };
+        }
+        fn validate(ptr: *anyopaque, _: Allocator, _: usize, value: Json, _: ?TokenEvidence) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.validations += 1;
+            try std.testing.expectEqual(@as(i64, 2), value.object.get("_count").?.integer);
+        }
+    };
+    var fake = Fake{};
+    const schema = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"type":"object","properties":{"_count":{"type":"integer"}},"required":["_count"],"additionalProperties":false}
+    , .{});
+    const result = try execute(a, .{ .ptr = &fake, .invoke = Fake.invoke, .validate_item = Fake.validate }, .json_schema, schema, "", .{}, &.{"text"});
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.validations);
+    try std.testing.expect(result.failures[0] == null);
+}

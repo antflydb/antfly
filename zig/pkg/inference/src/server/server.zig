@@ -20404,16 +20404,7 @@ pub const Node = struct {
         const instructions = try std.fmt.allocPrint(a, "Extract only entities and relations grounded in each input. Use literal source surface forms. Relations reference entity positions. Set present=false for absent candidates. Never invent offsets or confidence. {s}", .{config.instructions});
         const generated = try c.execute(a, .{ .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
         const values = try extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
-        var data = try c.array(a, &.{});
-        for (values, inputs.value.array.items) |value, input| {
-            var result = value orelse return error.InvalidConstrainedOutput;
-            if (input.object.get("id")) |id| {
-                if (id != .string) return error.InvalidGeneratedExtractorConfig;
-                try c.put(a, &result, "id", id);
-            }
-            try data.array.append(result);
-        }
-        return std.json.Stringify.valueAlloc(allocator, .{ .object = "extraction", .schema_version = @as(u8, 2), .model = config.generator.model, .data = data, .usage = .{ .input_tokens = generated.input_tokens, .output_tokens = generated.output_tokens } }, .{});
+        return std.json.Stringify.valueAlloc(allocator, try extractor.responseValue(a, config.generator.model, inputs.value.array.items, values, generated), .{});
     }
 
     fn generatedDecisionJson(self: *Node, allocator: std.mem.Allocator, a: std.mem.Allocator, envelope: std.json.Value, control: ?InferenceExecutionControl) ![]u8 {
@@ -39080,4 +39071,35 @@ test "local generation bridge reports unsupported finite vocabulary as permanent
     try std.testing.expectEqual(@as(u16, 400), response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "UNSUPPORTED_CONSTRAINED_PROBABILITIES") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":false") != null);
+}
+
+test "generated constrained extraction transport retains typed document failures" {
+    const c = @import("antfly_structured");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const inputs = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "[{\"content\":\"Alice\",\"id\":\"doc\"}]", .{});
+    for ([_]anyerror{ error.GenerationCapacityUnavailable, error.Timeout, error.UnsupportedConstrainedProbabilities }) |cause| {
+        const outcomes = [_]c.extraction.Outcome{.{ .failure = cause }};
+        const err = if (c.extraction.responseValue(scratch, "fixture", inputs.array.items, &outcomes, .{ .values = &.{}, .token_evidence = &.{} })) |_| return error.TestExpectedError else |failure| failure;
+        try std.testing.expectEqual(cause, err);
+        var request = try httpx.Request.init(a, .POST, "/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try extractionDirectFailureResponse(&ctx, err);
+        defer response.deinit();
+        const expected: struct { status: u16, code: []const u8, retryable: bool } = switch (cause) {
+            error.GenerationCapacityUnavailable => .{ .status = 503, .code = "MODEL_RESOURCE_BUSY", .retryable = true },
+            error.Timeout => .{ .status = 504, .code = "INFERENCE_TIMEOUT", .retryable = true },
+            else => .{ .status = 400, .code = "UNSUPPORTED_CONSTRAINED_PROBABILITIES", .retryable = false },
+        };
+        try std.testing.expectEqual(expected.status, response.status.code);
+        var body = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer body.deinit();
+        try std.testing.expectEqualStrings(expected.code, body.value.object.get("error").?.string);
+        try std.testing.expectEqual(expected.retryable, body.value.object.get("retryable").?.bool);
+        if (cause == error.GenerationCapacityUnavailable) try std.testing.expectEqual(@as(i64, 1000), body.value.object.get("retry_after_ms").?.integer);
+    }
 }

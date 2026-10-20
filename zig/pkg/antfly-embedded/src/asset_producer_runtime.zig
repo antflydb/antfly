@@ -3479,11 +3479,6 @@ pub const Runtime = struct {
         var validation = generated_extractor.Validation{ .config = config };
         engine.semantic_validation = .{ .ptr = &validation, .validate = generated_extractor.Validation.validate };
         const generated = try engine.execute(a, config.generator, mode, try generated_extractor.outputSchema(a, config), instructions, config.batch, planned.inputs);
-        const failures = try a.alloc(?anyerror, requests.len);
-        @memset(failures, null);
-        for (planned.windows, generated.failures) |window, failure| if (failure != null and failures[window.document] == null) {
-            failures[window.document] = failure;
-        };
         const outputs = try generated_extractor.materializeWithControl(a, config, texts, planned, generated, text_control);
         try self.requestContext().check();
         const items = try alloc.alloc(asset_producer.ProducedItem, requests.len);
@@ -3492,8 +3487,11 @@ pub const Runtime = struct {
             for (items[0..initialized]) |item| if (item.result == .value) alloc.free(item.result.value);
             alloc.free(items);
         }
-        for (items, outputs, requests, failures) |*item, output, request, failure| {
-            item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = if (output) |value| .{ .value = try std.json.Stringify.valueAlloc(alloc, value, .{}) } else .{ .item_error = .{ .cause = failure orelse error.InvalidConstrainedOutput, .code = .generation_failed } } };
+        for (items, outputs, requests) |*item, output, request| {
+            item.* = .{ .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number }, .result = switch (output) {
+                .value => |value| .{ .value = try std.json.Stringify.valueAlloc(alloc, value, .{}) },
+                .failure => |err| .{ .item_error = .{ .cause = err, .code = .generation_failed } },
+            } };
             initialized += 1;
         }
         return .{ .items = items, .execution = if (planned.windows.len == requests.len) constrainedExecution(generated.execution, requests.len) else inference_work.ExecutionReport.serial(requests.len) };

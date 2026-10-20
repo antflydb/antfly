@@ -42,7 +42,10 @@ Unsupported JSON-schema keywords are rejected rather than ignored. Hosted strict
 schema dialects are checked before generation as well: OpenAI object properties
 must all be required and use `additionalProperties: false`. The shared validator
 still checks unique array items when the wire dialect omits `uniqueItems`; a
-violating item uses its one repair attempt.
+violating item uses its one repair attempt. Generic output validation checks
+every JSON field, including underscore-prefixed fields, through nested arrays
+and schema composition. The document validator's metadata exemptions apply
+only to stored document validation.
 
 `auto` selects a forced, actual tool call, provider JSON-schema output, then
 native grammar output, subject to the selected model's admitted capabilities.
@@ -99,6 +102,13 @@ confidence. Durable adjudication evidence retains the normalized answer and
 raw structured answer. Successful siblings survive a repair or provider failure.
 
 ## Generated extraction
+
+Extraction windows produce typed document outcomes. The first failed window in
+source order retains its execution cause; successful sibling documents remain
+available to embedded producers. The HTTP response uses these same outcomes:
+capacity exhaustion remains retryable `MODEL_RESOURCE_BUSY` (503), deadlines
+remain retryable `INFERENCE_TIMEOUT` (504), and unsupported finite probability
+vocabularies remain permanent admission failures (400).
 
 ```json
 {
