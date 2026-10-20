@@ -16,17 +16,18 @@ branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `fc9bea9f20194754644605d796c00beeb1f325d0`.
-Native ABI 39 and engine descriptor 26 fence required PREPARE and final seal;
-storage owner ABI remains 101 and permanent file floor 6. Commit
-`629a03a2594ff9a6329a7452c77a350d111aee80` preserves the BEGIN mode through
-replicated intent staging and atomically seals accepted output with its ordered
-receipt. Reopen, immutable retry and weaker-acknowledgement resolution are covered
-by seven focused native targets and 25 package consumer checks. Raft protocol 24
-selects the required command format; production proposals remain gated pending
-real transport/provider readiness, funded producers, exact scoped receipt binding
-and coordinated migration. Distributed fault/restart qualification, large-frame
-transport and the broader scheduler design remain open. Held-cursor COMMIT retains
-its protected completion authority.
+Native ABI 40, engine descriptor 27, file floor 7 and Raft protocol 25 fence
+persistent participant/route bindings; storage owner ABI remains 101. Required
+BEGIN retains the original binding through prepare, seal and terminal history,
+and receipt fields come from durable record/frame evidence. Legacy commands cannot
+upgrade or drop that agreement. Final source
+`480494a5bb42a7f298bf799022dd67193a79a452` passes seven native targets and 25
+public-package consumer checks, including expired-request cancellation isolation
+for durable apply. Production proposals remain gated pending actual adapters,
+fresh route authority, funded producers, durable original routing for committed
+recovery, large-frame transport and coordinated migration. The global retained
+status path has not activated the stronger binding contract. The broader scheduler
+design and distributed fault/restart qualification remain open.
 
 The full goal remains safe, bounded execution sharing across many connections
 by default, with fair scheduling and bounded waiting, preserving session

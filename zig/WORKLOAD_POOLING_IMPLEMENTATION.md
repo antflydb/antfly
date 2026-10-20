@@ -4,6 +4,53 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Durable participant and route bindings (2026-10-19)
+
+Commit `2d3896d6313deb5e59701d6b24b90a83e6044960` persists the exact group,
+topology epoch, canonical participant digest and pinned-route digest with required
+BEGIN. A fixed 134-byte v8 record retains this 80-byte binding through prepare,
+seal and terminal history. Earlier unbound records stay readable but cannot gain
+binding authority through an idempotent retry or qualify a bound receipt. Legacy
+prepare/seal entry points cannot drop an existing binding.
+
+The distinct `begin_bound_v1`, `prepare_bound_v1` and `seal_bound_v1` commands carry
+the binding in canonical fixed-width hex. Apply validates the group, epoch and
+scoped participant identity, then preserves the exact BEGIN binding through intent
+publication and atomic sealing. Changed route or participant bindings cannot
+advance the ordered receipt. Receipt fields are reconstructed from the durable
+binding and fully inspected accepted frame; caller-supplied expected fields only
+validate the result. Terminal resolution retires effects while retaining mode and
+binding under the existing history/expiry rules.
+
+Reader floor/catalog envelope 7 protect v8 records, including after sidecars
+retire. Native ABI is 40, engine descriptor 27 and bound commands require Raft
+protocol 25; storage owner ABI remains 101. Older active preparation metadata
+still requires resolution or coordinated migration before enabling the new floor.
+These hashes preserve a route agreement; the route owner must establish fresh
+authority before BEGIN. Apply performs no metadata RPC and does not infer route
+authority from a digest alone.
+
+Final source `480494a5bb42a7f298bf799022dd67193a79a452` also preserves cancellation
+on nonreplicated calls while accepted Raft commands use durable apply lifetime,
+independent of expired request execution. Malformed bound fields without a mode
+are rejected before any protocol barrier. The seven-target
+`native-bound-seal-v5-verified.json` receipt includes both modes through persistent
+bound encoding/apply/reopen/resolution, identity drift and legacy refusal,
+allocation-failure atomicity and every original receipt-read rejection, plus the
+existing coordinator and ownership regressions. The immutable public package from
+`2d3896d6313deb5e59701d6b24b90a83e6044960` passes 25 ReleaseSafe consumer checks;
+all exported sources exactly match final source, whose later changes are server
+files excluded from that package. Full Linux qualification remains waived.
+
+Production proposals remain gated. Actual required transport/provider wiring,
+fresh route authority and producer funding, original durable participant routing
+for committed recovery, large-frame transport and coordinated all-member/import/
+downgrade migration still need qualification. Committed recovery must use original
+durable participants rather than compare their old binding to a freshly routed
+request. The current global retained-status adapter still carries only mode and
+has not activated this stronger bound contract. Completion resource bundles and
+the remaining original scheduler scope remain open.
+
 ## Replicated required PREPARE and final seal (2026-10-19)
 
 Commit `629a03a2594ff9a6329a7452c77a350d111aee80` adds distinct

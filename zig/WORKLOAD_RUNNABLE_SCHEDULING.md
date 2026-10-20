@@ -19,6 +19,21 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Durable participant and route binding (2026-10-19)
+
+Bound BEGIN now persists group, topology, scoped participant and pinned-route
+digests. Prepare/seal preserve that agreement, and receipt fields come from durable
+record/frame evidence. Legacy commands cannot upgrade or drop the binding.
+Terminal history retains it after effects retire. Reader floor 7, native ABI 40,
+engine descriptor 27 and Raft protocol 25 fence the new path; storage owner ABI
+remains 101. Accepted Raft apply remains independent of expired request execution.
+
+Seven native targets and 25 public-package consumer checks pass for final source
+`480494a5bb42a7f298bf799022dd67193a79a452`. Actual providers, route authority,
+funded producers, original participant routing for committed recovery and
+coordinated migration remain required before activation. See the implementation
+ledger for exact source/package identities and focused verification scope.
+
 ## Replicated required PREPARE and seal (2026-10-19)
 
 Required PREPARE now checks the original mode before staging and under apply.
