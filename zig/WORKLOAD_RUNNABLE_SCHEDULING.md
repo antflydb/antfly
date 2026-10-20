@@ -26,12 +26,13 @@ its delivery worker and runnable CPU admission. COMMIT can therefore materialize
 an existing held cursor while ordinary execution is saturated, even though the
 retained statement text is SELECT. Fresh queries and mixed statements still use
 ordinary capacity. The real HTTP/pgwire/H2 integration and imported-executor routing
-regression pass against commit `737098cfd7e24b7265c5e586676ada70f20adf7e`.
-The fixture funds the default worker-stack floors and installs both runtime and SQL
+regression pass on the current main merge
+`75c470fc1953918e422a6e13dd4d24675cef5f7c`, retaining the delivery fix from
+`737098cfd7e24b7265c5e586676ada70f20adf7e`. The fixture funds the default worker-stack floors and installs both runtime and SQL
 memory parents from the same storage manager, as production does. Remaining storage
 credit is exhausted during the test; no lane ceiling is reduced. Native ABI is 34
 and storage owner ABI is 101 after merging main; the delivery fix changes no ABI.
-See `native-main-merge-v2-verified.json` in the implementation ledger's receipt
+See `native-latest-main-v1-verified.json` in the implementation ledger's receipt
 directory for the 16-target scope and unchanged exported-package proof.
 
 ## Read execution lanes

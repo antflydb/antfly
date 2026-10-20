@@ -7,10 +7,13 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 ## Current verification status (2026-10-19)
 
 The full design remains in progress. The branch now contains `origin/main` at
-`a8e47ce4cc6af28b166ae26c62cd78ea848c869e`, merged in
-`332fd12e2ffa05213e3455be09b8051fa56e116a` after checkpoint
-`b004e8700c07e96a63b906af4366a3f48f29d8d4`. Native ABI is 34;
-storage owner ABI remains 101. The native ABI fences the combined inference
+`fc9bea9f20194754644605d796c00beeb1f325d0`, merged in
+`75c470fc1953918e422a6e13dd4d24675cef5f7c`. This follows the initial main
+merge `332fd12e2ffa05213e3455be09b8051fa56e116a` and checkpoint
+`b004e8700c07e96a63b906af4366a3f48f29d8d4`. The additional merge preserves
+both upstream video-cache cleanup and session device-budget retirement after
+metadata release; the generated error table includes incoming inference errors.
+Native ABI is 34; storage owner ABI remains 101. The native ABI fences the combined inference
 callback dispatch and CUDA ownership layout. No prepared-effects wire activation
 is implied by this merge.
 
@@ -22,17 +25,21 @@ ordinary execution admission. The integration fixture now funds the default guar
 worker-stack floor and shares one runtime and storage parent across DB, server and
 SQL memory banks. It still exhausts every remaining storage credit.
 
-All 16 focused native targets pass on that source: 166 build steps succeed, reusing
-cached results where inputs are unchanged. The real mixed HTTP/pgwire/H2 scenario
+All 16 focused native targets pass on source commit
+`75c470fc1953918e422a6e13dd4d24675cef5f7c`: 166 build steps succeed,
+with 28 standard tests passing and cached results reused where inputs are unchanged. The real mixed HTTP/pgwire/H2 scenario
 covers held-cursor completion under foreground worker, preparation and storage
 saturation. The imported-executor routing regression and six CUDA physical-credit
 mock cases pass; these are not real-GPU qualification. The dedicated SQL budget
 owner target has 12 passing standard tests on unchanged sources. Generated error
-and source catalogs are current. The frozen public package from merge commit
-`332fd12e2ffa05213e3455be09b8051fa56e116a` passes 25 ReleaseSafe compile checks;
-4,480 exported source files still match the current branch exactly. License policy
+and source catalogs are current. All 67 inference-host tests pass. A separate
+inference-unit invocation selects the two architecture teardown tests directly:
+both pass with zero skips, including device-budget retirement after actual session
+metadata release. The frozen public package from merge commit
+`75c470fc1953918e422a6e13dd4d24675cef5f7c` passes 25 ReleaseSafe compile checks;
+4,482 exported source files match the current branch exactly. License policy
 and packaging checks pass 11 and seven tests respectively. Source hashes, actual
-exit statuses and archive identity are recorded in `native-main-merge-v2-verified.json`
+exit statuses and archive identity are recorded in `native-latest-main-v1-verified.json`
 under the receipt directory below. Build-step and cached-test counts do not describe
 a fresh full-suite run.
 
