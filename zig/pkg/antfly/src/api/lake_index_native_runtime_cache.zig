@@ -151,6 +151,7 @@ pub const Entry = struct {
     fn bind(self: *Entry, context: Context) void {
         if (self.store.cloud_binding) |*binding| binding.reader.resetBudget();
         const reader = self.reader.?;
+        reader.navigation.detach();
         reader.context = context;
         if (reader.cache) |*cached| cached.context = context;
         if (self.loader) |loader| loader.context = context;
@@ -193,7 +194,7 @@ pub const Entry = struct {
             self.dense_metadata = try @import("lake_index_decoded_metadata.zig").acquire(dense.Root, cached, self.store.artifactStore(), declaration.artifact, .none, dense.loadRoot);
             const root = self.dense_metadata.?.value.*;
             if (!std.mem.eql(u8, &root.generation.domain, &domain) or !@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, declaration.binding)) return error.InvalidNativeLakeDenseRoot;
-            reader.* = .{ .root = root.generation, .prefix = path, .store = self.store.artifactStore(), .context = context, .cache = cached, .scratch = self.budget.allocator(), .max_block_bytes = 8 * 1024 * 1024 };
+            reader.* = .{ .root = root.generation, .prefix = path, .store = self.store.artifactStore(), .context = context, .cache = cached, .scratch = self.budget.allocator(), .navigation = .{ .allocator = self.budget.allocator() }, .max_block_bytes = 8 * 1024 * 1024 };
             self.reader = reader;
             const vectors = try a.create(local.storage_lsm_backend.Backend);
             vectors.* = try local.storage_lsm_backend.Backend.open(self.budget.allocator(), try std.fmt.allocPrint(a, "{s}/vectors", .{path}), .{ .storage = reader.storage(), .backend = .{ .read_only = true, .create_if_missing = false } });
@@ -218,7 +219,7 @@ pub const Entry = struct {
             self.sparse_metadata = try @import("lake_index_decoded_metadata.zig").acquire(sparse.Root, cached, self.store.artifactStore(), declaration.artifact, .none, sparse.loadRoot);
             const root = self.sparse_metadata.?.value.*;
             if (!std.mem.eql(u8, &root.generation.domain, &domain) or !@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, declaration.binding)) return error.InvalidNativeLakeSparseRoot;
-            reader.* = .{ .root = root.generation, .prefix = path, .store = self.store.artifactStore(), .context = context, .cache = cached, .scratch = self.budget.allocator(), .max_block_bytes = 8 * 1024 * 1024 };
+            reader.* = .{ .root = root.generation, .prefix = path, .store = self.store.artifactStore(), .context = context, .cache = cached, .scratch = self.budget.allocator(), .navigation = .{ .allocator = self.budget.allocator() }, .max_block_bytes = 8 * 1024 * 1024 };
             self.reader = reader;
             const entry = try a.create(Manager.SparseIndex);
             entry.* = .{ .apply_mutex = mutex, .config = .{ .name = name, .kind = .sparse_vector, .config_json = root.config_json }, .field_name = try a.dupe(u8, root.binding.column_bindings[0]), .external = true, .chunk_name = try @import("lake_enrichment_units.zig").chunkName(a, name, root.config_json), .embedding_name = null, .supports_unit_grouping = true, .rebuild_root_path = path, .index = try local.sparse_sparse.SparseIndex.open(self.budget.allocator(), path, .{ .lsm_storage = reader.storage(), .lsm_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } }) };

@@ -134,3 +134,35 @@ class LakeMetricEvidenceTests(unittest.TestCase):
                 500,
             )
         )
+
+
+class NativeTextPhaseTests(unittest.TestCase):
+    def test_native_text_phases_preserve_overlapping_scopes_and_failed_work(self):
+        timings = {"total": 300, "ranking": 270, "text_directory": 12,
+                   "text_inventory": 15, "text_opening": 40, "text_term_plan": 8,
+                   "text_navigation": 5, "text_postings": 210, "text_cursor": 2}
+        delta = poc.parse_lake_metrics("".join(
+            f"antfly_lake_query_{key}_nanoseconds_total {value * 1000000}\n"
+            for key, value in timings.items()))
+        profile = poc.lake_phase_profile(delta, 310)
+        self.assertEqual(profile["text_opening_ms"], 40)
+        self.assertEqual(profile["text_postings_ms"], 210)
+        self.assertEqual(profile["outside_lake_ms"], 10)
+        self.assertIn("Do not sum", profile["scope"])
+        self.assertIsNone(poc.lake_phase_profile({"antfly_lake_query_total_nanoseconds_total": 1}, 1))
+
+    def test_native_text_phases_survive_coexisting_coarse_metrics(self):
+        delta = {
+            f'antfly_lake_query_phase_nanoseconds_total{{phase="{phase}"}}': value * 1_000_000
+            for phase, value in dict(total=300, publication=20, search=270, hydration=0, delivery=10).items()
+        }
+        delta.update({f"antfly_lake_query_{phase}_nanoseconds_total": value * 1_000_000
+                      for phase, value in dict(text_opening=40, text_postings=210, cursor_retention=8, result_delivery=2).items()})
+        profile = poc.lake_phase_profile(delta, 310)
+        self.assertEqual(profile["search_ms"], 270)
+        self.assertEqual(profile["text_opening_ms"], 40)
+        self.assertEqual(profile["text_postings_ms"], 210)
+        self.assertEqual(profile["cursor_retention_ms"], 8)
+        self.assertEqual(profile["result_delivery_ms"], 2)
+        self.assertEqual(profile["outside_lake_ms"], 10)
+        self.assertIn("Do not sum", profile["scope"])
