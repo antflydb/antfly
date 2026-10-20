@@ -18,12 +18,24 @@ implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `d227ec2811235d618b8e50d86ab4b1472b207cc4`
 (merge commit `b81563cddd6bd86941e40ebcdf2b1bf805113605`).
 
-Native ABI 44, storage-owner ABI 106, engine descriptor 29, required preparation
+Native ABI 44, storage-owner ABI 107, engine descriptor 29, required preparation
 file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
+
+Source `b24235bc0854ba92ac66706438466c185634f799` carries original admission through
+typed ordinary native PREPARE, borrowing every intent field. Validation and
+principal parsing use preparation budgets; snapshot-held validation checks
+lifetime without lending CPU, and controlled relational rows retain one worker.
+Controlled validation avoids an uncontrolled schema-mode apply wait and rejects
+policy transitions without trying to finalize them. Actual native contention,
+original-error, schema/transform, private-plan and restart regressions pass with
+94/94 focused build steps and 25/25 immutable-package ReleaseSafe consumer steps.
+Explicit acknowledgement still needs original execution propagation. Required
+providers, funded producers and authenticated hidden PREPARE/completion remain
+open; neither required mode nor the full design is activated by this change.
 
 Source `53099a8ffc4f296b90240aa57ec5c42030d3a9df` carries original execution and
 cancellation through ordinary native commit/abort and atomic participant
@@ -32,7 +44,7 @@ later indexed commit pipeline also bounds admission with retained CPU. Original
 visibility lending resumes only after service holders retire. Actual full-text
 commit and retry, pre-holder lending/canceled reentry, restart and original error
 identity checks pass alongside the coordinator and packaged-source checks.
-Storage-owner ABI 106 and runtime-failure ABI 65 preserve the new
+Storage-owner ABI 107 and runtime-failure ABI 65 preserve the new
 completion-pending identity. Controlled hidden completion and required preparation
 remain closed pending their authenticated native Plan, provider and producer work.
 

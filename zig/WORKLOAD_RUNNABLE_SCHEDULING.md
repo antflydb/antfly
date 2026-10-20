@@ -19,6 +19,54 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Original admission through native transaction PREPARE (2026-10-20)
+
+Source `b24235bc0854ba92ac66706438466c185634f799` registers context-aware ordinary native PREPARE.
+A checked synchronous borrow carries the complete intent request through the
+production owner C boundary into the physical DB, preserving policy proof,
+predicates, schema, range and generation fields. The original deadline,
+cancellation, runnable and supplied route controls remain borrowed; original
+callback failures retain their exact identity. Successful intent durability has
+no subsequent caller checkpoint or response allocation.
+
+Schema/transform validation and principal parsing use the preparation memory
+budget. Validation snapshots retain lifetime checks without lending CPU. Schema
+mode inspection uses an immutable view rather than an uncontrolled apply wait;
+final preparation retains its existing native schema/apply fence. Controlled
+transform reads and intent admission reject policy transitions without attempting
+opportunistic finalization under apply. Transform capture, coalescing, intent,
+range, integrity and row loops poll original lifetime. Controlled relational row
+preparation stays on the caller's single worker: borrowed authority does not fund
+parallel producers. Legacy uncontrolled entry points retain their existing
+behavior. Supplied private restore plans are checked under native apply;
+context-aware hidden PREPARE remains explicitly unsupported.
+
+Storage-owner ABI is 107. Native ABI 44, API ABI 54, engine descriptor 29,
+runtime-failure ABI 65, required reader floor 10, data-Raft protocol 28 and
+metadata protocol 36 remain unchanged. Required mutation providers remain disabled.
+
+`native-controlled-prepare-verified.json` binds 5260 native/schema
+inputs to 94/94 passing build steps, 110 coordinator cases, 46 companion cases,
+15 native protocol/owner cases, two DB regressions, the error-registry check and
+four persistent WAL cases. Fourteen unnamed import companions are separate from
+those native cases. Failure injection verifies exact original causes and no
+accepted intents on rejection. Tests cover held-apply refusal, quota before
+backing allocation, public schema validation after transforms, policy-transition
+refusal, relational validation with one original worker, actual restore-plan
+rejection and accepted intent recovery after restart. The initial run exposed an
+uncontrolled schema-mode apply wait; the final regression retains its contention
+and no-durability assertions. The immutable package contains 4544 matching public
+sources and passes all 25 ReleaseSafe consumer steps. Source controller and both
+startup profiles pass semantic analysis; the full linked owner archive and source
+cold-open runtime remain unqualified. Full Linux qualification remains waived.
+
+Next work includes original execution through explicit acknowledgement, required
+capability/BEGIN/PREPARE/seal providers backed by observed durable readiness and
+independently funded producers, and authenticated native hidden preparation and
+completion. Fresh route authority, migration/activation, deep large-frame
+cooperation, completion resource bundles and broader scheduler/fault work remain
+open. This phase does not complete the full design.
+
 ## Ordinary native completion preserves admission and bounds retry (2026-10-20)
 
 Source `53099a8ffc4f296b90240aa57ec5c42030d3a9df` registers native execution-aware
