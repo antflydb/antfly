@@ -411,7 +411,16 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
-    inference_wasm_inference_mod.addImport("antfly_decisions", @import("../../lib/decisions/build.zig").create(b, b.path("lib/decisions/root.zig")));
+    // The native decision owner is wired to native structured-generation
+    // providers. Browser inference owns a separate source identity/profile,
+    // just like the standalone inference WASM product.
+    const wasm_decisions_mod = b.createModule(.{
+        .root_source_file = b.path("lib/decisions/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .single_threaded = true,
+    });
+    inference_wasm_inference_mod.addImport("antfly_decisions", wasm_decisions_mod);
     inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
     inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
     inference_wasm_inference_mod.addImport("antfly_media", wasm_inference_audio_mod.import_table.get("antfly_media").?);

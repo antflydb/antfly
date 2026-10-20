@@ -437,5 +437,10 @@ def test_generated_request_models_preserve_nested_configuration(extraction: bool
 
     client = AntflyClient("http://test")
     install_transport(client, httpx.MockTransport(handle))
-    result = client.extract(request) if extraction else client.decide(request)
+    if extraction:
+        assert isinstance(request, GeneratedExtractionRequest)
+        result = client.extract(request)
+    else:
+        assert isinstance(request, GeneratedDecideRequest)
+        result = client.decide(request)
     assert result.model == "registered"
