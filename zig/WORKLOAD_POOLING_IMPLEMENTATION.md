@@ -4,6 +4,48 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 [WORKLOAD_SCHEDULING.md](WORKLOAD_SCHEDULING.md). Branch:
 `codex/workload-scheduling` (PR #849).
 
+## Replicated required BEGIN (2026-10-19)
+
+Commit `da2faa3a1c8eceb3e413567944293acdd6f03133` carries preparation mode
+through the actual internal batch encoder, Raft envelope decoder and server apply
+dispatch into DB required BEGIN. The `begin_required_v1` phase is distinct from
+legacy BEGIN; a missing/unknown mode or a stripped phase with retained mode is
+rejected. Public batch ingress rejects this command. Required BEGIN also rejects
+ordinary row mutations rather than dropping them during transaction creation.
+
+DB apply commits the agreed mode, requirement sidecar and ordered receipt in one
+batch. Already-applied replay checks its receipt before seeking fresh catalog
+admission. New entries still require the validated file witness and preserve the
+agreed mode; failure cannot advance the receipt. Restore scope and participant
+validation remain on the original apply path. Required commands without an
+ordered receipt refuse the legacy local fallback.
+
+Raft protocol 23 selects the existing all-member barrier machinery for this
+command. Production proposals remain explicitly rejected before any barrier or
+entry: decoder support does not prove coordinated file migration or producer
+readiness. Native ABI 38 fences the changed batch/engine arguments, and engine
+descriptor 25 rejects older method signatures. Storage owner ABI remains 101;
+permanent required-preparation file floor remains 6.
+
+Final verification uses `0964f20fb0187ae1708bcaa859afeaa83ff13a05`, which also
+uses a memory primary for exhaustive checkpoint ordinals so background LSM mutex
+contention cannot change the fixture. Persistence cases retain the LSM backend.
+
+The seven-target `native-required-raft-begin-v6-verified.json` receipt includes
+persistent encoding/apply/reopen/replay for both modes, protocol selection,
+malformed command and allocation-failure checks, plus the existing storage,
+coordinator, fanout, inference checkpoint and independent ownership regressions.
+The immutable package passes 25 ReleaseSafe consumer checks. These focused
+checks do not establish live-cluster proposal or migration readiness; full Linux
+qualification remains waived.
+
+Next are required HTTP/local transport adapters, actual required PREPARE and
+final-seal commands/providers, eligible predecision producers and coordinated
+ordered-catalog/import/downgrade migration. Only after real distributed failure,
+restart and readiness checks can proposal gates or default activation change.
+Future completion resource bundles and the remaining original scheduler scope
+remain open.
+
 ## Retained preparation agreements (2026-10-19)
 
 Commit `bb9088a5ef0e84a0dc3c9c8e89b86f5d39a8916e` stores the original

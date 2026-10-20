@@ -16,18 +16,18 @@ branch, `codex/workload-scheduling`, in `.worktrees/workload-scheduling`, and
 [PR #849](https://github.com/antflydb/antfly/pull/849). Subsequent main merges and
 implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` at `fc9bea9f20194754644605d796c00beeb1f325d0`.
-Native ABI 37 fences the current required-preparation implementation; storage
-owner ABI remains 101. Reader floor/catalog envelope 6 protects the new retained
-agreement in required transaction records. Commit
-`bb9088a5ef0e84a0dc3c9c8e89b86f5d39a8916e` preserves the original mode through
-resolution and retry expiry without retaining effect sidecars or adding a history
-key. Legacy records cannot be upgraded into contract evidence. Six focused native
-targets and 25 ReleaseSafe package consumer checks pass. The earlier coordinator
-foundation negotiates readiness before BEGIN and seals every participant before
-decision. Production transport/storage adapters, eligible producers and migration
-remain required before activation. The retained pgwire fix preserves completion
-authority through held-cursor COMMIT. Distributed required preparation and the full
-design remain in progress.
+Native ABI 38 and engine descriptor 25 fence the replicated required-BEGIN
+implementation; storage owner ABI remains 101 and required-preparation file floor
+6. Commit `da2faa3a1c8eceb3e413567944293acdd6f03133` preserves the agreed mode
+through internal encoding, Raft decoding and ordered apply, committing the
+requirement and apply receipt atomically. Replay uses durable progress before
+fresh admission. Seven focused native targets and 25 ReleaseSafe package consumer
+checks pass at verification source `0964f20fb0187ae1708bcaa859afeaa83ff13a05`.
+Required proposals remain rejected before any barrier or entry until
+coordinated migration and real producer/provider readiness are established.
+Required transport and PREPARE/seal integration, distributed fault/restart checks
+and the broader scheduler design remain open. The retained pgwire fix preserves
+completion authority through held-cursor COMMIT.
 
 The full goal remains safe, bounded execution sharing across many connections
 by default, with fair scheduling and bounded waiting, preserving session

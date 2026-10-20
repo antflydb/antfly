@@ -19,6 +19,21 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Replicated required BEGIN (2026-10-19)
+
+The new required-BEGIN command preserves preparation mode through internal batch
+encoding, the Raft envelope and server ordered apply. Its mode, requirement and
+receipt commit atomically; durable replay bypasses fresh catalog admission while
+new entries still validate the file witness. Stripped phases and missing/unknown
+modes fail closed. Native ABI is 38, engine descriptor 25, storage owner ABI 101
+and required-preparation file floor 6.
+
+Seven focused native targets and 25 package consumer checks pass at
+`0964f20fb0187ae1708bcaa859afeaa83ff13a05`. Production proposals remain rejected
+before a barrier or entry until all-member migration and producer readiness are
+proved. Required transport, PREPARE/seal providers and real distributed failure
+checks remain open; see the implementation ledger for exact evidence.
+
 ## Retained preparation agreements (2026-10-19)
 
 Commit `bb9088a5ef0e84a0dc3c9c8e89b86f5d39a8916e` stores the original
