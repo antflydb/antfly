@@ -1201,6 +1201,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "HBC recall",
     };
     const lib_unit_default_filters = [_][]const u8{
+        "external dense readiness requires complete artifact publication",
+        "external embeddings index readiness does not require table doc coverage",
         "compiled CHECK",
         "relational contract",
         // Regressions previously selected only by unit-test-progress.
