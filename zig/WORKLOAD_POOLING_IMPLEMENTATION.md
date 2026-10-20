@@ -12,8 +12,8 @@ families. The request walker classifies every DerivedBatch field; the accepted
 walker classifies every PrecomputedGeneratedBatch field. Compile-time field
 coverage and an exhaustive document-action switch require an explicit decision
 when either contract grows. Upserts, document deletes and preserved base documents
-have separate contributions. Preserved graph-only rows do not invent primary-row
-notifications.
+have separate contributions. Preserved base documents alone do not add an upsert key to the
+estimate; this planner does not change replay notification semantics.
 
 The estimate includes explicit artifact tombstones in both deletion/artifact
 lanes, graph owner/source/target wake-ups, generated documents outside the request,
