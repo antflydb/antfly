@@ -23,7 +23,7 @@ const Bounds = @import("reduction.zig").Bounds;
 const A = std.mem.Allocator;
 pub const Rewrites = std.AutoHashMapUnmanaged(*const ast.Expr, ast.Expr);
 const Names = std.StringHashMapUnmanaged(usize);
-const FilterUse = struct { expression: *const ast.Expr, input: *const ast.Expr, filter: ast.CollectionFilter };
+const FilterUse = struct { expression: *const ast.Expr, input: *const ast.Expr, filter: ast.CollectionFilter, window: bool = false };
 const Candidate = struct { expression: *const ast.Expr, valid: bool = true, window: ?Bounds = null, uses: std.ArrayList(*const ast.Expr) = .empty, windows: std.ArrayList(*const ast.Expr) = .empty, filters: std.ArrayList(FilterUse) = .empty };
 const Cohort = struct { members: std.ArrayList(usize) = .empty, full: bool = false };
 fn hasCollection(value: anytype) bool {
@@ -95,6 +95,24 @@ const Flow = struct {
                 };
             };
             if (@import("reduction.zig").collectionConsumer(value)) |prefix| {
+                if (prefix.input.value == .comprehension) {
+                    const c = prefix.input.value.comprehension;
+                    const Context = struct {
+                        alias: []const u8,
+                        pub fn permits(context: @This(), name: []const u8) bool {
+                            return std.mem.eql(u8, context.alias, name);
+                        }
+                    };
+                    const context: Context = .{ .alias = c.alias };
+                    if ((c.predicate == null or (!expressions.aggregates(c.predicate.?) and expressions.rowLocal(c.predicate.?, context))) and
+                        (c.projection == null or (!expressions.aggregates(c.projection.?) and expressions.rowLocal(c.projection.?, context))))
+                    {
+                        if (try self.consumerInput(c.input, names, locals, index)) |id| {
+                            try self.candidates.items[id].filters.append(self.a, .{ .expression = value, .input = c.input, .window = true, .filter = .{ .alias = c.alias, .predicate = c.predicate, .projection = c.projection, .kind = .window, .prefix = prefix.bounds.prefix, .suffix = prefix.bounds.suffix } });
+                            return;
+                        }
+                    }
+                }
                 if (try self.consumerInput(prefix.input, names, locals, index)) |id| {
                     self.candidates.items[id].window = (self.candidates.items[id].window orelse Bounds{}).merge(prefix.bounds);
                     try self.candidates.items[id].windows.append(self.a, value);
@@ -168,6 +186,19 @@ const Flow = struct {
                     try self.scan(c.predicate, names, &local, index);
                 },
                 .reduce => |r| {
+                    const Context = struct {
+                        alias: ?[]const u8 = null,
+                        accumulator: ?[]const u8 = null,
+                        pub fn permits(context: @This(), name: []const u8) bool {
+                            return (context.alias != null and std.mem.eql(u8, context.alias.?, name)) or (context.accumulator != null and std.mem.eql(u8, context.accumulator.?, name));
+                        }
+                    };
+                    if (!expressions.aggregates(r.initial) and !expressions.aggregates(r.projection) and expressions.rowLocal(r.initial, Context{}) and expressions.rowLocal(r.projection, Context{ .alias = r.alias, .accumulator = r.accumulator })) {
+                        if (try self.consumerInput(r.input, names, locals, index)) |id| {
+                            try self.candidates.items[id].filters.append(self.a, .{ .expression = value, .input = r.input, .filter = .{ .alias = r.alias, .predicate = null, .projection = r.projection, .kind = .fold, .accumulator = r.accumulator, .initial = r.initial } });
+                            return;
+                        }
+                    }
                     try self.scan(r.initial, names, locals, index);
                     try self.scan(r.input, names, locals, index);
                     const alias: expressions.Local = .{ .name = r.alias, .parent = locals };
@@ -309,7 +340,17 @@ const Flow = struct {
                         var consumer = use.expression.*;
                         const args = try self.a.alloc(*const ast.Expr, 1);
                         args[0] = use.input;
-                        consumer.value = .{ .call = .{ .name = "head", .args = args, .collection_extract = .{ .filtered = filter_slot } } };
+                        const extracted: @FieldType(ast.Expr, "value") = .{ .call = .{ .name = "head", .args = args, .collection_extract = .{ .filtered = filter_slot } } };
+                        if (use.window) {
+                            const input = try self.a.create(ast.Expr);
+                            input.* = .{ .span = use.expression.span, .value = extracted };
+                            switch (consumer.value) {
+                                .call => |*call| call.args = try self.a.dupe(*const ast.Expr, &.{input}),
+                                .index => |*index| index.base = input,
+                                .slice => |*slice| slice.base = input,
+                                else => unreachable,
+                            }
+                        } else consumer.value = extracted;
                         filter_slot += 1;
                         try rewrites.put(self.a, use.expression, consumer);
                     }

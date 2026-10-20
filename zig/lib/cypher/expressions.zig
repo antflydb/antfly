@@ -146,7 +146,7 @@ pub fn same(a: *const ast.Expr, b: *const ast.Expr) bool {
             const y = b.value.call;
             if (!std.ascii.eqlIgnoreCase(x.name, y.name) or x.star != y.star or x.collect_limit != y.collect_limit or x.collect_suffix != y.collect_suffix or x.collect_summary != y.collect_summary or !std.meta.eql(x.collection_extract, y.collection_extract) or x.collect_filters.len != y.collect_filters.len or x.distinct != y.distinct or x.args.len != y.args.len) break :blk false;
             for (x.args, y.args) |left, right| if (!same(left, right)) break :blk false;
-            for (x.collect_filters, y.collect_filters) |left, right| if (left.kind != right.kind or !std.mem.eql(u8, left.alias, right.alias) or !sameOptional(left.predicate, right.predicate) or !sameOptional(left.projection, right.projection)) break :blk false;
+            for (x.collect_filters, y.collect_filters) |left, right| if (left.kind != right.kind or !std.mem.eql(u8, left.alias, right.alias) or !sameOptional(left.predicate, right.predicate) or !sameOptional(left.projection, right.projection) or left.prefix != right.prefix or left.suffix != right.suffix or !sameOptional(left.initial, right.initial) or !sameName(left.accumulator, right.accumulator)) break :blk false;
             break :blk true;
         },
         .list => |x| blk: {

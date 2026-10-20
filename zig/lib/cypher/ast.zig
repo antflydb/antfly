@@ -69,11 +69,17 @@ pub const Function = struct {
 /// Private physical summary access; never emitted by the parser or exposed on wire.
 pub const CollectionExtract = union(enum) { cardinality, window: usize, filtered: usize };
 pub const CollectionFilter = struct {
-    pub const Kind = enum { count, all, any, none, single };
+    pub const Kind = enum { count, all, any, none, single, window, fold };
     alias: []const u8,
     predicate: ?*const Expr,
     projection: ?*const Expr,
     kind: Kind = .count,
+    /// Window consumers evaluate every projection but only own these cells.
+    prefix: usize = 0,
+    suffix: usize = 0,
+    /// Fold inputs are closed initial expressions and row-local transitions.
+    accumulator: ?[]const u8 = null,
+    initial: ?*const Expr = null,
 };
 pub const Procedure = struct { name: []const u8, args: []const *const Expr, yields: []const Yield, predicate: ?*const Expr = null };
 pub const Branch = struct { condition: *const Expr, value: *const Expr };

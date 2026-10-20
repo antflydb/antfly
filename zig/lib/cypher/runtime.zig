@@ -1407,6 +1407,28 @@ const Engine = struct {
             failure: ?anyerror = null,
             unknown: bool = false,
             decided: ?bool = null,
+            window: ?*StreamingAggregate = null,
+            initialized: bool = false,
+            embedding_failure: bool = false,
+            accumulator: v.Value = .null,
+            owned: ?std.heap.ArenaAllocator = null,
+            fn deinit(self: *@This()) void {
+                if (self.window) |window| window.deinit();
+                if (self.owned) |*arena| arena.deinit();
+            }
+            fn own(self: *@This(), engine: *Engine, value: v.Value) !void {
+                var arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                errdefer arena.deinit();
+                // Clone once with DAG sharing before releasing the old state.
+                var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                defer scratch.deinit();
+                var context: v.CloneContext = .{ .a = arena.allocator(), .scratch = scratch.allocator() };
+                const copied = try context.clone(value);
+                if (self.owned) |*old| old.deinit();
+                self.owned = arena;
+                self.accumulator = copied;
+                self.initialized = true;
+            }
             fn result(self: @This(), kind: ast.CollectionFilter.Kind) v.Value {
                 if (kind == .count) return .{ .integer = @intCast(self.count) };
                 if (self.decided) |answer| return .{ .boolean = answer };
@@ -1415,7 +1437,7 @@ const Engine = struct {
                     .all, .none => true,
                     .any => false,
                     .single => self.count == 1,
-                    .count => unreachable,
+                    .count, .window, .fold => unreachable,
                 } };
             }
         };
@@ -1431,6 +1453,65 @@ const Engine = struct {
             if (filter.projection) |projection| _ = try engine.eval(projection, row, null);
             return true;
         }
+        fn ensureFilters(self: *@This()) !void {
+            if (self.filter_states.len != 0 or self.function.collect_filters.len == 0) return;
+            self.filter_states = try self.arena.allocator().alloc(FilterState, self.function.collect_filters.len);
+            @memset(self.filter_states, .{});
+        }
+        fn consumerFailure(err: anyerror) bool {
+            return switch (err) {
+                error.CypherTypeMismatch, error.CypherNumericOverflow, error.CypherDivisionByZero, error.MissingCypherParameter, error.UnboundCypherVariable, error.CypherInvalidArgument, error.CypherInvalidRange, error.CypherInvalidSubstring, error.CypherInvalidRegex, error.CypherRegexUnavailable, error.CypherValueDepthExceeded => true,
+                else => false,
+            };
+        }
+        fn initFold(engine: *Engine, filter: ast.CollectionFilter, state_value: *FilterState) !void {
+            if (!state_value.initialized) try state_value.own(engine, try engine.eval(filter.initial.?, &.{}, null));
+        }
+        fn addConsumer(self: *@This(), engine: *Engine, filter: ast.CollectionFilter, state_value: *FilterState, value: v.Value, weight: Count) !void {
+            const previous = engine.projection_locals;
+            const local: @import("expressions.zig").Local = .{ .name = filter.alias, .parent = previous };
+            engine.projection_locals = &local;
+            defer engine.projection_locals = previous;
+            if (filter.kind == .fold) {
+                try initFold(engine, filter, state_value);
+                const accumulator_local: @import("expressions.zig").Local = .{ .name = filter.accumulator.?, .parent = &local };
+                engine.projection_locals = &accumulator_local;
+                const copies = std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
+                for (0..copies) |_| {
+                    try engine.state();
+                    // Each transition has its own scratch lifetime; only the new
+                    // accumulator survives. Never reassociate an arbitrary fold.
+                    var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+                    defer scratch.deinit();
+                    const scope = EvalScope.enter(engine, scratch.allocator());
+                    defer scope.leave(engine);
+                    const initial_row = &.{v.Entry{ .name = filter.accumulator.?, .value = state_value.accumulator }};
+                    const row = try engine.replace(initial_row, filter.alias, value);
+                    try state_value.own(engine, try engine.eval(filter.projection.?, row, null));
+                }
+                return;
+            }
+            const row = &.{v.Entry{ .name = filter.alias, .value = value }};
+            try engine.state();
+            if (filter.predicate) |predicate| if ((try (try engine.eval(predicate, row, null)).truth()) != true) return;
+            const projected = if (filter.projection) |projection| try engine.eval(projection, row, null) else value;
+            // The original comprehension validates its full list, even when a
+            // bounded consumer later discards this particular projection.
+            _ = engine.values.info(.{ .list = &.{projected} }) catch |err| blk: {
+                if (err != error.CypherValueDepthExceeded) return err;
+                // List depth is checked after the original comprehension has
+                // evaluated every projection. A later scalar failure wins.
+                state_value.embedding_failure = true;
+                break :blk null;
+            };
+            if (state_value.window == null) {
+                const window = try self.arena.allocator().create(StreamingAggregate);
+                window.* = .{ .function = .{ .name = "collect", .args = &.{}, .collect_limit = filter.prefix, .collect_suffix = filter.suffix }, .arena = std.heap.ArenaAllocator.init(engine.scratch_allocator), .distinct_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator) };
+                state_value.window = window;
+            }
+            // Unlike COLLECT, a comprehension retains NULL projections.
+            try state_value.window.?.retainCollection(engine, projected, weight, null);
+        }
         fn addSummary(self: *@This(), engine: *Engine, value: v.Value, weight: Count) !void {
             if (weight.cap(1) == 0) return;
             if (!self.collection_overflow) self.collection_count = addPathCount(self.collection_count, weight.cap(std.math.maxInt(u64))) catch blk: {
@@ -1438,10 +1519,7 @@ const Engine = struct {
                 break :blk 0;
             };
             if (self.function.collect_filters.len == 0) return;
-            if (self.filter_states.len == 0) {
-                self.filter_states = try self.arena.allocator().alloc(FilterState, self.function.collect_filters.len);
-                @memset(self.filter_states, .{});
-            }
+            try self.ensureFilters();
             var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
             defer scratch.deinit();
             for (self.function.collect_filters, self.filter_states) |filter, *state_value| {
@@ -1449,12 +1527,17 @@ const Engine = struct {
                 _ = scratch.reset(.free_all);
                 const scope = EvalScope.enter(engine, scratch.allocator());
                 defer scope.leave(engine);
-                const selected = filterItem(engine, filter, value) catch |err| switch (err) {
-                    error.CypherTypeMismatch, error.CypherNumericOverflow, error.CypherDivisionByZero, error.MissingCypherParameter, error.UnboundCypherVariable, error.CypherInvalidArgument, error.CypherInvalidRange, error.CypherInvalidSubstring, error.CypherInvalidRegex, error.CypherRegexUnavailable, error.CypherValueDepthExceeded => {
+                if (filter.kind == .window or filter.kind == .fold) {
+                    self.addConsumer(engine, filter, state_value, value, weight) catch |err| {
+                        if (!consumerFailure(err)) return err;
                         state_value.failure = err;
-                        continue;
-                    },
-                    else => return err,
+                    };
+                    continue;
+                }
+                const selected = filterItem(engine, filter, value) catch |err| {
+                    if (!consumerFailure(err)) return err;
+                    state_value.failure = err;
+                    continue;
                 };
                 if (filter.kind == .count) {
                     if (selected == true) state_value.count = addPathCount(state_value.count, weight.cap(std.math.maxInt(u64))) catch |err| blk: {
@@ -1495,6 +1578,7 @@ const Engine = struct {
             if (self.released) return;
             self.released = true;
             self.tail.deinit();
+            for (self.filter_states) |*state_value| state_value.deinit();
             self.arena.deinit();
             if (self.distinct_bytes) |pool| pool.deinit();
             self.distinct_arena.deinit();
@@ -1604,19 +1688,7 @@ const Engine = struct {
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "collect")) {
                 if (self.function.collect_summary) try self.addSummary(engine, value, weight);
-                const retained = self.arena.allocator();
-                const remaining = if (self.function.collect_limit) |limit| limit - self.collected.items.len else std.math.maxInt(usize);
-                const copies = if (self.function.collect_limit != null) std.math.cast(usize, weight.cap(remaining)).? else std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
-                if (copies != 0) {
-                    const owned = if (self.function.distinct and self.function.collect_suffix == 0 and !self.function.collect_summary) distinct_owned orelse self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
-                    try Engine.chargeWork(engine, copies);
-                    try self.collected.ensureUnusedCapacity(retained, copies);
-                    for (0..copies) |_| self.collected.appendAssumeCapacity(owned);
-                }
-                if (self.function.collect_suffix != 0) {
-                    self.collection_seen +|= @intCast(weight.cap(std.math.maxInt(usize)));
-                    try self.tail.append(engine, self.distinct_arena.allocator(), value, weight, self.function.collect_suffix);
-                }
+                try self.retainCollection(engine, value, weight, distinct_owned);
                 return;
             }
             if (std.ascii.eqlIgnoreCase(self.function.name, "sum")) {
@@ -1694,6 +1766,21 @@ const Engine = struct {
                 self.best = try value.clone(self.arena.allocator());
             }
         }
+        fn retainCollection(self: *@This(), engine: *Engine, value: v.Value, weight: Count, distinct_owned: ?v.Value) !void {
+            const retained = self.arena.allocator();
+            const remaining = if (self.function.collect_limit) |limit| limit - self.collected.items.len else std.math.maxInt(usize);
+            const copies = if (self.function.collect_limit != null) std.math.cast(usize, weight.cap(remaining)).? else std.math.cast(usize, weight.exact() orelse return error.CypherStateBudgetExceeded) orelse return error.CypherStateBudgetExceeded;
+            if (copies != 0) {
+                const owned = if (self.function.distinct and self.function.collect_suffix == 0 and !self.function.collect_summary) distinct_owned orelse self.distinct_values.items[self.distinct_values.items.len - 1] else try value.clone(retained);
+                try Engine.chargeWork(engine, copies);
+                try self.collected.ensureUnusedCapacity(retained, copies);
+                for (0..copies) |_| self.collected.appendAssumeCapacity(owned);
+            }
+            if (self.function.collect_suffix != 0) {
+                self.collection_seen +|= @intCast(weight.cap(std.math.maxInt(usize)));
+                try self.tail.append(engine, self.distinct_arena.allocator(), value, weight, self.function.collect_suffix);
+            }
+        }
         fn addMoments(self: *StreamingAggregate, engine: *Engine, kind: MomentCall, form: Affine, stats: MomentStats, count_value: Count, weight: Count) !void {
             if (kind == .sum) {
                 // One-sign affine arguments preserve contribution-order
@@ -1729,21 +1816,37 @@ const Engine = struct {
             defer self.function = saved;
             return self.addWeighted(engine, &.{}, weight);
         }
-        fn finish(self: StreamingAggregate, engine: *Engine) !v.Value {
+        fn finish(self: *StreamingAggregate, engine: *Engine) !v.Value {
             const window = try self.finishWindow(engine);
             if (!self.function.collect_summary) return window;
             // This private execution tuple cannot escape: demand planning rewrites
             // every consumer, while full/correlated consumers prohibit summaries.
+            try self.ensureFilters();
             const header = 1 + self.function.collect_filters.len * 2;
-            const tuple = try engine.a.alloc(v.Value, header + window.list.len);
-            tuple[0] = .{ .integer = if (self.collection_overflow) -1 else @intCast(self.collection_count) };
-            @memcpy(tuple[header..], window.list);
+            var tuple: std.ArrayList(v.Value) = .empty;
+            try tuple.resize(engine.a, header + 1 + window.list.len);
+            tuple.items[0] = .{ .integer = if (self.collection_overflow) -1 else @intCast(self.collection_count) };
+            tuple.items[header] = .{ .integer = @intCast(window.list.len) };
+            @memcpy(tuple.items[header + 1 ..], window.list);
             for (self.function.collect_filters, 0..) |filter, i| {
-                const state_value: FilterState = if (self.filter_states.len == 0) .{} else self.filter_states[i];
-                tuple[1 + i * 2] = state_value.result(filter.kind);
-                tuple[2 + i * 2] = .{ .integer = if (state_value.failure) |err| @intFromError(err) else 0 };
+                const state_value = &self.filter_states[i];
+                if (filter.kind == .fold and state_value.failure == null and !state_value.initialized) {
+                    initFold(engine, filter, state_value) catch |err| {
+                        if (!consumerFailure(err)) return err;
+                        state_value.failure = err;
+                    };
+                }
+                if (state_value.failure == null and state_value.embedding_failure) state_value.failure = error.CypherValueDepthExceeded;
+                const consumer_value: v.Value = if (state_value.failure != null) .null else switch (filter.kind) {
+                    .window => if (state_value.window) |retained| try retained.finishWindow(engine) else .{ .list = &.{} },
+                    .fold => state_value.accumulator,
+                    else => state_value.result(filter.kind),
+                };
+                const encoded = if (state_value.failure) |err| @import("collection_summary.zig").Packed{ .value = .null, .code = @intFromError(err) } else try @import("collection_summary.zig").pack(engine.a, &tuple, consumer_value);
+                tuple.items[1 + i * 2] = encoded.value;
+                tuple.items[2 + i * 2] = .{ .integer = encoded.code };
             }
-            return .{ .list = tuple };
+            return .{ .list = tuple.items };
         }
         fn finishWindow(self: StreamingAggregate, engine: *Engine) !v.Value {
             if (self.function.collect_suffix == 0) return self.result();
@@ -2068,7 +2171,7 @@ const Engine = struct {
             const eval_scope = EvalScope.enter(self, scratch.allocator());
             defer eval_scope.leave(self);
             const overrides = try self.a.alloc(v.Value, calls.items.len);
-            for (overrides, group.states) |*override, state_value| override.* = try state_value.finish(self);
+            for (overrides, group.states) |*override, *state_value| override.* = try state_value.finish(self);
             self.aggregate_overrides = .{ .index = &calls.index.pointers, .values = overrides };
             self.group_overrides = .{ .index = &retention.uses, .values = group.key };
             const row = try self.a.alloc(v.Entry, projection.items.len);
@@ -8375,15 +8478,11 @@ const Engine = struct {
             },
         };
     }
-    fn collectionExtract(_: *Engine, extract: ast.CollectionExtract, value: v.Value) !v.Value {
+    fn collectionExtract(self: *Engine, extract: ast.CollectionExtract, value: v.Value) !v.Value {
         return switch (extract) {
-            .window => |header| .{ .list = value.list[header..] },
+            .window => |header| .{ .list = value.list[header + 1 ..][0..@intCast(value.list[header].integer)] },
             .cardinality => if (value.list[0].integer < 0) error.CypherNumericOverflow else value.list[0],
-            .filtered => |slot| blk: {
-                const code = value.list[2 + slot * 2].integer;
-                if (code != 0) return @errorFromInt(@as(@Int(.unsigned, @bitSizeOf(anyerror)), @intCast(code)));
-                break :blk value.list[1 + slot * 2];
-            },
+            .filtered => |slot| try @import("collection_summary.zig").unpack(self.a, value.list, .{ .value = value.list[1 + slot * 2], .code = value.list[2 + slot * 2].integer }),
         };
     }
     fn comprehensionSize(self: *Engine, expression: *const ast.Expr, row: Row) anyerror!v.Value {
@@ -9826,4 +9925,36 @@ test "boolean collection summaries cap promoted multiplicities and ignore empty 
         try collector.addWeighted(&engine, &.{.{ .name = "x", .value = .{ .boolean = true } }}, huge);
         try std.testing.expectEqual(kind == .all or kind == .any, (try collector.finish(&engine)).list[1].boolean);
     }
+}
+
+test "streaming windows cap promoted weights while sequential folds enforce transition budgets" {
+    const Noop = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dummy: u8 = 0;
+    var engine: Engine = .{ .a = arena.allocator(), .scratch_allocator = std.testing.allocator, .regex = .{ .a = arena.allocator(), .scratch = std.heap.ArenaAllocator.init(std.testing.allocator) }, .backend = .{ .ptr = &dummy, .vtable = &.{ .bind = undefined, .checkpoint = Noop.checkpoint, .scan = undefined, .get = undefined, .expand = undefined } }, .graph = undefined, .source = "", .parameters = &.{}, .limits = .{} };
+    defer engine.regex.deinit();
+    engine.values = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
+    engine.strings = .{ .a = engine.a, .ptr = &engine, .charge = Engine.chargeWork };
+    const input: ast.Expr = .{ .span = .{}, .value = .{ .variable = "x" } };
+    const item: ast.Expr = .{ .span = .{}, .value = .{ .variable = "y" } };
+    const zero: ast.Expr = .{ .span = .{}, .value = .{ .literal = .{ .integer = 0 } } };
+    const accumulator: ast.Expr = .{ .span = .{}, .value = .{ .variable = "s" } };
+    const transition: ast.Expr = .{ .span = .{}, .value = .{ .binary = .{ .op = .add, .left = &accumulator, .right = &item } } };
+    const huge = try Count.parse(engine.a, "1180591620717411303424");
+    var window: Engine.StreamingAggregate = .{ .function = .{ .name = "collect", .args = &.{&input}, .collect_limit = 0, .collect_summary = true, .collect_filters = &.{.{ .alias = "y", .predicate = null, .projection = &item, .kind = .window, .prefix = 2, .suffix = 2 }} }, .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .distinct_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer window.deinit();
+    try window.addWeighted(&engine, &.{.{ .name = "x", .value = .{ .integer = 7 } }}, huge);
+    const cells = (try engine.collectionExtract(.{ .filtered = 0 }, try window.finish(&engine))).list;
+    try std.testing.expectEqual(@as(usize, 4), cells.len);
+    for (cells) |cell| try std.testing.expectEqual(@as(i64, 7), cell.integer);
+    var fold: Engine.StreamingAggregate = .{ .function = .{ .name = "collect", .args = &.{&input}, .collect_limit = 0, .collect_summary = true, .collect_filters = &.{.{ .alias = "y", .predicate = null, .projection = &transition, .kind = .fold, .accumulator = "s", .initial = &zero }} }, .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .distinct_arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
+    defer fold.deinit();
+    try fold.addWeighted(&engine, &.{.{ .name = "x", .value = .{ .integer = 7 } }}, Count.init(3));
+    try std.testing.expectEqual(@as(i64, 21), (try fold.finish(&engine)).list[1].integer);
+    try std.testing.expectError(error.CypherStateBudgetExceeded, fold.addWeighted(&engine, &.{.{ .name = "x", .value = .{ .integer = 7 } }}, huge));
+    engine.limits.intermediate_states = engine.stats.intermediate_states + 2;
+    try std.testing.expectError(error.CypherStateBudgetExceeded, fold.addWeighted(&engine, &.{.{ .name = "x", .value = .{ .integer = 7 } }}, Count.init(100)));
 }

@@ -4773,3 +4773,68 @@ def test_boolean_collection_consumers_have_bounded_payload_retention(graph_db):
         },
     )
     assert direct["rows"][0][0]["value"] is True
+
+
+def test_comprehension_windows_and_folds_do_not_retain_collection_payloads(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092, unique=True)
+    for query, parameters, expected in (
+        ("WITH collect(n.payload) AS xs RETURN head([x IN xs | x])", {}, "000000000000"),
+        (
+            'WITH collect(n.payload) AS xs RETURN last([x IN xs WHERE x STARTS WITH "000000000" | x])',
+            {},
+            "000000000999",
+        ),
+        ("RETURN [x IN collect(n.payload) | x][-$k]", {"k": 2}, "000000000998"),
+        (
+            "WITH collect(n.payload) AS xs WITH xs AS ys RETURN [x IN ys | x][$a..$b]",
+            {"a": -2, "b": -1},
+            "000000000998",
+        ),
+    ):
+        result = db.cypher_json(
+            "payloads",
+            {
+                "query": "MATCH(n:W) " + query,
+                "parameters": parameters,
+                "limits": {"memory_bytes": 8 << 20},
+            },
+        )
+        cell = result["rows"][0][0]
+        if cell["type"] == "list":
+            assert len(cell["value"]) == 1
+            cell = cell["value"][0]
+        assert cell["value"].startswith(expected)
+    for tail in (
+        "WITH collect(n.payload) AS xs RETURN reduce(s=0,x IN xs | s+size(x))",
+        "RETURN reduce(s=0,x IN collect(n.payload) | s+size(x))",
+        "WITH collect(n.payload) AS xs WITH xs AS ys RETURN reduce(s={v:0},x IN ys | {v:s.v+size(x)}).v",
+    ):
+        result = db.cypher_json(
+            "payloads",
+            {"query": "MATCH(n:W) " + tail, "limits": {"memory_bytes": 8 << 20}},
+        )
+        assert int(result["rows"][0][0]["value"]) == 3000 * 4092
+
+
+def test_streaming_collection_consumers_match_materialized_entity_and_weighted_inputs(graph_db):
+    db = graph_db
+    populate(db, 12)
+    db.cypher_json("g", {"query": "MATCH(a:D),(b:D) WHERE a.score<6 AND b.score=a.score+1 CREATE(a)-[:R]->(b)"})
+    for source, value in (
+        ("MATCH(n:D)", "n"),
+        ("MATCH(a:D)-[:R*1..4]->(n:D)", "n"),
+        ("MATCH(n:D) UNWIND [1,2,3] AS repeat", "{score:n.score,payload:n.id}"),
+    ):
+        prefix = source + f" WITH collect({value}) AS xs "
+        expressions = (
+            "reduce(s=0,x IN xs | s+x.score)",
+            "reduce(s=[],x IN xs | s+[x.score])",
+            "head([x IN xs WHERE x.score%2=0 | {v:x.score}])",
+            "last([x IN xs WHERE x.score%2=0 | {v:x.score}])",
+            "[x IN xs WHERE x.score>2 | x.score][-3..-1]",
+        )
+        projection = ",".join(expressions)
+        fused = db.cypher_json("g", {"query": prefix + "RETURN " + projection})
+        materialized = db.cypher_json("g", {"query": prefix + "RETURN " + projection + ",xs"})
+        assert fused["rows"] == [row[:-1] for row in materialized["rows"]]

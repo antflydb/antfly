@@ -1924,7 +1924,19 @@ first-seen DISTINCT order, weighted multiplicity and lazy branches retain their
 ordinary semantics. Combined cardinality and front/back demands use one private
 collection summary, including through transparent WITH aliases. SIZE of a
 row-local filtered comprehension consumes per-filter counters instead of retaining
-its input collection. Predicate and projection evaluation preserves NULL exclusion,
+its input collection. Bounded HEAD/LAST, index and slice demands also pass through
+row-local mapped or filtered comprehensions. Each consumer evaluates all predicates
+and selected projections, including discarded cells, but owns only its output
+window; NULL projections remain list elements. Eligible REDUCE consumers use
+independently owned sequential accumulator state instead of retaining COLLECT
+inputs. Initial expressions must be closed and transitions may reference only
+parameters, the element and accumulator. Transitions preserve encounter order,
+NULL exclusion and intermediate overflow, including weighted repetitions; arbitrary
+folds are never reassociated into commutative aggregates. A flat private carrier
+replaces result root containers instead of adding nesting, so forwarding summary
+rows preserves public depth limits and entity snapshots. Full collection escapes,
+correlated or effectful consumers conservatively retain materialization. Predicate
+and projection evaluation preserves NULL exclusion,
 counts NULL projections, and records each consumer's first scalar error for its
 original evaluation site; lazy branches and earlier aggregate argument failures
 retain their error precedence. Resource/cancellation failures propagate immediately.

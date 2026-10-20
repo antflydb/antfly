@@ -3824,3 +3824,113 @@ test "invariant membership bound specialization and boolean summaries release fa
     };
     inline for (.{ @as(u1, 0), @as(u1, 1) }) |kind| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{kind});
 }
+
+test "streaming comprehension windows preserve mapping filtering nulls and consumer bounds" {
+    try check("UNWIND [1,2,3,4,null] AS x WITH collect(x) AS xs RETURN head([y IN xs | y*2]),last([y IN xs WHERE y%2=0 | y+10]),[y IN xs WHERE y>1 | y*2][1..2],[y IN xs | null][-1],size(xs)", "[[2,14,[6],null,4]]");
+    try check("UNWIND [1,2,3,4] AS x RETURN [y IN collect(x) WHERE y>1 | y*2][-2..-1]", "[[[6]]]");
+    try check("UNWIND [] AS x WITH collect(x) AS xs RETURN head([y IN xs | y]),last([y IN xs | y]),[y IN xs | y][..2]", "[[null,null,[]]]");
+    try check("UNWIND [1,1,2] AS x WITH collect(DISTINCT x) AS xs RETURN head([y IN xs | y]),last([y IN xs | y]),size(xs)", "[[1,2,2]]");
+    // A full escape and correlated projection keep their materialized behavior.
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN xs,head([y IN xs | y+1])", "[[[1,2],2]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs,10 AS k RETURN head([y IN xs | y+k])", "[[11]]");
+    try check("UNWIND [1,0] AS x WITH collect(x) AS xs RETURN CASE WHEN true THEN 7 ELSE head([y IN xs | 1/y]) END", "[[7]]");
+    try check("UNWIND [1,0] AS x WITH collect(x) AS xs RETURN CASE WHEN true THEN 7 ELSE [y IN xs | 1/y][..0] END", "[[7]]");
+}
+
+test "streaming folds preserve sequential transitions ownership empty inputs and null exclusion" {
+    try check("UNWIND [1,2,3,null] AS x WITH collect(x) AS xs RETURN reduce(s=10,y IN xs | s-y),reduce(s=[],y IN xs | s+[y]),reduce(s={v:0},y IN xs | {v:s.v+y}),size(xs)", "[[4,[1,2,3],{\"v\":6},3]]");
+    try check("UNWIND [1,2] AS x RETURN reduce(s=0,y IN collect(x) | s*10+y)", "[[12]]");
+    try check("UNWIND [] AS x WITH collect(x) AS xs RETURN reduce(s=[9],y IN xs | s+[y])", "[[[9]]]");
+    try check("UNWIND [null,null] AS x RETURN reduce(s=5,y IN collect(x) | s+y)", "[[5]]");
+    try check("UNWIND [1,1,2] AS x WITH collect(DISTINCT x) AS xs RETURN reduce(s=0,y IN xs | s*10+y),head(xs),last(xs)", "[[12,1,2]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs,10 AS k RETURN reduce(s=k,y IN xs | s+y)", "[[13]]");
+    try check("UNWIND [1,0] AS x WITH collect(x) AS xs RETURN CASE WHEN true THEN 7 ELSE reduce(s=1,y IN xs | s/y) END", "[[7]]");
+    try check("UNWIND [] AS x WITH collect(x) AS xs RETURN CASE WHEN true THEN 7 ELSE reduce(s=1/0,y IN xs | s+y) END", "[[7]]");
+    // Source argument errors precede any deferred consumer error.
+    const Case = struct { text: []const u8, err: anyerror };
+    for ([_]Case{
+        .{ .text = "UNWIND [1,0] AS x WITH collect(x) AS xs RETURN head([y IN xs | 1/y])", .err = error.CypherDivisionByZero },
+        .{ .text = "UNWIND [1,0] AS x WITH collect(x) AS xs RETURN [y IN xs | 1/y][..0]", .err = error.CypherDivisionByZero },
+        .{ .text = "UNWIND [] AS x WITH collect(x) AS xs RETURN reduce(s=1/0,y IN xs | s+y)", .err = error.CypherDivisionByZero },
+        .{ .text = "UNWIND [1,0] AS x WITH collect(1/x) AS xs RETURN reduce(s=1+'bad',y IN xs | s+y)", .err = error.CypherDivisionByZero },
+        .{ .text = "UNWIND [1,-1] AS x WITH collect(x) AS xs RETURN reduce(s=9223372036854775807,y IN xs | s+y)", .err = error.CypherNumericOverflow },
+    }) |case| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        try std.testing.expectError(case.err, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+    }
+}
+
+test "streaming windows and fold state release every failed allocation" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "UNWIND ['ab','cd'] AS x WITH collect(x) AS xs RETURN head([y IN xs | y+'!']),last([y IN xs | y+'?']),reduce(s={v:''},y IN xs | {v:s.v+y})", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
+}
+
+test "streaming consumers keep physical summaries outside public value depth" {
+    var nested: [65][1]v.Value = undefined;
+    nested[0][0] = .{ .integer = 1 };
+    for (1..nested.len) |i| nested[i][0] = .{ .list = &nested[i - 1] };
+    const Case = struct { text: []const u8, value: v.Value, failure: ?anyerror = null };
+    for ([_]Case{
+        .{ .text = "UNWIND [1] AS x WITH collect(x) AS xs RETURN size(reduce(s=$deep,y IN xs | s))", .value = nested[64][0] },
+        .{ .text = "UNWIND [1] AS x WITH collect(x) AS xs WITH xs AS ys RETURN size(reduce(s=$deep,y IN ys | s).nested)", .value = .{ .map = &.{.{ .name = "nested", .value = nested[63][0] }} } },
+        .{ .text = "UNWIND [1] AS x WITH collect(x) AS xs RETURN size(head([y IN xs | $deep]))", .value = nested[63][0] },
+        .{ .text = "UNWIND [1,2] AS x WITH collect(x) AS xs RETURN head([y IN xs | CASE WHEN y=1 THEN 7 ELSE $deep END])", .value = nested[64][0], .failure = error.CypherValueDepthExceeded },
+        .{ .text = "UNWIND [1,2,0] AS x WITH collect(x) AS xs RETURN head([y IN xs | CASE WHEN y=2 THEN $deep ELSE 1/y END])", .value = nested[64][0], .failure = error.CypherDivisionByZero },
+    }) |case| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, case.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        const parameters = &.{v.Entry{ .name = "deep", .value = case.value }};
+        if (case.failure) |failure| {
+            try std.testing.expectError(failure, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, parameters, .{}));
+        } else {
+            var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, parameters, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
+        }
+    }
+}
+
+test "streaming consumer plans specialize parameters independently for repeated prepared execution" {
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [1,2,3] AS x WITH collect(x) AS xs RETURN reduce(s=$initial,y IN xs | s+y),head([y IN xs WHERE y>=$k | y*10]),[y IN xs | y][$i]", .{}, &diagnostic);
+    defer compiled.deinit();
+    for ([_]struct { initial: i64, k: i64, i: i64 }{
+        .{ .initial = 10, .k = 2, .i = -1 },
+        .{ .initial = -10, .k = 4, .i = 20 },
+        .{ .initial = 0, .k = 0, .i = 0 },
+    }) |case| {
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{
+            .{ .name = "initial", .value = .{ .integer = case.initial } },
+            .{ .name = "k", .value = .{ .integer = case.k } },
+            .{ .name = "i", .value = .{ .integer = case.i } },
+        }, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.initial + 6, result.rows[0][0].integer);
+        if (case.k == 4) {
+            try std.testing.expect(result.rows[0][1] == .null and result.rows[0][2] == .null);
+        } else {
+            try std.testing.expectEqual(@as(i64, if (case.k == 2) 20 else 10), result.rows[0][1].integer);
+            try std.testing.expectEqual(@as(i64, if (case.i == -1) 3 else 1), result.rows[0][2].integer);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), compiled.query.clauses[1].operation.project.value.items[0].expression.value.call.collect_filters.len);
+}
