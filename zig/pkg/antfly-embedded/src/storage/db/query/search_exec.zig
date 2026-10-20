@@ -18843,6 +18843,7 @@ const ValueProducer = struct {
         var iterator = if (pending) |*bitmap| bitmap.iterator() else if (selected) |bitmap| bitmap.iterator() else null;
         var sequential: u32 = 0;
         while (true) {
+            try control.check();
             const local = if (iterator) |*it| it.next() orelse break else blk: {
                 if (deleted) |*tombstones| {
                     sequential = @intCast(roaring.RoaringBitmap.candidateLowerBound(sequential, count, &.{}, &.{tombstones}));
@@ -18867,7 +18868,6 @@ const ValueProducer = struct {
                 }
                 continue;
             }
-            try control.check();
             if (facts.known.contains(local)) {
                 if (facts.matched.contains(local)) try result.add(local);
                 continue;
