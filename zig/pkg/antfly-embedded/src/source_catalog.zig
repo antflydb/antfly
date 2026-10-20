@@ -843,3 +843,4 @@ pub const storage_db_native_query_reuse = @import("storage/db/native_query_reuse
 
 pub const api_batch_execution_admission = @import("api/batch_execution_admission.zig");
 pub const api_transaction_begin_admission = @import("api/transaction_begin_admission.zig");
+pub const api_transaction_prepare_admission = @import("api/transaction_prepare_admission.zig");

@@ -221,6 +221,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const batchInternalWithPreparationAllocator = commit.batchInternalWithPreparationAllocator;
         pub const captureGeneratedWriteReadSnapshot = preparation.captureGeneratedWriteReadSnapshot;
         pub const captureTransformReadSnapshot = preparation.captureTransformReadSnapshot;
+        pub const captureTransformReadSnapshotWithAuthority = preparation.captureTransformReadSnapshotWithAuthority;
         pub const childRangeManifestReader = materialization.childRangeManifestReader;
         pub const clearActiveIndexRepairsLocked = commit.clearActiveIndexRepairsLocked;
         pub const clearBulkIngestIdentityAllNewLocked = commit.clearBulkIngestIdentityAllNewLocked;
@@ -228,6 +229,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const clearLiveDocSetCache = commit.clearLiveDocSetCache;
         pub const clearNonVisibleDocSetCache = commit.clearNonVisibleDocSetCache;
         pub const coalesceKeyValueRequest = preparation.coalesceKeyValueRequest;
+        pub const coalesceKeyValueRequestWithAuthority = preparation.coalesceKeyValueRequestWithAuthority;
         pub const decodeDenseArtifactCounterBootstrap = materialization.decodeDenseArtifactCounterBootstrap;
         pub const deinitOwnedGraphEdgeDelete = materialization.deinitOwnedGraphEdgeDelete;
         pub const deinitOwnedGraphEdgeWrite = materialization.deinitOwnedGraphEdgeWrite;
@@ -823,6 +825,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const batchInternalPrepared = Implementation.batchInternalPrepared;
             pub const batchInternalWithPreparationAllocator = Implementation.batchInternalWithPreparationAllocator;
             pub const captureTransformReadSnapshot = Implementation.captureTransformReadSnapshot;
+            pub const captureTransformReadSnapshotWithAuthority = Implementation.captureTransformReadSnapshotWithAuthority;
             pub const captureGeneratedWriteReadSnapshot = Implementation.captureGeneratedWriteReadSnapshot;
             pub const validateGeneratedWriteReadSnapshot = Implementation.validateGeneratedWriteReadSnapshot;
             pub const GeneratedWriteReadSnapshot = Implementation.GeneratedWriteReadSnapshot;
@@ -999,6 +1002,7 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const batchInternalPrepared = Implementation.batchInternalPrepared;
             pub const batchInternalWithPreparationAllocator = Implementation.batchInternalWithPreparationAllocator;
             pub const captureTransformReadSnapshot = Implementation.captureTransformReadSnapshot;
+            pub const captureTransformReadSnapshotWithAuthority = Implementation.captureTransformReadSnapshotWithAuthority;
             pub const captureGeneratedWriteReadSnapshot = Implementation.captureGeneratedWriteReadSnapshot;
             pub const validateGeneratedWriteReadSnapshot = Implementation.validateGeneratedWriteReadSnapshot;
             pub const GeneratedWriteReadSnapshot = Implementation.GeneratedWriteReadSnapshot;

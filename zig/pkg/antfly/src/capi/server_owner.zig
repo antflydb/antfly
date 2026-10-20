@@ -4140,6 +4140,28 @@ pub fn storageOwnerTransactionBeginWithAdmission(owner: ?*anyopaque, request: *c
     return .ok;
 }
 
+pub fn storageOwnerTransactionPrepareWithAdmission(owner: ?*anyopaque, request: *const kernel_owner_abi.TransactionPrepareRequest) callconv(.c) kernel_owner_abi.Status {
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const read = @import("antfly_local_sources").common_read_admission;
+    const raw = request.port orelse return .invalid_argument;
+    if (@intFromPtr(raw) % @alignOf(read.Port) != 0) return .invalid_argument;
+    const control: *const read.Port = @ptrCast(@alignCast(raw));
+    control.checkpoint() catch |err| return storageOwnerStatusFromError(err);
+    if (request._reserved != 0 or (request.table_name.len != 0 and request.table_name.ptr == null) or std.math.cast(usize, request.table_name.len) == null) return .invalid_argument;
+    const raw_intents = request.intents orelse return .invalid_argument;
+    const intents = @import("antfly_local_sources").api_transaction_prepare_admission.Port.read(raw_intents) catch |err| return if (err == error.UnsupportedVersion) .invalid_abi else .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    // Private preparation requires the same native Plan authority as private
+    // completion. Never enlist more hidden work before that path is available.
+    if (intents.restore_staging_scope != null or intents.restore_staging_plan_id != null or handle.db.local_execution.restore_staging_required.load(.acquire) or handle.db.local_execution.initial_child_hidden.load(.acquire)) return storageOwnerStatusFromError(error.UnsupportedOperation);
+    if (intents.relational_index_maintenance) |command| if (command.owner_group_id != handle.storage_owner_group_id) return storageOwnerStatusFromError(error.PreparedGenerationChanged);
+    handle.db.prepareTransactionWithAdmission(request.txn_id.bytes, intents, control.*) catch |err| return storageOwnerStatusFromError(err);
+    // Accepted intent durability is authoritative. A later coordinator fence
+    // still owns independent abort if its original decision budget expires.
+    return .ok;
+}
+
 /// Completion borrows its existing owner; it neither mints a new deadline nor
 /// turns a visibility rejection into permission to change a durable decision.
 pub fn storageOwnerTransactionResolveWithAdmission(owner: ?*anyopaque, request: *const kernel_owner_abi.TransactionResolveRequest) callconv(.c) kernel_owner_abi.Status {

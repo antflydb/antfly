@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 106;
+pub const abi_version: u32 = 107;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1572,6 +1572,18 @@ pub const TransactionBeginRequest = extern struct {
     port: ?*const anyopaque = null,
 };
 pub extern fn antfly_storage_owner_transaction_begin_with_admission(owner: ?*anyopaque, request: *const TransactionBeginRequest) callconv(.c) Status;
+
+/// Synchronous intent preparation. The checked native request and original
+/// admission remain borrowed until all preparation and physical writes return.
+pub const TransactionPrepareRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    txn_id: TxnId = .{},
+    intents: ?*const anyopaque = null,
+    port: ?*const anyopaque = null,
+};
+pub extern fn antfly_storage_owner_transaction_prepare_with_admission(owner: ?*anyopaque, request: *const TransactionPrepareRequest) callconv(.c) Status;
 
 /// Ordinary local completion. The caller owns admission through resolution and
 /// visibility waiting; hidden-owner completion requires a separate Plan fence.

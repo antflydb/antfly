@@ -9791,6 +9791,7 @@ pub const DB = struct {
     pub const TransformReadSnapshot = local_mutation.TransformReadSnapshot;
 
     pub const captureTransformReadSnapshot = local_mutation.captureTransformReadSnapshot;
+    pub const captureTransformReadSnapshotWithAuthority = local_mutation.captureTransformReadSnapshotWithAuthority;
 
     pub const GeneratedWriteReadSnapshot = local_mutation.GeneratedWriteReadSnapshot;
 
@@ -9821,10 +9822,23 @@ pub const DB = struct {
     pub const setCoalescedEntryToOwnedWrite = local_mutation.setCoalescedEntryToOwnedWrite;
 
     pub const coalesceKeyValueRequest = local_mutation.coalesceKeyValueRequest;
+    pub const coalesceKeyValueRequestWithAuthority = local_mutation.coalesceKeyValueRequestWithAuthority;
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
         if (comptime storage_engine.enabled) return storage_engine.call("get", .{ self, alloc, key });
-        try self.maybeFinalizePendingRowPolicyPublication();
+        return self.getWithOptionalAdmission(alloc, key, null);
+    }
+
+    /// Physical validation reads retain the caller's lifetime and fail closed
+    /// during policy publication instead of trying to finalize under apply.
+    pub fn getWithAdmission(self: *DB, alloc: Allocator, key: []const u8, original: @import("../../common/read_admission.zig").Port) !?[]u8 {
+        if (comptime storage_engine.enabled) return error.UnsupportedOperation;
+        return self.getWithOptionalAdmission(alloc, key, original);
+    }
+
+    fn getWithOptionalAdmission(self: *DB, alloc: Allocator, key: []const u8, original: ?@import("../../common/read_admission.zig").Port) !?[]u8 {
+        if (original) |owner| try owner.checkLifetime();
+        if (original == null) try self.maybeFinalizePendingRowPolicyPublication();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRawRead();
         defer row_policy_lease.release();
         var schema_view = self.core.acquireSchemaView();
@@ -9852,6 +9866,7 @@ pub const DB = struct {
         const result = try self.core.index_manager.materializeStoredValueWithPinnedSchemaAlloc(alloc, store_key, raw, schema_view);
         errdefer alloc.free(result);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        if (original) |owner| try owner.checkLifetime();
         return result;
     }
 
@@ -24369,6 +24384,43 @@ pub const DB = struct {
         return self.writeTransactionWithOptionalAdmissionControls(txn_id, req, controls);
     }
 
+    /// Physical PREPARE validates the same table contract as local API writes.
+    /// Validation scratch and principal parsing use the native preparation budget.
+    pub fn prepareTransactionWithAdmission(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, supplied: @import("../../common/read_admission.zig").Port) !void {
+        var trace: @import("../../common/read_admission.zig").RejectionTrace = .{};
+        const original = trace.bind(supplied).?;
+        try original.checkpoint();
+        {
+            var validation: RequestPreparationContext = undefined;
+            validation.init(self);
+            defer validation.deinit();
+            const alloc = validation.guard.allocator();
+            const local_write = @import("../write.zig");
+            const durable = local_write.transactionUsesDurableContract(alloc, self, txn_id) catch |err| {
+                try original.checkpoint();
+                return validation.mapError(err);
+            };
+            try original.checkpoint();
+            if (!durable) {
+                comptime std.debug.assert(@sizeOf(types.TransactionWrite) == @sizeOf(types.BatchWrite) and @alignOf(types.TransactionWrite) == @alignOf(types.BatchWrite));
+                const writes: []const types.BatchWrite = @ptrCast(req.writes);
+                local_write.validateTableBatchAgainstLocalSchemaWithAdmission(alloc, self, writes, req.deletes, req.transforms, original) catch |err| {
+                    try original.checkpoint();
+                    return validation.mapError(err);
+                };
+            }
+        }
+        try original.checkpoint();
+        const Check = struct {
+            fn lifetime(raw: *const anyopaque) !void {
+                const port: *const @import("../../common/read_admission.zig").Port = @ptrCast(@alignCast(raw));
+                try port.checkLifetime();
+            }
+        };
+        const wait = try original.executionWaitAfterLifetime();
+        self.writeTransactionWithAdmissionControls(txn_id, req, .{ .lifetime = .{ .context = &original, .check_fn = Check.lifetime }, .execution_wait = wait }) catch |err| return trace.failure orelse err;
+    }
+
     fn writeTransactionWithOptionalAdmissionControls(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
         if (controls) |original| try original.lifetime.check();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
@@ -24433,7 +24485,12 @@ pub const DB = struct {
         requirement: ?@import("prepared_transaction_effects.zig").Requirement,
         preparation_binding: ?@import("prepared_transaction_effects.zig").Binding,
     ) !void {
-        if (ordered_receipt == null) try self.maybeFinalizePendingRowPolicyPublication();
+        var preparation: RequestPreparationContext = undefined;
+        preparation.init(self);
+        defer preparation.deinit();
+        // Controlled admission must not opportunistically finalize policy via
+        // an uncontrolled apply wait. The policy gate itself fails closed.
+        if (ordered_receipt == null and controls == null) try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
@@ -24441,7 +24498,7 @@ pub const DB = struct {
             if (req.row_policy_database.len == 0 or req.row_policy_admitted_at_seconds <= 0 or
                 req.restore_staging_scope != null) return error.RowPolicyAuthenticationRequired;
             const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
-            verified_principal = try self.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (ordered_receipt != null) req.row_policy_admitted_at_seconds else now_seconds);
+            verified_principal = try self.verifyRowPolicyPrincipal(preparation.guard.allocator(), req.row_policy_principal_proof, req.row_policy_database, .write, if (ordered_receipt != null) req.row_policy_admitted_at_seconds else now_seconds);
             row_policy_lease = if (ordered_receipt != null)
                 try self.local_execution.row_policy_gate.enterReplicatedPrincipal(&verified_principal.?.value)
             else
@@ -24456,9 +24513,6 @@ pub const DB = struct {
             return error.RowPolicyAuthenticationRequired;
         }
         defer if (row_policy_lease) |*lease| lease.release();
-        var preparation: RequestPreparationContext = undefined;
-        preparation.init(self);
-        defer preparation.deinit();
         const max_prepared_retries = 2;
         var retries: usize = 0;
         while (true) {
@@ -24496,20 +24550,23 @@ pub const DB = struct {
                 req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or
                 req.relational_activation != null or req.relational_retirement != null or
                 req.relational_repair or req.restore_staging_scope != null)) return error.InvalidBatchRequest;
+        var admission_poll: @import("../../search/work_authority.zig").Poller = .{ .authority = if (controls) |original| original.lifetime else null };
+        try admission_poll.tick();
         const schema_namespace = self.core.schemaNamespaceGeneration();
         // Parse and expand transforms from one optimistic read snapshot before
         // entering the serialized commit section. The commit fence below
         // validates both that read set and the immutable schema epoch.
-        var transform_snapshot = try self.captureTransformReadSnapshot(
+        var transform_snapshot = try self.captureTransformReadSnapshotWithAuthority(
             preparation_alloc,
             types.TransactionWrite,
             req.writes,
             req.deletes,
             req.transforms,
+            if (controls) |original| original.lifetime else null,
         );
         defer transform_snapshot.deinit(preparation_alloc);
 
-        var effective_ops = try coalesceKeyValueRequest(
+        var effective_ops = try coalesceKeyValueRequestWithAuthority(
             self,
             preparation_alloc,
             types.TransactionWrite,
@@ -24517,6 +24574,7 @@ pub const DB = struct {
             req.deletes,
             req.transforms,
             &transform_snapshot,
+            if (controls) |original| original.lifetime else null,
         );
         defer effective_ops.deinit(preparation_alloc);
         // Graph projections are maintained as artifact deltas, while the
@@ -24532,6 +24590,7 @@ pub const DB = struct {
         defer predicates.deinit(preparation_alloc);
 
         for (effective_ops.writes) |write| {
+            try admission_poll.tick();
             if (isProtectedIntegrityKey(write.key) or isProtectedRangeWriteKey(write.key)) return error.InvalidIntegrityOperation;
             try intents.append(preparation_alloc, .{
                 .key = write.key,
@@ -24540,6 +24599,7 @@ pub const DB = struct {
             });
         }
         for (effective_ops.deletes) |key| {
+            try admission_poll.tick();
             if (isProtectedIntegrityKey(key) or isProtectedRangeWriteKey(key)) return error.InvalidIntegrityOperation;
             try intents.append(preparation_alloc, .{
                 .key = key,
@@ -24547,6 +24607,7 @@ pub const DB = struct {
             });
         }
         for (req.predicates) |predicate| {
+            try admission_poll.tick();
             if (isProtectedIntegrityKey(predicate.key)) return error.InvalidIntegrityOperation;
             try predicates.append(preparation_alloc, .{
                 .key = predicate.key,
@@ -24568,6 +24629,7 @@ pub const DB = struct {
         defer preparation_alloc.free(range_values);
         var observed_buckets = std.StaticBitSet(tracking.bucket_count).empty;
         for (req.range_guards, 0..) |guard, i| {
+            try admission_poll.tick();
             tracking.validateProof(guard) catch return error.InvalidBatchRequest;
             const key: []const u8 = if (guard.index) |span| blk: {
                 index_range_keys[i] = tracking.indexCounterKey(span.digest);
@@ -24590,6 +24652,7 @@ pub const DB = struct {
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(preparation_alloc);
         for (intents.items) |intent| {
+            try admission_poll.tick();
             if (intent.value == null or isMetadataKey(intent.key)) continue;
             try identity_upsert_keys.append(preparation_alloc, intent.key);
         }
@@ -24638,6 +24701,7 @@ pub const DB = struct {
         var index_read: ?docstore_mod.DocStore.Txn = null;
         defer if (index_read) |*read| read.abort();
         for (req.range_guards) |guard| {
+            try admission_poll.tick();
             const span = guard.index orelse continue;
             const seen = try guarded_indexes.getOrPut(preparation_alloc, span.id);
             if (seen.found_existing) continue;
@@ -24659,7 +24723,7 @@ pub const DB = struct {
             try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, &control_key);
         }
         defer freePreparedIntentRows(preparation_alloc, intents.items);
-        try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
+        try self.prepareTransactionRowsWithAuthority(preparation_alloc, intents.items, prepared_schema_view, if (controls) |original| original.lifetime else null);
 
         const integrity_catalog_mod = @import("relational_integrity_catalog.zig");
         var integrity_catalog: ?integrity_catalog_mod.Catalog = null;
@@ -24681,6 +24745,7 @@ pub const DB = struct {
             const incarnation = try integrity_catalog_mod.incarnationFromTableId(self.core.identity_namespace.table_id);
             if (!std.mem.eql(u8, &incarnation, &integrity_catalog.?.incarnation)) return error.IntegrityCatalogIncarnationMismatch;
             for (req.integrity_commands) |command| {
+                try admission_poll.tick();
                 const generation = integrity_catalog.?.findGeneration(command.address.generation) orelse return error.IntegrityCatalogChanged;
                 if (generation.definition.kind != .unique) return error.InvalidIntegrityOperation;
                 if (generation.retired and (command.operation == .establish or command.operation == .attach)) return error.IntegrityCatalogChanged;
@@ -24710,7 +24775,7 @@ pub const DB = struct {
         {
             var topology_read = try self.core.store.beginProbeTxn();
             defer topology_read.abort();
-            try @import("restore_staging.zig").requireMutableScope(preparation_alloc, &topology_read, req.restore_staging_scope);
+            try @import("restore_staging.zig").requireMutableScopeWithPlan(preparation_alloc, &topology_read, req.restore_staging_scope, req.restore_staging_plan_id);
             if (req.restore_staging_scope != null and (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0 or req.relational_repair or req.relational_retirement != null)) return error.InvalidRestoreStagingCommand;
             if (req.restore_staging_scope != null) {
                 const checkpoint = (try @import("restore_staging.zig").optional(&topology_read)) orelse return error.RestoreStagingScopeChanged;
@@ -25095,12 +25160,29 @@ pub const DB = struct {
         intents: []transactions_mod.WriteIntent,
         schema_view: ?schema_registry_mod.SchemaView,
     ) !void {
+        return self.prepareTransactionRowsWithAuthority(alloc, intents, schema_view, null);
+    }
+
+    fn prepareTransactionRowsWithAuthority(
+        self: *DB,
+        alloc: Allocator,
+        intents: []transactions_mod.WriteIntent,
+        schema_view: ?schema_registry_mod.SchemaView,
+        original: ?@import("../../search/work_authority.zig").Authority,
+    ) !void {
+        if (original) |owner| try owner.check();
         const view = schema_view orelse {
-            for (intents) |intent| if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
+            for (intents) |intent| {
+                if (original) |owner| try owner.check();
+                if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
+            }
             return;
         };
         if (view.storageMode() != .relational) {
-            for (intents) |intent| if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
+            for (intents) |intent| {
+                if (original) |owner| try owner.check();
+                if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
+            }
             return;
         }
         const Context = struct {
@@ -25112,8 +25194,10 @@ pub const DB = struct {
             failed: std.atomic.Value(bool) = .init(false),
             mutex: std.Io.Mutex = .init,
             failure: ?anyerror = null,
+            original: ?@import("../../search/work_authority.zig").Authority,
 
             fn prepare(ctx: *@This(), scratch: Allocator, intent: *transactions_mod.WriteIntent) !void {
+                if (ctx.original) |owner| try owner.check();
                 if (isMetadataKey(intent.key)) return;
                 const value = intent.value orelse return;
                 var row = try mapper.PreparedRelationalWrite.initTyped(ctx.alloc, scratch, scratch, false, intent.key, value, ctx.view.validator(), ctx.view.tableSchema().*, ctx.view.physicalLayout(), intent.json_null_fields, false);
@@ -25125,6 +25209,8 @@ pub const DB = struct {
                 for ([_][]const u8{ "_edges", "_embeddings" }) |field|
                     if (root.object.get(field)) |special| try specials.put(scratch, field, special);
                 const sidecar = try std.json.Stringify.valueAlloc(ctx.alloc, std.json.Value{ .object = specials }, .{});
+                errdefer ctx.alloc.free(sidecar);
+                if (ctx.original) |owner| try owner.check();
                 intent.prepared_row = row.takePackedRow();
                 intent.value = sidecar;
                 intent.json_null_fields = &.{};
@@ -25148,10 +25234,12 @@ pub const DB = struct {
             }
         };
         const io = self.backend_runtime.io();
-        var ctx = Context{ .alloc = alloc, .intents = intents, .view = view, .io = io orelse std.Options.debug_io };
+        var ctx = Context{ .alloc = alloc, .intents = intents, .view = view, .io = io orelse std.Options.debug_io, .original = original };
         var input_bytes: usize = 0;
         for (intents) |intent| input_bytes +|= if (intent.value) |value| value.len else 0;
-        const workers = @min(@as(usize, 8), @min(intents.len, @max(@as(usize, 1), input_bytes / (256 * 1024))));
+        // An Authority conveys one retained caller, not extra CPU grants.
+        // Independent parallel producers require explicit child ownership.
+        const workers = if (original != null) 1 else @min(@as(usize, 8), @min(intents.len, @max(@as(usize, 1), input_bytes / (256 * 1024))));
         if (io != null and workers > 1) {
             var group: std.Io.Group = .init;
             for (1..workers) |_| group.async(io.?, Context.run, .{&ctx});
@@ -144034,4 +144122,44 @@ test "required replicated begin ordinary completion bounds late indexed apply co
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc", result.hits[0].id);
+}
+
+test "required replicated begin controlled row preparation retains the original worker authority" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("controlled-row-worker");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "id", .path = "id", .column_type = .integer, .required = true },
+        .{ .name = "payload", .path = "payload", .column_type = .string, .required = true },
+    };
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    var schema = db.core.acquireSchemaView().?;
+    defer schema.release();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const setup = arena.allocator();
+    const text: [512 * 1024]u8 = @splat('x');
+    var intents: [4]transactions_mod.WriteIntent = undefined;
+    for (&intents, 0..) |*intent, ordinal| intent.* = .{ .key = try std.fmt.allocPrint(setup, "row:{d}", .{ordinal}), .value = try std.fmt.allocPrint(setup, "{{\"id\":{d},\"payload\":\"{s}\"}}", .{ ordinal, &text }) };
+    const Control = struct {
+        thread: @TypeOf(std.Thread.getCurrentId()),
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
+            self.calls += 1;
+        }
+    };
+    var control: Control = .{ .thread = std.Thread.getCurrentId() };
+    var scratch: RequestPreparationContext = undefined;
+    scratch.init(&db);
+    defer scratch.deinit();
+    defer DB.freePreparedIntentRows(scratch.guard.allocator(), &intents);
+    // Enough input for eight legacy tasks. This authority grants only the
+    // caller's worker; row computation must not share it with parallel tasks.
+    try db.prepareTransactionRowsWithAuthority(scratch.guard.allocator(), &intents, schema, .{ .context = &control, .check_fn = Control.check });
+    try std.testing.expect(control.calls >= 2 * intents.len);
+    for (intents) |intent| try std.testing.expect(intent.prepared_row != null);
 }

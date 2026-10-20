@@ -497,6 +497,7 @@ fn assertPreparationOwnerStatus(db: *db_mod.DB, txn_id: [16]u8) !void {
 
 comptime {
     @export(&@import("capi/server_owner.zig").storageOwnerTransactionBeginWithAdmission, .{ .name = "antfly_storage_owner_transaction_begin_with_admission" });
+    @export(&@import("capi/server_owner.zig").storageOwnerTransactionPrepareWithAdmission, .{ .name = "antfly_storage_owner_transaction_prepare_with_admission" });
     @export(&@import("capi/server_owner.zig").storageOwnerTransactionResolveWithAdmission, .{ .name = "antfly_storage_owner_transaction_resolve_with_admission" });
 }
 
@@ -672,6 +673,9 @@ test "required replicated begin typed hidden owner checks the actual restore pla
     defer a.free(locator);
     try client.transactionBeginWithAdmission(a, "docs", id, 1, 2, &.{locator}, true, scope.digest(), scope.plan_id, &port);
     try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try manager.getTransactionStatus(id));
+    try std.testing.expectError(error.RestoreStagingScopeChanged, db.writeTransaction(id, .{ .restore_staging_scope = scope.digest(), .restore_staging_plan_id = wrong_plan }));
+    try std.testing.expect(!try manager.hasIntents(id));
+    try db.writeTransaction(id, .{ .restore_staging_scope = scope.digest(), .restore_staging_plan_id = scope.plan_id });
 }
 
 test "required replicated begin participant workspace covers geometric growth and long scoped names" {
@@ -740,6 +744,8 @@ test "required replicated begin native workspace denies quota before backing all
     try std.testing.expectEqual(@import("kernel_owner_abi").Status.invalid_abi, @import("capi/server_owner.zig").storageOwnerTransactionBeginWithAdmission(registered, &bad_request));
     try std.testing.expectError(error.ResourceBudgetExceeded, client.transactionBeginWithAdmission(failing.allocator(), "docs", id, 1, 2, &.{"table2:00000004:docs:7"}, true, null, null, &port));
     try std.testing.expectError(error.ResourceBudgetExceeded, client.transactionResolveWithAdmission("docs", id, .aborted, 3, .write, &port));
+    handle.db.alloc = failing.allocator();
+    try std.testing.expectError(error.ResourceBudgetExceeded, client.transactionPrepareWithAdmission("docs", id, .{ .writes = &.{.{ .key = "quota", .value = "{}" }} }, &port));
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(@as(u64, 0), quota.sliceStats(.relational_preparation_working_set).used_bytes);
     var manager = try db.core.initTxnManager();
@@ -934,4 +940,208 @@ test "required replicated begin ordinary completion lends CPU before native capt
     const rejected_acks = try manager.getResolvedParticipants(a, rejected_id);
     defer sources.storage_transactions.freeParticipantList(a, rejected_acks);
     try std.testing.expectEqual(@as(usize, 0), rejected_acks.len);
+}
+
+test "required replicated begin typed PREPARE preserves original authority and durable intent ownership" {
+    const a = std.testing.allocator;
+    const admission = sources.common_read_admission;
+    const Control = struct {
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ordinal = self.calls;
+            self.calls += 1;
+            if (ordinal == self.fail_at) return self.cause;
+        }
+        fn forbidden(_: *anyopaque) !void {
+            return error.UnexpectedCpuLoan;
+        }
+    };
+    var directory = try sources.common_test_directory.TestDirectory.init("native-prepare-controls");
+    defer directory.cleanup();
+    const accepted: [16]u8 = @splat(0xc1);
+    {
+        var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        var handle: sources.capi_handles.Handle = .{ .alloc = a, .db = db, .storage_owner_table_name = @constCast("docs"), .storage_owner_group_id = 7 };
+        const registry = sources.capi_handles.handleRegistry();
+        const registered = try registry.register(&handle);
+        defer {
+            _, const index = registry.beginClose(registered).?;
+            registry.finishClose(index);
+        }
+        var client: @import("storage/kernel_owner_client.zig").Owner = .{ .handle = registered };
+        var control: Control = .{};
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check }, .execution_wait = .{ .ptr = &control, .begin = Control.forbidden, .end = Control.forbidden } };
+        const port = admission.Port.init(&payload);
+        const intents: db_mod.types.TransactionIntentRequest = .{ .writes = &.{.{ .key = "prepared", .value = "{}" }} };
+        _ = try db.beginTransactionScoped(accepted, 1, 2, &.{}, true, true, null);
+        try client.transactionPrepareWithAdmission("docs", accepted, intents, &port);
+        const checkpoints = control.calls;
+        try std.testing.expect(checkpoints > 8);
+        var manager = try db.core.initTxnManager();
+        defer manager.deinit();
+        try std.testing.expect(try manager.hasIntents(accepted));
+        try std.testing.expect((try db.get(a, "prepared")) == null);
+        try db.resolveTransactionIntents(accepted, .aborted, 3);
+        for ([_]anyerror{ error.NotFound, error.TxnNotFound, error.Canceled, error.DeadlineExceeded, error.MemoryLimitExceeded, error.PreparedGenerationChanged, error.PreparedReadSetChanged }, 0..) |cause, cause_index| for (0..checkpoints) |ordinal| {
+            var attempt: [16]u8 = @splat(0xc2);
+            std.mem.writeInt(u64, attempt[0..8], @intCast(ordinal), .little);
+            attempt[8] = @intCast(cause_index);
+            _ = try db.beginTransactionScoped(attempt, 1, 2, &.{}, true, true, null);
+            control = .{ .fail_at = ordinal, .cause = cause };
+            const result = client.transactionPrepareWithAdmission("docs", attempt, intents, &port);
+            if (control.calls > ordinal) {
+                try std.testing.expectError(cause, result);
+                try std.testing.expect(!try manager.hasIntents(attempt));
+            } else try result;
+            try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try manager.getTransactionStatus(attempt));
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApplyExclusive();
+            // Rejected foreground authority cannot prevent mandatory abort.
+            try db.resolveTransactionIntents(attempt, .aborted, 3);
+        };
+        const pending: [16]u8 = @splat(0xc3);
+        _ = try db.beginTransactionScoped(pending, 1, 2, &.{}, true, true, null);
+        control = .{};
+        db.core.lockApplyExclusive();
+        const blocked = client.transactionPrepareWithAdmission("docs", pending, intents, &port);
+        db.core.unlockApplyExclusive();
+        try std.testing.expectError(error.Backpressured, blocked);
+        try std.testing.expect(!try manager.hasIntents(pending));
+        // A field omitted by the old JSON bridge must still reach native auth.
+        try std.testing.expectError(error.RowPolicyAuthenticationRequired, client.transactionPrepareWithAdmission("docs", pending, .{ .row_policy_database = "protected" }, &port));
+        try std.testing.expect(!try manager.hasIntents(pending));
+        try std.testing.expectError(error.VersionConflict, client.transactionPrepareWithAdmission("docs", pending, .{ .predicates = &.{.{ .key = "absent", .expected_version = 999 }} }, &port));
+        try std.testing.expect(!try manager.hasIntents(pending));
+        const borrowed = sources.api_transaction_prepare_admission;
+        var marker: u8 = 0;
+        const incompatible: borrowed.Port = .{ .contract = @import("antfly_runtime_abi").native_abi.TypeContract.of(u8), .payload = &marker };
+        const raw: @import("kernel_owner_abi").TransactionPrepareRequest = .{ .table_name = .fromSlice("docs"), .txn_id = .{ .bytes = pending }, .intents = &incompatible, .port = &port };
+        try std.testing.expectEqual(@import("kernel_owner_abi").Status.invalid_abi, @import("capi/server_owner.zig").storageOwnerTransactionPrepareWithAdmission(null, &raw));
+        try std.testing.expectError(error.UnsupportedOperation, client.transactionPrepareWithAdmission("docs", pending, .{ .restore_staging_scope = @splat(1), .restore_staging_plan_id = @splat(2) }, &port));
+        try client.transactionPrepareWithAdmission("docs", pending, intents, &port);
+        try std.testing.expect(try manager.hasIntents(pending));
+    }
+    var reopened = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer reopened.close();
+    var manager = try reopened.core.initTxnManager();
+    defer manager.deinit();
+    const pending: [16]u8 = @splat(0xc3);
+    try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try manager.getTransactionStatus(pending));
+    try std.testing.expect(try manager.hasIntents(pending));
+    try reopened.resolveTransactionIntents(pending, .committed, 4);
+    const value = (try reopened.get(a, "prepared")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("{}", value);
+}
+
+test "required replicated begin typed PREPARE validates public schema transforms and policy transition before durability" {
+    const a = std.testing.allocator;
+    var directory = try sources.common_test_directory.TestDirectory.init("native-prepare-schema");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(a,
+        \\{"version":1,"default_type":"doc","enforce_types":true,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}}}}
+    );
+    var handle: sources.capi_handles.Handle = .{ .alloc = a, .db = db, .storage_owner_table_name = @constCast("docs"), .storage_owner_group_id = 7 };
+    const registry = sources.capi_handles.handleRegistry();
+    const registered = try registry.register(&handle);
+    defer {
+        _, const index = registry.beginClose(registered).?;
+        registry.finishClose(index);
+    }
+    var client: @import("storage/kernel_owner_client.zig").Owner = .{ .handle = registered };
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+        fn forbidden(_: *anyopaque) !void {
+            return error.UnexpectedCpuLoan;
+        }
+    };
+    var marker: u8 = 0;
+    const admission = sources.common_read_admission;
+    const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check }, .execution_wait = .{ .ptr = &marker, .begin = Control.forbidden, .end = Control.forbidden } };
+    const port = admission.Port.init(&payload);
+    const id: [16]u8 = @splat(0xd1);
+    _ = try db.beginTransactionScoped(id, 1, 2, &.{}, true, true, null);
+    var manager = try db.core.initTxnManager();
+    defer manager.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, client.transactionPrepareWithAdmission("docs", id, .{ .writes = &.{.{ .key = "row", .value = "{}" }} }, &port));
+    try std.testing.expect(!try manager.hasIntents(id));
+    const writes = &[_]db_mod.types.TransactionWrite{.{ .key = "row", .value = "{\"id\":1}" }};
+    try std.testing.expectError(error.InvalidBatchRequest, client.transactionPrepareWithAdmission("docs", id, .{ .writes = writes, .transforms = &.{.{ .key = "row", .operations = &.{.{ .op = .set, .path = "id", .value_json = "\"bad\"" }} }} }, &port));
+    try std.testing.expect(!try manager.hasIntents(id));
+    // A preparing policy must reject admission even with apply held. Neither
+    // transform reads nor intent admission may try to finalize that policy.
+    try db.local_execution.row_policy_gate.beginPreparing(.disabled);
+    db.core.lockApplyExclusive();
+    const policy_read = client.transactionPrepareWithAdmission("docs", id, .{ .transforms = &.{.{ .key = "row", .operations = &.{.{ .op = .set, .path = "id", .value_json = "2" }} }} }, &port);
+    const policy_write = client.transactionPrepareWithAdmission("docs", id, .{}, &port);
+    db.core.unlockApplyExclusive();
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, policy_read);
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, policy_write);
+    try std.testing.expect(!try manager.hasIntents(id));
+    try db.local_execution.row_policy_gate.publishCommitted(.{ .mode_initialized = true, .row_policy_catalog_epoch = 1 });
+    try client.transactionPrepareWithAdmission("docs", id, .{ .writes = writes, .transforms = &.{.{ .key = "row", .operations = &.{.{ .op = .set, .path = "id", .value_json = "2" }} }} }, &port);
+    var intent_batch = try manager.collectIntentBatch(a, id);
+    defer intent_batch.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), intent_batch.writes.len);
+    var value = try std.json.parseFromSlice(std.json.Value, a, intent_batch.writes[0].value, .{});
+    defer value.deinit();
+    try std.testing.expectEqual(@as(i64, 2), value.value.object.get("id").?.integer);
+}
+
+test "required replicated begin typed relational PREPARE retains one original worker and validates rows" {
+    const a = std.testing.allocator;
+    const admission = sources.common_read_admission;
+    var directory = try sources.common_test_directory.TestDirectory.init("native-relational-prepare");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const columns = [_]sources.storage_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .column_type = .integer, .required = true },
+        .{ .name = "payload", .path = "payload", .column_type = .string, .required = true },
+    };
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    var handle: sources.capi_handles.Handle = .{ .alloc = a, .db = db, .storage_owner_table_name = @constCast("docs"), .storage_owner_group_id = 7 };
+    const registry = sources.capi_handles.handleRegistry();
+    const registered = try registry.register(&handle);
+    defer {
+        _, const index = registry.beginClose(registered).?;
+        registry.finishClose(index);
+    }
+    var client: @import("storage/kernel_owner_client.zig").Owner = .{ .handle = registered };
+    const Control = struct {
+        calls: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check } };
+    const port = admission.Port.init(&payload);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const setup = arena.allocator();
+    const text: [512 * 1024]u8 = @splat('x');
+    var writes: [4]db_mod.types.TransactionWrite = undefined;
+    for (&writes, 0..) |*write, ordinal| write.* = .{ .key = try std.fmt.allocPrint(setup, "row:{d}", .{ordinal}), .value = try std.fmt.allocPrint(setup, "{{\"id\":{d},\"payload\":\"{s}\"}}", .{ ordinal, &text }) };
+    const accepted: [16]u8 = @splat(0xc4);
+    _ = try db.beginTransactionScoped(accepted, 1, 2, &.{}, true, true, null);
+    try client.transactionPrepareWithAdmission("docs", accepted, .{ .writes = &writes, .schema_version = 1 }, &port);
+    try std.testing.expect(control.calls >= 2 * writes.len);
+    var manager = try db.core.initTxnManager();
+    defer manager.deinit();
+    var collected = try manager.collectIntentBatch(a, accepted);
+    defer collected.deinit(a);
+    try std.testing.expectEqual(writes.len, collected.writes.len);
+    for (collected.prepared_rows) |row| try std.testing.expect(row != null);
+    const rejected_id: [16]u8 = @splat(0xc5);
+    _ = try db.beginTransactionScoped(rejected_id, 1, 2, &.{}, true, true, null);
+    try std.testing.expectError(error.InvalidBatchRequest, client.transactionPrepareWithAdmission("docs", rejected_id, .{ .writes = &.{.{ .key = "bad", .value = "{\"id\":\"bad\",\"payload\":\"x\"}" }} }, &port));
+    try std.testing.expect(!try manager.hasIntents(rejected_id));
 }

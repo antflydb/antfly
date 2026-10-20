@@ -210,6 +210,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             deletes: []const []const u8,
             transforms: []const types.DocumentTransform,
         ) !TransformReadSnapshot {
+            return captureTransformReadSnapshotWithAuthority(self, alloc, T, writes, deletes, transforms, null);
+        }
+
+        pub fn captureTransformReadSnapshotWithAuthority(
+            self: anytype,
+            alloc: Allocator,
+            comptime T: type,
+            writes: []const T,
+            deletes: []const []const u8,
+            transforms: []const types.DocumentTransform,
+            original: ?@import("../../search/work_authority.zig").Authority,
+        ) !TransformReadSnapshot {
+            var poll: @import("../../search/work_authority.zig").Poller = .{ .authority = original };
+            try poll.tick();
             var result = TransformReadSnapshot{};
             errdefer result.deinit(alloc);
             if (transforms.len == 0) return result;
@@ -219,12 +233,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // entirely request-local base.
             var request_keys = std.StringHashMapUnmanaged(void).empty;
             defer request_keys.deinit(alloc);
-            for (writes) |write| try request_keys.put(alloc, write.key, {});
-            for (deletes) |key| try request_keys.put(alloc, key, {});
+            for (writes) |write| {
+                try poll.tick();
+                try request_keys.put(alloc, write.key, {});
+            }
+            for (deletes) |key| {
+                try poll.tick();
+                try request_keys.put(alloc, key, {});
+            }
 
             var keys = std.ArrayListUnmanaged([]const u8).empty;
             defer keys.deinit(alloc);
             for (transforms) |transform| {
+                try poll.tick();
                 if (request_keys.contains(transform.key)) continue;
                 try request_keys.put(alloc, transform.key, {});
                 try keys.append(alloc, transform.key);
@@ -247,6 +268,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try result.positions.ensureTotalCapacity(alloc, std.math.cast(u32, keys.items.len) orelse
                 return error.InvalidBatchRequest);
             for (keys.items, 0..) |key, index| {
+                try poll.tick();
                 const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
                 defer alloc.free(store_key);
                 const raw = read_txn.get(store_key) catch |err| switch (err) {
@@ -325,6 +347,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             transforms: []const types.DocumentTransform,
             transform_snapshot: ?*const TransformReadSnapshot,
         ) !CoalescedKeyValueRequest(T) {
+            return coalesceKeyValueRequestWithAuthority(self, alloc, T, writes, deletes, transforms, transform_snapshot, null);
+        }
+
+        pub fn coalesceKeyValueRequestWithAuthority(
+            self: anytype,
+            alloc: Allocator,
+            comptime T: type,
+            writes: []const T,
+            deletes: []const []const u8,
+            transforms: []const types.DocumentTransform,
+            transform_snapshot: ?*const TransformReadSnapshot,
+            original: ?@import("../../search/work_authority.zig").Authority,
+        ) !CoalescedKeyValueRequest(T) {
+            var poll: @import("../../search/work_authority.zig").Poller = .{ .authority = original };
+            try poll.tick();
             // SQL mutations lower to complete replacements. A document transform
             // cannot retain the provenance of JSON null after reconstructing JSON.
             if (transforms.len != 0) for (writes) |write| if (write.json_null_fields.len != 0) return error.UnsupportedTransformOperation;
@@ -346,6 +383,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer positions.deinit(alloc);
 
             for (writes) |write| {
+                try poll.tick();
                 const gop = try positions.getOrPut(alloc, write.key);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = order.items.len;
@@ -364,6 +402,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             for (deletes) |key| {
+                try poll.tick();
                 const gop = try positions.getOrPut(alloc, key);
                 if (!gop.found_existing) {
                     gop.value_ptr.* = order.items.len;
@@ -380,6 +419,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             for (transforms) |transform| {
+                try poll.tick();
                 const maybe_index = positions.get(transform.key);
                 const base_json = blk: {
                     if (maybe_index) |entry_index| {
@@ -405,6 +445,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }).empty;
                 defer graph_operations.deinit(alloc);
                 for (transform.operations) |operation| {
+                    try poll.tick();
                     const graph_path = try transform_mod.graphProjectionPath(operation.path);
                     if (graph_path) |path| {
                         switch (operation.op) {
@@ -503,6 +544,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var write_count: usize = 0;
             var delete_count: usize = 0;
             for (order.items) |entry| {
+                try poll.tick();
                 switch (entry.kind) {
                     .write => write_count += 1,
                     .delete => delete_count += 1,
@@ -517,6 +559,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var write_index: usize = 0;
             var delete_index: usize = 0;
             for (final_entries) |entry| {
+                try poll.tick();
                 switch (entry.kind) {
                     .write => {
                         result.writes[write_index] = .{

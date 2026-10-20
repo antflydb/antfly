@@ -1213,6 +1213,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
+                .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_resolve_group_local_with_execution = txnResolveGroupLocalWithExecution,
@@ -6339,6 +6340,39 @@ pub const ProvisionedKernelOwnerSource = struct {
         return {};
     }
 
+    fn txnPrepareGroupLocalWithPreDecisionContext(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_types.TxnId, topology_epoch: u64, req: db_types.TransactionIntentRequest, context: @import("antfly_local_sources").api_distributed_txn_contract.PreDecisionContext) !?void {
+        const original = @import("../storage/hot_standby/owner_preflight_admission.zig");
+        const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
+        try original.checkOriginal(active, context.execution_runnable);
+        if (context.route_fence) |fence| try original.checkOriginal(.{ .deadline_ns = fence.admission_deadline_ns, .deadline_io = fence.admission_deadline_io, .cancellation = fence.admission_cancellation }, null);
+        if (context.restore_staging_scope != null or context.restore_staging_plan_id != null or req.restore_staging_scope != null or req.restore_staging_plan_id != null) return error.UnsupportedOperation;
+        if (!context.requiresAwareCallback()) return txnPrepareGroupLocal(ptr, alloc, group_id, table_name, txn_id, topology_epoch, req);
+        if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        var receiver = if (context.deadline_io) |borrow| try borrow.receive() else null;
+        const io = if (receiver) |*received| received.io() else if (self.context_runtime) |runtime| runtime.io() orelse return error.BackendRuntimeIoUnavailable else return error.BackendRuntimeIoUnavailable;
+        const Controls = NativeTransactionControls;
+        const Budget = @import("antfly_local_sources").common_read_execution_budget.Budget(Controls, Controls.check);
+        const admission = @import("antfly_local_sources").common_read_admission;
+        var budget: Budget = .{ .controls = .{ .context = active, .route = context.route_fence, .execution_runnable = context.execution_runnable }, .io = io };
+        var adapter: admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const control = admission.Port.init(&payload);
+        if (context.route_fence) |fence| {
+            if (fence.topology_epoch != topology_epoch) return error.TopologyChanged;
+            try self.validateRoutedReadControlled(alloc, fence, group_id, table_name, control);
+        }
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = context.deadline_ns, .execution_io = context.deadline_io, .cancellation = context.cancellation, .execution_runnable = context.execution_runnable, .retain_cpu = true });
+        defer lease.deinit();
+        if (lease.entry.restore_bootstrap_json.len != 0) return error.UnsupportedOperation;
+        if (context.route_fence) |fence| {
+            const identity = fence.route.identity_namespace;
+            if (identity.table_id != lease.entry.identity.table_id or identity.shard_id != lease.entry.identity.shard_id or identity.range_id != lease.entry.identity.range_id) return error.TopologyChanged;
+        }
+        try lease.owner().transactionPrepareWithAdmission(table_name, txn_id, req, &control);
+        return {};
+    }
+
     fn txnResolveGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -9081,4 +9115,20 @@ test "controlled native completion source rejects original admission before sour
 test "controlled native completion source analyzes real owner acquisition" {
     var source: ProvisionedKernelOwnerSource = undefined;
     _ = source.writeSource().txnResolveGroupLocalWithExecution(std.testing.allocator, 7, "docs", @splat(1), .aborted, 2, 3, .write, .{ .deadline_ns = 10 }) catch {};
+}
+
+test "controlled native PREPARE source preserves original rejection before source access" {
+    const Reject = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.MemoryLimitExceeded;
+        }
+    };
+    var marker: u8 = 0;
+    var source: ProvisionedKernelOwnerSource = undefined;
+    try std.testing.expectError(error.MemoryLimitExceeded, ProvisionedKernelOwnerSource.txnPrepareGroupLocalWithPreDecisionContext(&source, std.testing.allocator, 7, "docs", @splat(1), 3, .{}, .{ .cancellation = .{ .ptr = &marker, .check_fn = Reject.check } }));
+}
+
+test "controlled native PREPARE source analyzes real typed intent preparation" {
+    var source: ProvisionedKernelOwnerSource = undefined;
+    _ = source.writeSource().txnPrepareGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", @splat(1), 3, .{}, .{ .deadline_ns = 10 }) catch {};
 }
