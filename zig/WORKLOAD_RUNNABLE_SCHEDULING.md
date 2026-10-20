@@ -19,6 +19,47 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Replay decoder validation before allocation (2026-10-20)
+
+Source `5e48b391853a4a1069ce0370b5de70c88d531bff` validates the complete CJ2 envelope before owned, borrowed
+or selected scratch decoders allocate from wire counts. Impossible counts,
+truncation in any field, trailing bytes and reserved field flags reject before
+hint or key descriptor allocation. Valid CJ2 bytes and decoded values remain
+unchanged. The allocation-free inspection reports encoded input bytes, per-list
+key counts/bytes and hint count. Its checked sizing methods measure exact owned
+or borrowed allocation payload bytes; they exclude allocator headers/alignment,
+input storage and ArrayList spare capacity. Inspection can poll original controls
+every 64 entries while skipping key contents. Existing decode/copy loops remain
+synchronous; this is not a new cooperative decode or durable completion grant.
+
+`replay-decode-preflight-integration-v2` passes 70/70 build steps, including
+147 replay-allocation cases and the 43-case wire suite (these suites overlap),
+plus their root/boundary companions. All 4096 field/hint combinations compare
+actual owned/borrowed allocation payloads with inspection. Every truncation of a
+multi-field fixture, forged counts, trailing data and reserved flags rejects with
+a refusing allocator without attempting allocation. Original inspection control
+rejection propagates at each metadata checkpoint.
+
+The unchanged baseline reproduced the same eleven replay fixture failures as the
+initial patch. Those fixtures assumed retained ResourceManager identity tables
+were payload or had not provisioned their physical storage. They now use the
+existing metadata fixture, retain the original payload limits, and assert the
+complete physical balance including owned tables. A repeated-window test proves
+payload retirement, stable table allocations across 128 windows, the declared
+physical ceiling and complete table free at manager teardown. Production worker
+code before its test section is unchanged; production limits are not relaxed.
+
+`replay-decode-preflight-verified.json` binds 5269 native inputs,
+4551 matching immutable public sources and 25/25 ReleaseSafe
+consumer build steps. Public consumer coverage remains module composition only.
+Native 51/runnable 18/API 57/storage-owner 109/failure 66 and durable formats are
+unchanged. Full archive/cold-source runtime remain unqualified; the full Linux
+sweep remains waived. This supplies a decoder-allocation input for future
+completion funding. Exact future replay effects plus physical inventory,
+predecision reservations, atomic background credit adjustment, working-resource
+bundles and required-provider orchestration remain unfinished. Required-mode
+providers stay disabled and the full design remains incomplete.
+
 ## Original-scope checks during producer CPU admission (2026-10-20)
 
 Source `c7de4b1b80ee26ce2643229f7cc39e6aaef21dbf` adds checked child activation to the native scheduler,
