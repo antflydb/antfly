@@ -140,6 +140,8 @@ fn cardinality(expression: *const ast.Expr) ?*const ast.Expr {
 }
 const Cardinality = struct {
     a: A,
+    source: []const u8,
+    rewrites: ?*const @import("alias_cardinality.zig").Rewrites = null,
     /// A full consumer in the same projection still needs the physical collect
     /// slot. Leave matching size consumers on that shared slot rather than
     /// adding another argument evaluation and reducer.
@@ -172,7 +174,7 @@ const Cardinality = struct {
     fn lower(self: *@This(), value: anytype, full: ?*const Index) anyerror!@TypeOf(value) {
         const T = @TypeOf(value);
         if (T == *const ast.Expr) {
-            var expression = value.*;
+            var expression = if (self.rewrites) |rewrites| rewrites.get(value) orelse value.* else value.*;
             if (cardinality(value)) |input| {
                 if (full == null or full.?.find(input) == null) {
                     expression.value = .{ .call = input.value.call };
@@ -207,6 +209,11 @@ const Cardinality = struct {
                 } else full;
                 var result = value;
                 inline for (info.field_names) |name| @field(result, name) = try self.lower(@field(value, name), scope);
+                // Replacing SIZE(alias) with a scalar binding must preserve the
+                // public implicit column name rather than exposing that alias.
+                if (T == ast.Item) if (result.alias == null and value.expression.value != .variable and result.expression.value == .variable) {
+                    result.alias = try expressions.outputName(self.a, self.source, value.expression);
+                };
                 return result;
             },
             .@"union" => return switch (value) {
@@ -218,8 +225,13 @@ const Cardinality = struct {
     }
 };
 pub fn lowerCardinality(a: A, query: ast.Query) !ast.Query {
-    var lower: Cardinality = .{ .a = a };
-    return lower.lower(query, null);
+    var lower: Cardinality = .{ .a = a, .source = query.source };
+    const direct = try lower.lower(query, null);
+    var rewrites: @import("alias_cardinality.zig").Rewrites = .empty;
+    try @import("alias_cardinality.zig").plan(a, query.source, direct, &rewrites);
+    if (rewrites.count() == 0) return direct;
+    lower.rewrites = &rewrites;
+    return lower.lower(direct, null);
 }
 
 /// Compile pointer lookups once, instead of structurally comparing every key

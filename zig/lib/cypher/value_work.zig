@@ -33,6 +33,8 @@ pub const Work = struct {
     binding_identity: bool = false,
     cache: std.AutoHashMapUnmanaged(Key, Info) = .empty,
     fields: std.AutoHashMapUnmanaged(Key, std.StringHashMapUnmanaged(usize)) = .empty,
+    order_depths: std.AutoHashMapUnmanaged(Key, usize) = .empty,
+    order_entries: std.AutoHashMapUnmanaged(Key, []const v.Entry) = .empty,
 
     fn key(value: v.Value) ?Key {
         return switch (value) {
@@ -270,12 +272,130 @@ pub const Work = struct {
         try self.charge(self.ptr, left.work +| right.work);
         return (try self.equalInner(a, b, true)).?;
     }
+    /// Ordering does not need equality hashes. Validate container depth without
+    /// reading string bodies, then meter the members/byte prefixes actually
+    /// compared. All metadata has the same owner/lifetime as this Work.
     pub fn order(self: *Work, a: v.Value, b: v.Value) !std.math.Order {
+        _ = try self.orderDepth(a, 0);
+        _ = try self.orderDepth(b, 0);
+        return self.orderInner(a, b);
+    }
+    fn orderDepth(self: *Work, value: v.Value, depth: usize) anyerror!usize {
+        try self.charge(self.ptr, 1);
+        if (depth > 64) return error.CypherValueDepthExceeded;
+        if (value != .list and value != .map) return 0;
+        const k = key(value).?;
+        if (self.order_depths.get(k)) |known| {
+            if (depth + known > 64) return error.CypherValueDepthExceeded;
+            return known;
+        }
+        var result: usize = 0;
+        switch (value) {
+            .list => |items| for (items) |item| {
+                result = @max(result, 1 + try self.orderDepth(item, depth + 1));
+            },
+            .map => |entries| for (entries) |entry| {
+                result = @max(result, 1 + try self.orderDepth(entry.value, depth + 1));
+            },
+            else => unreachable,
+        }
+        try self.order_depths.put(self.a, k, result);
+        return result;
+    }
+    fn orderText(self: *Work, a: []const u8, b: []const u8) !std.math.Order {
+        var offset: usize = 0;
+        const common = @min(a.len, b.len);
+        while (offset < common) {
+            try self.charge(self.ptr, 1);
+            const end = offset + @min(64, common - offset);
+            const comparison = std.mem.order(u8, a[offset..end], b[offset..end]);
+            if (comparison != .eq) return comparison;
+            offset = end;
+        }
+        return std.math.order(a.len, b.len);
+    }
+    fn orderIdentity(self: *Work, a: v.Identity, b: v.Identity) !std.math.Order {
+        const table = try self.orderText(a.table, b.table);
+        return if (table != .eq) table else self.orderText(a.key, b.key);
+    }
+    fn sortedEntries(self: *Work, entries: []const v.Entry) ![]const v.Entry {
+        const k = key(.{ .map = entries }).?;
+        if (self.order_entries.get(k)) |known| return known;
+        const sorted = try self.a.dupe(v.Entry, entries);
+        const scratch = try self.a.alloc(v.Entry, entries.len);
+        var width: usize = 1;
+        while (width < sorted.len) : (width *= 2) {
+            var start: usize = 0;
+            while (start < sorted.len) : (start += width * 2) {
+                const middle = @min(start + width, sorted.len);
+                const end = @min(start + width * 2, sorted.len);
+                var l = start;
+                var r = middle;
+                for (scratch[start..end]) |*out| {
+                    try self.charge(self.ptr, 1);
+                    if (r == end or (l < middle and try self.orderText(sorted[l].name, sorted[r].name) != .gt)) {
+                        out.* = sorted[l];
+                        l += 1;
+                    } else {
+                        out.* = sorted[r];
+                        r += 1;
+                    }
+                }
+            }
+            @memcpy(sorted, scratch);
+        }
+        try self.order_entries.put(self.a, k, sorted);
+        return sorted;
+    }
+    fn orderInner(self: *Work, a: v.Value, b: v.Value) anyerror!std.math.Order {
         try self.charge(self.ptr, 1);
         if (identical(a, b)) return .eq;
-        try self.charge(self.ptr, (try self.info(a)).comparison_work);
-        try self.charge(self.ptr, (try self.info(b)).comparison_work);
-        return v.Value.order(a, b);
+        const ar = v.Value.rank(a);
+        const br = v.Value.rank(b);
+        if (ar != br) return std.math.order(ar, br);
+        return switch (a) {
+            .null, .integer, .number, .boolean => v.Value.order(a, b),
+            .string => self.orderText(a.string, b.string),
+            .node => self.orderIdentity(a.node.identity, b.node.identity),
+            .relationship => blk: {
+                const identity_order = try self.orderIdentity(a.relationship.identity, b.relationship.identity);
+                break :blk if (identity_order != .eq) identity_order else try self.orderText(a.relationship.index, b.relationship.index);
+            },
+            .list => blk: {
+                for (a.list[0..@min(a.list.len, b.list.len)], b.list[0..@min(a.list.len, b.list.len)]) |left, right| {
+                    const comparison = try self.orderInner(left, right);
+                    if (comparison != .eq) break :blk comparison;
+                }
+                break :blk std.math.order(a.list.len, b.list.len);
+            },
+            .path => blk: {
+                for (0..@min(a.path.nodes.len, b.path.nodes.len)) |i| {
+                    try self.charge(self.ptr, 1);
+                    const node_order = try self.orderIdentity(a.path.nodes[i].identity, b.path.nodes[i].identity);
+                    if (node_order != .eq) break :blk node_order;
+                    if (i < @min(a.path.relationships.len, b.path.relationships.len)) {
+                        const edge_order = try self.orderInner(.{ .relationship = a.path.relationships[i] }, .{ .relationship = b.path.relationships[i] });
+                        if (edge_order != .eq) break :blk edge_order;
+                    }
+                }
+                break :blk std.math.order(a.path.nodes.len, b.path.nodes.len);
+            },
+            .map => blk: {
+                if (a.map.len != b.map.len) break :blk std.math.order(a.map.len, b.map.len);
+                const left = try self.sortedEntries(a.map);
+                const right = try self.sortedEntries(b.map);
+                // Cypher compares the complete sorted key sets before values.
+                for (left, right) |x, y| {
+                    const comparison = try self.orderText(x.name, y.name);
+                    if (comparison != .eq) break :blk comparison;
+                }
+                for (left, right) |x, y| {
+                    const comparison = try self.orderInner(x.value, y.value);
+                    if (comparison != .eq) break :blk comparison;
+                }
+                break :blk .eq;
+            },
+        };
     }
     pub fn compare(self: *Work, a: v.Value, b: v.Value) !?std.math.Order {
         try self.charge(self.ptr, 1);
@@ -420,4 +540,60 @@ test "mutable equality index reuses collision links after eviction" {
     try std.testing.expectEqual(@as(usize, 3), index.links.items.len);
     index.remove(7, 0);
     try std.testing.expect(index.head(7) == null);
+}
+
+test "metered ordering reads decisive prefixes and bounds equal tails and shared containers" {
+    const Counter = struct {
+        left: usize,
+        fn charge(ptr: *anyopaque, amount: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (amount > self.left) return error.CypherStateBudgetExceeded;
+            self.left -= amount;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const left = try a.alloc(u8, 65536);
+    const right = try a.alloc(u8, left.len);
+    @memset(left, 'x');
+    @memset(right, 'x');
+    left[0] = 'a';
+    right[0] = 'b';
+    var counter: Counter = .{ .left = 10 };
+    var work: Work = .{ .a = a, .ptr = &counter, .charge = Counter.charge };
+    try std.testing.expectEqual(std.math.Order.lt, try work.order(.{ .string = left }, .{ .string = right }));
+    right[0] = 'a';
+    counter.left = 10;
+    try std.testing.expectError(error.CypherStateBudgetExceeded, work.order(.{ .string = left }, .{ .string = right }));
+    // Separate allocation DAGs with equal leaves require real comparisons and
+    // must stop at the work ceiling, without an unmetered recursive traversal.
+    var x: v.Value = .{ .integer = 1 };
+    var y = x;
+    for (0..20) |_| {
+        const xs = try a.alloc(v.Value, 2);
+        const ys = try a.alloc(v.Value, 2);
+        xs[0..2].* = .{ x, x };
+        ys[0..2].* = .{ y, y };
+        x = .{ .list = xs };
+        y = .{ .list = ys };
+    }
+    counter.left = 1000;
+    try std.testing.expectError(error.CypherStateBudgetExceeded, work.order(x, y));
+}
+
+test "metered ordering matches total Cypher ordering across scalar and container types" {
+    const Counter = struct {
+        fn charge(_: *anyopaque, _: usize) !void {}
+    };
+    var state: u8 = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var work: Work = .{ .a = arena.allocator(), .ptr = &state, .charge = Counter.charge };
+    const values = [_]v.Value{
+        .null,                                                   .{ .boolean = false },                                                                                        .{ .boolean = true },                                                                             .{ .integer = 9007199254740993 },                                                                             .{ .number = 9007199254740992.0 },
+        .{ .integer = -1 },                                      .{ .number = -0.0 },                                                                                          .{ .string = "a" },                                                                               .{ .string = "b" },                                                                                           .{ .list = &.{ .{ .integer = 1 }, .null } },
+        .{ .list = &.{ .{ .number = 1 }, .{ .string = "x" } } }, .{ .map = &.{ .{ .name = "b", .value = .{ .integer = 1 } }, .{ .name = "a", .value = .{ .integer = 2 } } } }, .{ .map = &.{ .{ .name = "a", .value = .{ .integer = 2 } }, .{ .name = "b", .value = .null } } }, .{ .map = &.{ .{ .name = "z", .value = .{ .integer = 1 } }, .{ .name = "a", .value = .{ .integer = 2 } } } },
+    };
+    for (values) |x| for (values) |y| try std.testing.expectEqual(try v.Value.order(x, y), try work.order(x, y));
 }

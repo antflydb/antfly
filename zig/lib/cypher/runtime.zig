@@ -8449,14 +8449,7 @@ const Engine = struct {
     }
 
     fn expressionName(self: *Engine, expression: *const ast.Expr) ![]const u8 {
-        if (expression.value == .map_projection and expression.value.map_projection.base.value == .variable) return expression.value.map_projection.base.value.variable;
-        if (expression.value != .variable and expression.value != .property and expression.span.end <= self.source.len) return self.a.dupe(u8, self.source[expression.span.start..expression.span.end]);
-        return switch (expression.value) {
-            .variable => |n| n,
-            .property => |p| std.fmt.allocPrint(self.a, "{s}.{s}", .{ try self.expressionName(p.base), p.name }),
-            .call => |c| std.fmt.allocPrint(self.a, "{s}({s})", .{ c.name, if (c.star) "*" else if (c.args.len == 1) try self.expressionName(c.args[0]) else "..." }),
-            else => std.fmt.allocPrint(self.a, "expression@{}", .{expression.span.start}),
-        };
+        return @import("expressions.zig").outputName(self.a, self.source, expression);
     }
     const Projected = struct { row: Row, source: Row, group: ?[]const Row, keys: []const v.Value, sequence: usize = 0, weight: usize = 1, multiplicity: ?Count = null };
     const PatternScope = struct {
@@ -8632,8 +8625,16 @@ const Engine = struct {
         }
         fn finish(self: *TopK, final: bool) ![]const Row {
             const engine = self.engine;
+            const retained = engine.a;
+            var scratch = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            defer scratch.deinit();
+            // Picks own their values through this call. Sort borrowed descriptors
+            // and apply SKIP before owning the surviving rows. Sort metadata must
+            // also die before the pick arenas can be recycled.
+            const scope = EvalScope.enter(engine, scratch.allocator());
+            defer scope.leave(engine);
             const projected = try engine.a.alloc(Projected, self.picks.items.len);
-            for (self.picks.items, projected) |pick, *item| item.* = .{ .row = try cloneRow(engine.a, pick.value.row), .source = &.{}, .group = null, .keys = try cloneValues(engine.a, pick.value.keys), .sequence = pick.value.sequence, .weight = pick.value.weight, .multiplicity = if (pick.value.multiplicity) |weight| try weight.clone(engine.a) else null };
+            for (self.picks.items, projected) |pick, *item| item.* = pick.value;
             // Sort only the retained window, using input sequence for stable ties.
             if (self.projection.order.len == 0 and self.projection.limit != null) std.mem.sort(Projected, projected, {}, struct {
                 fn less(_: void, left: Projected, right: Projected) bool {
@@ -8648,25 +8649,27 @@ const Engine = struct {
                     const discarded = @min(skip, item.weight);
                     skip -= discarded;
                     if (item.weight == discarded) continue;
-                    try rows.append(engine.a, item.row);
-                    try weights.append(engine.a, try (item.multiplicity orelse Count.init(item.weight)).subtract(engine.a, discarded));
+                    try rows.append(retained, try cloneRow(retained, item.row));
+                    try weights.append(retained, try (try (item.multiplicity orelse Count.init(item.weight)).clone(retained)).subtract(retained, discarded));
                 }
                 engine.pending_window = .{ .rows = rows.items, .weights = weights.items };
-                if (final) engine.columns = try self.columns.toOwnedSlice(engine.a);
+                if (final) engine.columns = try self.columns.toOwnedSlice(retained);
                 return rows.items;
             }
-            const output = try engine.a.alloc(Row, self.total - skip);
+            const output = try retained.alloc(Row, self.total - skip);
             var position: usize = 0;
             for (projected) |item| {
                 const discarded = @min(skip, item.weight);
                 skip -= discarded;
+                if (item.weight == discarded) continue;
+                const owned = try cloneRow(retained, item.row);
                 for (0..item.weight - discarded) |_| {
                     try engine.state();
-                    output[position] = item.row;
+                    output[position] = owned;
                     position += 1;
                 }
             }
-            if (final) engine.columns = try self.columns.toOwnedSlice(engine.a);
+            if (final) engine.columns = try self.columns.toOwnedSlice(retained);
             return output;
         }
     };

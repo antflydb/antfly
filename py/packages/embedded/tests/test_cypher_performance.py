@@ -4462,3 +4462,74 @@ def test_aggregate_projection_borrows_collections_until_values_escape(graph_db):
                 },
             )
             assert int(result["rows"][0][0]["value"]) == expected
+
+
+def test_cardinality_demands_follow_aliases_without_retaining_payloads(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092)
+    for tail in (
+        "WITH collect(n.payload) AS xs RETURN size(xs)",
+        "WITH collect(n.payload) AS xs WITH xs AS ys WITH ys AS zs RETURN size(zs)",
+        "WITH collect(n.payload) AS xs,collect(n.payload) AS ys RETURN size(xs),size(ys)",
+        "WITH collect(n.payload) AS xs WITH size(xs) RETURN `size(xs)`",
+    ):
+        result = db.cypher_json(
+            "payloads",
+            {
+                "query": "MATCH(n:W) " + tail,
+                "limits": {"memory_bytes": 8 << 20, "intermediate_states": 300000},
+            },
+        )
+        assert all(int(cell["value"]) == 3000 for cell in result["rows"][0])
+
+
+def test_pagination_does_not_copy_discarded_wide_rows(graph_db):
+    db = graph_db
+    _populate_payload_graph(db, 3000, 4092)
+    for skip, expected in ((2999, 1), (3000, 0)):
+        result = db.cypher_json(
+            "payloads",
+            {
+                "query": f"MATCH(n:W) RETURN n.payload ORDER BY n.score SKIP {skip} LIMIT 1",
+                "limits": {"memory_bytes": 24 << 20},
+            },
+        )
+        assert len(result["rows"]) == expected
+        if expected:
+            assert len(result["rows"][0][0]["value"]) == 4092
+
+
+def test_wide_heap_keys_compare_decisive_prefixes_with_bounded_work(graph_db):
+    db = graph_db
+    count = 3000
+    db.sql("CREATE TABLE payloads (score BIGINT,payload TEXT)")
+    payload = "x" * 4080
+    for start in range(0, count, 50):
+        db.sql(
+            "INSERT INTO payloads (_id,score,payload) VALUES "
+            + ",".join(f"('n{i}',{i},'{i:012d}{payload}')" for i in range(start, min(start + 50, count)))
+        )
+    db.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "payloads",
+            "definition": {"labels": [{"name": "W", "table": "payloads"}], "relationships": []},
+        }
+    )
+    for key in ("n.payload", "[n.payload]", "{key:n.payload}"):
+        result = db.cypher_json(
+            "payloads",
+            {
+                "query": f"MATCH(n:W) RETURN n.score ORDER BY {key} LIMIT 100",
+                "limits": {"memory_bytes": 8 << 20, "intermediate_states": 600000},
+            },
+        )
+        assert [int(row[0]["value"]) for row in result["rows"]] == list(range(100))
+    distinct = db.cypher_json(
+        "payloads",
+        {
+            "query": "MATCH(n:W) WITH collect(DISTINCT n.payload) AS xs RETURN size(xs)",
+            "limits": {"memory_bytes": 24 << 20, "intermediate_states": 300000},
+        },
+    )
+    assert int(distinct["rows"][0][0]["value"]) == count

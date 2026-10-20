@@ -340,14 +340,7 @@ const Binder = struct {
         }
     }
     fn expressionName(self: *Binder, expr: *const ast.Expr) anyerror![]const u8 {
-        if (expr.value == .map_projection and expr.value.map_projection.base.value == .variable) return expr.value.map_projection.base.value.variable;
-        if (expr.value != .variable and expr.value != .property and expr.span.end <= self.source.len) return self.a.dupe(u8, self.source[expr.span.start..expr.span.end]);
-        return switch (expr.value) {
-            .variable => |name| name,
-            .property => |p| std.fmt.allocPrint(self.a, "{s}.{s}", .{ try self.expressionName(p.base), p.name }),
-            .call => |c| std.fmt.allocPrint(self.a, "{s}({s})", .{ c.name, if (c.star) "*" else if (c.args.len == 1) try self.expressionName(c.args[0]) else "..." }),
-            else => std.fmt.allocPrint(self.a, "expression@{}", .{expr.span.start}),
-        };
+        return @import("expressions.zig").outputName(self.a, self.source, expr);
     }
 };
 

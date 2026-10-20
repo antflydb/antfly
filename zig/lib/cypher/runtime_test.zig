@@ -3334,7 +3334,13 @@ test "bounded group keys retain exact counts stable ties nulls and multiple orde
 
 test "DISTINCT cohorts and evicting group windows release every allocation failure" {
     const Campaign = struct {
-        fn run(a: std.mem.Allocator, bounded: bool) !void {
+        fn run(backing: std.mem.Allocator, bounded: bool) !void {
+            // Keep the injected failure positions independent of opportunistic
+            // arena resize/remap success and adjacent allocator activity.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             var diagnostic: c.Diagnostic = .{};
             const text = if (bounded)
                 "MATCH (n:Document) RETURN n.rank AS key,count(n.title) AS c ORDER BY key DESC LIMIT 1"
@@ -3409,4 +3415,71 @@ test "aggregate retention keeps execution containers outside the value depth lim
         for (0..64) |_| value = value.list[0];
         try std.testing.expectEqual(@as(i64, 0), value.integer);
     }
+}
+
+test "alias cardinality follows bindings without changing escapes grouping or lazy errors" {
+    try check("MATCH(n:Document) WITH collect(n.title) AS xs RETURN size(xs)", "[[3]]");
+    try check("MATCH(n:Document) WITH collect(n.title) AS xs WITH xs AS ys WITH ys AS zs RETURN size(zs)", "[[3]]");
+    try check("UNWIND [null,1,1.0,2] AS x WITH collect(DISTINCT x) AS xs RETURN size(xs)", "[[2]]");
+    try check("UNWIND [] AS x WITH collect(x) AS xs RETURN size(xs)", "[[0]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs,collect(x) AS ys RETURN size(xs),size(ys)", "[[2,2]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs,collect(x) AS ys RETURN size(xs),ys", "[[2,[1,2]]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN size(xs),xs", "[[2,[1,2]]]");
+    try check("UNWIND ['b','a'] AS x WITH x,collect(x) AS xs ORDER BY xs RETURN x,size(xs)", "[[\"a\",1],[\"b\",1]]");
+    try check("UNWIND ['b','a'] AS x WITH x,collect(x) AS xs WITH DISTINCT xs RETURN size(xs)", "[[1],[1]]");
+    try check("UNWIND ['b','a'] AS x WITH x,collect(x) AS xs WITH xs,count(*) AS c RETURN size(xs),c", "[[1,1],[1,1]]");
+    try check("MATCH(n:Document) WITH collect(n.title) AS xs RETURN size(xs),[xs IN [[1,2]]|size(xs)]", "[[3,[2]]]");
+    try check("MATCH(n:Document) WITH collect(n.title) AS xs WITH size(xs) RETURN `size(xs)`", "[[3]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs WITH [7] AS xs RETURN size(xs)", "[[1]]");
+    try check("MATCH(n:Document) WITH collect(n.title) AS xs MATCH(m:Document {id:'a'}) RETURN size(xs)", "[[3]]");
+    try check("MATCH(n:Document) WITH collect(n.title) AS xs RETURN EXISTS { WITH xs RETURN size(xs) AS n },size(xs)", "[[true,3]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN CASE WHEN false THEN size(xs) ELSE 0 END", "[[0]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs WITH * RETURN size(xs),xs", "[[2,[1,2]]]");
+    try check("UNWIND [1] AS x WITH collect(x) AS xs RETURN size(xs) UNION ALL UNWIND [1,2] AS x WITH collect(x) AS xs RETURN size(xs)", "[[1],[2]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN DISTINCT size(xs) AS xs ORDER BY size(xs)", "[[2]]");
+    try check("UNWIND [1,2] AS x WITH collect(x) AS xs RETURN DISTINCT size(xs)+1 AS xs ORDER BY size(xs)+1", "[[3]]");
+    for ([_][]const u8{
+        "UNWIND [1,2] AS x WITH collect(x) AS xs RETURN size(xs) AS xs ORDER BY size(xs)",
+        "UNWIND [1,2] AS x WITH collect(x) AS `42` RETURN size(`42`) AS c,42 ORDER BY size(`42`)",
+        "MATCH(n:Document) WITH n,collect(n.title) AS `n.rank` RETURN size(`n.rank`) AS c,n.rank ORDER BY size(`n.rank`)",
+    }) |text| {
+        var diagnostic_: c.Diagnostic = .{};
+        var compiled_ = try c.compile(std.testing.allocator, text, .{}, &diagnostic_);
+        defer compiled_.deinit();
+        var fixture_: Fixture = .{};
+        try std.testing.expectError(error.CypherTypeMismatch, runtime.execute(std.testing.allocator, fixture_.backend(), graph, &compiled_, &.{}, .{}));
+    }
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "UNWIND [0] AS x WITH collect(1/x) AS xs RETURN CASE WHEN false THEN size(xs) ELSE 0 END", .{}, &diagnostic);
+    defer compiled.deinit();
+    var fixture: Fixture = .{};
+    try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+}
+
+test "borrowed pagination sorts preserve stable ties and nested window lifetimes" {
+    try check("UNWIND [[3,'c'],[1,'a'],[2,'b'],[1,'d']] AS pair RETURN pair[1] AS s ORDER BY pair[0] SKIP 1 LIMIT 2", "[[\"d\"],[\"b\"]]");
+    try check("UNWIND [1,2,3] AS x RETURN {x:x} AS m ORDER BY x SKIP 3 LIMIT 1", "[]");
+    try check("UNWIND [1,2,3] AS x RETURN {x:x} AS m ORDER BY x SKIP 2 LIMIT 1", "[[{\"x\":3}]]");
+    try check("UNWIND range(1,5) AS i CALL { WITH i UNWIND [i,-i] AS x RETURN x AS v ORDER BY v SKIP 1 LIMIT 1 } RETURN collect(v)", "[[[1,2,3,4,5]]]");
+    try check("UNWIND [{b:'b',a:2},{a:1,b:'c'},{b:'a',a:2}] AS x RETURN x ORDER BY x SKIP 1 LIMIT 2", "[[{\"b\":\"a\",\"a\":2}],[{\"b\":\"b\",\"a\":2}]]");
+}
+
+test "alias demand and borrowed pagination release every failed allocation" {
+    const Campaign = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = try c.compile(a, "MATCH(n:Document) WITH collect(n.title) AS xs WITH xs AS ys UNWIND [3,1,2] AS i RETURN size(ys) AS c,{key:i} AS k ORDER BY k SKIP 1 LIMIT 1", .{}, &diagnostic);
+            defer compiled.deinit();
+            var fixture: Fixture = .{};
+            var result = try runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(i64, 3), result.rows[0][0].integer);
+            try std.testing.expectEqual(@as(i64, 2), result.rows[0][1].map[0].value.integer);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{});
 }

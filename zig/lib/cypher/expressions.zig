@@ -16,6 +16,19 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 
+/// Binding, execution, and invocation-local rewrites share implicit output
+/// names, including quoted identifiers and properties which shadow aliases.
+pub fn outputName(a: std.mem.Allocator, source: []const u8, expr: *const ast.Expr) anyerror![]const u8 {
+    if (expr.value == .map_projection and expr.value.map_projection.base.value == .variable) return expr.value.map_projection.base.value.variable;
+    if (expr.value != .variable and expr.value != .property and expr.span.end <= source.len) return a.dupe(u8, source[expr.span.start..expr.span.end]);
+    return switch (expr.value) {
+        .variable => |identifier| identifier,
+        .property => |p| std.fmt.allocPrint(a, "{s}.{s}", .{ try outputName(a, source, p.base), p.name }),
+        .call => |c| std.fmt.allocPrint(a, "{s}({s})", .{ c.name, if (c.star) "*" else if (c.args.len == 1) try outputName(a, source, c.args[0]) else "..." }),
+        else => std.fmt.allocPrint(a, "expression@{}", .{expr.span.start}),
+    };
+}
+
 /// Nested graph patterns can bind an alias that is absent from a partial row.
 /// Evaluate these only after all of the containing MATCH aliases are bound.
 pub fn containsPattern(expr: *const ast.Expr) bool {
