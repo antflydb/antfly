@@ -966,16 +966,9 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
         assert wait_until(lambda: owner.fully_replicated_topology(child), timeout_s=90)
         timings.mark("child.replicated_topology")
 
-        def ready():
-            response = session.get(
-                f"{owner.data_api_urls[0]}/tables/{child}/constraints/status", timeout=5
-            )
-            return (
-                response.status_code == 200
-                and response.json().get("state") == "enforced"
-            )
-
-        assert wait_until(ready, timeout_s=90), owner.debug_logs()
+        assert backups._wait_for_constraints_enforced(
+            session, owner.data_api_urls[0], child
+        ), owner.debug_logs()
         timings.mark("child.constraints_enforced")
         children.update(
             {f"z:child:{row['id']}": {"id": row["id"]} for row in rows.values()}
@@ -1064,17 +1057,9 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
                 lambda: cluster.fully_replicated_topology(parent), timeout_s=90
             )
 
-            def ready_parent():
-                response = session.get(
-                    f"{cluster.data_api_urls[0]}/tables/{parent}/constraints/status",
-                    timeout=5,
-                )
-                return (
-                    response.status_code == 200
-                    and response.json().get("state") == "enforced"
-                )
-
-            assert wait_until(ready_parent, timeout_s=90), cluster.debug_logs()
+            assert backups._wait_for_constraints_enforced(
+                session, cluster.data_api_urls[0], parent
+            ), cluster.debug_logs()
             backups._seed_online_merge_setup_docs(cluster, session, parent, documents)
         children.update(documents)
     backups._exercise_online_document_merge(
