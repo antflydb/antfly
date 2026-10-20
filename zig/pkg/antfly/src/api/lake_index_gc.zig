@@ -404,7 +404,9 @@ pub const Collector = struct {
                     return;
                 }
                 try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len *| 2);
-                for (try artifacts.descendantsAlloc(a, self.store, ref, self.cancellation())) |child| _ = try self.mark(child);
+                const leaf = try artifacts.leafReferences(a, self.store, ref, self.cancellation());
+                if (leaf.key_index) |index| if (index.inline_page.len == 0) try self.markPages(a, index.domain, index.page, false);
+                for (leaf.blocks) |child| _ = try self.mark(child);
             },
             .ordered_row_index => {
                 try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
@@ -851,7 +853,7 @@ test "external lake global frontier native GC retains shared aggregate blocks na
     const cursor = (try artifacts.Reader.open(a, store, root, recipe, .none)).cursor();
     defer cursor.close(cursor.ptr);
     const result = (try cursor.next(cursor.ptr, ca, 1)).?;
-    var partial = try local.sql_aggregate_partial.decode(a, result[0].aggregates[0], spec);
+    var partial = try local.sql_aggregate_partial.read(a, result[0], 0, spec);
     defer partial.deinit();
     try std.testing.expectEqual(@as(i128, 9007199254740993), partial.integer_sum);
     var row_reader: ordered.Reader = undefined;
@@ -1091,4 +1093,46 @@ test "external lake native GC marks checkpoint forests and their covering blocks
         }
     }
     try std.testing.expectEqual(@as(usize, 3), count);
+}
+
+test "external lake native GC retains external aggregate key pages and embedded navigation" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var temporary = try local.common_test_directory.TestDirectory.init("aggregate-key-gc");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(4);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(4, identity, namespace);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    const specs = [_]local.sql_operators.AggregateSpec{.{ .kind = .count }};
+    const recipe: local.sql_aggregate_materialization.Recipe = .{ .keys = &.{.{ .path = "k", .type = .string, .nullable = false }}, .inputs = &.{.{ .spec = specs[0], .column = null }} };
+    for ([_]usize{ 4, 256 }) |count| {
+        const group = try local.sql_operators.Grouped.create(a, &specs, .{ .bytes = 2 * 1024 * 1024 });
+        defer group.deinit();
+        var label: [128]u8 = @splat('x');
+        for (0..count) |index| {
+            _ = try std.fmt.bufPrint(label[124..], "{d:0>4}", .{index});
+            try group.add(&.{local.sql_scalar.Datum.json(.{ .string = &label })}, &.{.{}});
+        }
+        const refs = try artifacts.publishCohort(a, out, &store, &.{"stats.count"}, group, recipe, .none);
+        const reader = try artifacts.Reader.open(a, store, refs[0], recipe, .none);
+        defer reader.cursor().close(reader);
+        const index = reader.root.key_index.?;
+        try std.testing.expectEqual(count == 4, index.inline_page.len != 0);
+        var collector: Collector = .{ .a = a, .table = 4, .authority = undefined, .store = store, .identity = identity, .namespace = namespace, .context = .{}, .token = @splat(1), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 32 * 1024 * 1024 };
+        defer {
+            var iterator = collector.marked.keyIterator();
+            while (iterator.next()) |key| a.free(key.*);
+            collector.marked.deinit(a);
+        }
+        try collector.markArtifact(out, refs[0]);
+        try std.testing.expectEqual(index.inline_page.len == 0, collector.marked.contains(&try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(domain, index.page)));
+        try std.testing.expect(try reader.cursor().select_keys.?(reader, .{ .order = &.{.{ .column = "k" }} }));
+        try std.testing.expectEqual(@as(usize, 1), (try reader.cursor().next(reader, out, 1)).?.len);
+    }
 }

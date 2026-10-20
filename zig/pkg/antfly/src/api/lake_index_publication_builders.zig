@@ -303,8 +303,9 @@ const FileJob = struct {
 };
 
 /// Cold publications whose configurations cannot reside together advance
-/// private immutable checkpoints over bounded four-file windows. Each family
-/// reopens once per window and releases its working state after checkpointing.
+/// private immutable checkpoints over adaptive windows of up to 64 files.
+/// Each family stays open through its admitted window and releases working
+/// state after checkpointing.
 /// At most two projected windows share the existing replay memory/disk quota.
 /// No prefix checkpoint is exposed to recovery or serving as a complete root.
 fn buildFileMajor(args: Args, units: []const Unit) !?Result {
@@ -329,10 +330,11 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
     if (lanes == 0) return null;
     const worker_bytes = scheduler.cpuWorkspaceBudget(lanes * 8 * 1024 * 1024) / lanes;
     if (worker_bytes < 1024 * 1024) return null;
+    const Window = @import("lake_index_build_window.zig");
     const replay = args.provider.replay.?;
     const replay_bytes = @min(replay.budget.limit, 16 * 1024 * 1024);
     const scan_workspace = args.provider.limits.max_input_bytes +| args.provider.limits.max_decoded_bytes *| 2;
-    const required_fixed = scan_workspace +| replay_bytes;
+    const required_fixed = scan_workspace +| replay_bytes +| (2 * @sizeOf(Window));
     const retained = scheduler.reservePullUpTo(lanes, required_fixed +| maximum, @min(available, required_fixed +| all +| scan_workspace)) orelse return null;
     const ahead = retained - required_fixed - maximum >= scan_workspace;
     const fixed = required_fixed + if (ahead) scan_workspace else 0;
@@ -389,8 +391,8 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
         .index_config_hash = "file-major-replay",
         .column_bindings = replay.columns,
     };
-    const Window = @import("lake_index_build_window.zig");
-    var windows: [2]Window = undefined;
+    const windows = try a.alloc(Window, 2);
+    defer a.free(windows);
     var window_count: usize = 0;
     defer for (windows[0..window_count]) |*window| window.deinit(replay);
     for (0..@as(usize, if (ahead) 2 else 1)) |index| {
@@ -403,10 +405,11 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
     };
     var file: usize = 0;
     var turn: usize = 0;
+    var session_width: usize = Window.initial_width;
     while (file < parent.inventory.files.len) {
         try args.token.check();
         try args.provider.context.ensureActive();
-        const requested_end = @min(file + Window.width, parent.inventory.files.len);
+        const requested_end = @min(file + session_width, parent.inventory.files.len);
         const window = &windows[turn % window_count];
         const prepared = if (read_ahead) |*task| loaded: {
             const result = task.await(io);
@@ -416,9 +419,11 @@ fn buildFileMajor(args: Args, units: []const Unit) !?Result {
         } else try window.capture(file, requested_end, args.token);
         window.report(replay);
         const end = window.end;
+        replay.publication_sessions += 1;
+        session_width = window.nextWidth(requested_end - file);
         if (ahead and end < parent.inventory.files.len) {
             const next = &windows[(turn + 1) % window_count];
-            read_ahead = scheduler.submitIoTransient(io, 8 * 1024 * 1024, Window.capture, .{ next, end, @min(end + Window.width, parent.inventory.files.len), args.token });
+            read_ahead = scheduler.submitIoTransient(io, 8 * 1024 * 1024, Window.capture, .{ next, end, @min(end + session_width, parent.inventory.files.len), args.token });
         }
         private_index.roots.clearRetainingCapacity();
         var nav_arena = std.heap.ArenaAllocator.init(a);
@@ -1029,7 +1034,7 @@ test "external lake file-first publication shares one decode across five native 
     try std.testing.expectEqual(@as(usize, 0), file_major.pull_bytes);
     try std.testing.expectEqual(@as(usize, 0), file_major.workers);
 
-    // Three windows cross two durable append frontiers in every family. The
+    // Two adaptive sessions cover nine files instead of three fixed windows. The
     // next window is captured on the scheduler while current consumers run.
     provider.context.additional_checkpoint = null;
     provider.progress = null;
@@ -1053,9 +1058,11 @@ test "external lake file-first publication shares one decode across five native 
     defer expanded_ref.deinit(a);
     args.base = try binding.binding.toManifestBaseSource(expanded.inventory.snapshot_id, expanded_ref.artifact_id);
     const before_windows = replay.captures;
+    const sessions_before_windows = replay.publication_sessions;
     const ahead_before_windows = replay.read_ahead_hits;
     const windows_result = (try build(args)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 9), replay.captures - before_windows);
+    try std.testing.expectEqual(@as(usize, 2), replay.publication_sessions - sessions_before_windows);
     try std.testing.expect(replay.read_ahead_hits > ahead_before_windows);
     const window_ordered = try @import("lake_index_ordered_rows.zig").loadRootLazy(out, store, windows_result.ordered[0].artifact, .none, null);
     try std.testing.expectEqual(@as(u64, 36), window_ordered.page.?.records);

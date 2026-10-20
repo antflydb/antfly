@@ -1381,3 +1381,25 @@ the storage port's recursive byte accounting. Writable overlays merge local and
 virtual children and honor subtree tombstones, including unmaterialized base
 directories. Navigation allocations participate in native runtime memory quotas;
 pooled readers drop request authority while retaining only immutable data.
+
+
+Protocol 63 adds exact normalized-key serving trees to native aggregate leaves.
+Hash/radix reductions still own incremental state; unchanged leaves retain their
+ordered indexes. Small packs embed one navigation leaf, and larger indexes own
+scoped pages traced by normal and resumable GC. Forward/reverse cursors merge
+complete keys across leaves and persist between result pages. Typed ranges seek
+within those indexes. Preflight charges navigation and retained immutable leases;
+legacy leaves and declined admission use one ordinary SQL external sort.
+Scan quotas count visited index records without repeating a page-sized TopK scan.
+
+Aggregate blocks use recipe-specific native transition columns rather than an
+AGS checkpoint string for each group. Counts, exact i128 integer sums, floating
+transition bits, typed extrema and NUMERIC coefficient buffers share the existing
+column/spill codec. Lazy state readers preserve bounded selected-slot decoding;
+legacy, DISTINCT and pattern states retain their existing representation.
+
+Cold file-major construction keeps builders open over adaptive sessions of up to
+64 files. Actual retained memory/spill occupancy grows or shrinks the window while
+the two capture lanes retain their original shared quotas. Descriptor residency
+also participates in admission. Session boundaries, rather than every fixed four
+files, determine private checkpoint/reopen frequency.

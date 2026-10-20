@@ -2902,3 +2902,49 @@ Aggregate-value order, mixed directions, unmatched NULL placement and unfenced
 legacy roots preserve the ordinary SQL path. Wide common prefixes or broad ranges
 can still require broad scans; this change does not claim an exact persistent
 ordered group-key index.
+
+
+### Exact aggregate serving indexes and typed states (protocol 63)
+
+Hash/radix partitions retain their role in reduction and incremental ownership.
+Each newly published flat reduction additionally owns a normalized group-key
+page tree mapping complete keys to block/row coordinates. The index uses the
+existing relational scalar tuple codec and immutable page-tree implementation.
+Unchanged reduction leaves retain their serving trees by reference; publishing
+an edited parent does not rebuild a global ordered copy of every group.
+Small packs embed a single navigation page in the authenticated pack control.
+Larger trees use ordinary publication-scoped pages, traced by both ordinary and
+resumable GC and therefore included in durable cloud generation closures.
+
+Compatible grouping-key orders merge exact forward/reverse index cursors retained
+across output pulls. Key ranges seek directly within each selected leaf; hash and
+conservative directory fences still prune the forest. Equal requested key
+prefixes keep deterministic full-key order and monotonic delivery ordinals.
+Each visited index record is charged once. Only one leaf's payload block remains
+pinned by the cursor owner; ordinary immutable payload/decoded caches supply
+reuse across leaves. Navigation, cached pack/root leases, cursor pages and merge
+state share explicit admission. Preflight finishes before ordering is attested:
+legacy/unindexed leaves or declined navigation preserve SQL's one-pass external
+sort. No request restarts a candidate TopK for every 256-row page, and neither
+spill nor scan allowances increase to conceal repeated work.
+
+Native aggregate blocks now store only the transition columns required by each
+recipe: COUNT uses one counter; integer SUM uses a count plus two i64 lanes for
+its exact i128 sum; floating transitions preserve their exact bits; extrema use
+typed scalar columns; exact NUMERIC uses a count and its portable coefficient
+buffer. The common native column/spill codec supplies compression, nulls,
+dictionaries and typed values. Resident publication bypasses per-group AGS
+checkpoint encoding. Radix spill carries the same physical columns. Readers
+select the requested state columns and can expose lazy state readers without
+expanding a whole page; repeated physical transition tuples share cached reducers.
+DISTINCT/pattern states and legacy blocks retain the established interchange.
+The authenticated enclosing recipe binds column interpretation. Protocol 63
+fences publication of this new block layout and serving navigation.
+
+File-major cold builds adapt their admitted session length from four files up to
+64 using actual retained memory and spill bytes. A native builder remains open
+through that session and checkpoints once at its boundary. Oversized captures
+shrink the next session and retain the single-file streaming fallback. Two windows
+still divide the original memory/disk allowance; their descriptor storage is heap
+allocated and included in shared retained admission. The real nine-file fixture
+now needs two sessions instead of three, with one capture per source file.

@@ -79,6 +79,8 @@ fn partitionShift(depth: u8) u6 {
     return if (depth == 0) 0 else @intCast(6 + (depth - 1) * 2);
 }
 const group_keys = @import("lake_index_aggregate_keys.zig");
+const ordered_keys = @import("lake_index_aggregate_order.zig");
+const native_partial = local.sql_aggregate_partial;
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_block_bytes = 4 * 1024 * 1024;
 pub const max_blocks = 8192;
@@ -87,7 +89,9 @@ const Block = struct {
     artifact: ChunkRef,
     rows: u16,
     bounds: ?group_keys.Bounds = null,
+    state_layout: u8 = 0,
     pub fn jsonStringify(self: Block, writer: anytype) !void {
+        if (self.state_layout != 0) return writer.write(.{ .artifact = self.artifact, .rows = self.rows, .bounds = self.bounds, .state_layout = self.state_layout });
         if (self.bounds != null) return writer.write(.{ .artifact = self.artifact, .rows = self.rows, .bounds = self.bounds });
         return writer.write(.{ .artifact = self.artifact, .rows = self.rows });
     }
@@ -123,10 +127,12 @@ const Root = struct {
     partitions: []const Partition = &.{},
     radix_depth: u8 = 0,
     bounds: ?group_keys.Bounds = null,
+    key_index: ?ordered_keys.Index = null,
     cohort: ?ChunkRef = null,
     state_recipe: ?recipes.Recipe = null,
     state_slot: ?u16 = null,
     pub fn jsonStringify(self: Root, writer: anytype) !void {
+        if (self.key_index != null) return writer.write(.{ .format = self.format, .name = self.name, .recipe = self.recipe, .groups = self.groups, .blocks = self.blocks, .partitions = self.partitions, .radix_depth = self.radix_depth, .bounds = self.bounds, .key_index = self.key_index, .cohort = self.cohort, .state_recipe = self.state_recipe, .state_slot = self.state_slot });
         if (self.bounds != null) return writer.write(.{ .format = self.format, .name = self.name, .recipe = self.recipe, .groups = self.groups, .blocks = self.blocks, .partitions = self.partitions, .radix_depth = self.radix_depth, .bounds = self.bounds, .cohort = self.cohort, .state_recipe = self.state_recipe, .state_slot = self.state_slot });
         return writer.write(.{ .format = self.format, .name = self.name, .recipe = self.recipe, .groups = self.groups, .blocks = self.blocks, .partitions = self.partitions, .radix_depth = self.radix_depth, .cohort = self.cohort, .state_recipe = self.state_recipe, .state_slot = self.state_slot });
     }
@@ -155,7 +161,7 @@ fn rootCommitment(a: A, input: Root) ![32]u8 {
 fn physicalIdentity(a: A, root: Root) !?[32]u8 {
     if (root.cohort) |ref| return try stores.sha256DigestFromChecksum(ref.checksum);
     if (root.partitions.len != 0 or root.state_recipe == null) return null;
-    const bytes = if (root.bounds != null) try std.json.Stringify.valueAlloc(a, .{ .recipe = root.state_recipe.?, .groups = root.groups, .blocks = root.blocks, .bounds = root.bounds }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .recipe = root.state_recipe.?, .groups = root.groups, .blocks = root.blocks }, .{});
+    const bytes = if (root.key_index != null) try std.json.Stringify.valueAlloc(a, .{ .recipe = root.state_recipe.?, .groups = root.groups, .blocks = root.blocks, .bounds = root.bounds, .key_index = root.key_index }, .{}) else if (root.bounds != null) try std.json.Stringify.valueAlloc(a, .{ .recipe = root.state_recipe.?, .groups = root.groups, .blocks = root.blocks, .bounds = root.bounds }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .recipe = root.state_recipe.?, .groups = root.groups, .blocks = root.blocks }, .{});
     defer a.free(bytes);
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
@@ -246,21 +252,17 @@ pub fn loadRecipe(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation
 
 /// GC traverses authenticated root references without reading every leaf.
 /// Unknown formats fail closed rather than guessing that a root has no edges.
+pub const LeafReferences = struct { blocks: []const ChunkRef, key_index: ?ordered_keys.Index };
+pub fn leafReferences(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation) !LeafReferences {
+    var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer scratch.deinit();
+    const root = try loadValidatedRoot(scratch.allocator(), store, artifact, cancellation);
+    const refs = try a.alloc(ChunkRef, if (artifact.metadata_version == 6) 0 else root.blocks.len);
+    for (refs, root.blocks[0..refs.len]) |*ref, block| ref.* = .{ .artifact_id = try a.dupe(u8, block.artifact.artifact_id), .checksum = try a.dupe(u8, block.artifact.checksum), .byte_len = block.artifact.byte_len };
+    return .{ .blocks = refs, .key_index = root.key_index };
+}
 pub fn descendantsAlloc(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation) ![]const ChunkRef {
-    if (artifact.metadata_version == 6) {
-        // The pack has no external block edges. Release its verified payload
-        // before the collector advances, rather than retaining bodies in its
-        // graph/frontier metadata arena.
-        var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
-        defer scratch.deinit();
-        _ = try (try loadPacked(scratch.allocator(), store, artifact, cancellation, null)).root(artifact.name);
-        return a.alloc(ChunkRef, 0);
-    }
-    if (!supportsMetadataVersion(artifact.metadata_version) or artifact.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
-    const root = try loadValidatedRoot(a, store, artifact, cancellation);
-    const refs = try a.alloc(ChunkRef, root.blocks.len);
-    for (refs, root.blocks) |*ref, block| ref.* = block.artifact;
-    return refs;
+    return (try leafReferences(a, store, artifact, cancellation)).blocks;
 }
 
 /// Consumes a completed reducer, including disk partitions. The caller owns
@@ -282,12 +284,12 @@ pub fn publishCohortProven(a: A, result_alloc: A, store: *stores.ArtifactStore, 
     if (proofs) |values| if (values.len != names.len) return error.InvalidNativeAggregateArtifact;
     if (names.len == 0 or names.len != recipe.inputs.len or names.len > 256 or group.specs.len != names.len) return error.InvalidNativeAggregateArtifact;
     for (names, group.specs, recipe.inputs) |name, spec, input| if (name.len == 0 or !std.meta.eql(spec, input.spec)) return error.InvalidNativeAggregateArtifact;
-    var input: PartialStream = .{ .group = group };
+    var input = PartialStream.init(group, recipe);
     const remaining = group.groups.items.len - group.result_cursor;
     if (group.external == null and remaining != 0 and remaining <= 256) {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        return publishPackedRows(a, result_alloc, store, names, try input.next(arena.allocator()), recipe, cancellation, proofs);
+        return publishPackedRows(a, result_alloc, store, names, try input.next(arena.allocator()), recipe, cancellation, proofs, input.state_layout);
     }
     return publishPartialStream(a, result_alloc, store, names, &input, recipe, cancellation, proofs);
 }
@@ -296,11 +298,19 @@ pub fn publishCohortProven(a: A, result_alloc: A, store: *stores.ArtifactStore, 
 /// reducer. State checkpoints remain opaque until serving imports them.
 const PartialStream = struct {
     group: ?*operators.Grouped = null,
+    recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{} },
+    state_layout: u8 = 0,
     rows: ?[]const operators.Row = null,
     file: ?*spill.Sequential = null,
     retirement: ?struct { pool: *spill.Partitions, index: usize } = null,
     offset: u64 = 0,
     finished: bool = false,
+    fn init(group: *operators.Grouped, recipe: recipes.Recipe) PartialStream {
+        const native = native_partial.physicalWidth(recipe.inputs) <= 1024 and for (recipe.inputs) |input| {
+            if (!native_partial.physicalEligible(input.spec)) break false;
+        } else true;
+        return .{ .group = group, .recipe = recipe, .state_layout = @intFromBool(native) };
+    }
     fn finish(self: *PartialStream) void {
         if (self.retirement) |owner| owner.pool.close(owner.index);
         self.retirement = null;
@@ -344,8 +354,19 @@ const PartialStream = struct {
         }
         var rows: std.ArrayList(operators.Row) = .empty;
         while (rows.items.len < 256) {
-            const partial = try self.group.?.nextPartialResult(a) orelse break;
-            try rows.append(a, .{ .keys = partial.keys, .values = partial.aggregates, .ordinal = partial.ordinal });
+            const row = (if (self.state_layout == 0) try self.group.?.nextPartialResult(a) else try self.group.?.nextTypedPartialResult(a)) orelse break;
+            var values = row.aggregates;
+            if (self.state_layout != 0) {
+                const cells = try a.alloc(local.sql_scalar.Datum, native_partial.physicalWidth(self.recipe.inputs));
+                for (self.recipe.inputs, 0..) |input, column| {
+                    const state = try native_partial.read(a, row, column, input.spec);
+                    const physical = try native_partial.physicalCells(a, state);
+                    const offset = native_partial.physicalOffset(self.recipe.inputs, column);
+                    for (native_partial.physicalColumns(input.spec), 0..) |lane, index| cells[offset + index] = physical[lane];
+                }
+                values = cells;
+            }
+            try rows.append(a, .{ .keys = row.keys, .values = values, .ordinal = row.ordinal });
         }
         return rows.items;
     }
@@ -354,6 +375,8 @@ fn publishPartialStream(a: A, result_alloc: A, store: *stores.ArtifactStore, nam
     var control = std.heap.ArenaAllocator.init(a);
     defer control.deinit();
     const ca = control.allocator();
+    var key_builder: ordered_keys.Builder = .{ .store = store, .token = cancellation, .recipe = recipe };
+    defer key_builder.deinit();
     var blocks: std.ArrayList(Block) = .empty;
     var groups: u64 = 0;
     var output_bytes: u64 = 0;
@@ -364,7 +387,7 @@ fn publishPartialStream(a: A, result_alloc: A, store: *stores.ArtifactStore, nam
         const pa = page.allocator();
         const rows = try input.next(pa);
         if (rows.len == 0) break;
-        for (rows) |row| if (row.keys.len != recipe.keys.len or row.values.len != recipe.inputs.len) return error.InvalidSqlBackendResponse;
+        for (rows) |row| if (row.keys.len != recipe.keys.len or row.values.len != (if (input.state_layout != 0) native_partial.physicalWidth(recipe.inputs) else recipe.inputs.len)) return error.InvalidSqlBackendResponse;
         var begin: usize = 0;
         while (begin < rows.len) {
             try cancellation.check();
@@ -387,7 +410,8 @@ fn publishPartialStream(a: A, result_alloc: A, store: *stores.ArtifactStore, nam
             if (output_bytes > 512 * 1024 * 1024) return error.NativeAggregateArtifactTooLarge;
             const artifact = try upload.putWithCancellation(encoded, cancellation);
             defer if (artifact.provider_version) |version| upload.allocator.free(version);
-            try blocks.append(ca, .{ .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, .rows = @intCast(count), .bounds = try group_keys.rowBoundsTyped(scratch.allocator(), rows[begin..][0..count], recipe) });
+            try key_builder.add(a, rows[begin..][0..count], @intCast(blocks.items.len));
+            try blocks.append(ca, .{ .state_layout = input.state_layout, .artifact = .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, .rows = @intCast(count), .bounds = try group_keys.rowBoundsTyped(scratch.allocator(), rows[begin..][0..count], recipe) });
             groups = std.math.add(u64, groups, count) catch return error.NativeAggregateArtifactTooLarge;
             begin += count;
         }
@@ -405,7 +429,7 @@ fn publishPartialStream(a: A, result_alloc: A, store: *stores.ArtifactStore, nam
     for (references, names, 0..) |*reference, name, slot| {
         var root_arena = std.heap.ArenaAllocator.init(a);
         defer root_arena.deinit();
-        const root: Root = .{ .name = name, .recipe = .{ .keys = recipe.keys, .inputs = recipe.inputs[slot .. slot + 1] }, .state_recipe = recipe, .state_slot = @intCast(slot), .groups = groups, .blocks = blocks.items, .bounds = allBounds(blocks.items) };
+        const root: Root = .{ .name = name, .recipe = .{ .keys = recipe.keys, .inputs = recipe.inputs[slot .. slot + 1] }, .state_recipe = recipe, .state_slot = @intCast(slot), .groups = groups, .blocks = blocks.items, .bounds = allBounds(blocks.items), .key_index = key_builder.result() };
         const bytes = try std.json.Stringify.valueAlloc(root_arena.allocator(), root, .{});
         if (bytes.len > max_root_bytes or bytes.len > 512 * 1024 * 1024 -| output_bytes) return error.NativeAggregateArtifactTooLarge;
         output_bytes += bytes.len;
@@ -453,6 +477,13 @@ fn validateRoot(artifact: Ref, root: Root) !void {
         if (ref.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
         try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
     }
+    if (root.key_index) |index| {
+        try index.page.validate();
+        if (index.inline_page.len != 0 and (index.inline_page.len != @as(usize, index.page.bytes) * 2 or index.page.height != 0)) return error.InvalidNativeAggregateArtifact;
+        const scope = (try stores.uploadScopeFromArtifactId(artifact.artifact_id)) orelse return error.InvalidNativeAggregateArtifact;
+        if (!std.mem.eql(u8, &index.domain, &scope.domain)) return error.InvalidNativeAggregateArtifact;
+        if (root.partitions.len != 0 or index.page.records != root.groups or std.mem.allEqual(u8, &index.domain, 0)) return error.InvalidNativeAggregateArtifact;
+    }
     if (root.bounds) |bounds| {
         try bounds.validate();
         const expected = if (root.partitions.len != 0) allBounds(root.partitions) else allBounds(root.blocks);
@@ -467,6 +498,8 @@ fn validateRoot(artifact: Ref, root: Root) !void {
     }
     for (root.blocks) |block| {
         if (block.bounds) |bounds| try bounds.validate();
+        if (block.state_layout > 1) return error.InvalidNativeAggregateArtifact;
+        if (block.state_layout == 1) for ((root.state_recipe orelse root.recipe).inputs) |input| if (!native_partial.physicalEligible(input.spec)) return error.InvalidNativeAggregateArtifact;
         if (block.rows == 0 or block.rows > 256 or block.artifact.byte_len > max_block_bytes) return error.InvalidNativeAggregateArtifact;
         try stores.validateSha256ArtifactIdentity(block.artifact.artifact_id, block.artifact.checksum);
         count = std.math.add(u64, count, block.rows) catch return error.InvalidNativeAggregateArtifact;
@@ -482,12 +515,13 @@ const PackedControl = struct {
     recipe: recipes.Recipe,
     names: []const []const u8,
     blocks: []const Block,
+    key_index: ?ordered_keys.Index = null,
 };
 const Packed = struct {
     control: PackedControl,
     bytes: []const u8,
     fn rootAt(self: Packed, slot: usize) Root {
-        return .{ .name = self.control.names[slot], .recipe = .{ .keys = self.control.recipe.keys, .inputs = self.control.recipe.inputs[slot..][0..1] }, .state_recipe = self.control.recipe, .state_slot = @intCast(slot), .groups = self.control.blocks[0].rows, .blocks = self.control.blocks, .bounds = self.control.blocks[0].bounds };
+        return .{ .name = self.control.names[slot], .recipe = .{ .keys = self.control.recipe.keys, .inputs = self.control.recipe.inputs[slot..][0..1] }, .state_recipe = self.control.recipe, .state_slot = @intCast(slot), .groups = self.control.blocks[0].rows, .blocks = self.control.blocks, .bounds = self.control.blocks[0].bounds, .key_index = self.control.key_index };
     }
     fn root(self: Packed, name: []const u8) !Root {
         for (self.control.names, 0..) |value, slot| if (std.mem.eql(u8, value, name)) return self.rootAt(slot);
@@ -521,34 +555,37 @@ fn loadPacked(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, 
     }
     return pack;
 }
-fn publishPackedRows(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, rows: []const operators.Row, recipe: recipes.Recipe, token: Cancellation, proofs: ?[]StateProof) ![]Ref {
+fn publishPackedRows(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, rows: []const operators.Row, recipe: recipes.Recipe, token: Cancellation, proofs: ?[]StateProof, state_layout: u8) ![]Ref {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const pa = arena.allocator();
     try token.check();
     const block = spill.encodeColumnarBlockAlloc(pa, rows, max_block_bytes) catch |err| {
         if (err != error.SqlProgramLimitExceeded or rows.len <= 1) return err;
-        var input: PartialStream = .{ .rows = rows };
+        var input: PartialStream = .{ .rows = rows, .recipe = recipe, .state_layout = state_layout };
         return publishPartialStream(a, out, store, names, &input, recipe, token, proofs);
     };
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(block, &digest, .{});
     const checksum = try pa.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
     const id = try std.fmt.allocPrint(pa, "sha256:{s}", .{checksum});
+    var key_builder: ordered_keys.Builder = .{ .store = store, .token = token, .recipe = recipe, .allow_inline = true };
+    defer key_builder.deinit();
+    try key_builder.add(a, rows, 0);
     const roots = try pa.alloc(Root, names.len);
-    const blocks = [_]Block{.{ .artifact = .{ .artifact_id = id, .checksum = checksum, .byte_len = block.len }, .rows = @intCast(rows.len), .bounds = try group_keys.rowBoundsTyped(pa, rows, recipe) }};
-    for (roots, names, 0..) |*root, name, slot| root.* = .{ .name = name, .recipe = .{ .keys = recipe.keys, .inputs = recipe.inputs[slot..][0..1] }, .state_recipe = recipe, .state_slot = @intCast(slot), .groups = rows.len, .blocks = &blocks, .bounds = blocks[0].bounds };
+    const blocks = [_]Block{.{ .state_layout = state_layout, .artifact = .{ .artifact_id = id, .checksum = checksum, .byte_len = block.len }, .rows = @intCast(rows.len), .bounds = try group_keys.rowBoundsTyped(pa, rows, recipe) }};
+    for (roots, names, 0..) |*root, name, slot| root.* = .{ .name = name, .recipe = .{ .keys = recipe.keys, .inputs = recipe.inputs[slot..][0..1] }, .state_recipe = recipe, .state_slot = @intCast(slot), .groups = rows.len, .blocks = &blocks, .bounds = blocks[0].bounds, .key_index = key_builder.result() };
     var control_arena = std.heap.ArenaAllocator.init(a);
     defer control_arena.deinit();
     var control_budget: local.sql_memory_budget = .{ .backing = control_arena.allocator(), .limit = max_root_bytes -| (9 + block.len), .monotonic = true };
-    const control = std.json.Stringify.valueAlloc(control_budget.allocator(), PackedControl{ .recipe = recipe, .names = names, .blocks = &blocks }, .{}) catch |err| {
+    const control = std.json.Stringify.valueAlloc(control_budget.allocator(), PackedControl{ .recipe = recipe, .names = names, .blocks = &blocks, .key_index = key_builder.result() }, .{}) catch |err| {
         if (err != error.OutOfMemory or !control_budget.isLocallyExhausted()) return err;
-        var input: PartialStream = .{ .rows = rows };
+        var input: PartialStream = .{ .rows = rows, .recipe = recipe, .state_layout = state_layout };
         return publishPartialStream(a, out, store, names, &input, recipe, token, proofs);
     };
     const length = std.math.add(usize, 9 + control.len, block.len) catch return error.NativeAggregateArtifactTooLarge;
     if (length > max_root_bytes) {
-        var input: PartialStream = .{ .rows = rows };
+        var input: PartialStream = .{ .rows = rows, .recipe = recipe, .state_layout = state_layout };
         return publishPartialStream(a, out, store, names, &input, recipe, token, proofs);
     }
     const bytes = try pa.alloc(u8, length);
@@ -587,22 +624,53 @@ fn publishPackedRows(a: A, out: A, store: *stores.ArtifactStore, names: []const 
 const TypedColumn = struct {
     states: ?[]const operators.Aggregate = null,
     decoded_states: usize = 0,
-    const Args = struct { block: spill.ColumnarBlock, recipe: recipes.Recipe, column: usize };
+    fn physicalIdentityAt(block: spill.ColumnarBlock, row: usize, column: usize, spec: operators.AggregateSpec) !?[native_partial.physical_width * 2]u64 {
+        var tuple: [native_partial.physical_width * 2]u64 = @splat(0);
+        for (native_partial.physicalColumns(spec), 0..) |_, lane| {
+            const physical = column + lane;
+            if (try block.dictionaryIdentity(row, physical, false)) |id| {
+                tuple[lane * 2] = 1;
+                tuple[lane * 2 + 1] = id;
+                continue;
+            }
+            const value = try block.cell(row, physical);
+            if (value.sql_null) continue;
+            if (value.numeric != null or value.array != null or value.patterns != null) return null;
+            switch (value.value) {
+                .integer => |n| {
+                    tuple[lane * 2] = 2;
+                    tuple[lane * 2 + 1] = @bitCast(n);
+                },
+                .bool => |v| {
+                    tuple[lane * 2] = 3;
+                    tuple[lane * 2 + 1] = @intFromBool(v);
+                },
+                else => return null,
+            }
+        }
+        return tuple;
+    }
+    const Args = struct { block: spill.ColumnarBlock, recipe: recipes.Recipe, column: usize, state_layout: u8 = 0 };
     fn decode(a: A, _: stores.ArtifactStore, _: Ref, token: Cancellation, _: ?CachedRead, args: Args) !TypedColumn {
         const block = args.block;
-        if (block.values.len != args.recipe.inputs.len or block.keys.len != args.recipe.keys.len or args.column >= block.values.len) return error.InvalidNativeAggregateArtifact;
+        if (block.values.len != (if (args.state_layout != 0) native_partial.physicalWidth(args.recipe.inputs) else args.recipe.inputs.len) or block.keys.len != args.recipe.keys.len or args.column >= args.recipe.inputs.len) return error.InvalidNativeAggregateArtifact;
         const states = try a.alloc(operators.Aggregate, block.count());
-        var dictionary: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+        var dictionary: std.AutoHashMapUnmanaged([native_partial.physical_width * 2]u64, usize) = .empty;
         defer dictionary.deinit(a);
         var decoded: usize = 0;
         for (states, 0..) |*state, row| {
             try token.check();
-            const identity = try block.dictionaryIdentity(row, args.column, false);
+            const identity = if (args.state_layout == 0) legacy: {
+                const id = (try block.dictionaryIdentity(row, args.column, false)) orelse break :legacy null;
+                var tuple: [native_partial.physical_width * 2]u64 = @splat(0);
+                tuple[0] = id;
+                break :legacy @as(?@TypeOf(tuple), tuple);
+            } else try physicalIdentityAt(block, row, native_partial.physicalOffset(args.recipe.inputs, args.column), args.recipe.inputs[args.column].spec);
             if (identity) |id| if (dictionary.get(id)) |prior| {
                 state.* = states[prior];
                 continue;
             };
-            state.* = try local.sql_aggregate_partial.decode(a, try block.cell(row, args.column), args.recipe.inputs[args.column].spec);
+            state.* = if (args.state_layout == 0) try native_partial.decode(a, try block.cell(row, args.column), args.recipe.inputs[args.column].spec) else try native_partial.readPhysical(a, block, row, native_partial.physicalOffset(args.recipe.inputs, args.column), args.recipe.inputs[args.column].spec);
             decoded += 1;
             if (identity) |id| try dictionary.put(a, id, row);
         }
@@ -630,6 +698,7 @@ pub const Reader = struct {
     cohort_metadata: ?@import("lake_index_decoded_metadata.zig").Owned(Cohort) = null,
     block_index: usize = 0,
     position: usize = 0,
+    indexed_position: ?usize = null,
     emitted: u64 = 0,
     output_slots: ?[]const u16 = null,
     state_slots: ?[]const u16 = null,
@@ -641,13 +710,11 @@ pub const Reader = struct {
     point_hash: ?u64 = null,
     key_range: ?group_keys.Range = null,
     ordered_scan: bool = false,
+    ordered_plan: ?*ordered_keys.Plan(Reader) = null,
     reverse: bool = false,
     raw_states: bool = false,
-    order_boundary: ?[]const u8 = null,
-    order_done: bool = false,
     selection_spill: ?*spill.Manager = null,
     selection_memory: usize = 8 * 1024 * 1024,
-    order_emitted: u64 = 0,
     selection_started: bool = false,
     selection_rows_left: usize = std.math.maxInt(usize),
     selection_pages_left: usize = std.math.maxInt(usize),
@@ -700,7 +767,7 @@ pub const Reader = struct {
         const incoming = other.root.state_recipe orelse return false;
         if (!state.eql(incoming) or self.root.groups != other.root.groups or self.root.blocks.len != other.root.blocks.len) return false;
         for (self.root.blocks, other.root.blocks) |left, right| {
-            if (left.rows != right.rows or left.artifact.byte_len != right.artifact.byte_len or !std.mem.eql(u8, left.artifact.artifact_id, right.artifact.artifact_id) or !std.mem.eql(u8, left.artifact.checksum, right.artifact.checksum)) return false;
+            if (left.state_layout != right.state_layout or left.rows != right.rows or left.artifact.byte_len != right.artifact.byte_len or !std.mem.eql(u8, left.artifact.artifact_id, right.artifact.artifact_id) or !std.mem.eql(u8, left.artifact.checksum, right.artifact.checksum)) return false;
         }
         return true;
     }
@@ -718,8 +785,11 @@ pub const Reader = struct {
         self.state_slots = states;
     }
     pub fn partitionReader(self: *Reader, index: usize) !*Reader {
+        return self.partitionReaderAllocated(index, self.a);
+    }
+    pub fn partitionReaderAllocated(self: *Reader, index: usize, allocator: A) !*Reader {
         const part = self.root.partitions[index];
-        const reader = try Reader.openWithCache(self.a, self.store, part.artifact, self.root.recipe, self.cancellation, self.cached);
+        const reader = try Reader.openWithCache(allocator, self.store, part.artifact, self.root.recipe, self.cancellation, self.cached);
         errdefer reader.cursor().close(reader);
         reader.max_typed_bytes = self.max_typed_bytes;
         reader.point_hash = self.point_hash;
@@ -809,7 +879,7 @@ pub const Reader = struct {
     }
     fn selectKeys(raw: *anyopaque, request: local.sql_catalog.GroupSelection) !bool {
         const self: *Reader = @ptrCast(@alignCast(raw));
-        if (self.selection_started or self.emitted != 0 or self.child != null) return error.InvalidNativeAggregateArtifact;
+        if (self.selection_started or self.ordered_plan != null or self.emitted != 0 or self.child != null) return error.InvalidNativeAggregateArtifact;
         self.selection_spill = request.spill;
         self.selection_memory = request.memory_bytes;
         self.selection_rows_left = request.row_limit;
@@ -821,8 +891,9 @@ pub const Reader = struct {
             if (!std.mem.eql(u8, order.column, key.path) or order.descending != reverse or (key.nullable and order.nulls_first != reverse)) return false;
         }
         for (self.root.recipe.inputs) |input| if (input.spec.distinct or input.spec.kind == .pattern_set) return false;
-        self.ordered_scan = true;
         self.reverse = reverse;
+        self.ordered_plan = (try ordered_keys.Plan(Reader).prepare(self, request.memory_bytes)) orelse return false;
+        self.ordered_scan = true;
         return true;
     }
     pub fn cursor(self: *Reader) local.sql_catalog.AggregatePartialCursor {
@@ -831,7 +902,7 @@ pub const Reader = struct {
     fn next(raw: *anyopaque, a: A, maximum: u32) !?[]const operators.GroupResult {
         const self: *Reader = @ptrCast(@alignCast(raw));
         self.selection_started = true;
-        if (self.ordered_scan) return @import("lake_index_aggregate_order.zig").next(self, a, maximum);
+        if (self.ordered_plan) |plan| return plan.next(a, maximum);
         return nextRaw(raw, a, maximum);
     }
     pub fn nextRaw(raw: *anyopaque, a: A, maximum: u32) anyerror!?[]const operators.GroupResult {
@@ -889,17 +960,18 @@ pub const Reader = struct {
                 const bytes = if (self.pack_data) |pack_data| pack_data.bytes else try readArtifact(pa, self.store, ref.artifact, self.cancellation, null);
                 break :decode try spill.decodeColumnarBlockInArena(pa, bytes, max_block_bytes);
             };
-            if (block.count() != ref.rows or block.keys.len != self.root.recipe.keys.len or block.values.len != state_recipe.inputs.len) return error.InvalidNativeAggregateArtifact;
+            if (block.count() != ref.rows or block.keys.len != self.root.recipe.keys.len or block.values.len != (if (ref.state_layout != 0) native_partial.physicalWidth(state_recipe.inputs) else state_recipe.inputs.len)) return error.InvalidNativeAggregateArtifact;
             const width = if (self.state_slots) |slots| slots.len else self.root.recipe.inputs.len;
             var columns: std.ArrayList(@import("lake_index_decoded_metadata.zig").Owned(TypedColumn)) = .empty;
             var typed_bytes: usize = 0;
             errdefer for (columns.items) |column| column.release();
             if (!self.raw_states) if (self.cached) |cached| for (0..width) |logical| {
                 const physical = self.physicalSlot(logical);
-                var interpretation: [34]u8 = undefined;
+                var interpretation: [35]u8 = undefined;
                 @memcpy(interpretation[0..32], &fingerprint);
                 std.mem.writeInt(u16, interpretation[32..34], @intCast(physical), .little);
-                const column = @import("lake_index_decoded_metadata.zig").acquireInterpretedBounded(TypedColumn, cached, self.store, .{ .kind = .algebraic_segment, .artifact_id = ref.artifact.artifact_id, .checksum = ref.artifact.checksum, .byte_len = ref.artifact.byte_len }, self.cancellation, &interpretation, TypedColumn.Args{ .block = block, .recipe = state_recipe, .column = physical }, TypedColumn.decode, 16 * 1024 * 1024, .{}) catch |err| fallback: {
+                interpretation[34] = ref.state_layout;
+                const column = @import("lake_index_decoded_metadata.zig").acquireInterpretedBounded(TypedColumn, cached, self.store, .{ .kind = .algebraic_segment, .artifact_id = ref.artifact.artifact_id, .checksum = ref.artifact.checksum, .byte_len = ref.artifact.byte_len }, self.cancellation, &interpretation, TypedColumn.Args{ .block = block, .recipe = state_recipe, .column = physical, .state_layout = ref.state_layout }, TypedColumn.decode, 16 * 1024 * 1024, .{}) catch |err| fallback: {
                     if (err != error.OutOfMemory) return err;
                     break :fallback null;
                 };
@@ -928,12 +1000,17 @@ pub const Reader = struct {
             self.blocks_decoded += 1;
         }
         const block = self.block.?;
+        if (self.indexed_position) |position| {
+            self.position = position;
+            self.indexed_position = null;
+        }
         const count = @min(maximum, block.count() - self.position);
         const result = try a.alloc(operators.GroupResult, count);
         const width = if (self.state_slots) |slots| slots.len else self.root.recipe.inputs.len;
         const key_cells = try a.alloc(local.sql_scalar.Datum, try std.math.mul(usize, count, block.keys.len));
+        const native_layout = self.root.blocks[self.block_index - 1].state_layout != 0;
         const typed_cells = if (self.typed_columns.len != 0) try a.alloc(operators.Aggregate, try std.math.mul(usize, count, width)) else null;
-        const encoded_cells = if (typed_cells == null) try a.alloc(local.sql_scalar.Datum, try std.math.mul(usize, count, width)) else null;
+        const encoded_cells = if (typed_cells == null and !native_layout) try a.alloc(local.sql_scalar.Datum, try std.math.mul(usize, count, width)) else null;
         for (result, 0..) |*row, index| {
             const keys = key_cells[index * block.keys.len ..][0..block.keys.len];
             for (keys, 0..) |*key, column| key.* = try block.keyCell(self.position, column);
@@ -941,13 +1018,43 @@ pub const Reader = struct {
             const cells: []local.sql_scalar.Datum = if (encoded_cells) |values| values[index * width ..][0..width] else &.{};
             for (0..width) |column| {
                 const physical = self.physicalSlot(column);
-                if (states) |values| values[column] = self.typed_columns[column].value.states.?[self.position] else cells[column] = try block.cell(self.position, physical);
+                if (states) |values| values[column] = self.typed_columns[column].value.states.?[self.position] else if (!native_layout) cells[column] = try block.cell(self.position, physical);
             }
-            row.* = .{ .keys = keys, .aggregates = cells, .typed_states = states, .ordinal = block.ordinals[self.position], .aggregate_slots = self.output_slots };
+            var state_reader: ?operators.GroupResult.StateReader = null;
+            if (native_layout and states == null) {
+                const view = try a.create(PhysicalRow);
+                view.* = .{ .reader = self, .block = block, .row = self.position, .width = width };
+                state_reader = .{ .ptr = view, .count = width, .read = PhysicalRow.read };
+            }
+            row.* = .{ .keys = keys, .aggregates = cells, .typed_states = states, .state_reader = state_reader, .ordinal = block.ordinals[self.position], .aggregate_slots = self.output_slots };
             self.position += 1;
             self.emitted += 1;
         }
         return result;
+    }
+    const PhysicalRow = struct {
+        reader: *Reader,
+        block: spill.ColumnarBlock,
+        row: usize,
+        width: usize,
+        fn read(raw: *const anyopaque, a: A, logical: usize) anyerror!operators.Aggregate {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (logical >= self.width) return error.InvalidSqlBackendResponse;
+            const physical = self.reader.physicalSlot(logical);
+            const inputs = (self.reader.root.state_recipe orelse self.reader.root.recipe).inputs;
+            return native_partial.readPhysical(a, self.block, self.row, native_partial.physicalOffset(inputs, physical), inputs[physical].spec);
+        }
+    };
+    pub fn readIndexed(self: *Reader, a: A, block_index: usize, row: usize) !operators.GroupResult {
+        if (block_index >= self.root.blocks.len or row >= self.root.blocks[block_index].rows) return error.InvalidNativeAggregateArtifact;
+        if (self.block == null or self.block_index != block_index + 1) {
+            self.discardBlock();
+            self.block_index = block_index;
+        } else self.position = row;
+        self.indexed_position = row;
+        const result = (try nextRaw(self, a, 1)) orelse return error.InvalidNativeAggregateArtifact;
+        if (self.block_index != block_index + 1) return error.InvalidNativeAggregateArtifact;
+        return result[0];
     }
     pub fn discardBlock(self: *Reader) void {
         self.block = null;
@@ -958,18 +1065,18 @@ pub const Reader = struct {
         self.position = 0;
         _ = self.page.reset(.free_all);
     }
-    fn physicalSlot(self: *const Reader, logical: usize) usize {
+    pub fn physicalSlot(self: *const Reader, logical: usize) usize {
         return if (self.state_slots) |slots| slots[logical] else if (self.root.state_slot) |slot| @as(usize, slot) else logical;
     }
     fn close(raw: *anyopaque) void {
         const self: *Reader = @ptrCast(@alignCast(raw));
         const a = self.a;
+        if (self.ordered_plan) |plan| plan.deinit();
         if (self.child) |child| child.cursor().close(child);
         if (self.block_metadata) |owned| owned.release();
         for (self.typed_columns) |owned| owned.release();
         if (self.cohort_metadata) |owned| owned.release();
         self.page.deinit();
-        if (self.order_boundary) |boundary| a.free(boundary);
         if (self.metadata) |owned| owned.release();
         if (self.pack_metadata) |owned| owned.release();
         self.control.deinit();
@@ -1153,7 +1260,7 @@ pub fn publishPartitionedAtProven(a: A, out: A, store: *stores.ArtifactStore, na
     if (proofs) |values| if (values.len != names.len) return error.InvalidNativeAggregateArtifact;
     for (names, group.specs, recipe.inputs) |name, spec, input| if (name.len == 0 or !std.meta.eql(spec, input.spec)) return error.InvalidNativeAggregateArtifact;
     try cancellation.check();
-    var input: PartialStream = .{ .group = group };
+    var input = PartialStream.init(group, recipe);
     if (group.external == null and group.groups.items.len - group.result_cursor <= 256)
         return publishSmallRadix(a, out, store, names, &input, recipe, cancellation, depth, proofs, false);
     var pool = try spill.Partitions.init(manager);
@@ -1165,7 +1272,7 @@ pub fn publishPartitionedAtProven(a: A, out: A, store: *stores.ArtifactStore, na
 pub fn publishPartitionDirectoryAt(a: A, out: A, store: *stores.ArtifactStore, names: []const []const u8, group: *operators.Grouped, recipe: recipes.Recipe, manager: *spill.Manager, cancellation: Cancellation, depth: u8) ![]Ref {
     if (depth > max_partition_depth or names.len == 0 or names.len != recipe.inputs.len or names.len > 256 or group.specs.len != names.len) return error.InvalidNativeAggregateArtifact;
     for (names, group.specs, recipe.inputs) |name, spec, input| if (name.len == 0 or !std.meta.eql(spec, input.spec)) return error.InvalidNativeAggregateArtifact;
-    var input: PartialStream = .{ .group = group };
+    var input = PartialStream.init(group, recipe);
     if (group.external == null and group.groups.items.len - group.result_cursor <= 256) return publishSmallRadix(a, out, store, names, &input, recipe, cancellation, depth, null, true);
     var pool = try spill.Partitions.init(manager);
     defer pool.deinit();
@@ -1191,7 +1298,7 @@ const RadixSelection = struct {
         var counts: [64]usize = @splat(0);
         var buckets: [256]u8 = undefined;
         for (rows, 0..) |row, index| {
-            if (row.keys.len != recipe.keys.len or row.values.len != recipe.inputs.len) return error.InvalidSqlBackendResponse;
+            if (row.keys.len != recipe.keys.len) return error.InvalidSqlBackendResponse;
             const bucket: u8 = @intCast((try groupHash(row.keys) >> partitionShift(depth)) % partitionFanout(depth));
             buckets[index] = bucket;
             counts[bucket] += 1;
@@ -1216,7 +1323,7 @@ fn publishSmallRadix(a: A, out: A, store: *stores.ArtifactStore, names: []const 
     const pa = arena.allocator();
     const rows = try input.next(pa);
     input.finish();
-    if (!route and rows.len != 0) return publishPackedRows(a, out, store, names, rows, recipe, cancellation, proofs);
+    if (!route and rows.len != 0) return publishPackedRows(a, out, store, names, rows, recipe, cancellation, proofs, input.state_layout);
     const selection = try RadixSelection.init(rows, recipe, depth);
     const lists = try pa.alloc(std.ArrayList(Partition), names.len);
     @memset(lists, .empty);
@@ -1228,7 +1335,7 @@ fn publishSmallRadix(a: A, out: A, store: *stores.ArtifactStore, names: []const 
         const count = positions.len;
         if (count == 0) continue;
         for (positions, 0..) |index, lane| selected[lane] = rows[index];
-        const refs = try publishPackedRows(a, pa, store, names, selected[0..count], recipe, cancellation, child_proofs);
+        const refs = try publishPackedRows(a, pa, store, names, selected[0..count], recipe, cancellation, child_proofs, input.state_layout);
         for (refs, lists, child_proofs) |ref, *list, proof| try list.append(pa, .{ .bucket = @intCast(bucket), .artifact = ref, .groups = count, .proof = proof, .bounds = proof.bounds });
     }
     return publishPartitionRootsAtProven(a, out, store, names, recipe, lists, cancellation, depth, proofs);
@@ -1279,7 +1386,7 @@ fn publishRadixStream(a: A, out: A, store: *stores.ArtifactStore, names: []const
     for (0..partitionFanout(depth)) |bucket| {
         const file = if (partitions.streams[bucket]) |*stream| stream else continue;
         const count = file.size;
-        var child: PartialStream = .{ .file = file, .retirement = .{ .pool = &partitions, .index = bucket } };
+        var child: PartialStream = .{ .recipe = recipe, .state_layout = input.state_layout, .file = file, .retirement = .{ .pool = &partitions, .index = bucket } };
         const refs = if (count > partition_leaf_groups and depth < max_partition_depth)
             try publishRadixStream(a, a, store, names, &child, recipe, pool, cancellation, depth + 1, child_proofs)
         else if (count <= 256) leaf: {
@@ -1287,7 +1394,7 @@ fn publishRadixStream(a: A, out: A, store: *stores.ArtifactStore, names: []const
             defer page.deinit();
             const rows = try child.next(page.allocator());
             child.finish();
-            break :leaf try publishPackedRows(a, a, store, names, rows, recipe, cancellation, child_proofs);
+            break :leaf try publishPackedRows(a, a, store, names, rows, recipe, cancellation, child_proofs, child.state_layout);
         } else try publishPartialStream(a, a, store, names, &child, recipe, cancellation, child_proofs);
         defer a.free(refs);
         var transferred: usize = 0;
@@ -1868,7 +1975,9 @@ test "external lake typed aggregate caching selects columns and shares dictionar
     const cached: CachedRead = .{ .cache = &cache, .scope = @splat(22), .context = .{ .io = std.testing.io } };
     const count = try Reader.openWithCache(a, store, refs[0], .{ .keys = recipe.keys, .inputs = recipe.inputs[0..1] }, .none, cached);
     defer count.cursor().close(count);
+    try std.testing.expectEqual(@as(u8, 1), count.root.blocks[0].state_layout);
     const counts = (try count.cursor().next(count, out, 256)).?;
+    try std.testing.expectEqual(native_partial.physicalWidth(recipe.inputs), count.block.?.values.len);
     try std.testing.expectEqual(@as(usize, 256), counts.len);
     try std.testing.expectEqual(@as(usize, 1), count.typed_columns.len);
     try std.testing.expectEqual(@as(usize, 1), count.typed_columns[0].value.decoded_states);
@@ -1999,7 +2108,7 @@ test "external lake packed leaves bound writes and build directories share authe
         @memset(text, @as(u8, 'a') + @as(u8, @intCast(slot)));
         name.* = text;
     }
-    const fallback = try publishPackedRows(a, out, &store, &wide_names, try partial_stream.next(out), wide_recipe, .none, null);
+    const fallback = try publishPackedRows(a, out, &store, &wide_names, try partial_stream.next(out), wide_recipe, .none, null, 0);
     try std.testing.expectEqual(@as(u16, 2), fallback[0].metadata_version);
     const leaf = first.?;
     try std.testing.expectEqual(@as(u16, 6), leaf.metadata_version);
@@ -2119,6 +2228,7 @@ test "external lake aggregate ordered frontiers prune payloads and page both dir
     var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
     defer fs.deinit();
     var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(3) };
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
     };
@@ -2154,9 +2264,16 @@ test "external lake aggregate ordered frontiers prune payloads and page both dir
     try std.testing.expect(try reader.cursor().select_keys.?(reader, .{ .conditions = &.{.{ .column = "k", .op = .gte, .value = .{ .integer = 1000 } }}, .order = &.{.{ .column = "k" }} }));
     const rows = (try reader.cursor().next(reader, out, 5)).?;
     for (rows, 1000..) |row, ordinal| try std.testing.expectEqual(@as(i64, @intCast(ordinal)), row.keys[0].value.integer);
+    const exact_range = try Reader.open(a, store, refs[0], recipe, .none);
+    defer exact_range.cursor().close(exact_range);
+    try std.testing.expect(try exact_range.cursor().select_keys.?(exact_range, .{ .memory_bytes = 64 * 1024, .row_limit = 1, .conditions = &.{ .{ .column = "k", .op = .gte, .value = .{ .integer = 500 } }, .{ .column = "k", .op = .lt, .value = .{ .integer = 501 } } }, .order = &.{.{ .column = "k" }} }));
+    try std.testing.expectEqual(@as(usize, 1), exact_range.ordered_plan.?.leaves.items.len);
+    try std.testing.expectEqual(@as(i64, 500), (try exact_range.cursor().next(exact_range, out, 1)).?[0].keys[0].value.integer);
+    try std.testing.expect((try exact_range.cursor().next(exact_range, out, 1)) == null);
     const bounded = try Reader.open(a, store, refs[0], recipe, .none);
     defer bounded.cursor().close(bounded);
     try std.testing.expect(try bounded.cursor().select_keys.?(bounded, .{ .row_limit = 1, .order = &.{.{ .column = "k" }} }));
+    _ = try bounded.cursor().next(bounded, out, 1);
     try std.testing.expectError(error.SqlProgramLimitExceeded, bounded.cursor().next(bounded, out, 1));
     const ranged = try Reader.open(a, store, refs[0], recipe, .none);
     defer ranged.cursor().close(ranged);
@@ -2182,7 +2299,7 @@ test "external lake aggregate ordered frontiers prune payloads and page both dir
             try std.testing.expectEqual(@as(i64, @intCast(ordinal)), row.keys[1].value.integer);
         }
     }
-    try std.testing.checkAllAllocationFailures(a, orderedFaultScenario, .{ store, pair_refs[0], pair_recipe });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, orderedFaultScenario, .{ store, pair_refs[0], pair_recipe });
     const wide_recipe: recipes.Recipe = .{ .keys = &.{.{ .path = "text", .type = .string, .nullable = false }}, .inputs = recipe.inputs };
     const wide = try operators.Grouped.create(a, &specs, .{ .bytes = 2 * 1024 * 1024 });
     defer wide.deinit();
@@ -2191,17 +2308,49 @@ test "external lake aggregate ordered frontiers prune payloads and page both dir
         _ = try std.fmt.bufPrint(label[1024..], "{d:0>4}", .{255 - index});
         try wide.add(&.{local.sql_scalar.Datum.json(.{ .string = &label })}, &.{local.sql_scalar.Datum.json(.{ .integer = 1 })});
     }
+    var limited_index: ordered_keys.Builder = .{ .store = &store, .token = .none, .recipe = wide_recipe, .writes = 1 };
+    defer limited_index.deinit();
+    try limited_index.add(a, &.{.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = "sample" })}, .values = &.{}, .ordinal = 0 }}, 0);
+    try std.testing.expect(limited_index.result() == null);
     const wide_refs = try publishCohort(a, out, &store, &.{"stats.count"}, wide, wide_recipe, .none);
     const spilled = try Reader.open(a, store, wide_refs[0], wide_recipe, .none);
     defer spilled.cursor().close(spilled);
-    try std.testing.expect(try spilled.cursor().select_keys.?(spilled, .{ .memory_bytes = 64 * 1024, .spill = &manager, .order = &.{.{ .column = "text" }} }));
+    try std.testing.expect(try spilled.cursor().select_keys.?(spilled, .{ .memory_bytes = 256 * 1024, .spill = &manager, .order = &.{.{ .column = "text" }} }));
     const before_spill = manager.written_bytes;
     const spilled_rows = (try spilled.cursor().next(spilled, out, 100)).?;
     try std.testing.expectEqual(@as(usize, 100), spilled_rows.len);
     try std.testing.expectEqualStrings("0000", spilled_rows[0].keys[0].value.string[1024..]);
     try std.testing.expectEqualStrings("0099", spilled_rows[99].keys[0].value.string[1024..]);
-    try std.testing.expect(manager.written_bytes > before_spill);
+    try std.testing.expectEqual(before_spill, manager.written_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+    for ([_]bool{ false, true }) |reverse| {
+        const paged = try Reader.open(a, store, wide_refs[0], wide_recipe, .none);
+        defer paged.cursor().close(paged);
+        try std.testing.expect(paged.root.key_index != null);
+        try std.testing.expect(try paged.cursor().select_keys.?(paged, .{ .row_limit = 256, .page_limit = 3, .memory_bytes = 512 * 1024, .order = &.{.{ .column = "text", .descending = reverse }} }));
+        var delivered: usize = 0;
+        while (try paged.cursor().next(paged, out, 100)) |page| {
+            for (page) |row| {
+                const expected = if (reverse) 255 - delivered else delivered;
+                var suffix: [4]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&suffix, "{d:0>4}", .{expected}), row.keys[0].value.string[1024..]);
+                try std.testing.expectEqual(delivered, row.ordinal);
+                delivered += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 256), delivered);
+        try std.testing.expectEqual(@as(usize, 0), paged.selection_rows_left);
+        try std.testing.expectEqual(@as(usize, 1), paged.blocks_decoded);
+    }
+    const declined = try Reader.open(a, store, wide_refs[0], wide_recipe, .none);
+    defer declined.cursor().close(declined);
+    const denied = try ordered_keys.Plan(Reader).prepare(declined, 1);
+    defer if (denied) |plan| plan.deinit();
+    try std.testing.expect(denied == null);
+    try std.testing.expect(!try declined.cursor().select_keys.?(declined, .{ .memory_bytes = 32 * 1024, .order = &.{.{ .column = "text" }} }));
+    try std.testing.expectEqual(@as(u64, 0), declined.emitted);
+    // Declining navigation preserves the ordinary one-pass sort input.
+    try std.testing.expectEqual(@as(usize, 256), (try declined.cursor().next(declined, out, 256)).?.len);
 }
 fn orderedFaultScenario(a: A, store: stores.ArtifactStore, ref: Ref, recipe: recipes.Recipe) !void {
     const reader = try Reader.open(a, store, ref, recipe, .none);

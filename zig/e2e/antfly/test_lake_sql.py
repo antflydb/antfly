@@ -6449,6 +6449,7 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
                         type=pa.int64(),
                     ),
                     "body": [None if i % 13 == 0 else f"quasar item {i}" for i in ids],
+                    **({"wide": ["x" * 80 + f"{i % key_count:04}" for i in ids]} if key_count > 256 else {}),
                 }
             ),
             path,
@@ -6513,6 +6514,7 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
                                     "k": {"type": "integer"},
                                     "amount": {"type": "integer"},
                                     "body": {"type": "string"},
+                                    **({"wide": {"type": "string"}} if key_count > 256 else {}),
                                 },
                                 "additionalProperties": False,
                             }
@@ -6534,6 +6536,7 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
                         "aggregates": [
                             {"name": "global_rows", "op": "count"},
                             {"name": "counts", "op": "count", "group_by": ["k"]},
+                            *([{"name": "wide_counts", "op": "count", "group_by": ["wide"]}] if key_count > 256 else []),
                             {
                                 "name": "sums",
                                 "op": "sum",
@@ -6624,6 +6627,16 @@ def test_native_configuration_cohorts_and_group_directories_survive_restart(
                     {"statement": f"SELECT k, COUNT(*), SUM(amount) FROM native_cohorts WHERE {predicate} GROUP BY k HAVING COUNT(*) > 0 ORDER BY k {ordering} {nulls} LIMIT 3 OFFSET 2"},
                 )["rows"]
                 assert ordered == [[str(k), str(expected[k][0]), str(expected[k][1])] for k in keys[2:5]]
+        if key_count > 256:
+            # Every group shares the full old 64-byte fence prefix. Deliver
+            # several native pages after source loss, in both seek directions.
+            for direction in ("ASC", "DESC"):
+                wide_keys = sorted(expected, reverse=direction == "DESC")[:400]
+                wide_rows = call(
+                    "POST", "/sql",
+                    {"statement": f"SELECT wide, COUNT(*) FROM native_cohorts GROUP BY wide ORDER BY wide {direction} LIMIT 400"},
+                )["rows"]
+                assert wide_rows == [["x" * 80 + f"{k:04}", str(expected[k][0])] for k in wide_keys]
         limited = call(
             "POST", "/sql",
             {"statement": "SELECT k, COUNT(*), SUM(amount) FROM native_cohorts GROUP BY k LIMIT 3 OFFSET 2"},

@@ -255,6 +255,7 @@ pub const Replay = struct {
     live_allocator: A = undefined,
     captures: usize = 0,
     read_ahead_hits: usize = 0,
+    publication_sessions: usize = 0,
     streamed_batches: usize = 0,
     retained_batches: usize = 0,
     pipeline: ?*@import("lake_index_build_pipeline.zig") = null,

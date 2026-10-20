@@ -721,7 +721,7 @@ test "external lake native publication builds scoped text artifacts and fences e
         const reader = try aggregate.Reader.open(a, artifact_store, declaration.artifact, recipe, .none);
         defer reader.cursor().close(reader);
         const values = (try reader.cursor().next(reader, next.arena.allocator(), 8)).?;
-        var count = try local.sql_aggregate_partial.decode(a, values[0].aggregates[0], .{ .kind = .count });
+        var count = try local.sql_aggregate_partial.read(a, values[0], 0, .{ .kind = .count });
         defer count.deinit();
         try std.testing.expectEqual(@as(u64, 4), count.count);
     };

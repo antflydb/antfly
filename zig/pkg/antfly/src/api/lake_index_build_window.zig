@@ -21,7 +21,8 @@ const Provider = @import("lake_index_row_source.zig").Provider;
 const Token = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const Self = @This();
-pub const width = 4;
+pub const width = 64;
+pub const initial_width = 4;
 a: A,
 parent: *local.serverless_query_lake_serving.ServingSource,
 source: local.serverless_query_lake_serving.ServingSource,
@@ -88,6 +89,15 @@ pub fn capture(self: *Self, first: usize, end: usize, token: Token) anyerror!boo
         disk -= buffer.manager.live_bytes;
     }
     return self.prepared;
+}
+/// Session length follows actual retained bytes, independently of file count.
+pub fn nextWidth(self: *const Self, requested: usize) usize {
+    const captured = self.end - self.first;
+    if (!self.prepared or captured < requested) return @max(1, captured);
+    var disk: u64 = 0;
+    for (self.buffers[0..captured]) |buffer| disk +|= buffer.manager.live_bytes;
+    if (self.budget.live <= self.budget.limit / 2 and disk <= self.disk_limit / 2) return @min(width, requested * 2);
+    return requested;
 }
 pub fn replay(self: *Self) *Replay {
     return &self.buffers[0];

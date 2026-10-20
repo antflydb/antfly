@@ -1204,11 +1204,11 @@ test "external lake native algebraic publication reads real Parquet into exact S
     const metadata_cursor = metadata_reader.cursor();
     defer metadata_cursor.close(metadata_cursor.ptr);
     const metadata_counts = (try metadata_cursor.next(metadata_cursor.ptr, page.allocator(), 32)).?;
-    var metadata_exact = try local.sql_aggregate_partial.decode(page.allocator(), metadata_counts[0].aggregates[0], .{ .kind = .count });
+    var metadata_exact = try local.sql_aggregate_partial.read(page.allocator(), metadata_counts[0], 0, .{ .kind = .count });
     defer metadata_exact.deinit();
     try std.testing.expectEqual(@as(u64, 3), metadata_exact.count);
     const counts = (try count_cursor.next(count_cursor.ptr, page.allocator(), 32)).?;
-    var exact = try local.sql_aggregate_partial.decode(page.allocator(), counts[0].aggregates[0], .{ .kind = .count });
+    var exact = try local.sql_aggregate_partial.read(page.allocator(), counts[0], 0, .{ .kind = .count });
     defer exact.deinit();
     try std.testing.expectEqual(@as(u64, 3), exact.count);
     // Serving reads a small directory without hydrating build-only records.
