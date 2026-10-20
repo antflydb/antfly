@@ -272,3 +272,49 @@ cold-storage or platform-parity qualification.
 Named `search_as_you_type` roots index complete Unicode word tokens with lowercase normalization. The bounded 2–20 character edge-prefix representation is an accelerator, not the root dictionary. Root prefix expansion remains available for one-character words, long prefixes, and full tokens beyond the accelerator window. Query analysis never expands edge n-grams. Generated shorthand mappings retain their independently verified shingle and prefix companions.
 
 Indexes created with earlier development builds of this PR used the prefix-only analyzer for named roots. Reindex those affected named representations before relying on long-token completeness; changing query normalization cannot recreate terms omitted at indexing time. This is a development-index migration, not a claim that existing prefix-only segments contain full tokens.
+
+### Bounded verification dataflow
+
+Retained predicate facts use a hash directory and intrusive hot/cold queues within
+the existing 16 MiB process allocation budget. New facts enter the cold queue;
+reuse promotes them. Directory metadata, immutable bitmap blocks, reader pins
+and unpublished builders all count against that budget. There is no fixed entry
+count. Lookup does not copy bitmaps, and construction occurs outside the directory
+lock. Expiry releases the empty directory too. This is optional memory-only
+acceleration; it never persists document bodies or bypasses read authorization,
+snapshot validation or revision isolation.
+
+Indexed producers read original values through the existing multi-read callback
+under the same read generation. Windows adapt between two and 64 candidate rows,
+target roughly 256 KiB of source payload, and carry the learned size across
+segments. Window allocations have an 8 MiB ceiling and may use at most a quarter
+of provable reusable allocator headroom. Unknown, monotonic and externally
+reserved budgets retain scalar reads. Failed optional windows shrink, release
+their memory and restore document reservations before scalar fallback. Deleted,
+already known and already covered candidates do not enter the window. Successful
+speculative reads count against shared document/byte allowances even when a
+consumer later stops early. Primary scans without a text index retain their
+existing scalar storage traversal.
+
+The compiled-engine boundary canonicalizes only the exact, unwrapped process
+libc allocator: separate compilation units have distinct allocator-vtable
+addresses despite sharing malloc/free. Quota, arena, tracking and custom
+allocators pass through unchanged. Optional admission must recognize a backing
+allocator without stripping constraints.
+
+Large originals use a query-local field-path trie and sparse JSON projection.
+The parser validates the complete input, including duplicate keys and unused
+values, while materializing only selected string paths and their array/object
+structure. Unselected values use iterative validation, so deeply nested unused
+data does not force recursive DOM construction. Tiny documents use the standard
+parser directly; excessive selected depth or unavailable compilation retains
+the ordinary full-DOM path. Sparse projections never enter the full-document
+source cache. Matcher semantics and work limits remain authoritative.
+
+Profile metrics with `verification_metrics_version: 1` expose source read/parse
+time, batch/scalar read counts, projected-source counts, batch refusals and peak
+individual-window allocation. Merging sums work and time, and takes the maximum
+window peak; it does not claim simultaneous process memory. Legacy components
+make the merged metric version zero rather than suggesting complete coverage.
+These counters make batching and projection observable through actual HTTP
+requests, rather than relying only on callback fixtures.
