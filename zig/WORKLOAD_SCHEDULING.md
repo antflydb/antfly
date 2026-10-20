@@ -18,12 +18,25 @@ implementation evidence are recorded in the implementation ledger.
 The current merge includes `origin/main` through `097588bf5d9d2f32cc16574545d95c375bbb24a1`
 (merge commit `1f1d60a4387601fa6d3f88150e4fd98218a2e99d`).
 
-Native ABI 49, storage-owner ABI 109, engine descriptor 29, required preparation
+Native ABI 50, storage-owner ABI 109, engine descriptor 29, required preparation
 file floor 10 and data-Raft protocol 28 fence persistent binding, original cohort handoff and typed
 recovery status. New stable SQL/HTTP sessions retain their original routed
 cohort before BEGIN. Required status compares actual saved mode and binding and
 represents successful absence explicitly; read errors cannot authorize a fresh
 BEGIN or follower cleanup. Legacy terminal aborts remain final.
+
+Source `97e121f317cb2c742730edd30e243a2d48ef9809` independently admits producer
+CPU after eligible holder retirement. The parent parks, the child inherits its
+original restrictions, and child retirement precedes checked parent CPU return
+and holder reentry. Foreground write teams provide a scoped producer parent
+without activating completion. Dense, sparse and nested asset contexts preserve
+the child. Scoped provider fanout and PDF prefetch stay disabled. Native 50,
+runnable 17 and API 56 fence the private layout changes; durable formats and
+shared status numbers remain unchanged. The 81-step focused run passes 46
+provider/admission cases, 21 PDF/funding cases and 16 write-team cases. The
+immutable package passes 25/25 ReleaseSafe consumer build steps. Complete
+eligibility, independent parallel children and durable completion reservations
+before PREPARE remain unfinished; required-mode providers remain disabled.
 
 Source `decfefff899c926b0ac7ccb3a07ac2ca6118d65f` retires owned policy and capture
 admissions around eligible controlled document/relational precompute. Reentry

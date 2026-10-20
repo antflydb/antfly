@@ -19,6 +19,58 @@ The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
+## Independent CPU for retired-holder producer work (2026-10-20)
+
+Source `97e121f317cb2c742730edd30e243a2d48ef9809` reserves a distinct producer
+child from the original execution after owned policy and capture holders retire.
+The parent parks before the child activates. The child inherits the original
+request's scheduler, deadline, cancellation, class and queue restrictions; it
+uses the borrowed request IO and bounded child-metadata allocator. Provider
+invocations and their internal consumers return/join before child retirement.
+Original parent CPU reenters through a checked restriction before holders are
+restored. A failed speculative call retires the child and leaves parent cleanup
+to its owning finish, without renewing foreground authority.
+
+The write completion adapter supplies a separate producer parent for this
+retired-holder phase. Its ordinary parking callbacks still reject use before
+completion activates; producer work does not activate completion. A live producer
+prevents holder reentry. Providers receive only the independently admitted child,
+never the coordinator token. Scoped dense/sparse contexts and nested asset
+invocations preserve it; the shared lifecycle runtime stays unchanged. Asset
+invocation planning and dispatch treat a runnable as controlled authority.
+Provider fanout and PDF prefetch remain disabled for scoped preparation.
+
+Native ABI 50, runnable ABI 17 and API ABI 56 fence the changed process-local
+layouts and producer-parent callback. Storage-owner 109, failure 66, engine
+descriptor 29, reader floor 10 and durable formats remain unchanged.
+
+`independent-producer-execution-v6` passes 81/81 focused build steps, with
+46 provider/admission cases, 21 PDF/funding cases and 16 write-team cases.
+Seven owner-preflight cases plus their root retain unchanged-source passing
+provenance from v5; only the write-team test's required license header changed.
+The actual DB fixture covers document/relational dense, sparse and two-asset
+consumers, with one ordinary CPU slot and a separate control slot. It checks
+parked parent ownership, child-only execution, query/control progress during
+child parking, inherited deadlines, cancellation, reservation refusal, rejected
+parent reentry and no row commit on failure. The real write-team adapter checks
+bounded metadata retirement and that completion stays inactive. Asset-runtime
+checks preserve the child token without changing the resident runtime.
+
+`independent-producer-verified.json` binds 5267 unchanged native inputs and
+4549 matching immutable public sources, with 25/25 ReleaseSafe public-consumer
+build steps. The consumer checks module composition without linking provider
+products. Source-controller coverage remains semantic; the small linked
+visibility fixture proves its contract only. Full archive/cold-source runtime
+remain unqualified, and full Linux qualification remains waived.
+
+Legacy capabilities, already granted whole teams, externally retained snapshot
+or policy holders and in-apply fallback retain their existing CPU path. Complete
+producer eligibility and independently funded parallel children remain open.
+Durable accepted effects and completion reservations before PREPARE, required-mode
+provider activation/readiness, hidden-owner authority, remaining routes/backends,
+overload faults and default-policy integration remain unfinished. The full
+design remains incomplete; this does not activate required-mode providers.
+
 ## Speculative producer holder retirement (2026-10-20)
 
 Source `decfefff899c926b0ac7ccb3a07ac2ca6118d65f`: eligible controlled document and relational precompute now retire their owned
