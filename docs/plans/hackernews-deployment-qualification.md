@@ -1239,8 +1239,73 @@ They overlap and must not be summed. This is a restart profile, not the
 immediate cold request, whose profiling sleeps were intentionally bypassed.
 It does not support treating reader opening as the dominant remaining cost.
 
-The 1,024-file highlighted/composed base-versus-main run is in progress.
-Publication duration, physical footprint, union/overlay latency and restart
-correctness must be recorded before drawing conclusions about fragmentation.
+The serial 1,024-file highlighted/composed comparison also completed, with the
+same source rows, memory envelope and cache settings. The harness generates one
+contiguous split fixture for the pair and records each file's content hash;
+these are not assertions of byte identity with the earlier RC split fixture.
+This pair has one fresh state per binary rather than two alternating cycles.
+Shared-host resource use changed during the pair, so the observed improvements
+do not establish a controlled speedup attributable to #1196.
+
+| Measurement, 1,024 files | Pre-merge main | Merged main |
+| --- | ---: | ---: |
+| Publication readiness | 727 s | 530 s |
+| First highlighted archive search | 510 ms | 394 ms |
+| Warm highlighted archive p95 | 231 ms | 101 ms |
+| Highlighted search after restart | 1,339 ms | 123 ms |
+| Cold union / warm union p95 | 1,155 / 679 ms | 195 / 235 ms |
+| Cold saved overlay / warm overlay p95 | 635 / 403 ms | 216 / 127 ms |
+| Maximum warm saved overlay | 2,844 ms | 132 ms |
+| Physical post-run artifact bytes | 8.58 GB | 8.63 GB |
+| Physical post-run artifact objects | 271,866 | 276,231 |
+| Whole-run child peak RSS | 522 MiB | 803 MiB |
+
+Both cases passed highlights without widening source projection, exact metadata
+filters and residual agreement, retained pagination and restart scores, plus
+union history, overlay nonmatching suppression, saved-source visibility and
+mutable composed cursor recovery after restart. Top-five archive HN identifiers
+and scores also match across revisions in both layouts. The measured composed
+cold/p95 pairs pass the existing 2,000/750 ms gates; these gates do not constrain
+every individual warm request. The baseline's 2,844 ms overlay outlier has a
+retained profile: native-leaf work takes 2,024 ms and cursor retention 700 ms,
+with zero diagnostic drops. Merged main retains no composed request above
+750 ms during this matrix; diagnostic drops remain zero. This bounded sample
+does not prove that the historical outlier is impossible.
+
+The merged-main fragmented restart profile records 121 ms inside lake execution:
+48 ms before search, 65 ms searching and 9 ms afterward. Inclusive text timings
+include 9 ms opening, 12 ms term planning, 11 ms navigation and 49 ms postings.
+Those nested scopes must not be summed. Both binaries emit catalog-routing
+snapshot retry warnings during construction, and merged main also defers native
+checkpoint warming after a deadline. Neither run terminates with an engine
+error. Physical footprint does not show a reduction in this pair; it includes
+retained and attempt-private artifacts and does not qualify GC or live storage
+cost. The RSS statistic is the maximum child-process RSS over the whole harness,
+including construction, not a query-only or aggregate process-tree measurement.
+
+Three further merged-main restarts clear the serving cache and query the saved
+overlay immediately after readiness, retaining the 4,096 MiB process budget and
+disabled navigation warming. First searches take 437, 200 and 228 ms; each
+following 20-query burst has p95 149, 167 and 197 ms. No warm query exceeds
+257 ms. Exact top-hit identities/scores and highlight presence pass, without
+pre-query metric-refresh sleeps. OS pages remain retained; this is not managed
+pod replacement or scale-to-zero qualification.
+
+Next, use an isolated fixed-resource environment for reproducible latency and
+construction attribution, recording admitted builder paths, scan/checkpoint
+work, provider requests and live versus orphan storage after bounded GC. Carry
+the construction retry and warming warnings into concurrent-ingestion and
+maintenance qualification. The new text timers support targeted investigation
+of postings/navigation and admission work rather than assuming reader opening
+dominates. Qualify any new RC through the managed Cloud route before promotion;
+these measurements are from main, not the published RC1 image.
+
+Main advanced to `6632c4dd276ac644d1a25a81f57ef83740d0549f` during the run,
+including #1232's merge-recovery and harness changes and #1214's HTTP method
+authorization fixes. The executable measurements above remain pinned to
+`f322acc4de`; those later changes are not covered by the runtime results.
+Use the actual next release revision for managed qualification rather than
+treating a moving main reference as already measured.
+
 Focused harness and metrics tests passed (16 tests). No new cloud compute,
 catalog apply, instance upgrade or release tag was created for these runs.
