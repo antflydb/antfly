@@ -7,6 +7,9 @@ import pytest
 import antfly.client as client_module
 from antfly import AntflyClient, AntflyException, InferenceAPIError, InferenceCapacityError
 from antfly.client_generated.models import (
+    ChunkEmbeddingContext,
+    ChunkEmbeddingObject,
+    ChunkEmbeddingResponse,
     InferenceChatMessage,
     InferenceGenerateChatTemplateKwargs,
     InferenceGenerateRequest,
@@ -456,3 +459,113 @@ def test_decide_bounds_response_bytes() -> None:
     install_transport(client, httpx.MockTransport(lambda _: httpx.Response(200, json=decision_response())))
     with pytest.raises(AntflyException, match="decision response exceeded 16 bytes"):
         client.decide(decision_request())
+
+
+@pytest.mark.parametrize("terminal", [True, False])
+def test_chunk_embedding_stream_preserves_provenance_and_requires_terminal(terminal: bool) -> None:
+    plan = "1" * 64
+    item = {
+        "descriptor": {
+            "id": f"{plan}:0",
+            "ordinal": 0,
+            "coordinates": {"kind": "text", "start_byte": 0, "end_byte": 7},
+            "input_tokens": 4,
+        },
+        "mime_type": "text/plain",
+        "text": "hé🐜",
+        "embedding": [0.6, 0.8],
+    }
+    coverage = {
+        "object": "chunk.embedding.list",
+        "data": [],
+        "status": "partial",
+        "source_fingerprint": "2" * 64,
+        "source_version": "v1",
+        "plan_id": plan,
+        "model": "model",
+        "model_identity": "3" * 64,
+        "model_revision": "4" * 64,
+        "task_type": "RETRIEVAL_DOCUMENT",
+        "dimensions": 2,
+        "policy": {},
+        "start_ordinal": 0,
+        "covered_through_ordinal": 1,
+        "next_continuation": f"{plan}:1",
+        "gaps": [],
+    }
+    events = [{"object": "chunk.embedding.start", "context": coverage}, {"object": "chunk.embedding", "data": item}]
+    if terminal:
+        events.append({"object": "chunk.embedding.complete", "response": coverage})
+    wire = ("\n".join(json.dumps(value, ensure_ascii=False) for value in events) + "\n").encode()
+    stream = ChunkStream([bytes([byte]) for byte in wire])
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer secret"
+        assert json.loads(request.read())["stream"] is True
+        return httpx.Response(200, headers={"Content-Type": "application/x-ndjson"}, stream=stream)
+
+    client = AntflyClient("http://test", token="secret")
+    install_transport(client, httpx.MockTransport(handle))
+    with client.chunk_and_embed_stream({"input": "hé🐜", "embedding": {"model": "model"}}) as results:
+        header = next(results)
+        assert isinstance(header, ChunkEmbeddingContext)
+        assert header.model_identity == coverage["model_identity"]
+        first = next(results)
+        assert isinstance(first, ChunkEmbeddingObject)
+        assert first.to_dict() == item
+        if terminal:
+            complete = next(results)
+            assert isinstance(complete, ChunkEmbeddingResponse)
+            assert complete.to_dict() == coverage
+            with pytest.raises(StopIteration):
+                next(results)
+        else:
+            with pytest.raises(AntflyException, match="before terminal coverage"):
+                next(results)
+    assert stream.closed
+
+
+@pytest.mark.parametrize("extraction", [False, True])
+def test_generated_request_models_preserve_nested_configuration(extraction: bool) -> None:
+    from antfly.client_generated.models import GeneratedDecideRequest, GeneratedExtractionRequest
+
+    config = {"provider": "antfly", "model": "registered"}
+    body = (
+        {
+            "method": "generated",
+            "generator": config,
+            "probabilities": "verdict_only",
+            "inputs": [{"content": "source"}],
+            "schema": {"entities": ["person"]},
+        }
+        if extraction
+        else {
+            "decision_method": "generated",
+            "generator": config,
+            "probabilities": "verdict_only",
+            "input": "source",
+            "questions": [{"name": "answer", "type": "predicate", "instructions": "Is it present?"}],
+        }
+    )
+    request_model = GeneratedExtractionRequest if extraction else GeneratedDecideRequest
+    request = request_model.from_dict(body)
+    encoded = request.to_dict()
+    assert "model" not in encoded
+    assert encoded["generator"] == config
+
+    def handle(incoming: httpx.Request) -> httpx.Response:
+        assert incoming.url.path == ("/ai/v1/extract" if extraction else "/ai/v1/decisions")
+        assert json.loads(incoming.read()) == encoded
+        return httpx.Response(
+            200,
+            json=(
+                {"object": "extraction", "model": "registered", "data": []}
+                if extraction
+                else {"model": "registered", "answers": [], "usage": {"input_tokens": 0, "output_tokens": 0}}
+            ),
+        )
+
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(handle))
+    result = client.extract(request) if extraction else client.decide(request)
+    assert result.model == "registered"

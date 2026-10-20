@@ -21,6 +21,30 @@ import (
 	"testing"
 )
 
+func TestLegacyEmbeddingGroupInputHelper(t *testing.T) {
+	var part ContentPart
+	if err := json.Unmarshal([]byte(`{"type":"text","text":"hello"}`), &part); err != nil {
+		t.Fatal(err)
+	}
+	var input InferenceEmbedRequest_Input
+	if err := input.FromInferenceEmbedRequestInput3(InferenceEmbedRequestInput3{
+		{Content: []ContentPart{part}, Title: "document"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != `[{"content":[{"type":"text","text":"hello"}],"title":"document"}]` {
+		t.Fatalf("legacy grouped input changed: %s", encoded)
+	}
+	groups, err := input.AsInferenceEmbedRequestInput3()
+	if err != nil || len(groups) != 1 || groups[0].Title != "document" {
+		t.Fatalf("legacy grouped input did not round trip: %#v, %v", groups, err)
+	}
+}
+
 func TestCanonicalGraphOpaqueObjectsRejectExplicitNull(t *testing.T) {
 	tests := []struct {
 		name    string

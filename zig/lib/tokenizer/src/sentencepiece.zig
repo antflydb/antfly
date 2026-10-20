@@ -535,6 +535,7 @@ pub const Processor = struct {
         .encodeGeneration = &vtableEncodeGeneration,
         .decode = &vtableDecode,
         .decodeToken = &vtableDecodeToken,
+        .tokenPiece = &vtableTokenPiece,
         .specialTokens = &vtableSpecialTokens,
         .vocabSize = &vtableVocabSize,
         .deinit = &vtableDeinit,
@@ -646,6 +647,14 @@ pub const Processor = struct {
             .attention_mask = mask,
             .allocator = allocator,
         };
+    }
+
+    fn vtableTokenPiece(ptr: *anyopaque, allocator: std.mem.Allocator, id: i32) ?Tokenizer.TokenPiece {
+        const self: *const Processor = @ptrCast(@alignCast(ptr));
+        if (self.extra_id_to_text.get(id)) |text| return .{ .bytes = allocator.dupe(u8, text) catch return null };
+        if (self.id_to_byte.get(id)) |byte| return .{ .bytes = allocator.dupe(u8, &.{byte}) catch return null, .is_byte_fallback = true };
+        if (id < 0 or id >= self.pieces.len) return .{ .bytes = allocator.dupe(u8, "") catch return null };
+        return .{ .bytes = self.decode(allocator, &.{id}) catch return null };
     }
 
     fn vtableDecode(ptr: *anyopaque, allocator: std.mem.Allocator, ids: []const i32) anyerror![]u8 {
@@ -889,7 +898,7 @@ test "convert hex value" {
     try std.testing.expectEqual(@as(?u8, null), convertHexValue("<0x>"));
 }
 
-test "decode byte fallback tolerates truncated utf8 tail" {
+test "raw token bytes preserve byte fallback before sequence utf8 repair" {
     const allocator = std.testing.allocator;
     var piece_inits = try allocator.alloc(PieceInit, 257);
     defer allocator.free(piece_inits);
@@ -906,6 +915,9 @@ test "decode byte fallback tolerates truncated utf8 tail" {
     var processor = try initFromPieceSpecs(allocator, piece_inits, .{ .byte_fallback = true });
     defer processor.deinit();
 
+    const raw_piece = try processor.tokenizer().tokenBytes(allocator, 0xE2 + 1);
+    defer allocator.free(raw_piece);
+    try std.testing.expectEqualSlices(u8, &.{0xe2}, raw_piece);
     const decoded = try processor.decode(allocator, &.{ 0xE2 + 1, 0x82 + 1, 0x41 + 1 });
     defer allocator.free(decoded);
     try std.testing.expectEqualStrings("\xef\xbf\xbd\xef\xbf\xbdA", decoded);

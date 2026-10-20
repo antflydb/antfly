@@ -1567,7 +1567,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             defer parsed.deinit();
             var input = parsed.value.input;
             switch (input) {
-                .text => if (parsed.value.attachment_count != 0 or context.binary_payloads_len != 0 or context.attachment_refs_len != 0)
+                .text, .source => if (parsed.value.attachment_count != 0 or context.binary_payloads_len != 0 or context.attachment_refs_len != 0)
                     return error.InvalidArguments,
                 .binary => |*binary| {
                     if (parsed.value.attachment_count != 1 or context.binary_payloads_len != 1 or
@@ -1582,61 +1582,81 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 },
             }
             const cfg = parsed.value.config;
-            const chunk_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .chunk);
-            var chunk_shape = inference_work.InvocationShape{ .item_count = 1 };
-            switch (input) {
-                .text => |text_value| {
-                    chunk_shape.modalities.text = true;
-                    chunk_shape.text_bytes = text_value.len;
-                    chunk_shape.max_text_bytes_per_item = text_value.len;
-                    try chunk_capabilities.validateMimeType("text/plain");
-                },
-                .binary => |binary| {
-                    chunk_shape.encoded_media_bytes = binary.data.len;
-                    chunk_shape.max_media_parts_per_item = 1;
-                    const essence = inference_work.mimeTypeEssence(binary.mime_type) catch
-                        return error.UnsupportedInferenceMimeType;
-                    if (std.ascii.startsWithIgnoreCase(essence, "audio/"))
-                        chunk_shape.modalities.audio = true
-                    else if (std.ascii.startsWithIgnoreCase(essence, "image/"))
-                        chunk_shape.modalities.image = true
-                    else
-                        chunk_shape.modalities.document = true;
-                    try chunk_capabilities.validateMimeType(binary.mime_type);
-                },
-            }
-            try chunk_capabilities.validateInvocation(.chunk, chunk_shape);
-            const result = try state.node.chunkInputDirectWithContext(deadline_ns, alloc, parsed.value.model, input, .{
-                .model = if (cfg.model.len > 0) cfg.model else "fixed",
-                .max_chunks = @intCast(cfg.max_chunks), // 0 = unlimited
-                .threshold = cfg.threshold,
-                .text = .{
-                    .target_tokens = cfg.defaultedTargetTokens(),
-                    .overlap_tokens = cfg.defaultedOverlapTokens(),
-                    .separator = cfg.defaultedSeparator(),
-                },
-                .audio = .{
-                    .window_duration_ms = if (cfg.audio.window_duration_ms > 0) cfg.audio.window_duration_ms else 30_000,
-                    .overlap_duration_ms = cfg.audio.overlap_duration_ms,
-                },
-            });
+            const result = if (cfg.embedding) |target| aware: {
+                const wire = inference.server.chunk_response;
+                const model_request: wire.Request = .{ .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
+                    var converted = wire.WirePolicy{};
+                    inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(converted, name) = @field(policy, name);
+                    break :convert converted;
+                } else null), .max_chunks = cfg.max_chunks, .include_content = false, .native_content = true, .execute = target.execute orelse true, .allow_partial = false };
+                const model_target = wire.Target{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null };
+                if (cfg.replay) |replay| {
+                    var replay_request = model_request;
+                    replay_request.source_version = replay.source_version;
+                    break :aware try state.node.replayModelChunkDirect(alloc, state.io, execution_control, replay_request, model_target, replay.plan_id, replay.source_fingerprint, replay.ordinal);
+                }
+                break :aware try state.node.chunkModelInputDirect(alloc, state.io, execution_control, model_request, model_target);
+            } else legacy: {
+                const chunk_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .chunk);
+                var chunk_shape = inference_work.InvocationShape{ .item_count = 1 };
+                switch (input) {
+                    .source => return error.ModelAwareChunkProviderRequired,
+                    .text => |text_value| {
+                        chunk_shape.modalities.text = true;
+                        chunk_shape.text_bytes = text_value.len;
+                        chunk_shape.max_text_bytes_per_item = text_value.len;
+                        try chunk_capabilities.validateMimeType("text/plain");
+                    },
+                    .binary => |binary| {
+                        chunk_shape.encoded_media_bytes = binary.data.len;
+                        chunk_shape.max_media_parts_per_item = 1;
+                        const essence = inference_work.mimeTypeEssence(binary.mime_type) catch
+                            return error.UnsupportedInferenceMimeType;
+                        if (std.ascii.startsWithIgnoreCase(essence, "audio/"))
+                            chunk_shape.modalities.audio = true
+                        else if (std.ascii.startsWithIgnoreCase(essence, "image/"))
+                            chunk_shape.modalities.image = true
+                        else
+                            chunk_shape.modalities.document = true;
+                        try chunk_capabilities.validateMimeType(binary.mime_type);
+                    },
+                }
+                try chunk_capabilities.validateInvocation(.chunk, chunk_shape);
+                break :legacy try state.node.chunkInputDirectWithContext(deadline_ns, alloc, parsed.value.model, input, .{
+                    .model = if (cfg.model.len > 0) cfg.model else "fixed",
+                    .max_chunks = @intCast(cfg.max_chunks), // 0 = unlimited
+                    .threshold = cfg.threshold,
+                    .text = .{
+                        .target_tokens = cfg.defaultedTargetTokens(),
+                        .overlap_tokens = cfg.defaultedOverlapTokens(),
+                        .separator = cfg.defaultedSeparator(),
+                    },
+                    .audio = .{
+                        .window_duration_ms = if (cfg.audio.window_duration_ms > 0) cfg.audio.window_duration_ms else 30_000,
+                        .overlap_duration_ms = cfg.audio.overlap_duration_ms,
+                    },
+                });
+            };
             defer inference_chunker.types.freeChunks(alloc, result);
             // JSON parsing allocates text/data in the receiving allocator. Mark
             // the wire copy as owning those allocations, then restore the
             // borrowed direct result before its local destructor runs.
-            const ownership = try alloc.alloc(struct { mime_type: bool, text: bool, data: bool }, result.len);
+            const ownership = try alloc.alloc(struct { mime_type: bool, text: bool, data: bool, metadata: bool }, result.len);
             defer alloc.free(ownership);
             for (result, ownership) |*chunk, *original| {
                 original.* = .{
                     .mime_type = chunk.owns_mime_type,
                     .text = chunk.owns_text,
                     .data = chunk.owns_data,
+                    .metadata = chunk.owns_metadata,
                 };
+                chunk.owns_metadata = chunk.metadata != null;
                 chunk.owns_mime_type = true;
                 chunk.owns_text = chunk.text != null;
                 chunk.owns_data = chunk.data != null;
             }
             defer for (result, ownership) |*chunk, original| {
+                chunk.owns_metadata = original.metadata;
                 chunk.owns_mime_type = original.mime_type;
                 chunk.owns_text = original.text;
                 chunk.owns_data = original.data;
@@ -3084,6 +3104,8 @@ fn localModelCapabilitiesInScope(
             inference_work.PromptPolicy,
             inference.server.resolvedTaskPromptPolicy(@tagName(task)),
         ).?,
+        .generation_grammar_v1 = task == .generate and inference.server.resolvedExecutorKind("generate", &manifest) == .native_generation,
+        .generation_token_logprobs_v1 = task == .generate and inference.server.resolvedExecutorKind("generate", &manifest) == .native_generation,
         .borrowed_attachments = task == .read or task == .generate or task == .embed or task == .extract,
         .borrowed_rasters = (task == .read and manifest.native_arch_hint == .florence) or
             (task == .embed and modalities.image),
@@ -3100,13 +3122,15 @@ fn localModelCapabilitiesInScope(
             try result.accepted_mime_types.add(mime_type);
         }
     }
-    if (task == .embed) {
+    if (task == .embed) result.model_aware_chunking_v1 = true;
+    if (task == .embed or task == .generate) {
         // Identity inspection reads the receipt/manifest, never model weights.
         // Prefer the immutable loaded generation if it already exists.
         if (node.model_manager.acquireLoadedModel(model_path)) |cached| {
             var loaded = cached;
             defer loaded.release();
             result.model_revision = loaded.get().resolution_revision;
+            if (result.model_revision == null and task == .generate) result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
         } else {
             result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
         }
@@ -3637,7 +3661,7 @@ pub fn linkedInferencePullModel(context: *const inference_bridge.PullModelContex
 }
 
 fn pullErrorMessage(err: anyerror) []const u8 {
-    if (inference.registry.pull_diagnostics.glinerMessage(err)) |message| return message;
+    if (inference.pull_diagnostics.glinerMessage(err)) |message| return message;
     return switch (err) {
         error.HubModelNotFound => "the model was not found on the hub",
         error.HubAccessDenied => "the hub denied access; the model may be private or gated, so set token or HF_TOKEN",

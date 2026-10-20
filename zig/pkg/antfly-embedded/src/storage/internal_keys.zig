@@ -24,6 +24,11 @@ pub const identity_namespace: u8 = 0x03;
 pub const replay_all_kind: u8 = 0xfe;
 
 pub const primary_kind: u8 = 0x10;
+const group_identity = @import("db/group_source_identity.zig");
+pub const group_source_primary_kind = group_identity.primary_kind;
+pub const group_source_reverse_kind = group_identity.reverse_kind;
+pub const group_source_outbox_kind = group_identity.outbox_kind;
+pub const group_source_metadata_kind = group_identity.metadata_kind;
 pub const ttl_kind: u8 = 0x11;
 pub const relational_row_kind: u8 = 0x12;
 /// One reverse ownership record per document/physical relational index.
@@ -76,7 +81,7 @@ pub const asset_reprocess_intent_kind: u8 = 0x52;
 pub const embedding_reprocess_intent_kind: u8 = 0x53;
 pub const graph_asset_state_kind: u8 = 0x34;
 pub const document_unit_record_kind: u8 = 0x35;
-pub const derived_coverage_kind: u8 = 0x36;
+pub const derived_coverage_kind: u8 = @backingInt(GlobalReplayKind.derived_coverage);
 pub const document_unit_navigation_summary_kind: u8 = 0x37;
 pub const document_unit_navigation_block_kind: u8 = 0x38;
 /// Private reverse ownership index for graph-edge precedence. Records are
@@ -95,12 +100,12 @@ pub const document_extraction_unit_spool_kind: u8 = 0x41;
 /// Store-local typed results produced by consumers of a shared PDF window.
 /// These attempts and their registry must stay outside document ranges: shard
 /// transfer must not copy temporary rows without their recovery metadata.
-pub const shared_pdf_consumer_kind: u8 = 0x42;
+pub const shared_pdf_consumer_kind: u8 = @backingInt(GlobalReplayKind.shared_pdf_consumer);
 /// Companion row of a resolution artifact recording the entity keys its
 /// canonical mentions last promoted (local id -> doc ref). The promoter
 /// diffs it on replay so a re-keyed mention tombstones the previously
 /// promoted document with a merged_into redirect instead of orphaning it.
-pub const promoted_keys_state_kind: u8 = 0x44;
+pub const promoted_keys_state_kind: u8 = @backingInt(GlobalReplayKind.promoted_keys_state);
 /// Ordered producer output-set inventory. Kept outside public artifact keys,
 /// but inside the owning document range for snapshot/retained transfer.
 pub const producer_stream_manifest_kind: u8 = 0x45;
@@ -118,9 +123,54 @@ pub const extraction_generation_clock_kind: u8 = 0x4e;
 pub const extraction_generation_name_kind: u8 = 0x4f;
 pub const extraction_generation_ordinal_kind: u8 = 0x50;
 pub const extraction_generation_directory_kind: u8 = 0x51;
+/// Allocate store-wide replay metadata families here. Document-owned record
+/// kinds are a separate namespace; reusing one globally requires an explicit
+/// reservation. Zig rejects duplicate enum values at compile time.
+pub const GlobalReplayKind = enum(u8) {
+    replay_init = 0x01,
+    next_sequence = 0x02,
+    latest_sequence = 0x03,
+    replication_applied = 0x04,
+    ordered_document_applied = 0x05,
+    artifact_presence = 0x20,
+    asset_source_index = 0x21,
+    child_range_outbox = 0x22,
+    artifact_repair_issue = 0x23,
+    artifact_repair_summary = 0x24,
+    artifact_repair_kind_issue = 0x25,
+    artifact_repair_kind_ready = 0x26,
+    artifact_repair_kind_progress = 0x27,
+    artifact_repair_summary_ready = 0x28,
+    artifact_repair_summary_progress = 0x29,
+    artifact_repair_summary_rebuild = 0x2a,
+    managed_admission = 0x2b,
+    artifact_cleanup = 0x2c,
+    range_document_count = 0x2d,
+    artifact_repair_completion = 0x2e,
+    resolution_handoff = 0x2f,
+    derived_coverage = 0x36,
+    terminal_failure_sequence = 0x3a,
+    terminal_failure_issue = 0x3b,
+    terminal_failure_generation = 0x3c,
+    terminal_failure_counter = 0x3d,
+    artifact_source_revision = 0x3e,
+    graph_contender = 0x3f,
+    table_storage = 0x40,
+    shared_pdf_consumer = 0x42,
+    shared_pdf_attempt = 0x43,
+    promoted_keys_state = 0x44,
+    graph_expiration = 0x54,
+};
+
+pub fn globalReplayPrefix(comptime kind: GlobalReplayKind) [3]u8 {
+    return .{ replay_namespace, 0xff, @backingInt(kind) };
+}
+
+pub const promoted_keys_state_prefix = globalReplayPrefix(.promoted_keys_state);
+
 /// Store-wide index of outstanding shared-PDF attempts. Recovery is independent
 /// of document existence and the current enrichment configuration.
-pub const shared_pdf_consumer_attempt_prefix = [_]u8{ replay_namespace, 0xff, 0x43 };
+pub const shared_pdf_consumer_attempt_prefix = globalReplayPrefix(.shared_pdf_attempt);
 pub const graph_edge_contender_count_kind: u8 = 0x00;
 pub const graph_edge_contender_record_kind: u8 = 0x01;
 pub const graph_edge_ttl_lifetime_kind: u8 = 0x02;
@@ -129,56 +179,59 @@ pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
 pub const derived_coverage_outcome_count_kind: u8 = 0xff;
 
 pub const replay_key_len: usize = 1 + 1 + @sizeOf(u64);
-pub const replay_meta_init_key = [_]u8{ replay_namespace, 0xff, 0x01 };
-pub const replay_meta_next_sequence_key = [_]u8{ replay_namespace, 0xff, 0x02 };
-pub const replay_meta_latest_sequence_kind: u8 = 0x03;
-pub const replication_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
+pub const replay_meta_init_key = globalReplayPrefix(.replay_init);
+pub const replay_meta_next_sequence_key = globalReplayPrefix(.next_sequence);
+pub const replay_meta_latest_sequence_kind: u8 = @backingInt(GlobalReplayKind.latest_sequence);
+pub const replication_applied_lsn_key = globalReplayPrefix(.replication_applied);
 /// Latest document-store mutation applied from the local data Raft log. The
 /// value stores term/index and is committed in the same primary batch as the
 /// document effects so restart replay cannot repeat non-idempotent transforms.
-pub const ordered_document_applied_entry_key = [_]u8{ replay_namespace, 0xff, 0x05 };
-pub const artifact_presence_key = [_]u8{ replay_namespace, 0xff, 0x20 };
-pub const asset_artifact_source_index_kind: u8 = 0x21;
-pub const document_child_range_outbox_kind: u8 = 0x22;
-pub const artifact_repair_issue_kind: u8 = 0x23;
-pub const artifact_repair_summary_kind: u8 = 0x24;
-pub const artifact_repair_kind_issue_kind: u8 = 0x25;
-pub const artifact_repair_kind_index_ready_kind: u8 = 0x26;
-pub const artifact_repair_kind_index_progress_kind: u8 = 0x27;
-pub const artifact_repair_summary_ready_kind: u8 = 0x28;
-pub const artifact_repair_summary_progress_kind: u8 = 0x29;
-pub const artifact_repair_summary_rebuild_kind: u8 = 0x2a;
-pub const managed_index_admission_kind: u8 = 0x2b;
-pub const index_artifact_cleanup_kind: u8 = 0x2c;
-pub const range_document_count_key = [_]u8{ replay_namespace, 0xff, 0x2d };
-pub const artifact_repair_completion_kind: u8 = 0x2e;
+pub const ordered_document_applied_entry_key = globalReplayPrefix(.ordered_document_applied);
+pub const artifact_presence_key = globalReplayPrefix(.artifact_presence);
+pub const asset_artifact_source_index_kind: u8 = @backingInt(GlobalReplayKind.asset_source_index);
+pub const document_child_range_outbox_kind: u8 = @backingInt(GlobalReplayKind.child_range_outbox);
+pub const artifact_repair_issue_kind: u8 = @backingInt(GlobalReplayKind.artifact_repair_issue);
+pub const artifact_repair_summary_kind: u8 = @backingInt(GlobalReplayKind.artifact_repair_summary);
+pub const artifact_repair_kind_issue_kind: u8 = @backingInt(GlobalReplayKind.artifact_repair_kind_issue);
+pub const artifact_repair_kind_index_ready_kind: u8 = @backingInt(GlobalReplayKind.artifact_repair_kind_ready);
+pub const artifact_repair_kind_index_progress_kind: u8 = @backingInt(GlobalReplayKind.artifact_repair_kind_progress);
+pub const artifact_repair_summary_ready_kind: u8 = @backingInt(GlobalReplayKind.artifact_repair_summary_ready);
+pub const artifact_repair_summary_progress_kind: u8 = @backingInt(GlobalReplayKind.artifact_repair_summary_progress);
+pub const artifact_repair_summary_rebuild_kind: u8 = @backingInt(GlobalReplayKind.artifact_repair_summary_rebuild);
+pub const managed_index_admission_kind: u8 = @backingInt(GlobalReplayKind.managed_admission);
+pub const index_artifact_cleanup_kind: u8 = @backingInt(GlobalReplayKind.artifact_cleanup);
+pub const range_document_count_key = globalReplayPrefix(.range_document_count);
+pub const artifact_repair_completion_kind: u8 = @backingInt(GlobalReplayKind.artifact_repair_completion);
 /// Private completion marker used to hand resolution artifacts from the
 /// resolver to the DB writer. Keep replay metadata kinds centralized here so
 /// independently-owned protocols cannot silently alias one another.
-pub const resolution_handoff_kind: u8 = 0x2f;
+pub const resolution_handoff_kind: u8 = @backingInt(GlobalReplayKind.resolution_handoff);
 /// Failure-only indexes that preserve every source sequence associated with a
 /// coalesced repair issue. The sequence index serves synchronous visibility
 /// checks; the issue index supports bounded per-artifact retirement pages.
-pub const enrichment_terminal_failure_sequence_kind: u8 = 0x3a;
-pub const enrichment_terminal_failure_issue_kind: u8 = 0x3b;
+pub const enrichment_terminal_failure_sequence_kind: u8 = @backingInt(GlobalReplayKind.terminal_failure_sequence);
+pub const enrichment_terminal_failure_issue_kind: u8 = @backingInt(GlobalReplayKind.terminal_failure_issue);
 /// Durable incarnation token for one live coalesced terminal enrichment issue.
-pub const enrichment_terminal_failure_generation_kind: u8 = 0x3c;
-pub const enrichment_terminal_failure_generation_counter_kind: u8 = 0x3d;
+pub const enrichment_terminal_failure_generation_kind: u8 = @backingInt(GlobalReplayKind.terminal_failure_generation);
+pub const enrichment_terminal_failure_generation_counter_kind: u8 = @backingInt(GlobalReplayKind.terminal_failure_counter);
 /// Latest committed derived-log revision that changed an artifact stream.
 /// The artifact name is length-prefixed so arbitrary user names cannot alias
 /// another replay metadata protocol or one another.
-pub const artifact_source_revision_kind: u8 = 0x3e;
+pub const artifact_source_revision_kind: u8 = @backingInt(GlobalReplayKind.artifact_source_revision);
 /// Generation-fenced graph contenders keyed by logical edge rather than by the
 /// artifact state that produced them. The record lives under the edge source's
 /// document prefix so range splits preserve graph ownership. Records are
 /// ordered by source priority and state identity so winner fallback can stop at
 /// the first surviving record.
-pub const graph_global_edge_contender_kind: u8 = 0x3f;
+pub const graph_global_edge_contender_kind: u8 = @backingInt(GlobalReplayKind.graph_contender);
 /// Deadline-first accelerator for graph contribution expiration. The source
 /// contender and lifetime remain document-owned; cleanup validates them under
 /// the primary writer before acting on an index entry.
-pub const graph_edge_expiration_index_prefix = [_]u8{ replay_namespace, 0xff, 0x44 };
-pub const table_storage_settings_key = [_]u8{ replay_namespace, 0xff, 0x40 };
+pub const graph_edge_expiration_index_prefix = globalReplayPrefix(.graph_expiration);
+/// Read-only compatibility namespace. Old expiry entries shared this family
+/// with promotion state; bounded migration preserves those companion rows.
+pub const legacy_graph_edge_expiration_index_prefix = promoted_keys_state_prefix;
+pub const table_storage_settings_key = globalReplayPrefix(.table_storage);
 pub const enrichment_terminal_failure_generation_counter_key = [_]u8{
     replay_namespace,
     0xff,
@@ -385,7 +438,7 @@ pub fn documentKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     var key = try alloc.alloc(u8, 1 + encodedComponentLen(doc_key) + 1);
     key[0] = user_namespace;
     const pos = 1 + encodeComponent(key[1..], doc_key);
-    key[pos] = primary_kind;
+    key[pos] = if (group_identity.isAnchor(doc_key)) group_source_primary_kind else primary_kind;
     return key;
 }
 
@@ -1692,6 +1745,23 @@ pub fn isRelationalRowKey(key: []const u8) bool {
 
 pub fn isStoredDocumentRowKey(key: []const u8) bool {
     return isPrimaryDocumentKey(key) or isRelationalRowKey(key);
+}
+
+/// Private unit sources participate in artifact authority and range ownership,
+/// while public row scans, identity counters and match_all keep using the
+/// primary/relational-only predicate above.
+pub fn isGroupSourceRowKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    return term + 3 == key.len and key[term + 2] == group_source_primary_kind;
+}
+pub fn isStoredSourceRowKey(key: []const u8) bool {
+    return isStoredDocumentRowKey(key) or isGroupSourceRowKey(key);
+}
+pub fn decodeStoredSourceRowKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isStoredSourceRowKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    return try decodeBodyAlloc(alloc, key[1..term]);
 }
 
 pub fn isRelationalIndexReverseKey(key: []const u8) bool {

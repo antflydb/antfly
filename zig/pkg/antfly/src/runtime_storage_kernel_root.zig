@@ -191,6 +191,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerRelationalReadProvider, "antfly_storage_owner_relational_read_provider");
     exportInternal(&storage_kernel_exports.storageOwnerScanNdjson, "antfly_storage_owner_scan_ndjson");
     exportInternal(&storage_kernel_exports.storageOwnerGraphMetricMaintenanceJson, "antfly_storage_owner_graph_metric_maintenance_json");
+    exportInternal(&storage_kernel_exports.storageOwnerResolverOperationJson, "antfly_storage_owner_resolver_operation_json");
     exportInternal(&storage_kernel_exports.storageOwnerPreflightJson, "antfly_storage_owner_preflight_json");
     exportInternal(&storage_kernel_exports.storageOwnerTextStatsJson, "antfly_storage_owner_text_stats_json");
     exportInternal(&storage_kernel_exports.storageOwnerAlgebraicPartialsJson, "antfly_storage_owner_algebraic_partials_json");

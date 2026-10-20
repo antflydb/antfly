@@ -770,8 +770,109 @@ pub const Detail = enum(c_int) {
     read_snapshot_fork_unsupported,
     file_busy,
     would_block,
-    inference_worker_executable_not_configured,
-    inference_worker_unavailable,
+    // Keep released main identities; append branch-only details below them.
+    inference_worker_executable_not_configured = 674,
+    inference_worker_unavailable = 675,
+    model_chunk_audio_too_large,
+    model_chunk_chunk_output_too_large,
+    model_chunk_chunk_request_failed,
+    model_chunk_chunk_unit_too_large,
+    model_chunk_embedding_identity_mismatch,
+    model_chunk_empty_embedding_input,
+    model_chunk_empty_response,
+    model_chunk_empty_source,
+    model_chunk_empty_video,
+    model_chunk_immutable_version_required,
+    model_chunk_incompatible_chunk_embedding_target,
+    model_chunk_incomplete_chunk_coverage,
+    model_chunk_incomplete_video_picture,
+    model_chunk_inference_admission_queue_full,
+    model_chunk_inference_capabilities_stale,
+    model_chunk_invalid_audio_window,
+    model_chunk_invalid_chunk_continuation,
+    model_chunk_invalid_chunk_coordinates,
+    model_chunk_invalid_chunk_geometry,
+    model_chunk_invalid_chunk_model,
+    model_chunk_invalid_chunk_policy,
+    model_chunk_invalid_chunk_provider,
+    model_chunk_invalid_chunk_replay,
+    model_chunk_invalid_chunk_source,
+    model_chunk_invalid_chunker_config,
+    model_chunk_invalid_chunker_response,
+    model_chunk_invalid_embedding_output,
+    model_chunk_invalid_input_shape,
+    model_chunk_invalid_sampling_policy,
+    model_chunk_invalid_source_reference,
+    model_chunk_invalid_utf8,
+    model_chunk_memory_budget_exceeded,
+    model_chunk_missing_attachment_envelope,
+    model_chunk_missing_chunk_stream_context,
+    model_chunk_model_aware_chunk_provider_required,
+    model_chunk_shared_admission_exceeded,
+    model_chunk_source_version_changed,
+    model_chunk_stale_chunk_continuation,
+    model_chunk_stream_too_long,
+    model_chunk_timestamp_overflow,
+    model_chunk_unknown_video_duration,
+    model_chunk_unresolved_chunk_source,
+    model_chunk_unsupported_audio_format,
+    model_chunk_unsupported_chunk_media_type,
+    model_chunk_working_budget,
+    model_chunk_dependency_budget,
+    model_chunk_coded_window_budget,
+    model_chunk_event_budget,
+    model_chunk_remote_bytes_budget,
+    model_chunk_remote_requests_budget,
+    model_chunk_invalid_limits,
+    model_chunk_streaming_profile,
+    model_chunk_incomplete_audio_stream,
+    decision_limit_exceeded,
+    grouped_source_owner_changed,
+    grouped_source_topology_unavailable,
+    apple_intelligence_provider_unavailable,
+    artifact_publication_pending,
+    chatgpt_billing_fallback_forbidden,
+    chatgpt_disabled,
+    chatgpt_interactive_only,
+    constrained_input_too_large,
+    decide_request_limit_exceeded,
+    enrichment_source_changed,
+    generated_extraction_limit_exceeded,
+    grouped_prior_context_limit_exceeded,
+    grouped_source_baseline_pending,
+    grouped_source_busy,
+    grouped_source_corrupt,
+    grouped_source_earlier_work_pending,
+    grouped_source_identity_conflict,
+    grouped_source_limit_exceeded,
+    grouped_source_member_limit_exceeded,
+    grouped_source_member_too_large,
+    grouped_source_partition_too_large,
+    grouped_source_retirement_pending,
+    invalid_constrained_generation_config,
+    invalid_constrained_output,
+    invalid_constrained_probabilities,
+    invalid_constrained_schema,
+    invalid_decide_request,
+    invalid_decision_output,
+    invalid_generated_extractor_config,
+    invalid_generator_config,
+    invalid_generator_tool_config,
+    invalid_grouped_prior_context,
+    invalid_grouped_source_command,
+    invalid_grouped_source_config,
+    invalid_grouped_source_member,
+    invalid_grouped_source_mutation,
+    invalid_grouped_source_query,
+    invalid_grouped_source_transfer,
+    invalid_structured_output,
+    missing_generator_credentials,
+    unsupported_apple_generation_options,
+    unsupported_constrained_output,
+    unsupported_constrained_probabilities,
+    unsupported_constrained_schema,
+    unsupported_generated_extraction_schema,
+    resolver_curation_conflict,
 };
 
 pub const Status = extern struct {
@@ -789,6 +890,106 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.ResolverCurationConflict => status(.conflict, .resolver_curation_conflict),
+        error.GroupedSourceOwnerChanged => status(.conflict, .grouped_source_owner_changed),
+        error.GroupedSourceTopologyUnavailable => status(.unavailable, .grouped_source_topology_unavailable),
+        error.AppleIntelligenceProviderUnavailable => status(.unavailable, .apple_intelligence_provider_unavailable),
+        error.ArtifactPublicationPending => status(.retryable, .artifact_publication_pending),
+        error.ChatGPTBillingFallbackForbidden => status(.forbidden, .chatgpt_billing_fallback_forbidden),
+        error.ChatGPTDisabled => status(.invalid_argument, .chatgpt_disabled),
+        error.ChatGPTInteractiveOnly => status(.invalid_argument, .chatgpt_interactive_only),
+        error.ConstrainedInputTooLarge => status(.invalid_argument, .constrained_input_too_large),
+        error.DecideRequestLimitExceeded => status(.invalid_argument, .decide_request_limit_exceeded),
+        error.EnrichmentSourceChanged => status(.conflict, .enrichment_source_changed),
+        error.GeneratedExtractionLimitExceeded => status(.invalid_argument, .generated_extraction_limit_exceeded),
+        error.GroupedPriorContextLimitExceeded => status(.invalid_argument, .grouped_prior_context_limit_exceeded),
+        error.GroupedSourceBaselinePending => status(.retryable, .grouped_source_baseline_pending),
+        error.GroupedSourceBusy => status(.retryable, .grouped_source_busy),
+        error.GroupedSourceCorrupt => status(.corrupt, .grouped_source_corrupt),
+        error.GroupedSourceEarlierWorkPending => status(.retryable, .grouped_source_earlier_work_pending),
+        error.GroupedSourceIdentityConflict => status(.conflict, .grouped_source_identity_conflict),
+        error.GroupedSourceLimitExceeded => status(.invalid_argument, .grouped_source_limit_exceeded),
+        error.GroupedSourceMemberLimitExceeded => status(.invalid_argument, .grouped_source_member_limit_exceeded),
+        error.GroupedSourceMemberTooLarge => status(.invalid_argument, .grouped_source_member_too_large),
+        error.GroupedSourcePartitionTooLarge => status(.invalid_argument, .grouped_source_partition_too_large),
+        error.GroupedSourceRetirementPending => status(.retryable, .grouped_source_retirement_pending),
+        error.InvalidConstrainedGenerationConfig => status(.invalid_argument, .invalid_constrained_generation_config),
+        error.InvalidConstrainedOutput => status(.invalid_argument, .invalid_constrained_output),
+        error.InvalidConstrainedProbabilities => status(.invalid_argument, .invalid_constrained_probabilities),
+        error.InvalidConstrainedSchema => status(.invalid_argument, .invalid_constrained_schema),
+        error.InvalidDecideRequest => status(.invalid_argument, .invalid_decide_request),
+        error.InvalidDecisionOutput => status(.invalid_argument, .invalid_decision_output),
+        error.InvalidGeneratedExtractorConfig => status(.invalid_argument, .invalid_generated_extractor_config),
+        error.InvalidGeneratorConfig => status(.invalid_argument, .invalid_generator_config),
+        error.InvalidGeneratorToolConfig => status(.invalid_argument, .invalid_generator_tool_config),
+        error.InvalidGroupedPriorContext => status(.invalid_argument, .invalid_grouped_prior_context),
+        error.InvalidGroupedSourceCommand => status(.invalid_argument, .invalid_grouped_source_command),
+        error.InvalidGroupedSourceConfig => status(.invalid_argument, .invalid_grouped_source_config),
+        error.InvalidGroupedSourceMember => status(.invalid_argument, .invalid_grouped_source_member),
+        error.InvalidGroupedSourceMutation => status(.invalid_argument, .invalid_grouped_source_mutation),
+        error.InvalidGroupedSourceQuery => status(.invalid_argument, .invalid_grouped_source_query),
+        error.InvalidGroupedSourceTransfer => status(.invalid_argument, .invalid_grouped_source_transfer),
+        error.InvalidStructuredOutput => status(.invalid_argument, .invalid_structured_output),
+        error.MissingGeneratorCredentials => status(.invalid_argument, .missing_generator_credentials),
+        error.UnsupportedAppleGenerationOptions => status(.unsupported, .unsupported_apple_generation_options),
+        error.UnsupportedConstrainedOutput => status(.unsupported, .unsupported_constrained_output),
+        error.UnsupportedConstrainedProbabilities => status(.unsupported, .unsupported_constrained_probabilities),
+        error.UnsupportedConstrainedSchema => status(.unsupported, .unsupported_constrained_schema),
+        error.UnsupportedGeneratedExtractionSchema => status(.unsupported, .unsupported_generated_extraction_schema),
+        error.ChunkWorkingBudgetExceeded => status(.invalid_argument, .model_chunk_working_budget),
+        error.ChunkDependencyBudgetExceeded => status(.invalid_argument, .model_chunk_dependency_budget),
+        error.ChunkCodedWindowBudgetExceeded => status(.invalid_argument, .model_chunk_coded_window_budget),
+        error.ChunkEventBudgetExceeded => status(.invalid_argument, .model_chunk_event_budget),
+        error.RemoteReadBudgetExceeded => status(.invalid_argument, .model_chunk_remote_bytes_budget),
+        error.RemoteRequestBudgetExceeded => status(.invalid_argument, .model_chunk_remote_requests_budget),
+        error.InvalidChunkLimits => status(.invalid_argument, .model_chunk_invalid_limits),
+        error.UnsupportedStreamingAudioProfile => status(.unsupported, .model_chunk_streaming_profile),
+        error.IncompleteAudioStream => status(.unavailable, .model_chunk_incomplete_audio_stream),
+
+        error.AudioTooLarge => status(.invalid_argument, .model_chunk_audio_too_large),
+        error.ChunkOutputTooLarge => status(.invalid_argument, .model_chunk_chunk_output_too_large),
+        error.ChunkRequestFailed => status(.unavailable, .model_chunk_chunk_request_failed),
+        error.ChunkUnitTooLarge => status(.invalid_argument, .model_chunk_chunk_unit_too_large),
+        error.EmbeddingIdentityMismatch => status(.conflict, .model_chunk_embedding_identity_mismatch),
+        error.EmptyEmbeddingInput => status(.invalid_argument, .model_chunk_empty_embedding_input),
+        error.EmptyResponse => status(.unavailable, .model_chunk_empty_response),
+        error.EmptySource => status(.invalid_argument, .model_chunk_empty_source),
+        error.EmptyVideo => status(.invalid_argument, .model_chunk_empty_video),
+        error.ImmutableVersionRequired => status(.invalid_argument, .model_chunk_immutable_version_required),
+        error.IncompatibleChunkEmbeddingTarget => status(.invalid_argument, .model_chunk_incompatible_chunk_embedding_target),
+        error.IncompleteChunkCoverage => status(.invalid_argument, .model_chunk_incomplete_chunk_coverage),
+        error.IncompleteVideoPicture => status(.corrupt, .model_chunk_incomplete_video_picture),
+        error.InferenceAdmissionQueueFull => status(.retryable, .model_chunk_inference_admission_queue_full),
+        error.InferenceCapabilitiesStale => status(.conflict, .model_chunk_inference_capabilities_stale),
+        error.InvalidAudioWindow => status(.invalid_argument, .model_chunk_invalid_audio_window),
+        error.InvalidChunkContinuation => status(.invalid_argument, .model_chunk_invalid_chunk_continuation),
+        error.InvalidChunkCoordinates => status(.invalid_argument, .model_chunk_invalid_chunk_coordinates),
+        error.InvalidChunkGeometry => status(.invalid_argument, .model_chunk_invalid_chunk_geometry),
+        error.InvalidChunkModel => status(.invalid_argument, .model_chunk_invalid_chunk_model),
+        error.InvalidChunkPolicy => status(.invalid_argument, .model_chunk_invalid_chunk_policy),
+        error.InvalidChunkProvider => status(.invalid_argument, .model_chunk_invalid_chunk_provider),
+        error.InvalidChunkReplay => status(.conflict, .model_chunk_invalid_chunk_replay),
+        error.InvalidChunkSource => status(.invalid_argument, .model_chunk_invalid_chunk_source),
+        error.InvalidChunkerConfig => status(.invalid_argument, .model_chunk_invalid_chunker_config),
+        error.InvalidChunkerResponse => status(.invalid_argument, .model_chunk_invalid_chunker_response),
+        error.InvalidEmbeddingOutput => status(.internal, .model_chunk_invalid_embedding_output),
+        error.InvalidInputShape => status(.invalid_argument, .model_chunk_invalid_input_shape),
+        error.InvalidSamplingPolicy => status(.invalid_argument, .model_chunk_invalid_sampling_policy),
+        error.InvalidSourceReference => status(.invalid_argument, .model_chunk_invalid_source_reference),
+        error.InvalidUtf8 => status(.invalid_argument, .model_chunk_invalid_utf8),
+        error.MemoryBudgetExceeded => status(.retryable, .model_chunk_memory_budget_exceeded),
+        error.MissingAttachmentEnvelope => status(.invalid_argument, .model_chunk_missing_attachment_envelope),
+        error.MissingChunkStreamContext => status(.internal, .model_chunk_missing_chunk_stream_context),
+        error.ModelAwareChunkProviderRequired => status(.invalid_argument, .model_chunk_model_aware_chunk_provider_required),
+        error.SharedAdmissionExceeded => status(.retryable, .model_chunk_shared_admission_exceeded),
+        error.SourceVersionChanged => status(.conflict, .model_chunk_source_version_changed),
+        error.StaleChunkContinuation => status(.conflict, .model_chunk_stale_chunk_continuation),
+        error.StreamTooLong => status(.unavailable, .model_chunk_stream_too_long),
+        error.TimestampOverflow => status(.invalid_argument, .model_chunk_timestamp_overflow),
+        error.UnknownVideoDuration => status(.invalid_argument, .model_chunk_unknown_video_duration),
+        error.UnresolvedChunkSource => status(.invalid_argument, .model_chunk_unresolved_chunk_source),
+        error.UnsupportedAudioFormat => status(.unsupported, .model_chunk_unsupported_audio_format),
+        error.UnsupportedChunkMediaType => status(.unsupported, .model_chunk_unsupported_chunk_media_type),
         error.ExternalLakeReadOnly => status(.forbidden, .external_lake_read_only),
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
@@ -1204,6 +1405,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
         error.NameServerFailure => status(.unavailable, .name_server_failure),
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
+        error.DecisionLimitExceeded => status(.invalid_argument, .decision_limit_exceeded),
         error.GraphWorkBudgetExceeded => status(.invalid_argument, .graph_work_budget_exceeded),
         error.GraphMinWeightDomainViolation => status(.invalid_argument, .graph_min_weight_domain_violation),
         error.GraphMaxWeightDomainViolation => status(.invalid_argument, .graph_max_weight_domain_violation),
@@ -1522,6 +1724,106 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .resolver_curation_conflict => "ResolverCurationConflict",
+        .grouped_source_owner_changed => "GroupedSourceOwnerChanged",
+        .grouped_source_topology_unavailable => "GroupedSourceTopologyUnavailable",
+        .apple_intelligence_provider_unavailable => "AppleIntelligenceProviderUnavailable",
+        .artifact_publication_pending => "ArtifactPublicationPending",
+        .chatgpt_billing_fallback_forbidden => "ChatGPTBillingFallbackForbidden",
+        .chatgpt_disabled => "ChatGPTDisabled",
+        .chatgpt_interactive_only => "ChatGPTInteractiveOnly",
+        .constrained_input_too_large => "ConstrainedInputTooLarge",
+        .decide_request_limit_exceeded => "DecideRequestLimitExceeded",
+        .enrichment_source_changed => "EnrichmentSourceChanged",
+        .generated_extraction_limit_exceeded => "GeneratedExtractionLimitExceeded",
+        .grouped_prior_context_limit_exceeded => "GroupedPriorContextLimitExceeded",
+        .grouped_source_baseline_pending => "GroupedSourceBaselinePending",
+        .grouped_source_busy => "GroupedSourceBusy",
+        .grouped_source_corrupt => "GroupedSourceCorrupt",
+        .grouped_source_earlier_work_pending => "GroupedSourceEarlierWorkPending",
+        .grouped_source_identity_conflict => "GroupedSourceIdentityConflict",
+        .grouped_source_limit_exceeded => "GroupedSourceLimitExceeded",
+        .grouped_source_member_limit_exceeded => "GroupedSourceMemberLimitExceeded",
+        .grouped_source_member_too_large => "GroupedSourceMemberTooLarge",
+        .grouped_source_partition_too_large => "GroupedSourcePartitionTooLarge",
+        .grouped_source_retirement_pending => "GroupedSourceRetirementPending",
+        .invalid_constrained_generation_config => "InvalidConstrainedGenerationConfig",
+        .invalid_constrained_output => "InvalidConstrainedOutput",
+        .invalid_constrained_probabilities => "InvalidConstrainedProbabilities",
+        .invalid_constrained_schema => "InvalidConstrainedSchema",
+        .invalid_decide_request => "InvalidDecideRequest",
+        .invalid_decision_output => "InvalidDecisionOutput",
+        .invalid_generated_extractor_config => "InvalidGeneratedExtractorConfig",
+        .invalid_generator_config => "InvalidGeneratorConfig",
+        .invalid_generator_tool_config => "InvalidGeneratorToolConfig",
+        .invalid_grouped_prior_context => "InvalidGroupedPriorContext",
+        .invalid_grouped_source_command => "InvalidGroupedSourceCommand",
+        .invalid_grouped_source_config => "InvalidGroupedSourceConfig",
+        .invalid_grouped_source_member => "InvalidGroupedSourceMember",
+        .invalid_grouped_source_mutation => "InvalidGroupedSourceMutation",
+        .invalid_grouped_source_query => "InvalidGroupedSourceQuery",
+        .invalid_grouped_source_transfer => "InvalidGroupedSourceTransfer",
+        .invalid_structured_output => "InvalidStructuredOutput",
+        .missing_generator_credentials => "MissingGeneratorCredentials",
+        .unsupported_apple_generation_options => "UnsupportedAppleGenerationOptions",
+        .unsupported_constrained_output => "UnsupportedConstrainedOutput",
+        .unsupported_constrained_probabilities => "UnsupportedConstrainedProbabilities",
+        .unsupported_constrained_schema => "UnsupportedConstrainedSchema",
+        .unsupported_generated_extraction_schema => "UnsupportedGeneratedExtractionSchema",
+        .model_chunk_audio_too_large => "AudioTooLarge",
+        .model_chunk_chunk_output_too_large => "ChunkOutputTooLarge",
+        .model_chunk_chunk_request_failed => "ChunkRequestFailed",
+        .model_chunk_chunk_unit_too_large => "ChunkUnitTooLarge",
+        .model_chunk_embedding_identity_mismatch => "EmbeddingIdentityMismatch",
+        .model_chunk_empty_embedding_input => "EmptyEmbeddingInput",
+        .model_chunk_empty_response => "EmptyResponse",
+        .model_chunk_empty_source => "EmptySource",
+        .model_chunk_empty_video => "EmptyVideo",
+        .model_chunk_immutable_version_required => "ImmutableVersionRequired",
+        .model_chunk_incompatible_chunk_embedding_target => "IncompatibleChunkEmbeddingTarget",
+        .model_chunk_incomplete_chunk_coverage => "IncompleteChunkCoverage",
+        .model_chunk_incomplete_video_picture => "IncompleteVideoPicture",
+        .model_chunk_inference_admission_queue_full => "InferenceAdmissionQueueFull",
+        .model_chunk_inference_capabilities_stale => "InferenceCapabilitiesStale",
+        .model_chunk_invalid_audio_window => "InvalidAudioWindow",
+        .model_chunk_invalid_chunk_continuation => "InvalidChunkContinuation",
+        .model_chunk_invalid_chunk_coordinates => "InvalidChunkCoordinates",
+        .model_chunk_invalid_chunk_geometry => "InvalidChunkGeometry",
+        .model_chunk_invalid_chunk_model => "InvalidChunkModel",
+        .model_chunk_invalid_chunk_policy => "InvalidChunkPolicy",
+        .model_chunk_invalid_chunk_provider => "InvalidChunkProvider",
+        .model_chunk_invalid_chunk_replay => "InvalidChunkReplay",
+        .model_chunk_invalid_chunk_source => "InvalidChunkSource",
+        .model_chunk_invalid_chunker_config => "InvalidChunkerConfig",
+        .model_chunk_invalid_chunker_response => "InvalidChunkerResponse",
+        .model_chunk_invalid_embedding_output => "InvalidEmbeddingOutput",
+        .model_chunk_invalid_input_shape => "InvalidInputShape",
+        .model_chunk_invalid_sampling_policy => "InvalidSamplingPolicy",
+        .model_chunk_invalid_source_reference => "InvalidSourceReference",
+        .model_chunk_invalid_utf8 => "InvalidUtf8",
+        .model_chunk_memory_budget_exceeded => "MemoryBudgetExceeded",
+        .model_chunk_missing_attachment_envelope => "MissingAttachmentEnvelope",
+        .model_chunk_missing_chunk_stream_context => "MissingChunkStreamContext",
+        .model_chunk_model_aware_chunk_provider_required => "ModelAwareChunkProviderRequired",
+        .model_chunk_shared_admission_exceeded => "SharedAdmissionExceeded",
+        .model_chunk_source_version_changed => "SourceVersionChanged",
+        .model_chunk_stale_chunk_continuation => "StaleChunkContinuation",
+        .model_chunk_stream_too_long => "StreamTooLong",
+        .model_chunk_timestamp_overflow => "TimestampOverflow",
+        .model_chunk_unknown_video_duration => "UnknownVideoDuration",
+        .model_chunk_unresolved_chunk_source => "UnresolvedChunkSource",
+        .model_chunk_unsupported_audio_format => "UnsupportedAudioFormat",
+        .model_chunk_unsupported_chunk_media_type => "UnsupportedChunkMediaType",
+        .model_chunk_working_budget => "ChunkWorkingBudgetExceeded",
+        .model_chunk_dependency_budget => "ChunkDependencyBudgetExceeded",
+        .model_chunk_coded_window_budget => "ChunkCodedWindowBudgetExceeded",
+        .model_chunk_event_budget => "ChunkEventBudgetExceeded",
+        .model_chunk_remote_bytes_budget => "RemoteReadBudgetExceeded",
+        .model_chunk_remote_requests_budget => "RemoteRequestBudgetExceeded",
+        .model_chunk_invalid_limits => "InvalidChunkLimits",
+        .model_chunk_streaming_profile => "UnsupportedStreamingAudioProfile",
+        .model_chunk_incomplete_audio_stream => "IncompleteAudioStream",
+
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
         .crc_mismatch => "CrcMismatch",
@@ -1971,6 +2273,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .temporary_name_server_failure => "TemporaryNameServerFailure",
         .name_server_failure => "NameServerFailure",
         .query_candidate_budget_exceeded => "QueryCandidateBudgetExceeded",
+        .decision_limit_exceeded => "DecisionLimitExceeded",
         .query_embedding_input_too_large => "QueryEmbeddingInputTooLarge",
         .query_embedding_overloaded => "QueryEmbeddingOverloaded",
         .embed_rate_limited => "EmbedRateLimited",
@@ -2492,6 +2795,13 @@ test "external lake and spill errors retain exact identity across runtime archiv
     }
 }
 
+test "external lake evaluation limits retain their exact boundary identity" {
+    const value = statusFromError(error.DecisionLimitExceeded);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), value.code);
+    try std.testing.expect(errorHasStableDetail(error.DecisionLimitExceeded));
+    try std.testing.expectEqual(error.DecisionLimitExceeded, errorFromStatus(value));
+}
+
 test "inference command and lifecycle errors retain their identities across engine calls" {
     inline for (.{ error.WarmInferenceServerUnavailable, error.UnsupportedServerGenerateOption, error.MissingInferenceListener, error.RuntimeFailed, error.RuntimeStopping, error.RuntimeAlreadyReady }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
@@ -2506,6 +2816,23 @@ test "storage callback boundaries retain capability integrity and bounded-read o
     }
 }
 
+test "model-aware chunk failures preserve retry and source fencing semantics" {
+    const Case = struct { err: anyerror, code: Code };
+    for ([_]Case{
+        .{ .err = error.StaleChunkContinuation, .code = .conflict },
+        .{ .err = error.SourceVersionChanged, .code = .conflict },
+        .{ .err = error.EmbeddingIdentityMismatch, .code = .conflict },
+        .{ .err = error.IncompleteChunkCoverage, .code = .invalid_argument },
+        .{ .err = error.ChunkOutputTooLarge, .code = .invalid_argument },
+        .{ .err = error.MemoryBudgetExceeded, .code = .retryable },
+        .{ .err = error.UnsupportedChunkMediaType, .code = .unsupported },
+    }) |case| {
+        const wire = statusFromError(case.err);
+        try std.testing.expectEqual(@backingInt(case.code), wire.code);
+        try std.testing.expectEqual(case.err, errorFromStatus(wire));
+    }
+}
+
 test "inference worker setup and transport failures retain distinct boundary semantics" {
     const missing = statusFromError(error.InferenceWorkerExecutableNotConfigured);
     const unavailable = statusFromError(error.InferenceWorkerUnavailable);
@@ -2516,4 +2843,110 @@ test "inference worker setup and transport failures retain distinct boundary sem
     for ([_]anyerror{ error.InferenceWorkerExecutableNotConfigured, error.InferenceWorkerUnavailable }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromErrorWithFallback(err, error.InferenceProviderFailure)));
     }
+}
+
+test "grouped and constrained producer failures preserve callback identity and behavior" {
+    try std.testing.expectEqual(error.GroupedSourceOwnerChanged, errorFromStatus(statusFromError(error.GroupedSourceOwnerChanged)));
+    try std.testing.expectEqual(@backingInt(Code.conflict), statusFromError(error.GroupedSourceOwnerChanged).code);
+    try std.testing.expectEqual(error.GroupedSourceTopologyUnavailable, errorFromStatus(statusFromError(error.GroupedSourceTopologyUnavailable)));
+    try std.testing.expectEqual(@backingInt(Code.unavailable), statusFromError(error.GroupedSourceTopologyUnavailable).code);
+    try std.testing.expectEqual(error.AppleIntelligenceProviderUnavailable, errorFromStatus(statusFromError(error.AppleIntelligenceProviderUnavailable)));
+    try std.testing.expectEqual(@backingInt(Code.unavailable), statusFromError(error.AppleIntelligenceProviderUnavailable).code);
+    try std.testing.expectEqual(error.ArtifactPublicationPending, errorFromStatus(statusFromError(error.ArtifactPublicationPending)));
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.ArtifactPublicationPending).code);
+    try std.testing.expectEqual(error.ChatGPTBillingFallbackForbidden, errorFromStatus(statusFromError(error.ChatGPTBillingFallbackForbidden)));
+    try std.testing.expectEqual(@backingInt(Code.forbidden), statusFromError(error.ChatGPTBillingFallbackForbidden).code);
+    try std.testing.expectEqual(error.ChatGPTDisabled, errorFromStatus(statusFromError(error.ChatGPTDisabled)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.ChatGPTDisabled).code);
+    try std.testing.expectEqual(error.ChatGPTInteractiveOnly, errorFromStatus(statusFromError(error.ChatGPTInteractiveOnly)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.ChatGPTInteractiveOnly).code);
+    try std.testing.expectEqual(error.ConstrainedInputTooLarge, errorFromStatus(statusFromError(error.ConstrainedInputTooLarge)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.ConstrainedInputTooLarge).code);
+    try std.testing.expectEqual(error.DecideRequestLimitExceeded, errorFromStatus(statusFromError(error.DecideRequestLimitExceeded)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.DecideRequestLimitExceeded).code);
+    try std.testing.expectEqual(error.EnrichmentSourceChanged, errorFromStatus(statusFromError(error.EnrichmentSourceChanged)));
+    try std.testing.expectEqual(@backingInt(Code.conflict), statusFromError(error.EnrichmentSourceChanged).code);
+    try std.testing.expectEqual(error.GeneratedExtractionLimitExceeded, errorFromStatus(statusFromError(error.GeneratedExtractionLimitExceeded)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.GeneratedExtractionLimitExceeded).code);
+    try std.testing.expectEqual(error.GroupedPriorContextLimitExceeded, errorFromStatus(statusFromError(error.GroupedPriorContextLimitExceeded)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.GroupedPriorContextLimitExceeded).code);
+    try std.testing.expectEqual(error.GroupedSourceBaselinePending, errorFromStatus(statusFromError(error.GroupedSourceBaselinePending)));
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.GroupedSourceBaselinePending).code);
+    try std.testing.expectEqual(error.GroupedSourceBusy, errorFromStatus(statusFromError(error.GroupedSourceBusy)));
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.GroupedSourceBusy).code);
+    try std.testing.expectEqual(error.GroupedSourceCorrupt, errorFromStatus(statusFromError(error.GroupedSourceCorrupt)));
+    try std.testing.expectEqual(@backingInt(Code.corrupt), statusFromError(error.GroupedSourceCorrupt).code);
+    try std.testing.expectEqual(error.GroupedSourceEarlierWorkPending, errorFromStatus(statusFromError(error.GroupedSourceEarlierWorkPending)));
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.GroupedSourceEarlierWorkPending).code);
+    try std.testing.expectEqual(error.GroupedSourceIdentityConflict, errorFromStatus(statusFromError(error.GroupedSourceIdentityConflict)));
+    try std.testing.expectEqual(@backingInt(Code.conflict), statusFromError(error.GroupedSourceIdentityConflict).code);
+    try std.testing.expectEqual(error.GroupedSourceLimitExceeded, errorFromStatus(statusFromError(error.GroupedSourceLimitExceeded)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.GroupedSourceLimitExceeded).code);
+    try std.testing.expectEqual(error.GroupedSourceMemberLimitExceeded, errorFromStatus(statusFromError(error.GroupedSourceMemberLimitExceeded)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.GroupedSourceMemberLimitExceeded).code);
+    try std.testing.expectEqual(error.GroupedSourceMemberTooLarge, errorFromStatus(statusFromError(error.GroupedSourceMemberTooLarge)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.GroupedSourceMemberTooLarge).code);
+    try std.testing.expectEqual(error.GroupedSourcePartitionTooLarge, errorFromStatus(statusFromError(error.GroupedSourcePartitionTooLarge)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.GroupedSourcePartitionTooLarge).code);
+    try std.testing.expectEqual(error.GroupedSourceRetirementPending, errorFromStatus(statusFromError(error.GroupedSourceRetirementPending)));
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.GroupedSourceRetirementPending).code);
+    try std.testing.expectEqual(error.InvalidConstrainedGenerationConfig, errorFromStatus(statusFromError(error.InvalidConstrainedGenerationConfig)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidConstrainedGenerationConfig).code);
+    try std.testing.expectEqual(error.InvalidConstrainedOutput, errorFromStatus(statusFromError(error.InvalidConstrainedOutput)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidConstrainedOutput).code);
+    try std.testing.expectEqual(error.InvalidConstrainedProbabilities, errorFromStatus(statusFromError(error.InvalidConstrainedProbabilities)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidConstrainedProbabilities).code);
+    try std.testing.expectEqual(error.InvalidConstrainedSchema, errorFromStatus(statusFromError(error.InvalidConstrainedSchema)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidConstrainedSchema).code);
+    try std.testing.expectEqual(error.InvalidDecideRequest, errorFromStatus(statusFromError(error.InvalidDecideRequest)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidDecideRequest).code);
+    try std.testing.expectEqual(error.InvalidDecisionOutput, errorFromStatus(statusFromError(error.InvalidDecisionOutput)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidDecisionOutput).code);
+    try std.testing.expectEqual(error.InvalidGeneratedExtractorConfig, errorFromStatus(statusFromError(error.InvalidGeneratedExtractorConfig)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidGeneratedExtractorConfig).code);
+    try std.testing.expectEqual(error.InvalidGeneratorConfig, errorFromStatus(statusFromError(error.InvalidGeneratorConfig)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidGeneratorConfig).code);
+    try std.testing.expectEqual(error.InvalidGeneratorToolConfig, errorFromStatus(statusFromError(error.InvalidGeneratorToolConfig)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidGeneratorToolConfig).code);
+    try std.testing.expectEqual(error.InvalidGroupedPriorContext, errorFromStatus(statusFromError(error.InvalidGroupedPriorContext)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidGroupedPriorContext).code);
+    try std.testing.expectEqual(error.InvalidGroupedSourceCommand, errorFromStatus(statusFromError(error.InvalidGroupedSourceCommand)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidGroupedSourceCommand).code);
+    try std.testing.expectEqual(error.InvalidGroupedSourceConfig, errorFromStatus(statusFromError(error.InvalidGroupedSourceConfig)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidGroupedSourceConfig).code);
+    try std.testing.expectEqual(error.InvalidGroupedSourceMember, errorFromStatus(statusFromError(error.InvalidGroupedSourceMember)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidGroupedSourceMember).code);
+    try std.testing.expectEqual(error.InvalidGroupedSourceMutation, errorFromStatus(statusFromError(error.InvalidGroupedSourceMutation)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidGroupedSourceMutation).code);
+    try std.testing.expectEqual(error.InvalidGroupedSourceQuery, errorFromStatus(statusFromError(error.InvalidGroupedSourceQuery)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidGroupedSourceQuery).code);
+    try std.testing.expectEqual(error.InvalidGroupedSourceTransfer, errorFromStatus(statusFromError(error.InvalidGroupedSourceTransfer)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidGroupedSourceTransfer).code);
+    try std.testing.expectEqual(error.InvalidStructuredOutput, errorFromStatus(statusFromError(error.InvalidStructuredOutput)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.InvalidStructuredOutput).code);
+    try std.testing.expectEqual(error.MissingGeneratorCredentials, errorFromStatus(statusFromError(error.MissingGeneratorCredentials)));
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), statusFromError(error.MissingGeneratorCredentials).code);
+    try std.testing.expectEqual(error.UnsupportedAppleGenerationOptions, errorFromStatus(statusFromError(error.UnsupportedAppleGenerationOptions)));
+    try std.testing.expectEqual(@backingInt(Code.unsupported), statusFromError(error.UnsupportedAppleGenerationOptions).code);
+    try std.testing.expectEqual(error.UnsupportedConstrainedOutput, errorFromStatus(statusFromError(error.UnsupportedConstrainedOutput)));
+    try std.testing.expectEqual(@backingInt(Code.unsupported), statusFromError(error.UnsupportedConstrainedOutput).code);
+    try std.testing.expectEqual(error.UnsupportedConstrainedProbabilities, errorFromStatus(statusFromError(error.UnsupportedConstrainedProbabilities)));
+    try std.testing.expectEqual(@backingInt(Code.unsupported), statusFromError(error.UnsupportedConstrainedProbabilities).code);
+    try std.testing.expectEqual(error.UnsupportedConstrainedSchema, errorFromStatus(statusFromError(error.UnsupportedConstrainedSchema)));
+    try std.testing.expectEqual(@backingInt(Code.unsupported), statusFromError(error.UnsupportedConstrainedSchema).code);
+    try std.testing.expectEqual(error.UnsupportedGeneratedExtractionSchema, errorFromStatus(statusFromError(error.UnsupportedGeneratedExtractionSchema)));
+    try std.testing.expectEqual(@backingInt(Code.unsupported), statusFromError(error.UnsupportedGeneratedExtractionSchema).code);
+}
+
+test "merged runtime error details preserve main wire identifiers" {
+    try std.testing.expectEqual(@as(c_int, 674), @backingInt(Detail.inference_worker_executable_not_configured));
+    try std.testing.expectEqual(@as(c_int, 675), @backingInt(Detail.inference_worker_unavailable));
+    try std.testing.expectEqual(@as(c_int, 676), @backingInt(Detail.model_chunk_audio_too_large));
+    try std.testing.expectEqual(@as(c_int, 729), @backingInt(Detail.decision_limit_exceeded));
+}
+
+test "resolver namespace rejection retains its conflict identity across runtime callbacks" {
+    const value = statusFromError(error.ResolverCurationConflict);
+    try std.testing.expectEqual(@backingInt(Code.conflict), value.code);
+    try std.testing.expectEqual(error.ResolverCurationConflict, errorFromStatus(value));
 }

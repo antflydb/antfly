@@ -1,0 +1,156 @@
+name: Apple video backends
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        type: string
+        default: ''
+      head_sha:
+        type: string
+        default: ''
+      base_sha:
+        type: string
+        default: ''
+      check_id:
+        type: string
+        default: ''
+      comment_id:
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      hardware_runner:
+        description: Optional self-hosted Apple Silicon runner label with Metal/media-engine access
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+
+concurrency:
+  group: apple-video-${{ inputs.head_sha || github.sha }}
+  cancel-in-progress: true
+
+env:
+  ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache/global
+
+jobs:
+  admission:
+    uses: ./.github/workflows/pr-ci-admission.yml
+    with:
+      pr_number: ${{ inputs.pr_number }}
+      head_sha: ${{ inputs.head_sha }}
+      base_sha: ${{ inputs.base_sha }}
+      check_id: ${{ inputs.check_id }}
+      comment_id: ${{ inputs.comment_id }}
+      suite: apple-video
+
+  apple-runtime:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) }}
+    needs: admission
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Record actual runtime and execute portable and Apple comparisons
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          mkdir -p .benchmark-results/apple-video
+          sw_vers > .benchmark-results/apple-video/os.txt
+          system_profiler SPHardwareDataType > .benchmark-results/apple-video/hardware.txt
+          zig version > .benchmark-results/apple-video/zig.txt
+          zig build --build-file zig/lib/video/build.zig test-video -Dvideo-test-filter='Apple WebM' -Doptimize=safe -Dtarget=aarch64-macos.15.0 --summary all 2>&1 | tee .benchmark-results/apple-video/video.log
+          zig build --build-file zig/pkg/inference/build.zig test-video-model test-media-chunking -Dmetal=false -Doptimize=safe -Dtarget=aarch64-macos.15.0 --summary all 2>&1 | tee .benchmark-results/apple-video/model.log
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: apple-video-${{ matrix.os }}
+          path: .benchmark-results/apple-video
+
+  cross-sdk:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) }}
+    needs: admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Compile against the release SDK and explicit deployment target
+        env:
+          SDK_VERSION: ${{ steps.toolchain.outputs.macos_cross_sdk_version }}
+          SDK_SHA256: ${{ steps.toolchain.outputs.macos_cross_sdk_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p .benchmark-assets/apple-sdk
+          archive="$PWD/.benchmark-assets/apple-sdk/sdk.tar.xz"
+          curl --fail --location --retry 3 "https://github.com/joseluisq/macosx-sdks/releases/download/${SDK_VERSION}/MacOSX${SDK_VERSION}.sdk.tar.xz" -o "$archive"
+          echo "$SDK_SHA256  $archive" | sha256sum --check --strict
+          tar -xJf "$archive" -C .benchmark-assets/apple-sdk
+          export SDK_PATH="$PWD/.benchmark-assets/apple-sdk/MacOSX${SDK_VERSION}.sdk"
+          zig build --build-file zig/lib/video/build.zig check-video -Doptimize=safe -Dtarget=aarch64-macos.15.0 --summary all
+
+  apple-hardware:
+    if: >-
+      ${{ !cancelled() &&
+      success() &&
+      needs.admission.result == 'success' &&
+      (inputs.pr_number == '' ||
+      github.run_attempt == 1) &&
+      github.event_name == 'workflow_dispatch' && inputs.hardware_runner != '' }}
+    needs: admission
+    runs-on: [self-hosted, macOS, ARM64, "${{ inputs.hardware_runner }}"]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Qualify actual hardware and GPU inference lifetimes
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          sw_vers
+          zig build --build-file zig/lib/video/build.zig test-video -Doptimize=safe -Dtarget=aarch64-macos.15.0 --summary all
+          zig build --build-file zig/pkg/inference/build.zig test-video-model test-media-chunking -Dmetal=true -Doptimize=safe -Dtarget=aarch64-macos.15.0 --summary all

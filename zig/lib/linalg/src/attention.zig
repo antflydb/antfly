@@ -407,36 +407,116 @@ pub fn flashAttentionHost(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
+    return flashAttentionHostWithIo(allocator, null, Q, K, V, bias, mask, batch, seq_len, num_heads, head_dim);
+}
+
+/// Bounded independent head lanes on the caller's Io owner. Per-lane scratch
+/// is allocated before dispatch; workers never allocate or share output rows.
+pub fn flashAttentionHostWithIo(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) ![]f32 {
     if (num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
     const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
     const expected = std.math.mul(usize, std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape, H) catch return error.InvalidAttentionShape;
     if (Q.len != expected or K.len != expected or V.len != expected) return error.InvalidAttentionShape;
     const mask_expected = std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape;
-    if (mask.len < mask_expected) return error.InvalidAttentionShape;
+    if (mask.len != 0 and mask.len < mask_expected) return error.InvalidAttentionShape;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
     const seq_sq = std.math.mul(usize, seq_len, seq_len) catch return error.InvalidAttentionShape;
     const bias_shared_len = std.math.mul(usize, num_heads, seq_sq) catch return error.InvalidAttentionShape;
     const bias_batched_len = std.math.mul(usize, batch, bias_shared_len) catch return error.InvalidAttentionShape;
     const output_elems = std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape;
+    if (io) |handle| try handle.checkCancel();
     const output = try allocator.alloc(f32, std.math.mul(usize, output_elems, H) catch return error.InvalidAttentionShape);
     errdefer allocator.free(output);
     @memset(output, 0.0);
 
-    const bq = @min(BLOCK_Q, seq_len);
-    const bkv = @min(BLOCK_KV, seq_len);
-    const score_tile = try allocator.alloc(f32, std.math.mul(usize, bq, bkv) catch return error.InvalidAttentionShape);
+    if (output.len == 0) return output;
+    const head_count = try std.math.mul(usize, batch, num_heads);
+    const lanes = if (io != null and seq_len >= 256) @min(head_count, @min(pool.max_workers, @max(1, pool.cachedCpuCount()))) else 1;
+    const bq: usize = @min(BLOCK_Q, seq_len);
+    const bkv: usize = @min(BLOCK_KV, seq_len);
+    const score_tile = try allocator.alloc(f32, std.math.mul(usize, try std.math.mul(usize, bq, bkv), lanes) catch return error.InvalidAttentionShape);
     defer allocator.free(score_tile);
-    const row_max = try allocator.alloc(f32, bq);
+    const row_max = try allocator.alloc(f32, bq * lanes);
     defer allocator.free(row_max);
-    const row_sum = try allocator.alloc(f32, bq);
+    const row_sum = try allocator.alloc(f32, bq * lanes);
     defer allocator.free(row_sum);
 
-    for (0..batch) |b| {
-        const mask_base = b * seq_len;
-        for (0..num_heads) |h| {
+    var contexts: [pool.max_workers]FlashHeadWork = undefined;
+    var jobs: [pool.max_workers]pool.Job = undefined;
+    const per_lane = head_count / lanes;
+    const extra = head_count % lanes;
+    for (contexts[0..lanes], jobs[0..lanes], 0..) |*ctx, *job, lane| {
+        const first = per_lane * lane + @min(lane, extra);
+        const end = first + per_lane + @intFromBool(lane < extra);
+        ctx.* = .{ .io = io, .Q = Q, .K = K, .V = V, .bias = bias, .mask = mask, .seq_len = seq_len, .num_heads = num_heads, .head_dim = head_dim, .scale = scale, .seq_sq = seq_sq, .bias_shared_len = bias_shared_len, .bias_batched_len = bias_batched_len, .head_start = first, .head_end = end, .output = output, .score_tile = score_tile[lane * bq * bkv ..][0 .. bq * bkv], .row_max = row_max[lane * bq ..][0..bq], .row_sum = row_sum[lane * bq ..][0..bq] };
+        job.* = .{ .fn_ptr = FlashHeadWork.run, .ctx = ctx };
+    }
+    if (io) |handle| {
+        try pool.dispatchJobsIo(handle, jobs[0..lanes]);
+        try handle.checkCancel();
+    } else FlashHeadWork.run(&contexts[0]);
+    for (contexts[0..lanes]) |ctx| if (ctx.cancelled) return error.Canceled;
+
+    return output;
+}
+
+const FlashHeadWork = struct {
+    io: ?std.Io,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    mask: []const i64,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    seq_sq: usize,
+    bias_shared_len: usize,
+    bias_batched_len: usize,
+    head_start: usize,
+    head_end: usize,
+    output: []f32,
+    score_tile: []f32,
+    row_max: []f32,
+    row_sum: []f32,
+    cancelled: bool = false,
+    fn run(raw: *anyopaque) void {
+        const self: *FlashHeadWork = @ptrCast(@alignCast(raw));
+        const Q = self.Q;
+        const K = self.K;
+        const V = self.V;
+        const bias = self.bias;
+        const mask = self.mask;
+        const seq_len = self.seq_len;
+        const num_heads = self.num_heads;
+        const head_dim = self.head_dim;
+        const scale = self.scale;
+        const seq_sq = self.seq_sq;
+        const bias_shared_len = self.bias_shared_len;
+        const bias_batched_len = self.bias_batched_len;
+        const output = self.output;
+        const score_tile = self.score_tile;
+        const row_max = self.row_max;
+        const row_sum = self.row_sum;
+        for (self.head_start..self.head_end) |bh_idx| {
+            const b = bh_idx / num_heads;
+            const h = bh_idx % num_heads;
+            const mask_base = b * seq_len;
             // Head-major: each (b, h) occupies a contiguous [seq, head_dim]
             // slab in Q/K/V/output starting at (b * num_heads + h) * seq * head_dim.
-            const bh_idx = b * num_heads + h;
             const bh_offset = bh_idx * seq_len * head_dim;
 
             // Position-bias offset for this (b, h) -- either head-shared
@@ -455,6 +535,10 @@ pub fn flashAttentionHost(
 
             var q_start: usize = 0;
             while (q_start < seq_len) {
+                if (self.io) |handle| handle.checkCancel() catch {
+                    self.cancelled = true;
+                    return;
+                };
                 const q_end = @min(q_start + BLOCK_Q, seq_len);
                 const cur_bq = q_end - q_start;
 
@@ -465,6 +549,10 @@ pub fn flashAttentionHost(
 
                 var kv_start: usize = 0;
                 while (kv_start < seq_len) {
+                    if (self.io) |handle| handle.checkCancel() catch {
+                        self.cancelled = true;
+                        return;
+                    };
                     const kv_end = @min(kv_start + BLOCK_KV, seq_len);
                     const cur_bkv = kv_end - kv_start;
 
@@ -498,7 +586,7 @@ pub fn flashAttentionHost(
                     // no positional masking; only the -inf masked-out keys.
                     for (0..cur_bkv) |ki_local| {
                         const ki = kv_start + ki_local;
-                        if (mask[mask_base + ki] == 0) {
+                        if (mask.len != 0 and mask[mask_base + ki] == 0) {
                             for (0..cur_bq) |qi_local| {
                                 score_tile[qi_local * cur_bkv + ki_local] = -std.math.inf(f32);
                             }
@@ -586,9 +674,7 @@ pub fn flashAttentionHost(
             }
         }
     }
-
-    return output;
-}
+};
 
 /// Segment-masked attention for tree-packed sequences.
 ///
@@ -638,7 +724,7 @@ pub fn segmentAttentionHostWithGemm(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(Gemm, allocator, null, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim);
+    return segmentAttentionHostWithGemmImpl(Gemm, allocator, null, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null);
 }
 
 /// Independent heads share immutable inputs and use caller-preallocated scratch.
@@ -659,13 +745,30 @@ pub fn segmentAttentionHostWithGemmParallelIo(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
-    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim);
+    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null);
+}
+
+/// Serial heads with cancellation between bounded GEMM tiles. A threaded
+/// system BLAS owns parallelism; scratch remains independent of head count.
+pub fn segmentAttentionHostWithGemmSerialIo(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize) ![]f32 {
+    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_heads, null);
+}
+
+/// Compact grouped K/V, reusing one packed K/V head across its query heads.
+/// Threaded BLAS owns parallelism; no expanded [keys, query_heads, dim] tensors.
+pub fn segmentAttentionGroupedHostWithGemmIo(comptime Gemm: type, allocator: std.mem.Allocator, io: ?std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32) ![]f32 {
+    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, false, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale);
+}
+
+pub fn segmentAttentionGroupedHostWithGemmParallelIo(comptime Gemm: type, allocator: std.mem.Allocator, io: std.Io, Q: []const f32, K: []const f32, V: []const f32, ranges: []const u32, query_positions: []const i32, key_positions: []const i32, window: u32, queries: usize, keys: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize, score_scale: f32) ![]f32 {
+    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, true, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim, num_kv_heads, score_scale);
 }
 
 fn segmentAttentionHostWithGemmImpl(
     comptime Gemm: type,
     allocator: std.mem.Allocator,
     io: ?std.Io,
+    parallel: bool,
     Q: []const f32,
     K: []const f32,
     V: []const f32,
@@ -677,27 +780,31 @@ fn segmentAttentionHostWithGemmImpl(
     keys: usize,
     num_heads: usize,
     head_dim: usize,
+    num_kv_heads: usize,
+    score_scale: ?f32,
 ) ![]f32 {
     const block_q = if (@hasDecl(Gemm, "query_block")) Gemm.query_block else BLOCK_Q;
     const block_kv = if (@hasDecl(Gemm, "key_block")) Gemm.key_block else BLOCK_KV;
-    if (num_heads == 0 or head_dim == 0 or queries == 0 or keys == 0) return error.InvalidAttentionShape;
+    if (num_kv_heads == 0 or num_heads % num_kv_heads != 0 or num_heads == 0 or head_dim == 0 or queries == 0 or keys == 0) return error.InvalidAttentionShape;
     const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
     const q_count = std.math.mul(usize, queries, H) catch return error.InvalidAttentionShape;
-    const k_count = std.math.mul(usize, keys, H) catch return error.InvalidAttentionShape;
+    const KH = std.math.mul(usize, num_kv_heads, head_dim) catch return error.InvalidAttentionShape;
+    const k_count = std.math.mul(usize, keys, KH) catch return error.InvalidAttentionShape;
     const range_count = std.math.mul(usize, queries, 6) catch return error.InvalidAttentionShape;
-    const lanes = if (io != null) num_heads else 1;
+    const lanes = if (parallel and io != null) num_heads else 1;
     const tile_count = std.math.mul(usize, block_q, block_kv) catch return error.InvalidAttentionShape;
     const score_count = std.math.mul(usize, tile_count, lanes) catch return error.InvalidAttentionShape;
     if (block_q == 0 or block_kv == 0 or Q.len != q_count or K.len != k_count or V.len != k_count or ranges.len != range_count or
         query_positions.len != queries or key_positions.len != keys) return error.InvalidAttentionShape;
     for (ranges) |bound| if (bound > keys) return error.InvalidAttentionShape;
     if (io) |handle| try handle.checkCancel();
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const scale: f32 = score_scale orelse (1.0 / @sqrt(@as(f32, @floatFromInt(head_dim))));
     const output = try allocator.alloc(f32, queries * H);
     errdefer allocator.free(output);
     const qhs = try allocator.alloc(f32, queries * head_dim * lanes);
     defer allocator.free(qhs);
-    const khs = try allocator.alloc(f32, keys * head_dim * lanes);
+    const kv_lanes = if (parallel and io != null) num_kv_heads else 1;
+    const khs = try allocator.alloc(f32, keys * head_dim * kv_lanes);
     defer allocator.free(khs);
     const vhs = try allocator.alloc(f32, khs.len);
     defer allocator.free(vhs);
@@ -706,21 +813,34 @@ fn segmentAttentionHostWithGemmImpl(
     const scores = try allocator.alloc(f32, score_count);
     defer allocator.free(scores);
     const Head = SegmentHeadWork(Gemm);
-    if (io) |handle| {
+    if (parallel and io != null) {
+        const handle = io.?;
         const heads = try allocator.alloc(Head, num_heads);
         defer allocator.free(heads);
         const jobs = try allocator.alloc(pool.Job, num_heads);
         defer allocator.free(jobs);
+        // Pack each KV head once, then all query-head workers borrow it read-only.
+        for (0..num_kv_heads) |kh| {
+            try handle.checkCancel();
+            for (0..keys) |row| {
+                const dst = (kh * keys + row) * head_dim;
+                const src = row * KH + kh * head_dim;
+                @memcpy(khs[dst..][0..head_dim], K[src..][0..head_dim]);
+                @memcpy(vhs[dst..][0..head_dim], V[src..][0..head_dim]);
+            }
+        }
         for (heads, jobs, 0..) |*ctx, *job, h| {
-            ctx.* = .{ .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .h = h, .scale = scale, .output = output, .qh = qhs[h * queries * head_dim ..][0 .. queries * head_dim], .kh = khs[h * keys * head_dim ..][0 .. keys * head_dim], .vh = vhs[h * keys * head_dim ..][0 .. keys * head_dim], .oh = ohs[h * queries * head_dim ..][0 .. queries * head_dim], .score_tile = scores[h * block_q * block_kv ..][0 .. block_q * block_kv] };
+            ctx.* = .{ .pack_kv = false, .io = io, .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .KH = KH, .kv_h = h / (num_heads / num_kv_heads), .h = h, .scale = scale, .output = output, .qh = qhs[h * queries * head_dim ..][0 .. queries * head_dim], .kh = khs[(h / (num_heads / num_kv_heads)) * keys * head_dim ..][0 .. keys * head_dim], .vh = vhs[(h / (num_heads / num_kv_heads)) * keys * head_dim ..][0 .. keys * head_dim], .oh = ohs[h * queries * head_dim ..][0 .. queries * head_dim], .score_tile = scores[h * block_q * block_kv ..][0 .. block_q * block_kv] };
             job.* = .{ .fn_ptr = Head.run, .ctx = ctx };
         }
         try pool.dispatchJobsIo(handle, jobs);
+        for (heads) |head| if (head.failure) |err| return err;
         try handle.checkCancel();
     } else {
         for (0..num_heads) |h| {
-            var ctx = Head{ .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .h = h, .scale = scale, .output = output, .qh = qhs, .kh = khs, .vh = vhs, .oh = ohs, .score_tile = scores };
+            var ctx = Head{ .pack_kv = h % (num_heads / num_kv_heads) == 0, .io = io, .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .KH = KH, .kv_h = h / (num_heads / num_kv_heads), .h = h, .scale = scale, .output = output, .qh = qhs, .kh = khs, .vh = vhs, .oh = ohs, .score_tile = scores };
             Head.run(&ctx);
+            if (ctx.failure) |err| return err;
         }
     }
     return output;
@@ -730,6 +850,8 @@ fn SegmentHeadWork(comptime Gemm: type) type {
     const block_q = if (@hasDecl(Gemm, "query_block")) Gemm.query_block else BLOCK_Q;
     const block_kv = if (@hasDecl(Gemm, "key_block")) Gemm.key_block else BLOCK_KV;
     return struct {
+        io: ?std.Io = null,
+        failure: ?anyerror = null,
         Q: []const f32,
         K: []const f32,
         V: []const f32,
@@ -741,6 +863,9 @@ fn SegmentHeadWork(comptime Gemm: type) type {
         keys: usize,
         head_dim: usize,
         H: usize,
+        KH: usize,
+        kv_h: usize,
+        pack_kv: bool = true,
         h: usize,
         scale: f32,
         output: []f32,
@@ -751,6 +876,11 @@ fn SegmentHeadWork(comptime Gemm: type) type {
         score_tile: []f32,
         fn run(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.execute() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn execute(self: *@This()) !void {
             const Q = self.Q;
             const K = self.K;
             const V = self.V;
@@ -774,13 +904,14 @@ fn SegmentHeadWork(comptime Gemm: type) type {
             var row_sum: [block_q]f32 = undefined;
             var intervals: [block_q * 3][2]u32 = undefined;
             for (0..queries) |i| @memcpy(qh[i * head_dim ..][0..head_dim], Q[i * H + h * head_dim ..][0..head_dim]);
-            for (0..keys) |k| {
-                @memcpy(kh[k * head_dim ..][0..head_dim], K[k * H + h * head_dim ..][0..head_dim]);
-                @memcpy(vh[k * head_dim ..][0..head_dim], V[k * H + h * head_dim ..][0..head_dim]);
-            }
+            if (self.pack_kv) for (0..keys) |k| {
+                @memcpy(kh[k * head_dim ..][0..head_dim], K[k * self.KH + self.kv_h * head_dim ..][0..head_dim]);
+                @memcpy(vh[k * head_dim ..][0..head_dim], V[k * self.KH + self.kv_h * head_dim ..][0..head_dim]);
+            };
             @memset(oh, 0);
             var q_start: usize = 0;
             while (q_start < queries) : (q_start += block_q) {
+                if (self.io) |io| try io.checkCancel();
                 const cur_bq = @min(block_q, queries - q_start);
                 for (0..cur_bq) |r| {
                     row_max[r] = -std.math.inf(f32);
@@ -815,6 +946,7 @@ fn SegmentHeadWork(comptime Gemm: type) type {
                 for (intervals[0..merged]) |interval| {
                     var kv_start: usize = interval[0];
                     while (kv_start < interval[1]) {
+                        if (self.io) |io| try io.checkCancel();
                         const kv_end = @min(kv_start + block_kv, interval[1]);
                         const cur_bkv = kv_end - kv_start;
                         const tile = score_tile[0 .. cur_bq * cur_bkv];
@@ -2789,4 +2921,465 @@ test "segmentAttentionDropoutKeep is deterministic and disables at probability 0
     const b = segmentAttentionDropoutKeep(999, 1, 0, 2, 10, 3, 7, 0.4);
     try std.testing.expectEqual(a, b);
     try std.testing.expect(a == 0 or @abs(a - 1.0 / 0.6) < 1e-6);
+}
+
+test "flash attention Io lanes preserve exact masked biased results and inline progress" {
+    const a = std.testing.allocator;
+    const batch = 2;
+    const heads = 3;
+    const seq = 257;
+    const dim = 65;
+    const count = batch * heads * seq * dim;
+    const q = try a.alloc(f32, count);
+    defer a.free(q);
+    const k = try a.alloc(f32, count);
+    defer a.free(k);
+    const v = try a.alloc(f32, count);
+    defer a.free(v);
+    var rng = std.Random.DefaultPrng.init(50177);
+    for (q, k, v) |*x, *y, *z| {
+        x.* = rng.random().float(f32) * 2 - 1;
+        y.* = rng.random().float(f32) * 2 - 1;
+        z.* = rng.random().float(f32) * 2 - 1;
+    }
+    const mask = try a.alloc(i64, batch * seq);
+    defer a.free(mask);
+    for (mask, 0..) |*x, i| x.* = if (i >= seq or i % 7 == 0) 0 else 1;
+    const bias = try a.alloc(f32, batch * heads * seq * seq);
+    defer a.free(bias);
+    for (bias) |*x| x.* = rng.random().float(f32) * 0.5;
+    for ([_]usize{ seq * seq, heads * seq * seq, bias.len }) |length| {
+        const serial = try flashAttentionHost(a, q, k, v, bias[0..length], mask, batch, seq, heads, dim);
+        defer a.free(serial);
+        const parallel = try flashAttentionHostWithIo(a, std.testing.io, q, k, v, bias[0..length], mask, batch, seq, heads, dim);
+        defer a.free(parallel);
+        try std.testing.expectEqualSlices(f32, serial, parallel);
+        var bounded = std.Io.Threaded.init(a, .{ .async_limit = .limited(0), .concurrent_limit = .limited(0) });
+        defer bounded.deinit();
+        const inline_result = try flashAttentionHostWithIo(a, bounded.io(), q, k, v, bias[0..length], mask, batch, seq, heads, dim);
+        defer a.free(inline_result);
+        try std.testing.expectEqualSlices(f32, serial, inline_result);
+    }
+}
+fn flashIoAllocationFailure(a: std.mem.Allocator) !void {
+    const count = 2 * 257 * 8;
+    const input = try a.alloc(f32, count);
+    defer a.free(input);
+    @memset(input, 0.25);
+    const mask = try a.alloc(i64, 257);
+    defer a.free(mask);
+    @memset(mask, 1);
+    const result = try flashAttentionHostWithIo(a, std.testing.io, input, input, input, null, mask, 1, 257, 2, 8);
+    defer a.free(result);
+}
+test "flash attention parallel scratch rolls back every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, flashIoAllocationFailure, .{});
+}
+
+test "flash attention cancellation drains parallel lanes and permits exact retry" {
+    const Probe = struct {
+        var calls: std.atomic.Value(u32) = .init(0);
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            try std.testing.io.checkCancel();
+            if (calls.fetchAdd(1, .acq_rel) >= 3) return error.Canceled;
+        }
+    };
+    const a = std.testing.allocator;
+    const count = 4 * 513 * 16;
+    const input = try a.alloc(f32, count);
+    defer a.free(input);
+    for (input, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 117))) * 0.5;
+    const mask = try a.alloc(i64, 513);
+    defer a.free(mask);
+    @memset(mask, 1);
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Probe.check;
+    var controlled = std.testing.io;
+    controlled.vtable = &table;
+    Probe.calls.store(0, .release);
+    try std.testing.expectError(error.Canceled, flashAttentionHostWithIo(a, controlled, input, input, input, null, mask, 1, 513, 4, 16));
+    const drained = Probe.calls.load(.acquire);
+    try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(20), .awake);
+    try std.testing.expectEqual(drained, Probe.calls.load(.acquire));
+    const retry = try flashAttentionHostWithIo(a, std.testing.io, input, input, input, null, mask, 1, 513, 4, 16);
+    defer a.free(retry);
+    const expected = try flashAttentionHost(a, input, input, input, null, mask, 1, 513, 4, 16);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(f32, expected, retry);
+}
+
+test "flash attention unmasked tiles match explicit all-valid masks" {
+    const a = std.testing.allocator;
+    const batch = 2;
+    const heads = 3;
+    const seq = 257;
+    const dim = 17;
+    const input = try a.alloc(f32, batch * heads * seq * dim);
+    defer a.free(input);
+    for (input, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 31)) / 31;
+    const mask = try a.alloc(i64, batch * seq);
+    defer a.free(mask);
+    @memset(mask, 1);
+    const expected = try flashAttentionHostWithIo(a, std.testing.io, input, input, input, null, mask, batch, seq, heads, dim);
+    defer a.free(expected);
+    const actual = try flashAttentionHostWithIo(a, std.testing.io, input, input, input, null, &.{}, batch, seq, heads, dim);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, expected, actual);
+    try std.testing.expectError(error.InvalidAttentionShape, flashAttentionHostWithIo(a, std.testing.io, input, input, input, null, mask[0..seq], batch, seq, heads, dim));
+}
+
+test "segmentAttentionHost serial Io bounds scratch and cancels between BLAS tiles before exact retry" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator, io: std.Io) !void {
+            const q: [12]f32 = @splat(0.25);
+            const k: [18]f32 = @splat(-0.5);
+            const v: [18]f32 = @splat(0.75);
+            const output = try segmentAttentionHostWithGemmSerialIo(SegmentParallelTestGemm, a, io, &q, &k, &v, &.{ 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, &.{ 0, 1 }, &.{ 0, 1, 2 }, std.math.maxInt(u32), 2, 3, 2, 3);
+            defer a.free(output);
+            for (output[0..6]) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.75), value, 1e-6);
+            for (output[6..]) |value| try std.testing.expectEqual(@as(f32, 0), value);
+        }
+        var calls: u32 = 0;
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            calls += 1;
+            if (calls >= 3) return error.Canceled;
+        }
+    };
+    try Case.run(std.testing.allocator, std.testing.io);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{std.testing.io});
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Case.check;
+    var io = std.testing.io;
+    io.vtable = &table;
+    Case.calls = 0;
+    try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, io));
+    try std.testing.expectEqual(@as(u32, 3), Case.calls);
+    try Case.run(std.testing.allocator, std.testing.io);
+}
+
+/// Dense independent pictures: no per-query ranges, masking or interval sort.
+/// Narrow vision heads use bounded BLAS tiles and explicit portable SIMD row
+/// reductions. One head's reusable scratch keeps live storage linear in tokens.
+pub fn denseAttentionHostWithGemmIo(comptime Gemm: type, a: std.mem.Allocator, io: ?std.Io, q: []const f32, k: []const f32, v: []const f32, batch: usize, sequence: usize, heads: usize, dim: usize) ![]f32 {
+    if (batch == 0 or sequence == 0 or heads == 0 or dim == 0) return error.InvalidAttentionShape;
+    const width = try std.math.mul(usize, heads, dim);
+    const rows = try std.math.mul(usize, batch, sequence);
+    const count = try std.math.mul(usize, rows, width);
+    if (q.len != count or k.len != count or v.len != count) return error.InvalidAttentionShape;
+    const bq = if (@hasDecl(Gemm, "dense_query_block")) Gemm.dense_query_block else 256;
+    const bk = if (@hasDecl(Gemm, "dense_key_block")) Gemm.dense_key_block else 1024;
+    const output = try a.alloc(f32, count);
+    errdefer a.free(output);
+    const head_count = try std.math.mul(usize, sequence, dim);
+    const scratch = try a.alloc(f32, try std.math.add(usize, try std.math.mul(usize, 4, head_count), bq * bk));
+    defer a.free(scratch);
+    const qh = scratch[0..head_count];
+    const kh = scratch[head_count..][0..head_count];
+    const vh = scratch[2 * head_count ..][0..head_count];
+    const oh = scratch[3 * head_count ..][0..head_count];
+    const scores = scratch[4 * head_count ..];
+    const scale = 1 / @sqrt(@as(f32, @floatFromInt(dim)));
+    for (0..batch) |b| for (0..heads) |h| {
+        if (io) |runtime| try runtime.checkCancel();
+        for (0..sequence) |r| {
+            const at = (b * sequence + r) * width + h * dim;
+            @memcpy(qh[r * dim ..][0..dim], q[at..][0..dim]);
+            @memcpy(kh[r * dim ..][0..dim], k[at..][0..dim]);
+            @memcpy(vh[r * dim ..][0..dim], v[at..][0..dim]);
+        }
+        @memset(oh, 0);
+        var first: usize = 0;
+        while (first < sequence) : (first += bq) {
+            const nq: usize = @min(bq, sequence - first);
+            var maxima: [bq]f32 = @splat(-std.math.inf(f32));
+            var sums: [bq]f32 = @splat(0);
+            const dst = oh[first * dim ..][0 .. nq * dim];
+            var key: usize = 0;
+            while (key < sequence) : (key += bk) {
+                if (io) |runtime| try runtime.checkCancel();
+                const nk: usize = @min(bk, sequence - key);
+                const tile = scores[0 .. nq * nk];
+                Gemm.sgemmTransBSync(nq, nk, dim, scale, qh[first * dim ..][0 .. nq * dim], kh[key * dim ..][0 .. nk * dim], 0, tile);
+                try normalizeDenseTile(io, tile, dst, maxima[0..nq], sums[0..nq], nk, dim);
+                Gemm.sgemmSync(nq, dim, nk, 1, tile, vh[key * dim ..][0 .. nk * dim], 1, dst);
+            }
+            for (0..nq) |r| denseScaleRow(dst[r * dim ..][0..dim], 1 / sums[r]);
+        }
+        for (0..sequence) |r| @memcpy(output[(b * sequence + r) * width + h * dim ..][0..dim], oh[r * dim ..][0..dim]);
+    };
+    return output;
+}
+
+const DenseTileRows = struct {
+    io: ?std.Io,
+    tile: []f32,
+    output: []f32,
+    maxima: []f32,
+    sums: []f32,
+    keys: usize,
+    dim: usize,
+    first: usize,
+    last: usize,
+    failure: ?anyerror = null,
+    fn run(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.execute() catch |err| {
+            self.failure = err;
+        };
+    }
+    fn execute(self: *@This()) !void {
+        for (self.first..self.last) |r| {
+            if (self.io) |runtime| try runtime.checkCancel();
+            const row = self.tile[r * self.keys ..][0..self.keys];
+            const next = @max(self.maxima[r], denseRowMax(row));
+            if (self.sums[r] != 0 and next != self.maxima[r]) {
+                const rescale = @exp(self.maxima[r] - next);
+                denseScaleRow(self.output[r * self.dim ..][0..self.dim], rescale);
+                self.sums[r] *= rescale;
+            }
+            self.sums[r] += primitives.expSubtractAndSum(row, next);
+            self.maxima[r] = next;
+        }
+    }
+};
+fn normalizeDenseTile(io: ?std.Io, tile: []f32, output: []f32, maxima: []f32, sums: []f32, keys: usize, dim: usize) !void {
+    // BLAS has completed before these row workers start. Never nest workers
+    // around threaded BLAS; switch the parallelism owner at tile boundaries.
+    const workers: usize = if (io != null and maxima.len >= 128 and keys >= 256) 4 else 1;
+    var rows: [4]DenseTileRows = undefined;
+    var jobs: [4]pool.Job = undefined;
+    for (rows[0..workers], jobs[0..workers], 0..) |*row, *job, index| {
+        row.* = .{ .io = io, .tile = tile, .output = output, .maxima = maxima, .sums = sums, .keys = keys, .dim = dim, .first = maxima.len * index / workers, .last = maxima.len * (index + 1) / workers };
+        job.* = .{ .fn_ptr = DenseTileRows.run, .ctx = row };
+    }
+    if (workers == 1) DenseTileRows.run(&rows[0]) else try pool.dispatchJobsIo(io.?, jobs[0..workers]);
+    for (rows[0..workers]) |row| if (row.failure) |err| return err;
+}
+
+fn denseRowMax(row: []const f32) f32 {
+    const lanes = primitives.vec_len;
+    const V = @Vector(lanes, f32);
+    var acc: V = @splat(-std.math.inf(f32));
+    var i: usize = 0;
+    while (i + lanes <= row.len) : (i += lanes) acc = @max(acc, @as(V, row[i..][0..lanes].*));
+    var result = @reduce(.Max, acc);
+    for (row[i..]) |x| result = @max(result, x);
+    return result;
+}
+fn denseScaleRow(row: []f32, scale: f32) void {
+    const lanes = primitives.vec_len;
+    const V = @Vector(lanes, f32);
+    var i: usize = 0;
+    while (i + lanes <= row.len) : (i += lanes) row[i..][0..lanes].* = @as(V, row[i..][0..lanes].*) * @as(V, @splat(scale));
+    for (row[i..]) |*x| x.* *= scale;
+}
+
+test "embeddinggemma2 compact grouped attention preserves independent visibility and dense vision tails" {
+    const a = std.testing.allocator;
+    const seq = 35;
+    const batch = 2;
+    const heads = 4;
+    const dim = 7;
+    var q: [batch * seq * heads * dim]f32 = undefined;
+    var k: [q.len]f32 = undefined;
+    var v: [q.len]f32 = undefined;
+    for (&q, &k, &v, 0..) |*x, *y, *z, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)) * 0.173);
+        y.* = @cos(@as(f32, @floatFromInt(i)) * 0.131);
+        z.* = @sin(@as(f32, @floatFromInt(i)) * 0.271);
+    }
+    var ranges: [batch * seq * 6]u32 = @splat(0);
+    const positions: [batch * seq]i32 = @splat(0);
+    for (0..batch * seq) |r| {
+        ranges[r * 6] = @intCast(r / seq * seq);
+        ranges[r * 6 + 1] = @intCast((r / seq + 1) * seq);
+    }
+    const dense = try denseAttentionHostWithGemmIo(SegmentParallelTestGemm, a, std.testing.io, &q, &k, &v, batch, seq, heads, dim);
+    defer a.free(dense);
+    const expected = try segmentAttentionHost(a, &q, &k, &v, &ranges, &positions, &positions, std.math.maxInt(u32), batch * seq, batch * seq, heads, dim);
+    defer a.free(expected);
+    for (dense, expected) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-6);
+    for ([_]usize{ 1, 2, 4 }) |kv| {
+        var expanded_k: [k.len]f32 = undefined;
+        var expanded_v: [v.len]f32 = undefined;
+        for (0..batch * seq) |r| for (0..heads) |h| {
+            const source = (r * kv + h / (heads / kv)) * dim;
+            @memcpy(expanded_k[(r * heads + h) * dim ..][0..dim], k[source..][0..dim]);
+            @memcpy(expanded_v[(r * heads + h) * dim ..][0..dim], v[source..][0..dim]);
+        };
+        // Include a hole and an empty query; neither may bleed across pictures.
+        ranges[0..6].* = .{ 0, 0, 0, 0, 0, 0 };
+        ranges[6..12].* = .{ 0, 3, 8, 19, 22, seq };
+        const compact = try segmentAttentionGroupedHostWithGemmIo(SegmentParallelTestGemm, a, std.testing.io, &q, k[0 .. batch * seq * kv * dim], v[0 .. batch * seq * kv * dim], &ranges, &positions, &positions, std.math.maxInt(u32), batch * seq, batch * seq, heads, kv, dim, 1 / @sqrt(@as(f32, dim)));
+        defer a.free(compact);
+        const workers = try segmentAttentionGroupedHostWithGemmParallelIo(SegmentParallelTestGemm, a, std.testing.io, &q, k[0 .. batch * seq * kv * dim], v[0 .. batch * seq * kv * dim], &ranges, &positions, &positions, std.math.maxInt(u32), batch * seq, batch * seq, heads, kv, dim, 1 / @sqrt(@as(f32, dim)));
+        defer a.free(workers);
+        try std.testing.expectEqualSlices(f32, compact, workers);
+        const expanded = try segmentAttentionHost(a, &q, &expanded_k, &expanded_v, &ranges, &positions, &positions, std.math.maxInt(u32), batch * seq, batch * seq, heads, dim);
+        defer a.free(expanded);
+        for (compact, expanded) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
+    }
+}
+
+test "embeddinggemma2 dense vision scratch and cancellation unwind all allocations" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator, io: std.Io) !void {
+            const input: [18]f32 = @splat(0.25);
+            const output = try denseAttentionHostWithGemmIo(SegmentParallelTestGemm, a, io, &input, &input, &input, 1, 3, 2, 3);
+            defer a.free(output);
+            for (output) |x| try std.testing.expectApproxEqAbs(@as(f32, 0.25), x, 1e-6);
+        }
+        fn cancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{std.testing.io});
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Case.cancel;
+    var io = std.testing.io;
+    io.vtable = &table;
+    try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, io));
+    try Case.run(std.testing.allocator, std.testing.io);
+}
+
+test "embeddinggemma2 dense vision online normalization spans query and key tile tails" {
+    const a = std.testing.allocator;
+    const seq = 1031;
+    const dim = 3;
+    var q: [seq * dim]f32 = undefined;
+    var k: [seq * dim]f32 = undefined;
+    var v: [seq * dim]f32 = undefined;
+    for (&q, &k, &v, 0..) |*x, *y, *z, i| {
+        x.* = @sin(@as(f32, @floatFromInt(i)) * 0.173) * 3;
+        y.* = @cos(@as(f32, @floatFromInt(i)) * 0.131) * 3;
+        z.* = @sin(@as(f32, @floatFromInt(i)) * 0.271);
+    }
+    const got = try denseAttentionHostWithGemmIo(SegmentParallelTestGemm, a, std.testing.io, &q, &k, &v, 1, seq, 1, dim);
+    defer a.free(got);
+    var ranges: [seq * 6]u32 = @splat(0);
+    const positions: [seq]i32 = @splat(0);
+    for (0..seq) |row| ranges[row * 6 + 1] = seq;
+    const expected = try segmentAttentionHost(a, &q, &k, &v, &ranges, &positions, &positions, std.math.maxInt(u32), seq, seq, 1, dim);
+    defer a.free(expected);
+    for (got, expected) |x, y| try std.testing.expectApproxEqAbs(y, x, 3e-6);
+}
+
+test "embeddinggemma2 dense vision row workers drain cancellation before retry" {
+    const Case = struct {
+        var calls: std.atomic.Value(usize) = .init(0);
+        fn cancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            if (calls.fetchAdd(1, .monotonic) >= 49) return error.Canceled;
+        }
+        fn run(io: std.Io) !void {
+            const a = std.testing.allocator;
+            const values: [257 * 3]f32 = @splat(0.25);
+            const result = try denseAttentionHostWithGemmIo(SegmentParallelTestGemm, a, io, &values, &values, &values, 1, 257, 1, 3);
+            defer a.free(result);
+            for (result) |x| try std.testing.expectApproxEqAbs(@as(f32, 0.25), x, 1e-6);
+        }
+    };
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Case.cancel;
+    var io = std.testing.io;
+    io.vtable = &table;
+    Case.calls.store(0, .monotonic);
+    try std.testing.expectError(error.Canceled, Case.run(io));
+    try std.testing.expect(Case.calls.load(.monotonic) >= 50);
+    try Case.run(std.testing.io);
+}
+
+/// Portable dense attention uses independent head workers around sequential
+/// register-tiled SIMD GEMM. Pack once before dispatch; no nested GEMM workers.
+/// The existing head-major flash kernel owns online softmax and bounded tiles.
+pub fn denseAttentionPortableHostWithIo(a: std.mem.Allocator, io: ?std.Io, q: []const f32, k: []const f32, v: []const f32, batch: usize, sequence: usize, heads: usize, dim: usize) ![]f32 {
+    if (batch == 0 or sequence == 0 or heads == 0 or dim == 0) return error.InvalidAttentionShape;
+    const rows = try std.math.mul(usize, batch, sequence);
+    const width = try std.math.mul(usize, heads, dim);
+    const count = try std.math.mul(usize, rows, width);
+    if (q.len != count or k.len != count or v.len != count) return error.InvalidAttentionShape;
+    const storage = try a.alloc(f32, try std.math.mul(usize, count, 3));
+    defer a.free(storage);
+    const qh = storage[0..count];
+    const kh = storage[count..][0..count];
+    const vh = storage[2 * count ..];
+    for (0..batch) |b| for (0..heads) |h| {
+        if (io) |runtime| try runtime.checkCancel();
+        for (0..sequence) |row| {
+            const src = (b * sequence + row) * width + h * dim;
+            const dst = ((b * heads + h) * sequence + row) * dim;
+            @memcpy(qh[dst..][0..dim], q[src..][0..dim]);
+            @memcpy(kh[dst..][0..dim], k[src..][0..dim]);
+            @memcpy(vh[dst..][0..dim], v[src..][0..dim]);
+        }
+    };
+    const headed = try flashAttentionHostWithIo(a, io, qh, kh, vh, null, &.{}, batch, sequence, heads, dim);
+    defer a.free(headed);
+    const output = try a.alloc(f32, count);
+    errdefer a.free(output);
+    for (0..batch) |b| for (0..heads) |h| {
+        if (io) |runtime| try runtime.checkCancel();
+        for (0..sequence) |row| @memcpy(output[(b * sequence + row) * width + h * dim ..][0..dim], headed[((b * heads + h) * sequence + row) * dim ..][0..dim]);
+    };
+    return output;
+}
+
+test "embeddinggemma2 portable dense SIMD head workers preserve batch isolation and tails" {
+    const a = std.testing.allocator;
+    const count = 2 * 257 * 3 * 8;
+    const data = try a.alloc(f32, count);
+    defer a.free(data);
+    for (data, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.173) * 0.5;
+    const actual = try denseAttentionPortableHostWithIo(a, std.testing.io, data, data, data, 2, 257, 3, 8);
+    defer a.free(actual);
+    const expected = try denseAttentionHostWithGemmIo(SegmentParallelTestGemm, a, std.testing.io, data, data, data, 2, 257, 3, 8);
+    defer a.free(expected);
+    for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-6);
+}
+test "embeddinggemma2 portable dense scratch ownership survives allocation failure cancellation and retry" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator, io: std.Io) !void {
+            const input: [18]f32 = @splat(0.25);
+            const output = try denseAttentionPortableHostWithIo(a, io, &input, &input, &input, 1, 3, 2, 3);
+            defer a.free(output);
+            for (output) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.25), value, 1e-6);
+        }
+        fn cancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{std.testing.io});
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Case.cancel;
+    var io = std.testing.io;
+    io.vtable = &table;
+    try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, io));
+    try Case.run(std.testing.allocator, std.testing.io);
+}
+
+test "embeddinggemma2 grouped shared KV workers drain allocation failure and cancellation" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator, io: std.Io) !void {
+            const q: [3 * 4 * 3]f32 = @splat(0.25);
+            const k: [3 * 3]f32 = @splat(0.25);
+            var ranges: [18]u32 = @splat(0);
+            for (0..3) |i| {
+                ranges[i * 6] = 0;
+                ranges[i * 6 + 1] = 3;
+            }
+            const positions = [_]i32{ 0, 1, 2 };
+            const result = try segmentAttentionGroupedHostWithGemmParallelIo(SegmentParallelTestGemm, a, io, &q, &k, &k, &ranges, &positions, &positions, std.math.maxInt(u32), 3, 3, 4, 1, 3, 1);
+            defer a.free(result);
+            for (result) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.25), value, 1e-6);
+        }
+        fn cancel(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{std.testing.io});
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Case.cancel;
+    var io = std.testing.io;
+    io.vtable = &table;
+    try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, io));
+    try Case.run(std.testing.allocator, std.testing.io);
 }

@@ -166,6 +166,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = &.{
+        "#1210",
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
         "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
@@ -396,6 +397,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub makes progress when byte window is smaller than utf8 scalar",
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub preserves utf8 boundaries across default byte windows",
         "storage.db.enrichment.chunker_stub.test.enrichment chunker stub replaces invalid utf8 before storing chunk text",
+        "storage.db.enrichment.chunker_stub.test.chunker stub model-aware input retains validation without byte chunk fallback",
         "storage.db.enrichment.embedder.test.enrichment dense embedder replaces invalid utf8 before provider call",
         "storage.db.enrichment.embedder.test.enrichment dense parts embedder replaces invalid text part utf8 before provider call",
         "storage.db.enrichment.embedder.test.enrichment sparse batch embedder replaces invalid utf8 before provider call",

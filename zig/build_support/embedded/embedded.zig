@@ -588,6 +588,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi native text queries",
         "capi native replacement wait",
         "capi native resolver maintenance retries",
+        "capi native idle maintenance",
+        "SQL overlay native pages retain typed cells",
         "capi Lite models_dir loads a real extractor",
         "capi Lite promotion resolves ANN",
         "capi Lite promotion retains writer admission",
@@ -650,7 +652,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = optimize,
     });
     antfly_imports.configureEmbedded(b, resolution_test_mod, link_libc);
-    const resolution_tests = b.addTest(.{ .root_module = resolution_test_mod, .filters = &.{ "resolver backfill skips", "incremental resolution", "processRecordKeys", "reresolveAll", "embedding (cosine) scoring", "db ttl cleanup defers transaction guarded" } });
+    const resolution_tests = b.addTest(.{ .root_module = resolution_test_mod, .filters = &.{ "resolver curation", "resolver review", "resolver adjudication", "resolver backfill skips", "incremental resolution", "processRecordKeys", "reresolveAll", "embedding (cosine) scoring", "db ttl cleanup defers transaction guarded" } });
     const run_resolution = b.addRunArtifact(resolution_tests);
     b.step("embedded-resolver-replay-test", "Test selective embedded resolver replay").dependOn(&run_resolution.step);
     capi_test_step.dependOn(&run_resolution.step);

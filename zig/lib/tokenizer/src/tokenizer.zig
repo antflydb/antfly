@@ -56,6 +56,14 @@ pub const SpecialTokens = struct {
 pub const Tokenizer = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Optional immutable tokenization generation for lifetime-bound caches.
+    /// Change this before mutation/address reuse; mutable adapters leave it null.
+    cache_identity: ?u64 = null,
+
+    pub const TokenPiece = struct {
+        bytes: []u8,
+        is_byte_fallback: bool = false,
+    };
 
     pub const VTable = struct {
         /// Encode text into token IDs (without special tokens or padding).
@@ -85,6 +93,10 @@ pub const Tokenizer = struct {
         /// Bytes contributed by one generated token. Continuations must retain
         /// spaces that whole-sequence decoding strips only at the beginning.
         decodeToken: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, id: i32, at_start: bool) anyerror![]u8 = null,
+        /// Owned additive continuation bytes, without sequence-level cleanup.
+        /// Stateful decoders must provide this for grammar/evidence decoding.
+        /// Null reports allocation failure without a foreign Zig error ID.
+        tokenPiece: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, id: i32) ?TokenPiece = null,
         /// Get special token IDs.
         specialTokens: *const fn (ptr: *anyopaque) SpecialTokens,
         /// Return every tokenizer-declared special token ID. Implementations
@@ -169,6 +181,14 @@ pub const Tokenizer = struct {
     pub fn decodeToken(self: Tokenizer, allocator: std.mem.Allocator, id: i32, at_start: bool) ![]u8 {
         if (self.vtable.decodeToken) |decode_token| return decode_token(self.ptr, allocator, id, at_start);
         return self.decode(allocator, &.{id});
+    }
+
+    pub fn tokenPiece(self: Tokenizer, allocator: std.mem.Allocator, id: i32) !TokenPiece {
+        if (self.vtable.tokenPiece) |decode_piece| return decode_piece(self.ptr, allocator, id) orelse error.OutOfMemory;
+        return .{ .bytes = try self.decode(allocator, &.{id}) };
+    }
+    pub fn tokenBytes(self: Tokenizer, allocator: std.mem.Allocator, id: i32) ![]u8 {
+        return (try self.tokenPiece(allocator, id)).bytes;
     }
 
     pub fn specialTokens(self: Tokenizer) SpecialTokens {

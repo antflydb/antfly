@@ -826,6 +826,9 @@ const LocalStandaloneMetadata = struct {
         committed: bool = false,
 
         fn upsertTable(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, table: antfly.metadata.TableRecord) !void {
+            if (metadata.lifecycle_store) |store| {
+                if (!try store.resolverProjectionValid(metadata.alloc, group_ids.main_metadata_group_id, table)) return error.ResolverCurationConflict;
+            }
             try self.captureTable(metadata, table.table_id);
             try metadata.manager.upsertTable(table);
         }
@@ -1077,6 +1080,7 @@ const LocalStandaloneMetadata = struct {
                 .status = status,
                 .system_catalog = systemCatalog,
                 .supports_query_definitions = true,
+                .supports_resolver_catalog_read = true,
                 .supports_object_tables = true,
                 .acquire_join_planning = acquireJoinPlanning,
                 .admin_snapshot = catalogAdminSnapshot,
@@ -2582,6 +2586,12 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
+            .resolver_catalog_read => |input| {
+                _ = try self.ensureNativeOwnerBindingLocked();
+                var read = input;
+                read.standalone = true;
+                return self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, read);
+            },
             .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
@@ -3514,6 +3524,7 @@ const LocalStandaloneMetadata = struct {
     fn runRound(ptr: *anyopaque) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try self.reconcileRelations();
+        try self.reconcileResolverNamespaces();
         try self.provisionRestoreOwners();
         self.finalizeReadySchemaMigrations() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.LmdbUnexpected, error.Corrupted => {},
@@ -3549,6 +3560,32 @@ const LocalStandaloneMetadata = struct {
         }
     }
 
+    fn reconcileResolverNamespaces(self: *LocalStandaloneMetadata) !void {
+        const store = self.lifecycle_store orelse return;
+        if (!self.mutex.tryLock()) return;
+        defer self.mutex.unlock();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const group = group_ids.main_metadata_group_id;
+        const job = (try store.pendingResolverNamespaceTable(a, group)) orelse {
+            const id = (try store.pendingResolverNamespaceDrop(a, group)) orelse return;
+            const fence = try store.getTableTransitionFence(group, id);
+            try self.applyJobCommandLocked(.{ .remove_table = .{ .table_id = id, .expected_transition_generation = fence.generation } });
+            return;
+        };
+        const sources = try store.pendingResolverNamespaceSources(a, group);
+        try store.updateStandaloneCatalog(group, self.durable_revision, .{ .table_replacements = &.{.{ .expected = job, .replacement = job }} });
+        // Certify the new projection only after each touched table is refreshed.
+        self.durable_revision = 0;
+        for (sources) |source| {
+            const actual = (try store.getTable(a, group, source.table_id)) orelse continue;
+            try self.manager.upsertTable(actual);
+        }
+        self.durable_revision = try store.standaloneRevision();
+        self.epoch = self.durable_revision;
+    }
+
     fn reconcileRelations(self: *LocalStandaloneMetadata) !void {
         // HA has a separate writer/replica authority contract. A standalone
         // coordinator cannot activate a single-owner capability for it.
@@ -3568,7 +3605,10 @@ const LocalStandaloneMetadata = struct {
         // the next catalog reader. No full projection scan on control rounds.
         if (self.durable_revision != 0 and self.durable_revision == before and
             applied and before != std.math.maxInt(u64) and after == before + 1)
+        {
             self.durable_revision = after;
+            self.epoch = after;
+        }
     }
 
     fn provisionRestoreOwners(self: *LocalStandaloneMetadata) !void {
@@ -4468,6 +4508,15 @@ const LocalStandaloneMetadata = struct {
         mutation.committed = true;
         self.durable_revision += 1;
         self.epoch = self.durable_revision;
+        var projected_tables = mutation.previous_tables.keyIterator();
+        while (projected_tables.next()) |id| {
+            if (!self.manager.tables.contains(id.*)) continue;
+            const actual = (try self.lifecycle_store.?.getTable(a, group_ids.main_metadata_group_id, id.*)) orelse return error.TableLifecycleConflict;
+            self.manager.upsertTable(actual) catch {
+                self.durable_revision = 0;
+                return error.MetadataMutationOutcomeUnknown;
+            };
+        }
     }
 
     fn persistMutationLocked(self: *LocalStandaloneMetadata, mutation: *CatalogMutation) !void {
@@ -5062,31 +5111,32 @@ pub fn runFromIterator(
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
+    defer if (comptime !control_only_storage_sources) if (auth_backend) |*backend| backend.close();
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (auth_runtime) |*runtime| runtime.deinit();
     var kernel_auth_users_store: ?antfly.storage_backend_erased.Store = null;
+    defer if (kernel_auth_users_store) |*store| store.deinit();
     var kernel_auth_casbin_store: ?antfly.storage_backend_erased.Store = null;
+    defer if (kernel_auth_casbin_store) |*store| store.deinit();
     var kernel_auth_users_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
     var kernel_auth_casbin_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
     var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
     var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
     var user_manager: ?antfly.usermgr.UserManager = null;
+    defer if (user_manager) |*manager| manager.deinit();
     if (auth_enabled) {
         if (comptime control_only_storage_sources) {
             kernel_auth_users_store = try storage_kernel_context.systemStore(alloc, "system/auth-users");
-            errdefer kernel_auth_users_store.?.deinit();
             kernel_auth_casbin_store = try storage_kernel_context.systemStore(alloc, "system/auth-casbin");
-            errdefer kernel_auth_casbin_store.?.deinit();
             kernel_auth_users_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_users_store.?, "usermgr_users");
-            errdefer kernel_auth_users_runtime.?.deinit();
             kernel_auth_casbin_runtime = try kernel_owner_client.singleNamespaceStore(alloc, &kernel_auth_casbin_store.?, "usermgr_casbin");
-            errdefer kernel_auth_casbin_runtime.?.deinit();
             auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, kernel_auth_users_runtime.?);
             auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, kernel_auth_casbin_runtime.?);
         } else {
             auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
-            errdefer if (auth_backend) |*backend| backend.close();
             auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
-            errdefer if (auth_runtime) |*runtime| runtime.deinit();
             auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
             auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
         }
@@ -5096,7 +5146,6 @@ pub fn runFromIterator(
             auth_user_store.?.iface(),
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
-        errdefer if (user_manager) |*manager| manager.deinit();
         if (hot_standby_role_requested) {
             // Auth is carried by the portable seed, not the continuous HA WAL.
             // Creating a local default admin on either HA role after seeding
@@ -5118,13 +5167,6 @@ pub fn runFromIterator(
             };
         }
     }
-    defer if (user_manager) |*manager| manager.deinit();
-    defer if (auth_runtime) |*runtime| runtime.deinit();
-    defer if (comptime !control_only_storage_sources) if (auth_backend) |*backend| backend.close();
-    defer if (kernel_auth_users_store) |*store| store.deinit();
-    defer if (kernel_auth_casbin_store) |*store| store.deinit();
-    defer if (kernel_auth_users_runtime) |*runtime| runtime.deinit();
-    defer if (kernel_auth_casbin_runtime) |*runtime| runtime.deinit();
 
     const public_listener = resolvePublicListener(cli);
     antfly.common.listener_security.warnIfUnauthenticated("public", public_listener.bind_host, public_listener.bind_port, auth_enabled);

@@ -3673,6 +3673,7 @@ test "capi lite open options validate and configure ttl cleanup" {
         antfly.platform_clock.Clock.real().sleepMs(10);
     }
     defer freeRawBuffer(stats.ptr, stats.len);
+    if (attempts == 200) std.debug.print("\nTTL cleanup did not converge: {s}\n", .{stats.ptr.?[0..stats.len]});
     try std.testing.expect(attempts < 200);
 }
 
@@ -6192,6 +6193,171 @@ test "capi native replacement wait observes its background owner without rebuild
     )));
 }
 
+test "capi native idle maintenance discovers resolver debt after producer checkpoint" {
+    try testNativeIdleResolverDebt(false, false, null);
+}
+
+test "capi native idle maintenance discovers persisted enrichment target beyond journal" {
+    try testNativeIdleResolverDebt(true, false, null);
+}
+
+test "capi native idle maintenance continues resolver replay after TTL failure" {
+    try testNativeIdleResolverDebt(false, true, null);
+}
+
+test "capi native idle maintenance discovers cursor-only resolver debt" {
+    const catalog = @import("antfly_local_sources").storage_db_catalog_resolver_catalog;
+    for ([_][]const u8{ catalog.reresolve_resume_key, catalog.reresolve_repair_resume_key }) |cursor|
+        try testNativeIdleResolverDebt(false, false, cursor);
+}
+
+fn testNativeIdleResolverDebt(notified_tail: bool, ttl_failure: bool, cursor: ?[]const u8) !void {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("native-resolver-durable-debt");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    options.flags |= capi.open_flag_generated_enrichment_replay;
+    if (ttl_failure) {
+        options.flags |= capi.open_flag_ttl_cleanup;
+        options.ttl_cleanup_enabled = true;
+        options.ttl_cleanup_lease_owned = true;
+        options.ttl_cleanup_grace_period_ns = 0;
+    }
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const Pause = struct {
+        fn run(db_handle: ?*anyopaque) !std.meta.Child(@FieldType(shared.Handle, "maintenance_owner")) {
+            const guard = public.enterHandle(db_handle, .exclusive).?;
+            const owner = guard.connection.?.owner;
+            guard.leave();
+            owner.stopping.store(true, .release);
+            owner.wake.set(shared.handleLockIo());
+            owner.worker.?.join();
+            owner.worker = null;
+            owner.stopping.store(false, .release);
+            return owner;
+        }
+    };
+    var owner = try Pause.run(handle);
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const database = &guard.handle.db;
+        try database.addIndex(.{ .name = "kg", .kind = .graph, .config_json =
+            \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"payload"},"content_type":"application/json"},"edge_types":[{"name":"about"}]}
+        });
+        _ = try database.upsertResolverWithResultOptions(.{
+            .name = "concepts",
+            .table = "default",
+            .source_artifact = "extraction",
+            .resolution_artifact = "resolution",
+            .key_template = "entity/{{ uslug _entity.text }}",
+            .promote = false,
+            .inline_managed = true,
+        }, .{ .drain_backfill = false });
+        const document = try std.json.Stringify.valueAlloc(a, .{ .payload = "{\"entities\":[{\"id\":\"a\",\"text\":\"Antfly\",\"label\":\"technology\"}],\"relations\":[]}" }, .{});
+        defer a.free(document);
+        try database.batch(.{ .writes = &.{.{ .key = "seed", .value = document }}, .sync_level = .write });
+        // Simulate a process/turn boundary after the producer checkpoint but
+        // before resolver replay. Durable work must not depend on a wake flag.
+        for (0..8) |_| {
+            const target = database.core.nextDerivedSequence();
+            try database.runEnrichmentUntil(target);
+            if (database.core.nextDerivedSequence() == target) break;
+        }
+        const stats = database.pendingWorkStats();
+        try std.testing.expect(stats.enrichment.applied_sequence >= database.core.nextDerivedSequence());
+        try std.testing.expect(stats.resolution.catch_up_required);
+        if (cursor) |key| {
+            try database.runUntilIdle();
+            const settled = database.pendingWorkStats();
+            try std.testing.expect(!settled.resolution.catch_up_required);
+            try std.testing.expect(!settled.promotion.catch_up_required);
+            // Leave no harmless generated/derived tail that could admit a
+            // maintenance turn independently of the backfill cursor.
+            const target = database.core.nextDerivedSequence();
+            for ([_][]const u8{ "generated", "resolution", "promotion" }) |scope| {
+                var checkpoint = try db_mod.enrichment_state.loadProjectionCheckpoint(a, database.core.store, scope);
+                checkpoint.applied_sequence = target;
+                try db_mod.enrichment_state.saveProjectionCheckpoint(database.core.store, scope, checkpoint);
+            }
+            // A durable backfill can be admitted without appending replay
+            // records. Equal watermarks must not make the owner skip it.
+            try database.core.store.putBatch(&.{.{ .key = key, .value = "" }}, &.{});
+            if (database.resolution_runtime) |runtime| runtime.notifyBackfill();
+            try std.testing.expect(database.pendingWorkStats().resolution.catch_up_required);
+        }
+        if (notified_tail) {
+            const target = database.core.nextDerivedSequence() + 1;
+            database.enrichment_runtime.?.notifySequence(target);
+            try db_mod.enrichment_state.saveRuntimeStatus(database.core.store, "generated", .{ .target_sequence = target });
+        }
+        if (ttl_failure) {
+            try database.core.index_manager.aggregateAuthoritativeReaderVersion(database.core.store, 4);
+            // A bad independent expiry page must remain visible without
+            // preventing resolver/promotion replay from advancing.
+            const keys = @import("antfly_local_sources").storage_internal_keys;
+            const bad_key = try std.mem.concat(a, u8, &.{ &keys.graph_edge_expiration_index_prefix, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 }, "bad" });
+            defer a.free(bad_key);
+            try database.core.store.putBatch(&.{.{ .key = bad_key, .value = "bad" }}, &.{});
+        }
+        owner.maintenance_pending = false;
+        owner.maintenance_round_pending = false;
+    }
+    // A fresh owner must rediscover the debt without any process-local wake.
+    antfly_db_close(handle);
+    handle = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
+    owner = try Pause.run(handle);
+    if (cursor != null) {
+        const guard = public.enterHandle(handle, .read).?;
+        defer guard.leave();
+        const pending = guard.handle.db.pendingWorkStats();
+        const target = guard.handle.db.core.nextDerivedSequence();
+        try std.testing.expect(pending.enrichment.applied_sequence >= target);
+        try std.testing.expect(pending.resolution.applied_sequence >= target);
+        try std.testing.expect(pending.promotion.applied_sequence >= target);
+        try std.testing.expect(pending.resolution.catch_up_required);
+        owner.maintenance_pending = false;
+        owner.maintenance_round_pending = false;
+    }
+    var ttl_failures: usize = 0;
+    for (0..64) |_| {
+        const pending = owner.maintenanceTurnForTest() catch |err| {
+            if (!ttl_failure or err != error.InvalidGraphTtlCandidate) return err;
+            ttl_failures += 1;
+            continue;
+        };
+        if (!pending) break;
+    }
+    if (ttl_failure) try std.testing.expectEqual(@as(usize, 1), ttl_failures);
+    const guard = public.enterHandle(handle, .read).?;
+    defer guard.leave();
+    const stats = guard.handle.db.pendingWorkStats();
+    try std.testing.expect(stats.enrichment.applied_sequence >= stats.enrichment.target_sequence);
+    try std.testing.expect(!stats.resolution.catch_up_required);
+    try std.testing.expect(!stats.promotion.catch_up_required);
+    if (cursor) |key| {
+        var probe = try guard.handle.db.core.store.beginProbeTxn();
+        defer probe.abort();
+        try std.testing.expectError(error.NotFound, probe.get(key));
+    }
+    if (ttl_failure) {
+        var ttl = guard.handle.db.ttl_runtime.?.stats();
+        owner.overlayTtlStats(&guard.handle.db, &ttl);
+        try std.testing.expect(ttl.error_count > 0);
+        try std.testing.expect(owner.publication_stats.maintenance_errors > 0);
+    }
+}
+
 test "capi native resolver maintenance retries transient inference and survives reopen" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const producer = @import("antfly_local_sources").storage_db_enrichment_asset_producer;
@@ -6258,7 +6424,7 @@ test "capi native resolver maintenance retries transient inference and survives 
         extern fn antfly_db_create_table_json(?*anyopaque, capi.Slice, capi.Slice) capi.ErrorCode;
     }.antfly_db_create_table_json(handle, .fromSlice("concepts"), .fromSlice("{}")));
     const config =
-        \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"text"},"content_type":"application/json","producer_json":{"type":"generator","config":{"provider":"mock"}}},"edge_types":[{"name":"about"}],"resolvers":[{"name":"concepts","table":"concepts","source_artifact":"extraction","resolution_artifact":"resolution","key_template":"concept/{{ uslug _entity.text }}"}]}
+        \\{"source":{"artifact":"extraction","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"about"},"artifact":{"name":"extraction","kind":"asset","source":{"type":"field","value":"text"},"content_type":"application/json","producer_json":{"type":"generator","config":{"provider":"antfly","model":"test-generator"}}},"edge_types":[{"name":"about"}],"resolvers":[{"name":"concepts","table":"concepts","source_artifact":"extraction","resolution_artifact":"resolution","key_template":"concept/{{ uslug _entity.text }}"}]}
     ;
     const index = try std.json.Stringify.valueAlloc(a, .{ .name = "kg", .kind = "graph", .config_json = config }, .{});
     defer a.free(index);
@@ -6694,4 +6860,250 @@ test "capi lite inference failed open drains the configured generation before re
     borrower.deinit();
     // Exercise final-service destruction through the same failed-open path.
     try std.testing.expectError(error.UnexpectedEndOfInput, public.openLiteHandleAllocWithRuntime(a, path, options, false, shared.handleLockIo(), null));
+}
+
+test "capi SQL document search projects native cells without copying unselected bodies" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-document-search");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer database.close();
+    try database.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"object","properties":{"amount":{"type":"integer"}}},"ignored":{"type":"string"}},"additionalProperties":false}}}}
+    );
+    try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    const ignored = try a.alloc(u8, 1024 * 1024);
+    defer a.free(ignored);
+    @memset(ignored, 'x');
+    const document = try std.fmt.allocPrint(a, "{{\"body\":\"alpha\",\"payload\":{{\"amount\":9007199254740993}},\"ignored\":\"{s}\"}}", .{ignored});
+    defer a.free(document);
+    try database.batch(.{ .writes = &.{.{ .key = "a", .value = document }} });
+    try database.runUntilIdle();
+    const sql = @import("antfly_local_sources").capi_sql;
+    var adapter = sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    var searched = try sql.compiler.compile(a, "SELECT _id,body,payload->>'amount',score FROM antfly_search('rows','body:alpha')", .{});
+    defer searched.deinit();
+    var hits = try sql.runtime.execute(a, adapter.backend(), &searched, &.{}, .{ .page_rows = 1 });
+    defer hits.deinit();
+    try std.testing.expectEqual(@as(usize, 1), hits.output.rows.len);
+    try std.testing.expectEqualStrings("a", hits.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("alpha", hits.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[0][2].string);
+    try std.testing.expect(!hits.output.sql_nulls.?[0][3]);
+    var native_json = try sql.compiler.compile(a, "SELECT _id,payload FROM antfly_search('rows','body:alpha')", .{});
+    defer native_json.deinit();
+    const stream = (try @import("antfly_local_sources").sql_read_stream.Stream.open(a, adapter.backend(), &native_json, &.{}, .{ .page_rows = 1 })).?;
+    defer stream.close();
+    var native_page = try stream.nextBatch(1);
+    defer native_page.deinit();
+    try std.testing.expectEqualStrings("a", (try native_page.values.cell(native_page.arena.allocator(), 0, 0)).value.string);
+    try std.testing.expectEqualStrings("{\"amount\":9007199254740993}", (try native_page.values.encodedJson(0, 1)).?);
+    var metadata = try sql.compiler.compile(a, "SELECT _id,score FROM antfly_search('rows','body:alpha')", .{});
+    defer metadata.deinit();
+    var metadata_hits = try sql.runtime.execute(a, adapter.backend(), &metadata, &.{}, .{});
+    defer metadata_hits.deinit();
+    try std.testing.expectEqualStrings("a", metadata_hits.output.rows[0][0].string);
+    try std.testing.expect(!metadata_hits.output.sql_nulls.?[0][1]);
+    var count = try sql.compiler.compile(a, "SELECT count(*) FROM antfly_search('rows','body:alpha')", .{});
+    defer count.deinit();
+    var counted = try sql.runtime.execute(a, adapter.backend(), &count, &.{}, .{});
+    defer counted.deinit();
+    try std.testing.expectEqualStrings("1", counted.output.rows[0][0].string);
+}
+
+test "capi SQL document ranked hydration pins old primary bytes and retires each scope" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator, is_lite: bool) !void {
+            var directory = try TestDirectory.init("capi-sql-document-ranked-cut");
+            defer directory.cleanup();
+            try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+            const path = try std.fmt.allocPrint(a, "{s}/primary.aflite", .{directory.path()});
+            defer a.free(path);
+            var lite_runtime: ?db_mod.background_runtime.BackendRuntimeHandle = if (is_lite) try .initManualWithOwnedIo(a) else null;
+            defer if (lite_runtime) |*runtime| runtime.deinit();
+            const handle = if (is_lite) try public.openLiteHandleAllocWithRuntime(a, path, .{ .profile = .hosted, .open_mode = .writer_no_replay, .no_sync = true }, true, shared.handleLockIo(), lite_runtime.?.runtime) else null;
+            defer if (handle) |owner| shared.closeHandle(owner);
+            var lsm: db_mod.DB = if (is_lite) undefined else try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            defer if (!is_lite) lsm.close();
+            const database = if (handle) |owner| &owner.db else &lsm;
+            try database.setSchemaJson(a,
+                \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"string"},"ignored":{"type":"string"}},"additionalProperties":false}}}}
+            );
+            try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+            const ignored = try a.alloc(u8, 1024 * 1024);
+            defer a.free(ignored);
+            var random = std.Random.DefaultPrng.init(0x9561165);
+            random.random().bytes(ignored);
+            for (ignored) |*byte| byte.* = 'a' + byte.* % 26;
+            const document = try std.fmt.allocPrint(a, "{{\"ignored\":\"{s}\",\"body\":\"alpha\"}}", .{ignored});
+            defer a.free(document);
+            const second = try std.fmt.allocPrint(a, "{{\"ignored\":\"{s}\",\"body\":\"beta\"}}", .{ignored});
+            defer a.free(second);
+            try database.batch(.{ .writes = &.{ .{ .key = "a", .value = document }, .{ .key = "b", .value = second }, .{ .key = "legacy", .value = document } } });
+            var small_arena = std.heap.ArenaAllocator.init(a);
+            defer small_arena.deinit();
+            const small_a = small_arena.allocator();
+            var small_ids: [64][]const u8 = undefined;
+            var small_writes: [64]db_mod.types.BatchWrite = undefined;
+            for (&small_ids, &small_writes, 0..) |*id, *write, index| {
+                id.* = try std.fmt.allocPrint(small_a, "s-{d:0>3}", .{index});
+                write.* = .{ .key = id.*, .value = "{\"body\":\"tiny\",\"ignored\":\"small\"}" };
+            }
+            try database.batch(.{ .writes = &small_writes });
+            try database.runUntilIdle();
+            // Exercise production cursor batching as well as the reader below.
+            // Seventeen-row pages cross several proof/body window boundaries.
+            const sql = @import("antfly_local_sources").capi_sql;
+            var adapter = sql.Adapter(antfly){ .db = database, .table_name = "rows" };
+            var statement = try sql.compiler.compile(a, "SELECT _id,body FROM antfly_search('rows','body:tiny',64) ORDER BY _id", .{});
+            defer statement.deinit();
+            var output = try sql.runtime.execute(a, adapter.backend(), &statement, &.{}, .{ .page_rows = 17 });
+            defer output.deinit();
+            try std.testing.expectEqual(@as(usize, 64), output.output.rows.len);
+            for (output.output.rows, small_ids) |row, id| {
+                try std.testing.expectEqualStrings(id, row[0].string);
+                try std.testing.expectEqualStrings("tiny", row[1].string);
+            }
+            const revisions = @import("antfly_local_sources").storage_document_mutation_revision;
+            const projection_keys = @import("antfly_local_sources").storage_document_projection;
+            const legacy_key = try revisions.keyForDocumentAlloc(a, "legacy");
+            try database.core.store.delete(&projection_keys.keyForRevision(legacy_key));
+            var budget: @import("antfly_local_sources").sql_memory_budget = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+            var lease = try database.beginQueryReadLease();
+            var held = true;
+            defer if (held) lease.release();
+            var reader = try lease.documentRows(budget.allocator(), 1);
+            defer reader.deinit();
+            const file = if (handle) |owner| &owner.owned_lite_backend.?.native_docstore.?.read_generation.?.file else null;
+            if (file) |native_file| native_file.page_cache_enabled.store(false, .monotonic);
+            var ranked = (try lease.search(a, .{ .full_text = .{ .match_all = {} }, .limit = 2, .include_stored = false })).result;
+            defer ranked.deinit();
+            try std.testing.expectEqual(@as(usize, 2), ranked.hits.len);
+            for (ranked.hits) |hit| try std.testing.expect(hit.stored_data == null and hit.source_value == null);
+            lease.release();
+            held = false;
+            try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"changed\",\"ignored\":\"small\"}" }}, .deletes = &.{"b"} });
+            try database.runUntilIdle();
+            // Both projections use the original captured cut, after update/delete.
+            const projected_before = if (file) |native_file| native_file.test_backing_read_bytes.load(.monotonic) else 0;
+            const projected = try reader.lookupProjectedBatch(&.{ "a", "b" }, &.{"body"}, 256 * 1024);
+            try std.testing.expectEqual(@as(usize, if (is_lite) 2 else 1), projected.consumed);
+            if (is_lite) try std.testing.expectEqualStrings("\"beta\"", projected.values[1].fields[0].value);
+            try std.testing.expectEqualStrings("body", projected.values[0].fields[0].name);
+            try std.testing.expectEqualStrings("\"alpha\"", projected.values[0].fields[0].value);
+            const projected_reads = if (file) |native_file| native_file.test_backing_read_bytes.load(.monotonic) - projected_before else 0;
+            std.debug.print("projected hydration lite={any}: scoped_peak={d} backing_read_bytes={d} source_bytes={d}\n", .{ is_lite, budget.peak, projected_reads, document.len });
+            if (is_lite) {
+                try std.testing.expect(budget.peak < 256 * 1024);
+                try std.testing.expect(projected_reads < document.len / 4);
+            }
+            reader.releasePage();
+            const repeated_projection = try reader.lookupProjectedBatch(&.{ "b", "a", "b" }, &.{"body"}, 256 * 1024);
+            try std.testing.expectEqualStrings("\"beta\"", repeated_projection.values[0].fields[0].value);
+            if (is_lite) {
+                try std.testing.expectEqual(@as(usize, 3), repeated_projection.consumed);
+                try std.testing.expectEqualStrings("\"alpha\"", repeated_projection.values[1].fields[0].value);
+                try std.testing.expectEqual(repeated_projection.values[0].fields.ptr, repeated_projection.values[2].fields.ptr);
+            }
+            reader.releasePage();
+            const bounded_projection = try reader.lookupProjectedBatch(&.{ "b", "a" }, &.{"body"}, 8);
+            try std.testing.expectEqual(@as(usize, 1), bounded_projection.consumed);
+            const metadata_owner = reader.directory_scope.?.ptr;
+            const cached_directory = reader.directories[1].?.ptr;
+            budget.limit = 0;
+            try std.testing.expectError(error.OutOfMemory, reader.lookupProjectedBatch(&.{"a"}, &.{"body"}, 8));
+            budget.limit = 8 * 1024 * 1024;
+            const continued_projection = try reader.lookupProjectedBatch(&.{"a"}, &.{"body"}, 8);
+            try std.testing.expectEqual(metadata_owner, reader.directory_scope.?.ptr);
+            try std.testing.expectEqual(cached_directory, reader.directories[1].?.ptr);
+
+            try std.testing.expectEqualStrings("\"alpha\"", continued_projection.values[0].fields[0].value);
+            reader.releasePage();
+            const absent_projection = try reader.lookupProjectedBatch(&.{ "b", "a", "b" }, &.{"not-present"}, 8);
+            try std.testing.expectEqual(@as(usize, 3), absent_projection.consumed);
+            for (absent_projection.values) |source| try std.testing.expectEqual(@as(usize, 0), source.fields.len);
+            reader.releasePage();
+            const deleted_projection = try reader.lookupProjectedBatch(&.{"b"}, &.{"body"}, 256 * 1024);
+            try std.testing.expectEqualStrings("\"beta\"", deleted_projection.values[0].fields[0].value);
+            reader.releasePage();
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            const legacy = try reader.lookupProjectedBatch(&.{"legacy"}, &.{"body"}, 256 * 1024);
+            try std.testing.expectEqualSlices(u8, document, legacy.values[0].bytes);
+            reader.releasePage();
+            for (0..32) |index| {
+                const raw = try reader.lookup(if (index % 2 == 0) "a" else "b");
+                try std.testing.expectEqualSlices(u8, if (index % 2 == 0) document else second, raw);
+            }
+            // The primary generation remains pinned, but body/decompression owners
+            // retire on every lookup rather than accumulating across the result set.
+            try std.testing.expect(budget.peak < 8 * 1024 * 1024);
+            reader.releasePage();
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            try std.testing.expectEqualSlices(u8, second, try reader.lookup("b"));
+            reader.releasePage();
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            budget.limit = 0;
+            try std.testing.expectError(error.OutOfMemory, reader.lookupBatch(&.{ "b", "a", "b" }, 4 * 1024 * 1024));
+            budget.limit = 8 * 1024 * 1024;
+            // Retry the failed metadata preparation on the same pinned owner.
+            const batch = try reader.lookupBatch(&.{ "b", "a", "b" }, 4 * 1024 * 1024);
+            try std.testing.expectEqual(@as(usize, 3), batch.consumed);
+            try std.testing.expectEqualSlices(u8, second, batch.values[0].?);
+            try std.testing.expectEqualSlices(u8, document, batch.values[1].?);
+            try std.testing.expectEqualSlices(u8, second, batch.values[2].?);
+            reader.releasePage();
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            const isolated = try reader.lookupBatch(&.{ "a", "b" }, 1);
+            try std.testing.expectEqual(@as(usize, 1), isolated.consumed);
+            try std.testing.expectEqualSlices(u8, document, isolated.values[0].?);
+            // Consume the cached suffix with a different byte target. A caller
+            // can supply more IDs than remain in the current proof window.
+            const suffix = try reader.lookupBatch(&.{ "b", "s-000" }, 256 * 1024);
+            try std.testing.expectEqual(@as(usize, 1), suffix.consumed);
+            try std.testing.expectEqualSlices(u8, second, suffix.values[0].?);
+            reader.releasePage();
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            try std.testing.expectError(error.InvalidBatch, reader.lookupBatch(&.{ "a", "b" }, 0));
+            reader.releasePage();
+            const point_before = if (file) |native_file| native_file.test_page_reads.load(.monotonic) else 0;
+            for (small_ids) |id| try std.testing.expectEqualStrings("{\"body\":\"tiny\",\"ignored\":\"small\"}", try reader.lookup(id));
+            const point_reads = if (file) |native_file| native_file.test_page_reads.load(.monotonic) - point_before else 0;
+            reader.releasePage();
+            const batch_before = if (file) |native_file| native_file.test_page_reads.load(.monotonic) else 0;
+            const small = try reader.lookupBatch(&small_ids, 256 * 1024);
+            try std.testing.expectEqual(@as(usize, 64), small.consumed);
+            for (small.values) |raw| try std.testing.expectEqualStrings("{\"body\":\"tiny\",\"ignored\":\"small\"}", raw.?);
+            const batch_reads = if (file) |native_file| native_file.test_page_reads.load(.monotonic) - batch_before else 0;
+            if (file != null) std.debug.print("document hydration 64 small keys: point pages {d}, bounded batch pages incl proofs {d}\n", .{ point_reads, batch_reads });
+            reader.releasePage();
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            const legacy_revision = blk: {
+                var txn = try database.core.store.beginReadTxn();
+                defer txn.abort();
+                break :blk try revisions.load(&txn, legacy_key);
+            };
+            try std.testing.expect(database.document_authority_backfill_requested.load(.acquire));
+            // Manual owners drive the independent authority worker explicitly;
+            // runUntilIdle drains replay/index work, not this cache migration.
+            var maintenance_pages: usize = 0;
+            while (database.document_authority_backfill_active.load(.acquire) or database.document_authority_backfill_requested.load(.acquire)) : (maintenance_pages += 1) {
+                try std.testing.expect(maintenance_pages < 256);
+                _ = try database.advanceDocumentAuthorityBackfillPage();
+            }
+            {
+                var txn = try database.core.store.beginReadTxn();
+                defer txn.abort();
+                try std.testing.expectEqual(legacy_revision, try revisions.load(&txn, legacy_key));
+            }
+            var migrated_lease = try database.beginQueryReadLease();
+            defer migrated_lease.release();
+            var migrated = try migrated_lease.documentRows(budget.allocator(), 1);
+            defer migrated.deinit();
+            const migrated_value = try migrated.lookupProjectedBatch(&.{"legacy"}, &.{"body"}, 256 * 1024);
+            try std.testing.expectEqualStrings("\"alpha\"", migrated_value.values[0].fields[0].value);
+            std.debug.print("document ranked hydration lite={any}: scoped peak {d} bytes across snapshot and bounded batch reads\n", .{ is_lite, budget.peak });
+        }
+    };
+    try Fixture.run(std.testing.allocator, false);
+    try Fixture.run(std.testing.allocator, true);
 }

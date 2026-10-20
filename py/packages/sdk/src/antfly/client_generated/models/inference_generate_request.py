@@ -37,6 +37,10 @@ class InferenceGenerateRequest:
         messages (list[InferenceChatMessage]): Conversation messages (OpenAI-compatible format). When
             `context_management.checkpoint` is supplied, this array is the active suffix;
             the archived prefix represented by the checkpoint is not resent.
+        logprobs (bool | Unset): Return actual token log-probabilities for non-streaming native grammar decoding.
+            Incompatible routes reject the request. Default: False.
+        top_logprobs (int | Unset): Bounded alternatives per decoded token; retained evidence also has a hard byte
+            ceiling. Default: 64.
         max_tokens (int | Unset): Maximum tokens to generate Default: 256. Example: 256.
         temperature (float | Unset): Sampling temperature (0.0 = deterministic, higher = more random) Default: 0.0.
             Example: 0.7.
@@ -121,6 +125,8 @@ class InferenceGenerateRequest:
 
     model: str
     messages: list[InferenceChatMessage]
+    logprobs: bool | Unset = False
+    top_logprobs: int | Unset = 64
     max_tokens: int | Unset = 256
     temperature: float | Unset = 0.0
     top_p: float | Unset = 0.0
@@ -159,6 +165,10 @@ class InferenceGenerateRequest:
         for messages_item_data in self.messages:
             messages_item = messages_item_data.to_dict()
             messages.append(messages_item)
+
+        logprobs = self.logprobs
+
+        top_logprobs = self.top_logprobs
 
         max_tokens = self.max_tokens
 
@@ -259,6 +269,10 @@ class InferenceGenerateRequest:
                 "messages": messages,
             }
         )
+        if logprobs is not UNSET:
+            field_dict["logprobs"] = logprobs
+        if top_logprobs is not UNSET:
+            field_dict["top_logprobs"] = top_logprobs
         if max_tokens is not UNSET:
             field_dict["max_tokens"] = max_tokens
         if temperature is not UNSET:
@@ -340,6 +354,10 @@ class InferenceGenerateRequest:
             messages_item = InferenceChatMessage.from_dict(messages_item_data)
 
             messages.append(messages_item)
+
+        logprobs = d.pop("logprobs", UNSET)
+
+        top_logprobs = d.pop("top_logprobs", UNSET)
 
         max_tokens = d.pop("max_tokens", UNSET)
 
@@ -481,6 +499,8 @@ class InferenceGenerateRequest:
         inference_generate_request = cls(
             model=model,
             messages=messages,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,

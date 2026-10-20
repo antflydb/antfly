@@ -9043,7 +9043,8 @@ pub const KernelModule = struct {
         try checkBytes(q, count);
         try checkBytes(k, count);
         try checkBytes(v, count);
-        try checkRawBytes(mask, try checkedTensorElements(batch, seq) * @sizeOf(i64));
+        // The kernel also accepts null for unmasked vision attention.
+        if (mask.ptr != 0) try checkRawBytes(mask, try checkedTensorElements(batch, seq) * @sizeOf(i64));
         var dst_ptr = dst.ptr;
         var q_ptr = q.ptr;
         var k_ptr = k.ptr;

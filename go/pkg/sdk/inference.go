@@ -484,7 +484,25 @@ func (c *InferenceClient) ListModels(ctx context.Context) (*oapi.InferenceModels
 // Decide answers named choice, score, and Boolean questions using a decision
 // capable inference model.
 func (c *InferenceClient) Decide(ctx context.Context, req oapi.InferenceDecideRequest) (*oapi.InferenceDecideResponse, error) {
-	resp, err := c.client.DecideWithResponse(ctx, req)
+	var body oapi.DecisionRequest
+	if err := body.FromInferenceDecideRequest(req); err != nil {
+		return nil, fmt.Errorf("encoding decision request: %w", err)
+	}
+	return c.decide(ctx, body)
+}
+
+// DecideGenerated answers typed questions with a registered generator using
+// constrained decoding. The model must support the selected output mode.
+func (c *InferenceClient) DecideGenerated(ctx context.Context, req oapi.GeneratedDecideRequest) (*oapi.InferenceDecideResponse, error) {
+	var body oapi.DecisionRequest
+	if err := body.FromGeneratedDecideRequest(req); err != nil {
+		return nil, fmt.Errorf("encoding generated decision request: %w", err)
+	}
+	return c.decide(ctx, body)
+}
+
+func (c *InferenceClient) decide(ctx context.Context, body oapi.DecisionRequest) (*oapi.InferenceDecideResponse, error) {
+	resp, err := c.client.DecideWithResponse(ctx, oapi.DecideJSONRequestBody(body))
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}
@@ -500,7 +518,25 @@ func (c *InferenceClient) Decide(ctx context.Context, req oapi.InferenceDecideRe
 // Extract runs schema-driven extraction through the canonical Antfly inference
 // extraction endpoint.
 func (c *InferenceClient) Extract(ctx context.Context, req oapi.ExtractionRequest) (*oapi.ExtractionResponse, error) {
-	resp, err := c.client.ExtractWithResponse(ctx, req)
+	var body oapi.ExtractionInputRequest
+	if err := body.FromExtractionRequest(req); err != nil {
+		return nil, fmt.Errorf("encoding extraction request: %w", err)
+	}
+	return c.extract(ctx, body)
+}
+
+// ExtractGenerated extracts source-grounded entities and relations with a
+// registered generator using constrained decoding.
+func (c *InferenceClient) ExtractGenerated(ctx context.Context, req oapi.GeneratedExtractionRequest) (*oapi.ExtractionResponse, error) {
+	var body oapi.ExtractionInputRequest
+	if err := body.FromGeneratedExtractionRequest(req); err != nil {
+		return nil, fmt.Errorf("encoding generated extraction request: %w", err)
+	}
+	return c.extract(ctx, body)
+}
+
+func (c *InferenceClient) extract(ctx context.Context, body oapi.ExtractionInputRequest) (*oapi.ExtractionResponse, error) {
+	resp, err := c.client.ExtractWithResponse(ctx, oapi.ExtractJSONRequestBody(body))
 	if err != nil {
 		return nil, fmt.Errorf("sending request: %w", err)
 	}

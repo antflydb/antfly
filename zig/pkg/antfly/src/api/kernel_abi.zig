@@ -28,8 +28,8 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-// Version 20 adds incremental reads to the shared HTTP RequestBodySource.
-pub const abi_version: u32 = 20;
+// Version 21 combines main's control contract with incremental request-body reads.
+pub const abi_version: u32 = 21;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 

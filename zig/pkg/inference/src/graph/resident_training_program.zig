@@ -107,9 +107,7 @@ const CombinedControl = struct {
             if (result.progress == null) result.progress = original.progress;
             if (original.deadline_ns) |deadline| result.deadline_ns = if (result.deadline_ns) |other| @min(deadline, other) else deadline;
         }
-        result.ptr = self;
-        result.check_fn = checkBoth;
-        return result;
+        return result.withCheckpoint(self, checkBoth);
     }
 };
 

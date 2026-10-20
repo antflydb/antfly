@@ -272,6 +272,7 @@ pub const Handle = struct {
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
                 opts.index_backends.vector_block_storage = storage;
+                opts.index_backends.generation_storage = storage;
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.index_repair_checkpoint_storage = storage;
@@ -294,6 +295,7 @@ pub const Handle = struct {
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
                 opts.index_backends.vector_block_storage = storage;
+                opts.index_backends.generation_storage = storage;
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.index_backends.text_main_lsm_options.storage = storage;
@@ -367,6 +369,7 @@ pub const Handle = struct {
         opts.index_backends.text_lsm_storage = storage;
         opts.index_backends.dense_lsm_storage = storage;
         opts.index_backends.vector_block_storage = storage;
+        opts.index_backends.generation_storage = storage;
         opts.index_backends.sparse_lsm_storage = storage;
         opts.index_backends.graph_lsm_storage = storage;
         opts.index_backends.text_main_lsm_options.storage = storage;
@@ -500,7 +503,7 @@ pub const Handle = struct {
     }
 
     pub fn storageStatus(self: *Handle) StorageStatus {
-        if (self.native_docstore) |store| platform_sync.lockYielding(&store.mutex);
+        if (self.native_docstore) |store| store.mutex.lock();
         defer if (self.native_docstore) |store| store.mutex.unlock();
         return switch (self.engine) {
             .native_single_file => blk: {
@@ -839,7 +842,7 @@ fn nativeVacuumReport(handle: *Handle, cancel: ?*const maintenance.CancelToken) 
 
 fn nativeStableSnapshot(handle: *Handle, dest_path: []const u8, replace: bool) !StableSnapshotReport {
     const store = handle.native_docstore.?;
-    platform_sync.lockYielding(&store.mutex);
+    store.mutex.lock();
     defer store.mutex.unlock();
     return try store.file.copyStableSnapshotToPath(dest_path, replace);
 }

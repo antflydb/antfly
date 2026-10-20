@@ -347,6 +347,8 @@ pub const PreparedRelationalProjection = struct {
 /// parse supplies validation, special-field extraction, the semantic digest,
 /// and the physical base row.
 pub const PreparedRelationalWrite = struct {
+    /// Bounded grouped projections retained with the prepared row region.
+    group_changes: ?[]const @import("group_source_mutations.zig").Plan.Change = null,
     parsed: ?std.json.Parsed(std.json.Value),
     extracted: ExtractedWrite,
     packed_row: []u8,
@@ -6699,7 +6701,7 @@ test "relational index system NUMERIC array modifiers round before hashing and s
         }
     };
     try Run.run(a, table, &layout, json);
-    try std.testing.checkAllAllocationFailures(a, Run.run, .{ table, &layout, json });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{ table, &layout, json });
     const overflow =
         \\{"a":{"dimensions":[{"length":2,"lower_bound":-7}],"values":["12.345","99.995"],"sql_nulls":[false,false]}}
     ;

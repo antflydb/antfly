@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const work_control = @import("work_control.zig");
 
 pub const Resample = enum(u32) {
     nearest = 0,
@@ -642,7 +643,7 @@ fn sampleBicubic(
     return std.math.clamp(accum, 0.0, 255.0);
 }
 
-const BicubicAxis = struct {
+pub const BicubicAxis = struct {
     allocator: std.mem.Allocator,
     starts: []usize,
     offsets: []usize,
@@ -659,7 +660,7 @@ const BicubicAxis = struct {
 /// Build Pillow-compatible antialiased bicubic coefficients. Downsampling
 /// widens the cubic support by the reduction factor and renormalizes the
 /// surviving in-bounds taps instead of clamping out-of-bounds samples.
-fn buildPillowBicubicAxis(
+pub fn buildPillowBicubicAxis(
     allocator: std.mem.Allocator,
     source_size: usize,
     target_size: usize,
@@ -679,6 +680,7 @@ fn buildPillowBicubicAxis(
     const filter_scale = @max(scale, 1.0);
     const support = 2.0 * filter_scale;
     for (0..target_size) |target| {
+        if (target & 63 == 0) try @import("work_control.zig").check();
         const center = (@as(f64, @floatFromInt(target)) + 0.5) * scale;
         var first: isize = @intFromFloat(center - support + 0.5);
         var last: isize = @intFromFloat(center + support + 0.5);
@@ -773,22 +775,57 @@ fn preprocessDecodedRectPillowBicubic(
         }
     }
 
+    const row_bytes = target_width * 3;
+    const Vec = @Vector(8, i32);
     for (0..target_height) |target_y| {
         try @import("work_control.zig").check();
         const start = vertical_axis.starts[target_y];
         const begin = vertical_axis.offsets[target_y];
         const end = vertical_axis.offsets[target_y + 1];
-        for (0..target_width) |target_x| {
-            for (0..3) |channel| {
-                var value: i64 = @as(i64, 1) << (vertical_axis.precision_bits - 1);
-                for (vertical_axis.weights[begin..end], 0..) |weight, offset| {
-                    const source_y = start + offset;
-                    value += @as(i64, horizontal[(source_y * target_width + target_x) * 3 + channel]) * weight;
+        const weights = vertical_axis.weights[begin..end];
+        // Bound every partial accumulator before narrowing to SIMD i32.
+        // The wider scalar path preserves the existing behavior when a
+        // coefficient set cannot safely use the faster representation.
+        var magnitude: u64 = @as(u64, 1) << (vertical_axis.precision_bits - 1);
+        var vector_safe = vertical_axis.precision_bits < 32;
+        for (weights) |weight| {
+            const term = @as(u64, @intCast(@abs(@as(i64, weight)))) * 255;
+            magnitude = std.math.add(u64, magnitude, term) catch {
+                vector_safe = false;
+                break;
+            };
+        }
+        var byte_x: usize = 0;
+        if (vector_safe and magnitude <= std.math.maxInt(i32)) {
+            while (byte_x + 8 <= row_bytes) : (byte_x += 8) {
+                var accum: Vec = @splat(@as(i32, 1) << @intCast(vertical_axis.precision_bits - 1));
+                for (weights, 0..) |weight, offset| {
+                    const source = (start + offset) * row_bytes + byte_x;
+                    const bytes: @Vector(8, u8) = horizontal[source..][0..8].*;
+                    const values: Vec = @intCast(bytes);
+                    accum += values * @as(Vec, @splat(weight));
                 }
-                const sample: f32 = @floatFromInt(clipPillowAccumulator(value, vertical_axis.precision_bits));
-                result[channel * target_height * target_width + target_y * target_width + target_x] =
-                    normalizeSample(sample, mean[channel], std_dev[channel], rescale_factor);
+                const clipped = @min(
+                    @max(accum >> @as(@Vector(8, u5), @splat(@intCast(vertical_axis.precision_bits))), @as(Vec, @splat(0))),
+                    @as(Vec, @splat(255)),
+                );
+                inline for (0..8) |lane| {
+                    const channel = (byte_x + lane) % 3;
+                    const x = (byte_x + lane) / 3;
+                    const sample: f32 = @floatFromInt(clipped[lane]);
+                    result[channel * target_height * target_width + target_y * target_width + x] =
+                        normalizeSample(sample, mean[channel], std_dev[channel], rescale_factor);
+                }
             }
+        }
+        while (byte_x < row_bytes) : (byte_x += 1) {
+            var value: i64 = @as(i64, 1) << (vertical_axis.precision_bits - 1);
+            for (weights, 0..) |weight, offset| value += @as(i64, horizontal[(start + offset) * row_bytes + byte_x]) * weight;
+            const channel = byte_x % 3;
+            const x = byte_x / 3;
+            const sample: f32 = @floatFromInt(clipPillowAccumulator(value, vertical_axis.precision_bits));
+            result[channel * target_height * target_width + target_y * target_width + x] =
+                normalizeSample(sample, mean[channel], std_dev[channel], rescale_factor);
         }
     }
 }
@@ -1077,7 +1114,40 @@ test "embeddinggemma2 torchvision bicubic matches pinned uint8 pixels" {
     };
     const actual = try preprocessDecodedRectScaledWithResample(a, .{ .data = &pixels, .width = 13, .height = 7, .format = .rgb8 }, 5, 3, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1, .torchvision_bicubic);
     defer a.free(actual);
-    // PyTorch 2.10.0 / torchvision 0.25.0, CHW uint8 resize, antialias=true.
-    const expected = [_]f32{ 102, 140, 106, 122, 137, 142, 120, 135, 138, 120, 140, 106, 138, 133, 107, 128, 153, 120, 120, 123, 120, 140, 122, 121, 143, 145, 133, 124, 103, 144, 143, 109, 137, 140, 107, 126, 110, 133, 128, 110, 109, 151, 133, 122, 156 };
+    // PyTorch 2.10.0: F.interpolate(CHW uint8[None], size=(3, 5),
+    // mode="bicubic", align_corners=False, antialias=True). Do not cast the
+    // input to float: rounding only the final float output omits the uint8
+    // horizontal intermediate and changes five pixels in this fixture.
+    const expected = [_]f32{ 103, 140, 106, 122, 137, 141, 120, 135, 138, 120, 140, 106, 138, 132, 107, 128, 153, 120, 120, 123, 120, 140, 122, 121, 142, 145, 132, 124, 103, 144, 143, 109, 137, 140, 107, 126, 110, 133, 128, 110, 109, 151, 133, 122, 156 };
     try std.testing.expectEqualSlices(f32, &expected, actual);
+}
+
+test "torchvision bicubic upsampling preserves padded RGBA pixels and allocation cleanup" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var pixels: [2 * 16]u8 = @splat(255);
+            for (0..2) |y| for (0..3) |x| for (0..3) |c| {
+                pixels[y * 16 + x * 4 + c] = @intCast((x * 37 + y * 83 + c * 59) % 256);
+            };
+            const actual = try preprocessDecodedRectScaledWithResample(a, .{
+                .data = &pixels,
+                .width = 3,
+                .height = 2,
+                .format = .rgba8,
+                .row_stride_bytes = 16,
+            }, 5, 4, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1, .torchvision_bicubic);
+            defer a.free(actual);
+            // PyTorch 2.10.0 F.interpolate on the RGB uint8 channels, size=(4, 5),
+            // bicubic, align_corners=False, antialias=True. Includes clipped
+            // negative lobes, vector lanes crossing channels, and scalar tails.
+            const expected = [_]f32{
+                0,   4,   30,  56,  70,  17,  28,  54,  80,  94,  63,  77,  103, 129, 143,
+                87,  101, 127, 153, 167, 49,  63,  89,  115, 129, 73,  87,  113, 139, 153,
+                122, 136, 162, 188, 202, 146, 160, 186, 212, 226, 108, 121, 148, 188, 212,
+                132, 149, 172, 164, 155, 181, 204, 221, 114, 42,  205, 232, 245, 90,  0,
+            };
+            try std.testing.expectEqualSlices(f32, &expected, actual);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

@@ -351,3 +351,43 @@ The conformance tests in `lib/audio/src/mod.zig` use this corpus to verify:
 - interleaved decode shape
 - stereo duplication stays coherent
 - mono downmix remains close to the original `tone.wav` reference
+
+
+### Owned HE-AAC and parametric-stereo qualification
+
+`owned-he-aac-44100-stereo.m4a` and `owned-he-aac-v2-44100-stereo.m4a`
+encode the repository's generated `../tone.wav` with Apple's AAC encoder.
+They contain actual SBR and PS data, independently decoded by FFmpeg 9.0.2
+into the `reference/*-reference.s16le` stereo PCM16 files at 44,100 Hz. The
+reference includes container edit-list priming and the complete declared tail.
+These fixtures are owned generated test signals under the repository license.
+
+Reproduce on macOS (the checked-in encoding used macOS 27.0.1):
+
+```sh
+ffmpeg -y -i zig/lib/audio/testdata/tone.wav -c:a aac_at -profile:a 4 -b:a 32000 -ar 44100 -ac 2 owned-he-aac-44100-stereo.m4a
+ffmpeg -y -i zig/lib/audio/testdata/tone.wav -c:a aac_at -profile:a 28 -b:a 24000 -ar 44100 -ac 2 owned-he-aac-v2-44100-stereo.m4a
+ffmpeg -y -i owned-he-aac-44100-stereo.m4a -f s16le -acodec pcm_s16le owned-he-aac-44100-stereo-reference.s16le
+ffmpeg -y -i owned-he-aac-v2-44100-stereo.m4a -f s16le -acodec pcm_s16le owned-he-aac-v2-44100-stereo-reference.s16le
+```
+
+The tests require exact sample counts/rates and at least 50 dB SNR, with codec
+and output blocks fitting 512 KiB of visitor scratch. The existing file named
+`tone-stereo-12k-sbr.m4a` is an LC compatibility fixture and does not establish
+HE-AAC reconstruction conformance.
+
+- `owned-he-aac-44100-stereo.m4a`
+  - Generated HE-AAC stereo with real spectral band replication.
+- `owned-he-aac-v2-44100-stereo.m4a`
+  - Generated HE-AAC v2 with real SBR and parametric stereo.
+
+### Mixed-band HE-AAC qualification
+
+Generated with `zig/lib/audio/scripts/generate_he_aac.py` using the offline Apple
+encoder and independent FFmpeg PCM16 references. These two-second, 48 kHz
+fixtures include distinct stereo chirps, high-frequency tones, seeded noise,
+silence and transients. Full-channel references live in `reference/`.
+
+- `owned-he-aac-v2-48000-mixed.m4a`
+- `owned-he-aac-48000-mono.m4a`
+- `owned-he-aac-48000-mixed.m4a`

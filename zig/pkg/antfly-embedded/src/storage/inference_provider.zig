@@ -1471,7 +1471,7 @@ pub fn inferenceProviderChunkInputControlled(
     cancellation: CancellationToken,
 ) anyerror![]inference_chunker.Chunk {
     return switch (input) {
-        .text => try invokeInferenceProviderControlled([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
+        .text, .source => try invokeInferenceProviderControlled([]inference_chunker.Chunk, alloc, handle, .chunk_input, .{
             .model = model,
             .input = input,
             .config = config,
